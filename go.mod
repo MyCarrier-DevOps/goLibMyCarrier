@@ -1,4 +1,4 @@
-module goLibMyCarrier
+module github.com/MyCarrier-DevOps/goLibMyCarrier
 
 go 1.22.5
 
