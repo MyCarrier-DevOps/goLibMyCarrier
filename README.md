@@ -7,7 +7,7 @@ goLibMyCarrier is a Go library that provides utilities for authentication, confi
 goLibMyCarrier includes the following components:
 
 - **`auth.go`**: Provides functions and types for user authentication.
-- **`config.go`**: Manages app configuration settings.
+- **`kafka.go`**: Manages kafka configuration settings.
 - **`otel.go`**: Integrates with OpenTelemetry for distributed logs, tracing and metrics collection.
 
 ## Installation

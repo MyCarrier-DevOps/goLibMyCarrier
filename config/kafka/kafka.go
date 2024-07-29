@@ -1,4 +1,4 @@
-package config
+package kafka
 
 import (
 	"fmt"
@@ -15,15 +15,8 @@ type KafkaConfig struct {
 	GroupID  string `mapstructure:"groupid"`
 }
 
-// Config holds the application-wide configuration.
-type Config struct {
-	Kafka    KafkaConfig `mapstructure:"kafka"`
-	ApiKey   string      `mapstructure:"apikey"`
-	Loglevel string      `mapstructure:"loglevel"`
-}
-
 // LoadConfig loads the configuration from environment variables using Viper.
-func LoadConfig() (*Config, error) {
+func LoadConfig() (*KafkaConfig, error) {
 	viper.SetEnvPrefix("APP") // Set environment variable prefix (e.g., APP_KAFKA_ADDRESS)
 
 	// Bind environment variables
@@ -32,49 +25,41 @@ func LoadConfig() (*Config, error) {
 	viper.BindEnv("kafka.username", "APP_KAFKA_USERNAME")
 	viper.BindEnv("kafka.password", "APP_KAFKA_PASSWORD")
 	viper.BindEnv("kafka.groupid", "APP_KAFKA_GROUPID")
-	viper.BindEnv("apikey", "APP_APIKEY")
-	viper.BindEnv("loglevel", "APP_LOG_LEVEL")
 
 	// Read environment variables
 	viper.AutomaticEnv()
 
-	var config Config
+	var kafkaConfig KafkaConfig
 
 	// Unmarshal environment variables into the Config struct
-	if err := viper.Unmarshal(&config); err != nil {
+	if err := viper.Unmarshal(&kafkaConfig); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %v", err)
 	}
 
 	// Validate the configuration
-	if err := validateConfig(&config); err != nil {
+	if err := validateConfig(&kafkaConfig); err != nil {
 		return nil, err
 	}
 
-	return &config, nil
+	return &kafkaConfig, nil
 }
 
 // validateConfig validates the loaded configuration.
-func validateConfig(config *Config) error {
-	if config.Kafka.Address == "" {
+func validateConfig(kafkaConfig *KafkaConfig) error {
+	if kafkaConfig.Address == "" {
 		return fmt.Errorf("kafka address is required")
 	}
-	if config.Kafka.Topic == "" {
+	if kafkaConfig.Topic == "" {
 		return fmt.Errorf("kafka topic is required")
 	}
-	if config.Kafka.Username == "" {
+	if kafkaConfig.Username == "" {
 		return fmt.Errorf("kafka username is required")
 	}
-	if config.Kafka.Password == "" {
+	if kafkaConfig.Password == "" {
 		return fmt.Errorf("kafka password is required")
 	}
-	if config.Kafka.GroupID == "" {
-		return fmt.Errorf("kafka groupid is required")
-	}
-	if config.ApiKey == "" {
-		return fmt.Errorf("apikey is required")
-	}
-	if config.Loglevel == "" {
-		config.Loglevel = "info"
+	if kafkaConfig.GroupID == "" {
+		kafkaConfig.GroupID = "default-group"
 	}
 	return nil
 }
