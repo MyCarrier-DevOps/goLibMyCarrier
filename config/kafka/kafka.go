@@ -20,11 +20,11 @@ func LoadConfig() (*KafkaConfig, error) {
 	viper.SetEnvPrefix("APP") // Set environment variable prefix (e.g., APP_KAFKA_ADDRESS)
 
 	// Bind environment variables
-	viper.BindEnv("kafka.address", "APP_KAFKA_ADDRESS")
-	viper.BindEnv("kafka.topic", "APP_KAFKA_TOPIC")
-	viper.BindEnv("kafka.username", "APP_KAFKA_USERNAME")
-	viper.BindEnv("kafka.password", "APP_KAFKA_PASSWORD")
-	viper.BindEnv("kafka.groupid", "APP_KAFKA_GROUPID")
+	viper.BindEnv("address", "APP_KAFKA_ADDRESS")
+	viper.BindEnv("topic", "APP_KAFKA_TOPIC")
+	viper.BindEnv("username", "APP_KAFKA_USERNAME")
+	viper.BindEnv("password", "APP_KAFKA_PASSWORD")
+	viper.BindEnv("groupid", "APP_KAFKA_GROUPID")
 
 	// Read environment variables
 	viper.AutomaticEnv()
