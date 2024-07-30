@@ -8,9 +8,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func initOtel() {}
-
-func initLogger() (*zap.Logger, error) {
+func InitZapLogger() (*zap.Logger, error) {
 	// Create a logger
 	logger, err := zap.NewProduction()
 	if err != nil {
@@ -21,7 +19,7 @@ func initLogger() (*zap.Logger, error) {
 }
 
 // Gin middleware for logging with Zap
-func ZapLogger(logger *zap.Logger) gin.HandlerFunc {
+func ZapLoggerForGin(logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Start time
 		start := time.Now()
