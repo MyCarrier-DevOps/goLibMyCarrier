@@ -8,6 +8,8 @@ import (
 	"go.uber.org/zap"
 )
 
+// TODO: Add functions to initialize the OpenTelemetry SDK for tracing and metrics.
+
 func InitZapLogger() (*zap.Logger, error) {
 	// Create a logger
 	logger, err := zap.NewProduction()
