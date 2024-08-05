@@ -14,15 +14,20 @@ REF: https://github.com/hashicorp/vault-client-go
 
 ## Usage
 ``` go
+package main
+
+import (
+  vault "github.com/mycarrier-devops/goLibMyCarrier/vault"
+)
 func main() {
 	ctx := context.Background()
 
-  vaultClient, err := VaultClient(ctx)
+  vaultClient, err := vault.VaultClient(ctx)
 	if err != nil {
 		log.Fatal("Error generating vault client: %s", err)
 	}
 
-	secretData, err := getKVSecret(ctx, vaultClient, "some/secret/path", "SomeMountPoint")
+	secretData, err := vault.getKVSecret(ctx, vaultClient, "some/secret/path", "SomeMountPoint")
 	if err != nil {
 		log.Fatal("Error reading secret: %s", err)
 	}
@@ -31,5 +36,6 @@ func main() {
 	}
 	
   log.Printf("Secret read successfully. Secret1 = %s, Secret2 = %s", secretData["Secret1"], secretData["Secret2"])
+}
 
 ```
