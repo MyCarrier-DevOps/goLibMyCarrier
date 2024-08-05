@@ -94,7 +94,7 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 	return client, nil
 }
 
-func getKVSecret(ctx context.Context, client *vault.Client, path string, mount string) (map[string]interface{}, error) {
+func GetKVSecret(ctx context.Context, client *vault.Client, path string, mount string) (map[string]interface{}, error) {
 	// Read a secret from Vault's KV v2 secrets engine
 	secret, err := client.Secrets.KvV2Read(
 		ctx,
