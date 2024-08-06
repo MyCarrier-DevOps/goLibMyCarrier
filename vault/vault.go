@@ -16,7 +16,7 @@ type LocalConfig struct {
 }
 
 type VaultConfig struct {
-	Address string      `mapstructure:"address"`
+	Address string      `mapstructure:"vaultaddress"`
 	Local   LocalConfig `mapstructure:"local"`
 }
 
@@ -24,7 +24,7 @@ func VaultLoadConfig() (*VaultConfig, error) {
 	viper.SetEnvPrefix("APP") // Set environment variable prefix
 
 	// Bind environment variables
-	viper.BindEnv("address", "APP_VAULT_ADDRESS")
+	viper.BindEnv("vaultaddress", "APP_VAULT_ADDRESS")
 	viper.BindEnv("local.role_id", "APP_VAULT_LOCAL_ROLE_ID")
 	viper.BindEnv("local.secret_id", "APP_VAULT_LOCAL_SECRET_ID")
 
