@@ -108,3 +108,18 @@ func GetKVSecret(ctx context.Context, client *vault.Client, path string, mount s
 	// Return the secret data
 	return secret.Data.Data, nil
 }
+
+func GetAzureDynamicCredentials(ctx context.Context, client *vault.Client, azure_role string) (map[string]interface{}, error) {
+	// Read dynamic credentials from Vault's Azure secrets engine
+	secret, err := client.Secrets.AzureRequestServicePrincipalCredentials(
+		ctx,
+		azure_role,
+		vault.WithMountPath("azure"),
+	)
+	if err != nil {
+		// Return an error if reading the secret fails
+		return nil, fmt.Errorf("Error reading secret, %v", err)
+	}
+	// Return the secret data
+	return secret.Data, nil
+}
