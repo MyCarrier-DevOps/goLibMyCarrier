@@ -16,8 +16,8 @@ type LocalConfig struct {
 }
 
 type VaultConfig struct {
-	Address string      `mapstructure:"vaultaddress"`
-	Local   LocalConfig `mapstructure:"local"`
+	VaultAddress string      `mapstructure:"vaultaddress"`
+	Local        LocalConfig `mapstructure:"local"`
 }
 
 func VaultLoadConfig() (*VaultConfig, error) {
@@ -48,7 +48,7 @@ func VaultLoadConfig() (*VaultConfig, error) {
 
 // validateConfig validates the loaded configuration.
 func VaultValidateConfig(config *VaultConfig) error {
-	if config.Address == "" {
+	if config.VaultAddress == "" {
 		return fmt.Errorf("vault address is required")
 	}
 	return nil
@@ -63,7 +63,7 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 
 	// prepare a client with the given base address
 	client, err := vault.New(
-		vault.WithAddress(config.Address),
+		vault.WithAddress(config.VaultAddress),
 		vault.WithRequestTimeout(30*time.Second),
 	)
 	if err != nil {
