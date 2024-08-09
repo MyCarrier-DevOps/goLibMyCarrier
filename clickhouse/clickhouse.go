@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"log"
 
 	"github.com/spf13/viper"
 
@@ -69,7 +68,6 @@ func ClickhouseConnect(ctx context.Context) (driver.Conn, error) {
 	if config_err != nil {
 		return nil, fmt.Errorf("Unable to load config, %v", config_err)
 	}
-	log.Printf("Clickhouse Configuration loaded successfully: %s", chConfig.ChHostname)
 
 	var (
 		conn, err = clickhouse.Open(&clickhouse.Options{
