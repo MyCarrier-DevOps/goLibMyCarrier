@@ -21,7 +21,16 @@ const (
 
 // AppLogger returns a new AppLogger instance
 func NewAppLogger() *zap.SugaredLogger {
+	// Set default log level and app name
 	logLevel, _ := os.LookupEnv("LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = InfoLevel
+	}
+	appName, _ := os.LookupEnv("LOG_APP_NAME")
+	if appName == "" {
+		appName = "default_app"
+	}
+
 	config := ConfigureLogLevelLogger(logLevel)
 	// Config customization goes here if any
 	config.EncoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
@@ -30,7 +39,7 @@ func NewAppLogger() *zap.SugaredLogger {
 	if err != nil {
 		panic(err)
 	}
-	return logger.Named("pr-merge-sync").Sugar()
+	return logger.Named(appName).Sugar()
 }
 
 func SetKlogLevel(level int) {
