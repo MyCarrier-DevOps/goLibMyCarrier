@@ -7,10 +7,13 @@ toolchain go1.23.5
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.27.1
 	github.com/gin-gonic/gin v1.10.0
+	github.com/google/go-github/v69 v69.2.0
+	github.com/jferrl/go-githubauth v1.2.0
 	github.com/odigos-io/opentelemetry-zap-bridge v0.0.5
 	github.com/smartystreets/goconvey v1.8.1
 	github.com/spf13/viper v1.19.0
 	go.uber.org/zap v1.27.0
+	golang.org/x/oauth2 v0.28.0
 	k8s.io/klog/v2 v2.130.1
 )
 
@@ -19,6 +22,8 @@ require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
 	github.com/go-faster/errors v0.7.1 // indirect
+	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
+	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gopherjs/gopherjs v1.17.2 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
@@ -35,7 +40,7 @@ require (
 	github.com/segmentio/asm v1.2.0 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/smarty/assertions v1.15.0 // indirect
-	golang.org/x/time v0.5.0 // indirect
+	golang.org/x/time v0.6.0 // indirect
 )
 
 require (
