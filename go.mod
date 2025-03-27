@@ -6,8 +6,10 @@ require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.27.1
 	github.com/gin-gonic/gin v1.10.0
 	github.com/odigos-io/opentelemetry-zap-bridge v0.0.5
+	github.com/smartystreets/goconvey v1.8.1
 	github.com/spf13/viper v1.19.0
 	go.uber.org/zap v1.27.0
+	k8s.io/klog/v2 v2.130.1
 )
 
 require (
@@ -16,10 +18,12 @@ require (
 	github.com/go-faster/city v1.0.1 // indirect
 	github.com/go-faster/errors v0.7.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/gopherjs/gopherjs v1.17.2 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.7 // indirect
 	github.com/hashicorp/go-rootcerts v1.0.2 // indirect
 	github.com/hashicorp/go-secure-stdlib/strutil v0.1.2 // indirect
+	github.com/jtolds/gls v4.20.0+incompatible // indirect
 	github.com/klauspost/compress v1.17.7 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/paulmach/orb v0.11.1 // indirect
@@ -28,6 +32,7 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	github.com/segmentio/asm v1.2.0 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
+	github.com/smarty/assertions v1.15.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 )
 
