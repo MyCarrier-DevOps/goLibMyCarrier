@@ -38,6 +38,8 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 	viper.BindEnv("chusername", "CLICKHOUSE_USERNAME")
 	viper.BindEnv("chpassword", "CLICKHOUSE_PASSWORD")
 	viper.BindEnv("chdatabase", "CLICKHOUSE_DATABASE")
+	viper.BindEnv("chskipverify", "CLICKHOUSE_SKIP_VERIFY")
+	viper.BindEnv("chport", "CLICKHOUSE_PORT")
 
 	// Read environment variables
 	viper.AutomaticEnv()
