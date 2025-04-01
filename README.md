@@ -15,4 +15,4 @@ goLibMyCarrier includes the following components:
 To install goLibMyCarrier, use the following Go command:
 
 ```bash
-go get -u github.com/mycarrier-devops/goLibMyCarrier
+go get -u github.com/MyCarrier-DevOps/goLibMyCarrier
