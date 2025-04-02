@@ -58,7 +58,7 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 	// Load the configuration
 	config, err := VaultLoadConfig()
 	if err != nil {
-		return nil, fmt.Errorf("Unable to load config, %v", err)
+		return nil, fmt.Errorf("unable to load config, %v", err)
 	}
 
 	// prepare a client with the given base address
@@ -67,7 +67,7 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 		vault.WithRequestTimeout(30*time.Second),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("Error configuring vault, %v", err)
+		return nil, fmt.Errorf("error configuring vault, %v", err)
 	}
 
 	// Load local configuration if needed to authenticate
@@ -81,14 +81,14 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 			})
 		if err != nil {
 			// Return an error if authentication fails
-			return nil, fmt.Errorf("Error authenticating with vault, %v", err)
+			return nil, fmt.Errorf("error authenticating with vault, %v", err)
 		}
 		clientToken := resp.Auth.ClientToken
 		// Set the client token for future requests
 		err = client.SetToken(clientToken)
 		if err != nil {
 			// Return an error if setting the token fails
-			return nil, fmt.Errorf("Error retrieving token %v", err)
+			return nil, fmt.Errorf("error retrieving token %v", err)
 		}
 	}
 	return client, nil
@@ -103,7 +103,7 @@ func GetKVSecret(ctx context.Context, client *vault.Client, path string, mount s
 	)
 	if err != nil {
 		// Return an error if reading the secret fails
-		return nil, fmt.Errorf("Error reading secret, %v", err)
+		return nil, fmt.Errorf("error reading secret, %v", err)
 	}
 	// Return the secret data
 	return secret.Data.Data, nil
@@ -118,7 +118,7 @@ func GetAzureDynamicCredentials(ctx context.Context, client *vault.Client, azure
 	)
 	if err != nil {
 		// Return an error if reading the secret fails
-		return nil, fmt.Errorf("Error reading secret, %v", err)
+		return nil, fmt.Errorf("error reading secret, %v", err)
 	}
 	// Return the secret data
 	return secret.Data, nil

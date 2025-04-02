@@ -145,9 +145,13 @@ func (ch *ClickhouseSession) Query(ctx context.Context, query string) (driver.Ro
 	return rows, nil
 }
 
-// return ClickHouse connection
-func (ch *ClickhouseSession) Conn() driver.Conn {
-	return ch.conn
+// Exec ClickHouse query
+func (ch *ClickhouseSession) Exec(ctx context.Context, stmt string) error {
+	err := ch.conn.Exec(ctx, stmt)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // Close ClickHouse connection
@@ -158,4 +162,9 @@ func (ch *ClickhouseSession) Close() error {
 		}
 	}
 	return nil
+}
+
+// return ClickHouse connection
+func (ch *ClickhouseSession) Conn() driver.Conn {
+	return ch.conn
 }

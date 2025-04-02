@@ -1,18 +1,23 @@
 # goLibMyCarrier
 
-goLibMyCarrier is a Go library that provides utilities for authentication, configuration management, and OpenTelemetry integration. It is designed to streamline the development of Go applications by providing essential components for these common tasks.
+`goLibMyCarrier` is a Go library that provides utilities for authentication, configuration management, interaction with ClickHouse and OpenTelemetry integration. It is designed to streamline the development of Go applications by providing essential components for these common tasks.
 
 ## Overview
 
-goLibMyCarrier includes the following components:
+`goLibMyCarrier` includes the following components:
 
-- **`auth.go`**: Provides functions and types for user authentication.
-- **`kafka.go`**: Manages kafka configuration settings.
-- **`otel.go`**: Integrates with OpenTelemetry for distributed logs, tracing and metrics collection.
+-   **`auth`**: Provides authentication middleware for Gin framework.
+-   **`clickhouse`**: Provides utilities to connect and query ClickHouse database.
+-   **`github`**: Provides utilities to authenticate and interact with Github.
+-   **`kafka`**: Provides utilities to produce and consume messages from Kafka.
+-   **`logger`**: Provides a pre-configured logger using `go.uber.org/zap`.
+-   **`otel`**: Integrates with OpenTelemetry for distributed tracing and logging.
+-   **`vault`**: Provides utilities to interact with HashiCorp Vault.
 
 ## Installation
 
-To install goLibMyCarrier, use the following Go command:
+To install `goLibMyCarrier`, use the following Go command:
 
 ```bash
 go get -u github.com/MyCarrier-DevOps/goLibMyCarrier
+```
