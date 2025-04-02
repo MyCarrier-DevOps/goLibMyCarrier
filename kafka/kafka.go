@@ -137,5 +137,5 @@ func InitializeKafkaWriter(kafkacfg *KafkaConfig) (*kafka.Writer, error) {
 		MaxAttempts: 5,
 	})
 
-	return writer, err
+	return writer, nil
 }
