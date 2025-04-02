@@ -24,12 +24,24 @@ type KafkaConfig struct {
 // LoadConfig loads the configuration from environment variables using Viper.
 func LoadConfig() (*KafkaConfig, error) {
 	// Bind environment variables
-	viper.BindEnv("address", "KAFKA_ADDRESS")
-	viper.BindEnv("topic", "KAFKA_TOPIC")
-	viper.BindEnv("username", "KAFKA_USERNAME")
-	viper.BindEnv("password", "KAFKA_PASSWORD")
-	viper.BindEnv("groupid", "KAFKA_GROUPID")
-	viper.BindEnv("partition", "KAFKA_PARTITION")
+	if err := viper.BindEnv("address", "KAFKA_ADDRESS"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_ADDRESS: %v", err)
+	}
+	if err := viper.BindEnv("topic", "KAFKA_TOPIC"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_TOPIC: %v", err)
+	}
+	if err := viper.BindEnv("username", "KAFKA_USERNAME"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_USERNAME: %v", err)
+	}
+	if err := viper.BindEnv("password", "KAFKA_PASSWORD"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_PASSWORD: %v", err)
+	}
+	if err := viper.BindEnv("groupid", "KAFKA_GROUPID"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_GROUPID: %v", err)
+	}
+	if err := viper.BindEnv("partition", "KAFKA_PARTITION"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_PARTITION: %v", err)
+	}
 
 	// Read environment variables
 	viper.AutomaticEnv()

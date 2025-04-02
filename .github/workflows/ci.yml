@@ -1,0 +1,42 @@
+name: ci
+on:
+  push:
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!.github/**'
+    branches:
+      - main
+  pull_request: 
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!.github/**'
+    branches: 
+      - main
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2.3.4
+      - uses: actions/setup-go@v2
+        with:
+          go-version: ^1.23.5
+      - name: Unit Tests
+        run: make test
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2.3.4
+      - uses: actions/setup-go@v2
+        with:
+          go-version: ^1.23.5
+      - name: Install tools
+        run: make install-tools
+      - name: Lint
+        run: make lint

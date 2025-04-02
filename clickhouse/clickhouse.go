@@ -34,12 +34,24 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 	viper.SetEnvPrefix("CLICKHOUSE")
 
 	// Bind environment variables
-	viper.BindEnv("chhostname", "CLICKHOUSE_HOSTNAME")
-	viper.BindEnv("chusername", "CLICKHOUSE_USERNAME")
-	viper.BindEnv("chpassword", "CLICKHOUSE_PASSWORD")
-	viper.BindEnv("chdatabase", "CLICKHOUSE_DATABASE")
-	viper.BindEnv("chskipverify", "CLICKHOUSE_SKIP_VERIFY")
-	viper.BindEnv("chport", "CLICKHOUSE_PORT")
+	if err := viper.BindEnv("chhostname", "CLICKHOUSE_HOSTNAME"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for chhostname: %v", err)
+	}
+	if err := viper.BindEnv("chusername", "CLICKHOUSE_USERNAME"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for chusername: %v", err)
+	}
+	if err := viper.BindEnv("chpassword", "CLICKHOUSE_PASSWORD"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for chpassword: %v", err)
+	}
+	if err := viper.BindEnv("chdatabase", "CLICKHOUSE_DATABASE"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for chdatabase: %v", err)
+	}
+	if err := viper.BindEnv("chskipverify", "CLICKHOUSE_SKIP_VERIFY"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for chskipverify: %v", err)
+	}
+	if err := viper.BindEnv("chport", "CLICKHOUSE_PORT"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for chport: %v", err)
+	}
 
 	// Read environment variables
 	viper.AutomaticEnv()

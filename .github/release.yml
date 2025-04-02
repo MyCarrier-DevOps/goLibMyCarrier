@@ -1,0 +1,34 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+    authors:
+      - dependabot[bot]
+      - octocat
+      - github-actions[bot]
+  categories:
+    - title: 🚀 Features
+      labels:
+        - '*'
+      exclude:
+        labels:
+          - dependencies
+          - bug
+          - support
+          - hotfix
+          - documentation
+    - title: 🐛 Bug Fixes
+      labels:
+        - bug
+    - title: 📦 Dependencies
+      labels:
+        - dependencies
+    - title: 🛠️ Support
+      labels:
+        - support
+    - title: 🚀 Hotfix
+      labels:
+        - hotfix
+    - title: 📝 Documentation
+      labels:
+        - documentation

@@ -21,12 +21,16 @@ type VaultConfig struct {
 }
 
 func VaultLoadConfig() (*VaultConfig, error) {
-	viper.SetEnvPrefix("APP") // Set environment variable prefix
-
 	// Bind environment variables
-	viper.BindEnv("vaultaddress", "APP_VAULT_ADDRESS")
-	viper.BindEnv("local.role_id", "APP_VAULT_LOCAL_ROLE_ID")
-	viper.BindEnv("local.secret_id", "APP_VAULT_LOCAL_SECRET_ID")
+	if err := viper.BindEnv("vaultaddress", "VAULT_ADDRESS"); err != nil {
+		return nil, fmt.Errorf("error binding environment variable VAULT_ADDRESS: %v", err)
+	}
+	if err := viper.BindEnv("local.role_id", "VAULT_LOCAL_ROLE_ID"); err != nil {
+		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_ROLE_ID: %v", err)
+	}
+	if err := viper.BindEnv("local.secret_id", "VAULT_LOCAL_SECRET_ID"); err != nil {
+		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_SECRET_ID: %v", err)
+	}
 
 	// Read environment variables
 	viper.AutomaticEnv()

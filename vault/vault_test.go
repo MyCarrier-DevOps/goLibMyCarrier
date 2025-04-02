@@ -7,9 +7,9 @@ import (
 
 func TestVaultLoadConfig(t *testing.T) {
 	// Set environment variables for testing
-	os.Setenv("APP_VAULT_ADDRESS", "http://localhost:8200")
-	os.Setenv("APP_VAULT_LOCAL_ROLE_ID", "test_role_id")
-	os.Setenv("APP_VAULT_LOCAL_SECRET_ID", "test_secret_id")
+	os.Setenv("VAULT_ADDRESS", "http://localhost:8200")
+	os.Setenv("VAULT_LOCAL_ROLE_ID", "test_role_id")
+	os.Setenv("VAULT_LOCAL_SECRET_ID", "test_secret_id")
 
 	// Call the function
 	config, err := VaultLoadConfig()
@@ -36,9 +36,9 @@ func TestVaultLoadConfig(t *testing.T) {
 	}
 
 	// Unset environment variables after testing
-	os.Unsetenv("APP_VAULT_ADDRESS")
-	os.Unsetenv("APP_VAULT_LOCAL_ROLE_ID")
-	os.Unsetenv("APP_VAULT_LOCAL_SECRET_ID")
+	os.Unsetenv("VAULT_ADDRESS")
+	os.Unsetenv("VAULT_LOCAL_ROLE_ID")
+	os.Unsetenv("VAULT_LOCAL_SECRET_ID")
 }
 
 func TestVaultLoadConfig_NoAddress(t *testing.T) {
