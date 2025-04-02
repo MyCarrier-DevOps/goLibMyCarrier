@@ -67,9 +67,7 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 		kafkaConfig.GroupID = "default-group"
 	}
 	if kafkaConfig.Partition == "" {
-		if kafkaConfig.GroupID == "" {
-			kafkaConfig.Partition = "0"
-		}
+		kafkaConfig.Partition = "0"
 	} else {
 		if _, err := strconv.Atoi(kafkaConfig.Partition); err != nil {
 			return fmt.Errorf("kafka partition must be a valid numeric value")
