@@ -1,0 +1,21 @@
+assembly-versioning-scheme: MajorMinorPatch
+assembly-file-versioning-scheme: MajorMinorPatchTag
+commit-date-format: yyyy-MM-dd
+update-build-number: true
+tag-prefix: '[vV]?'
+
+strategies:
+  - TaggedCommit
+
+branches:
+  main:
+    regex: ^main$
+    mode: ContinuousDelivery
+    label: ''
+    increment: Patch
+    prevent-increment:
+      of-merged-branch: true
+    track-merge-target: false
+    track-merge-message: false
+    is-release-branch: false
+    is-main-branch: true
