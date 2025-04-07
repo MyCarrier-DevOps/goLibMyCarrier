@@ -104,6 +104,7 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 	// Create a new Kafka reader
 	readerConfig := kafka.ReaderConfig{
 		Brokers:     []string{kafkacfg.Address},
+		Topic:       kafkacfg.Topic,
 		GroupID:     kafkacfg.GroupID,
 		MinBytes:    1,    // 1 Byte
 		MaxBytes:    10e6, // 10MB
