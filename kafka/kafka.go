@@ -13,12 +13,13 @@ import (
 
 // KafkaConfig represents the configuration for Kafka.
 type KafkaConfig struct {
-	Address   string `mapstructure:"address"`
-	Topic     string `mapstructure:"topic"`
-	Username  string `mapstructure:"username"`
-	Password  string `mapstructure:"password"`
-	GroupID   string `mapstructure:"groupid"`
-	Partition string `mapstructure:"partition"`
+	Address            string `mapstructure:"address"`
+	Topic              string `mapstructure:"topic"`
+	Username           string `mapstructure:"username"`
+	Password           string `mapstructure:"password"`
+	GroupID            string `mapstructure:"groupid"`
+	Partition          string `mapstructure:"partition"`
+	InsecureSkipVerify string `mapstructure:"insecure_skip_verify"`
 }
 
 // LoadConfig loads the configuration from environment variables using Viper.
@@ -41,6 +42,9 @@ func LoadConfig() (*KafkaConfig, error) {
 	}
 	if err := viper.BindEnv("partition", "KAFKA_PARTITION"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_PARTITION: %v", err)
+	}
+	if err := viper.BindEnv("insecure_skip_verify", "KAFKA_INSECURE_SKIP_VERIFY"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_INSECURE_SKIP_VERIFY: %v", err)
 	}
 
 	// Read environment variables
@@ -85,6 +89,11 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 			return fmt.Errorf("kafka partition must be a valid numeric value")
 		}
 	}
+	if kafkaConfig.InsecureSkipVerify == "" {
+		kafkaConfig.InsecureSkipVerify = "false"
+	} else if kafkaConfig.InsecureSkipVerify != "true" && kafkaConfig.InsecureSkipVerify != "false" {
+		return fmt.Errorf("kafka insecure_skip_verify must be true or false")
+	}
 	return nil
 }
 
@@ -96,7 +105,9 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 
 	dialer := &kafka.Dialer{
 		SASLMechanism: mechanism,
-		TLS:           &tls.Config{},
+		TLS: &tls.Config{
+			InsecureSkipVerify: bool(kafkacfg.InsecureSkipVerify == "true"),
+		},
 	}
 
 	// Create a new Kafka reader
