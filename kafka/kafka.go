@@ -96,9 +96,7 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 
 	dialer := &kafka.Dialer{
 		SASLMechanism: mechanism,
-		TLS: &tls.Config{
-			InsecureSkipVerify: true,
-		},
+		TLS:           &tls.Config{},
 	}
 
 	// Create a new Kafka reader
@@ -136,9 +134,7 @@ func InitializeKafkaWriter(kafkacfg *KafkaConfig) (*kafka.Writer, error) {
 
 	dialer := &kafka.Dialer{
 		SASLMechanism: mechanism,
-		TLS: &tls.Config{
-			InsecureSkipVerify: true,
-		},
+		TLS:           &tls.Config{},
 	}
 
 	writer := kafka.NewWriter(kafka.WriterConfig{
