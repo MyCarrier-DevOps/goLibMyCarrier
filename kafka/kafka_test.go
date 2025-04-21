@@ -13,6 +13,7 @@ func TestLoadConfig(t *testing.T) {
 	t.Setenv("KAFKA_PASSWORD", "test-password")
 	t.Setenv("KAFKA_GROUPID", "test-group")
 	t.Setenv("KAFKA_PARTITION", "1")
+	t.Setenv("KAFKA_INSECURE_SKIP_VERIFY", "true")
 
 	config, err := LoadConfig()
 	assert.NoError(t, err)
@@ -23,6 +24,7 @@ func TestLoadConfig(t *testing.T) {
 	assert.Equal(t, "test-password", config.Password)
 	assert.Equal(t, "test-group", config.GroupID)
 	assert.Equal(t, "1", config.Partition)
+	assert.Equal(t, "true", config.InsecureSkipVerify)
 }
 
 func TestLoadConfig_MissingRequiredFields(t *testing.T) {
@@ -30,6 +32,7 @@ func TestLoadConfig_MissingRequiredFields(t *testing.T) {
 	t.Setenv("KAFKA_TOPIC", "")
 	t.Setenv("KAFKA_USERNAME", "")
 	t.Setenv("KAFKA_PASSWORD", "")
+	t.Setenv("KAFKA_INSECURE_SKIP_VERIFY", "")
 
 	_, err := LoadConfig()
 	assert.Error(t, err)
@@ -143,4 +146,35 @@ func TestValidateConfig_InvalidPartition(t *testing.T) {
 	err := validateConfig(config)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "kafka partition must be a valid numeric value")
+}
+
+func TestValidateConfig_InvalidInsecureSkipVerify(t *testing.T) {
+	config := &KafkaConfig{
+		Address:            "localhost:9092",
+		Topic:              "test-topic",
+		Username:           "test-user",
+		Password:           "test-password",
+		GroupID:            "test-group",
+		Partition:          "1",
+		InsecureSkipVerify: "invalid",
+	}
+
+	err := validateConfig(config)
+	assert.Error(t, err)
+	assert.Equal(t, "kafka insecure_skip_verify must be true or false", err.Error())
+}
+
+func TestValidateConfig_DefaultInsecureSkipVerify(t *testing.T) {
+	config := &KafkaConfig{
+		Address:   "localhost:9092",
+		Topic:     "test-topic",
+		Username:  "test-user",
+		Password:  "test-password",
+		GroupID:   "test-group",
+		Partition: "1",
+	}
+
+	err := validateConfig(config)
+	assert.NoError(t, err)
+	assert.Equal(t, "false", config.InsecureSkipVerify)
 }
