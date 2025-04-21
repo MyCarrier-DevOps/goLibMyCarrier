@@ -145,7 +145,9 @@ func InitializeKafkaWriter(kafkacfg *KafkaConfig) (*kafka.Writer, error) {
 
 	dialer := &kafka.Dialer{
 		SASLMechanism: mechanism,
-		TLS:           &tls.Config{},
+		TLS: &tls.Config{
+			InsecureSkipVerify: bool(kafkacfg.InsecureSkipVerify == "true"),
+		},
 	}
 
 	writer := kafka.NewWriter(kafka.WriterConfig{
