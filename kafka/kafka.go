@@ -4,8 +4,6 @@ import (
 	"crypto/tls"
 	"fmt"
 
-	"strconv"
-
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/sasl/scram"
 	"github.com/spf13/viper"
@@ -18,7 +16,6 @@ type KafkaConfig struct {
 	Username           string `mapstructure:"username"`
 	Password           string `mapstructure:"password"`
 	GroupID            string `mapstructure:"groupid"`
-	Partition          string `mapstructure:"partition"`
 	InsecureSkipVerify string `mapstructure:"insecure_skip_verify"`
 }
 
@@ -39,9 +36,6 @@ func LoadConfig() (*KafkaConfig, error) {
 	}
 	if err := viper.BindEnv("groupid", "KAFKA_GROUPID"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_GROUPID: %v", err)
-	}
-	if err := viper.BindEnv("partition", "KAFKA_PARTITION"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_PARTITION: %v", err)
 	}
 	if err := viper.BindEnv("insecure_skip_verify", "KAFKA_INSECURE_SKIP_VERIFY"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_INSECURE_SKIP_VERIFY: %v", err)
@@ -82,13 +76,6 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 	if kafkaConfig.GroupID == "" {
 		kafkaConfig.GroupID = "default-group"
 	}
-	if kafkaConfig.Partition == "" {
-		kafkaConfig.Partition = "0"
-	} else {
-		if _, err := strconv.Atoi(kafkaConfig.Partition); err != nil {
-			return fmt.Errorf("kafka partition must be a valid numeric value")
-		}
-	}
 	if kafkaConfig.InsecureSkipVerify == "" {
 		kafkaConfig.InsecureSkipVerify = "false"
 	} else if kafkaConfig.InsecureSkipVerify != "true" && kafkaConfig.InsecureSkipVerify != "false" {
@@ -120,15 +107,6 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 		StartOffset: kafka.FirstOffset,
 		Dialer:      dialer,
 		MaxAttempts: 5,
-	}
-
-	// Set Partition based on GroupID presence
-	if kafkacfg.GroupID == "" {
-		partition, err := strconv.Atoi(kafkacfg.Partition)
-		if err != nil {
-			return nil, fmt.Errorf("invalid partition value: %v", err)
-		}
-		readerConfig.Partition = partition
 	}
 
 	reader := kafka.NewReader(readerConfig)
