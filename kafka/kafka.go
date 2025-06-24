@@ -100,7 +100,7 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 	mechanism, mech_err := scram.Mechanism(scram.SHA512, kafkacfg.Username, kafkacfg.Password)
 	if mech_err != nil {
-		return nil, fmt.Errorf("error creating sasl mechanism: %v", mech_err.Error())
+		return nil, fmt.Errorf("error creating sasl mechanism: %w", mech_err)
 	}
 
 	dialer := &kafka.Dialer{
