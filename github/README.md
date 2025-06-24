@@ -25,7 +25,7 @@ Use the `GithubLoadConfig` function to load the configuration from environment v
 ```go
 config, err := GithubLoadConfig()
 if err != nil {
-    log.Fatalf("Failed to load GitHub configuration: %v", err)
+    log.Fatalf("Failed to load GitHub configuration: %v", err.Error())
 }
 ```
 
@@ -36,7 +36,7 @@ Use the `NewGithubSession` function to create a new session:
 ```go
 session, err := NewGithubSession(config.Pem, config.AppId, config.InstallId)
 if err != nil {
-    log.Fatalf("Failed to create GitHub session: %v", err)
+    log.Fatalf("Failed to create GitHub session: %v", err.Error())
 }
 ```
 

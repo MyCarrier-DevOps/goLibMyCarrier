@@ -36,7 +36,7 @@ func TestLoadConfig_MissingRequiredFields(t *testing.T) {
 
 	_, err := LoadConfig()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "kafka address is required")
+	assert.Contains(t, err, "kafka address is required")
 }
 
 func TestInitializeKafkaReader_InvalidPartition(t *testing.T) {
@@ -51,7 +51,7 @@ func TestInitializeKafkaReader_InvalidPartition(t *testing.T) {
 
 	_, err := InitializeKafkaReader(config)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid partition value")
+	assert.Contains(t, err, "invalid partition value")
 }
 
 func TestInitializeKafkaWriter(t *testing.T) {
@@ -145,7 +145,7 @@ func TestValidateConfig_InvalidPartition(t *testing.T) {
 
 	err := validateConfig(config)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "kafka partition must be a valid numeric value")
+	assert.Contains(t, err, "kafka partition must be a valid numeric value")
 }
 
 func TestValidateConfig_InvalidInsecureSkipVerify(t *testing.T) {

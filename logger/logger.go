@@ -37,7 +37,7 @@ func NewAppLogger() *zap.SugaredLogger {
 	config.OutputPaths = []string{"stdout"}
 	logger, err := config.Build()
 	if err != nil {
-		panic(err)
+		panic(err.Error())
 	}
 	return logger.Named(appName).Sugar()
 }

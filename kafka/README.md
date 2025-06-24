@@ -31,7 +31,7 @@ Use the `LoadConfig` function to load and validate Kafka configuration:
 ```go
 config, err := kafka.LoadConfig()
 if err != nil {
-    log.Fatalf("Failed to load Kafka config: %v", err)
+    log.Fatalf("Failed to load Kafka config: %v", err.Error())
 }
 ```
 
@@ -42,7 +42,7 @@ Use the `InitializeKafkaReader` function to create a Kafka reader:
 ```go
 reader, err := kafka.InitializeKafkaReader(config)
 if err != nil {
-    log.Fatalf("Failed to initialize Kafka reader: %v", err)
+    log.Fatalf("Failed to initialize Kafka reader: %v", err.Error())
 }
 defer reader.Close()
 ```
@@ -54,7 +54,7 @@ Use the `InitializeKafkaWriter` function to create a Kafka writer:
 ```go
 writer, err := kafka.InitializeKafkaWriter(config)
 if err != nil {
-    log.Fatalf("Failed to initialize Kafka writer: %v", err)
+    log.Fatalf("Failed to initialize Kafka writer: %v", err.Error())
 }
 defer writer.Close()
 ```
@@ -76,13 +76,13 @@ func main() {
 	// Load Kafka configuration
 	config, err := kafka.LoadConfig()
 	if err != nil {
-		log.Fatalf("Failed to load Kafka config: %v", err)
+		log.Fatalf("Failed to load Kafka config: %v", err.Error())
 	}
 
 	// Initialize Kafka writer
 	writer, err := kafka.InitializeKafkaWriter(config)
 	if err != nil {
-		log.Fatalf("Failed to initialize Kafka writer: %v", err)
+		log.Fatalf("Failed to initialize Kafka writer: %v", err.Error())
 	}
 	defer writer.Close()
 
@@ -91,20 +91,20 @@ func main() {
 		Value: []byte("Hello, Kafka!"),
 	})
 	if err != nil {
-		log.Fatalf("Failed to write message: %v", err)
+		log.Fatalf("Failed to write message: %v", err.Error())
 	}
 
 	// Initialize Kafka reader
 	reader, err := kafka.InitializeKafkaReader(config)
 	if err != nil {
-		log.Fatalf("Failed to initialize Kafka reader: %v", err)
+		log.Fatalf("Failed to initialize Kafka reader: %v", err.Error())
 	}
 	defer reader.Close()
 
 	// Consume a message
 	msg, err := reader.ReadMessage(context.Background())
 	if err != nil {
-		log.Fatalf("Failed to read message: %v", err)
+		log.Fatalf("Failed to read message: %v", err.Error())
 	}
 	log.Printf("Received message: %s", string(msg.Value))
 }

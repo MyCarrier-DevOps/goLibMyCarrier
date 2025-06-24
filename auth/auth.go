@@ -56,7 +56,7 @@ func (am *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 		// Decode the Base64 ApiKey
 		decodedApiKey, err := base64.StdEncoding.DecodeString(apiKey)
 		if err != nil {
-			log.Printf("Failed to decode Base64 string: %v", err)
+			log.Printf("Failed to decode Base64 string: %v", err.Error())
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
 			return

@@ -29,7 +29,7 @@ Use the `ClickhouseLoadConfig` function to load the configuration from environme
 ```go
 config, err := ClickhouseLoadConfig()
 if err != nil {
-    log.Fatalf("Failed to load ClickHouse configuration: %v", err)
+    log.Fatalf("Failed to load ClickHouse configuration: %v", err.Error())
 }
 ```
 
@@ -41,7 +41,7 @@ Use the `NewClickhouseSession` function to create a new session:
 ctx := context.Background()
 session, err := NewClickhouseSession(config, ctx)
 if err != nil {
-    log.Fatalf("Failed to create ClickHouse session: %v", err)
+    log.Fatalf("Failed to create ClickHouse session: %v", err.Error())
 }
 defer session.Close()
 ```
@@ -55,7 +55,7 @@ Use the `Query` method to execute a query and retrieve rows:
 ```go
 rows, err := session.Query(ctx, "SELECT * FROM my_table")
 if err != nil {
-    log.Fatalf("Query failed: %v", err)
+    log.Fatalf("Query failed: %v", err.Error())
 }
 defer rows.Close()
 ```
@@ -67,7 +67,7 @@ Use the `Exec` method to execute a statement:
 ```go
 err := session.Exec(ctx, "INSERT INTO my_table (id, name) VALUES (1, 'example')")
 if err != nil {
-    log.Fatalf("Execution failed: %v", err)
+    log.Fatalf("Execution failed: %v", err.Error())
 }
 ```
 
@@ -78,7 +78,7 @@ Always close the session when done:
 ```go
 err := session.Close()
 if err != nil {
-    log.Fatalf("Failed to close ClickHouse session: %v", err)
+    log.Fatalf("Failed to close ClickHouse session: %v", err.Error())
 }
 ```
 
