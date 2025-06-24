@@ -16,7 +16,10 @@ import (
 // branch: The branch to clone from the repository. Do not include the "refs/heads/" prefix, just the branch name.
 // gitCloneOptions: Optional git clone options. If nil, default options will be used.
 // Returns a pointer to the cloned git.Repository or an error if the clone operation fails.
-func CloneRepository(session GithubSession, repository_url, branch string, gitCloneOptions *git.CloneOptions) (*git.Repository, error) {
+func CloneRepository(session GithubSession,
+	repository_url, branch string,
+	gitCloneOptions *git.CloneOptions,
+) (*git.Repository, error) {
 	token := session.AuthToken()
 	if token == nil {
 		return nil, fmt.Errorf("error getting auth token for GitHub session")

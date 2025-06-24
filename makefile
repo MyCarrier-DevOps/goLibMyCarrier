@@ -27,6 +27,18 @@ test:
 		fi; \
 	done
 
+.PHONY: fmt
+fmt:
+	@echo "Formatting all modules..."
+	@for dir in auth clickhouse github kafka logger otel vault; do \
+		if [ -d "$$dir" ]; then \
+			echo "Formatting $$dir module..."; \
+			(cd $$dir && gofmt -s -w .); \
+		else \
+			echo "Directory $$dir not found, skipping..."; \
+		fi; \
+	done
+
 .PHONY: install-tools
 install-tools:
 	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s v2.1.6
