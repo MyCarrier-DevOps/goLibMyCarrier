@@ -17,12 +17,17 @@ import (
 // gitCloneOptions: Optional git clone options. If nil, default options will be used.
 // Returns a pointer to the cloned git.Repository or an error if the clone operation fails.
 func CloneRepository(session GithubSession,
-	repository_url, branch string,
+	repository_url,
+	workdir,
+	branch string,
 	gitCloneOptions *git.CloneOptions,
 ) (*git.Repository, error) {
 	token := session.AuthToken()
 	if token == nil {
 		return nil, fmt.Errorf("error getting auth token for GitHub session")
+	}
+	if workdir == "" {
+		workdir = "/work" // Default work directory if none provided
 	}
 	if gitCloneOptions == nil {
 		// Default clone options if none provided
@@ -38,7 +43,7 @@ func CloneRepository(session GithubSession,
 			},
 		}
 	}
-	repo, err := git.PlainClone("/work", false, gitCloneOptions)
+	repo, err := git.PlainClone(workdir, false, gitCloneOptions)
 	if err != nil {
 		return nil, fmt.Errorf("error cloning repository: %v", err.Error())
 	}
