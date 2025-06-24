@@ -1,6 +1,3 @@
-# This is the golangci-lint configuration file following Google Go Style Guide
-# Compatible with golangci-lint v2.0+
-
 version: "2"
 
 run:
@@ -13,15 +10,10 @@ formatters:
     - golines # checks if code is formatted, and fixes long lines
   settings:
     goimports:
-      # A list of prefixes, which, if set, checks import paths
-      # with the given prefixes are grouped after 3rd-party packages.
-      # Default: []
       local-prefixes:
         - github.com/MyCarrier-DevOps/goLibMyCarrier
 
     golines:
-      # Target maximum line length.
-      # Default: 100
       max-len: 120
 
 linters:
@@ -86,8 +78,6 @@ linters:
     - whitespace # detects leading and trailing whitespace
 
 linters-settings:
-  # I'm biased and I'm enabling more than 100 checks
-  # Might be too much for you. See https://go-critic.com/overview.html
   gocritic:
     enabled-tags:
       - diagnostic
@@ -96,8 +86,6 @@ linters-settings:
       - performance
       - style
     disabled-checks:
-      # These 3 will detect many cases, but they do sense
-      # if it's performance oriented code
       - hugeParam
       - rangeExprCopy
       - rangeValCopy
@@ -126,8 +114,8 @@ linters-settings:
   tagliatelle:
     case:
       rules:
-        json: snake # why it's not a `snake` by default?!
-        yaml: snake # why it's not a `snake` by default?!
+        json: snake
+        yaml: snake
         xml: camel
         bson: camel
         avro: snake
