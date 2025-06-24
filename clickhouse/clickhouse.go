@@ -3,6 +3,7 @@ package clickhouse
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 
 	"github.com/spf13/viper"
@@ -35,22 +36,22 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 
 	// Bind environment variables
 	if err := viper.BindEnv("chhostname", "CLICKHOUSE_HOSTNAME"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chhostname: %v", err)
+		return nil, fmt.Errorf("failed to bind environment variable for chhostname: %w", err)
 	}
 	if err := viper.BindEnv("chusername", "CLICKHOUSE_USERNAME"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chusername: %v", err)
+		return nil, fmt.Errorf("failed to bind environment variable for chusername: %w", err)
 	}
 	if err := viper.BindEnv("chpassword", "CLICKHOUSE_PASSWORD"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chpassword: %v", err)
+		return nil, fmt.Errorf("failed to bind environment variable for chpassword: %w", err)
 	}
 	if err := viper.BindEnv("chdatabase", "CLICKHOUSE_DATABASE"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chdatabase: %v", err)
+		return nil, fmt.Errorf("failed to bind environment variable for chdatabase: %w", err)
 	}
 	if err := viper.BindEnv("chskipverify", "CLICKHOUSE_SKIP_VERIFY"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chskipverify: %v", err)
+		return nil, fmt.Errorf("failed to bind environment variable for chskipverify: %w", err)
 	}
 	if err := viper.BindEnv("chport", "CLICKHOUSE_PORT"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chport: %v", err)
+		return nil, fmt.Errorf("failed to bind environment variable for chport: %w", err)
 	}
 
 	// Read environment variables
@@ -60,7 +61,7 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 
 	// Unmarshal environment variables into the Config struct
 	if err := viper.Unmarshal(&ClickhouseConfig); err != nil {
-		return nil, fmt.Errorf("unable to decode into struct, %v", err)
+		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
 	// Validate the configuration
@@ -72,26 +73,26 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 }
 
 // validateConfig validates the loaded configuration.
-func ClickhouseValidateConfig(ClickhouseConfig *ClickhouseConfig) error {
-	if ClickhouseConfig.ChHostname == "" {
+func ClickhouseValidateConfig(clickhouseConfig *ClickhouseConfig) error {
+	if clickhouseConfig.ChHostname == "" {
 		return fmt.Errorf("clickhouse hostname is required")
 	}
-	if ClickhouseConfig.ChUsername == "" {
+	if clickhouseConfig.ChUsername == "" {
 		return fmt.Errorf("clickhouse username is required")
 	}
-	if ClickhouseConfig.ChPassword == "" {
+	if clickhouseConfig.ChPassword == "" {
 		return fmt.Errorf("clickhouse password is required")
 	}
-	if ClickhouseConfig.ChDatabase == "" {
+	if clickhouseConfig.ChDatabase == "" {
 		return fmt.Errorf("clickhouse database is required")
 	}
-	if ClickhouseConfig.ChPort == "" {
+	if clickhouseConfig.ChPort == "" {
 		return fmt.Errorf("clickhouse port is required")
 	}
-	if ClickhouseConfig.ChSkipVerify == "" {
+	if clickhouseConfig.ChSkipVerify == "" {
 		return fmt.Errorf("clickhouse skip verify is required")
 	}
-	if ClickhouseConfig.ChSkipVerify != "true" && ClickhouseConfig.ChSkipVerify != "false" {
+	if clickhouseConfig.ChSkipVerify != "true" && clickhouseConfig.ChSkipVerify != "false" {
 		return fmt.Errorf("clickhouse skip verify must be true or false")
 	}
 	return nil
@@ -117,7 +118,6 @@ func NewClickhouseSession(ch *ClickhouseConfig, context context.Context) (*Click
 
 // Connect to ClickHouse database
 func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, context context.Context) error {
-
 	var (
 		ctx       = context
 		conn, err = clickhouse.Open(&clickhouse.Options{
@@ -134,11 +134,12 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, context contex
 		})
 	)
 	if err != nil {
-		return fmt.Errorf("error connecting to ClickHouse: %v", err)
+		return fmt.Errorf("error connecting to ClickHouse: %w", err)
 	}
 
 	if err := conn.Ping(ctx); err != nil {
-		if exception, ok := err.(*clickhouse.Exception); ok {
+		var exception *clickhouse.Exception
+		if errors.As(err, &exception) {
 			return fmt.Errorf("exception [%d] %s %s", exception.Code, exception.Message, exception.StackTrace)
 		}
 		return err

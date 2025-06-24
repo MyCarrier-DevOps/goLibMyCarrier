@@ -7,16 +7,22 @@ import (
 
 func TestVaultLoadConfig(t *testing.T) {
 	// Set environment variables for testing
-	os.Setenv("VAULT_ADDRESS", "http://localhost:8200")
-	os.Setenv("VAULT_LOCAL_ROLE_ID", "test_role_id")
-	os.Setenv("VAULT_LOCAL_SECRET_ID", "test_secret_id")
+	if err := os.Setenv("VAULT_ADDRESS", "http://localhost:8200"); err != nil {
+		t.Fatalf("Failed to set VAULT_ADDRESS: %v", err.Error())
+	}
+	if err := os.Setenv("VAULT_LOCAL_ROLE_ID", "test_role_id"); err != nil {
+		t.Fatalf("Failed to set VAULT_LOCAL_ROLE_ID: %v", err.Error())
+	}
+	if err := os.Setenv("VAULT_LOCAL_SECRET_ID", "test_secret_id"); err != nil {
+		t.Fatalf("Failed to set VAULT_LOCAL_SECRET_ID: %v", err.Error())
+	}
 
 	// Call the function
 	config, err := VaultLoadConfig()
 
 	// Assert that there is no error
 	if err != nil {
-		t.Errorf("VaultLoadConfig() error = %v", err)
+		t.Errorf("VaultLoadConfig() error = %v", err.Error())
 		return
 	}
 
@@ -36,9 +42,15 @@ func TestVaultLoadConfig(t *testing.T) {
 	}
 
 	// Unset environment variables after testing
-	os.Unsetenv("VAULT_ADDRESS")
-	os.Unsetenv("VAULT_LOCAL_ROLE_ID")
-	os.Unsetenv("VAULT_LOCAL_SECRET_ID")
+	if err := os.Unsetenv("VAULT_ADDRESS"); err != nil {
+		t.Errorf("Failed to unset VAULT_ADDRESS: %v", err.Error())
+	}
+	if err := os.Unsetenv("VAULT_LOCAL_ROLE_ID"); err != nil {
+		t.Errorf("Failed to unset VAULT_LOCAL_ROLE_ID: %v", err.Error())
+	}
+	if err := os.Unsetenv("VAULT_LOCAL_SECRET_ID"); err != nil {
+		t.Errorf("Failed to unset VAULT_LOCAL_SECRET_ID: %v", err.Error())
+	}
 }
 
 func TestVaultLoadConfig_NoAddress(t *testing.T) {
@@ -73,7 +85,7 @@ func TestVaultValidateConfig(t *testing.T) {
 
 	// Assert that there is no error
 	if err != nil {
-		t.Errorf("VaultValidateConfig() error = %v", err)
+		t.Errorf("VaultValidateConfig() error = %v", err.Error())
 	}
 }
 

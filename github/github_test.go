@@ -9,13 +9,25 @@ import (
 
 func TestGithubLoadConfig_Success(t *testing.T) {
 	// Set environment variables
-	os.Setenv("GITHUB_APP_PRIVATE_KEY", "test-private-key")
-	os.Setenv("GITHUB_APP_ID", "12345")
-	os.Setenv("GITHUB_APP_INSTALLATION_ID", "67890")
+	if err := os.Setenv("GITHUB_APP_PRIVATE_KEY", "test-private-key"); err != nil {
+		t.Fatalf("Failed to set GITHUB_APP_PRIVATE_KEY: %v", err.Error())
+	}
+	if err := os.Setenv("GITHUB_APP_ID", "12345"); err != nil {
+		t.Fatalf("Failed to set GITHUB_APP_ID: %v", err.Error())
+	}
+	if err := os.Setenv("GITHUB_APP_INSTALLATION_ID", "67890"); err != nil {
+		t.Fatalf("Failed to set GITHUB_APP_INSTALLATION_ID: %v", err.Error())
+	}
 	defer func() {
-		os.Unsetenv("GITHUB_APP_PRIVATE_KEY")
-		os.Unsetenv("GITHUB_APP_ID")
-		os.Unsetenv("GITHUB_APP_INSTALLATION_ID")
+		if err := os.Unsetenv("GITHUB_APP_PRIVATE_KEY"); err != nil {
+			t.Errorf("Failed to unset GITHUB_APP_PRIVATE_KEY: %v", err.Error())
+		}
+		if err := os.Unsetenv("GITHUB_APP_ID"); err != nil {
+			t.Errorf("Failed to unset GITHUB_APP_ID: %v", err.Error())
+		}
+		if err := os.Unsetenv("GITHUB_APP_INSTALLATION_ID"); err != nil {
+			t.Errorf("Failed to unset GITHUB_APP_INSTALLATION_ID: %v", err.Error())
+		}
 	}()
 
 	config, err := GithubLoadConfig()
@@ -28,9 +40,15 @@ func TestGithubLoadConfig_Success(t *testing.T) {
 
 func TestGithubLoadConfig_MissingEnvVars(t *testing.T) {
 	// Ensure environment variables are not set
-	os.Unsetenv("GITHUB_APP_PRIVATE_KEY")
-	os.Unsetenv("GITHUB_APP_ID")
-	os.Unsetenv("GITHUB_APP_INSTALLATION_ID")
+	if err := os.Unsetenv("GITHUB_APP_PRIVATE_KEY"); err != nil {
+		t.Errorf("Failed to unset GITHUB_APP_PRIVATE_KEY: %v", err)
+	}
+	if err := os.Unsetenv("GITHUB_APP_ID"); err != nil {
+		t.Errorf("Failed to unset GITHUB_APP_ID: %v", err)
+	}
+	if err := os.Unsetenv("GITHUB_APP_INSTALLATION_ID"); err != nil {
+		t.Errorf("Failed to unset GITHUB_APP_INSTALLATION_ID: %v", err)
+	}
 
 	config, err := GithubLoadConfig()
 	assert.Error(t, err)

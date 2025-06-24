@@ -23,13 +23,13 @@ type VaultConfig struct {
 func VaultLoadConfig() (*VaultConfig, error) {
 	// Bind environment variables
 	if err := viper.BindEnv("vaultaddress", "VAULT_ADDRESS"); err != nil {
-		return nil, fmt.Errorf("error binding environment variable VAULT_ADDRESS: %v", err)
+		return nil, fmt.Errorf("error binding environment variable VAULT_ADDRESS: %w", err)
 	}
 	if err := viper.BindEnv("local.role_id", "VAULT_LOCAL_ROLE_ID"); err != nil {
-		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_ROLE_ID: %v", err)
+		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_ROLE_ID: %w", err)
 	}
 	if err := viper.BindEnv("local.secret_id", "VAULT_LOCAL_SECRET_ID"); err != nil {
-		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_SECRET_ID: %v", err)
+		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_SECRET_ID: %w", err)
 	}
 
 	// Read environment variables
@@ -39,7 +39,7 @@ func VaultLoadConfig() (*VaultConfig, error) {
 
 	// Unmarshal environment variables into the Config struct
 	if err := viper.Unmarshal(&config); err != nil {
-		return nil, fmt.Errorf("unable to decode into struct, %v", err)
+		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
 	// Validate the configuration
@@ -62,7 +62,7 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 	// Load the configuration
 	config, err := VaultLoadConfig()
 	if err != nil {
-		return nil, fmt.Errorf("unable to load config, %v", err)
+		return nil, fmt.Errorf("unable to load config, %w", err)
 	}
 
 	// prepare a client with the given base address
@@ -71,7 +71,7 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 		vault.WithRequestTimeout(30*time.Second),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error configuring vault, %v", err)
+		return nil, fmt.Errorf("error configuring vault, %w", err)
 	}
 
 	// Load local configuration if needed to authenticate
@@ -85,14 +85,14 @@ func VaultClient(ctx context.Context) (*vault.Client, error) {
 			})
 		if err != nil {
 			// Return an error if authentication fails
-			return nil, fmt.Errorf("error authenticating with vault, %v", err)
+			return nil, fmt.Errorf("error authenticating with vault, %w", err)
 		}
 		clientToken := resp.Auth.ClientToken
 		// Set the client token for future requests
 		err = client.SetToken(clientToken)
 		if err != nil {
 			// Return an error if setting the token fails
-			return nil, fmt.Errorf("error retrieving token %v", err)
+			return nil, fmt.Errorf("error retrieving token %w", err)
 		}
 	}
 	return client, nil
@@ -107,13 +107,17 @@ func GetKVSecret(ctx context.Context, client *vault.Client, path string, mount s
 	)
 	if err != nil {
 		// Return an error if reading the secret fails
-		return nil, fmt.Errorf("error reading secret, %v", err)
+		return nil, fmt.Errorf("error reading secret, %w", err)
 	}
 	// Return the secret data
 	return secret.Data.Data, nil
 }
 
-func GetAzureDynamicCredentials(ctx context.Context, client *vault.Client, azure_role string) (map[string]interface{}, error) {
+func GetAzureDynamicCredentials(
+	ctx context.Context,
+	client *vault.Client,
+	azure_role string,
+) (map[string]interface{}, error) {
 	// Read dynamic credentials from Vault's Azure secrets engine
 	secret, err := client.Secrets.AzureRequestServicePrincipalCredentials(
 		ctx,
@@ -122,7 +126,7 @@ func GetAzureDynamicCredentials(ctx context.Context, client *vault.Client, azure
 	)
 	if err != nil {
 		// Return an error if reading the secret fails
-		return nil, fmt.Errorf("error reading secret, %v", err)
+		return nil, fmt.Errorf("error reading secret, %w", err)
 	}
 	// Return the secret data
 	return secret.Data, nil

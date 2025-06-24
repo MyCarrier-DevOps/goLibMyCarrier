@@ -25,7 +25,7 @@ func main() {
     // Initialize Zap logger
     logger, err := otel.InitZapLogger()
     if err != nil {
-        log.Fatalf("failed to initialize logger: %v", err)
+        log.Fatalf("failed to initialize logger: %v", err.Error())
     }
     defer logger.Sync() // flushes buffer, if any
 
@@ -44,7 +44,7 @@ func main() {
 
     // Start the server
     if err := r.Run(":8080"); err != nil {
-        log.Fatalf("failed to run server: %v", err)
+        log.Fatalf("failed to run server: %v", err.Error())
     }
 }
 ```

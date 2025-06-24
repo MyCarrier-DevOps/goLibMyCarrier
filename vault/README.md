@@ -24,12 +24,12 @@ func main() {
 
   vaultClient, err := vault.VaultClient(ctx)
 	if err != nil {
-		log.Fatal("Error generating vault client: %s", err)
+		log.Fatal("Error generating vault client: %w", err)
 	}
 
 	secretData, err := vault.getKVSecret(ctx, vaultClient, "some/secret/path", "SomeMountPoint")
 	if err != nil {
-		log.Fatal("Error reading secret: %s", err)
+		log.Fatal("Error reading secret: %w", err)
 	}
 	if secretData == nil {
 		log.Fatal("Secret data is nil")
