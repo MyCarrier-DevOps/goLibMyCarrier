@@ -13,11 +13,12 @@
 -   **`logger`**: Provides a pre-configured logger using `go.uber.org/zap`.
 -   **`otel`**: Integrates with OpenTelemetry for distributed tracing and logging.
 -   **`vault`**: Provides utilities to interact with HashiCorp Vault.
+-   **`yaml`**: Provides utilities to read and write yaml files.
 
 ## Installation
 
 To install `goLibMyCarrier`, use the following Go command:
 
 ```bash
-go get -u github.com/MyCarrier-DevOps/goLibMyCarrier
+go get -u github.com/MyCarrier-DevOps/goLibMyCarrier/<module>
 ```
