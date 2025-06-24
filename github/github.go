@@ -30,13 +30,13 @@ func GithubLoadConfig() (*GithubConfig, error) {
 	// Load the configuration from environment variables or a config file
 	viper.SetEnvPrefix("GITHUB")
 	if err := viper.BindEnv("pem", "GITHUB_APP_PRIVATE_KEY"); err != nil {
-		return nil, fmt.Errorf("error binding env GITHUB_APP_PRIVATE_KEY: %v", err.Error())
+		return nil, fmt.Errorf("error binding env GITHUB_APP_PRIVATE_KEY: %w", err)
 	}
 	if err := viper.BindEnv("app_id", "GITHUB_APP_ID"); err != nil {
-		return nil, fmt.Errorf("error binding env GITHUB_APP_ID: %v", err.Error())
+		return nil, fmt.Errorf("error binding env GITHUB_APP_ID: %w", err)
 	}
 	if err := viper.BindEnv("install_id", "GITHUB_APP_INSTALLATION_ID"); err != nil {
-		return nil, fmt.Errorf("error binding env GITHUB_APP_INSTALLATION_ID: %v", err.Error())
+		return nil, fmt.Errorf("error binding env GITHUB_APP_INSTALLATION_ID: %w", err)
 	}
 
 	// Read environment variables
@@ -46,7 +46,7 @@ func GithubLoadConfig() (*GithubConfig, error) {
 
 	// Unmarshal environment variables into the Config struct
 	if err := viper.Unmarshal(&GithubConfig); err != nil {
-		return nil, fmt.Errorf("unable to decode into struct, %v", err.Error())
+		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
 	err := validateConfig(&GithubConfig)

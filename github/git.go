@@ -59,7 +59,7 @@ func CloneRepository(session GithubSessionInterface,
 	}
 	repo, err := git.PlainClone(workdir, false, gitCloneOptions)
 	if err != nil {
-		return nil, fmt.Errorf("error cloning repository: %v", err.Error())
+		return nil, fmt.Errorf("error cloning repository: %w", err)
 	}
 	return repo, nil
 }

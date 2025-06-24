@@ -36,22 +36,22 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 
 	// Bind environment variables
 	if err := viper.BindEnv("chhostname", "CLICKHOUSE_HOSTNAME"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chhostname: %v", err.Error())
+		return nil, fmt.Errorf("failed to bind environment variable for chhostname: %w", err)
 	}
 	if err := viper.BindEnv("chusername", "CLICKHOUSE_USERNAME"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chusername: %v", err.Error())
+		return nil, fmt.Errorf("failed to bind environment variable for chusername: %w", err)
 	}
 	if err := viper.BindEnv("chpassword", "CLICKHOUSE_PASSWORD"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chpassword: %v", err.Error())
+		return nil, fmt.Errorf("failed to bind environment variable for chpassword: %w", err)
 	}
 	if err := viper.BindEnv("chdatabase", "CLICKHOUSE_DATABASE"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chdatabase: %v", err.Error())
+		return nil, fmt.Errorf("failed to bind environment variable for chdatabase: %w", err)
 	}
 	if err := viper.BindEnv("chskipverify", "CLICKHOUSE_SKIP_VERIFY"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chskipverify: %v", err.Error())
+		return nil, fmt.Errorf("failed to bind environment variable for chskipverify: %w", err)
 	}
 	if err := viper.BindEnv("chport", "CLICKHOUSE_PORT"); err != nil {
-		return nil, fmt.Errorf("failed to bind environment variable for chport: %v", err.Error())
+		return nil, fmt.Errorf("failed to bind environment variable for chport: %w", err)
 	}
 
 	// Read environment variables
@@ -61,7 +61,7 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 
 	// Unmarshal environment variables into the Config struct
 	if err := viper.Unmarshal(&ClickhouseConfig); err != nil {
-		return nil, fmt.Errorf("unable to decode into struct, %v", err.Error())
+		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
 	// Validate the configuration
@@ -134,7 +134,7 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, context contex
 		})
 	)
 	if err != nil {
-		return fmt.Errorf("error connecting to ClickHouse: %v", err.Error())
+		return fmt.Errorf("error connecting to ClickHouse: %w", err)
 	}
 
 	if err := conn.Ping(ctx); err != nil {

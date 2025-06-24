@@ -26,25 +26,25 @@ type KafkaConfig struct {
 func LoadConfig() (*KafkaConfig, error) {
 	// Bind environment variables
 	if err := viper.BindEnv("address", "KAFKA_ADDRESS"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_ADDRESS: %v", err.Error())
+		return nil, fmt.Errorf("error binding KAFKA_ADDRESS: %w", err)
 	}
 	if err := viper.BindEnv("topic", "KAFKA_TOPIC"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_TOPIC: %v", err.Error())
+		return nil, fmt.Errorf("error binding KAFKA_TOPIC: %w", err)
 	}
 	if err := viper.BindEnv("username", "KAFKA_USERNAME"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_USERNAME: %v", err.Error())
+		return nil, fmt.Errorf("error binding KAFKA_USERNAME: %w", err)
 	}
 	if err := viper.BindEnv("password", "KAFKA_PASSWORD"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_PASSWORD: %v", err.Error())
+		return nil, fmt.Errorf("error binding KAFKA_PASSWORD: %w", err)
 	}
 	if err := viper.BindEnv("groupid", "KAFKA_GROUPID"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_GROUPID: %v", err.Error())
+		return nil, fmt.Errorf("error binding KAFKA_GROUPID: %w", err)
 	}
 	if err := viper.BindEnv("partition", "KAFKA_PARTITION"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_PARTITION: %v", err.Error())
+		return nil, fmt.Errorf("error binding KAFKA_PARTITION: %w", err)
 	}
 	if err := viper.BindEnv("insecure_skip_verify", "KAFKA_INSECURE_SKIP_VERIFY"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_INSECURE_SKIP_VERIFY: %v", err.Error())
+		return nil, fmt.Errorf("error binding KAFKA_INSECURE_SKIP_VERIFY: %w", err)
 	}
 
 	// Read environment variables
@@ -54,7 +54,7 @@ func LoadConfig() (*KafkaConfig, error) {
 
 	// Unmarshal environment variables into the Config struct
 	if err := viper.Unmarshal(&kafkaConfig); err != nil {
-		return nil, fmt.Errorf("unable to decode into struct, %v", err.Error())
+		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
 	// Validate the configuration
@@ -126,7 +126,7 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 	if kafkacfg.GroupID == "" {
 		partition, err := strconv.Atoi(kafkacfg.Partition)
 		if err != nil {
-			return nil, fmt.Errorf("invalid partition value: %v", err.Error())
+			return nil, fmt.Errorf("invalid partition value: %w", err)
 		}
 		readerConfig.Partition = partition
 	}
@@ -140,7 +140,7 @@ func InitializeKafkaWriter(kafkacfg *KafkaConfig) (*kafka.Writer, error) {
 	// Initialize Kafka writer
 	mechanism, err := scram.Mechanism(scram.SHA512, kafkacfg.Username, kafkacfg.Password)
 	if err != nil {
-		return nil, fmt.Errorf("error creating SASL mechanism: %v", err.Error())
+		return nil, fmt.Errorf("error creating SASL mechanism: %w", err)
 	}
 
 	dialer := &kafka.Dialer{
