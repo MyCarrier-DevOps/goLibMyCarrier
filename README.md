@@ -20,5 +20,9 @@
 To install `goLibMyCarrier`, use the following Go command:
 
 ```bash
-go get -u github.com/MyCarrier-DevOps/goLibMyCarrier/<module>
+go get -u github.com/MyCarrier-DevOps/goLibMyCarrier/<module>@<version>
+
+# Example
+go get -u github.com/MyCarrier-DevOps/goLibMyCarrier/kafka@v1.3.6
+
 ```
