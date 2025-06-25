@@ -1,0 +1,31 @@
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - .github/*
+      
+name: Create Release
+
+jobs:
+  build:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.ref }}
+        fetch-depth: 0
+    - name: Install GitVersion
+      uses: gittools/actions/gitversion/setup@v3.1.11
+      with:
+        versionSpec: '6.0.x'
+    - name: Calculate Version
+      id: calculate_version # step id used as reference for output values
+      uses: gittools/actions/gitversion/execute@v3.1.11
+      with:
+        useConfigFile: true
+        disableCache: true
+        configFilePath: .github/GitVersion.yml
