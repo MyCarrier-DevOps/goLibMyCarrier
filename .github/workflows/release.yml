@@ -28,4 +28,4 @@ jobs:
       with:
         useConfigFile: true
         disableCache: true
-        configFilePath: .github/GitVersion.yml
+        configFilePath: .github/Gitversion.yml
