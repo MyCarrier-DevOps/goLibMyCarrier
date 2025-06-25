@@ -32,6 +32,9 @@ jobs:
         configFilePath: .github/Gitversion.yml
     - name: Create Tags
       run: |
+        git config user.name "$GITHUB_ACTOR"
+        git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+
         git tag -a auth/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release auth/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a github/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release github/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
