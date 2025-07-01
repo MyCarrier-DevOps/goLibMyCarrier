@@ -5,7 +5,7 @@ go 1.24.2
 require (
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/golang-jwt/jwt v3.2.2+incompatible
-	github.com/google/go-github/v69 v69.2.0
+	github.com/google/go-github/v73 v73.0.0
 	github.com/jferrl/go-githubauth v1.2.0
 	github.com/spf13/viper v1.20.1
 	github.com/stretchr/testify v1.10.0
@@ -26,6 +26,7 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.2.1 // indirect
 	github.com/golang-jwt/jwt/v5 v5.2.1 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
+	github.com/google/go-github/v69 v69.2.0 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
 	github.com/kevinburke/ssh_config v1.2.0 // indirect
