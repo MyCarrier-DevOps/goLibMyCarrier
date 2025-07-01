@@ -10,26 +10,55 @@ import (
 	"github.com/spf13/viper"
 )
 
-type LocalConfig struct {
+// VaultClientInterface defines the interface for Vault operations
+type VaultClientInterface interface {
+	GetKVSecret(ctx context.Context, path string, mount string) (map[string]interface{}, error)
+	GetAzureDynamicCredentials(ctx context.Context, azureRole string) (map[string]interface{}, error)
+	SetToken(token string) error
+}
+
+// ConfigLoader interface allows for dependency injection of configuration loading
+type ConfigLoader interface {
+	LoadConfig() (*VaultConfig, error)
+}
+
+// VaultAuthenticator interface for authentication strategies
+type VaultAuthenticator interface {
+	Authenticate(ctx context.Context, client *vault.Client, config *VaultConfig) error
+}
+
+type Credentials struct {
 	RoleID   string `mapstructure:"role_id"`
 	SecretID string `mapstructure:"secret_id"`
 }
 
 type VaultConfig struct {
 	VaultAddress string      `mapstructure:"vaultaddress"`
-	Local        LocalConfig `mapstructure:"local"`
+	Credentials  Credentials `mapstructure:"credentials"`
 }
 
-func VaultLoadConfig() (*VaultConfig, error) {
+// VaultClient wraps the actual Vault client and implements VaultClientInterface
+type VaultClient struct {
+	client *vault.Client
+}
+
+// AppRoleAuthenticator implements authentication using AppRole
+type AppRoleAuthenticator struct{}
+
+// ViperConfigLoader implements configuration loading using Viper
+type ViperConfigLoader struct{}
+
+// ViperConfigLoader implements ConfigLoader interface
+func (v *ViperConfigLoader) LoadConfig() (*VaultConfig, error) {
 	// Bind environment variables
 	if err := viper.BindEnv("vaultaddress", "VAULT_ADDRESS"); err != nil {
 		return nil, fmt.Errorf("error binding environment variable VAULT_ADDRESS: %w", err)
 	}
-	if err := viper.BindEnv("local.role_id", "VAULT_LOCAL_ROLE_ID"); err != nil {
-		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_ROLE_ID: %w", err)
+	if err := viper.BindEnv("credentials.role_id", "VAULT_ROLE_ID"); err != nil {
+		return nil, fmt.Errorf("error binding environment variable VAULT_ROLE_ID: %w", err)
 	}
-	if err := viper.BindEnv("local.secret_id", "VAULT_LOCAL_SECRET_ID"); err != nil {
-		return nil, fmt.Errorf("error binding environment variable VAULT_LOCAL_SECRET_ID: %w", err)
+	if err := viper.BindEnv("credentials.secret_id", "VAULT_SECRET_ID"); err != nil {
+		return nil, fmt.Errorf("error binding environment variable VAULT_SECRET_ID: %w", err)
 	}
 
 	// Read environment variables
@@ -50,6 +79,12 @@ func VaultLoadConfig() (*VaultConfig, error) {
 	return &config, nil
 }
 
+// VaultLoadConfig is a convenience function that uses the default ViperConfigLoader
+func VaultLoadConfig() (*VaultConfig, error) {
+	loader := &ViperConfigLoader{}
+	return loader.LoadConfig()
+}
+
 // validateConfig validates the loaded configuration.
 func VaultValidateConfig(config *VaultConfig) error {
 	if config.VaultAddress == "" {
@@ -58,59 +93,117 @@ func VaultValidateConfig(config *VaultConfig) error {
 	return nil
 }
 
-func VaultClient(ctx context.Context) (*vault.Client, error) {
-	// Load the configuration
-	config, err := VaultLoadConfig()
-	if err != nil {
-		return nil, fmt.Errorf("unable to load config, %w", err)
+// AppRoleAuthenticator implements VaultAuthenticator interface
+func (a *AppRoleAuthenticator) Authenticate(ctx context.Context, client *vault.Client, config *VaultConfig) error {
+	if config.Credentials.RoleID == "" || config.Credentials.SecretID == "" {
+		return nil // No credentials provided, skip authentication
 	}
 
+	// Authenticate with Vault using AppRole
+	resp, err := client.Auth.AppRoleLogin(
+		ctx,
+		schema.AppRoleLoginRequest{
+			RoleId:   config.Credentials.RoleID,
+			SecretId: config.Credentials.SecretID,
+		})
+	if err != nil {
+		return fmt.Errorf("error authenticating with vault: %w", err)
+	}
+
+	clientToken := resp.Auth.ClientToken
+	// Set the client token for future requests
+	if err := client.SetToken(clientToken); err != nil {
+		return fmt.Errorf("error setting token: %w", err)
+	}
+
+	return nil
+}
+
+// NewVaultClient creates a new Vault client with the given configuration and authenticator
+func NewVaultClient(ctx context.Context, config *VaultConfig, authenticator VaultAuthenticator) (*VaultClient, error) {
 	// prepare a client with the given base address
 	client, err := vault.New(
 		vault.WithAddress(config.VaultAddress),
 		vault.WithRequestTimeout(30*time.Second),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error configuring vault, %w", err)
+		return nil, fmt.Errorf("error configuring vault: %w", err)
 	}
 
-	// Load local configuration if needed to authenticate
-	if config.Local.RoleID != "" && config.Local.SecretID != "" {
-		// Authenticate with Vault using AppRole
-		resp, err := client.Auth.AppRoleLogin(
-			ctx,
-			schema.AppRoleLoginRequest{
-				RoleId:   config.Local.RoleID,
-				SecretId: config.Local.SecretID,
-			})
-		if err != nil {
-			// Return an error if authentication fails
-			return nil, fmt.Errorf("error authenticating with vault, %w", err)
-		}
-		clientToken := resp.Auth.ClientToken
-		// Set the client token for future requests
-		err = client.SetToken(clientToken)
-		if err != nil {
-			// Return an error if setting the token fails
-			return nil, fmt.Errorf("error retrieving token %w", err)
+	// Authenticate if authenticator is provided
+	if authenticator != nil {
+		if err := authenticator.Authenticate(ctx, client, config); err != nil {
+			return nil, err
 		}
 	}
-	return client, nil
+
+	return &VaultClient{client: client}, nil
 }
 
-func GetKVSecret(ctx context.Context, client *vault.Client, path string, mount string) (map[string]interface{}, error) {
+// CreateVaultClient is a convenience function that uses AppRole authentication
+func CreateVaultClient(ctx context.Context, config *VaultConfig) (*VaultClient, error) {
+	authenticator := &AppRoleAuthenticator{}
+	return NewVaultClient(ctx, config, authenticator)
+}
+
+// VaultClient methods implementing VaultClientInterface
+func (vc *VaultClient) GetKVSecret(ctx context.Context, path string, mount string) (map[string]interface{}, error) {
 	// Read a secret from Vault's KV v2 secrets engine
-	secret, err := client.Secrets.KvV2Read(
+	secret, err := vc.client.Secrets.KvV2Read(
 		ctx,
 		path,
 		vault.WithMountPath(mount),
 	)
 	if err != nil {
-		// Return an error if reading the secret fails
-		return nil, fmt.Errorf("error reading secret, %w", err)
+		return nil, fmt.Errorf("error reading secret: %w", err)
 	}
-	// Return the secret data
 	return secret.Data.Data, nil
+}
+
+func (vc *VaultClient) GetKVSecretList(ctx context.Context, path string, mount string) ([]string, error) {
+	// Read a secret from Vault's KV v2 secrets engine
+	secret, err := vc.client.Secrets.KvV2List(
+		ctx,
+		path,
+		vault.WithMountPath(mount),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error reading secret: %w", err)
+	}
+	return secret.Data.Keys, nil
+}
+
+func (vc *VaultClient) GetAzureDynamicCredentials(ctx context.Context, azureRole string) (map[string]interface{}, error) {
+	// Read dynamic credentials from Vault's Azure secrets engine
+	secret, err := vc.client.Secrets.AzureRequestServicePrincipalCredentials(
+		ctx,
+		azureRole,
+		vault.WithMountPath("azure"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error reading secret: %w", err)
+	}
+	return secret.Data, nil
+}
+
+func (vc *VaultClient) SetToken(token string) error {
+	return vc.client.SetToken(token)
+}
+
+// Backward compatibility functions (deprecated, use the new interface-based approach)
+
+// LegacyVaultClient maintains backward compatibility with the old function signature
+func LegacyVaultClient(ctx context.Context, config *VaultConfig) (*vault.Client, error) {
+	vaultClient, err := CreateVaultClient(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return vaultClient.client, nil
+}
+
+func GetKVSecret(ctx context.Context, client *vault.Client, path string, mount string) (map[string]interface{}, error) {
+	vc := &VaultClient{client: client}
+	return vc.GetKVSecret(ctx, path, mount)
 }
 
 func GetAzureDynamicCredentials(
@@ -118,16 +211,6 @@ func GetAzureDynamicCredentials(
 	client *vault.Client,
 	azure_role string,
 ) (map[string]interface{}, error) {
-	// Read dynamic credentials from Vault's Azure secrets engine
-	secret, err := client.Secrets.AzureRequestServicePrincipalCredentials(
-		ctx,
-		azure_role,
-		vault.WithMountPath("azure"),
-	)
-	if err != nil {
-		// Return an error if reading the secret fails
-		return nil, fmt.Errorf("error reading secret, %w", err)
-	}
-	// Return the secret data
-	return secret.Data, nil
+	vc := &VaultClient{client: client}
+	return vc.GetAzureDynamicCredentials(ctx, azure_role)
 }
