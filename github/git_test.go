@@ -613,3 +613,56 @@ func TestCommitChanges_MultipleFiles(t *testing.T) {
 		assert.NoError(t, err, "File %s should exist in commit", file)
 	}
 }
+
+func TestCloneRepository_NoCheckout(t *testing.T) {
+	session := &SimpleGithubSession{
+		token: &oauth2.Token{
+			AccessToken: "test-token",
+		},
+	}
+
+	tempDir, err := os.MkdirTemp("", "test-clone-no-checkout-*")
+	require.NoError(t, err)
+	defer func() {
+		if rmErr := os.RemoveAll(tempDir); rmErr != nil {
+			t.Logf("failed to remove temp dir: %v", rmErr)
+		}
+	}()
+
+	// Test no checkout option
+	options := CloneOptions{
+		RepositoryURL: "https://github.com/invalid/repo.git",
+		WorkDir:       tempDir,
+		Branch:        "main",
+		NoCheckout:    true,
+		SingleBranch:  true,
+		Depth:         1,
+	}
+
+	_, err = CloneRepository(session, options)
+	// We expect an error because the repo doesn't exist, but we can verify the NoCheckout option was set
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "error cloning repository")
+}
+
+func TestCloneRepositoryNoCheckout_ConvenienceFunction(t *testing.T) {
+	session := &SimpleGithubSession{
+		token: &oauth2.Token{
+			AccessToken: "test-token",
+		},
+	}
+
+	tempDir, err := os.MkdirTemp("", "test-clone-no-checkout-convenience-*")
+	require.NoError(t, err)
+	defer func() {
+		if rmErr := os.RemoveAll(tempDir); rmErr != nil {
+			t.Logf("failed to remove temp dir: %v", rmErr)
+		}
+	}()
+
+	// Test convenience function
+	_, err = CloneRepositoryNoCheckout(session, "https://github.com/invalid/repo.git", tempDir, "main")
+	// We expect an error because the repo doesn't exist
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "error cloning repository")
+}

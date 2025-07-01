@@ -39,6 +39,8 @@ type CloneOptions struct {
 	SingleBranch bool
 	// Clone depth (defaults to 1 for shallow clone)
 	Depth int
+	// No checkout - clone without checking out files (defaults to false)
+	NoCheckout bool
 }
 
 // CheckRunOptions defines the configuration for creating check runs
@@ -114,6 +116,7 @@ func CloneRepository(session GithubSessionInterface, options CloneOptions) (*git
 			SingleBranch: options.SingleBranch,
 			Depth:        options.Depth,
 			Auth:         options.Auth,
+			NoCheckout:   options.NoCheckout,
 		}
 
 		// Set branch reference if specified
@@ -451,6 +454,20 @@ func CloneRepositorySimple(session GithubSessionInterface,
 		Branch:        branch,
 		SingleBranch:  true,
 		Depth:         1,
+	}
+	return CloneRepository(session, options)
+}
+
+// CloneRepositoryNoCheckout is a convenience function that clones a repository without checking out files
+func CloneRepositoryNoCheckout(session GithubSessionInterface,
+	repositoryURL, workDir, branch string) (*git.Repository, error) {
+	options := CloneOptions{
+		RepositoryURL: repositoryURL,
+		WorkDir:       workDir,
+		Branch:        branch,
+		SingleBranch:  true,
+		Depth:         1,
+		NoCheckout:    true,
 	}
 	return CloneRepository(session, options)
 }

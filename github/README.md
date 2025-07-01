@@ -68,6 +68,22 @@ if err != nil {
 }
 ```
 
+### No-Checkout Repository Cloning
+
+```go
+// Clone without checking out files (useful for CI/CD operations that only need repository metadata)
+repo, err := github_handler.CloneRepositoryNoCheckout(
+    session,
+    "https://github.com/org/repo.git",
+    "/local/path",
+    "main",
+)
+if err != nil {
+    log.Fatalf("Failed to clone repository: %v", err)
+}
+// Repository is cloned but no files are checked out to the working directory
+```
+
 ### Advanced Repository Cloning
 
 ```go
@@ -78,6 +94,7 @@ options := github_handler.CloneOptions{
     Branch:        "feature-branch",
     SingleBranch:  true,
     Depth:         1,
+    NoCheckout:    false, // Set to true to skip file checkout
     Progress:      os.Stdout,
 }
 
@@ -295,6 +312,7 @@ type CloneOptions struct {
     Progress        *os.File            // Progress output destination (default: os.Stdout)
     SingleBranch    bool                // Clone only the specified branch (default: true)
     Depth           int                 // Clone depth for shallow clones (default: 1)
+    NoCheckout      bool                // Skip checking out files to working directory (default: false)
 }
 ```
 
@@ -364,6 +382,8 @@ type CheckRunOptions struct {
 - Use shallow clones (depth: 1) for CI/CD operations to save bandwidth
 - Specify branches explicitly to avoid unexpected behavior
 - Clean up cloned repositories when done to save disk space
+- Use `NoCheckout: true` for operations that only need repository metadata (e.g., analyzing commit history, checking branch information)
+- Consider no-checkout clones for performance-critical operations where file content is not needed
 
 ### Commit Management
 - Use descriptive commit messages following conventional commit format
