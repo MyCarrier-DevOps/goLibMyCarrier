@@ -13,6 +13,7 @@ import (
 // VaultClientInterface defines the interface for Vault operations
 type VaultClientInterface interface {
 	GetKVSecret(ctx context.Context, path string, mount string) (map[string]interface{}, error)
+	GetKVSecretList(ctx context.Context, path string, mount string) ([]string, error)
 	GetAzureDynamicCredentials(ctx context.Context, azureRole string) (map[string]interface{}, error)
 	SetToken(token string) error
 }
@@ -173,7 +174,10 @@ func (vc *VaultClient) GetKVSecretList(ctx context.Context, path string, mount s
 	return secret.Data.Keys, nil
 }
 
-func (vc *VaultClient) GetAzureDynamicCredentials(ctx context.Context, azureRole string) (map[string]interface{}, error) {
+func (vc *VaultClient) GetAzureDynamicCredentials(
+	ctx context.Context,
+	azureRole string,
+) (map[string]interface{}, error) {
 	// Read dynamic credentials from Vault's Azure secrets engine
 	secret, err := vc.client.Secrets.AzureRequestServicePrincipalCredentials(
 		ctx,

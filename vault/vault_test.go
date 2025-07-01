@@ -21,8 +21,10 @@ func (m *MockConfigLoader) LoadConfig() (*VaultConfig, error) {
 
 type MockVaultClient struct {
 	kvSecrets        map[string]interface{}
+	kvSecretsList    []string
 	azureCredentials map[string]interface{}
 	kvError          error
+	kvListError      error
 	azureError       error
 	setTokenError    error
 }
@@ -34,7 +36,17 @@ func (m *MockVaultClient) GetKVSecret(ctx context.Context, path string, mount st
 	return m.kvSecrets, nil
 }
 
-func (m *MockVaultClient) GetAzureDynamicCredentials(ctx context.Context, azureRole string) (map[string]interface{}, error) {
+func (m *MockVaultClient) GetKVSecretList(ctx context.Context, path string, mount string) ([]string, error) {
+	if m.kvListError != nil {
+		return nil, m.kvListError
+	}
+	return m.kvSecretsList, nil
+}
+
+func (m *MockVaultClient) GetAzureDynamicCredentials(
+	ctx context.Context,
+	azureRole string,
+) (map[string]interface{}, error) {
 	if m.azureError != nil {
 		return nil, m.azureError
 	}
@@ -172,7 +184,8 @@ func TestViperConfigLoader_LoadConfig(t *testing.T) {
 	}
 
 	if config.VaultAddress != "http://localhost:8200" {
-		t.Errorf("ViperConfigLoader.LoadConfig() VaultAddress = %v, want %v", config.VaultAddress, "http://localhost:8200")
+		t.Errorf("ViperConfigLoader.LoadConfig() VaultAddress = %v, want %v",
+			config.VaultAddress, "http://localhost:8200")
 	}
 
 	// Cleanup
@@ -221,6 +234,32 @@ func TestVaultClient_GetKVSecret(t *testing.T) {
 	}
 }
 
+func TestVaultClient_GetKVSecretList(t *testing.T) {
+	mockClient := &MockVaultClient{
+		kvSecretsList: []string{"secret1", "secret2", "secret3"},
+	}
+
+	ctx := context.Background()
+	secretsList, err := mockClient.GetKVSecretList(ctx, "myapp/", "secret")
+
+	if err != nil {
+		t.Errorf("VaultClient.GetKVSecretList() error = %v", err)
+		return
+	}
+
+	expectedSecrets := []string{"secret1", "secret2", "secret3"}
+	if len(secretsList) != len(expectedSecrets) {
+		t.Errorf("VaultClient.GetKVSecretList() length = %v, want %v", len(secretsList), len(expectedSecrets))
+		return
+	}
+
+	for i, secret := range expectedSecrets {
+		if secretsList[i] != secret {
+			t.Errorf("VaultClient.GetKVSecretList() secret[%d] = %v, want %v", i, secretsList[i], secret)
+		}
+	}
+}
+
 func TestVaultClient_GetAzureDynamicCredentials(t *testing.T) {
 	mockClient := &MockVaultClient{
 		azureCredentials: map[string]interface{}{
@@ -238,11 +277,13 @@ func TestVaultClient_GetAzureDynamicCredentials(t *testing.T) {
 	}
 
 	if creds["client_id"] != "test-client-id" {
-		t.Errorf("VaultClient.GetAzureDynamicCredentials() client_id = %v, want %v", creds["client_id"], "test-client-id")
+		t.Errorf("VaultClient.GetAzureDynamicCredentials() client_id = %v, want %v",
+			creds["client_id"], "test-client-id")
 	}
 
 	if creds["client_secret"] != "test-client-secret" {
-		t.Errorf("VaultClient.GetAzureDynamicCredentials() client_secret = %v, want %v", creds["client_secret"], "test-client-secret")
+		t.Errorf("VaultClient.GetAzureDynamicCredentials() client_secret = %v, want %v",
+			creds["client_secret"], "test-client-secret")
 	}
 }
 
@@ -267,11 +308,13 @@ func TestMockConfigLoader(t *testing.T) {
 	}
 
 	if config.VaultAddress != expectedConfig.VaultAddress {
-		t.Errorf("MockConfigLoader.LoadConfig() VaultAddress = %v, want %v", config.VaultAddress, expectedConfig.VaultAddress)
+		t.Errorf("MockConfigLoader.LoadConfig() VaultAddress = %v, want %v",
+			config.VaultAddress, expectedConfig.VaultAddress)
 	}
 
 	if config.Credentials.RoleID != expectedConfig.Credentials.RoleID {
-		t.Errorf("MockConfigLoader.LoadConfig() RoleID = %v, want %v", config.Credentials.RoleID, expectedConfig.Credentials.RoleID)
+		t.Errorf("MockConfigLoader.LoadConfig() RoleID = %v, want %v",
+			config.Credentials.RoleID, expectedConfig.Credentials.RoleID)
 	}
 }
 
