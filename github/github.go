@@ -86,16 +86,6 @@ func NewGithubSession(pem, appID, installID string) (*GithubSession, error) {
 	return session, nil
 }
 
-// Get AuthToken returns the authentication token
-func (s *GithubSession) AuthToken() *oauth2.Token {
-	return s.auth
-}
-
-// Get Client returns the authenticated Github client
-func (s *GithubSession) Client() *github.Client {
-	return s.client
-}
-
 // Authenticate with Github using the provided PEM file, App ID, and Install ID
 func (s *GithubSession) authenticate() error {
 	privateKey := []byte(s.pem)
@@ -117,4 +107,126 @@ func (s *GithubSession) authenticate() error {
 	s.client = github.NewClient(httpClient)
 	s.auth = token
 	return nil
+}
+
+// PullRequestOptions contains options for creating a pull request
+type PullRequestOptions struct {
+	Title               string   `json:"title"`
+	Head                string   `json:"head"`
+	Base                string   `json:"base"`
+	Body                *string  `json:"body,omitempty"`
+	Draft               *bool    `json:"draft,omitempty"`
+	MaintainerCanModify *bool    `json:"maintainer_can_modify,omitempty"`
+	Assignees           []string `json:"assignees,omitempty"`
+	Reviewers           []string `json:"reviewers,omitempty"`
+	TeamReviewers       []string `json:"team_reviewers,omitempty"`
+	Labels              []string `json:"labels,omitempty"`
+	Milestone           *int     `json:"milestone,omitempty"`
+}
+
+// Validate validates the pull request options
+func (opts *PullRequestOptions) Validate() error {
+	if opts.Title == "" {
+		return fmt.Errorf("title is required")
+	}
+	if opts.Head == "" {
+		return fmt.Errorf("head branch is required")
+	}
+	if opts.Base == "" {
+		return fmt.Errorf("base branch is required")
+	}
+	if opts.Head == opts.Base {
+		return fmt.Errorf("head and base branches cannot be the same")
+	}
+	return nil
+}
+
+// CreatePullRequest creates a new pull request in the specified repository using the provided options
+func (s *GithubSession) CreatePullRequest(ctx context.Context, owner, repo string, opts *PullRequestOptions) (*github.PullRequest, error) {
+	if opts == nil {
+		return nil, fmt.Errorf("pull request options cannot be nil")
+	}
+
+	if err := opts.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid pull request options: %w", err)
+	}
+
+	if s.client == nil {
+		return nil, fmt.Errorf("github client is not initialized")
+	}
+
+	prRequest := &github.NewPullRequest{
+		Title:               &opts.Title,
+		Head:                &opts.Head,
+		Base:                &opts.Base,
+		Body:                opts.Body,
+		Draft:               opts.Draft,
+		MaintainerCanModify: opts.MaintainerCanModify,
+	}
+
+	pr, _, err := s.client.PullRequests.Create(ctx, owner, repo, prRequest)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pull request: %w", err)
+	}
+
+	// Add assignees if specified
+	if len(opts.Assignees) > 0 {
+		_, _, err = s.client.Issues.AddAssignees(ctx, owner, repo, pr.GetNumber(), opts.Assignees)
+		if err != nil {
+			return pr, fmt.Errorf("pull request created but failed to add assignees: %w", err)
+		}
+	}
+
+	// Add reviewers if specified
+	if len(opts.Reviewers) > 0 || len(opts.TeamReviewers) > 0 {
+		reviewersRequest := github.ReviewersRequest{
+			Reviewers:     opts.Reviewers,
+			TeamReviewers: opts.TeamReviewers,
+		}
+		_, _, err = s.client.PullRequests.RequestReviewers(ctx, owner, repo, pr.GetNumber(), reviewersRequest)
+		if err != nil {
+			return pr, fmt.Errorf("pull request created but failed to add reviewers: %w", err)
+		}
+	}
+
+	// Add labels if specified
+	if len(opts.Labels) > 0 {
+		_, _, err = s.client.Issues.AddLabelsToIssue(ctx, owner, repo, pr.GetNumber(), opts.Labels)
+		if err != nil {
+			return pr, fmt.Errorf("pull request created but failed to add labels: %w", err)
+		}
+	}
+
+	// Set milestone if specified
+	if opts.Milestone != nil {
+		issueRequest := &github.IssueRequest{
+			Milestone: opts.Milestone,
+		}
+		_, _, err = s.client.Issues.Edit(ctx, owner, repo, pr.GetNumber(), issueRequest)
+		if err != nil {
+			return pr, fmt.Errorf("pull request created but failed to set milestone: %w", err)
+		}
+	}
+
+	return pr, nil
+}
+
+// CreatePullRequestSimple creates a pull request with basic options (backward compatibility)
+func (s *GithubSession) CreatePullRequestSimple(ctx context.Context, owner, repo, title, head, base string) (*github.PullRequest, error) {
+	opts := &PullRequestOptions{
+		Title: title,
+		Head:  head,
+		Base:  base,
+	}
+	return s.CreatePullRequest(ctx, owner, repo, opts)
+}
+
+// Get AuthToken returns the authentication token
+func (s *GithubSession) AuthToken() *oauth2.Token {
+	return s.auth
+}
+
+// Get Client returns the authenticated Github client
+func (s *GithubSession) Client() *github.Client {
+	return s.client
 }

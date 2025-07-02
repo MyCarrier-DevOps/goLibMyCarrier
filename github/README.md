@@ -7,6 +7,7 @@ A comprehensive Go library for interacting with GitHub API and Git repositories 
 - **🔐 Authentication**: Seamless GitHub App authentication with automatic token management
 - **📂 Repository Operations**: Flexible repository cloning with extensive customization options
 - **💾 Commit Management**: Advanced commit operations with selective file staging and push control
+- **📝 Pull Request Management**: Extensible pull request creation with comprehensive options for automation
 - **✅ Check Runs**: Create rich GitHub check runs with annotations, actions, and detailed output
 - **🎛️ Extensible Design**: Configuration-based approach using option structs for maximum flexibility
 - **🔄 Backwards Compatibility**: Simple convenience functions for common use cases
@@ -298,6 +299,120 @@ if err != nil {
 }
 ```
 
+## 📝 Pull Request Management
+
+The library provides an extensible API for creating pull requests with comprehensive options for automation and team workflows.
+
+### Simple Pull Request Creation
+
+```go
+// Basic pull request creation (backward compatibility)
+pr, err := session.CreatePullRequestSimple(
+    ctx,
+    "myorg",
+    "myrepo",
+    "Fix authentication bug",
+    "bugfix/auth-issue",
+    "main",
+)
+if err != nil {
+    log.Fatalf("Failed to create PR: %v", err)
+}
+fmt.Printf("Created PR #%d: %s\n", pr.GetNumber(), pr.GetTitle())
+```
+
+### Advanced Pull Request with Full Options
+
+```go
+// Comprehensive pull request creation with all available options
+body := `This pull request adds comprehensive authentication improvements:
+
+## Changes
+- Fixed JWT token validation
+- Added rate limiting
+- Improved error handling
+- Added comprehensive tests
+
+## Testing
+- All existing tests pass
+- Added 15 new test cases
+- Performance benchmarks included
+
+Closes #123`
+
+opts := &github_handler.PullRequestOptions{
+    Title:               "feat: Comprehensive authentication improvements",
+    Head:                "feature/auth-improvements",
+    Base:                "develop",
+    Body:                github.Ptr(body),
+    Draft:               github.Ptr(false),
+    MaintainerCanModify: github.Ptr(true),
+    Assignees:           []string{"tech-lead", "security-reviewer"},
+    Reviewers:           []string{"senior-dev1", "senior-dev2"},
+    TeamReviewers:       []string{"security-team", "backend-team"},
+    Labels:              []string{"enhancement", "security", "high-priority"},
+    Milestone:           github.Ptr(2), // Sprint 2
+}
+
+ctx := context.Background()
+pr, err := session.CreatePullRequest(ctx, "myorg", "myrepo", opts)
+if err != nil {
+    log.Fatalf("Failed to create advanced PR: %v", err)
+}
+
+fmt.Printf("Created PR #%d with full configuration\n", pr.GetNumber())
+```
+
+### Draft Pull Request
+
+```go
+// Create a draft pull request for work-in-progress features
+opts := &github_handler.PullRequestOptions{
+    Title: "WIP: Refactor database layer",
+    Head:  "refactor/database-layer",
+    Base:  "main",
+    Body:  github.Ptr("🚧 **Work in Progress** 🚧\n\nThis PR is still under development."),
+    Draft: github.Ptr(true), // Mark as draft
+    Labels: []string{"work-in-progress", "refactoring"},
+}
+
+pr, err := session.CreatePullRequest(ctx, "myorg", "myrepo", opts)
+if err != nil {
+    log.Fatalf("Failed to create draft PR: %v", err)
+}
+```
+
+### Error Handling and Validation
+
+```go
+// Validate options before creating PR
+opts := &github_handler.PullRequestOptions{
+    Title: "My PR",
+    Head:  "feature-branch",
+    Base:  "main",
+}
+
+if err := opts.Validate(); err != nil {
+    log.Printf("Invalid PR options: %v", err)
+    return
+}
+
+// Create PR with comprehensive error handling
+pr, err := session.CreatePullRequest(ctx, "owner", "repo", opts)
+if err != nil {
+    if strings.Contains(err.Error(), "pull request options cannot be nil") {
+        log.Printf("Configuration error: %v", err)
+    } else if strings.Contains(err.Error(), "invalid pull request options") {
+        log.Printf("Validation error: %v", err)
+    } else if strings.Contains(err.Error(), "github client is not initialized") {
+        log.Printf("Authentication error: %v", err)
+    } else {
+        log.Printf("API error: %v", err)
+    }
+    return
+}
+```
+
 ## 📊 Configuration Reference
 
 ### CloneOptions Structure
@@ -336,6 +451,31 @@ type AuthorInfo struct {
 }
 ```
 
+### PullRequestOptions Structure
+
+```go
+type PullRequestOptions struct {
+    // Required fields
+    Title                 string   `json:"title"`                          // Pull request title
+    Head                  string   `json:"head"`                           // Source branch name
+    Base                  string   `json:"base"`                           // Target branch name
+    
+    // Optional content fields
+    Body                  *string  `json:"body,omitempty"`                 // Pull request description
+    Draft                 *bool    `json:"draft,omitempty"`                // Whether to create as draft
+    MaintainerCanModify   *bool    `json:"maintainer_can_modify,omitempty"` // Allow maintainer modifications
+    
+    // Assignment and review fields
+    Assignees             []string `json:"assignees,omitempty"`            // Usernames to assign
+    Reviewers             []string `json:"reviewers,omitempty"`            // Usernames to request review from
+    TeamReviewers         []string `json:"team_reviewers,omitempty"`       // Team names to request review from
+    
+    // Organization fields
+    Labels                []string `json:"labels,omitempty"`               // Label names to apply
+    Milestone             *int     `json:"milestone,omitempty"`            // Milestone ID to associate
+}
+```
+
 ### CheckRunOptions Structure
 
 ```go
@@ -363,6 +503,24 @@ type CheckRunOptions struct {
     Actions     []*github.CheckRunAction     // Action buttons
     Images      []*github.CheckRunImage      // Images to display
     Annotations []*github.CheckRunAnnotation // Code annotations
+}
+```
+
+### PullRequestOptions Structure
+
+```go
+type PullRequestOptions struct {
+    Title               string              // Required: Pull request title
+    Head                string              // Required: Source branch or commit SHA
+    Base                 string              // Required: Target branch
+    Body                 *string             // Optional: Detailed description
+    Draft                *bool               // Optional: Mark as a draft PR
+    MaintainerCanModify  *bool               // Optional: Allow maintainer to modify
+    Assignees            []string            // Optional: List of assignee usernames
+    Reviewers            []string            // Optional: List of reviewers
+    TeamReviewers        []string            // Optional: List of team reviewers
+    Labels               []string            // Optional: List of labels
+    Milestone            *int                // Optional: Milestone number
 }
 ```
 
