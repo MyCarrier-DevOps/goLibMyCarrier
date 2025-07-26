@@ -460,3 +460,394 @@ func BenchmarkWithAttributes(b *testing.B) {
 		enhanced.Info("benchmark message")
 	}
 }
+
+// Tests for OTEL_HOST_IP and OTEL_HOST_PORT functionality
+func TestOtelEndpointConfiguration_HostIP(t *testing.T) {
+	// Test OTEL_HOST_IP takes precedence over OTEL_EXPORTER_OTLP_ENDPOINT
+	os.Setenv("OTEL_HOST_IP", "192.168.1.100:4317")
+	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://fallback.example.com:4317")
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
+	defer func() {
+		os.Unsetenv("OTEL_HOST_IP")
+		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output to verify endpoint selection
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
+		useOtel:     true,
+	}
+
+	// Test the endpoint selection logic by calling initOtel
+	err := logger.initOtel()
+	if err != nil {
+		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
+	}
+
+	// Check that OTEL_HOST_IP was used (it should be in the log output)
+	output := buf.String()
+	if !strings.Contains(output, "http://192.168.1.100:4317") {
+		t.Errorf("Expected log to contain OTEL_HOST_IP endpoint, got: %s", output)
+	}
+}
+
+func TestOtelEndpointConfiguration_HostIPWithPort(t *testing.T) {
+	// Test OTEL_HOST_IP with separate OTEL_HOST_PORT
+	os.Setenv("OTEL_HOST_IP", "192.168.1.100")
+	os.Setenv("OTEL_HOST_PORT", "4318")
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
+	defer func() {
+		os.Unsetenv("OTEL_HOST_IP")
+		os.Unsetenv("OTEL_HOST_PORT")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output to verify endpoint selection
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
+		useOtel:     true,
+	}
+
+	// Test the endpoint selection logic by calling initOtel
+	err := logger.initOtel()
+	if err != nil {
+		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
+	}
+
+	// Check that OTEL_HOST_IP:OTEL_HOST_PORT was used
+	output := buf.String()
+	if !strings.Contains(output, "http://192.168.1.100:4318") {
+		t.Errorf("Expected log to contain OTEL_HOST_IP:OTEL_HOST_PORT endpoint, got: %s", output)
+	}
+}
+
+func TestOtelEndpointConfiguration_HostIPWithExistingPort(t *testing.T) {
+	// Test OTEL_HOST_IP already contains port, OTEL_HOST_PORT should be ignored
+	os.Setenv("OTEL_HOST_IP", "192.168.1.100:4317")
+	os.Setenv("OTEL_HOST_PORT", "4318")    // This should be ignored
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
+	defer func() {
+		os.Unsetenv("OTEL_HOST_IP")
+		os.Unsetenv("OTEL_HOST_PORT")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output to verify endpoint selection
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
+		useOtel:     true,
+	}
+
+	// Test the endpoint selection logic by calling initOtel
+	err := logger.initOtel()
+	if err != nil {
+		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
+	}
+
+	// Check that original port from OTEL_HOST_IP was preserved
+	output := buf.String()
+	if !strings.Contains(output, "http://192.168.1.100:4317") {
+		t.Errorf("Expected log to contain original OTEL_HOST_IP port (4317), got: %s", output)
+	}
+	if strings.Contains(output, ":4318") {
+		t.Errorf("OTEL_HOST_PORT should be ignored when OTEL_HOST_IP already contains port, got: %s", output)
+	}
+}
+
+func TestOtelEndpointConfiguration_FallbackToStandard(t *testing.T) {
+	// Test fallback to OTEL_EXPORTER_OTLP_ENDPOINT when OTEL_HOST_IP is not set
+	os.Unsetenv("OTEL_HOST_IP")
+	os.Unsetenv("OTEL_HOST_PORT")
+	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://standard.example.com:4317")
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
+	defer func() {
+		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output to verify endpoint selection
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
+		useOtel:     true,
+	}
+
+	// Test the endpoint selection logic by calling initOtel
+	err := logger.initOtel()
+	if err != nil {
+		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
+	}
+
+	// Check that OTEL_EXPORTER_OTLP_ENDPOINT was used
+	output := buf.String()
+	if !strings.Contains(output, "http://standard.example.com:4317") {
+		t.Errorf("Expected log to contain standard OTLP endpoint, got: %s", output)
+	}
+}
+
+func TestOtelEndpointConfiguration_NoEndpoint(t *testing.T) {
+	// Test behavior when neither OTEL_HOST_IP nor OTEL_EXPORTER_OTLP_ENDPOINT is set
+	os.Unsetenv("OTEL_HOST_IP")
+	os.Unsetenv("OTEL_HOST_PORT")
+	os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	defer func() {
+		// Clean up in case they were set
+		os.Unsetenv("OTEL_HOST_IP")
+		os.Unsetenv("OTEL_HOST_PORT")
+		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}()
+
+	// Capture log output to verify noop behavior
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
+		useOtel:     true,
+	}
+
+	// Test the endpoint selection logic by calling initOtel
+	err := logger.initOtel()
+	if err != nil {
+		t.Fatalf("initOtel() should not return error when no endpoint is configured, got: %v", err)
+	}
+
+	// Check that noop exporter message was logged
+	output := buf.String()
+	if !strings.Contains(output, "no OTLP endpoint configured, using noop exporter") {
+		t.Errorf("Expected log to contain noop exporter message, got: %s", output)
+	}
+
+	// Verify tracer was still created
+	if logger.tracer == nil {
+		t.Error("Tracer should be created even with noop exporter")
+	}
+}
+
+func TestOtelEndpointConfiguration_EmptyHostIP(t *testing.T) {
+	// Test behavior when OTEL_HOST_IP is set but empty
+	os.Setenv("OTEL_HOST_IP", "")
+	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://fallback.example.com:4317")
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
+	defer func() {
+		os.Unsetenv("OTEL_HOST_IP")
+		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output to verify endpoint selection
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
+		useOtel:     true,
+	}
+
+	// Test the endpoint selection logic by calling initOtel
+	err := logger.initOtel()
+	if err != nil {
+		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
+	}
+
+	// Check that fallback endpoint was used
+	output := buf.String()
+	if !strings.Contains(output, "http://fallback.example.com:4317") {
+		t.Errorf("Expected log to contain fallback endpoint when OTEL_HOST_IP is empty, got: %s", output)
+	}
+}
+
+func TestOtelEndpointConfiguration_URLFormatting(t *testing.T) {
+	tests := []struct {
+		name             string
+		hostIP           string
+		hostPort         string
+		expectedEndpoint string
+	}{
+		{
+			name:             "IP with port in hostIP",
+			hostIP:           "192.168.1.100:4317",
+			hostPort:         "",
+			expectedEndpoint: "http://192.168.1.100:4317",
+		},
+		{
+			name:             "IP without port, with separate port",
+			hostIP:           "192.168.1.100",
+			hostPort:         "4318",
+			expectedEndpoint: "http://192.168.1.100:4318",
+		},
+		{
+			name:             "IP without port, no separate port",
+			hostIP:           "192.168.1.100",
+			hostPort:         "",
+			expectedEndpoint: "http://192.168.1.100",
+		},
+		{
+			name:             "hostname with port in hostIP",
+			hostIP:           "otel-collector:4317",
+			hostPort:         "4318",
+			expectedEndpoint: "http://otel-collector:4317", // port ignored when already present
+		},
+		{
+			name:             "hostname without port, with separate port",
+			hostIP:           "otel-collector",
+			hostPort:         "4318",
+			expectedEndpoint: "http://otel-collector:4318",
+		},
+		{
+			name:             "already has http prefix",
+			hostIP:           "http://otel-collector:4317",
+			hostPort:         "",
+			expectedEndpoint: "http://otel-collector:4317",
+		},
+		{
+			name:             "already has https prefix",
+			hostIP:           "https://otel-collector:4317",
+			hostPort:         "",
+			expectedEndpoint: "https://otel-collector:4317",
+		},
+		{
+			name:             "with trailing slash",
+			hostIP:           "192.168.1.100:4317/",
+			hostPort:         "",
+			expectedEndpoint: "http://192.168.1.100:4317",
+		},
+		{
+			name:             "with http and trailing slash",
+			hostIP:           "http://192.168.1.100:4317/",
+			hostPort:         "",
+			expectedEndpoint: "http://192.168.1.100:4317",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			os.Setenv("OTEL_HOST_IP", tt.hostIP)
+			if tt.hostPort != "" {
+				os.Setenv("OTEL_HOST_PORT", tt.hostPort)
+			} else {
+				os.Unsetenv("OTEL_HOST_PORT")
+			}
+			os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+			os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
+			defer func() {
+				os.Unsetenv("OTEL_HOST_IP")
+				os.Unsetenv("OTEL_HOST_PORT")
+				os.Unsetenv("OTEL_SDK_DISABLED")
+			}()
+
+			// Capture log output to verify endpoint formatting
+			var buf bytes.Buffer
+			logger := &OtelLogger{
+				appName:     "test-app",
+				appVersion:  "1.0.0",
+				logLevel:    LevelInfo,
+				attributes:  make(map[string]interface{}),
+				fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
+				useOtel:     true,
+			}
+
+			// Test the endpoint selection logic by calling initOtel
+			err := logger.initOtel()
+			if err != nil {
+				t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
+			}
+
+			// Check that the endpoint was formatted correctly
+			output := buf.String()
+			if !strings.Contains(output, tt.expectedEndpoint) {
+				t.Errorf("Expected log to contain formatted endpoint %q, got: %s", tt.expectedEndpoint, output)
+			}
+		})
+	}
+}
+
+func TestOtelEndpointConfiguration_Integration(t *testing.T) {
+	// Test the complete flow with NewAppLogger
+	os.Setenv("OTEL_HOST_IP", "test-host")
+	os.Setenv("OTEL_HOST_PORT", "4318")
+	os.Setenv("LOG_APP_NAME", "integration-test")
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel to avoid external dependencies
+	defer func() {
+		os.Unsetenv("OTEL_HOST_IP")
+		os.Unsetenv("OTEL_HOST_PORT")
+		os.Unsetenv("LOG_APP_NAME")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture stdout to verify the logger works end-to-end
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	logger := NewAppLogger()
+	logger.Info("integration test message")
+
+	// Restore stdout
+	w.Close()
+	os.Stdout = oldStdout
+
+	// Read the output
+	var buf bytes.Buffer
+	buf.ReadFrom(r)
+	output := buf.String()
+
+	// Verify the log was written
+	if !strings.Contains(output, "integration test message") {
+		t.Errorf("Expected log output to contain test message, got: %s", output)
+	}
+
+	// Parse the JSON log entry
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	var logLine string
+	for _, line := range lines {
+		if strings.Contains(line, "integration test message") {
+			logLine = line
+			break
+		}
+	}
+
+	if logLine == "" {
+		t.Fatalf("Could not find log entry in output: %s", output)
+	}
+
+	var logEntry LogEntry
+	if err := json.Unmarshal([]byte(logLine), &logEntry); err != nil {
+		t.Fatalf("Failed to parse JSON output: %v", err)
+	}
+
+	// Verify log entry structure
+	if logEntry.AppName != "integration-test" {
+		t.Errorf("Expected app name 'integration-test', got %q", logEntry.AppName)
+	}
+	if logEntry.Level != "info" {
+		t.Errorf("Expected level 'info', got %q", logEntry.Level)
+	}
+	if logEntry.Message != "integration test message" {
+		t.Errorf("Expected message 'integration test message', got %q", logEntry.Message)
+	}
+}

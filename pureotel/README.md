@@ -33,7 +33,12 @@ import (
 
 func main() {
     // Optional: Configure OpenTelemetry collector endpoint
+    // Method 1: Using standard OTLP endpoint
     os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+    
+    // Method 2: Using separate host IP and port (takes precedence)
+    os.Setenv("OTEL_HOST_IP", "192.168.1.100")
+    os.Setenv("OTEL_HOST_PORT", "4318")
     
     // Create logger
     logger := pureotel.NewAppLogger()
@@ -61,9 +66,45 @@ Configure the logger using environment variables:
 |---------------------|-------------|---------|---------|
 | `LOG_LEVEL` | Set minimum log level | `info` | `debug`, `info`, `warn`, `error` |
 | `LOG_APP_NAME` | Application name for logs | `test_application_abcd` | `my-service` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | OpenTelemetry collector endpoint | - | `http://localhost:4318` |
-| `OTEL_EXPORTER_OTLP_INSECURE` | Use insecure connection | `false` | `true` |
+| `LOG_APP_VERSION` | Application version for logs | `1.0.0` | `2.1.0` |
+| `OTEL_HOST_IP` | OpenTelemetry collector host IP/hostname (takes precedence) | - | `192.168.1.100`, `otel-collector` |
+| `OTEL_HOST_PORT` | OpenTelemetry collector port (used with OTEL_HOST_IP) | - | `4317`, `4318` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Full OpenTelemetry collector endpoint (fallback) | - | `http://localhost:4318` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | Headers for OTLP requests | - | `api-key=abc123` |
 | `OTEL_SDK_DISABLED` | Disable OpenTelemetry | `false` | `true` |
+
+### Endpoint Configuration Priority
+
+The logger uses the following priority order for endpoint configuration:
+
+1. **`OTEL_HOST_IP` + `OTEL_HOST_PORT`**: If `OTEL_HOST_IP` is set, it takes precedence
+   - If `OTEL_HOST_PORT` is also set and `OTEL_HOST_IP` doesn't contain a port, they are combined
+   - If `OTEL_HOST_IP` already contains a port, `OTEL_HOST_PORT` is ignored
+2. **`OTEL_EXPORTER_OTLP_ENDPOINT`**: Used as fallback when `OTEL_HOST_IP` is not set
+3. **No endpoint**: Uses noop exporter (structured logging only)
+
+#### Examples:
+
+```bash
+# Example 1: Using separate host and port
+export OTEL_HOST_IP="192.168.1.100"
+export OTEL_HOST_PORT="4318"
+# Result: http://192.168.1.100:4318
+
+# Example 2: Host IP with port already included
+export OTEL_HOST_IP="otel-collector:4317"
+export OTEL_HOST_PORT="4318"  # This will be ignored
+# Result: http://otel-collector:4317
+
+# Example 3: Fallback to standard endpoint
+export OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4318"
+# Result: http://localhost:4318
+
+# Example 4: Kubernetes deployment with node IP
+export OTEL_HOST_IP="${NODE_IP}"  # Injected by Kubernetes
+export OTEL_HOST_PORT="4317"
+# Result: http://<node-ip>:4317
+```
 
 ## Usage Examples
 
@@ -172,8 +213,16 @@ Each log entry generates a span with the following attributes:
 Configure the OTLP endpoint to send traces to your observability platform:
 
 ```bash
+# Method 1: Using separate host and port (recommended for dynamic environments)
+export OTEL_HOST_IP="jaeger"
+export OTEL_HOST_PORT="4318"
+
+# Method 2: Using full endpoint URL
 export OTEL_EXPORTER_OTLP_ENDPOINT="http://jaeger:4318"
-export OTEL_EXPORTER_OTLP_INSECURE="true"
+
+# For Kubernetes deployments with node IP
+export OTEL_HOST_IP="${NODE_IP}"
+export OTEL_HOST_PORT="4317"
 ```
 
 Supported backends:
@@ -193,8 +242,10 @@ services:
     environment:
       - LOG_LEVEL=debug
       - LOG_APP_NAME=my-service
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
-      - OTEL_EXPORTER_OTLP_INSECURE=true
+      - LOG_APP_VERSION=1.0.0
+      - OTEL_HOST_IP=jaeger
+      - OTEL_HOST_PORT=4318
+      # Alternative: OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
     depends_on:
       - jaeger
 
@@ -205,6 +256,55 @@ services:
       - "16686:16686" # Jaeger UI
     environment:
       - COLLECTOR_OTLP_ENABLED=true
+```
+
+## Kubernetes Deployment Example
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+      - name: my-app
+        image: my-app:latest
+        env:
+        - name: LOG_LEVEL
+          value: "info"
+        - name: LOG_APP_NAME
+          value: "my-service"
+        - name: NODE_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        - name: OTEL_HOST_IP
+          value: "$(NODE_IP)"
+        - name: OTEL_HOST_PORT
+          value: "4317"
+        # Kubernetes resource attributes for better observability
+        - name: OTEL_RESOURCE_ATTRIBUTES_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: OTEL_RESOURCE_ATTRIBUTES_POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: OTEL_RESOURCE_ATTRIBUTES_POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: OTEL_RESOURCE_ATTRIBUTES_POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
 ```
 
 ## Performance

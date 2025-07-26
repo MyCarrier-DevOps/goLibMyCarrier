@@ -148,7 +148,19 @@ func (l *OtelLogger) initOtel() error {
 	ctx := context.Background()
 
 	// Check if OTLP endpoint is configured
-	otlpEndpoint := os.Getenv(OtelEndpointEnv)
+	var otlpEndpoint string
+
+	// Use OTEL_HOST_IP if set, otherwise use OTEL_EXPORTER_OTLP_ENDPOINT directly
+	if hostIP := os.Getenv("OTEL_HOST_IP"); hostIP != "" {
+		otlpEndpoint = hostIP
+		// Add port if OTEL_HOST_PORT is set and hostIP doesn't already contain a port
+		if port := os.Getenv("OTEL_HOST_PORT"); port != "" && !strings.Contains(hostIP, ":") {
+			otlpEndpoint = hostIP + ":" + port
+		}
+	} else {
+		otlpEndpoint = os.Getenv(OtelEndpointEnv)
+	}
+
 	if otlpEndpoint == "" {
 		l.fallbackLog.Printf("OpenTelemetry enabled but no OTLP endpoint configured, using noop exporter")
 		l.tracer = otel.Tracer(instrumentationName)
