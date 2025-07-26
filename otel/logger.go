@@ -1,4 +1,4 @@
-package pureotel
+package otel
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
@@ -510,4 +511,37 @@ func FromContext(ctx context.Context) AppLogger {
 		return logger
 	}
 	return NewAppLogger()
+}
+
+// GinLoggerMiddleware creates a Gin middleware that uses otel logger
+func GinLoggerMiddleware(logger AppLogger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Start timer
+		start := time.Now()
+		path := c.Request.URL.Path
+		raw := c.Request.URL.RawQuery
+
+		// Process request
+		c.Next()
+
+		// Log request details
+		end := time.Now()
+		latency := end.Sub(start)
+		clientIP := c.ClientIP()
+		method := c.Request.Method
+		statusCode := c.Writer.Status()
+
+		if raw != "" {
+			path = path + "?" + raw
+		}
+
+		logger.Infof("%s - [%s] \"%s %s\" %d %v",
+			clientIP,
+			end.Format("02/Jan/2006:15:04:05 -0700"),
+			method,
+			path,
+			statusCode,
+			latency,
+		)
+	}
 }

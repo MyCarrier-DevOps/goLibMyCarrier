@@ -1,4 +1,4 @@
-# pureotel Logger
+# otel Logger
 
 A lightweight, structured logging library that combines JSON logging with comprehensive OpenTelemetry integration. This logger provides structured logging capabilities while seamlessly sending both log records and trace data to OpenTelemetry collectors for complete observability.
 
@@ -8,6 +8,7 @@ A lightweight, structured logging library that combines JSON logging with compre
 - **🔭 Dual OpenTelemetry Export**: Automatic export of both logs and traces to OTLP collectors
 - **📋 OTLP Log Records**: Native OpenTelemetry log records with proper severity mapping
 - **🔗 Trace Correlation**: Automatic correlation between log entries and trace spans
+- **🌐 Web Framework Integration**: Built-in middleware for Gin with request/response logging
 - **⚙️ Environment-Driven Configuration**: Configure via environment variables
 - **🎯 Configurable Log Levels**: Support for debug, info, warn, and error levels
 - **📝 Contextual Attributes**: Add structured attributes to log entries and traces
@@ -18,7 +19,7 @@ A lightweight, structured logging library that combines JSON logging with compre
 ## Installation
 
 ```bash
-go get github.com/MyCarrier-DevOps/goLibMyCarrier/pureotel
+go get github.com/MyCarrier-DevOps/goLibMyCarrier/otel
 ```
 
 ## Quick Start
@@ -31,7 +32,7 @@ import (
     "os"
     "time"
     
-    "github.com/MyCarrier-DevOps/goLibMyCarrier/pureotel"
+    "github.com/MyCarrier-DevOps/goLibMyCarrier/otel"
 )
 
 func main() {
@@ -44,7 +45,7 @@ func main() {
     os.Setenv("OTEL_HOST_PORT", "4318")
     
     // Create logger
-    logger := pureotel.NewAppLogger()
+    logger := otel.NewAppLogger()
     defer logger.Shutdown(context.Background())
     
     // Basic logging
@@ -114,7 +115,7 @@ export OTEL_HOST_PORT="4317"
 ### Basic Logging
 
 ```go
-logger := pureotel.NewAppLogger()
+logger := otel.NewAppLogger()
 
 logger.Debug("Debug information")
 logger.Info("General information") 
@@ -149,12 +150,64 @@ enhanced.Info("Payment processed successfully")
 
 ```go
 // Store logger in context
-ctx := pureotel.WithLogger(context.Background(), logger)
+ctx := otel.WithLogger(context.Background(), logger)
 
 // Retrieve logger from context
 func processRequest(ctx context.Context) {
-    logger := pureotel.FromContext(ctx)
+    logger := otel.FromContext(ctx)
     logger.Info("Processing request")
+}
+```
+
+### Gin Web Framework Integration
+
+The library provides built-in middleware for the Gin web framework:
+
+```go
+package main
+
+import (
+    "github.com/gin-gonic/gin"
+    "github.com/MyCarrier-DevOps/goLibMyCarrier/otel"
+)
+
+func main() {
+    // Create logger
+    logger := otel.NewAppLogger()
+    defer logger.Shutdown(context.Background())
+    
+    // Create Gin router
+    router := gin.New()
+    
+    // Add otel logging middleware
+    router.Use(otel.GinLoggerMiddleware(logger))
+    
+    // Add your routes
+    router.GET("/api/users", func(c *gin.Context) {
+        c.JSON(200, gin.H{"message": "success"})
+    })
+    
+    router.Run(":8080")
+}
+```
+
+#### Middleware Features
+
+- **Structured Request Logging**: Logs all HTTP requests with structured data
+- **Response Time Tracking**: Includes request latency in logs
+- **Client IP Detection**: Captures real client IP (handles X-Forwarded-For)
+- **Query Parameter Logging**: Includes full request path with query parameters
+- **Status Code Tracking**: Logs HTTP response status codes
+- **OpenTelemetry Integration**: Automatic trace correlation for HTTP requests
+
+#### Example Log Output
+
+```json
+{
+  "timestamp": "2025-01-20T15:04:05Z",
+  "level": "info", 
+  "message": "192.168.1.100 - [20/Jan/2025:15:04:05 -0700] \"GET /api/users?page=1&limit=10\" 200 15.2ms",
+  "app_name": "my-service"
 }
 ```
 
@@ -162,7 +215,7 @@ func processRequest(ctx context.Context) {
 
 ```go
 func main() {
-    logger := pureotel.NewAppLogger()
+    logger := otel.NewAppLogger()
     
     // Setup graceful shutdown
     defer func() {
@@ -294,6 +347,138 @@ services:
     ports:
       - "16686:16686" # Jaeger UI
       - "14250:14250" # Jaeger gRPC
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+```
+
+### Example Gin Web Service
+
+Here's a complete example of a Gin web service with otel logging:
+
+```dockerfile
+# Dockerfile
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o main .
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+COPY --from=builder /app/main .
+CMD ["./main"]
+```
+
+```go
+// main.go
+package main
+
+import (
+    "context"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "syscall"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    "github.com/MyCarrier-DevOps/goLibMyCarrier/otel"
+)
+
+func main() {
+    // Create logger
+    logger := otel.NewAppLogger()
+    
+    // Setup graceful shutdown
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+    
+    // Create Gin router
+    router := gin.New()
+    router.Use(otel.GinLoggerMiddleware(logger))
+    
+    // Add routes
+    router.GET("/health", func(c *gin.Context) {
+        c.JSON(200, gin.H{"status": "healthy"})
+    })
+    
+    router.GET("/api/users/:id", func(c *gin.Context) {
+        userID := c.Param("id")
+        logger.With("user_id", userID).Info("Fetching user details")
+        c.JSON(200, gin.H{"id": userID, "name": "John Doe"})
+    })
+    
+    // Start server
+    srv := &http.Server{
+        Addr:    ":8080",
+        Handler: router,
+    }
+    
+    go func() {
+        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Server failed to start: %v", err)
+        }
+    }()
+    
+    logger.Info("Server started on :8080")
+    
+    // Wait for interrupt signal
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    <-quit
+    
+    logger.Info("Shutting down server...")
+    
+    // Graceful shutdown
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer shutdownCancel()
+    
+    if err := srv.Shutdown(shutdownCtx); err != nil {
+        logger.Errorf("Server forced to shutdown: %v", err)
+    }
+    
+    if err := logger.Shutdown(shutdownCtx); err != nil {
+        log.Printf("Logger shutdown error: %v", err)
+    }
+    
+    logger.Info("Server exited")
+}
+```
+
+```yaml
+# docker-compose.yml for Gin service
+version: '3.8'
+services:
+  web-service:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - LOG_LEVEL=info
+      - LOG_APP_NAME=gin-web-service
+      - LOG_APP_VERSION=1.0.0
+      - OTEL_HOST_IP=otel-collector
+      - OTEL_HOST_PORT=4318
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    command: ["--config=/etc/otel-collector-config.yml"]
+    volumes:
+      - ./otel-collector-config.yml:/etc/otel-collector-config.yml
+    ports:
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      - jaeger
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686" # Jaeger UI
     environment:
       - COLLECTOR_OTLP_ENABLED=true
 ```
@@ -459,7 +644,7 @@ logger.Error("Error that needs attention")     // Failures - critical for debugg
 func handleRequest(w http.ResponseWriter, r *http.Request) {
     requestID := generateRequestID()
     requestLogger := logger.With("request_id", requestID).With("user_id", getUserID(r))
-    ctx := pureotel.WithLogger(r.Context(), requestLogger)
+    ctx := otel.WithLogger(r.Context(), requestLogger)
     
     // All downstream operations will inherit the enriched logger
     processRequest(ctx)
@@ -494,7 +679,7 @@ func processPayment(ctx context.Context, order Order) {
 ### 6. Graceful Shutdown for Data Integrity
 ```go
 func main() {
-    logger := pureotel.NewAppLogger()
+    logger := otel.NewAppLogger()
     
     // Setup graceful shutdown to ensure all logs and traces are exported
     c := make(chan os.Signal, 1)
@@ -513,36 +698,31 @@ func main() {
     
     // Your application code...
 }
-
-## Migration from Other Loggers
-
-The pureotel logger provides enhanced capabilities beyond traditional logging libraries:
-
-### From logrus
-```go
-// logrus
-logrus.WithFields(logrus.Fields{"key": "value"}).Info("message")
-
-// pureotel (with automatic OTLP export)
-logger.With("key", "value").Info("message")
 ```
 
-### From standard log
+### 7. Web Framework Integration Best Practices
 ```go
-// standard log
-log.Printf("User %s logged in", userID)
+// Good: Use middleware early in the chain for complete request coverage
+router := gin.New()
+router.Use(otel.GinLoggerMiddleware(logger))
+router.Use(gin.Recovery()) // Add after logging middleware
 
-// pureotel (structured + observability)
-logger.With("user_id", userID).Info("User logged in")
-```
+// Good: Combine with request-scoped loggers for better tracing
+router.GET("/api/orders/:id", func(c *gin.Context) {
+    orderID := c.Param("id")
+    requestLogger := logger.With("order_id", orderID).With("request_id", generateRequestID())
+    
+    // Use the request logger throughout the handler
+    requestLogger.Info("Processing order request")
+    // ... business logic
+    requestLogger.Info("Order request completed")
+})
 
-### From zap
-```go
-// zap
-zap.L().Info("Processing request", zap.String("request_id", reqID))
-
-// pureotel (with dual export)
-logger.With("request_id", reqID).Info("Processing request")
+// Good: Add custom attributes to middleware for consistent logging
+func customGinLogger(logger otel.AppLogger) gin.HandlerFunc {
+    baseLogger := logger.With("component", "http-server")
+    return otel.GinLoggerMiddleware(baseLogger)
+}
 ```
 
 ## Contributing
@@ -557,6 +737,6 @@ logger.With("request_id", reqID).Info("Processing request")
 
 ## Support
 
-- 📖 [Documentation](https://github.com/MyCarrier-DevOps/goLibMyCarrier/tree/main/pureotel)
+- 📖 [Documentation](https://github.com/MyCarrier-DevOps/goLibMyCarrier/tree/main/otel)
 - 🐛 [Issue Tracker](https://github.com/MyCarrier-DevOps/goLibMyCarrier/issues)
 - 💬 [Discussions](https://github.com/MyCarrier-DevOps/goLibMyCarrier/discussions)

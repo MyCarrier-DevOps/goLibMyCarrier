@@ -1,14 +1,18 @@
-package pureotel
+package otel
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestLogLevel_String(t *testing.T) {
@@ -849,5 +853,200 @@ func TestOtelEndpointConfiguration_Integration(t *testing.T) {
 	}
 	if logEntry.Message != "integration test message" {
 		t.Errorf("Expected message 'integration test message', got %q", logEntry.Message)
+	}
+}
+
+// TestGinLoggerMiddleware tests the Gin middleware functionality
+func TestGinLoggerMiddleware(t *testing.T) {
+	// Set up a test logger
+	os.Setenv("LOG_APP_NAME", "gin-test")
+	os.Setenv("LOG_LEVEL", "info")
+	os.Setenv("OTEL_SDK_DISABLED", "true")
+	defer func() {
+		os.Unsetenv("LOG_APP_NAME")
+		os.Unsetenv("LOG_LEVEL")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output
+	var buf bytes.Buffer
+	originalOutput := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	// Create a logger
+	logger := NewAppLogger()
+
+	// Create Gin engine with our middleware
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(GinLoggerMiddleware(logger))
+
+	// Add a test route
+	router.GET("/test", func(c *gin.Context) {
+		c.JSON(200, gin.H{"message": "test"})
+	})
+
+	// Make a test request
+	req := httptest.NewRequest("GET", "/test?param=value", nil)
+	req.Header.Set("X-Forwarded-For", "192.168.1.100")
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req)
+
+	// Close the pipe and restore stdout
+	w.Close()
+	os.Stdout = originalOutput
+
+	// Read the captured output
+	go func() {
+		io.Copy(&buf, r)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the response
+	if w2.Code != 200 {
+		t.Errorf("Expected status code 200, got %d", w2.Code)
+	}
+
+	// Verify that a log entry was generated
+	output := buf.String()
+	if !strings.Contains(output, "GET") {
+		t.Errorf("Expected log to contain HTTP method 'GET', got: %s", output)
+	}
+	if !strings.Contains(output, "/test") {
+		t.Errorf("Expected log to contain path '/test', got: %s", output)
+	}
+	if !strings.Contains(output, "200") {
+		t.Errorf("Expected log to contain status code '200', got: %s", output)
+	}
+}
+
+func TestGinLoggerMiddleware_WithQueryParams(t *testing.T) {
+	// Set up a test logger
+	os.Setenv("LOG_APP_NAME", "gin-test")
+	os.Setenv("LOG_LEVEL", "info")
+	os.Setenv("OTEL_SDK_DISABLED", "true")
+	defer func() {
+		os.Unsetenv("LOG_APP_NAME")
+		os.Unsetenv("LOG_LEVEL")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output
+	var buf bytes.Buffer
+	originalOutput := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	// Create a logger
+	logger := NewAppLogger()
+
+	// Create Gin engine with our middleware
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(GinLoggerMiddleware(logger))
+
+	// Add a test route
+	router.POST("/api/users", func(c *gin.Context) {
+		c.JSON(201, gin.H{"id": 123})
+	})
+
+	// Make a test request with query parameters
+	req := httptest.NewRequest("POST", "/api/users?include=profile&sort=name", strings.NewReader(`{"name":"test"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req)
+
+	// Close the pipe and restore stdout
+	w.Close()
+	os.Stdout = originalOutput
+
+	// Read the captured output
+	go func() {
+		io.Copy(&buf, r)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the response
+	if w2.Code != 201 {
+		t.Errorf("Expected status code 201, got %d", w2.Code)
+	}
+
+	// Verify that a log entry was generated with query parameters
+	output := buf.String()
+	if !strings.Contains(output, "POST") {
+		t.Errorf("Expected log to contain HTTP method 'POST', got: %s", output)
+	}
+	if !strings.Contains(output, "/api/users") {
+		t.Errorf("Expected log to contain path '/api/users', got: %s", output)
+	}
+	if !strings.Contains(output, "include=profile") {
+		t.Errorf("Expected log to contain query param 'include=profile', got: %s", output)
+	}
+	if !strings.Contains(output, "sort=name") {
+		t.Errorf("Expected log to contain query param 'sort=name', got: %s", output)
+	}
+	if !strings.Contains(output, "201") {
+		t.Errorf("Expected log to contain status code '201', got: %s", output)
+	}
+}
+
+func TestGinLoggerMiddleware_ErrorStatus(t *testing.T) {
+	// Set up a test logger
+	os.Setenv("LOG_APP_NAME", "gin-test")
+	os.Setenv("LOG_LEVEL", "info")
+	os.Setenv("OTEL_SDK_DISABLED", "true")
+	defer func() {
+		os.Unsetenv("LOG_APP_NAME")
+		os.Unsetenv("LOG_LEVEL")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	// Capture log output
+	var buf bytes.Buffer
+	originalOutput := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	// Create a logger
+	logger := NewAppLogger()
+
+	// Create Gin engine with our middleware
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(GinLoggerMiddleware(logger))
+
+	// Add a test route that returns an error
+	router.GET("/error", func(c *gin.Context) {
+		c.JSON(500, gin.H{"error": "internal server error"})
+	})
+
+	// Make a test request
+	req := httptest.NewRequest("GET", "/error", nil)
+	w2 := httptest.NewRecorder()
+	router.ServeHTTP(w2, req)
+
+	// Close the pipe and restore stdout
+	w.Close()
+	os.Stdout = originalOutput
+
+	// Read the captured output
+	go func() {
+		io.Copy(&buf, r)
+	}()
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify the response
+	if w2.Code != 500 {
+		t.Errorf("Expected status code 500, got %d", w2.Code)
+	}
+
+	// Verify that a log entry was generated with error status
+	output := buf.String()
+	if !strings.Contains(output, "500") {
+		t.Errorf("Expected log to contain status code '500', got: %s", output)
+	}
+	if !strings.Contains(output, "/error") {
+		t.Errorf("Expected log to contain path '/error', got: %s", output)
 	}
 }

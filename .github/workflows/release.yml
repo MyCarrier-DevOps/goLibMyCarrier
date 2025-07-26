@@ -40,7 +40,7 @@ jobs:
         git tag -a github/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release github/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a kafka/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release kafka/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a logger/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release logger/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a pureotel/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release pureotel/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
+        git tag -a otel/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release otel/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a vault/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release vault/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         
@@ -49,7 +49,7 @@ jobs:
         git push origin github/v${{ steps.calculate_version.outputs.majorMinorPatch }}
         git push origin kafka/v${{ steps.calculate_version.outputs.majorMinorPatch }}
         git push origin logger/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin pureotel/v${{ steps.calculate_version.outputs.majorMinorPatch }}
+        git push origin otel/v${{ steps.calculate_version.outputs.majorMinorPatch }}
         git push origin vault/v${{ steps.calculate_version.outputs.majorMinorPatch }}
         git push origin yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }}
     - name: Create Release
@@ -73,7 +73,7 @@ jobs:
           - **github** - GitHub authentication and interaction utilities
           - **kafka** - Kafka producer and consumer utilities
           - **logger** - Pre-configured Zap logger
-          - **pureotel** - OpenTelemetry integration for distributed tracing
+          - **otel** - OpenTelemetry integration for distributed tracing
           - **vault** - HashiCorp Vault interaction utilities
           - **yaml** - YAML file read/write utilities
           
@@ -98,7 +98,7 @@ jobs:
           - [github](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/github@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [kafka](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [logger](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/logger@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [pureotel](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/pureotel@v${{ steps.calculate_version.outputs.majorMinorPatch }})
+          - [otel](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/otel@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [vault](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/vault@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [yaml](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml@v${{ steps.calculate_version.outputs.majorMinorPatch }})
         draft: false

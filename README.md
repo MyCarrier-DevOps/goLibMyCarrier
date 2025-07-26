@@ -11,7 +11,7 @@
 -   **`github`**: Provides utilities to authenticate and interact with Github.
 -   **`kafka`**: Provides utilities to produce and consume messages from Kafka.
 -   **`logger`**: Provides a pre-configured logger using `go.uber.org/zap`.
--   **`pureotel`**: Integrates with OpenTelemetry for distributed tracing and logging.
+-   **`otel`**: Integrates with OpenTelemetry for distributed tracing and logging.
 -   **`vault`**: Provides utilities to interact with HashiCorp Vault.
 -   **`yaml`**: Provides utilities to read and write yaml files.
 
