@@ -214,9 +214,20 @@ func (l *OtelLogger) initOtel() error {
 		)
 	}
 
-	// Create OTLP HTTP trace exporter using environment variable configuration
-	// This avoids URL parsing issues by letting the SDK handle the endpoint
-	traceExporter, err := otlptracehttp.New(ctx)
+	// Create OTLP HTTP trace exporter with explicit endpoint configuration
+	var traceExporter sdktrace.SpanExporter
+	if strings.HasPrefix(otlpEndpoint, "https://") {
+		// Use HTTPS
+		traceExporter, err = otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint(otlpEndpoint),
+		)
+	} else {
+		// Use HTTP (insecure)
+		traceExporter, err = otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint(otlpEndpoint),
+			otlptracehttp.WithInsecure(),
+		)
+	}
 	if err != nil {
 		return fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
