@@ -1,4 +1,4 @@
-module pureotel
+module github.com/MyCarrier-DevOps/goLibMyCarrier/pureotel
 
 go 1.24.2
 
