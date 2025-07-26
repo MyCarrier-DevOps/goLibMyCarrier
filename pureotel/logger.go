@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
+	stdlog "log"
 	"os"
 	"strconv"
 	"strings"
@@ -13,8 +13,11 @@ import (
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/propagation"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
@@ -77,16 +80,18 @@ type AppLogger interface {
 	Shutdown(ctx context.Context) error
 }
 
-// OtelLogger implements AppLogger with OpenTelemetry tracing integration
+// OtelLogger implements AppLogger with structured logging and OpenTelemetry logs integration
 type OtelLogger struct {
 	appName       string
 	appVersion    string
 	logLevel      LogLevel
 	attributes    map[string]interface{}
-	fallbackLog   *log.Logger
+	fallbackLog   *stdlog.Logger
 	useOtel       bool
 	tracer        trace.Tracer
 	traceProvider *sdktrace.TracerProvider
+	logger        otellog.Logger
+	logProvider   *sdklog.LoggerProvider
 }
 
 // LogEntry represents a structured log entry
@@ -98,7 +103,7 @@ type LogEntry struct {
 	Attributes map[string]interface{} `json:"attributes,omitempty"`
 }
 
-// NewAppLogger returns a new AppLogger instance with OpenTelemetry integration
+// NewAppLogger returns a new AppLogger instance with structured logging
 func NewAppLogger() AppLogger {
 	// Set default log level and app name
 	logLevelStr, _ := os.LookupEnv("LOG_LEVEL")
@@ -121,7 +126,7 @@ func NewAppLogger() AppLogger {
 	useOtel := !(defined && strings.ToLower(otelSdkDisabled) == "true")
 
 	// Create fallback standard logger
-	fallbackLog := log.New(os.Stdout, fmt.Sprintf("[%s] ", appName), log.LstdFlags)
+	fallbackLog := stdlog.New(os.Stdout, fmt.Sprintf("[%s] ", appName), stdlog.LstdFlags)
 
 	otelLogger := &OtelLogger{
 		appName:     appName,
@@ -143,7 +148,7 @@ func NewAppLogger() AppLogger {
 	return otelLogger
 }
 
-// initOtel initializes the OpenTelemetry SDK with OTLP exporter
+// initOtel initializes the OpenTelemetry SDK with OTLP trace and log exporters
 func (l *OtelLogger) initOtel() error {
 	ctx := context.Background()
 
@@ -214,26 +219,27 @@ func (l *OtelLogger) initOtel() error {
 		)
 	}
 
-	// Create OTLP HTTP trace exporter with explicit endpoint configuration
-	var traceExporter sdktrace.SpanExporter
-
 	// Extract just the host:port from the endpoint URL
 	endpointURL := otlpEndpoint
+	var isSecure bool
 	if strings.HasPrefix(otlpEndpoint, "https://") {
 		endpointURL = strings.TrimPrefix(otlpEndpoint, "https://")
-		// Use HTTPS
-		traceExporter, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpoint(endpointURL),
-		)
+		isSecure = true
 	} else if strings.HasPrefix(otlpEndpoint, "http://") {
 		endpointURL = strings.TrimPrefix(otlpEndpoint, "http://")
-		// Use HTTP (insecure)
-		traceExporter, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpoint(endpointURL),
-			otlptracehttp.WithInsecure(),
-		)
+		isSecure = false
 	} else {
 		// No scheme, assume HTTP
+		isSecure = false
+	}
+
+	// Create OTLP HTTP trace exporter
+	var traceExporter sdktrace.SpanExporter
+	if isSecure {
+		traceExporter, err = otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint(endpointURL),
+		)
+	} else {
 		traceExporter, err = otlptracehttp.New(ctx,
 			otlptracehttp.WithEndpoint(endpointURL),
 			otlptracehttp.WithInsecure(),
@@ -243,18 +249,41 @@ func (l *OtelLogger) initOtel() error {
 		return fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
 
+	// Create OTLP HTTP log exporter
+	var logExporter sdklog.Exporter
+	if isSecure {
+		logExporter, err = otlploghttp.New(ctx,
+			otlploghttp.WithEndpoint(endpointURL),
+		)
+	} else {
+		logExporter, err = otlploghttp.New(ctx,
+			otlploghttp.WithEndpoint(endpointURL),
+			otlploghttp.WithInsecure(),
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create OTLP log exporter: %w", err)
+	}
+
 	// Create trace provider
 	l.traceProvider = sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(traceExporter),
 		sdktrace.WithResource(res),
 	)
 
-	// Set global trace provider
+	// Create log provider
+	l.logProvider = sdklog.NewLoggerProvider(
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+		sdklog.WithResource(res),
+	)
+
+	// Set global providers
 	otel.SetTracerProvider(l.traceProvider)
 	otel.SetTextMapPropagator(propagation.TraceContext{})
 
-	// Create tracer
+	// Create tracer and logger
 	l.tracer = l.traceProvider.Tracer(instrumentationName)
+	l.logger = l.logProvider.Logger(instrumentationName)
 
 	l.fallbackLog.Printf("OpenTelemetry initialized with OTLP endpoint: %s", otlpEndpoint)
 	return nil
@@ -290,9 +319,9 @@ func (l *OtelLogger) log(level LogLevel, message string) {
 	// Always log to structured output
 	l.logStructured(level, message)
 
-	// Also create OpenTelemetry span if enabled
-	if l.useOtel && l.tracer != nil {
-		l.createOtelSpan(level, message)
+	// Also send to OpenTelemetry logs if enabled
+	if l.useOtel && l.logger != nil {
+		l.sendOtelLog(level, message)
 	}
 }
 
@@ -322,46 +351,47 @@ func (l *OtelLogger) logStructured(level LogLevel, message string) {
 	}
 }
 
-// createOtelSpan creates an OpenTelemetry span that contains log data
-// This sends structured log data to the OTLP collector as trace events
-func (l *OtelLogger) createOtelSpan(level LogLevel, message string) {
-	if l.tracer == nil {
+// sendOtelLog sends log records to OpenTelemetry logs
+func (l *OtelLogger) sendOtelLog(level LogLevel, message string) {
+	if l.logger == nil {
 		return
 	}
 
-	ctx := context.Background()
-	spanName := fmt.Sprintf("log.%s", level.String())
-
-	_, span := l.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindInternal))
-	defer span.End()
-
-	// Set span attributes with log data
-	attrs := []attribute.KeyValue{
-		attribute.String("log.severity", level.String()),
-		attribute.String("log.body", message),
-		attribute.String("service.name", l.appName),
-		attribute.String("log.timestamp", time.Now().Format(time.RFC3339)),
-		attribute.String("instrumentation.name", instrumentationName),
+	// Convert our log level to OpenTelemetry severity
+	var severity otellog.Severity
+	switch level {
+	case LevelDebug:
+		severity = otellog.SeverityDebug
+	case LevelInfo:
+		severity = otellog.SeverityInfo
+	case LevelWarn:
+		severity = otellog.SeverityWarn
+	case LevelError:
+		severity = otellog.SeverityError
+	default:
+		severity = otellog.SeverityInfo
 	}
+
+	// Create log record
+	logRecord := otellog.Record{}
+	logRecord.SetTimestamp(time.Now())
+	logRecord.SetSeverity(severity)
+	logRecord.SetSeverityText(level.String())
+	logRecord.SetBody(otellog.StringValue(message))
+
+	// Add service attributes
+	logRecord.AddAttributes(
+		otellog.String("service.name", l.appName),
+		otellog.String("service.version", l.appVersion),
+	)
 
 	// Add custom attributes
 	for k, v := range l.attributes {
-		attrs = append(attrs, attribute.String(fmt.Sprintf("log.%s", k), fmt.Sprintf("%v", v)))
+		logRecord.AddAttributes(otellog.String(k, fmt.Sprintf("%v", v)))
 	}
 
-	span.SetAttributes(attrs...)
-
-	// Add the log message as an event (this will appear as structured data in the collector)
-	span.AddEvent("log", trace.WithAttributes(
-		attribute.String("level", level.String()),
-		attribute.String("message", message),
-		attribute.String("timestamp", time.Now().Format(time.RFC3339)),
-	))
-
-	// Set span status based on log level
-	if level == LevelError {
-		span.RecordError(fmt.Errorf("log error: %s", message))
-	}
+	// Emit the log record
+	l.logger.Emit(context.Background(), logRecord)
 }
 
 // logFallback uses standard library logging as fallback
@@ -430,6 +460,8 @@ func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 		useOtel:       l.useOtel,
 		tracer:        l.tracer,
 		traceProvider: l.traceProvider,
+		logger:        l.logger,
+		logProvider:   l.logProvider,
 	}
 
 	// Copy existing attributes
@@ -443,12 +475,20 @@ func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 	return newLogger
 }
 
-// Shutdown gracefully shuts down the OpenTelemetry tracer provider
+// Shutdown gracefully shuts down the OpenTelemetry providers
 func (l *OtelLogger) Shutdown(ctx context.Context) error {
+	var err error
 	if l.traceProvider != nil {
-		return l.traceProvider.Shutdown(ctx)
+		if shutdownErr := l.traceProvider.Shutdown(ctx); shutdownErr != nil {
+			err = shutdownErr
+		}
 	}
-	return nil
+	if l.logProvider != nil {
+		if shutdownErr := l.logProvider.Shutdown(ctx); shutdownErr != nil {
+			err = shutdownErr
+		}
+	}
+	return err
 }
 
 func SetKlogLevel(level int) {
