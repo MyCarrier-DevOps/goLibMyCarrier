@@ -6,7 +6,7 @@ GOARCH ?= $(shell go env GOARCH)
 .PHONY: lint
 lint: install-tools
 	@echo "Linting all modules..."
-	@for dir in auth clickhouse github kafka logger otel vault yaml; do \
+	@for dir in auth clickhouse github kafka logger pureotel vault yaml; do \
 		if [ -d "$$dir" ]; then \
 			echo "Linting $$dir module..."; \
 			(cd $$dir && go mod tidy && golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...); \
@@ -18,7 +18,7 @@ lint: install-tools
 .PHONY: test
 test:
 	@echo "Testing all modules..."
-	@for dir in auth clickhouse github kafka logger otel vault yaml; do \
+	@for dir in auth clickhouse github kafka logger pureotel vault yaml; do \
 		if [ -d "$$dir" ]; then \
 			echo "Testing $$dir module..."; \
 			(cd $$dir && go mod download && go test -v ./...); \
@@ -30,7 +30,7 @@ test:
 .PHONY: fmt
 fmt:
 	@echo "Formatting all modules..."
-	@for dir in auth clickhouse github kafka logger otel vault yaml; do \
+	@for dir in auth clickhouse github kafka logger pureotel vault yaml; do \
 		if [ -d "$$dir" ]; then \
 			echo "Formatting $$dir module..."; \
 			(cd $$dir && gofmt -s -w .); \
