@@ -216,15 +216,26 @@ func (l *OtelLogger) initOtel() error {
 
 	// Create OTLP HTTP trace exporter with explicit endpoint configuration
 	var traceExporter sdktrace.SpanExporter
+
+	// Extract just the host:port from the endpoint URL
+	endpointURL := otlpEndpoint
 	if strings.HasPrefix(otlpEndpoint, "https://") {
+		endpointURL = strings.TrimPrefix(otlpEndpoint, "https://")
 		// Use HTTPS
 		traceExporter, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpoint(otlpEndpoint),
+			otlptracehttp.WithEndpoint(endpointURL),
 		)
-	} else {
+	} else if strings.HasPrefix(otlpEndpoint, "http://") {
+		endpointURL = strings.TrimPrefix(otlpEndpoint, "http://")
 		// Use HTTP (insecure)
 		traceExporter, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpoint(otlpEndpoint),
+			otlptracehttp.WithEndpoint(endpointURL),
+			otlptracehttp.WithInsecure(),
+		)
+	} else {
+		// No scheme, assume HTTP
+		traceExporter, err = otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint(endpointURL),
 			otlptracehttp.WithInsecure(),
 		)
 	}
