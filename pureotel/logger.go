@@ -80,6 +80,7 @@ type AppLogger interface {
 // OtelLogger implements AppLogger with OpenTelemetry tracing integration
 type OtelLogger struct {
 	appName       string
+	appVersion    string
 	logLevel      LogLevel
 	attributes    map[string]interface{}
 	fallbackLog   *log.Logger
@@ -108,6 +109,10 @@ func NewAppLogger() AppLogger {
 	if appName == "" {
 		appName = "test_application_abcd"
 	}
+	appVersion, _ := os.LookupEnv("LOG_APP_VERSION")
+	if appVersion == "" {
+		appVersion = "1.0.0"
+	}
 
 	logLevel := parseLogLevel(logLevelStr)
 
@@ -120,6 +125,7 @@ func NewAppLogger() AppLogger {
 
 	otelLogger := &OtelLogger{
 		appName:     appName,
+		appVersion:  appVersion,
 		logLevel:    logLevel,
 		attributes:  make(map[string]interface{}),
 		fallbackLog: fallbackLog,
@@ -157,23 +163,42 @@ func (l *OtelLogger) initOtel() error {
 
 	l.fallbackLog.Printf("Using OTLP endpoint: %s", otlpEndpoint)
 
-	// Create resource with service information
+	// Create resource with service information and Kubernetes attributes
+	resourceAttrs := []attribute.KeyValue{
+		semconv.ServiceName(l.appName),
+		semconv.ServiceVersion(l.appVersion),
+		attribute.String("service.instance.id", fmt.Sprintf("%s-%d", l.appName, time.Now().Unix())),
+	}
+
+	// Add Kubernetes attributes from environment variables
+	if nodeName := os.Getenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME"); nodeName != "" {
+		resourceAttrs = append(resourceAttrs, attribute.String("k8s.node.name", nodeName))
+	}
+	if podName := os.Getenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME"); podName != "" {
+		resourceAttrs = append(resourceAttrs, attribute.String("k8s.pod.name", podName))
+	}
+	if podNamespace := os.Getenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE"); podNamespace != "" {
+		resourceAttrs = append(resourceAttrs, attribute.String("k8s.namespace.name", podNamespace))
+	}
+	if podUID := os.Getenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID"); podUID != "" {
+		resourceAttrs = append(resourceAttrs, attribute.String("k8s.pod.uid", podUID))
+	}
+	if podIP := os.Getenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP"); podIP != "" {
+		resourceAttrs = append(resourceAttrs, attribute.String("k8s.pod.ip", podIP))
+	}
+
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceName(l.appName),
-			semconv.ServiceVersion("1.0.0"),
-			attribute.String("service.instance.id", fmt.Sprintf("%s-%d", l.appName, time.Now().Unix())),
+			resourceAttrs...,
 		),
 	)
 	if err != nil {
-		// If merge fails due to schema conflicts, create a new resource
+		// If merge fails due to schema conflicts, create a new resource with the same attributes
 		res = resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceName(l.appName),
-			semconv.ServiceVersion("1.0.0"),
-			attribute.String("service.instance.id", fmt.Sprintf("%s-%d", l.appName, time.Now().Unix())),
+			resourceAttrs...,
 		)
 	}
 
@@ -364,6 +389,7 @@ func (l *OtelLogger) Warnf(template string, args ...interface{}) {
 func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 	newLogger := &OtelLogger{
 		appName:       l.appName,
+		appVersion:    l.appVersion,
 		logLevel:      l.logLevel,
 		attributes:    make(map[string]interface{}),
 		fallbackLog:   l.fallbackLog,

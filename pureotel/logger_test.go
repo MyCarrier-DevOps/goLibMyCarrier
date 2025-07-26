@@ -62,6 +62,7 @@ func TestNewAppLogger_DefaultValues(t *testing.T) {
 	// Clear environment variables
 	os.Unsetenv("LOG_LEVEL")
 	os.Unsetenv("LOG_APP_NAME")
+	os.Unsetenv("LOG_APP_VERSION")
 	os.Unsetenv("OTEL_SDK_DISABLED")
 
 	logger := NewAppLogger()
@@ -78,6 +79,10 @@ func TestNewAppLogger_DefaultValues(t *testing.T) {
 		t.Errorf("Default app name should be 'test_application_abcd', got %q", otelLogger.appName)
 	}
 
+	if otelLogger.appVersion != "1.0.0" {
+		t.Errorf("Default app version should be '1.0.0', got %q", otelLogger.appVersion)
+	}
+
 	if !otelLogger.useOtel {
 		t.Error("OpenTelemetry should be enabled by default")
 	}
@@ -87,10 +92,12 @@ func TestNewAppLogger_EnvironmentVariables(t *testing.T) {
 	// Set environment variables
 	os.Setenv("LOG_LEVEL", "debug")
 	os.Setenv("LOG_APP_NAME", "test-app")
+	os.Setenv("LOG_APP_VERSION", "2.1.0")
 	os.Setenv("OTEL_SDK_DISABLED", "true")
 	defer func() {
 		os.Unsetenv("LOG_LEVEL")
 		os.Unsetenv("LOG_APP_NAME")
+		os.Unsetenv("LOG_APP_VERSION")
 		os.Unsetenv("OTEL_SDK_DISABLED")
 	}()
 
@@ -108,8 +115,66 @@ func TestNewAppLogger_EnvironmentVariables(t *testing.T) {
 		t.Errorf("App name should be 'test-app', got %q", otelLogger.appName)
 	}
 
+	if otelLogger.appVersion != "2.1.0" {
+		t.Errorf("App version should be '2.1.0', got %q", otelLogger.appVersion)
+	}
+
 	if otelLogger.useOtel {
 		t.Error("OpenTelemetry should be disabled when OTEL_SDK_DISABLED=true")
+	}
+}
+
+func TestKubernetesAttributes(t *testing.T) {
+	// Set Kubernetes environment variables
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME", "test-node")
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME", "test-pod")
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE", "test-namespace")
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID", "test-uid-123")
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP", "10.0.0.1")
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable OTel to avoid actual initialization
+	defer func() {
+		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME")
+		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME")
+		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE")
+		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID")
+		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	logger := NewAppLogger()
+	otelLogger, ok := logger.(*OtelLogger)
+	if !ok {
+		t.Fatal("NewAppLogger() should return *OtelLogger")
+	}
+
+	// Since OTel is disabled, we can't test the actual resource attributes,
+	// but we can verify that the logger was created successfully with the environment variables set
+	if otelLogger.useOtel {
+		t.Error("OpenTelemetry should be disabled for this test")
+	}
+}
+
+func TestKubernetesAttributes_PartialEnvironment(t *testing.T) {
+	// Set only some Kubernetes environment variables
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME", "test-node")
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME", "test-pod")
+	// Intentionally omit other K8s attributes
+	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable OTel to avoid actual initialization
+	defer func() {
+		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME")
+		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME")
+		os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	logger := NewAppLogger()
+	otelLogger, ok := logger.(*OtelLogger)
+	if !ok {
+		t.Fatal("NewAppLogger() should return *OtelLogger")
+	}
+
+	// Verify logger creation succeeds even with partial K8s environment
+	if otelLogger.useOtel {
+		t.Error("OpenTelemetry should be disabled for this test")
 	}
 }
 
