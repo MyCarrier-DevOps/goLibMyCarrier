@@ -98,7 +98,7 @@ jobs:
           - [github](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/github@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [kafka](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [logger](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/logger@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [otel](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/otel@v${{ steps.calculate_version.outputs.majorMinorPatch }})
+          - [pureotel](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/pureotel@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [vault](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/vault@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [yaml](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml@v${{ steps.calculate_version.outputs.majorMinorPatch }})
         draft: false
