@@ -1,13 +1,15 @@
 # YAML Helper Module
 
-A Go module that provides enhanced YAML file operations with custom formatting styles, particularly for handling arrays in YAML documents.
+A Go module that provides enhanced YAML file operations with custom formatting styles, particularly for handling arrays in YAML documents. Supports both file-based and string-based YAML operations.
 
 ## Features
 
 - **Custom Array Formatting**: Automatically formats all arrays as inline/flow style (e.g., `["item1", "item2", "item3"]`)
 - **Style Preservation**: Read YAML files while preserving original formatting styles
+- **String Content Parsing**: Parse YAML directly from string content with `ReadYamlContent` and `ReadYamlContentWithStyle`
 - **2-Space Indentation**: Consistent formatting with 2-space indentation
-- **Multiple Read/Write Functions**: Various functions for different use cases
+- **Multiple Read/Write Functions**: Various functions for different use cases (files, strings, raw nodes)
+- **Comprehensive Error Handling**: Descriptive error messages with proper error wrapping
 
 ## Installation
 
@@ -81,6 +83,64 @@ Returns the raw YAML node structure, preserving all original formatting.
 
 ```go
 func ReadYamlFileRaw(filePath string) (*yaml.Node, error)
+```
+
+### ReadYamlContent
+
+Reads YAML content from a string and unmarshals it into a map.
+
+```go
+func ReadYamlContent(content string) (map[string]interface{}, error)
+```
+
+**Example:**
+```go
+yamlContent := `
+name: test-api
+version: 1.0.0
+tags: ["dev", "staging", "prod"]
+config:
+  debug: true
+  timeout: 30
+`
+
+data, err := ReadYamlContent(yamlContent)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Printf("Parsed data: %+v\n", data)
+```
+
+### ReadYamlContentWithStyle
+
+Reads YAML content from a string while preserving the original formatting styles.
+
+```go
+func ReadYamlContentWithStyle(content string) (map[string]interface{}, error)
+```
+
+**Example:**
+```go
+yamlContent := `
+applications:
+  api:
+    name: "test-api"
+    filters: ["TestCategory=coreapitest", "Priority=High"]
+    environments: ["dev", "staging", "prod"]
+description: |
+  This is a multiline
+  description that spans
+  multiple lines
+`
+
+data, err := ReadYamlContentWithStyle(yamlContent)
+if err != nil {
+    log.Fatal(err)
+}
+
+// The function preserves styles while parsing to standard Go data structures
+fmt.Printf("Parsed data: %+v\n", data)
 ```
 
 ## Array Formatting Behavior
@@ -174,6 +234,61 @@ services:
   tags: ["frontend", "react"]
 ```
 
+### Working with YAML Content Strings
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    
+    yaml "github.com/MyCarrier-DevOps/goLibMyCarrier/yaml"
+)
+
+func main() {
+    // Parse YAML from string content
+    yamlContent := `
+applications:
+  api:
+    name: test-api
+    filters: ["TestCategory=coreapitest", "Priority=High"]
+    testdefinitions:
+      - filters: ["TestCategory=unitTest"]
+        timeout: 300
+      - filters: ["TestCategory=integration"] 
+        timeout: 600
+    environments: ["dev", "staging", "prod"]
+config:
+  debug: true
+  features:
+    - feature1
+    - feature2
+description: |
+  This is a multiline
+  description that spans
+  multiple lines
+`
+
+    // Use ReadYamlContent for basic parsing
+    data, err := yaml.ReadYamlContent(yamlContent)
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    // Use ReadYamlContentWithStyle to preserve formatting styles
+    styledData, err := yaml.ReadYamlContentWithStyle(yamlContent)
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    fmt.Printf("Basic parsing: %+v\n", data)
+    fmt.Printf("Style-aware parsing: %+v\n", styledData)
+    
+    // Both functions return equivalent data structures
+    // The WithStyle version preserves original formatting information internally
+}
+
 ## Error Handling
 
 All functions return descriptive errors with proper error wrapping:
@@ -189,14 +304,40 @@ if err != nil {
 ## Testing
 
 The module includes comprehensive tests covering:
-- Basic array formatting for various data types
-- Nested structure handling
-- Round-trip operations (write → read → verify)
-- Error handling scenarios
+- **File Operations**: Write and read operations with style preservation
+- **Content Parsing**: String-based YAML parsing with `ReadYamlContent` and `ReadYamlContentWithStyle`
+- **Array Formatting**: Various data types (strings, integers, nested structures)
+- **Style Preservation**: Flow-style arrays, block-style arrays, multiline strings
+- **Nested Structures**: Complex real-world scenarios with mixed formatting styles
+- **Round-trip Operations**: Write → read → verify consistency
+- **Error Handling**: Invalid YAML syntax and edge cases
+- **Data Consistency**: Ensuring both regular and style-aware functions return equivalent data
+
+**Test Coverage Includes:**
+- Simple key-value pairs
+- Nested YAML structures
+- Inline and block-style arrays
+- Mixed data types (strings, booleans, integers, floats)
+- Multiline strings (literal `|` and folded `>` styles)
+- Complex nested structures with different formatting styles
+- Empty content and malformed YAML handling
+- Function comparison tests to ensure data consistency
 
 Run tests:
 ```bash
 go test -v ./...
+```
+
+Run specific test groups:
+```bash
+# Test content parsing functions
+go test -v -run="TestReadYamlContent"
+
+# Test all array formatting
+go test -v -run="Array"
+
+# Test style preservation
+go test -v -run="Style"
 ```
 
 ## Dependencies

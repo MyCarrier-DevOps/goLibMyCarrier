@@ -266,3 +266,363 @@ func TestGenericArrayFormatting(t *testing.T) {
 		}
 	}
 }
+
+func TestReadYamlContent(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		expected  map[string]interface{}
+		expectErr bool
+	}{
+		{
+			name: "simple_key_value",
+			content: `name: test-api
+version: 1.0.0`,
+			expected: map[string]interface{}{
+				"name":    "test-api",
+				"version": "1.0.0",
+			},
+			expectErr: false,
+		},
+		{
+			name: "nested_structure",
+			content: `applications:
+  api:
+    name: test-api
+    port: 8080`,
+			expected: map[string]interface{}{
+				"applications": map[string]interface{}{
+					"api": map[string]interface{}{
+						"name": "test-api",
+						"port": 8080,
+					},
+				},
+			},
+			expectErr: false,
+		},
+		{
+			name: "array_values",
+			content: `tags:
+  - dev
+  - staging
+  - prod
+ports:
+  - 80
+  - 443`,
+			expected: map[string]interface{}{
+				"tags":  []interface{}{"dev", "staging", "prod"},
+				"ports": []interface{}{80, 443},
+			},
+			expectErr: false,
+		},
+		{
+			name: "inline_array_format",
+			content: `filters: ["TestCategory=coreapitest", "Priority=High"]
+environments: ["dev", "staging"]`,
+			expected: map[string]interface{}{
+				"filters":      []interface{}{"TestCategory=coreapitest", "Priority=High"},
+				"environments": []interface{}{"dev", "staging"},
+			},
+			expectErr: false,
+		},
+		{
+			name: "mixed_types",
+			content: `name: "test-api"
+enabled: true
+count: 42
+rate: 3.14
+tags: ["tag1", "tag2"]`,
+			expected: map[string]interface{}{
+				"name":    "test-api",
+				"enabled": true,
+				"count":   42,
+				"rate":    3.14,
+				"tags":    []interface{}{"tag1", "tag2"},
+			},
+			expectErr: false,
+		},
+		{
+			name:      "empty_content",
+			content:   "",
+			expected:  map[string]interface{}{},
+			expectErr: false,
+		},
+		{
+			name: "invalid_yaml",
+			content: `name: test-api
+invalid: [unclosed array`,
+			expected:  nil,
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ReadYamlContent(tt.content)
+
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if !yamlDataEqual(result, tt.expected) {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestReadYamlContentWithStyle(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		expected  map[string]interface{}
+		expectErr bool
+	}{
+		{
+			name: "simple_key_value_with_style",
+			content: `name: "test-api"
+version: '1.0.0'`,
+			expected: map[string]interface{}{
+				"name":    "test-api",
+				"version": "1.0.0",
+			},
+			expectErr: false,
+		},
+		{
+			name: "nested_structure_with_style",
+			content: `applications:
+  api:
+    name: "test-api"
+    port: 8080
+    config:
+      debug: true`,
+			expected: map[string]interface{}{
+				"applications": map[string]interface{}{
+					"api": map[string]interface{}{
+						"name": "test-api",
+						"port": 8080,
+						"config": map[string]interface{}{
+							"debug": true,
+						},
+					},
+				},
+			},
+			expectErr: false,
+		},
+		{
+			name: "flow_style_arrays",
+			content: `filters: ["TestCategory=coreapitest", "Priority=High"]
+tags: ["dev", "staging", "prod"]
+ports: [80, 443, 8080]`,
+			expected: map[string]interface{}{
+				"filters": []interface{}{"TestCategory=coreapitest", "Priority=High"},
+				"tags":    []interface{}{"dev", "staging", "prod"},
+				"ports":   []interface{}{80, 443, 8080},
+			},
+			expectErr: false,
+		},
+		{
+			name: "block_style_arrays",
+			content: `tags:
+  - dev
+  - staging
+  - prod
+environments:
+  - name: development
+    url: dev.example.com
+  - name: production
+    url: prod.example.com`,
+			expected: map[string]interface{}{
+				"tags": []interface{}{"dev", "staging", "prod"},
+				"environments": []interface{}{
+					map[string]interface{}{
+						"name": "development",
+						"url":  "dev.example.com",
+					},
+					map[string]interface{}{
+						"name": "production",
+						"url":  "prod.example.com",
+					},
+				},
+			},
+			expectErr: false,
+		},
+		{
+			name: "complex_nested_with_different_styles",
+			content: `applications:
+  api:
+    name: "test-api"
+    testdefinitions:
+      - filters: ["TestCategory=coreapitest"]
+        timeout: 300
+      - filters: ["TestCategory=integration"]
+        timeout: 600
+    environments: ["dev", "staging", "prod"]`,
+			expected: map[string]interface{}{
+				"applications": map[string]interface{}{
+					"api": map[string]interface{}{
+						"name": "test-api",
+						"testdefinitions": []interface{}{
+							map[string]interface{}{
+								"filters": []interface{}{"TestCategory=coreapitest"},
+								"timeout": 300,
+							},
+							map[string]interface{}{
+								"filters": []interface{}{"TestCategory=integration"},
+								"timeout": 600,
+							},
+						},
+						"environments": []interface{}{"dev", "staging", "prod"},
+					},
+				},
+			},
+			expectErr: false,
+		},
+		{
+			name: "multiline_strings",
+			content: `description: |
+  This is a multiline
+  description that spans
+  multiple lines
+summary: >
+  This is a folded
+  string that will be
+  on one line`,
+			expected: map[string]interface{}{
+				"description": "This is a multiline\ndescription that spans\nmultiple lines\n",
+				"summary":     "This is a folded string that will be on one line",
+			},
+			expectErr: false,
+		},
+		{
+			name:      "empty_content",
+			content:   "",
+			expected:  map[string]interface{}{},
+			expectErr: false,
+		},
+		{
+			name: "invalid_yaml_syntax",
+			content: `name: test-api
+invalid: [unclosed array
+malformed: {key: value`,
+			expected:  nil,
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := ReadYamlContentWithStyle(tt.content)
+
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if !yamlDataEqual(result, tt.expected) {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
+func TestReadYamlContentComparison(t *testing.T) {
+	// Test that both functions return the same data structure for the same input
+	testCases := []string{
+		`name: test-api
+version: 1.0.0`,
+		`applications:
+  api:
+    name: test-api
+    filters: ["TestCategory=coreapitest"]`,
+		`tags: ["dev", "staging", "prod"]
+ports: [80, 443]`,
+		`config:
+  debug: true
+  timeout: 30
+  features:
+    - feature1
+    - feature2`,
+	}
+
+	for i, content := range testCases {
+		t.Run(string(rune('A'+i)), func(t *testing.T) {
+			result1, err1 := ReadYamlContent(content)
+			if err1 != nil {
+				t.Fatalf("ReadYamlContent failed: %v", err1)
+			}
+
+			result2, err2 := ReadYamlContentWithStyle(content)
+			if err2 != nil {
+				t.Fatalf("ReadYamlContentWithStyle failed: %v", err2)
+			}
+
+			if !yamlDataEqual(result1, result2) {
+				t.Errorf("Results differ:\nReadYamlContent: %v\nReadYamlContentWithStyle: %v", result1, result2)
+			}
+		})
+	}
+}
+
+// yamlDataEqual is a helper function to deeply compare YAML data structures
+func yamlDataEqual(a, b map[string]interface{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for key, valueA := range a {
+		valueB, exists := b[key]
+		if !exists {
+			return false
+		}
+
+		if !interfaceEqual(valueA, valueB) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// interfaceEqual recursively compares two interface{} values
+func interfaceEqual(a, b interface{}) bool {
+	switch aVal := a.(type) {
+	case map[string]interface{}:
+		bVal, ok := b.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		return yamlDataEqual(aVal, bVal)
+	case []interface{}:
+		bVal, ok := b.([]interface{})
+		if !ok {
+			return false
+		}
+		if len(aVal) != len(bVal) {
+			return false
+		}
+		for i := range aVal {
+			if !interfaceEqual(aVal[i], bVal[i]) {
+				return false
+			}
+		}
+		return true
+	default:
+		return a == b
+	}
+}

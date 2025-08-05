@@ -140,3 +140,34 @@ func ReadYamlFileRaw(filePath string) (*yaml.Node, error) {
 
 	return &rootNode, nil
 }
+
+// ReadYamlContent reads YAML content from a string and unmarshals it into a map.
+func ReadYamlContent(content string) (map[string]interface{}, error) {
+	// Unmarshal the YAML content
+	var result map[string]interface{}
+	err := yaml.Unmarshal([]byte(content), &result)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling yaml content: %w", err)
+	}
+	// Return the result
+	return result, nil
+}
+
+// ReadYamlContentWithStyle reads YAML content from a string and preserves the original formatting styles.
+func ReadYamlContentWithStyle(content string) (map[string]interface{}, error) {
+	// Use a yaml.Node to parse the YAML while preserving style
+	var rootNode yaml.Node
+	err := yaml.Unmarshal([]byte(content), &rootNode)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling yaml content: %w", err)
+	}
+
+	// Convert the node tree to a map
+	var result map[string]interface{}
+	err = rootNode.Decode(&result)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding yaml node: %w", err)
+	}
+
+	return result, nil
+}
