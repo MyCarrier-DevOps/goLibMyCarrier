@@ -21,7 +21,7 @@ test:
 	@for dir in auth clickhouse github kafka logger otel vault yaml; do \
 		if [ -d "$$dir" ]; then \
 			echo "Testing $$dir module..."; \
-			(cd $$dir && go mod download && go test -v ./...); \
+			(cd $$dir && go mod download && go test ./...); \
 		else \
 			echo "Directory $$dir not found, skipping..."; \
 		fi; \
@@ -34,6 +34,18 @@ fmt:
 		if [ -d "$$dir" ]; then \
 			echo "Formatting $$dir module..."; \
 			(cd $$dir && gofmt -s -w .); \
+		else \
+			echo "Directory $$dir not found, skipping..."; \
+		fi; \
+	done
+
+.PHONY: bump
+bump:
+	@echo "Bumping module versions..."
+	@for dir in auth clickhouse github kafka logger otel vault yaml; do \
+		if [ -d "$$dir" ]; then \
+			echo "Bumping $$dir module..."; \
+			(cd $$dir && go get -u && go mod tidy ); \
 		else \
 			echo "Directory $$dir not found, skipping..."; \
 		fi; \

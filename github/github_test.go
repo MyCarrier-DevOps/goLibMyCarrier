@@ -15,9 +15,7 @@ import (
 )
 
 // Helper functions for pointer creation (replacing deprecated github.String, github.Int, github.Bool)
-func stringPtr(s string) *string { return &s }
-func intPtr(i int) *int          { return &i }
-func boolPtr(b bool) *bool       { return &b }
+// These functions are currently unused but kept for future use if needed
 
 func TestGithubLoadConfig_Success(t *testing.T) {
 	// Set environment variables
@@ -81,7 +79,28 @@ func TestNewGithubSession_InvalidInputs(t *testing.T) {
 }
 
 func TestPullRequestOptions_Validate(t *testing.T) {
-	tests := []struct {
+	tests := getPullRequestValidationTestCases()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.opts.Validate()
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func getPullRequestValidationTestCases() []struct {
+	name    string
+	opts    *PullRequestOptions
+	wantErr bool
+	errMsg  string
+} {
+	return []struct {
 		name    string
 		opts    *PullRequestOptions
 		wantErr bool
@@ -134,142 +153,22 @@ func TestPullRequestOptions_Validate(t *testing.T) {
 			errMsg:  "head and base branches cannot be the same",
 		},
 	}
+}
+
+func TestGithubSession_CreatePullRequest(t *testing.T) {
+	tests := getCreatePullRequestTestCases(t)
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := tt.opts.Validate()
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), tt.errMsg)
-			} else {
-				assert.NoError(t, err)
-			}
+			runCreatePullRequestTest(t, tt)
 		})
 	}
 }
 
-func TestGithubSession_CreatePullRequest(t *testing.T) {
-	tests := []struct {
-		name           string
-		opts           *PullRequestOptions
-		mockResponse   func() *http.ServeMux
-		wantErr        bool
-		errMsg         string
-		validateResult func(t *testing.T, pr *github.PullRequest)
-	}{
-		{
-			name: "successful PR creation with basic options",
-			opts: &PullRequestOptions{
-				Title: "Test PR",
-				Head:  "feature-branch",
-				Base:  "main",
-			},
-			mockResponse: func() *http.ServeMux {
-				mux := http.NewServeMux()
-				mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
-					if r.Method != "POST" {
-						t.Errorf("Expected POST request, got %s", r.Method)
-					}
-
-					pr := &github.PullRequest{
-						Number: github.Ptr(1),
-						Title:  github.Ptr("Test PR"),
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("feature-branch"),
-						},
-						Base: &github.PullRequestBranch{
-							Ref: github.Ptr("main"),
-						},
-					}
-
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusCreated)
-					json.NewEncoder(w).Encode(pr)
-				})
-				return mux
-			},
-			wantErr: false,
-			validateResult: func(t *testing.T, pr *github.PullRequest) {
-				assert.Equal(t, 1, pr.GetNumber())
-				assert.Equal(t, "Test PR", pr.GetTitle())
-				assert.Equal(t, "feature-branch", pr.GetHead().GetRef())
-				assert.Equal(t, "main", pr.GetBase().GetRef())
-			},
-		},
-		{
-			name: "successful PR creation with all options",
-			opts: &PullRequestOptions{
-				Title:               "Test PR with options",
-				Head:                "feature-branch",
-				Base:                "main",
-				Body:                github.Ptr("Test body"),
-				Draft:               github.Ptr(true),
-				MaintainerCanModify: github.Ptr(true),
-				Assignees:           []string{"user1"},
-				Reviewers:           []string{"reviewer1"},
-				TeamReviewers:       []string{"team1"},
-				Labels:              []string{"bug", "enhancement"},
-				Milestone:           github.Ptr(1),
-			},
-			mockResponse: func() *http.ServeMux {
-				mux := http.NewServeMux()
-
-				// Mock PR creation
-				mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
-					pr := &github.PullRequest{
-						Number: github.Ptr(1),
-						Title:  github.Ptr("Test PR with options"),
-						Head: &github.PullRequestBranch{
-							Ref: github.Ptr("feature-branch"),
-						},
-						Base: &github.PullRequestBranch{
-							Ref: github.Ptr("main"),
-						},
-					}
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusCreated)
-					json.NewEncoder(w).Encode(pr)
-				})
-
-				// Mock assignees
-				mux.HandleFunc("/repos/owner/repo/issues/1/assignees", func(w http.ResponseWriter, r *http.Request) {
-					w.WriteHeader(http.StatusCreated)
-					json.NewEncoder(w).Encode(map[string]interface{}{})
-				})
-
-				// Mock reviewers
-				mux.HandleFunc("/repos/owner/repo/pulls/1/requested_reviewers", func(w http.ResponseWriter, r *http.Request) {
-					w.WriteHeader(http.StatusCreated)
-					json.NewEncoder(w).Encode(map[string]interface{}{})
-				})
-
-				// Mock labels
-				mux.HandleFunc("/repos/owner/repo/issues/1/labels", func(w http.ResponseWriter, r *http.Request) {
-					labels := []*github.Label{
-						{Name: github.Ptr("bug")},
-						{Name: github.Ptr("enhancement")},
-					}
-					w.WriteHeader(http.StatusCreated)
-					json.NewEncoder(w).Encode(labels)
-				})
-
-				// Mock milestone
-				mux.HandleFunc("/repos/owner/repo/issues/1", func(w http.ResponseWriter, r *http.Request) {
-					if r.Method != "PATCH" {
-						t.Errorf("Expected PATCH request for milestone, got %s", r.Method)
-					}
-					w.WriteHeader(http.StatusOK)
-					json.NewEncoder(w).Encode(map[string]interface{}{})
-				})
-
-				return mux
-			},
-			wantErr: false,
-			validateResult: func(t *testing.T, pr *github.PullRequest) {
-				assert.Equal(t, 1, pr.GetNumber())
-				assert.Equal(t, "Test PR with options", pr.GetTitle())
-			},
-		},
+func getCreatePullRequestTestCases(t *testing.T) []createPRTestCase {
+	return []createPRTestCase{
+		getBasicPRTestCase(t),
+		getAdvancedPRTestCase(t),
 		{
 			name:    "nil options",
 			opts:    nil,
@@ -287,50 +186,200 @@ func TestGithubSession_CreatePullRequest(t *testing.T) {
 			errMsg:  "invalid pull request options",
 		},
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.mockResponse != nil {
-				server := httptest.NewServer(tt.mockResponse())
-				defer server.Close()
+type createPRTestCase struct {
+	name           string
+	opts           *PullRequestOptions
+	mockResponse   func() *http.ServeMux
+	wantErr        bool
+	errMsg         string
+	validateResult func(t *testing.T, pr *github.PullRequest)
+}
 
-				// Create a session with a mock client
-				session := &GithubSession{}
-				client := github.NewClient(nil)
-				url, _ := url.Parse(server.URL + "/")
-				client.BaseURL = url
-				session.client = client
-
-				ctx := context.Background()
-				pr, err := session.CreatePullRequest(ctx, "owner", "repo", tt.opts)
-
-				if tt.wantErr {
-					assert.Error(t, err)
-					assert.Contains(t, err.Error(), tt.errMsg)
-					assert.Nil(t, pr)
-				} else {
-					assert.NoError(t, err)
-					assert.NotNil(t, pr)
-					if tt.validateResult != nil {
-						tt.validateResult(t, pr)
-					}
+func getBasicPRTestCase(t *testing.T) createPRTestCase {
+	return createPRTestCase{
+		name: "successful PR creation with basic options",
+		opts: &PullRequestOptions{
+			Title: "Test PR",
+			Head:  "feature-branch",
+			Base:  "main",
+		},
+		mockResponse: func() *http.ServeMux {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != "POST" {
+					t.Errorf("Expected POST request, got %s", r.Method)
 				}
-			} else {
-				// Test cases that don't need HTTP mocking
-				session := &GithubSession{}
-				ctx := context.Background()
-				pr, err := session.CreatePullRequest(ctx, "owner", "repo", tt.opts)
-
-				if tt.wantErr {
-					assert.Error(t, err)
-					assert.Contains(t, err.Error(), tt.errMsg)
-					assert.Nil(t, pr)
-				} else {
-					assert.NoError(t, err)
-					assert.NotNil(t, pr)
+				pr := &github.PullRequest{
+					Number: github.Ptr(1),
+					Title:  github.Ptr("Test PR"),
+					Head: &github.PullRequestBranch{
+						Ref: github.Ptr("feature-branch"),
+					},
+					Base: &github.PullRequestBranch{
+						Ref: github.Ptr("main"),
+					},
 				}
-			}
-		})
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				if err := json.NewEncoder(w).Encode(pr); err != nil {
+					t.Errorf("Failed to encode response: %v", err)
+				}
+			})
+			return mux
+		},
+		wantErr: false,
+		validateResult: func(t *testing.T, pr *github.PullRequest) {
+			assert.Equal(t, 1, pr.GetNumber())
+			assert.Equal(t, "Test PR", pr.GetTitle())
+			assert.Equal(t, "feature-branch", pr.GetHead().GetRef())
+			assert.Equal(t, "main", pr.GetBase().GetRef())
+		},
+	}
+}
+
+func getAdvancedPRTestCase(t *testing.T) createPRTestCase {
+	return createPRTestCase{
+		name: "successful PR creation with all options",
+		opts: &PullRequestOptions{
+			Title:               "Test PR with options",
+			Head:                "feature-branch",
+			Base:                "main",
+			Body:                github.Ptr("Test body"),
+			Draft:               github.Ptr(true),
+			MaintainerCanModify: github.Ptr(true),
+			Assignees:           []string{"user1"},
+			Reviewers:           []string{"reviewer1"},
+			TeamReviewers:       []string{"team1"},
+			Labels:              []string{"bug", "enhancement"},
+			Milestone:           github.Ptr(1),
+		},
+		mockResponse: createAdvancedPRMockServer(t),
+		wantErr:      false,
+		validateResult: func(t *testing.T, pr *github.PullRequest) {
+			assert.Equal(t, 1, pr.GetNumber())
+			assert.Equal(t, "Test PR with options", pr.GetTitle())
+		},
+	}
+}
+
+func createAdvancedPRMockServer(t *testing.T) func() *http.ServeMux {
+	return func() *http.ServeMux {
+		mux := http.NewServeMux()
+		setupPRCreationMock(mux, t)
+		setupAssigneesMock(mux, t)
+		setupReviewersMock(mux, t)
+		setupLabelsMock(mux, t)
+		setupMilestoneMock(mux, t)
+		return mux
+	}
+}
+
+func runCreatePullRequestTest(t *testing.T, tt createPRTestCase) {
+	if tt.mockResponse != nil {
+		runCreatePullRequestTestWithMock(t, tt)
+	} else {
+		runCreatePullRequestTestWithoutMock(t, tt)
+	}
+}
+
+func runCreatePullRequestTestWithMock(t *testing.T, tt createPRTestCase) {
+	server := httptest.NewServer(tt.mockResponse())
+	defer server.Close()
+
+	session := &GithubSession{}
+	client := github.NewClient(nil)
+	url, _ := url.Parse(server.URL + "/")
+	client.BaseURL = url
+	session.client = client
+
+	ctx := context.Background()
+	pr, err := session.CreatePullRequest(ctx, "owner", "repo", tt.opts)
+	validatePRTestResult(t, tt, pr, err)
+}
+
+func runCreatePullRequestTestWithoutMock(t *testing.T, tt createPRTestCase) {
+	session := &GithubSession{}
+	ctx := context.Background()
+	pr, err := session.CreatePullRequest(ctx, "owner", "repo", tt.opts)
+	validatePRTestResult(t, tt, pr, err)
+}
+
+func setupPRCreationMock(mux *http.ServeMux, t *testing.T) {
+	mux.HandleFunc("/repos/owner/repo/pulls", func(w http.ResponseWriter, r *http.Request) {
+		pr := &github.PullRequest{
+			Number: github.Ptr(1),
+			Title:  github.Ptr("Test PR with options"),
+			Head: &github.PullRequestBranch{
+				Ref: github.Ptr("feature-branch"),
+			},
+			Base: &github.PullRequestBranch{
+				Ref: github.Ptr("main"),
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(pr); err != nil {
+			t.Errorf("Failed to encode response: %v", err)
+		}
+	})
+}
+
+func setupAssigneesMock(mux *http.ServeMux, t *testing.T) {
+	mux.HandleFunc("/repos/owner/repo/issues/1/assignees", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{}); err != nil {
+			t.Errorf("Failed to encode response: %v", err)
+		}
+	})
+}
+
+func setupReviewersMock(mux *http.ServeMux, t *testing.T) {
+	mux.HandleFunc("/repos/owner/repo/pulls/1/requested_reviewers", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{}); err != nil {
+			t.Errorf("Failed to encode response: %v", err)
+		}
+	})
+}
+
+func setupLabelsMock(mux *http.ServeMux, t *testing.T) {
+	mux.HandleFunc("/repos/owner/repo/issues/1/labels", func(w http.ResponseWriter, r *http.Request) {
+		labels := []*github.Label{
+			{Name: github.Ptr("bug")},
+			{Name: github.Ptr("enhancement")},
+		}
+		w.WriteHeader(http.StatusCreated)
+		if err := json.NewEncoder(w).Encode(labels); err != nil {
+			t.Logf("Failed to encode labels response: %v", err)
+		}
+	})
+}
+
+func setupMilestoneMock(mux *http.ServeMux, t *testing.T) {
+	mux.HandleFunc("/repos/owner/repo/issues/1", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "PATCH" {
+			t.Errorf("Expected PATCH request for milestone, got %s", r.Method)
+		}
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{}); err != nil {
+			t.Logf("Failed to encode milestone response: %v", err)
+		}
+	})
+}
+
+func validatePRTestResult(t *testing.T, tt createPRTestCase, pr *github.PullRequest, err error) {
+	if tt.wantErr {
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), tt.errMsg)
+		assert.Nil(t, pr)
+	} else {
+		assert.NoError(t, err)
+		assert.NotNil(t, pr)
+		if tt.validateResult != nil {
+			tt.validateResult(t, pr)
+		}
 	}
 }
 
@@ -365,7 +414,9 @@ func TestGithubSession_CreatePullRequestSimple(t *testing.T) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
-			json.NewEncoder(w).Encode(pr)
+			if err := json.NewEncoder(w).Encode(pr); err != nil {
+				t.Errorf("Failed to encode response: %v", err)
+			}
 		}
 	}))
 	defer server.Close()
@@ -396,7 +447,7 @@ func BenchmarkPullRequestOptions_Validate(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		_ = opts.Validate()
 	}
 }

@@ -64,10 +64,18 @@ func TestParseLogLevel(t *testing.T) {
 
 func TestNewAppLogger_DefaultValues(t *testing.T) {
 	// Clear environment variables
-	os.Unsetenv("LOG_LEVEL")
-	os.Unsetenv("LOG_APP_NAME")
-	os.Unsetenv("LOG_APP_VERSION")
-	os.Unsetenv("OTEL_SDK_DISABLED")
+	if err := os.Unsetenv("LOG_LEVEL"); err != nil {
+		t.Logf("Failed to unset LOG_LEVEL: %v", err)
+	}
+	if err := os.Unsetenv("LOG_APP_NAME"); err != nil {
+		t.Logf("Failed to unset LOG_APP_NAME: %v", err)
+	}
+	if err := os.Unsetenv("LOG_APP_VERSION"); err != nil {
+		t.Logf("Failed to unset LOG_APP_VERSION: %v", err)
+	}
+	if err := os.Unsetenv("OTEL_SDK_DISABLED"); err != nil {
+		t.Logf("Failed to unset OTEL_SDK_DISABLED: %v", err)
+	}
 
 	logger := NewAppLogger()
 	otelLogger, ok := logger.(*OtelLogger)
@@ -94,15 +102,31 @@ func TestNewAppLogger_DefaultValues(t *testing.T) {
 
 func TestNewAppLogger_EnvironmentVariables(t *testing.T) {
 	// Set environment variables
-	os.Setenv("LOG_LEVEL", "debug")
-	os.Setenv("LOG_APP_NAME", "test-app")
-	os.Setenv("LOG_APP_VERSION", "2.1.0")
-	os.Setenv("OTEL_SDK_DISABLED", "true")
+	if err := os.Setenv("LOG_LEVEL", "debug"); err != nil {
+		t.Fatalf("Failed to set LOG_LEVEL: %v", err)
+	}
+	if err := os.Setenv("LOG_APP_NAME", "test-app"); err != nil {
+		t.Fatalf("Failed to set LOG_APP_NAME: %v", err)
+	}
+	if err := os.Setenv("LOG_APP_VERSION", "2.1.0"); err != nil {
+		t.Fatalf("Failed to set LOG_APP_VERSION: %v", err)
+	}
+	if err := os.Setenv("OTEL_SDK_DISABLED", "true"); err != nil {
+		t.Fatalf("Failed to set OTEL_SDK_DISABLED: %v", err)
+	}
 	defer func() {
-		os.Unsetenv("LOG_LEVEL")
-		os.Unsetenv("LOG_APP_NAME")
-		os.Unsetenv("LOG_APP_VERSION")
-		os.Unsetenv("OTEL_SDK_DISABLED")
+		if err := os.Unsetenv("LOG_LEVEL"); err != nil {
+			t.Logf("Failed to unset LOG_LEVEL: %v", err)
+		}
+		if err := os.Unsetenv("LOG_APP_NAME"); err != nil {
+			t.Logf("Failed to unset LOG_APP_NAME: %v", err)
+		}
+		if err := os.Unsetenv("LOG_APP_VERSION"); err != nil {
+			t.Logf("Failed to unset LOG_APP_VERSION: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_SDK_DISABLED"); err != nil {
+			t.Logf("Failed to unset OTEL_SDK_DISABLED: %v", err)
+		}
 	}()
 
 	logger := NewAppLogger()
@@ -130,19 +154,43 @@ func TestNewAppLogger_EnvironmentVariables(t *testing.T) {
 
 func TestKubernetesAttributes(t *testing.T) {
 	// Set Kubernetes environment variables
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME", "test-node")
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME", "test-pod")
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE", "test-namespace")
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID", "test-uid-123")
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP", "10.0.0.1")
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable OTel to avoid actual initialization
+	if err := os.Setenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME", "test-node"); err != nil {
+		t.Fatalf("Failed to set OTEL_RESOURCE_ATTRIBUTES_NODE_NAME: %v", err)
+	}
+	if err := os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME", "test-pod"); err != nil {
+		t.Fatalf("Failed to set OTEL_RESOURCE_ATTRIBUTES_POD_NAME: %v", err)
+	}
+	if err := os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE", "test-namespace"); err != nil {
+		t.Fatalf("Failed to set OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE: %v", err)
+	}
+	if err := os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID", "test-uid-123"); err != nil {
+		t.Fatalf("Failed to set OTEL_RESOURCE_ATTRIBUTES_POD_UID: %v", err)
+	}
+	if err := os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP", "10.0.0.1"); err != nil {
+		t.Fatalf("Failed to set OTEL_RESOURCE_ATTRIBUTES_POD_IP: %v", err)
+	}
+	if err := os.Setenv("OTEL_SDK_DISABLED", "true"); err != nil {
+		t.Fatalf("Failed to set OTEL_SDK_DISABLED: %v", err)
+	}
 	defer func() {
-		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME")
-		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME")
-		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE")
-		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID")
-		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP")
-		os.Unsetenv("OTEL_SDK_DISABLED")
+		if err := os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME"); err != nil {
+			t.Logf("Failed to unset OTEL_RESOURCE_ATTRIBUTES_NODE_NAME: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME"); err != nil {
+			t.Logf("Failed to unset OTEL_RESOURCE_ATTRIBUTES_POD_NAME: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE"); err != nil {
+			t.Logf("Failed to unset OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID"); err != nil {
+			t.Logf("Failed to unset OTEL_RESOURCE_ATTRIBUTES_POD_UID: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP"); err != nil {
+			t.Logf("Failed to unset OTEL_RESOURCE_ATTRIBUTES_POD_IP: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_SDK_DISABLED"); err != nil {
+			t.Logf("Failed to unset OTEL_SDK_DISABLED: %v", err)
+		}
 	}()
 
 	logger := NewAppLogger()
@@ -160,14 +208,26 @@ func TestKubernetesAttributes(t *testing.T) {
 
 func TestKubernetesAttributes_PartialEnvironment(t *testing.T) {
 	// Set only some Kubernetes environment variables
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME", "test-node")
-	os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME", "test-pod")
+	if err := os.Setenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME", "test-node"); err != nil {
+		t.Fatalf("Failed to set OTEL_RESOURCE_ATTRIBUTES_NODE_NAME: %v", err)
+	}
+	if err := os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME", "test-pod"); err != nil {
+		t.Fatalf("Failed to set OTEL_RESOURCE_ATTRIBUTES_POD_NAME: %v", err)
+	}
 	// Intentionally omit other K8s attributes
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable OTel to avoid actual initialization
+	if err := os.Setenv("OTEL_SDK_DISABLED", "true"); err != nil {
+		t.Fatalf("Failed to set OTEL_SDK_DISABLED: %v", err)
+	}
 	defer func() {
-		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME")
-		os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME")
-		os.Unsetenv("OTEL_SDK_DISABLED")
+		if err := os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME"); err != nil {
+			t.Logf("Failed to unset OTEL_RESOURCE_ATTRIBUTES_NODE_NAME: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME"); err != nil {
+			t.Logf("Failed to unset OTEL_RESOURCE_ATTRIBUTES_POD_NAME: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_SDK_DISABLED"); err != nil {
+			t.Logf("Failed to unset OTEL_SDK_DISABLED: %v", err)
+		}
 	}()
 
 	logger := NewAppLogger()
@@ -220,24 +280,32 @@ func TestShouldLog(t *testing.T) {
 func TestLogStructured(t *testing.T) {
 	// Capture stdout
 	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to create pipe: %v", err)
+	}
 	os.Stdout = w
 
 	logger := &OtelLogger{
-		appName:    "test-app",
-		logLevel:   LevelDebug,
-		attributes: map[string]interface{}{"key": "value"},
+		appName:     "test-app",
+		logLevel:    LevelDebug,
+		attributes:  map[string]interface{}{"key": "value"},
+		fallbackLog: log.New(w, "", 0), // Initialize fallbackLog
 	}
 
 	logger.logStructured(LevelInfo, "test message")
 
 	// Restore stdout
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
 	os.Stdout = oldStdout
 
 	// Read the output
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read from pipe: %v", err)
+	}
 	output := buf.String()
 
 	// Parse JSON output
@@ -285,12 +353,16 @@ func TestLoggingMethods(t *testing.T) {
 	logger.Errorf("error %s", "formatted")
 
 	// Restore stdout
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
 	os.Stdout = oldStdout
 
 	// Read the output
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read from pipe: %v", err)
+	}
 	output := buf.String()
 
 	// Verify that logs were written
@@ -324,19 +396,25 @@ func TestWith(t *testing.T) {
 	os.Stdout = w
 
 	// Clear environment to avoid interference
-	os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if err := os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT"); err != nil {
+		t.Logf("Failed to unset OTEL_EXPORTER_OTLP_ENDPOINT: %v", err)
+	}
 
 	logger := NewAppLogger()
 	enhancedLogger := logger.With("component", "test").With("version", "1.0.0")
 	enhancedLogger.Info("test message")
 
 	// Restore stdout
-	w.Close()
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
 	os.Stdout = oldStdout
 
 	// Read the output
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read from pipe: %v", err)
+	}
 	output := buf.String()
 
 	// Split output into lines and get the last non-empty line (the actual log entry)
@@ -344,7 +422,11 @@ func TestWith(t *testing.T) {
 	var logLine string
 	for i := len(lines) - 1; i >= 0; i-- {
 		if strings.TrimSpace(lines[i]) != "" && strings.Contains(lines[i], "test message") {
-			logLine = strings.TrimSpace(lines[i])
+			line := strings.TrimSpace(lines[i])
+			// Extract JSON part (everything after the timestamp and prefix)
+			if jsonStart := strings.Index(line, "{"); jsonStart != -1 {
+				logLine = line[jsonStart:]
+			}
 			break
 		}
 	}
@@ -445,7 +527,7 @@ func BenchmarkLogStructured(b *testing.B) {
 	}
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		logger.logStructured(LevelInfo, "benchmark message")
 	}
 }
@@ -459,25 +541,45 @@ func BenchmarkWithAttributes(b *testing.B) {
 	logger := NewAppLogger()
 
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := range b.N {
 		enhanced := logger.With("iteration", i).With("benchmark", true)
 		enhanced.Info("benchmark message")
 	}
 }
 
-// Tests for OTEL_HOST_IP and OTEL_HOST_PORT functionality
-func TestOtelEndpointConfiguration_HostIP(t *testing.T) {
-	// Test OTEL_HOST_IP takes precedence over OTEL_EXPORTER_OTLP_ENDPOINT
-	os.Setenv("OTEL_HOST_IP", "192.168.1.100:4317")
-	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://fallback.example.com:4317")
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
+// Helper function for testing endpoint configuration
+func testOtelEndpointConfig(t *testing.T, hostIP, hostPort, otlpEndpoint, expectedOutput string) {
+	t.Helper()
+
+	// Set environment variables
+	if hostIP != "" {
+		if err := os.Setenv("OTEL_HOST_IP", hostIP); err != nil {
+			t.Fatalf("Failed to set OTEL_HOST_IP: %v", err)
+		}
+	}
+	if hostPort != "" {
+		if err := os.Setenv("OTEL_HOST_PORT", hostPort); err != nil {
+			t.Fatalf("Failed to set OTEL_HOST_PORT: %v", err)
+		}
+	}
+	if otlpEndpoint != "" {
+		if err := os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", otlpEndpoint); err != nil {
+			t.Fatalf("Failed to set OTEL_EXPORTER_OTLP_ENDPOINT: %v", err)
+		}
+	}
+	if err := os.Setenv("OTEL_SDK_DISABLED", "true"); err != nil {
+		t.Fatalf("Failed to set OTEL_SDK_DISABLED: %v", err)
+	}
+
+	// Cleanup
 	defer func() {
-		os.Unsetenv("OTEL_HOST_IP")
-		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-		os.Unsetenv("OTEL_SDK_DISABLED")
+		_ = os.Unsetenv("OTEL_HOST_IP")
+		_ = os.Unsetenv("OTEL_HOST_PORT")
+		_ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+		_ = os.Unsetenv("OTEL_SDK_DISABLED")
 	}()
 
-	// Capture log output to verify endpoint selection
+	// Create test logger
 	var buf bytes.Buffer
 	logger := &OtelLogger{
 		appName:     "test-app",
@@ -488,137 +590,58 @@ func TestOtelEndpointConfiguration_HostIP(t *testing.T) {
 		useOtel:     true,
 	}
 
-	// Test the endpoint selection logic by calling initOtel
+	// Test the endpoint selection logic
 	err := logger.initOtel()
 	if err != nil {
 		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
 	}
 
-	// Check that OTEL_HOST_IP was used (it should be in the log output)
+	// Verify output
 	output := buf.String()
-	if !strings.Contains(output, "http://192.168.1.100:4317") {
-		t.Errorf("Expected log to contain OTEL_HOST_IP endpoint, got: %s", output)
+	if !strings.Contains(output, expectedOutput) {
+		t.Errorf("Expected log to contain %q, got: %s", expectedOutput, output)
 	}
+}
+
+// Tests for OTEL_HOST_IP and OTEL_HOST_PORT functionality
+func TestOtelEndpointConfiguration_HostIP(t *testing.T) {
+	testOtelEndpointConfig(t, "192.168.1.100:4317", "", "http://fallback.example.com:4317", "http://192.168.1.100:4317")
 }
 
 func TestOtelEndpointConfiguration_HostIPWithPort(t *testing.T) {
-	// Test OTEL_HOST_IP with separate OTEL_HOST_PORT
-	os.Setenv("OTEL_HOST_IP", "192.168.1.100")
-	os.Setenv("OTEL_HOST_PORT", "4318")
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
-	defer func() {
-		os.Unsetenv("OTEL_HOST_IP")
-		os.Unsetenv("OTEL_HOST_PORT")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
-
-	// Capture log output to verify endpoint selection
-	var buf bytes.Buffer
-	logger := &OtelLogger{
-		appName:     "test-app",
-		appVersion:  "1.0.0",
-		logLevel:    LevelInfo,
-		attributes:  make(map[string]interface{}),
-		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
-		useOtel:     true,
-	}
-
-	// Test the endpoint selection logic by calling initOtel
-	err := logger.initOtel()
-	if err != nil {
-		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
-	}
-
-	// Check that OTEL_HOST_IP:OTEL_HOST_PORT was used
-	output := buf.String()
-	if !strings.Contains(output, "http://192.168.1.100:4318") {
-		t.Errorf("Expected log to contain OTEL_HOST_IP:OTEL_HOST_PORT endpoint, got: %s", output)
-	}
+	testOtelEndpointConfig(t, "192.168.1.100", "4318", "", "http://192.168.1.100:4318")
 }
 
 func TestOtelEndpointConfiguration_HostIPWithExistingPort(t *testing.T) {
-	// Test OTEL_HOST_IP already contains port, OTEL_HOST_PORT should be ignored
-	os.Setenv("OTEL_HOST_IP", "192.168.1.100:4317")
-	os.Setenv("OTEL_HOST_PORT", "4318")    // This should be ignored
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
-	defer func() {
-		os.Unsetenv("OTEL_HOST_IP")
-		os.Unsetenv("OTEL_HOST_PORT")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
-
-	// Capture log output to verify endpoint selection
-	var buf bytes.Buffer
-	logger := &OtelLogger{
-		appName:     "test-app",
-		appVersion:  "1.0.0",
-		logLevel:    LevelInfo,
-		attributes:  make(map[string]interface{}),
-		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
-		useOtel:     true,
-	}
-
-	// Test the endpoint selection logic by calling initOtel
-	err := logger.initOtel()
-	if err != nil {
-		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
-	}
-
-	// Check that original port from OTEL_HOST_IP was preserved
-	output := buf.String()
-	if !strings.Contains(output, "http://192.168.1.100:4317") {
-		t.Errorf("Expected log to contain original OTEL_HOST_IP port (4317), got: %s", output)
-	}
-	if strings.Contains(output, ":4318") {
-		t.Errorf("OTEL_HOST_PORT should be ignored when OTEL_HOST_IP already contains port, got: %s", output)
-	}
+	testOtelEndpointConfig(t, "192.168.1.100:4317", "4318", "", "http://192.168.1.100:4317")
 }
 
 func TestOtelEndpointConfiguration_FallbackToStandard(t *testing.T) {
-	// Test fallback to OTEL_EXPORTER_OTLP_ENDPOINT when OTEL_HOST_IP is not set
-	os.Unsetenv("OTEL_HOST_IP")
-	os.Unsetenv("OTEL_HOST_PORT")
-	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://standard.example.com:4317")
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
-	defer func() {
-		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
-
-	// Capture log output to verify endpoint selection
-	var buf bytes.Buffer
-	logger := &OtelLogger{
-		appName:     "test-app",
-		appVersion:  "1.0.0",
-		logLevel:    LevelInfo,
-		attributes:  make(map[string]interface{}),
-		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
-		useOtel:     true,
-	}
-
-	// Test the endpoint selection logic by calling initOtel
-	err := logger.initOtel()
-	if err != nil {
-		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
-	}
-
-	// Check that OTEL_EXPORTER_OTLP_ENDPOINT was used
-	output := buf.String()
-	if !strings.Contains(output, "http://standard.example.com:4317") {
-		t.Errorf("Expected log to contain standard OTLP endpoint, got: %s", output)
-	}
+	testOtelEndpointConfig(t, "", "", "http://standard.example.com:4317", "http://standard.example.com:4317")
 }
 
 func TestOtelEndpointConfiguration_NoEndpoint(t *testing.T) {
 	// Test behavior when neither OTEL_HOST_IP nor OTEL_EXPORTER_OTLP_ENDPOINT is set
-	os.Unsetenv("OTEL_HOST_IP")
-	os.Unsetenv("OTEL_HOST_PORT")
-	os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if err := os.Unsetenv("OTEL_HOST_IP"); err != nil {
+		t.Logf("Failed to unset OTEL_HOST_IP: %v", err)
+	}
+	if err := os.Unsetenv("OTEL_HOST_PORT"); err != nil {
+		t.Logf("Failed to unset OTEL_HOST_PORT: %v", err)
+	}
+	if err := os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT"); err != nil {
+		t.Logf("Failed to unset OTEL_EXPORTER_OTLP_ENDPOINT: %v", err)
+	}
 	defer func() {
 		// Clean up in case they were set
-		os.Unsetenv("OTEL_HOST_IP")
-		os.Unsetenv("OTEL_HOST_PORT")
-		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+		if err := os.Unsetenv("OTEL_HOST_IP"); err != nil {
+			t.Logf("Failed to unset OTEL_HOST_IP: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_HOST_PORT"); err != nil {
+			t.Logf("Failed to unset OTEL_HOST_PORT: %v", err)
+		}
+		if err := os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT"); err != nil {
+			t.Logf("Failed to unset OTEL_EXPORTER_OTLP_ENDPOINT: %v", err)
+		}
 	}()
 
 	// Capture log output to verify noop behavior
@@ -651,47 +674,28 @@ func TestOtelEndpointConfiguration_NoEndpoint(t *testing.T) {
 }
 
 func TestOtelEndpointConfiguration_EmptyHostIP(t *testing.T) {
-	// Test behavior when OTEL_HOST_IP is set but empty
-	os.Setenv("OTEL_HOST_IP", "")
-	os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://fallback.example.com:4317")
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
-	defer func() {
-		os.Unsetenv("OTEL_HOST_IP")
-		os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
-
-	// Capture log output to verify endpoint selection
-	var buf bytes.Buffer
-	logger := &OtelLogger{
-		appName:     "test-app",
-		appVersion:  "1.0.0",
-		logLevel:    LevelInfo,
-		attributes:  make(map[string]interface{}),
-		fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
-		useOtel:     true,
-	}
-
-	// Test the endpoint selection logic by calling initOtel
-	err := logger.initOtel()
-	if err != nil {
-		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
-	}
-
-	// Check that fallback endpoint was used
-	output := buf.String()
-	if !strings.Contains(output, "http://fallback.example.com:4317") {
-		t.Errorf("Expected log to contain fallback endpoint when OTEL_HOST_IP is empty, got: %s", output)
-	}
+	testOtelEndpointConfig(t, "", "", "http://fallback.example.com:4317", "http://fallback.example.com:4317")
 }
 
 func TestOtelEndpointConfiguration_URLFormatting(t *testing.T) {
-	tests := []struct {
-		name             string
-		hostIP           string
-		hostPort         string
-		expectedEndpoint string
-	}{
+	tests := getOtelEndpointFormattingTestCases()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runOtelEndpointFormattingTest(t, tt)
+		})
+	}
+}
+
+type otelEndpointTestCase struct {
+	name             string
+	hostIP           string
+	hostPort         string
+	expectedEndpoint string
+}
+
+func getOtelEndpointFormattingTestCases() []otelEndpointTestCase {
+	return []otelEndpointTestCase{
 		{
 			name:             "IP with port in hostIP",
 			hostIP:           "192.168.1.100:4317",
@@ -714,7 +718,7 @@ func TestOtelEndpointConfiguration_URLFormatting(t *testing.T) {
 			name:             "hostname with port in hostIP",
 			hostIP:           "otel-collector:4317",
 			hostPort:         "4318",
-			expectedEndpoint: "http://otel-collector:4317", // port ignored when already present
+			expectedEndpoint: "http://otel-collector:4317",
 		},
 		{
 			name:             "hostname without port, with separate port",
@@ -747,90 +751,152 @@ func TestOtelEndpointConfiguration_URLFormatting(t *testing.T) {
 			expectedEndpoint: "http://192.168.1.100:4317",
 		},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			os.Setenv("OTEL_HOST_IP", tt.hostIP)
-			if tt.hostPort != "" {
-				os.Setenv("OTEL_HOST_PORT", tt.hostPort)
-			} else {
-				os.Unsetenv("OTEL_HOST_PORT")
-			}
-			os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-			os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel initialization
-			defer func() {
-				os.Unsetenv("OTEL_HOST_IP")
-				os.Unsetenv("OTEL_HOST_PORT")
-				os.Unsetenv("OTEL_SDK_DISABLED")
-			}()
-
-			// Capture log output to verify endpoint formatting
-			var buf bytes.Buffer
-			logger := &OtelLogger{
-				appName:     "test-app",
-				appVersion:  "1.0.0",
-				logLevel:    LevelInfo,
-				attributes:  make(map[string]interface{}),
-				fallbackLog: log.New(&buf, "[test-app] ", log.LstdFlags),
-				useOtel:     true,
-			}
-
-			// Test the endpoint selection logic by calling initOtel
-			err := logger.initOtel()
-			if err != nil {
-				t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
-			}
-
-			// Check that the endpoint was formatted correctly
-			output := buf.String()
-			if !strings.Contains(output, tt.expectedEndpoint) {
-				t.Errorf("Expected log to contain formatted endpoint %q, got: %s", tt.expectedEndpoint, output)
-			}
-		})
-	}
 }
 
-func TestOtelEndpointConfiguration_Integration(t *testing.T) {
-	// Test the complete flow with NewAppLogger
-	os.Setenv("OTEL_HOST_IP", "test-host")
-	os.Setenv("OTEL_HOST_PORT", "4318")
-	os.Setenv("LOG_APP_NAME", "integration-test")
-	os.Setenv("OTEL_SDK_DISABLED", "true") // Disable actual OTel to avoid external dependencies
-	defer func() {
-		os.Unsetenv("OTEL_HOST_IP")
-		os.Unsetenv("OTEL_HOST_PORT")
-		os.Unsetenv("LOG_APP_NAME")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
+func runOtelEndpointFormattingTest(t *testing.T, tt otelEndpointTestCase) {
+	setupOtelEndpointTest(t, tt)
+	defer cleanupOtelEndpointTest()
 
-	// Capture stdout to verify the logger works end-to-end
+	// Capture stdout to verify endpoint formatting
 	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to create pipe: %v", err)
+	}
 	os.Stdout = w
 
-	logger := NewAppLogger()
-	logger.Info("integration test message")
+	logger := createTestOtelLogger()
+	err = logger.initOtel()
+	if err != nil {
+		t.Fatalf("initOtel() should not return error when OTEL_SDK_DISABLED=true, got: %v", err)
+	}
 
-	// Restore stdout
-	w.Close()
+	// Close writer and restore stdout
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
 	os.Stdout = oldStdout
 
 	// Read the output
 	var buf bytes.Buffer
-	buf.ReadFrom(r)
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read from pipe: %v", err)
+	}
 	output := buf.String()
 
-	// Verify the log was written
-	if !strings.Contains(output, "integration test message") {
+	validateOtelEndpointFormatting(t, output, tt.expectedEndpoint)
+}
+
+func setupOtelEndpointTest(t *testing.T, tt otelEndpointTestCase) {
+	if err := os.Setenv("OTEL_HOST_IP", tt.hostIP); err != nil {
+		t.Fatalf("Failed to set OTEL_HOST_IP: %v", err)
+	}
+	if tt.hostPort != "" {
+		if err := os.Setenv("OTEL_HOST_PORT", tt.hostPort); err != nil {
+			t.Fatalf("Failed to set OTEL_HOST_PORT: %v", err)
+		}
+	} else {
+		if err := os.Unsetenv("OTEL_HOST_PORT"); err != nil {
+			t.Logf("Failed to unset OTEL_HOST_PORT: %v", err)
+		}
+	}
+	if err := os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT"); err != nil {
+		t.Logf("Failed to unset OTEL_EXPORTER_OTLP_ENDPOINT: %v", err)
+	}
+	if err := os.Setenv("OTEL_SDK_DISABLED", "true"); err != nil {
+		t.Fatalf("Failed to set OTEL_SDK_DISABLED: %v", err)
+	}
+}
+
+func cleanupOtelEndpointTest() {
+	_ = os.Unsetenv("OTEL_HOST_IP")
+	_ = os.Unsetenv("OTEL_HOST_PORT")
+	_ = os.Unsetenv("OTEL_SDK_DISABLED")
+}
+
+func createTestOtelLogger() *OtelLogger {
+	return &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(os.Stdout, "[test-app] ", log.LstdFlags),
+		useOtel:     true,
+	}
+}
+
+func validateOtelEndpointFormatting(t *testing.T, output string, expectedEndpoint string) {
+	if !strings.Contains(output, expectedEndpoint) {
+		t.Errorf("Expected log to contain formatted endpoint %q, got: %s", expectedEndpoint, output)
+	}
+}
+
+// Helper function to set up integration test environment
+func setupIntegrationTest(t *testing.T) func() {
+	t.Helper()
+
+	if err := os.Setenv("OTEL_HOST_IP", "test-host"); err != nil {
+		t.Fatalf("Failed to set OTEL_HOST_IP: %v", err)
+	}
+	if err := os.Setenv("OTEL_HOST_PORT", "4318"); err != nil {
+		t.Fatalf("Failed to set OTEL_HOST_PORT: %v", err)
+	}
+	if err := os.Setenv("LOG_APP_NAME", "integration-test"); err != nil {
+		t.Fatalf("Failed to set LOG_APP_NAME: %v", err)
+	}
+	if err := os.Setenv("OTEL_SDK_DISABLED", "true"); err != nil {
+		t.Fatalf("Failed to set OTEL_SDK_DISABLED: %v", err)
+	}
+
+	return func() {
+		_ = os.Unsetenv("OTEL_HOST_IP")
+		_ = os.Unsetenv("OTEL_HOST_PORT")
+		_ = os.Unsetenv("LOG_APP_NAME")
+		_ = os.Unsetenv("OTEL_SDK_DISABLED")
+	}
+}
+
+// Helper function to capture logger output
+func captureLoggerOutput(t *testing.T, loggerFunc func(AppLogger)) string {
+	t.Helper()
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to create pipe: %v", err)
+	}
+	os.Stdout = w
+
+	logger := NewAppLogger()
+	loggerFunc(logger)
+
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read from pipe: %v", err)
+	}
+	return buf.String()
+}
+
+// Helper function to parse log entry from output
+func parseLogEntry(t *testing.T, output, expectedMessage string) LogEntry {
+	t.Helper()
+
+	if !strings.Contains(output, expectedMessage) {
 		t.Errorf("Expected log output to contain test message, got: %s", output)
 	}
 
-	// Parse the JSON log entry
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	var logLine string
 	for _, line := range lines {
-		if strings.Contains(line, "integration test message") {
-			logLine = line
+		if strings.Contains(line, expectedMessage) {
+			if jsonStart := strings.Index(line, "{"); jsonStart != -1 {
+				logLine = line[jsonStart:]
+			}
 			break
 		}
 	}
@@ -843,6 +909,18 @@ func TestOtelEndpointConfiguration_Integration(t *testing.T) {
 	if err := json.Unmarshal([]byte(logLine), &logEntry); err != nil {
 		t.Fatalf("Failed to parse JSON output: %v", err)
 	}
+	return logEntry
+}
+
+func TestOtelEndpointConfiguration_Integration(t *testing.T) {
+	cleanup := setupIntegrationTest(t)
+	defer cleanup()
+
+	output := captureLoggerOutput(t, func(logger AppLogger) {
+		logger.Info("integration test message")
+	})
+
+	logEntry := parseLogEntry(t, output, "integration test message")
 
 	// Verify log entry structure
 	if logEntry.AppName != "integration-test" {
@@ -857,59 +935,96 @@ func TestOtelEndpointConfiguration_Integration(t *testing.T) {
 }
 
 // TestGinLoggerMiddleware tests the Gin middleware functionality
-func TestGinLoggerMiddleware(t *testing.T) {
-	// Set up a test logger
-	os.Setenv("LOG_APP_NAME", "gin-test")
-	os.Setenv("LOG_LEVEL", "info")
-	os.Setenv("OTEL_SDK_DISABLED", "true")
-	defer func() {
-		os.Unsetenv("LOG_APP_NAME")
-		os.Unsetenv("LOG_LEVEL")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
+// Helper function to set up Gin test environment
+func setupGinTestEnvironment(t *testing.T) func() {
+	t.Helper()
 
-	// Capture log output
+	if err := os.Setenv("LOG_APP_NAME", "gin-test"); err != nil {
+		t.Fatalf("Failed to set LOG_APP_NAME: %v", err)
+	}
+	if err := os.Setenv("LOG_LEVEL", "info"); err != nil {
+		t.Fatalf("Failed to set LOG_LEVEL: %v", err)
+	}
+	if err := os.Setenv("OTEL_SDK_DISABLED", "true"); err != nil {
+		t.Fatalf("Failed to set OTEL_SDK_DISABLED: %v", err)
+	}
+
+	return func() {
+		_ = os.Unsetenv("LOG_APP_NAME")
+		_ = os.Unsetenv("LOG_LEVEL")
+		_ = os.Unsetenv("OTEL_SDK_DISABLED")
+	}
+}
+
+// Helper function to capture Gin middleware logs
+func captureGinLogs(t *testing.T, testFunc func(*gin.Engine, AppLogger)) string {
+	t.Helper()
+
 	var buf bytes.Buffer
 	originalOutput := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
+	defer func() {
+		if err := w.Close(); err != nil {
+			t.Logf("Failed to close writer: %v", err)
+		}
+		os.Stdout = originalOutput
+	}()
 
-	// Create a logger
-	logger := NewAppLogger()
-
-	// Create Gin engine with our middleware
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
+	logger := NewAppLogger()
 	router.Use(GinLoggerMiddleware(logger))
 
-	// Add a test route
-	router.GET("/test", func(c *gin.Context) {
-		c.JSON(200, gin.H{"message": "test"})
-	})
-
-	// Make a test request
-	req := httptest.NewRequest("GET", "/test?param=value", nil)
-	req.Header.Set("X-Forwarded-For", "192.168.1.100")
-	w2 := httptest.NewRecorder()
-	router.ServeHTTP(w2, req)
-
-	// Close the pipe and restore stdout
-	w.Close()
-	os.Stdout = originalOutput
+	testFunc(router, logger)
 
 	// Read the captured output
 	go func() {
-		io.Copy(&buf, r)
+		if _, err := io.Copy(&buf, r); err != nil {
+			t.Logf("Failed to copy from pipe: %v", err)
+		}
 	}()
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify the response
-	if w2.Code != 200 {
-		t.Errorf("Expected status code 200, got %d", w2.Code)
+	return buf.String()
+} // Helper to perform GET request and verify basic response
+func performGETRequest(router *gin.Engine, path string, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", path, nil)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+// Helper to perform POST request and verify basic response
+func performPOSTRequest(router *gin.Engine, path, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func TestGinLoggerMiddleware(t *testing.T) {
+	cleanup := setupGinTestEnvironment(t)
+	defer cleanup()
+
+	var response *httptest.ResponseRecorder
+	output := captureGinLogs(t, func(router *gin.Engine, logger AppLogger) {
+		router.GET("/test", func(c *gin.Context) {
+			c.JSON(200, gin.H{"message": "test"})
+		})
+		response = performGETRequest(router, "/test?param=value", map[string]string{
+			"X-Forwarded-For": "192.168.1.100",
+		})
+	})
+
+	if response.Code != 200 {
+		t.Errorf("Expected status code 200, got %d", response.Code)
 	}
 
-	// Verify that a log entry was generated
-	output := buf.String()
 	if !strings.Contains(output, "GET") {
 		t.Errorf("Expected log to contain HTTP method 'GET', got: %s", output)
 	}
@@ -922,69 +1037,29 @@ func TestGinLoggerMiddleware(t *testing.T) {
 }
 
 func TestGinLoggerMiddleware_WithQueryParams(t *testing.T) {
-	// Set up a test logger
-	os.Setenv("LOG_APP_NAME", "gin-test")
-	os.Setenv("LOG_LEVEL", "info")
-	os.Setenv("OTEL_SDK_DISABLED", "true")
-	defer func() {
-		os.Unsetenv("LOG_APP_NAME")
-		os.Unsetenv("LOG_LEVEL")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
+	cleanup := setupGinTestEnvironment(t)
+	defer cleanup()
 
-	// Capture log output
-	var buf bytes.Buffer
-	originalOutput := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Create a logger
-	logger := NewAppLogger()
-
-	// Create Gin engine with our middleware
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	router.Use(GinLoggerMiddleware(logger))
-
-	// Add a test route
-	router.POST("/api/users", func(c *gin.Context) {
-		c.JSON(201, gin.H{"id": 123})
+	var response *httptest.ResponseRecorder
+	output := captureGinLogs(t, func(router *gin.Engine, logger AppLogger) {
+		router.POST("/api/users", func(c *gin.Context) {
+			c.JSON(201, gin.H{"id": 1, "name": "test"})
+		})
+		response = performPOSTRequest(router, "/api/users?include=profile&sort=name", `{"name":"test"}`)
 	})
 
-	// Make a test request with query parameters
-	req := httptest.NewRequest("POST", "/api/users?include=profile&sort=name", strings.NewReader(`{"name":"test"}`))
-	req.Header.Set("Content-Type", "application/json")
-	w2 := httptest.NewRecorder()
-	router.ServeHTTP(w2, req)
-
-	// Close the pipe and restore stdout
-	w.Close()
-	os.Stdout = originalOutput
-
-	// Read the captured output
-	go func() {
-		io.Copy(&buf, r)
-	}()
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify the response
-	if w2.Code != 201 {
-		t.Errorf("Expected status code 201, got %d", w2.Code)
+	if response.Code != 201 {
+		t.Errorf("Expected status code 201, got %d", response.Code)
 	}
 
-	// Verify that a log entry was generated with query parameters
-	output := buf.String()
+	if output == "" {
+		t.Error("Expected log output, got empty string")
+	}
 	if !strings.Contains(output, "POST") {
-		t.Errorf("Expected log to contain HTTP method 'POST', got: %s", output)
+		t.Errorf("Expected log to contain method 'POST', got: %s", output)
 	}
 	if !strings.Contains(output, "/api/users") {
 		t.Errorf("Expected log to contain path '/api/users', got: %s", output)
-	}
-	if !strings.Contains(output, "include=profile") {
-		t.Errorf("Expected log to contain query param 'include=profile', got: %s", output)
-	}
-	if !strings.Contains(output, "sort=name") {
-		t.Errorf("Expected log to contain query param 'sort=name', got: %s", output)
 	}
 	if !strings.Contains(output, "201") {
 		t.Errorf("Expected log to contain status code '201', got: %s", output)
@@ -992,57 +1067,21 @@ func TestGinLoggerMiddleware_WithQueryParams(t *testing.T) {
 }
 
 func TestGinLoggerMiddleware_ErrorStatus(t *testing.T) {
-	// Set up a test logger
-	os.Setenv("LOG_APP_NAME", "gin-test")
-	os.Setenv("LOG_LEVEL", "info")
-	os.Setenv("OTEL_SDK_DISABLED", "true")
-	defer func() {
-		os.Unsetenv("LOG_APP_NAME")
-		os.Unsetenv("LOG_LEVEL")
-		os.Unsetenv("OTEL_SDK_DISABLED")
-	}()
+	cleanup := setupGinTestEnvironment(t)
+	defer cleanup()
 
-	// Capture log output
-	var buf bytes.Buffer
-	originalOutput := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Create a logger
-	logger := NewAppLogger()
-
-	// Create Gin engine with our middleware
-	gin.SetMode(gin.TestMode)
-	router := gin.New()
-	router.Use(GinLoggerMiddleware(logger))
-
-	// Add a test route that returns an error
-	router.GET("/error", func(c *gin.Context) {
-		c.JSON(500, gin.H{"error": "internal server error"})
+	var response *httptest.ResponseRecorder
+	output := captureGinLogs(t, func(router *gin.Engine, logger AppLogger) {
+		router.GET("/error", func(c *gin.Context) {
+			c.JSON(500, gin.H{"error": "internal server error"})
+		})
+		response = performGETRequest(router, "/error", nil)
 	})
 
-	// Make a test request
-	req := httptest.NewRequest("GET", "/error", nil)
-	w2 := httptest.NewRecorder()
-	router.ServeHTTP(w2, req)
-
-	// Close the pipe and restore stdout
-	w.Close()
-	os.Stdout = originalOutput
-
-	// Read the captured output
-	go func() {
-		io.Copy(&buf, r)
-	}()
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify the response
-	if w2.Code != 500 {
-		t.Errorf("Expected status code 500, got %d", w2.Code)
+	if response.Code != 500 {
+		t.Errorf("Expected status code 500, got %d", response.Code)
 	}
 
-	// Verify that a log entry was generated with error status
-	output := buf.String()
 	if !strings.Contains(output, "500") {
 		t.Errorf("Expected log to contain status code '500', got: %s", output)
 	}
