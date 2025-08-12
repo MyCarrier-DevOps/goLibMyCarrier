@@ -21,7 +21,7 @@ test:
 	@for dir in auth clickhouse github kafka logger otel vault yaml; do \
 		if [ -d "$$dir" ]; then \
 			echo "Testing $$dir module..."; \
-			(cd $$dir && go mod download && go test ./...); \
+			(cd $$dir && go mod download && go test -cover ./...); \
 		else \
 			echo "Directory $$dir not found, skipping..."; \
 		fi; \

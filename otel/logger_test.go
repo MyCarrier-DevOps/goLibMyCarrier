@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 func TestLogLevel_String(t *testing.T) {
@@ -1087,5 +1088,335 @@ func TestGinLoggerMiddleware_ErrorStatus(t *testing.T) {
 	}
 	if !strings.Contains(output, "/error") {
 		t.Errorf("Expected log to contain path '/error', got: %s", output)
+	}
+}
+
+// Additional tests to improve coverage
+
+func TestOtelLogger_Shutdown(t *testing.T) {
+	// Test shutdown with no providers
+	logger := &OtelLogger{}
+	ctx := context.Background()
+	err := logger.Shutdown(ctx)
+	if err != nil {
+		t.Errorf("Shutdown with no providers should not return error, got: %v", err)
+	}
+
+	// Test with mock providers would require complex mocking
+	// The existing test covers the basic case
+}
+
+func TestOtelLogger_formatOtlpEndpoint(t *testing.T) {
+	logger := &OtelLogger{}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"empty endpoint", "", ""},
+		{"endpoint with trailing slash", "http://localhost:4317/", "http://localhost:4317"},
+		{"endpoint without protocol", "localhost:4317", "http://localhost:4317"},
+		{"https endpoint", "https://collector.example.com:4317", "https://collector.example.com:4317"},
+		{"http endpoint", "http://collector.example.com:4317", "http://collector.example.com:4317"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := logger.formatOtlpEndpoint(tt.input)
+			if result != tt.expected {
+				t.Errorf("formatOtlpEndpoint(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestOtelLogger_getOtlpEndpoint(t *testing.T) {
+	logger := &OtelLogger{}
+
+	// Test with OTEL_HOST_IP and OTEL_HOST_PORT
+	_ = os.Setenv("OTEL_HOST_IP", "192.168.1.100")
+	_ = os.Setenv("OTEL_HOST_PORT", "4317")
+	defer func() {
+		_ = os.Unsetenv("OTEL_HOST_IP")
+		_ = os.Unsetenv("OTEL_HOST_PORT")
+	}()
+
+	result := logger.getOtlpEndpoint()
+	expected := "http://192.168.1.100:4317"
+	if result != expected {
+		t.Errorf("getOtlpEndpoint() = %q, want %q", result, expected)
+	}
+
+	// Test with OTEL_HOST_IP only (no port)
+	_ = os.Unsetenv("OTEL_HOST_PORT")
+	result = logger.getOtlpEndpoint()
+	expected = "http://192.168.1.100"
+	if result != expected {
+		t.Errorf("getOtlpEndpoint() = %q, want %q", result, expected)
+	}
+
+	// Test with OTEL_HOST_IP containing port
+	_ = os.Setenv("OTEL_HOST_IP", "192.168.1.100:4318")
+	_ = os.Setenv("OTEL_HOST_PORT", "4317") // Should be ignored
+	result = logger.getOtlpEndpoint()
+	expected = "http://192.168.1.100:4318"
+	if result != expected {
+		t.Errorf("getOtlpEndpoint() = %q, want %q", result, expected)
+	}
+
+	// Test fallback to OTEL_EXPORTER_OTLP_ENDPOINT
+	_ = os.Unsetenv("OTEL_HOST_IP")
+	_ = os.Unsetenv("OTEL_HOST_PORT")
+	_ = os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://otel.example.com:4317")
+	defer func() { _ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT") }()
+
+	result = logger.getOtlpEndpoint()
+	expected = "https://otel.example.com:4317"
+	if result != expected {
+		t.Errorf("getOtlpEndpoint() = %q, want %q", result, expected)
+	}
+}
+
+func TestOtelLogger_handleDisabledOtel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		fallbackLog: log.New(&buf, "[test] ", 0),
+	}
+
+	// Test with endpoint
+	_ = os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+	defer func() { _ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT") }()
+
+	err := logger.handleDisabledOtel()
+	if err != nil {
+		t.Errorf("handleDisabledOtel() should not return error, got: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "Using OTLP endpoint: http://localhost:4317") {
+		t.Errorf("Expected log to contain endpoint info, got: %s", output)
+	}
+	if !strings.Contains(output, "OpenTelemetry SDK is disabled") {
+		t.Errorf("Expected log to contain disabled message, got: %s", output)
+	}
+}
+
+func TestOtelLogger_addKubernetesAttributes(t *testing.T) {
+	logger := &OtelLogger{}
+
+	// Set Kubernetes environment variables
+	_ = os.Setenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME", "node-1")
+	_ = os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME", "my-pod")
+	_ = os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE", "default")
+	_ = os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID", "12345-67890")
+	_ = os.Setenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP", "10.244.0.5")
+
+	defer func() {
+		_ = os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_NODE_NAME")
+		_ = os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAME")
+		_ = os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE")
+		_ = os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_UID")
+		_ = os.Unsetenv("OTEL_RESOURCE_ATTRIBUTES_POD_IP")
+	}()
+
+	var resourceAttrs []attribute.KeyValue
+	logger.addKubernetesAttributes(&resourceAttrs)
+
+	// Check that all Kubernetes attributes were added
+	expectedAttrs := map[string]string{
+		"k8s.node.name":      "node-1",
+		"k8s.pod.name":       "my-pod",
+		"k8s.namespace.name": "default",
+		"k8s.pod.uid":        "12345-67890",
+		"k8s.pod.ip":         "10.244.0.5",
+	}
+
+	if len(resourceAttrs) != len(expectedAttrs) {
+		t.Errorf("Expected %d attributes, got %d", len(expectedAttrs), len(resourceAttrs))
+	}
+
+	for _, attr := range resourceAttrs {
+		key := string(attr.Key)
+		value := attr.Value.AsString()
+		if expectedValue, exists := expectedAttrs[key]; exists {
+			if value != expectedValue {
+				t.Errorf("Expected %s = %s, got %s", key, expectedValue, value)
+			}
+		} else {
+			t.Errorf("Unexpected attribute: %s = %s", key, value)
+		}
+	}
+}
+
+func TestOtelLogger_addKubernetesAttributes_Empty(t *testing.T) {
+	logger := &OtelLogger{}
+
+	// Ensure no Kubernetes environment variables are set
+	envVars := []string{
+		"OTEL_RESOURCE_ATTRIBUTES_NODE_NAME",
+		"OTEL_RESOURCE_ATTRIBUTES_POD_NAME",
+		"OTEL_RESOURCE_ATTRIBUTES_POD_NAMESPACE",
+		"OTEL_RESOURCE_ATTRIBUTES_POD_UID",
+		"OTEL_RESOURCE_ATTRIBUTES_POD_IP",
+	}
+	for _, env := range envVars {
+		_ = os.Unsetenv(env)
+	}
+
+	var resourceAttrs []attribute.KeyValue
+	logger.addKubernetesAttributes(&resourceAttrs)
+
+	// Should not add any attributes when environment variables are not set
+	if len(resourceAttrs) != 0 {
+		t.Errorf("Expected 0 attributes when no env vars set, got %d", len(resourceAttrs))
+	}
+}
+
+func TestOtelLogger_initOtel_Disabled(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		fallbackLog: log.New(&buf, "[test] ", 0),
+	}
+
+	// Test with OTEL_SDK_DISABLED=true
+	_ = os.Setenv("OTEL_SDK_DISABLED", "true")
+	defer func() { _ = os.Unsetenv("OTEL_SDK_DISABLED") }()
+
+	err := logger.initOtel()
+	if err != nil {
+		t.Errorf("initOtel() with disabled SDK should not return error, got: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "OpenTelemetry SDK is disabled") {
+		t.Errorf("Expected log to contain disabled message, got: %s", output)
+	}
+}
+
+func TestOtelLogger_initOtel_NoEndpoint(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		fallbackLog: log.New(&buf, "[test] ", 0),
+	}
+
+	// Ensure no endpoint environment variables are set
+	_ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	_ = os.Unsetenv("OTEL_HOST_IP")
+	_ = os.Unsetenv("OTEL_HOST_PORT")
+	_ = os.Unsetenv("OTEL_SDK_DISABLED")
+
+	err := logger.initOtel()
+	if err != nil {
+		t.Errorf("initOtel() with no endpoint should not return error, got: %v", err)
+	}
+
+	output := buf.String()
+	if !strings.Contains(output, "no OTLP endpoint configured, using noop exporter") {
+		t.Errorf("Expected log to contain noop exporter message, got: %s", output)
+	}
+
+	// Should have set up a tracer even without endpoint
+	if logger.tracer == nil {
+		t.Error("Expected tracer to be set even without endpoint")
+	}
+}
+
+func TestOtelLogger_logStructured_JSONMarshalError(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		fallbackLog: log.New(&buf, "", 0),
+		attributes: map[string]interface{}{
+			"invalid": func() {}, // Functions can't be marshaled to JSON
+		},
+	}
+
+	logger.logStructured(LevelInfo, "test message")
+
+	output := buf.String()
+	// Should fall back to simple logging when JSON marshaling fails
+	if !strings.Contains(output, "test message") {
+		t.Errorf("Expected fallback log to contain message, got: %s", output)
+	}
+}
+
+func TestOtelLogger_sendOtelLog(t *testing.T) {
+	// Test with nil logger (should not panic)
+	logger := &OtelLogger{}
+	logger.sendOtelLog(LevelInfo, "test message")
+
+	// Test should not panic and complete without error
+	// More comprehensive testing would require mocking the otel logger
+}
+
+func TestNewAppLogger_WithEnvironmentVariables(t *testing.T) {
+	// Set all environment variables
+	_ = os.Setenv("LOG_LEVEL", "debug")
+	_ = os.Setenv("LOG_APP_NAME", "custom-app")
+	_ = os.Setenv("LOG_APP_VERSION", "2.0.0")
+	_ = os.Setenv("OTEL_SDK_DISABLED", "false") // Enable OTel
+
+	defer func() {
+		_ = os.Unsetenv("LOG_LEVEL")
+		_ = os.Unsetenv("LOG_APP_NAME")
+		_ = os.Unsetenv("LOG_APP_VERSION")
+		_ = os.Unsetenv("OTEL_SDK_DISABLED")
+	}()
+
+	logger := NewAppLogger()
+	otelLogger := logger.(*OtelLogger)
+
+	if otelLogger.appName != "custom-app" {
+		t.Errorf("Expected appName 'custom-app', got '%s'", otelLogger.appName)
+	}
+	if otelLogger.appVersion != "2.0.0" {
+		t.Errorf("Expected appVersion '2.0.0', got '%s'", otelLogger.appVersion)
+	}
+	if otelLogger.logLevel != LevelDebug {
+		t.Errorf("Expected logLevel LevelDebug, got %v", otelLogger.logLevel)
+	}
+	if !otelLogger.useOtel {
+		t.Error("Expected useOtel to be true when OTEL_SDK_DISABLED=false")
+	}
+}
+
+func TestNewAppLogger_OtelDisabled(t *testing.T) {
+	_ = os.Setenv("OTEL_SDK_DISABLED", "true")
+	defer func() { _ = os.Unsetenv("OTEL_SDK_DISABLED") }()
+
+	logger := NewAppLogger()
+	otelLogger := logger.(*OtelLogger)
+
+	if otelLogger.useOtel {
+		t.Error("Expected useOtel to be false when OTEL_SDK_DISABLED=true")
+	}
+}
+
+func TestOtelLogger_logFallback(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		fallbackLog: log.New(&buf, "", 0),
+		attributes: map[string]interface{}{
+			"key1": "value1",
+			"key2": 42,
+		},
+	}
+
+	logger.logFallback(LevelError, "test error message")
+
+	output := buf.String()
+	if !strings.Contains(output, "ERROR") {
+		t.Errorf("Expected log to contain 'ERROR', got: %s", output)
+	}
+	if !strings.Contains(output, "test error message") {
+		t.Errorf("Expected log to contain message, got: %s", output)
+	}
+	if !strings.Contains(output, "key1=value1") {
+		t.Errorf("Expected log to contain attributes, got: %s", output)
+	}
+	if !strings.Contains(output, "key2=42") {
+		t.Errorf("Expected log to contain attributes, got: %s", output)
 	}
 }

@@ -96,6 +96,12 @@ func VaultValidateConfig(config *VaultConfig) error {
 
 // AppRoleAuthenticator implements VaultAuthenticator interface
 func (a *AppRoleAuthenticator) Authenticate(ctx context.Context, client *vault.Client, config *VaultConfig) error {
+	if client == nil {
+		return fmt.Errorf("vault client cannot be nil")
+	}
+	if config == nil {
+		return fmt.Errorf("vault config cannot be nil")
+	}
 	if config.Credentials.RoleID == "" || config.Credentials.SecretID == "" {
 		return nil // No credentials provided, skip authentication
 	}

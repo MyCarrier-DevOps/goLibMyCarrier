@@ -12,6 +12,31 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
+// ClickhouseSessionInterface defines the interface for ClickHouse session operations
+type ClickhouseSessionInterface interface {
+	Connect(ch *ClickhouseConfig, context context.Context) error
+	Query(ctx context.Context, query string) (driver.Rows, error)
+	Exec(ctx context.Context, stmt string) error
+	Close() error
+	Conn() driver.Conn
+}
+
+// ConfigLoaderInterface defines the interface for configuration loading
+type ConfigLoaderInterface interface {
+	LoadConfig() (*ClickhouseConfig, error)
+}
+
+// ConfigValidatorInterface defines the interface for configuration validation
+type ConfigValidatorInterface interface {
+	ValidateConfig(config *ClickhouseConfig) error
+}
+
+// SessionFactoryInterface defines the interface for creating ClickHouse sessions
+type SessionFactoryInterface interface {
+	NewSession(ch *ClickhouseConfig, context context.Context) (ClickhouseSessionInterface, error)
+}
+
+// ClickhouseSession implements ClickhouseSessionInterface
 type ClickhouseSession struct {
 	conn       driver.Conn
 	db         string
@@ -98,8 +123,39 @@ func ClickhouseValidateConfig(clickhouseConfig *ClickhouseConfig) error {
 	return nil
 }
 
+// DefaultConfigLoader implements ConfigLoaderInterface
+type DefaultConfigLoader struct{}
+
+// LoadConfig implements ConfigLoaderInterface
+func (c *DefaultConfigLoader) LoadConfig() (*ClickhouseConfig, error) {
+	return ClickhouseLoadConfig()
+}
+
+// DefaultConfigValidator implements ConfigValidatorInterface
+type DefaultConfigValidator struct{}
+
+// ValidateConfig implements ConfigValidatorInterface
+func (v *DefaultConfigValidator) ValidateConfig(config *ClickhouseConfig) error {
+	return ClickhouseValidateConfig(config)
+}
+
+// DefaultSessionFactory implements SessionFactoryInterface
+type DefaultSessionFactory struct{}
+
+// NewSession implements SessionFactoryInterface
+func (f *DefaultSessionFactory) NewSession(
+	ch *ClickhouseConfig,
+	context context.Context,
+) (ClickhouseSessionInterface, error) {
+	return NewClickhouseSession(ch, context)
+}
+
 // NewClickhouseSession creates a new Clickhouse session.
 func NewClickhouseSession(ch *ClickhouseConfig, context context.Context) (*ClickhouseSession, error) {
+	if ch == nil {
+		return nil, fmt.Errorf("clickhouse config cannot be nil")
+	}
+
 	conn := &ClickhouseSession{
 		db:         ch.ChDatabase,
 		addr:       []string{ch.ChHostname + ":" + ch.ChPort},
@@ -118,6 +174,13 @@ func NewClickhouseSession(ch *ClickhouseConfig, context context.Context) (*Click
 
 // Connect to ClickHouse database
 func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, context context.Context) error {
+	if ch == nil {
+		return fmt.Errorf("clickhouse config cannot be nil")
+	}
+	if context == nil {
+		return fmt.Errorf("context cannot be nil")
+	}
+
 	var (
 		ctx       = context
 		conn, err = clickhouse.Open(&clickhouse.Options{
@@ -151,6 +214,9 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, context contex
 
 // Query ClickHouse database
 func (ch *ClickhouseSession) Query(ctx context.Context, query string) (driver.Rows, error) {
+	if ch.conn == nil {
+		return nil, fmt.Errorf("clickhouse connection is not established")
+	}
 	rows, err := ch.conn.Query(ctx, query)
 	if err != nil {
 		return nil, err
@@ -160,6 +226,9 @@ func (ch *ClickhouseSession) Query(ctx context.Context, query string) (driver.Ro
 
 // Exec ClickHouse query
 func (ch *ClickhouseSession) Exec(ctx context.Context, stmt string) error {
+	if ch.conn == nil {
+		return fmt.Errorf("clickhouse connection is not established")
+	}
 	err := ch.conn.Exec(ctx, stmt)
 	if err != nil {
 		return err

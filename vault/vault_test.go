@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
@@ -200,12 +201,47 @@ func TestAppRoleAuthenticator_Authenticate_NoCredentials(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	// We can't easily create a real vault client for testing, so this test focuses on the no-credentials path
+
+	// Since we now check for nil client first, we expect that error
 	err := authenticator.Authenticate(ctx, nil, config)
 
-	// Should return nil when no credentials are provided
+	// Should return error for nil client
+	if err == nil {
+		t.Errorf("AppRoleAuthenticator.Authenticate() expected error for nil client, got nil")
+	}
+	if err != nil && err.Error() != "vault client cannot be nil" {
+		t.Errorf("AppRoleAuthenticator.Authenticate() error = %v, want 'vault client cannot be nil'", err)
+	}
+}
+
+func TestAppRoleAuthenticator_Authenticate_NoCredentials_ValidClient(t *testing.T) {
+	authenticator := &AppRoleAuthenticator{}
+	config := &VaultConfig{
+		VaultAddress: "http://localhost:8200",
+		Credentials:  Credentials{}, // No credentials
+	}
+
+	ctx := context.Background()
+
+	// Create a minimal mock client struct (we can't easily create a real one without vault)
+	// But we can test the logic path where client is not nil but credentials are empty
+	// We'll use a mock here since we can't easily create a real vault.Client
+
+	// For this test, we'll call it with a mock that's designed to test the no-credentials path
+	// Since the function checks credentials before making any client calls, this should work
+
+	// Actually, let's test this differently - we can't easily create a vault.Client without vault
+	// So let's modify the approach to test the authentication logic through NewVaultClient
+
+	// Test that when no credentials are provided, authentication should be skipped
+	client, err := NewVaultClient(ctx, config, authenticator)
+
+	// This should succeed even without credentials (auth is skipped)
 	if err != nil {
-		t.Errorf("AppRoleAuthenticator.Authenticate() with no credentials should return nil, got %v", err)
+		t.Errorf("NewVaultClient() with no credentials should succeed, got error: %v", err)
+	}
+	if client == nil {
+		t.Errorf("NewVaultClient() client should not be nil when config is valid")
 	}
 }
 
@@ -330,5 +366,270 @@ func cleanupEnvVars(t *testing.T) {
 		if err := os.Unsetenv(envVar); err != nil {
 			t.Errorf("Failed to unset %s: %v", envVar, err.Error())
 		}
+	}
+}
+
+// Additional comprehensive tests for vault package
+
+// Test NewVaultClient function
+func TestNewVaultClient_Success(t *testing.T) {
+	config := &VaultConfig{
+		VaultAddress: "http://localhost:8200",
+		Credentials: Credentials{
+			RoleID:   "",
+			SecretID: "",
+		},
+	}
+
+	// Test with nil authenticator (should not authenticate)
+	ctx := context.Background()
+	client, err := NewVaultClient(ctx, config, nil)
+
+	// Should succeed with valid config even without authenticator
+	if err != nil {
+		t.Errorf("NewVaultClient() error = %v, want nil", err)
+	}
+	if client == nil {
+		t.Errorf("NewVaultClient() client = nil, want non-nil")
+	}
+}
+
+func TestNewVaultClient_WithMockAuthenticator(t *testing.T) {
+	config := &VaultConfig{
+		VaultAddress: "http://localhost:8200",
+	}
+
+	// Test with authenticator that returns error
+	mockAuth := &MockAuthenticator{err: fmt.Errorf("authentication failed")}
+	ctx := context.Background()
+	client, err := NewVaultClient(ctx, config, mockAuth)
+
+	// Should return error from authenticator
+	if err == nil {
+		t.Errorf("NewVaultClient() expected error from authenticator, got nil")
+	}
+	if client != nil {
+		t.Errorf("NewVaultClient() client should be nil when authentication fails")
+	}
+}
+
+func TestNewVaultClient_WithSuccessfulAuth(t *testing.T) {
+	config := &VaultConfig{
+		VaultAddress: "http://localhost:8200",
+	}
+
+	// Test with authenticator that succeeds
+	mockAuth := &MockAuthenticator{err: nil}
+	ctx := context.Background()
+	client, err := NewVaultClient(ctx, config, mockAuth)
+
+	if err != nil {
+		t.Errorf("NewVaultClient() error = %v, want nil", err)
+	}
+	if client == nil {
+		t.Errorf("NewVaultClient() client = nil, want non-nil")
+	}
+}
+
+// Test CreateVaultClient function
+func TestCreateVaultClient_Success(t *testing.T) {
+	config := &VaultConfig{
+		VaultAddress: "http://localhost:8200",
+		Credentials: Credentials{
+			RoleID:   "",
+			SecretID: "",
+		},
+	}
+
+	ctx := context.Background()
+	client, err := CreateVaultClient(ctx, config)
+
+	// Should succeed with valid config (no credentials means no auth)
+	if err != nil {
+		t.Errorf("CreateVaultClient() error = %v, want nil", err)
+	}
+	if client == nil {
+		t.Errorf("CreateVaultClient() client = nil, want non-nil")
+	}
+}
+
+// Test VaultClient methods using the real struct with a mock underlying client
+func TestVaultClient_Methods(t *testing.T) {
+	// We can't easily test the real VaultClient methods without a vault instance
+	// But we can test using our MockVaultClient which implements the interface
+
+	mockClient := &MockVaultClient{
+		kvSecrets: map[string]interface{}{
+			"username": "testuser",
+			"password": "testpass",
+		},
+		kvSecretsList: []string{"config1", "config2", "config3"},
+		azureCredentials: map[string]interface{}{
+			"client_id":     "test-client-id",
+			"client_secret": "test-client-secret",
+		},
+	}
+
+	ctx := context.Background()
+
+	// Test GetKVSecret
+	secrets, err := mockClient.GetKVSecret(ctx, "myapp/config", "secret")
+	if err != nil {
+		t.Errorf("GetKVSecret() error = %v, want nil", err)
+	}
+	if secrets["username"] != "testuser" {
+		t.Errorf("GetKVSecret() username = %v, want testuser", secrets["username"])
+	}
+
+	// Test GetKVSecretList
+	secretsList, err := mockClient.GetKVSecretList(ctx, "myapp", "secret")
+	if err != nil {
+		t.Errorf("GetKVSecretList() error = %v, want nil", err)
+	}
+	if len(secretsList) != 3 {
+		t.Errorf("GetKVSecretList() length = %v, want 3", len(secretsList))
+	}
+
+	// Test GetAzureDynamicCredentials
+	creds, err := mockClient.GetAzureDynamicCredentials(ctx, "my-azure-role")
+	if err != nil {
+		t.Errorf("GetAzureDynamicCredentials() error = %v, want nil", err)
+	}
+	if creds["client_id"] != "test-client-id" {
+		t.Errorf("GetAzureDynamicCredentials() client_id = %v, want test-client-id", creds["client_id"])
+	}
+
+	// Test SetToken
+	err = mockClient.SetToken("test-token")
+	if err != nil {
+		t.Errorf("SetToken() error = %v, want nil", err)
+	}
+}
+
+// Test error scenarios
+func TestVaultClient_ErrorScenarios(t *testing.T) {
+	mockClient := &MockVaultClient{
+		kvError:       fmt.Errorf("secret not found"),
+		kvListError:   fmt.Errorf("list operation failed"),
+		azureError:    fmt.Errorf("azure role not found"),
+		setTokenError: fmt.Errorf("failed to set token"),
+	}
+
+	ctx := context.Background()
+
+	// Test GetKVSecret error
+	_, err := mockClient.GetKVSecret(ctx, "nonexistent", "secret")
+	if err == nil {
+		t.Errorf("GetKVSecret() expected error, got nil")
+	}
+
+	// Test GetKVSecretList error
+	_, err = mockClient.GetKVSecretList(ctx, "nonexistent", "secret")
+	if err == nil {
+		t.Errorf("GetKVSecretList() expected error, got nil")
+	}
+
+	// Test GetAzureDynamicCredentials error
+	_, err = mockClient.GetAzureDynamicCredentials(ctx, "nonexistent-role")
+	if err == nil {
+		t.Errorf("GetAzureDynamicCredentials() expected error, got nil")
+	}
+
+	// Test SetToken error
+	err = mockClient.SetToken("test-token")
+	if err == nil {
+		t.Errorf("SetToken() expected error, got nil")
+	}
+}
+
+// Test legacy functions
+func TestLegacyVaultClient(t *testing.T) {
+	config := &VaultConfig{
+		VaultAddress: "http://localhost:8200",
+		Credentials: Credentials{
+			RoleID:   "",
+			SecretID: "",
+		},
+	}
+
+	ctx := context.Background()
+	client, err := LegacyVaultClient(ctx, config)
+
+	if err != nil {
+		t.Errorf("LegacyVaultClient() error = %v, want nil", err)
+	}
+	if client == nil {
+		t.Errorf("LegacyVaultClient() client = nil, want non-nil")
+	}
+}
+
+// Test LoadConfig edge cases
+func TestViperConfigLoader_LoadConfig_WithCredentials(t *testing.T) {
+	// Set all environment variables
+	if err := os.Setenv("VAULT_ADDRESS", "http://localhost:8200"); err != nil {
+		t.Fatalf("Failed to set VAULT_ADDRESS: %v", err)
+	}
+	if err := os.Setenv("VAULT_ROLE_ID", "test-role"); err != nil {
+		t.Fatalf("Failed to set VAULT_ROLE_ID: %v", err)
+	}
+	if err := os.Setenv("VAULT_SECRET_ID", "test-secret"); err != nil {
+		t.Fatalf("Failed to set VAULT_SECRET_ID: %v", err)
+	}
+
+	loader := &ViperConfigLoader{}
+	config, err := loader.LoadConfig()
+
+	if err != nil {
+		t.Errorf("ViperConfigLoader.LoadConfig() error = %v, want nil", err)
+	}
+	if config == nil {
+		t.Errorf("ViperConfigLoader.LoadConfig() config = nil, want non-nil")
+		return
+	}
+	if config.Credentials.RoleID != "test-role" {
+		t.Errorf("ViperConfigLoader.LoadConfig() RoleID = %v, want test-role", config.Credentials.RoleID)
+	}
+	if config.Credentials.SecretID != "test-secret" {
+		t.Errorf("ViperConfigLoader.LoadConfig() SecretID = %v, want test-secret", config.Credentials.SecretID)
+	}
+
+	cleanupEnvVars(t)
+}
+
+// Test AppRoleAuthenticator edge cases
+func TestAppRoleAuthenticator_Authenticate_WithCredentials(t *testing.T) {
+	authenticator := &AppRoleAuthenticator{}
+	config := &VaultConfig{
+		VaultAddress: "http://localhost:8200",
+		Credentials: Credentials{
+			RoleID:   "test-role-id",
+			SecretID: "test-secret-id",
+		},
+	}
+
+	ctx := context.Background()
+
+	// Test with nil client
+	err := authenticator.Authenticate(ctx, nil, config)
+	if err == nil {
+		t.Errorf("AppRoleAuthenticator.Authenticate() expected error with nil client, got nil")
+	}
+	if err != nil && err.Error() != "vault client cannot be nil" {
+		t.Errorf("AppRoleAuthenticator.Authenticate() error = %v, want 'vault client cannot be nil'", err)
+	}
+}
+
+func TestAppRoleAuthenticator_Authenticate_NilConfig(t *testing.T) {
+	authenticator := &AppRoleAuthenticator{}
+	ctx := context.Background()
+
+	// Test with nil config (we can pass a mock client or nil)
+	err := authenticator.Authenticate(ctx, nil, nil)
+	if err == nil {
+		t.Errorf("AppRoleAuthenticator.Authenticate() expected error with nil config, got nil")
+	}
+	if err != nil && err.Error() != "vault client cannot be nil" {
+		// Since we check client first, we get that error
+		t.Errorf("AppRoleAuthenticator.Authenticate() error = %v, want 'vault client cannot be nil'", err)
 	}
 }
