@@ -106,14 +106,9 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 func getTopicName(kafkacfg *KafkaConfig, suffix string, separator string) string {
 	if kafkacfg.Topic != "" {
 		return kafkacfg.Topic
-	}
-	if kafkacfg.TopicPrefix != "" && suffix != "" {
+	} else {
 		return kafkacfg.TopicPrefix + separator + suffix
 	}
-	if kafkacfg.TopicPrefix != "" {
-		return kafkacfg.TopicPrefix
-	}
-	return ""
 }
 
 // InitializeKafkaReader initializes a Kafka reader with the provided configuration.
