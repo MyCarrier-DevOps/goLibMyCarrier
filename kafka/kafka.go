@@ -29,9 +29,10 @@ func LoadConfig() (*KafkaConfig, error) {
 	if err := viper.BindEnv("address", "KAFKA_ADDRESS"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_ADDRESS: %w", err)
 	}
-	terr := viper.BindEnv("topic_prefix", "KAFKA_TOPIC_PREFIX")
-	if err := viper.BindEnv("topic", "KAFKA_TOPIC"); err != nil && terr != nil {
-		return nil, fmt.Errorf("error binding KAFKA_TOPIC or KAFKA_TOPIC_PREFIX: %w", err)
+	prefixerr := viper.BindEnv("topic_prefix", "KAFKA_TOPIC_PREFIX")
+	topicerr := viper.BindEnv("topic", "KAFKA_TOPIC")
+	if prefixerr != nil && topicerr != nil {
+		return nil, fmt.Errorf("error binding KAFKA_TOPIC or KAFKA_TOPIC_PREFIX. Prefix error: %w, Topic error: %w", prefixerr, topicerr)
 	}
 	if err := viper.BindEnv("username", "KAFKA_USERNAME"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_USERNAME: %w", err)
