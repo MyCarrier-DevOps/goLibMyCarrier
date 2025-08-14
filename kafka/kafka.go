@@ -15,6 +15,7 @@ import (
 type KafkaConfig struct {
 	Address            string `mapstructure:"address"`
 	Topic              string `mapstructure:"topic"`
+	TopicPrefix        string `mapstructure:"topic_prefix"`
 	Username           string `mapstructure:"username"`
 	Password           string `mapstructure:"password"`
 	GroupID            string `mapstructure:"groupid"`
@@ -28,8 +29,9 @@ func LoadConfig() (*KafkaConfig, error) {
 	if err := viper.BindEnv("address", "KAFKA_ADDRESS"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_ADDRESS: %w", err)
 	}
-	if err := viper.BindEnv("topic", "KAFKA_TOPIC"); err != nil {
-		return nil, fmt.Errorf("error binding KAFKA_TOPIC: %w", err)
+	terr := viper.BindEnv("topic_prefix", "KAFKA_TOPIC_PREFIX")
+	if err := viper.BindEnv("topic", "KAFKA_TOPIC"); err != nil && terr != nil {
+		return nil, fmt.Errorf("error binding KAFKA_TOPIC or KAFKA_TOPIC_PREFIX: %w", err)
 	}
 	if err := viper.BindEnv("username", "KAFKA_USERNAME"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_USERNAME: %w", err)
@@ -70,8 +72,8 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 	if kafkaConfig.Address == "" {
 		return fmt.Errorf("kafka address is required")
 	}
-	if kafkaConfig.Topic == "" {
-		return fmt.Errorf("kafka topic is required")
+	if kafkaConfig.Topic == "" && kafkaConfig.TopicPrefix == "" {
+		return fmt.Errorf("kafka topic or topic prefix is required")
 	}
 	if kafkaConfig.Username == "" {
 		return fmt.Errorf("kafka username is required")
@@ -97,10 +99,27 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 	return nil
 }
 
+// getTopicName returns the appropriate topic name based on configuration.
+// If Topic is set, it returns the Topic directly.
+// If TopicPrefix is set and Topic is empty, it concatenates TopicPrefix with the suffix.
+func getTopicName(kafkacfg *KafkaConfig, suffix string) string {
+	if kafkacfg.Topic != "" {
+		return kafkacfg.Topic
+	}
+	if kafkacfg.TopicPrefix != "" && suffix != "" {
+		return kafkacfg.TopicPrefix + "." + suffix
+	}
+	if kafkacfg.TopicPrefix != "" {
+		return kafkacfg.TopicPrefix
+	}
+	return ""
+}
+
+// InitializeKafkaReader initializes a Kafka reader with the provided configuration.
 func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
-	mechanism, mech_err := scram.Mechanism(scram.SHA512, kafkacfg.Username, kafkacfg.Password)
-	if mech_err != nil {
-		return nil, fmt.Errorf("error creating sasl mechanism: %w", mech_err)
+	mechanism, mechErr := scram.Mechanism(scram.SHA512, kafkacfg.Username, kafkacfg.Password)
+	if mechErr != nil {
+		return nil, fmt.Errorf("error creating sasl mechanism: %w", mechErr)
 	}
 
 	dialer := &kafka.Dialer{
@@ -111,9 +130,10 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 	}
 
 	// Create a new Kafka reader
+	topicName := getTopicName(kafkacfg, "")
 	readerConfig := kafka.ReaderConfig{
 		Brokers:     []string{kafkacfg.Address},
-		Topic:       kafkacfg.Topic,
+		Topic:       topicName,
 		GroupID:     kafkacfg.GroupID,
 		MinBytes:    1,    // 1 Byte
 		MaxBytes:    10e6, // 10MB
@@ -135,12 +155,27 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig) (*kafka.Reader, error) {
 	return reader, nil
 }
 
-// InitializeKafkaWriter initializes a Kafka writer with the provided configuration.
-func InitializeKafkaWriter(kafkacfg *KafkaConfig) (*kafka.Writer, error) {
+// InitializeKafkaWriter initializes a Kafka writer with the provided configuration and optional topic suffix.
+// If KAFKA_TOPIC is set, the suffix is ignored and the topic is used directly.
+// If KAFKA_TOPIC_PREFIX is set and KAFKA_TOPIC is not set, the topic will be KAFKA_TOPIC_PREFIX + "." + suffix.
+// The suffix parameter is optional - pass an empty string or omit it for backward compatibility.
+func InitializeKafkaWriter(kafkacfg *KafkaConfig, suffix ...string) (*kafka.Writer, error) {
 	// Initialize Kafka writer
 	mechanism, err := scram.Mechanism(scram.SHA512, kafkacfg.Username, kafkacfg.Password)
 	if err != nil {
 		return nil, fmt.Errorf("error creating SASL mechanism: %w", err)
+	}
+
+	// Determine suffix - use empty string if not provided
+	topicSuffix := ""
+	if len(suffix) > 0 {
+		topicSuffix = suffix[0]
+	}
+
+	// Determine topic name based on configuration and suffix
+	topicName := getTopicName(kafkacfg, topicSuffix)
+	if topicName == "" {
+		return nil, fmt.Errorf("unable to determine topic name from configuration")
 	}
 
 	dialer := &kafka.Dialer{
@@ -152,7 +187,7 @@ func InitializeKafkaWriter(kafkacfg *KafkaConfig) (*kafka.Writer, error) {
 
 	writer := kafka.NewWriter(kafka.WriterConfig{
 		Brokers:     []string{kafkacfg.Address},
-		Topic:       kafkacfg.Topic,
+		Topic:       topicName,
 		Dialer:      dialer,
 		Balancer:    &kafka.LeastBytes{},
 		Async:       true,
