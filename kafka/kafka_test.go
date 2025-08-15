@@ -90,13 +90,13 @@ func TestValidateConfig_MissingAddress(t *testing.T) {
 
 func TestValidateConfig_MissingTopic(t *testing.T) {
 	config := &KafkaConfig{
-		Address:   "localhost:9092",
-		Topic:     "",
+		Address:     "localhost:9092",
+		Topic:       "",
 		TopicPrefix: "",
-		Username:  "test-user",
-		Password:  "test-password",
-		GroupID:   "test-group",
-		Partition: "1",
+		Username:    "test-user",
+		Password:    "test-password",
+		GroupID:     "test-group",
+		Partition:   "1",
 	}
 
 	err := validateConfig(config)
@@ -262,7 +262,7 @@ func TestGetTopicName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result, err := getTopicName(tt.config, tt.suffix, tt.separator)
-			
+
 			if tt.expectedError != "" {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), tt.expectedError)

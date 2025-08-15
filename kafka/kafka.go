@@ -109,12 +109,12 @@ func getTopicName(kafkacfg *KafkaConfig, suffix string, separator string) (strin
 	if separator == "" {
 		separator = "."
 	}
-	
+
 	// If Topic is set, return it directly
 	if kafkacfg.Topic != "" {
 		return kafkacfg.Topic, nil
 	}
-	
+
 	// If TopicPrefix is set but Topic is not
 	if kafkacfg.TopicPrefix != "" {
 		if suffix == "" {
@@ -122,7 +122,7 @@ func getTopicName(kafkacfg *KafkaConfig, suffix string, separator string) (strin
 		}
 		return kafkacfg.TopicPrefix + separator + suffix, nil
 	}
-	
+
 	return "", fmt.Errorf("either topic or topic prefix must be configured")
 }
 
