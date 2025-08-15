@@ -102,13 +102,28 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 
 // getTopicName returns the appropriate topic name based on configuration.
 // If Topic is set, it returns the Topic directly.
-// If TopicPrefix is set and Topic is empty, it concatenates TopicPrefix with the suffix.
-func getTopicName(kafkacfg *KafkaConfig, suffix string, separator string) string {
-	if kafkacfg.Topic != "" {
-		return kafkacfg.Topic
-	} else {
-		return kafkacfg.TopicPrefix + separator + suffix
+// If TopicPrefix is set and Topic is empty, it concatenates TopicPrefix with the separator and suffix.
+// If TopicPrefix is set but no suffix is provided, it returns an error.
+func getTopicName(kafkacfg *KafkaConfig, suffix string, separator string) (string, error) {
+	// Use default separator if not provided
+	if separator == "" {
+		separator = "."
 	}
+	
+	// If Topic is set, return it directly
+	if kafkacfg.Topic != "" {
+		return kafkacfg.Topic, nil
+	}
+	
+	// If TopicPrefix is set but Topic is not
+	if kafkacfg.TopicPrefix != "" {
+		if suffix == "" {
+			return "", fmt.Errorf("suffix is required when using topic prefix")
+		}
+		return kafkacfg.TopicPrefix + separator + suffix, nil
+	}
+	
+	return "", fmt.Errorf("either topic or topic prefix must be configured")
 }
 
 // InitializeKafkaReader initializes a Kafka reader with the provided configuration.
@@ -129,7 +144,10 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig, separator string, suffix ...st
 		topicSuffix = suffix[0]
 	}
 	// Create a new Kafka reader
-	topicName := getTopicName(kafkacfg, topicSuffix, separator)
+	topicName, err := getTopicName(kafkacfg, topicSuffix, separator)
+	if err != nil {
+		return nil, fmt.Errorf("error determining topic name: %w", err)
+	}
 	readerConfig := kafka.ReaderConfig{
 		Brokers:     []string{kafkacfg.Address},
 		Topic:       topicName,
@@ -172,9 +190,9 @@ func InitializeKafkaWriter(kafkacfg *KafkaConfig, separator string, suffix ...st
 	}
 
 	// Determine topic name based on configuration and suffix
-	topicName := getTopicName(kafkacfg, topicSuffix, separator)
-	if topicName == "" {
-		return nil, fmt.Errorf("unable to determine topic name from configuration")
+	topicName, err := getTopicName(kafkacfg, topicSuffix, separator)
+	if err != nil {
+		return nil, fmt.Errorf("error determining topic name: %w", err)
 	}
 
 	dialer := &kafka.Dialer{
