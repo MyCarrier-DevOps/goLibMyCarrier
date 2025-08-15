@@ -522,7 +522,14 @@ func TestMockClickhouseSession_Conn(t *testing.T) {
 
 // Test configuration loading with missing environment variables
 func TestClickhouseLoadConfig_MissingEnvVars(t *testing.T) {
-	// Don't set any environment variables
+	// Clear all ClickHouse environment variables to ensure isolation
+	t.Setenv("CLICKHOUSE_HOSTNAME", "")
+	t.Setenv("CLICKHOUSE_USERNAME", "")
+	t.Setenv("CLICKHOUSE_PASSWORD", "")
+	t.Setenv("CLICKHOUSE_DATABASE", "")
+	t.Setenv("CLICKHOUSE_PORT", "")
+	t.Setenv("CLICKHOUSE_SKIP_VERIFY", "")
+
 	config, err := ClickhouseLoadConfig()
 
 	// Should return error due to validation failure
@@ -532,10 +539,13 @@ func TestClickhouseLoadConfig_MissingEnvVars(t *testing.T) {
 
 // Test ClickhouseLoadConfig with partial environment variables
 func TestClickhouseLoadConfig_PartialEnvVars(t *testing.T) {
-	// Set only some environment variables
+	// Clear all environment variables first, then set only some
 	t.Setenv("CLICKHOUSE_HOSTNAME", "localhost")
 	t.Setenv("CLICKHOUSE_USERNAME", "default")
-	// Missing other required variables
+	t.Setenv("CLICKHOUSE_PASSWORD", "")
+	t.Setenv("CLICKHOUSE_DATABASE", "")
+	t.Setenv("CLICKHOUSE_PORT", "")
+	t.Setenv("CLICKHOUSE_SKIP_VERIFY", "")
 
 	config, err := ClickhouseLoadConfig()
 
