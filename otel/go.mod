@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/otel
 
-go 1.24.2
+go 1.24.6
 
 require (
 	github.com/gin-gonic/gin v1.10.1

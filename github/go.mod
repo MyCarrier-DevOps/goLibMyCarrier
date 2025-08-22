@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/github
 
-go 1.24.2
+go 1.24.6
 
 require (
 	github.com/go-git/go-git/v5 v5.16.2
