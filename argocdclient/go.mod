@@ -1,4 +1,4 @@
-module argocdclient
+module github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient
 
 go 1.24.6
 
