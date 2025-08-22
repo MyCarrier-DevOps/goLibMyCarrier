@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-// GetArgoApplication gets the ArgoCD application data with retry logic
+// GetArgoApplication retrieves ArgoCD application data for the specified application.
+// It implements retry logic with exponential backoff to handle transient failures.
+// Returns the application data as a map or an error if the operation fails after all retries.
 func GetArgoApplication(revision string, config *Config) (map[string]interface{}, error) {
 	const maxRetries = 3
 	const baseDelay = time.Second
@@ -71,7 +73,9 @@ func GetArgoApplication(revision string, config *Config) (map[string]interface{}
 	return nil, fmt.Errorf("failed after %d attempts, last error: %w", maxRetries, lastErr)
 }
 
-// GetManifests gets the manifests from ArgoCD
+// GetManifests retrieves application manifests from ArgoCD for the specified application.
+// If revision is provided, it fetches manifests for that specific revision; otherwise, it gets the current manifests.
+// It implements retry logic with exponential backoff and returns a slice of manifest strings or an error.
 func GetManifests(revision string, config *Config) ([]string, error) {
 	const maxRetries = 3
 	const baseDelay = time.Second
