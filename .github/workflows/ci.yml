@@ -1,5 +1,6 @@
 name: Build And Release Pkgs
 on:
+  workflow_dispatch:
   push:
     paths:
       - '**'
@@ -16,8 +17,6 @@ on:
       - '!README.md'
     branches: 
       - main
-permissions:
-  contents: read
 
 jobs:
   unit-tests:
