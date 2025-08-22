@@ -6,6 +6,7 @@
 
 `goLibMyCarrier` includes the following components:
 
+-   **`argocdclient`**: Provides a client to fetch argo application and manifest data.
 -   **`auth`**: Provides authentication middleware for Gin framework.
 -   **`clickhouse`**: Provides utilities to connect and query ClickHouse database.
 -   **`github`**: Provides utilities to authenticate and interact with Github.

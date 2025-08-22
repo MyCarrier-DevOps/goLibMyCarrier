@@ -71,6 +71,7 @@ jobs:
         git config user.name "$GITHUB_ACTOR"
         git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
+        git tag -a argocdclient/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release argocdclient/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a auth/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release auth/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a github/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release github/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
@@ -79,7 +80,8 @@ jobs:
         git tag -a otel/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release otel/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a vault/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release vault/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
         git tag -a yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        
+
+        git push origin argocdclient/v${{ steps.calculate_version.outputs.majorMinorPatch }}
         git push origin auth/v${{ steps.calculate_version.outputs.majorMinorPatch }}
         git push origin clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }}
         git push origin github/v${{ steps.calculate_version.outputs.majorMinorPatch }}
@@ -103,7 +105,8 @@ jobs:
           ## Packages Released
           
           All packages have been tagged with version `v${{ steps.calculate_version.outputs.majorMinorPatch }}`:
-          
+
+          - **argocdclient** - ArgoCD client utilities
           - **auth** - Authentication middleware for Gin framework
           - **clickhouse** - ClickHouse database utilities  
           - **github** - GitHub authentication and interaction utilities
@@ -129,6 +132,7 @@ jobs:
           ## Documentation
           
           View package documentation on pkg.go.dev:
+          - [argocdclient](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [auth](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/auth@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [clickhouse](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse@v${{ steps.calculate_version.outputs.majorMinorPatch }})
           - [github](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/github@v${{ steps.calculate_version.outputs.majorMinorPatch }})
