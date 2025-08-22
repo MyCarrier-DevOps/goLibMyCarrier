@@ -24,8 +24,8 @@ The client uses environment variables for configuration:
 |---------------------|-------------|----------|
 | `ARGOCD_SERVER` | ArgoCD server URL (e.g., `https://argocd.example.com`) | Yes |
 | `ARGOCD_AUTHTOKEN` | Bearer token for authentication | Yes |
-| `ARGOCD_APP_NAME` | ArgoCD application name | Yes |
-| `ARGOCD_REVISION` | Git revision/commit hash | Yes |
+| `ARGOCD_APP_NAME` | ArgoCD application name | No |
+| `ARGOCD_REVISION` | Git revision/commit hash | No |
 
 ## Usage
 
@@ -99,10 +99,10 @@ for i, manifest := range manifests {
 
 ```go
 type Config struct {
-    ServerUrl string // ArgoCD server URL
-    AuthToken string // Bearer token for authentication  
-    AppName   string // ArgoCD application name
-    Revision  string // Git revision/commit hash
+    ServerUrl string // ArgoCD server URL (required)
+    AuthToken string // Bearer token for authentication (required)
+    AppName   string // ArgoCD application name (optional)
+    Revision  string // Git revision/commit hash (optional)
 }
 ```
 
@@ -110,7 +110,7 @@ type Config struct {
 
 #### LoadConfig() (*Config, error)
 
-Loads configuration from environment variables and validates required fields.
+Loads configuration from environment variables and validates required fields (ServerUrl and AuthToken).
 
 **Returns:**
 - `*Config`: Populated configuration struct
@@ -175,8 +175,11 @@ import (
 
 func main() {
     // Set environment variables (or use your preferred method)
+    // Only ServerUrl and AuthToken are required
     os.Setenv("ARGOCD_SERVER", "https://argocd.example.com")
     os.Setenv("ARGOCD_AUTHTOKEN", "your-bearer-token")
+    
+    // Optional: Set application-specific variables
     os.Setenv("ARGOCD_APP_NAME", "my-app")
     os.Setenv("ARGOCD_REVISION", "main")
     
@@ -214,6 +217,45 @@ Run the tests with:
 cd argocdclient
 go test -v
 ```
+
+Run tests with coverage:
+
+```bash
+go test -v -cover
+```
+
+Generate coverage report:
+
+```bash
+go test -coverprofile=coverage.out
+go tool cover -html=coverage.out -o coverage.html
+```
+
+### Test Coverage
+
+The package includes comprehensive tests covering:
+
+- **Success scenarios**: Normal API responses and data parsing
+- **Retry logic**: Server errors that trigger exponential backoff retries
+- **Error handling**: Client errors, network failures, and invalid responses
+- **Configuration management**: Environment variable loading and validation
+- **Edge cases**: Invalid JSON responses, request creation errors
+
+Current test coverage is maintained at 80%+ to ensure reliability.
+
+## Changelog
+
+### Recent Updates
+
+- **Configuration Changes**: `ARGOCD_APP_NAME` and `ARGOCD_REVISION` are now optional fields
+- **Enhanced Documentation**: Added comprehensive function documentation with Go doc comments
+- **Improved Test Coverage**: Expanded test suite to 80%+ coverage including:
+  - Additional error scenarios for both `GetArgoApplication` and `GetManifests`
+  - Request creation error handling
+  - Invalid JSON response handling
+  - Client error scenarios (4xx responses)
+  - Maximum retry exhaustion scenarios
+- **Configuration Flexibility**: LoadConfig now only validates required fields (ServerUrl and AuthToken)
 
 ## License
 

@@ -420,6 +420,149 @@ func TestGetManifests_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestGetArgoApplication_InvalidJSON(t *testing.T) {
+	// Create mock server that returns invalid JSON
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, err := w.Write([]byte("invalid json")); err != nil {
+			t.Errorf("Failed to write invalid json: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	config := &Config{
+		ServerUrl: server.URL,
+		AuthToken: "test-token",
+		AppName:   "test-app",
+		Revision:  "main",
+	}
+
+	result, err := GetArgoApplication("main", config)
+
+	if err == nil {
+		t.Fatal("Expected error for invalid JSON")
+	}
+
+	if !strings.Contains(err.Error(), "error unmarshalling") {
+		t.Errorf("Expected unmarshalling error, got %v", err)
+	}
+
+	if result != nil {
+		t.Error("Expected nil result for error case")
+	}
+}
+
+func TestGetManifests_ClientError_NoRetry(t *testing.T) {
+	requestCount := 0
+	server := testErrorServer(t, http.StatusNotFound, "Manifests not found", &requestCount)
+	defer server.Close()
+
+	config := &Config{
+		ServerUrl: server.URL,
+		AuthToken: "test-token",
+		AppName:   "test-app",
+		Revision:  "main",
+	}
+
+	result, err := GetManifests("main", config)
+
+	if err == nil {
+		t.Fatal("Expected error for client error")
+	}
+
+	if !strings.Contains(err.Error(), "client error 404") {
+		t.Errorf("Expected client error, got %v", err)
+	}
+
+	if requestCount != 1 {
+		t.Errorf("Expected 1 request (no retry for client error), got %d", requestCount)
+	}
+
+	if result != nil {
+		t.Error("Expected nil result for error case")
+	}
+}
+
+func TestGetManifests_MaxRetriesExceeded(t *testing.T) {
+	requestCount := 0
+	server := testErrorServer(t, http.StatusInternalServerError, "Internal Server Error", &requestCount)
+	defer server.Close()
+
+	config := &Config{
+		ServerUrl: server.URL,
+		AuthToken: "test-token",
+		AppName:   "test-app",
+		Revision:  "main",
+	}
+
+	result, err := GetManifests("main", config)
+
+	if err == nil {
+		t.Fatal("Expected error after max retries")
+	}
+
+	if !strings.Contains(err.Error(), "failed after 3 attempts") {
+		t.Errorf("Expected max retries error, got %v", err)
+	}
+
+	if requestCount != 3 {
+		t.Errorf("Expected 3 requests (max retries), got %d", requestCount)
+	}
+
+	if result != nil {
+		t.Error("Expected nil result for error case")
+	}
+}
+
+func TestGetArgoApplication_RequestCreationError(t *testing.T) {
+	// Test with invalid URL that would cause http.NewRequest to fail
+	config := &Config{
+		ServerUrl: "ht!tp://invalid-url", // Invalid URL scheme
+		AuthToken: "test-token",
+		AppName:   "test-app",
+		Revision:  "main",
+	}
+
+	result, err := GetArgoApplication("main", config)
+
+	if err == nil {
+		t.Fatal("Expected error for invalid URL")
+	}
+
+	if !strings.Contains(err.Error(), "error creating request") {
+		t.Errorf("Expected request creation error, got %v", err)
+	}
+
+	if result != nil {
+		t.Error("Expected nil result for error case")
+	}
+}
+
+func TestGetManifests_RequestCreationError(t *testing.T) {
+	// Test with invalid URL that would cause http.NewRequest to fail
+	config := &Config{
+		ServerUrl: "ht!tp://invalid-url", // Invalid URL scheme
+		AuthToken: "test-token",
+		AppName:   "test-app",
+		Revision:  "main",
+	}
+
+	result, err := GetManifests("main", config)
+
+	if err == nil {
+		t.Fatal("Expected error for invalid URL")
+	}
+
+	if !strings.Contains(err.Error(), "error creating request") {
+		t.Errorf("Expected request creation error, got %v", err)
+	}
+
+	if result != nil {
+		t.Error("Expected nil result for error case")
+	}
+}
+
 // Benchmark tests
 func BenchmarkGetArgoApplication(b *testing.B) {
 	mockApp := map[string]interface{}{

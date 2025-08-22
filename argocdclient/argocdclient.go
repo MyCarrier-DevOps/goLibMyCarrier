@@ -1,3 +1,30 @@
+// Package argocdclient provides a Go client library for interacting with the ArgoCD API.
+//
+// This package includes functionality to retrieve ArgoCD application data and manifests
+// with built-in retry logic, exponential backoff, and comprehensive error handling.
+//
+// Key features:
+//   - Exponential backoff retry strategy for network failures and server errors
+//   - Smart error handling that distinguishes between retryable and non-retryable errors
+//   - Environment variable-based configuration with validation
+//   - Support for retrieving application data and manifests for specific revisions
+//
+// Basic usage:
+//
+//	config, err := argocdclient.LoadConfig()
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	appData, err := argocdclient.GetArgoApplication("", config)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	manifests, err := argocdclient.GetManifests("abc123", config)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
 package argocdclient
 
 import (

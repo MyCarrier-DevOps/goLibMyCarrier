@@ -6,6 +6,8 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Config holds the configuration for ArgoCD client operations.
+// Only ServerUrl and AuthToken are required fields; AppName and Revision are optional.
 type Config struct {
 	ServerUrl string `mapstructure:"server_url"`
 	AuthToken string `mapstructure:"auth_token"`
@@ -13,6 +15,15 @@ type Config struct {
 	Revision  string `mapstructure:"revision"`
 }
 
+// LoadConfig loads the ArgoCD client configuration from environment variables.
+// It binds the following environment variables to configuration fields:
+//   - ARGOCD_SERVER -> ServerUrl (required)
+//   - ARGOCD_AUTHTOKEN -> AuthToken (required)
+//   - ARGOCD_APP_NAME -> AppName (optional)
+//   - ARGOCD_REVISION -> Revision (optional)
+//
+// Returns an error if required environment variables are missing or if
+// there are issues with configuration binding or validation.
 func LoadConfig() (*Config, error) {
 	if err := viper.BindEnv("server_url", "ARGOCD_SERVER"); err != nil {
 		return nil, fmt.Errorf("error binding ARGOCD_SERVER: %w", err)
@@ -40,18 +51,15 @@ func LoadConfig() (*Config, error) {
 	return &config, nil
 }
 
+// validateConfig validates that all required configuration fields are present.
+// Currently only validates ServerUrl and AuthToken as required fields.
+// AppName and Revision are optional and not validated.
 func validateConfig(config *Config) error {
 	if config.ServerUrl == "" {
 		return fmt.Errorf("ARGOCD_SERVER is required")
 	}
 	if config.AuthToken == "" {
 		return fmt.Errorf("ARGOCD_AUTHTOKEN is required")
-	}
-	if config.AppName == "" {
-		return fmt.Errorf("ARGOCD_APP_NAME is required")
-	}
-	if config.Revision == "" {
-		return fmt.Errorf("ARGOCD_REVISION is required")
 	}
 
 	return nil

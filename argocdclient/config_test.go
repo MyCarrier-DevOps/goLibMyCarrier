@@ -101,14 +101,6 @@ func TestConfig_Struct(t *testing.T) {
 	if config.AuthToken != "test-token" {
 		t.Errorf("Expected AuthToken 'test-token', got '%s'", config.AuthToken)
 	}
-
-	if config.AppName != "test-app" {
-		t.Errorf("Expected AppName 'test-app', got '%s'", config.AppName)
-	}
-
-	if config.Revision != "main" {
-		t.Errorf("Expected Revision 'main', got '%s'", config.Revision)
-	}
 }
 
 func TestLoadConfig_Success(t *testing.T) {
@@ -122,12 +114,6 @@ func TestLoadConfig_Success(t *testing.T) {
 	if err := os.Setenv("ARGOCD_AUTHTOKEN", "test-auth-token"); err != nil {
 		t.Fatalf("Failed to set ARGOCD_AUTHTOKEN: %v", err)
 	}
-	if err := os.Setenv("ARGOCD_APP_NAME", "my-test-app"); err != nil {
-		t.Fatalf("Failed to set ARGOCD_APP_NAME: %v", err)
-	}
-	if err := os.Setenv("ARGOCD_REVISION", "v1.0.0"); err != nil {
-		t.Fatalf("Failed to set ARGOCD_REVISION: %v", err)
-	}
 
 	defer func() {
 		// Clean up environment variables
@@ -136,12 +122,6 @@ func TestLoadConfig_Success(t *testing.T) {
 		}
 		if err := os.Unsetenv("ARGOCD_AUTHTOKEN"); err != nil {
 			t.Errorf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
-		}
-		if err := os.Unsetenv("ARGOCD_APP_NAME"); err != nil {
-			t.Errorf("Failed to unset ARGOCD_APP_NAME: %v", err)
-		}
-		if err := os.Unsetenv("ARGOCD_REVISION"); err != nil {
-			t.Errorf("Failed to unset ARGOCD_REVISION: %v", err)
 		}
 		viper.Reset()
 	}()
@@ -161,14 +141,6 @@ func TestLoadConfig_Success(t *testing.T) {
 
 	if config.AuthToken != "test-auth-token" {
 		t.Errorf("Expected AuthToken 'test-auth-token', got '%s'", config.AuthToken)
-	}
-
-	if config.AppName != "my-test-app" {
-		t.Errorf("Expected AppName 'my-test-app', got '%s'", config.AppName)
-	}
-
-	if config.Revision != "v1.0.0" {
-		t.Errorf("Expected Revision 'v1.0.0', got '%s'", config.Revision)
 	}
 }
 
@@ -191,21 +163,77 @@ func TestLoadConfig_MissingAuthToken(t *testing.T) {
 }
 
 func TestLoadConfig_MissingAppName(t *testing.T) {
-	vars := testConfigEnvVars{
-		server:    "https://argocd.example.com",
-		authToken: "test-auth-token",
-		revision:  "v1.0.0",
+	// Clean up viper state
+	viper.Reset()
+
+	// Set environment variables (AppName is now optional)
+	if err := os.Setenv("ARGOCD_SERVER", "https://argocd.example.com"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_SERVER: %v", err)
 	}
-	testLoadConfigMissing(t, vars, "ARGOCD_APP_NAME")
+	if err := os.Setenv("ARGOCD_AUTHTOKEN", "test-auth-token"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_AUTHTOKEN: %v", err)
+	}
+
+	defer func() {
+		// Clean up environment variables
+		if err := os.Unsetenv("ARGOCD_SERVER"); err != nil {
+			t.Errorf("Failed to unset ARGOCD_SERVER: %v", err)
+		}
+		if err := os.Unsetenv("ARGOCD_AUTHTOKEN"); err != nil {
+			t.Errorf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
+		}
+		viper.Reset()
+	}()
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("Expected no error when AppName is missing (now optional), got %v", err)
+	}
+
+	if config == nil {
+		t.Fatal("Expected config, got nil")
+	}
+
+	if config.AppName != "" {
+		t.Errorf("Expected empty AppName, got '%s'", config.AppName)
+	}
 }
 
 func TestLoadConfig_MissingRevision(t *testing.T) {
-	vars := testConfigEnvVars{
-		server:    "https://argocd.example.com",
-		authToken: "test-auth-token",
-		appName:   "my-test-app",
+	// Clean up viper state
+	viper.Reset()
+
+	// Set environment variables (Revision is now optional)
+	if err := os.Setenv("ARGOCD_SERVER", "https://argocd.example.com"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_SERVER: %v", err)
 	}
-	testLoadConfigMissing(t, vars, "ARGOCD_REVISION")
+	if err := os.Setenv("ARGOCD_AUTHTOKEN", "test-auth-token"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_AUTHTOKEN: %v", err)
+	}
+
+	defer func() {
+		// Clean up environment variables
+		if err := os.Unsetenv("ARGOCD_SERVER"); err != nil {
+			t.Errorf("Failed to unset ARGOCD_SERVER: %v", err)
+		}
+		if err := os.Unsetenv("ARGOCD_AUTHTOKEN"); err != nil {
+			t.Errorf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
+		}
+		viper.Reset()
+	}()
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("Expected no error when Revision is missing (now optional), got %v", err)
+	}
+
+	if config == nil {
+		t.Fatal("Expected config, got nil")
+	}
+
+	if config.Revision != "" {
+		t.Errorf("Expected empty Revision, got '%s'", config.Revision)
+	}
 }
 
 func TestLoadConfig_AllMissing(t *testing.T) {
@@ -305,13 +333,8 @@ func TestValidateConfig_EmptyAppName(t *testing.T) {
 	}
 
 	err := validateConfig(config)
-	if err == nil {
-		t.Fatal("Expected error for empty AppName")
-	}
-
-	expectedError := "ARGOCD_APP_NAME is required"
-	if err.Error() != expectedError {
-		t.Errorf("Expected error '%s', got '%v'", expectedError, err)
+	if err != nil {
+		t.Errorf("Expected no error for empty AppName (now optional), got %v", err)
 	}
 }
 
@@ -324,13 +347,8 @@ func TestValidateConfig_EmptyRevision(t *testing.T) {
 	}
 
 	err := validateConfig(config)
-	if err == nil {
-		t.Fatal("Expected error for empty Revision")
-	}
-
-	expectedError := "ARGOCD_REVISION is required"
-	if err.Error() != expectedError {
-		t.Errorf("Expected error '%s', got '%v'", expectedError, err)
+	if err != nil {
+		t.Errorf("Expected no error for empty Revision (now optional), got %v", err)
 	}
 }
 
@@ -346,8 +364,8 @@ func TestLoadConfig_PartialEnvironmentVariables(t *testing.T) {
 			name: "Complete config",
 			envVars: map[string]string{
 				"ARGOCD_SERVER":    "https://argocd.example.com",
-				"ARGOCD_AUTHTOKEN": "token123",
-				"ARGOCD_APP_NAME":  "my-app",
+				"ARGOCD_AUTHTOKEN": "test-auth-token",
+				"ARGOCD_APP_NAME":  "my-test-app",
 				"ARGOCD_REVISION":  "v1.0.0",
 			},
 			shouldSucceed: true,
@@ -355,20 +373,22 @@ func TestLoadConfig_PartialEnvironmentVariables(t *testing.T) {
 		{
 			name: "Missing server",
 			envVars: map[string]string{
-				"ARGOCD_AUTHTOKEN": "token123",
-				"ARGOCD_APP_NAME":  "my-app",
+				"ARGOCD_AUTHTOKEN": "test-auth-token",
+				"ARGOCD_APP_NAME":  "my-test-app",
 				"ARGOCD_REVISION":  "v1.0.0",
 			},
 			expectedError: "ARGOCD_SERVER is required",
+			shouldSucceed: false,
 		},
 		{
 			name: "Missing token",
 			envVars: map[string]string{
 				"ARGOCD_SERVER":   "https://argocd.example.com",
-				"ARGOCD_APP_NAME": "my-app",
+				"ARGOCD_APP_NAME": "my-test-app",
 				"ARGOCD_REVISION": "v1.0.0",
 			},
 			expectedError: "ARGOCD_AUTHTOKEN is required",
+			shouldSucceed: false,
 		},
 	}
 
@@ -377,41 +397,101 @@ func TestLoadConfig_PartialEnvironmentVariables(t *testing.T) {
 			// Clean up viper state
 			viper.Reset()
 
-			// Clear all environment variables first
-			if err := os.Unsetenv("ARGOCD_SERVER"); err != nil {
-				t.Errorf("Failed to unset ARGOCD_SERVER: %v", err)
-			}
-			if err := os.Unsetenv("ARGOCD_AUTHTOKEN"); err != nil {
-				t.Errorf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
-			}
-			if err := os.Unsetenv("ARGOCD_APP_NAME"); err != nil {
-				t.Errorf("Failed to unset ARGOCD_APP_NAME: %v", err)
-			}
-			if err := os.Unsetenv("ARGOCD_REVISION"); err != nil {
-				t.Errorf("Failed to unset ARGOCD_REVISION: %v", err)
-			}
+			// Clean up any existing environment variables
+			_ = os.Unsetenv("ARGOCD_SERVER")
+			_ = os.Unsetenv("ARGOCD_AUTHTOKEN")
+			_ = os.Unsetenv("ARGOCD_APP_NAME")
+			_ = os.Unsetenv("ARGOCD_REVISION")
 
 			// Set test environment variables
 			for key, value := range tc.envVars {
 				if err := os.Setenv(key, value); err != nil {
-					t.Errorf("Failed to set %s: %v", key, err)
+					t.Fatalf("Failed to set %s: %v", key, err)
 				}
 			}
 
 			defer func() {
-				// Clean up environment variables
+				// Clean up
 				for key := range tc.envVars {
-					if err := os.Unsetenv(key); err != nil {
-						t.Errorf("Failed to unset %s: %v", key, err)
-					}
+					_ = os.Unsetenv(key)
 				}
 				viper.Reset()
 			}()
 
 			config, err := LoadConfig()
 
-			validateTestResult(t, tc, config, err)
+			if tc.shouldSucceed {
+				if err != nil {
+					t.Fatalf("Expected no error, got %v", err)
+				}
+				if config == nil {
+					t.Fatal("Expected config, got nil")
+				}
+			} else {
+				if err == nil {
+					t.Fatal("Expected error, got nil")
+				}
+				if config != nil {
+					t.Error("Expected nil config for error case")
+				}
+				if !strings.Contains(err.Error(), tc.expectedError) {
+					t.Errorf("Expected error containing '%s', got %v", tc.expectedError, err)
+				}
+			}
 		})
+	}
+}
+
+func TestLoadConfig_WithOptionalFields(t *testing.T) {
+	// Clean up viper state
+	viper.Reset()
+
+	// Set only required environment variables
+	if err := os.Setenv("ARGOCD_SERVER", "https://argocd.example.com"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_SERVER: %v", err)
+	}
+	if err := os.Setenv("ARGOCD_AUTHTOKEN", "test-auth-token"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_AUTHTOKEN: %v", err)
+	}
+	if err := os.Setenv("ARGOCD_APP_NAME", "my-app"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_APP_NAME: %v", err)
+	}
+	if err := os.Setenv("ARGOCD_REVISION", "main"); err != nil {
+		t.Fatalf("Failed to set ARGOCD_REVISION: %v", err)
+	}
+
+	defer func() {
+		// Clean up environment variables
+		_ = os.Unsetenv("ARGOCD_SERVER")
+		_ = os.Unsetenv("ARGOCD_AUTHTOKEN")
+		_ = os.Unsetenv("ARGOCD_APP_NAME")
+		_ = os.Unsetenv("ARGOCD_REVISION")
+		viper.Reset()
+	}()
+
+	config, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	if config == nil {
+		t.Fatal("Expected config, got nil")
+	}
+
+	if config.ServerUrl != "https://argocd.example.com" {
+		t.Errorf("Expected ServerUrl 'https://argocd.example.com', got '%s'", config.ServerUrl)
+	}
+
+	if config.AuthToken != "test-auth-token" {
+		t.Errorf("Expected AuthToken 'test-auth-token', got '%s'", config.AuthToken)
+	}
+
+	if config.AppName != "my-app" {
+		t.Errorf("Expected AppName 'my-app', got '%s'", config.AppName)
+	}
+
+	if config.Revision != "main" {
+		t.Errorf("Expected Revision 'main', got '%s'", config.Revision)
 	}
 }
 
