@@ -1,4 +1,4 @@
-name: CI Lint and Unit Tests
+name: Build And Release Pkgs
 on:
   push:
     paths:
