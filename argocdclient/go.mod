@@ -2,11 +2,15 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient
 
 go 1.24.6
 
-require github.com/spf13/viper v1.20.1
+require (
+	github.com/hashicorp/go-retryablehttp v0.7.8
+	github.com/spf13/viper v1.20.1
+)
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
+	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/sagikazarmark/locafero v0.10.0 // indirect
 	github.com/sourcegraph/conc v0.3.1-0.20240121214520-5f936abd7ae8 // indirect

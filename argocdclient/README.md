@@ -37,7 +37,6 @@ package main
 import (
     "fmt"
     "log"
-    
     "github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient"
 )
 
@@ -47,14 +46,16 @@ func main() {
     if err != nil {
         log.Fatal("Failed to load config:", err)
     }
-    
+
+    // Create a new client
+    client := argocdclient.NewClient(config)
+
     // Or create config manually for testing purposes
-    config := &argocdclient.Config{
+    manualConfig := &argocdclient.Config{
         ServerUrl: "https://argocd.example.com",
         AuthToken: "your-bearer-token",
-        AppName:   "my-application",
-        Revision:  "main",
     }
+    manualClient := argocdclient.NewClient(manualConfig)
 }
 ```
 
@@ -62,7 +63,7 @@ func main() {
 
 ```go
 // Get current application data with soft refresh
-appData, err := argocdclient.GetArgoApplication("", config)
+appData, err := client.GetApplication("my-application")
 if err != nil {
     log.Fatal("Failed to get application:", err)
 }
@@ -75,19 +76,73 @@ fmt.Printf("Application health: %v\n", appData["health"])
 
 ```go
 // Get manifests for the latest revision
-manifests, err := argocdclient.GetManifests("", config)
+manifests, err := client.GetManifests("", "my-application")
 if err != nil {
     log.Fatal("Failed to get manifests:", err)
 }
 
 // Get manifests for a specific revision
-manifests, err := argocdclient.GetManifests("abc123def456", config)
+manifests, err := client.GetManifests("abc123def456", "my-application")
 if err != nil {
     log.Fatal("Failed to get manifests:", err)
 }
 
 for i, manifest := range manifests {
     fmt.Printf("Manifest %d:\n%s\n\n", i+1, manifest)
+}
+```
+
+## Usage with Interfaces
+
+### ApplicationService Example
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient"
+)
+
+func main() {
+    config := &argocdclient.Config{
+        ServerUrl: "https://argocd.example.com",
+        AuthToken: "your-bearer-token",
+        AppName:   "my-application",
+    }
+    var appSvc argocdclient.ApplicationService = argocdclient.NewClient()
+    appData, err := appSvc.GetApplication(config)
+    if err != nil {
+        log.Fatal("Failed to get application:", err)
+    }
+    fmt.Printf("Application sync status: %v\n", appData["status"])
+}
+```
+
+### ManifestService Example
+
+```go
+package main
+
+import (
+    "fmt"
+    "log"
+    "github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient"
+)
+
+func main() {
+    config := &argocdclient.Config{
+        ServerUrl: "https://argocd.example.com",
+        AuthToken: "your-bearer-token",
+        AppName:   "my-application",
+    }
+    var manifestSvc argocdclient.ManifestService = argocdclient.NewClient()
+    manifests, err := manifestSvc.GetManifests("", config)
+    if err != nil {
+        log.Fatal("Failed to get manifests:", err)
+    }
+    fmt.Printf("Manifests: %v\n", manifests)
 }
 ```
 
@@ -116,25 +171,24 @@ Loads configuration from environment variables and validates required fields (Se
 - `*Config`: Populated configuration struct
 - `error`: Validation or binding error
 
-#### GetArgoApplication(revision string, config *Config) (map[string]interface{}, error)
+#### (c *Client) GetApplication(argoAppName string) (map[string]interface{}, error)
 
-Retrieves ArgoCD application data with retry logic.
+Retrieves ArgoCD application data for the specified application name using the configured client.
 
 **Parameters:**
-- `revision`: Git revision (currently unused, pass empty string)
-- `config`: ArgoCD client configuration
+- `argoAppName`: Name of the ArgoCD application
 
 **Returns:**
 - `map[string]interface{}`: Application data as parsed JSON
 - `error`: Request or parsing error
 
-#### GetManifests(revision string, config *Config) ([]string, error)
+#### (c *Client) GetManifests(revision, argoAppName string) ([]string, error)
 
-Retrieves application manifests from ArgoCD.
+Retrieves application manifests from ArgoCD for the specified application and revision using the configured client.
 
 **Parameters:**
 - `revision`: Git revision to get manifests for (empty string for latest)
-- `config`: ArgoCD client configuration
+- `argoAppName`: Name of the ArgoCD application
 
 **Returns:**
 - `[]string`: Array of manifest YAML strings
@@ -169,42 +223,39 @@ import (
     "fmt"
     "log"
     "os"
-    
-    "github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient"
+    argo "github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient"
 )
 
 func main() {
     // Set environment variables (or use your preferred method)
-    // Only ServerUrl and AuthToken are required
     os.Setenv("ARGOCD_SERVER", "https://argocd.example.com")
     os.Setenv("ARGOCD_AUTHTOKEN", "your-bearer-token")
-    
-    // Optional: Set application-specific variables
-    os.Setenv("ARGOCD_APP_NAME", "my-app")
-    os.Setenv("ARGOCD_REVISION", "main")
-    
+
     // Load configuration
-    config, err := argocdclient.LoadConfig()
+    config, err := argo.LoadConfig()
     if err != nil {
         log.Fatal("Config error:", err)
     }
-    
+
+    // Create a new client
+    c := argo.NewClient(config)
+
     // Get application data
     fmt.Println("Fetching application data...")
-    appData, err := argocdclient.GetArgoApplication("", config)
+    appData, err := c.GetApplication("my-app")
     if err != nil {
         log.Fatal("Application error:", err)
     }
-    
+
     fmt.Printf("Application: %s\n", appData["metadata"].(map[string]interface{})["name"])
-    
+
     // Get manifests
     fmt.Println("\nFetching manifests...")
-    manifests, err := argocdclient.GetManifests("", config)
+    manifests, err := c.GetManifests("cbbb3fb9c683ae8b75bb182482a59", "my-app")
     if err != nil {
         log.Fatal("Manifests error:", err)
     }
-    
+
     fmt.Printf("Retrieved %d manifests\n", len(manifests))
 }
 ```
@@ -230,32 +281,6 @@ Generate coverage report:
 go test -coverprofile=coverage.out
 go tool cover -html=coverage.out -o coverage.html
 ```
-
-### Test Coverage
-
-The package includes comprehensive tests covering:
-
-- **Success scenarios**: Normal API responses and data parsing
-- **Retry logic**: Server errors that trigger exponential backoff retries
-- **Error handling**: Client errors, network failures, and invalid responses
-- **Configuration management**: Environment variable loading and validation
-- **Edge cases**: Invalid JSON responses, request creation errors
-
-Current test coverage is maintained at 80%+ to ensure reliability.
-
-## Changelog
-
-### Recent Updates
-
-- **Configuration Changes**: `ARGOCD_APP_NAME` and `ARGOCD_REVISION` are now optional fields
-- **Enhanced Documentation**: Added comprehensive function documentation with Go doc comments
-- **Improved Test Coverage**: Expanded test suite to 80%+ coverage including:
-  - Additional error scenarios for both `GetArgoApplication` and `GetManifests`
-  - Request creation error handling
-  - Invalid JSON response handling
-  - Client error scenarios (4xx responses)
-  - Maximum retry exhaustion scenarios
-- **Configuration Flexibility**: LoadConfig now only validates required fields (ServerUrl and AuthToken)
 
 ## License
 

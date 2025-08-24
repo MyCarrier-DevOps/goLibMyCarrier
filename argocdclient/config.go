@@ -11,16 +11,20 @@ import (
 type Config struct {
 	ServerUrl string `mapstructure:"server_url"`
 	AuthToken string `mapstructure:"auth_token"`
-	AppName   string `mapstructure:"app_name"`
-	Revision  string `mapstructure:"revision"`
+}
+
+// ConfigLoaderInterface defines the contract for configuration loading
+type ConfigLoaderInterface interface {
+	// LoadConfig loads configuration from environment variables
+	LoadConfig() (*Config, error)
+	// ValidateConfig validates the provided configuration
+	ValidateConfig(config *Config) error
 }
 
 // LoadConfig loads the ArgoCD client configuration from environment variables.
 // It binds the following environment variables to configuration fields:
 //   - ARGOCD_SERVER -> ServerUrl (required)
 //   - ARGOCD_AUTHTOKEN -> AuthToken (required)
-//   - ARGOCD_APP_NAME -> AppName (optional)
-//   - ARGOCD_REVISION -> Revision (optional)
 //
 // Returns an error if required environment variables are missing or if
 // there are issues with configuration binding or validation.
@@ -30,12 +34,6 @@ func LoadConfig() (*Config, error) {
 	}
 	if err := viper.BindEnv("auth_token", "ARGOCD_AUTHTOKEN"); err != nil {
 		return nil, fmt.Errorf("error binding ARGOCD_AUTHTOKEN: %w", err)
-	}
-	if err := viper.BindEnv("app_name", "ARGOCD_APP_NAME"); err != nil {
-		return nil, fmt.Errorf("error binding ARGOCD_APP_NAME: %w", err)
-	}
-	if err := viper.BindEnv("revision", "ARGOCD_REVISION"); err != nil {
-		return nil, fmt.Errorf("error binding ARGOCD_REVISION: %w", err)
 	}
 
 	viper.AutomaticEnv()
