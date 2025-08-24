@@ -277,16 +277,18 @@ func TestLoadConfig_PartialEnvironmentVariables(t *testing.T) {
 				if config == nil {
 					t.Fatal("Expected config, got nil")
 				}
-			} else {
-				if err == nil {
-					t.Fatal("Expected error, got nil")
-				}
-				if config != nil {
-					t.Error("Expected nil config for error case")
-				}
-				if !strings.Contains(err.Error(), tc.expectedError) {
-					t.Errorf("Expected error containing '%s', got %v", tc.expectedError, err)
-				}
+				return
+			}
+
+			// error expectations for failing test cases
+			if err == nil {
+				t.Fatal("Expected error, got nil")
+			}
+			if config != nil {
+				t.Error("Expected nil config for error case")
+			}
+			if !strings.Contains(err.Error(), tc.expectedError) {
+				t.Errorf("Expected error containing '%s', got %v", tc.expectedError, err)
 			}
 		})
 	}

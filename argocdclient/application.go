@@ -30,7 +30,7 @@ func (c *Client) GetApplication(argoAppName string) (map[string]interface{}, err
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			// Log the error but don't override the main error
-			fmt.Printf("warning: error closing response body: %v\n", closeErr)
+			_ = closeErr
 		}
 	}()
 

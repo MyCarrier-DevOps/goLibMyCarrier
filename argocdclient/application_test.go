@@ -9,26 +9,14 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 )
 
-// mockRetryableClient implements HTTPClientInterface for testing
-// It returns a custom response for each test
-
-// ...existing code...
-
-type mockRetryableClient struct {
-	Response *http.Response
-	Err      error
-}
-
-func (m *mockRetryableClient) Do(req *retryablehttp.Request) (*http.Response, error) {
-	return m.Response, m.Err
-}
-
 func TestGetApplication_Success(t *testing.T) {
 	appData := map[string]interface{}{"name": "test-app"}
 	body, _ := json.Marshal(appData)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		w.Write(body)
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -45,7 +33,9 @@ func TestGetApplication_Success(t *testing.T) {
 func TestGetApplication_ClientError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(404)
-		w.Write([]byte("not found"))
+		if _, err := w.Write([]byte("not found")); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -61,7 +51,9 @@ func TestGetManifests_Success(t *testing.T) {
 	body, _ := json.Marshal(manifests)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		w.Write(body)
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -78,7 +70,9 @@ func TestGetManifests_Success(t *testing.T) {
 func TestGetManifests_ServerError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
-		w.Write([]byte("server error"))
+		if _, err := w.Write([]byte("server error")); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -91,7 +85,9 @@ func TestGetManifests_ServerError(t *testing.T) {
 func TestGetApplication_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("not a json"))
+		if _, err := w.Write([]byte("not a json")); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
 	}))
 	defer server.Close()
 
@@ -113,7 +109,9 @@ func TestGetApplication_RequestCreationError(t *testing.T) {
 func TestGetManifests_InvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		w.Write([]byte("not a json"))
+		if _, err := w.Write([]byte("not a json")); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
 	}))
 	defer server.Close()
 

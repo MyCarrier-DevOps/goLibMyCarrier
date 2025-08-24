@@ -35,7 +35,7 @@ func (c *Client) GetManifests(revision, argoAppName string) ([]string, error) {
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			// Log the error but don't override the main error
-			fmt.Printf("warning: error closing response body: %v\n", closeErr)
+			_ = closeErr
 		}
 	}()
 
