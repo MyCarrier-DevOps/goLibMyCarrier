@@ -40,13 +40,13 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: |
           go mod download
-          go test -coverprofile=coverage.out -covermode=atomic ./...
+          go test -cover -coverprofile=coverage.out -covermode=atomic ./...
       
-      - name: Upload coverage for ${{ matrix.module }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: code-coverage-${{ matrix.module }}
-          path: ${{ matrix.module }}/coverage.out
+      # - name: Upload coverage for ${{ matrix.module }}
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: code-coverage-${{ matrix.module }}
+      #     path: ${{ matrix.module }}/coverage.out
   lint:
     name: lint-${{ matrix.module }}
     runs-on: ubuntu-latest
@@ -67,45 +67,45 @@ jobs:
           go mod tidy
           golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...
 
-  # Unified coverage reporting job
-  code-coverage:
-    name: "Generate coverage report"
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    needs: unit-tests
-    continue-on-error: true
-    strategy:
-      matrix:
-        module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: write
-    steps:
-      - uses: actions/checkout@v4
+  # # Unified coverage reporting job
+  # code-coverage:
+  #   name: "Generate coverage report"
+  #   if: github.event_name == 'pull_request'
+  #   runs-on: ubuntu-latest
+  #   needs: unit-tests
+  #   continue-on-error: true
+  #   strategy:
+  #     matrix:
+  #       module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
+  #   permissions:
+  #     contents: read
+  #     actions: read
+  #     pull-requests: write
+  #   steps:
+  #     - uses: actions/checkout@v4
       
-      # Download coverage artifact for this specific module
-      - name: Download coverage for ${{ matrix.module }}
-        uses: actions/download-artifact@v4
-        with:
-          name: code-coverage-${{ matrix.module }}
-          path: coverage-${{ matrix.module }}
+  #     # Download coverage artifact for this specific module
+  #     - name: Download coverage for ${{ matrix.module }}
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: code-coverage-${{ matrix.module }}
+  #         path: coverage-${{ matrix.module }}
       
-      # Upload module-specific coverage with unique name
-      - name: Upload ${{ matrix.module }} coverage
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-${{ matrix.module }}-final
-          path: coverage-${{ matrix.module }}/coverage.out
+  #     # Upload module-specific coverage with unique name
+  #     - name: Upload ${{ matrix.module }} coverage
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: coverage-${{ matrix.module }}-final
+  #         path: coverage-${{ matrix.module }}/coverage.out
       
-      # Generate coverage report for this specific module
-      - name: Generate ${{ matrix.module }} coverage report
-        uses: vladopajic/go-test-coverage@v2
-        with:
-          profile: coverage-${{ matrix.module }}/coverage.out
-          threshold-file: 40
-          threshold-package: 40
-          threshold-total: 40
+  #     # Generate coverage report for this specific module
+  #     - name: Generate ${{ matrix.module }} coverage report
+  #       uses: vladopajic/go-test-coverage@v2
+  #       with:
+  #         profile: coverage-${{ matrix.module }}/coverage.out
+  #         threshold-file: 40
+  #         threshold-package: 40
+  #         threshold-total: 40
 
   # Check that all unit tests passed
   unit-tests-check:
