@@ -103,7 +103,6 @@ jobs:
         uses: vladopajic/go-test-coverage@v2
         with:
           profile: coverage-${{ matrix.module }}/coverage.out
-          local-prefix: github.com/MyCarrier-DevOps/goLibMyCarrier/${{ matrix.module }}
           threshold-file: 40
           threshold-package: 40
           threshold-total: 40
