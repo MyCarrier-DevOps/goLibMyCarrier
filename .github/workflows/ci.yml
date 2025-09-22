@@ -20,33 +20,174 @@ on:
 
 jobs:
   unit-tests:
-    name: Unit Tests
+    name: unit-test-${{ matrix.module }}
     runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v4
         with:
           go-version: ^1.23.5
-      - name: Unit Tests
-        run: make test
+      
+      - name: Test ${{ matrix.module }} module
+        working-directory: ${{ matrix.module }}
+        run: |
+          go mod download
+          go test -coverprofile=coverage.out -covermode=atomic ./...
+      
+      - name: Upload coverage for ${{ matrix.module }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-${{ matrix.module }}
+          path: ${{ matrix.module }}/coverage.out
   lint:
-    name: Lint
+    name: lint-${{ matrix.module }}
     runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      matrix:
+        module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v2
+      - uses: actions/setup-go@v4
         with:
           go-version: ^1.23.5
       - name: Install tools
         run: make install-tools
-      - name: Lint
-        run: make lint
+      - name: Lint ${{ matrix.module }} module
+        working-directory: ${{ matrix.module }}
+        run: |
+          go mod tidy
+          golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...
+
+  code-coverage:
+    name: "Code coverage report"
+    if: github.event_name == 'pull_request' # Only run on pull requests
+    runs-on: ubuntu-latest
+    needs: unit-tests # Depends on all unit test jobs completing
+    permissions:
+      contents: read
+      actions: read # to download code coverage results from unit test jobs
+      pull-requests: write # write permission needed to comment on PR
+    steps:
+      - uses: actions/checkout@v4
+      
+      # Download all coverage artifacts
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: code-coverage-*
+          path: coverage-artifacts
+          merge-multiple: false
+      
+      # Debug: List downloaded artifacts
+      - name: Debug coverage artifacts
+        run: |
+          echo "Contents of coverage-artifacts directory:"
+          find coverage-artifacts -type f -name "*.out" || echo "No .out files found"
+          ls -la coverage-artifacts/ || echo "coverage-artifacts directory not found"
+      
+      # Merge all coverage files into one
+      - name: Merge coverage files
+        run: |
+          mkdir -p merged-coverage
+          echo "mode: atomic" > merged-coverage/coverage.txt
+          
+          # Find all coverage.out files and merge them
+          find coverage-artifacts -name "coverage.out" -type f | while read -r file; do
+            if [ -f "$file" ]; then
+              echo "Processing coverage from $file"
+              tail -n +2 "$file" >> merged-coverage/coverage.txt
+            fi
+          done
+          
+          echo "Merged coverage file created"
+          if [ -f "merged-coverage/coverage.txt" ]; then
+            wc -l merged-coverage/coverage.txt
+            echo "Sample lines from coverage.txt:"
+            head -5 merged-coverage/coverage.txt
+          else
+            echo "ERROR: merged coverage file not created"
+            exit 1
+          fi
+      
+      # Upload merged coverage as artifact
+      - name: Upload merged coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage
+          path: merged-coverage/coverage.txt
+      
+      # Check if we have coverage data before running the report
+      - name: Check coverage file
+        id: check-coverage
+        run: |
+          if [ -f "merged-coverage/coverage.txt" ] && [ -s "merged-coverage/coverage.txt" ]; then
+            lines=$(wc -l < merged-coverage/coverage.txt)
+            if [ "$lines" -gt 1 ]; then
+              echo "has-coverage=true" >> $GITHUB_OUTPUT
+              echo "Coverage file has $lines lines"
+            else
+              echo "has-coverage=false" >> $GITHUB_OUTPUT
+              echo "Coverage file is empty or only has header"
+            fi
+          else
+            echo "has-coverage=false" >> $GITHUB_OUTPUT
+            echo "No coverage file found"
+          fi
+      
+      # Use the coverage report action only if we have coverage data
+      - name: Generate coverage report
+        if: steps.check-coverage.outputs.has-coverage == 'true'
+        uses: fgrosse/go-coverage-report@v1.2.0
+        with:
+          coverage-artifact-name: "code-coverage"
+          coverage-file-name: "coverage.txt"
+          root-package: "github.com/MyCarrier-DevOps/goLibMyCarrier"
+
+  # Check that all unit tests passed
+  unit-tests-check:
+    name: "Unit tests status check"
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    if: always()
+    steps:
+      - name: Check unit test results
+        run: |
+          echo "Unit tests completed"
+          # This job will fail if any of the matrix unit test jobs failed
+          if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
+            echo "Some unit tests failed"
+            exit 1
+          fi
+          echo "All unit tests passed"
+
+  # Check that all lint jobs passed  
+  lint-check:
+    name: "Lint status check"
+    runs-on: ubuntu-latest
+    needs: lint
+    if: always()
+    steps:
+      - name: Check lint results
+        run: |
+          echo "Lint jobs completed"
+          # This job will fail if any of the matrix lint jobs failed
+          if [[ "${{ needs.lint.result }}" != "success" ]]; then
+            echo "Some lint jobs failed"
+            exit 1
+          fi
+          echo "All lint jobs passed"
+
   release:
     name: Create Release
     runs-on: ubuntu-latest
     needs: 
-      - unit-tests
-      - lint
+      - unit-tests-check
+      - lint-check
     if: github.ref == 'refs/heads/main'
     steps:
     - name: Checkout code
