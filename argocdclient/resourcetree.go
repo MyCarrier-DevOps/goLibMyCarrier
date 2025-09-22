@@ -14,6 +14,7 @@ func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]
 	const baseDelay = time.Second
 
 	var lastErr error
+	client := &http.Client{}
 
 	for attempt := range maxRetries {
 		if attempt > 0 {
@@ -22,7 +23,6 @@ func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]
 			time.Sleep(delay)
 		}
 
-		client := &http.Client{}
 		apiUrl := fmt.Sprintf("%v/api/v1/applications/%v/resource-tree", c.baseUrl, argoAppName)
 		req, err := http.NewRequest("GET", apiUrl, nil)
 		if err != nil {
