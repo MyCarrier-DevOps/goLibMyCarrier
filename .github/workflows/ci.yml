@@ -100,12 +100,13 @@ jobs:
       
       # Generate coverage report for this specific module
       - name: Generate ${{ matrix.module }} coverage report
-        uses: fgrosse/go-coverage-report@v1.2.0
+        uses: vladopajic/go-test-coverage@v2
         with:
-          coverage-artifact-name: "coverage-${{ matrix.module }}-final"
-          coverage-file-name: "coverage.out"
-          root-package: "github.com/MyCarrier-DevOps/goLibMyCarrier/${{ matrix.module }}"
-          trim: "github.com/MyCarrier-DevOps/goLibMyCarrier/"
+          profile: coverage-${{ matrix.module }}/coverage.out
+          local-prefix: github.com/MyCarrier-DevOps/goLibMyCarrier/${{ matrix.module }}
+          threshold-file: 40
+          threshold-package: 40
+          threshold-total: 40
 
   # Check that all unit tests passed
   unit-tests-check:
