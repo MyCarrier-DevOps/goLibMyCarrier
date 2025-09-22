@@ -83,21 +83,36 @@ jobs:
           path: coverage-artifacts
           merge-multiple: false
       
+      # Debug: List downloaded artifacts
+      - name: Debug coverage artifacts
+        run: |
+          echo "Contents of coverage-artifacts directory:"
+          find coverage-artifacts -type f -name "*.out" || echo "No .out files found"
+          ls -la coverage-artifacts/ || echo "coverage-artifacts directory not found"
+      
       # Merge all coverage files into one
       - name: Merge coverage files
         run: |
           mkdir -p merged-coverage
           echo "mode: atomic" > merged-coverage/coverage.txt
           
-          for dir in coverage-artifacts/code-coverage-*; do
-            if [ -d "$dir" ] && [ -f "$dir/coverage.out" ]; then
-              echo "Processing coverage from $dir"
-              tail -n +2 "$dir/coverage.out" >> merged-coverage/coverage.txt
+          # Find all coverage.out files and merge them
+          find coverage-artifacts -name "coverage.out" -type f | while read -r file; do
+            if [ -f "$file" ]; then
+              echo "Processing coverage from $file"
+              tail -n +2 "$file" >> merged-coverage/coverage.txt
             fi
           done
           
           echo "Merged coverage file created"
-          wc -l merged-coverage/coverage.txt
+          if [ -f "merged-coverage/coverage.txt" ]; then
+            wc -l merged-coverage/coverage.txt
+            echo "Sample lines from coverage.txt:"
+            head -5 merged-coverage/coverage.txt
+          else
+            echo "ERROR: merged coverage file not created"
+            exit 1
+          fi
       
       # Upload merged coverage as artifact
       - name: Upload merged coverage
@@ -106,8 +121,28 @@ jobs:
           name: code-coverage
           path: merged-coverage/coverage.txt
       
-      # Use the coverage report action
-      - uses: fgrosse/go-coverage-report@v1.2.0
+      # Check if we have coverage data before running the report
+      - name: Check coverage file
+        id: check-coverage
+        run: |
+          if [ -f "merged-coverage/coverage.txt" ] && [ -s "merged-coverage/coverage.txt" ]; then
+            lines=$(wc -l < merged-coverage/coverage.txt)
+            if [ "$lines" -gt 1 ]; then
+              echo "has-coverage=true" >> $GITHUB_OUTPUT
+              echo "Coverage file has $lines lines"
+            else
+              echo "has-coverage=false" >> $GITHUB_OUTPUT
+              echo "Coverage file is empty or only has header"
+            fi
+          else
+            echo "has-coverage=false" >> $GITHUB_OUTPUT
+            echo "No coverage file found"
+          fi
+      
+      # Use the coverage report action only if we have coverage data
+      - name: Generate coverage report
+        if: steps.check-coverage.outputs.has-coverage == 'true'
+        uses: fgrosse/go-coverage-report@v1.2.0
         with:
           coverage-artifact-name: "code-coverage"
           coverage-file-name: "coverage.txt"
