@@ -21,7 +21,7 @@ test:
 	@for dir in argocdclient auth clickhouse github kafka logger otel vault yaml; do \
 		if [ -d "$$dir" ]; then \
 			echo "Testing $$dir module..."; \
-			(cd $$dir && go mod download && go test -cover ./...); \
+			(cd $$dir && go mod download && go test -cover -coverprofile=coverage.txt ./...); \
 		else \
 			echo "Directory $$dir not found, skipping..."; \
 		fi; \
@@ -50,6 +50,15 @@ bump:
 			echo "Directory $$dir not found, skipping..."; \
 		fi; \
 	done
+
+.PHONY: install-go-test-coverage
+install-go-test-coverage:
+	go install github.com/vladopajic/go-test-coverage/v2@latest
+
+.PHONY: check-coverage
+check-coverage: install-go-test-coverage
+	go test ./... -coverprofile=./cover.out -covermode=atomic -coverpkg=./...
+	${GOBIN}/go-test-coverage --config=./.testcoverage.yml
 
 .PHONY: install-tools
 install-tools:
