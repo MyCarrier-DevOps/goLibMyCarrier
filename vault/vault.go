@@ -131,7 +131,7 @@ func NewVaultClient(ctx context.Context, config *VaultConfig, authenticator Vaul
 	// prepare a client with the given base address
 	client, err := vault.New(
 		vault.WithAddress(config.VaultAddress),
-		vault.WithRequestTimeout(30*time.Second),
+		vault.WithRequestTimeout(2*time.Second),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("error configuring vault: %w", err)
