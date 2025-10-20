@@ -40,10 +40,12 @@ jobs:
           go mod download
           go test -cover -coverprofile=../coverage-${{ matrix.module }}.out -covermode=atomic ./...
           go tool cover -func=../coverage-${{ matrix.module }}.out
+          ls -lah
+          ls -lah ../
       - name: check ${{ matrix.module }} test coverage
         uses: vladopajic/go-test-coverage@v2
         with:
-          profile: ../coverage-${{ matrix.module }}.out
+          profile: ./coverage-${{ matrix.module }}.out
           threshold-total: 75
       
   lint:
