@@ -45,6 +45,7 @@ jobs:
         with:
           profile: ./coverage-${{ matrix.module }}.out
           threshold-total: 75
+          source-dir: ./${{ matrix.module }}
       
   lint:
     name: lint-${{ matrix.module }}
