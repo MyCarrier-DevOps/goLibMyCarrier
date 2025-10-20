@@ -1,3 +1,5 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/logger.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/logger) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/logger)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/logger)
+
 # Logger Utility
 
 This is a simple logging utility written in Go, designed to provide structured and easy-to-read logs for your application.

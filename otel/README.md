@@ -1,4 +1,6 @@
-# otel Logger
+[![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/otel.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/otel) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/otel)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/otel)
+
+# Otel Logger
 
 A lightweight, structured logging library that combines JSON logging with comprehensive OpenTelemetry integration. This logger provides structured logging capabilities while seamlessly sending both log records and trace data to OpenTelemetry collectors for complete observability.
 

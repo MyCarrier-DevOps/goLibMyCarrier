@@ -1,3 +1,4 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka) 
 # Kafka Utilities
 
 The `kafka` package provides utilities to interact with Kafka, including configuration management, message production, and message consumption. It simplifies the process of integrating Kafka into your Go applications.

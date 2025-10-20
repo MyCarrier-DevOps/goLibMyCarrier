@@ -1,3 +1,4 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/github.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/github) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/github)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/github) 
 # GitHub Handler Library
 
 A comprehensive Go library for interacting with GitHub API and Git repositories using GitHub App credentials. This library provides a clean, extensible API for authentication, repository operations, commit management, and check run creation.

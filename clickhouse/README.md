@@ -1,3 +1,4 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse)
 # ClickHouse Handler Library
 
 This library provides a utility for interacting with a ClickHouse database. It includes functionality for loading configuration, establishing a connection, executing queries, and managing the database session.

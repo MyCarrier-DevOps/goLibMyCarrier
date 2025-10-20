@@ -1,3 +1,5 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml)
+
 # Vault Package
 
 ## Description

@@ -1,3 +1,4 @@
+[![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/auth.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/auth) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/auth)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/auth)
 # Authentication Middleware Library
 
 This library provides a middleware utility for API key-based authentication in a Gin web framework. It includes functionality for validating API keys and ensuring secure access to protected routes.
