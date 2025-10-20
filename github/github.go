@@ -171,11 +171,11 @@ func (s *GithubSession) authenticate() error {
 	}
 	appID, err := strconv.ParseInt(s.appID, 10, 64)
 	if err != nil {
-		return fmt.Errorf("error converting string to int")
+		return fmt.Errorf("error parsing appId ")
 	}
 	installationID, err := strconv.ParseInt(s.installID, 10, 64)
 	if err != nil {
-		return fmt.Errorf("error converting string to int: %s", err.Error())
+		return fmt.Errorf("error parsing installationID: %s", err.Error())
 	}
 	appTokenSource, err := githubauth.NewApplicationTokenSource(appID, privateKey)
 	if err != nil {
