@@ -53,11 +53,12 @@ When contributing:
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/amazing-feature`)
 3. Write tests for your changes
-4. Ensure all tests pass (`go test ./...`)
-5. Run linting (`golangci-lint run`)
-6. Commit your changes (`git commit -m 'Add some amazing feature'`)
-7. Push to the branch (`git push origin feature/amazing-feature`)
-8. Open a Pull Request
+4. Run lint checks (`make lint`)
+5. Ensure all tests pass (`make test`)
+6. Cleanup go deps (`make tidy`)
+7. Commit your changes (`git commit -m 'Add some amazing feature'`)
+8. Push to the branch (`git push origin feature/amazing-feature`)
+9. Open a Pull Request
 
 ## Versioning
 
