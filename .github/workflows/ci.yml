@@ -38,12 +38,12 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: |
           go mod download
-          go test -cover -coverprofile=coverage.out -covermode=atomic ./...
-          go tool cover -func=../${{ matrix.module }}-coverage.out
+          go test -cover -coverprofile=../coverage-${{ matrix.module }}.out -covermode=atomic ./...
+          go tool cover -func=../coverage-${{ matrix.module }}.out
       - name: check ${{ matrix.module }} test coverage
         uses: vladopajic/go-test-coverage@v2
         with:
-          profile: ./${{ matrix.module }}-coverage.out
+          profile: ../coverage-${{ matrix.module }}.out
           threshold-total: 75
       
   lint:

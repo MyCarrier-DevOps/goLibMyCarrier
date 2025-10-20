@@ -27,14 +27,14 @@ test:
 		for dir in argocdclient auth clickhouse github kafka logger otel vault yaml; do \
 			if [ -d "$$dir" ]; then \
 				echo "Testing $$dir module..."; \
-				(cd $$dir && go mod download && go test -cover -coverprofile=coverage.txt ./...); \
+				(cd $$dir && go mod download && go test -cover -coverprofile=../coverage-$$dir.out ./... && go tool cover -func=../coverage-$$dir.out); \
 			else \
 				echo "Directory $$dir not found, skipping..."; \
 			fi; \
 		done; \
 	else \
 		echo "Testing $(PKG) module..."; \
-		(cd $(PKG) && go mod download && go test -cover -coverprofile=coverage.txt ./...); \
+		(cd $(PKG) && go mod download && go test -cover -coverprofile=../coverage-$(PKG).out ./... && go tool cover -func=../coverage-$(PKG).out); \
 	fi
 
 .PHONY: fmt
