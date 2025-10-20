@@ -16,6 +16,126 @@ type MockClickhouseSession struct {
 	mock.Mock
 }
 
+// MockConn implements driver.Conn for testing
+type MockConn struct {
+	mock.Mock
+}
+
+func (m *MockConn) Contributors() []string {
+	args := m.Called()
+	return args.Get(0).([]string)
+}
+
+func (m *MockConn) ServerVersion() (*driver.ServerVersion, error) {
+	args := m.Called()
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*driver.ServerVersion), args.Error(1)
+}
+
+func (m *MockConn) Select(ctx context.Context, dest interface{}, query string, args ...interface{}) error {
+	mArgs := m.Called(ctx, dest, query, args)
+	return mArgs.Error(0)
+}
+
+func (m *MockConn) Query(ctx context.Context, query string, args ...interface{}) (driver.Rows, error) {
+	mArgs := m.Called(ctx, query, args)
+	if mArgs.Get(0) == nil {
+		return nil, mArgs.Error(1)
+	}
+	return mArgs.Get(0).(driver.Rows), mArgs.Error(1)
+}
+
+func (m *MockConn) QueryRow(ctx context.Context, query string, args ...interface{}) driver.Row {
+	mArgs := m.Called(ctx, query, args)
+	if mArgs.Get(0) == nil {
+		return nil
+	}
+	return mArgs.Get(0).(driver.Row)
+}
+
+func (m *MockConn) PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error) {
+	mArgs := m.Called(ctx, query, opts)
+	if mArgs.Get(0) == nil {
+		return nil, mArgs.Error(1)
+	}
+	return mArgs.Get(0).(driver.Batch), mArgs.Error(1)
+}
+
+func (m *MockConn) Exec(ctx context.Context, query string, args ...interface{}) error {
+	mArgs := m.Called(ctx, query, args)
+	return mArgs.Error(0)
+}
+
+func (m *MockConn) AsyncInsert(ctx context.Context, query string, wait bool, args ...interface{}) error {
+	mArgs := m.Called(ctx, query, wait, args)
+	return mArgs.Error(0)
+}
+
+func (m *MockConn) Ping(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *MockConn) Stats() driver.Stats {
+	args := m.Called()
+	return args.Get(0).(driver.Stats)
+}
+
+func (m *MockConn) Close() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+// MockRows implements driver.Rows for testing
+type MockRows struct {
+	mock.Mock
+}
+
+func (m *MockRows) Next() bool {
+	args := m.Called()
+	return args.Bool(0)
+}
+
+func (m *MockRows) Scan(dest ...interface{}) error {
+	args := m.Called(dest)
+	return args.Error(0)
+}
+
+func (m *MockRows) ScanStruct(dest interface{}) error {
+	args := m.Called(dest)
+	return args.Error(0)
+}
+
+func (m *MockRows) ColumnTypes() []driver.ColumnType {
+	args := m.Called()
+	if args.Get(0) == nil {
+		return nil
+	}
+	return args.Get(0).([]driver.ColumnType)
+}
+
+func (m *MockRows) Totals(dest ...interface{}) error {
+	args := m.Called(dest)
+	return args.Error(0)
+}
+
+func (m *MockRows) Columns() []string {
+	args := m.Called()
+	return args.Get(0).([]string)
+}
+
+func (m *MockRows) Close() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *MockRows) Err() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
 func (m *MockClickhouseSession) Connect(ch *ClickhouseConfig, context context.Context) error {
 	args := m.Called(ch, context)
 	return args.Error(0)
@@ -979,4 +1099,117 @@ func TestClickhouseSession_Conn_ReturnsCorrectValue(t *testing.T) {
 
 	conn := session.Conn()
 	assert.Nil(t, conn)
+}
+
+// Test Query with successful connection
+func TestClickhouseSession_Query_Success(t *testing.T) {
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT 1"
+
+	mockConn.On("Query", ctx, query, mock.Anything).Return(mockRows, nil)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	rows, err := session.Query(ctx, query)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, rows)
+	mockConn.AssertExpectations(t)
+}
+
+// Test Query with connection error
+func TestClickhouseSession_Query_ConnectionError(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	query := "SELECT 1"
+	expectedError := errors.New("query failed")
+
+	mockConn.On("Query", ctx, query, mock.Anything).Return(nil, expectedError)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	rows, err := session.Query(ctx, query)
+
+	assert.Error(t, err)
+	assert.Nil(t, rows)
+	assert.Equal(t, expectedError, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test Exec with successful connection
+func TestClickhouseSession_Exec_Success(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "CREATE TABLE test (id UInt32) ENGINE = Memory"
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(nil)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Exec(ctx, stmt)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test Exec with connection error
+func TestClickhouseSession_Exec_ConnectionError(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INVALID SQL"
+	expectedError := errors.New("exec failed")
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(expectedError)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Exec(ctx, stmt)
+
+	assert.Error(t, err)
+	assert.Equal(t, expectedError, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test Close with successful connection close
+func TestClickhouseSession_Close_Success(t *testing.T) {
+	mockConn := &MockConn{}
+
+	mockConn.On("Close").Return(nil)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Close()
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test Close with connection close error
+func TestClickhouseSession_Close_ConnectionError(t *testing.T) {
+	mockConn := &MockConn{}
+	expectedError := errors.New("close failed")
+
+	mockConn.On("Close").Return(expectedError)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Close()
+
+	assert.Error(t, err)
+	assert.Equal(t, expectedError, err)
+	mockConn.AssertExpectations(t)
 }
