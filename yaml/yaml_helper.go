@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 )
 
 // WriteYamlFileWithStyle writes YAML data to a file while preserving specific formatting styles.

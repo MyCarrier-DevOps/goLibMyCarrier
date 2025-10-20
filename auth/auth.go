@@ -61,7 +61,6 @@ func (am *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		// log.Printf("Decoded API Key: %s", decodedApiKey)
 
 		// Convert decoded API key to string
 		decodedApiKeyStr := string(decodedApiKey)

@@ -105,7 +105,7 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 // If Topic is set, it returns the Topic directly.
 // If TopicPrefix is set and Topic is empty, it concatenates TopicPrefix with the separator and suffix.
 // If TopicPrefix is set but no suffix is provided, it returns an error.
-func getTopicName(kafkacfg *KafkaConfig, suffix string, separator string) (string, error) {
+func getTopicName(kafkacfg *KafkaConfig, suffix, separator string) (string, error) {
 	// Use default separator if not provided
 	if separator == "" {
 		separator = "."

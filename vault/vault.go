@@ -12,8 +12,8 @@ import (
 
 // VaultClientInterface defines the interface for Vault operations
 type VaultClientInterface interface {
-	GetKVSecret(ctx context.Context, path string, mount string) (map[string]interface{}, error)
-	GetKVSecretList(ctx context.Context, path string, mount string) ([]string, error)
+	GetKVSecret(ctx context.Context, path, mount string) (map[string]interface{}, error)
+	GetKVSecretList(ctx context.Context, path, mount string) ([]string, error)
 	GetAzureDynamicCredentials(ctx context.Context, azureRole string) (map[string]interface{}, error)
 	SetToken(token string) error
 }
@@ -154,7 +154,7 @@ func CreateVaultClient(ctx context.Context, config *VaultConfig) (*VaultClient, 
 }
 
 // VaultClient methods implementing VaultClientInterface
-func (vc *VaultClient) GetKVSecret(ctx context.Context, path string, mount string) (map[string]interface{}, error) {
+func (vc *VaultClient) GetKVSecret(ctx context.Context, path, mount string) (map[string]interface{}, error) {
 	// Read a secret from Vault's KV v2 secrets engine
 	secret, err := vc.client.Secrets.KvV2Read(
 		ctx,
@@ -167,7 +167,7 @@ func (vc *VaultClient) GetKVSecret(ctx context.Context, path string, mount strin
 	return secret.Data.Data, nil
 }
 
-func (vc *VaultClient) GetKVSecretList(ctx context.Context, path string, mount string) ([]string, error) {
+func (vc *VaultClient) GetKVSecretList(ctx context.Context, path, mount string) ([]string, error) {
 	// Read a secret from Vault's KV v2 secrets engine
 	secret, err := vc.client.Secrets.KvV2List(
 		ctx,
@@ -211,7 +211,7 @@ func LegacyVaultClient(ctx context.Context, config *VaultConfig) (*vault.Client,
 	return vaultClient.client, nil
 }
 
-func GetKVSecret(ctx context.Context, client *vault.Client, path string, mount string) (map[string]interface{}, error) {
+func GetKVSecret(ctx context.Context, client *vault.Client, path, mount string) (map[string]interface{}, error) {
 	vc := &VaultClient{client: client}
 	return vc.GetKVSecret(ctx, path, mount)
 }

@@ -3,11 +3,9 @@ package otel
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	stdlog "log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,7 +21,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
 	"go.opentelemetry.io/otel/trace"
-	klog "k8s.io/klog/v2"
 )
 
 // Logger constants
@@ -33,6 +30,7 @@ const (
 	DebugLevel      = "debug"
 	ErrorLevel      = "error"
 	WarnLevel       = "warn"
+	FatalLevel      = "fatal"
 
 	// OTel environment variables for configuration
 	OtelEndpointEnv     = "OTEL_EXPORTER_OTLP_ENDPOINT"
@@ -49,6 +47,7 @@ const (
 	LevelInfo
 	LevelWarn
 	LevelError
+	LevelFatal
 )
 
 // String returns the string representation of the log level
@@ -62,6 +61,8 @@ func (l LogLevel) String() string {
 		return WarnLevel
 	case LevelError:
 		return ErrorLevel
+	case LevelFatal:
+		return FatalLevel
 	default:
 		return InfoLevel
 	}
@@ -77,6 +78,8 @@ type AppLogger interface {
 	Errorf(template string, args ...interface{})
 	Warn(args ...interface{})
 	Warnf(template string, args ...interface{})
+	Fatal(args ...interface{})
+	Fatalf(template string, args ...interface{})
 	With(key string, value interface{}) AppLogger
 	Shutdown(ctx context.Context) error
 }
@@ -113,7 +116,7 @@ func NewAppLogger() AppLogger {
 	}
 	appName, _ := os.LookupEnv("LOG_APP_NAME")
 	if appName == "" {
-		appName = "test_application_abcd"
+		appName = "default_app"
 	}
 	appVersion, _ := os.LookupEnv("LOG_APP_VERSION")
 	if appVersion == "" {
@@ -124,7 +127,7 @@ func NewAppLogger() AppLogger {
 
 	// Check if OpenTelemetry is disabled
 	otelSdkDisabled, defined := os.LookupEnv(otelSdkDisabled)
-	useOtel := !defined || strings.ToLower(otelSdkDisabled) != "true"
+	useOtel := !defined || !strings.EqualFold(otelSdkDisabled, "true")
 
 	// Create fallback standard logger
 	fallbackLog := stdlog.New(os.Stdout, fmt.Sprintf("[%s] ", appName), stdlog.LstdFlags)
@@ -192,6 +195,16 @@ func (l *OtelLogger) Warnf(template string, args ...interface{}) {
 	l.log(LevelWarn, fmt.Sprintf(template, args...))
 }
 
+// Fatal logs a fatal level message
+func (l *OtelLogger) Fatal(args ...interface{}) {
+	l.log(LevelFatal, fmt.Sprint(args...))
+}
+
+// Fatalf logs a fatal level message with formatting
+func (l *OtelLogger) Fatalf(template string, args ...interface{}) {
+	l.log(LevelFatal, fmt.Sprintf(template, args...))
+}
+
 // With adds a key-value pair to the logger context
 func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 	newLogger := &OtelLogger{
@@ -232,11 +245,6 @@ func (l *OtelLogger) Shutdown(ctx context.Context) error {
 		}
 	}
 	return err
-}
-
-func SetKlogLevel(level int) {
-	klog.InitFlags(nil)
-	_ = flag.Set("v", strconv.Itoa(level))
 }
 
 type loggerKey struct{}
@@ -331,7 +339,7 @@ func (l *OtelLogger) handleDisabledOtel() error {
 // initOtel initializes the OpenTelemetry SDK with OTLP trace and log exporters
 func (l *OtelLogger) initOtel() error {
 	// Check if OpenTelemetry SDK is disabled
-	if otelSdkDisabled := os.Getenv("OTEL_SDK_DISABLED"); strings.ToLower(otelSdkDisabled) == "true" {
+	if otelSdkDisabled := os.Getenv("OTEL_SDK_DISABLED"); strings.EqualFold(otelSdkDisabled, "true") {
 		return l.handleDisabledOtel()
 	}
 
@@ -492,6 +500,8 @@ func parseLogLevel(level string) LogLevel {
 		return LevelWarn
 	case ErrorLevel:
 		return LevelError
+	case FatalLevel:
+		return LevelFatal
 	default:
 		return LevelInfo
 	}
@@ -560,6 +570,8 @@ func (l *OtelLogger) sendOtelLog(level LogLevel, message string) {
 		severity = otellog.SeverityWarn
 	case LevelError:
 		severity = otellog.SeverityError
+	case LevelFatal:
+		severity = otellog.SeverityFatal
 	default:
 		severity = otellog.SeverityInfo
 	}

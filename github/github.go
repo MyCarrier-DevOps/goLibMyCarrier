@@ -169,8 +169,14 @@ func (s *GithubSession) authenticate() error {
 	if _, err := jwt.ParseRSAPrivateKeyFromPEM(privateKey); err != nil {
 		return fmt.Errorf("error creating application token source: invalid private key: %s", err.Error())
 	}
-	appID, _ := strconv.ParseInt(s.appID, 10, 64)
-	installationID, _ := strconv.ParseInt(s.installID, 10, 64)
+	appID, err := strconv.ParseInt(s.appID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("error converting string to int")
+	}
+	installationID, err := strconv.ParseInt(s.installID, 10, 64)
+	if err != nil {
+		return fmt.Errorf("error converting string to int: %s", err.Error())
+	}
 	appTokenSource, err := githubauth.NewApplicationTokenSource(appID, privateKey)
 	if err != nil {
 		return fmt.Errorf("error creating application token source: %s", err.Error())

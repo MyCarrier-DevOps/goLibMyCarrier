@@ -25,6 +25,7 @@ func TestLogLevel_String(t *testing.T) {
 		{LevelInfo, "info"},
 		{LevelWarn, "warn"},
 		{LevelError, "error"},
+		{LevelFatal, "fatal"},
 		{LogLevel(999), "info"}, // default case
 	}
 
@@ -50,6 +51,8 @@ func TestParseLogLevel(t *testing.T) {
 		{"WARN", LevelWarn},
 		{"error", LevelError},
 		{"ERROR", LevelError},
+		{"fatal", LevelFatal},
+		{"FATAL", LevelFatal},
 		{"invalid", LevelInfo}, // default case
 		{"", LevelInfo},        // empty string
 	}
@@ -88,8 +91,8 @@ func TestNewAppLogger_DefaultValues(t *testing.T) {
 		t.Errorf("Default log level should be LevelInfo, got %v", otelLogger.logLevel)
 	}
 
-	if otelLogger.appName != "test_application_abcd" {
-		t.Errorf("Default app name should be 'test_application_abcd', got %q", otelLogger.appName)
+	if otelLogger.appName != "default_app" {
+		t.Errorf("Default app name should be 'default_app', got %q", otelLogger.appName)
 	}
 
 	if otelLogger.appVersion != "1.0.0" {
@@ -253,18 +256,27 @@ func TestShouldLog(t *testing.T) {
 		{LevelDebug, LevelInfo, true},
 		{LevelDebug, LevelWarn, true},
 		{LevelDebug, LevelError, true},
+		{LevelDebug, LevelFatal, true},
 		{LevelInfo, LevelDebug, false},
 		{LevelInfo, LevelInfo, true},
 		{LevelInfo, LevelWarn, true},
 		{LevelInfo, LevelError, true},
+		{LevelInfo, LevelFatal, true},
 		{LevelWarn, LevelDebug, false},
 		{LevelWarn, LevelInfo, false},
 		{LevelWarn, LevelWarn, true},
 		{LevelWarn, LevelError, true},
+		{LevelWarn, LevelFatal, true},
 		{LevelError, LevelDebug, false},
 		{LevelError, LevelInfo, false},
 		{LevelError, LevelWarn, false},
 		{LevelError, LevelError, true},
+		{LevelError, LevelFatal, true},
+		{LevelFatal, LevelDebug, false},
+		{LevelFatal, LevelInfo, false},
+		{LevelFatal, LevelWarn, false},
+		{LevelFatal, LevelError, false},
+		{LevelFatal, LevelFatal, true},
 	}
 
 	for _, tt := range tests {
@@ -390,6 +402,113 @@ func TestLoggingMethods(t *testing.T) {
 	}
 }
 
+func TestFatalLogging(t *testing.T) {
+	// Capture stdout
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	// Clear environment to avoid interference
+	if err := os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT"); err != nil {
+		t.Logf("Failed to unset OTEL_EXPORTER_OTLP_ENDPOINT: %v", err)
+	}
+	if err := os.Setenv("LOG_LEVEL", "fatal"); err != nil {
+		t.Fatalf("Failed to set LOG_LEVEL: %v", err)
+	}
+	defer func() {
+		if err := os.Unsetenv("LOG_LEVEL"); err != nil {
+			t.Logf("Failed to unset LOG_LEVEL: %v", err)
+		}
+	}()
+
+	logger := NewAppLogger()
+	otelLogger, ok := logger.(*OtelLogger)
+	if !ok {
+		t.Fatal("NewAppLogger() should return *OtelLogger")
+	}
+
+	// Test Fatal method
+	otelLogger.Fatal("fatal error occurred")
+
+	// Test Fatalf method
+	otelLogger.Fatalf("fatal error: %s", "system failure")
+
+	// Restore stdout
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
+	os.Stdout = oldStdout
+
+	// Read the output
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read from pipe: %v", err)
+	}
+	output := buf.String()
+
+	// Verify that fatal logs were written
+	if !strings.Contains(output, "fatal error occurred") {
+		t.Error("Expected output to contain 'fatal error occurred'")
+	}
+	if !strings.Contains(output, "fatal error: system failure") {
+		t.Error("Expected output to contain formatted fatal message")
+	}
+
+	// Verify log level is "fatal"
+	if !strings.Contains(output, `"level":"fatal"`) {
+		t.Error("Expected log level to be 'fatal'")
+	}
+}
+
+func TestFatalLoggingStructured(t *testing.T) {
+	// Capture stdout
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("Failed to create pipe: %v", err)
+	}
+	os.Stdout = w
+
+	logger := &OtelLogger{
+		appName:     "test-app",
+		logLevel:    LevelDebug,
+		attributes:  map[string]interface{}{"severity": "critical"},
+		fallbackLog: log.New(w, "", 0),
+	}
+
+	logger.logStructured(LevelFatal, "fatal test message")
+
+	// Restore stdout
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
+	os.Stdout = oldStdout
+
+	// Read the output
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("Failed to read from pipe: %v", err)
+	}
+	output := buf.String()
+
+	// Parse JSON output
+	var logEntry LogEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &logEntry); err != nil {
+		t.Fatalf("Failed to parse JSON output: %v", err)
+	}
+
+	// Verify log entry
+	if logEntry.Level != "fatal" {
+		t.Errorf("Expected level 'fatal', got %q", logEntry.Level)
+	}
+	if logEntry.Message != "fatal test message" {
+		t.Errorf("Expected message 'fatal test message', got %q", logEntry.Message)
+	}
+	if logEntry.Attributes["severity"] != "critical" {
+		t.Errorf("Expected attribute severity='critical', got %v", logEntry.Attributes["severity"])
+	}
+}
+
 func TestWith(t *testing.T) {
 	// Capture stdout
 	oldStdout := os.Stdout
@@ -480,12 +599,6 @@ func TestFromContext(t *testing.T) {
 	if retrievedLogger != originalLogger {
 		t.Error("FromContext should return the same logger that was stored in context")
 	}
-}
-
-func TestSetKlogLevel(t *testing.T) {
-	// Test that SetKlogLevel doesn't panic
-	SetKlogLevel(2)
-	// We can't easily test the actual effect, but we can ensure it doesn't crash
 }
 
 func TestLogFallback(t *testing.T) {
@@ -965,27 +1078,32 @@ func captureGinLogs(t *testing.T, testFunc func(*gin.Engine, AppLogger)) string 
 	originalOutput := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
-	defer func() {
-		if err := w.Close(); err != nil {
-			t.Logf("Failed to close writer: %v", err)
-		}
-		os.Stdout = originalOutput
-	}()
 
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
 	logger := NewAppLogger()
 	router.Use(GinLoggerMiddleware(logger))
 
-	testFunc(router, logger)
-
-	// Read the captured output
+	// Start reading in background
+	done := make(chan bool)
 	go func() {
 		if _, err := io.Copy(&buf, r); err != nil {
 			t.Logf("Failed to copy from pipe: %v", err)
 		}
+		done <- true
 	}()
-	time.Sleep(100 * time.Millisecond)
+
+	// Execute test function
+	testFunc(router, logger)
+
+	// Close writer and wait for reader to finish
+	if err := w.Close(); err != nil {
+		t.Logf("Failed to close writer: %v", err)
+	}
+	<-done
+
+	// Restore stdout
+	os.Stdout = originalOutput
 
 	return buf.String()
 } // Helper to perform GET request and verify basic response
@@ -1350,6 +1468,24 @@ func TestOtelLogger_sendOtelLog(t *testing.T) {
 	// More comprehensive testing would require mocking the otel logger
 }
 
+func TestOtelLogger_sendOtelLog_AllLevels(t *testing.T) {
+	// Test all log levels including Fatal
+	logger := &OtelLogger{
+		appName:    "test-app",
+		appVersion: "1.0.0",
+		attributes: map[string]interface{}{"test": "value"},
+	}
+
+	// Test all log levels (should not panic even with nil otel logger)
+	levels := []LogLevel{LevelDebug, LevelInfo, LevelWarn, LevelError, LevelFatal}
+	for _, level := range levels {
+		t.Run(level.String(), func(t *testing.T) {
+			// Should not panic
+			logger.sendOtelLog(level, "test message for "+level.String())
+		})
+	}
+}
+
 func TestNewAppLogger_WithEnvironmentVariables(t *testing.T) {
 	// Set all environment variables
 	_ = os.Setenv("LOG_LEVEL", "debug")
@@ -1418,5 +1554,317 @@ func TestOtelLogger_logFallback(t *testing.T) {
 	}
 	if !strings.Contains(output, "key2=42") {
 		t.Errorf("Expected log to contain attributes, got: %s", output)
+	}
+}
+
+func TestOtelLogger_logFallback_FatalLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		fallbackLog: log.New(&buf, "", 0),
+		attributes: map[string]interface{}{
+			"component":  "core",
+			"error_code": 500,
+		},
+	}
+
+	logger.logFallback(LevelFatal, "fatal system error")
+
+	output := buf.String()
+	if !strings.Contains(output, "FATAL") {
+		t.Errorf("Expected log to contain 'FATAL', got: %s", output)
+	}
+	if !strings.Contains(output, "fatal system error") {
+		t.Errorf("Expected log to contain message, got: %s", output)
+	}
+	if !strings.Contains(output, "component=core") {
+		t.Errorf("Expected log to contain component attribute, got: %s", output)
+	}
+	if !strings.Contains(output, "error_code=500") {
+		t.Errorf("Expected log to contain error_code attribute, got: %s", output)
+	}
+}
+
+func TestOtelLogger_log_FiltersBasedOnLevel(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		logLevel:    LevelWarn, // Only warn and above
+		fallbackLog: log.New(&buf, "", 0),
+		useOtel:     false,
+		attributes:  make(map[string]interface{}),
+	}
+
+	// These should be filtered out
+	logger.log(LevelDebug, "debug message")
+	logger.log(LevelInfo, "info message")
+
+	// These should be logged
+	logger.log(LevelWarn, "warn message")
+	logger.log(LevelError, "error message")
+	logger.log(LevelFatal, "fatal message")
+
+	output := buf.String()
+	if strings.Contains(output, "debug message") {
+		t.Error("Debug message should be filtered out")
+	}
+	if strings.Contains(output, "info message") {
+		t.Error("Info message should be filtered out")
+	}
+	if !strings.Contains(output, "warn message") {
+		t.Error("Warn message should be logged")
+	}
+	if !strings.Contains(output, "error message") {
+		t.Error("Error message should be logged")
+	}
+	if !strings.Contains(output, "fatal message") {
+		t.Error("Fatal message should be logged")
+	}
+}
+
+func TestOtelLogger_NewAppLogger_InitOtelFailure(t *testing.T) {
+	// Set environment to enable OTel but with invalid configuration that will cause init to fail
+	_ = os.Setenv("OTEL_SDK_DISABLED", "false")
+	_ = os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://invalid-endpoint-that-does-not-exist:99999")
+	defer func() {
+		_ = os.Unsetenv("OTEL_SDK_DISABLED")
+		_ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}()
+
+	// Capture stdout to verify fallback message
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	logger := NewAppLogger()
+
+	// Close writer and restore stdout
+	_ = w.Close()
+	os.Stdout = oldStdout
+
+	// Read output
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+
+	// Logger should still be created even if OTel init fails
+	if logger == nil {
+		t.Fatal("Logger should be created even if OTel init fails")
+	}
+
+	otelLogger, ok := logger.(*OtelLogger)
+	if !ok {
+		t.Fatal("Should return *OtelLogger")
+	}
+
+	// Since the endpoint is invalid but formatted correctly, init might succeed
+	// The important thing is that logger is created and functional
+	// We test the actual failure case in TestOtelLogger_initOtel_WithEndpoint
+	if otelLogger == nil {
+		t.Fatal("Logger should be created")
+	}
+}
+
+func TestOtelLogger_With_PreservesOtelReferences(t *testing.T) {
+	// Create a logger with mock OTel providers
+	originalLogger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelInfo,
+		attributes:  map[string]interface{}{"original": "value"},
+		fallbackLog: log.New(os.Stdout, "", 0),
+		useOtel:     true,
+		tracer:      nil, // Would be set in real scenario
+	}
+
+	// Create enhanced logger
+	enhanced := originalLogger.With("new_key", "new_value")
+	enhancedLogger := enhanced.(*OtelLogger)
+
+	// Verify original attributes are preserved
+	if enhancedLogger.attributes["original"] != "value" {
+		t.Error("Original attributes should be preserved")
+	}
+
+	// Verify new attribute is added
+	if enhancedLogger.attributes["new_key"] != "new_value" {
+		t.Error("New attribute should be added")
+	}
+
+	// Verify original logger is not modified
+	if _, exists := originalLogger.attributes["new_key"]; exists {
+		t.Error("Original logger should not be modified")
+	}
+
+	// Verify OTel references are preserved
+	if enhancedLogger.useOtel != originalLogger.useOtel {
+		t.Error("useOtel should be preserved")
+	}
+	if enhancedLogger.appName != originalLogger.appName {
+		t.Error("appName should be preserved")
+	}
+	if enhancedLogger.appVersion != originalLogger.appVersion {
+		t.Error("appVersion should be preserved")
+	}
+}
+
+func TestOtelLogger_formatOtlpEndpoint_EdgeCases(t *testing.T) {
+	logger := &OtelLogger{}
+
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"multiple trailing slashes", "http://localhost:4317///", "http://localhost:4317//"},
+		{"single trailing slash removed", "http://localhost:4317/", "http://localhost:4317"},
+		{"just protocol http", "http://", "http://http:/"},
+		{"just protocol https", "https://", "http://https:/"},
+		{"ip address without port", "192.168.1.100", "http://192.168.1.100"},
+		{"hostname with path", "collector.example.com/v1/traces", "http://collector.example.com/v1/traces"},
+		{"https with path and trailing slash", "https://collector.example.com/v1/traces/", "https://collector.example.com/v1/traces"},
+		{"http with path no trailing slash", "http://collector.example.com/v1/traces", "http://collector.example.com/v1/traces"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := logger.formatOtlpEndpoint(tt.input)
+			if result != tt.expected {
+				t.Errorf("formatOtlpEndpoint(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestOtelLogger_getOtlpEndpoint_PriorityOrder(t *testing.T) {
+	logger := &OtelLogger{}
+
+	// Test 1: OTEL_HOST_IP takes priority over OTEL_EXPORTER_OTLP_ENDPOINT
+	_ = os.Setenv("OTEL_HOST_IP", "priority-host")
+	_ = os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://fallback.example.com")
+	defer func() {
+		_ = os.Unsetenv("OTEL_HOST_IP")
+		_ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}()
+
+	result := logger.getOtlpEndpoint()
+	if !strings.Contains(result, "priority-host") {
+		t.Errorf("OTEL_HOST_IP should take priority, got: %s", result)
+	}
+	if strings.Contains(result, "fallback") {
+		t.Errorf("Should not use OTEL_EXPORTER_OTLP_ENDPOINT when OTEL_HOST_IP is set, got: %s", result)
+	}
+}
+
+func TestOtelLogger_initOtel_WithEndpoint(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		fallbackLog: log.New(&buf, "", 0),
+	}
+
+	// Set endpoint but OTel creation will fail (which is expected in test env)
+	_ = os.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318")
+	_ = os.Unsetenv("OTEL_SDK_DISABLED")
+	defer func() {
+		_ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	}()
+
+	err := logger.initOtel()
+	// Error is expected since we don't have a real OTLP collector running
+	// The important thing is that it attempts initialization
+	if err == nil {
+		// If no error, verify tracer or logger was set
+		if logger.tracer == nil && logger.logger == nil {
+			t.Error("Expected tracer or logger to be set when no error")
+		}
+	}
+}
+
+func TestOtelLogger_log_WithOtelEnabled(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		appVersion:  "1.0.0",
+		logLevel:    LevelDebug,
+		attributes:  map[string]interface{}{"test": "value"},
+		fallbackLog: log.New(&buf, "", 0),
+		useOtel:     true,
+		logger:      nil, // Nil logger means sendOtelLog will be called but do nothing
+	}
+
+	logger.log(LevelInfo, "test message with otel enabled")
+
+	output := buf.String()
+	// Should still log to structured output even with OTel enabled
+	if !strings.Contains(output, "test message with otel enabled") {
+		t.Error("Should log to structured output")
+	}
+}
+
+func TestOtelLogger_sendOtelLog_WithAttributes(t *testing.T) {
+	// Test that sendOtelLog formats attributes correctly
+	logger := &OtelLogger{
+		appName:    "test-app",
+		appVersion: "1.0.0",
+		attributes: map[string]interface{}{
+			"string_attr": "value",
+			"int_attr":    42,
+			"bool_attr":   true,
+			"float_attr":  3.14,
+		},
+		logger: nil, // Nil logger, so this won't actually send
+	}
+
+	// Should not panic even with complex attributes
+	logger.sendOtelLog(LevelInfo, "test message")
+	logger.sendOtelLog(LevelWarn, "warning message")
+	logger.sendOtelLog(LevelError, "error message")
+	logger.sendOtelLog(LevelFatal, "fatal message")
+}
+
+func TestOtelLogger_logStructured_WithoutAttributes(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		logLevel:    LevelInfo,
+		attributes:  nil, // No attributes
+		fallbackLog: log.New(&buf, "", 0),
+	}
+
+	logger.logStructured(LevelInfo, "message without attributes")
+
+	output := buf.String()
+	var logEntry LogEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &logEntry); err != nil {
+		t.Fatalf("Failed to parse JSON: %v", err)
+	}
+
+	// Attributes should be nil or empty in JSON
+	if len(logEntry.Attributes) > 0 {
+		t.Errorf("Expected no attributes, got: %v", logEntry.Attributes)
+	}
+}
+
+func TestOtelLogger_logStructured_EmptyAttributesMap(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &OtelLogger{
+		appName:     "test-app",
+		logLevel:    LevelInfo,
+		attributes:  make(map[string]interface{}), // Empty map
+		fallbackLog: log.New(&buf, "", 0),
+	}
+
+	logger.logStructured(LevelInfo, "message with empty attributes map")
+
+	output := buf.String()
+	var logEntry LogEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &logEntry); err != nil {
+		t.Fatalf("Failed to parse JSON: %v", err)
+	}
+
+	// Attributes should not be present in JSON when map is empty
+	if len(logEntry.Attributes) > 0 {
+		t.Errorf("Expected no attributes in JSON for empty map, got: %v", logEntry.Attributes)
 	}
 }

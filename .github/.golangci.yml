@@ -2,7 +2,8 @@ version: "2"
 
 run:
   timeout: 5m
-  go: "1.24.2"
+  go: "1.25"
+  tests: false
 
 formatters:
   enable:
@@ -11,7 +12,7 @@ formatters:
   settings:
     goimports:
       local-prefixes:
-        - github.com/MyCarrier-DevOps/goLibMyCarrier
+        - github.com/MyCarrier-DevOps/go-langfuse
 
     golines:
       max-len: 120
@@ -35,7 +36,6 @@ linters:
     - forbidigo # forbids identifiers
     - funcorder # checks the order of functions, methods, and constructors
     - gocheckcompilerdirectives # validates go compiler directive comments (//go:)
-    - gochecknoglobals # checks that no global variables exist
     - gochecknoinits # checks that no init functions are present in Go code
     - gochecksumtype # checks exhaustiveness on Go "sum types"
     - gocritic # provides diagnostics that check for bugs, performance and style issues
@@ -51,12 +51,11 @@ linters:
     - mirror # reports wrong mirror patterns of bytes/strings usage
     - musttag # enforces field tags in (un)marshaled structs
     - nakedret # finds naked returns in functions greater than a specified function length
-    - nestif # reports deeply nested if statements
+    - nestif # detects nested if statements that can be flattened
     - nilerr # finds the code that returns nil even if it checks that the error is not nil
     - nilnesserr # reports that it checks for err != nil, but it returns a different nil value error (powered by nilness and nilerr.Error())
     - nilnil # checks that there is no simultaneous return of nil error and an invalid value
     - nolintlint # reports ill-formed or insufficient nolint directives
-    - nonamedreturns # reports all named returns
     - nosprintfhostport # checks for misuse of Sprintf to construct a host with port in a URL
     - predeclared # finds code that shadows one of Go's predeclared identifiers
     - promlinter # checks Prometheus metrics naming via promlint
@@ -74,47 +73,39 @@ linters:
     - unused # checks for unused constants, variables, functions and types
     - wastedassign # finds wasted assignment statements
     - whitespace # detects leading and trailing whitespace
-
-linters-settings:
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - experimental
-      - opinionated
-      - performance
-      - style
-    disabled-checks:
-      - hugeParam
-      - rangeExprCopy
-      - rangeValCopy
-
-  errcheck:
-    # Report `a := b.(MyStruct)` when `a, ok := ...` should be.
-    check-type-assertions: true # Default: false
-
-    # Report skipped checks:`num, _ := strconv.Atoi(numStr)`.
-    check-blank: true # Default: false
-
-    # Function to skip.
-    exclude-functions:
-      - io/ioutil.ReadFile
-      - io.Copy(*bytes.Buffer)
-      - io.Copy(os.Stdout)
-
-  govet:
-    disable:
-      - fieldalignment # I'm ok to waste some bytes
-
-  nakedret:
-    # No naked returns, ever.
-    max-func-lines: 1 # Default: 30
-
-  tagliatelle:
-    case:
-      rules:
-        json: snake
-        yaml: snake
-        xml: camel
-        bson: camel
-        avro: snake
-        mapstructure: kebab
+  
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      disabled-checks:
+        - hugeParam
+        - rangeExprCopy
+        - rangeValCopy
+        - exitAfterDefer
+        - tooManyResultsChecker
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+      exclude-functions:
+        - io/ioutil.ReadFile
+        - io.Copy(*bytes.Buffer)
+        - io.Copy(os.Stdout)
+    govet:
+      disable:
+        - fieldalignment
+    nakedret:
+      max-func-lines: 1
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+          yaml: snake
+          xml: camel
+          bson: camel
+          avro: snake
+          mapstructure: kebab

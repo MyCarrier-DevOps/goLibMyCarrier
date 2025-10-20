@@ -24,7 +24,7 @@ func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]
 		}
 
 		apiUrl := fmt.Sprintf("%v/api/v1/applications/%v/resource-tree", c.baseUrl, argoAppName)
-		req, err := http.NewRequest("GET", apiUrl, nil)
+		req, err := http.NewRequest("GET", apiUrl, http.NoBody)
 		if err != nil {
 			lastErr = fmt.Errorf("error creating request: %w", err)
 			continue
@@ -37,11 +37,10 @@ func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]
 			lastErr = fmt.Errorf("error making request (attempt %d/%d): %w", attempt+1, maxRetries, err)
 			continue
 		}
-		defer func() {
-			if closeErr := resp.Body.Close(); closeErr != nil {
-				lastErr = fmt.Errorf("error closing response body: %w", closeErr)
-			}
-		}()
+
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			lastErr = fmt.Errorf("error closing response body: %w", closeErr)
+		}
 
 		// Check for HTTP error status codes
 		if resp.StatusCode >= 500 {
@@ -49,13 +48,15 @@ func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]
 			continue
 		} else if resp.StatusCode >= 400 {
 			// Client errors (4xx) shouldn't be retried
-			body, _ := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("error reading body: %s", string(body))
+			}
 			return nil, fmt.Errorf("client error %d: %s", resp.StatusCode, string(body))
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			lastErr = fmt.Errorf("error reading response body (attempt %d/%d): %w", attempt+1, maxRetries, err)
 			continue
 		}
 

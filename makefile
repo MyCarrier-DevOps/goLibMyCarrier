@@ -5,27 +5,37 @@ GOARCH ?= $(shell go env GOARCH)
 
 .PHONY: lint
 lint: install-tools
-	@echo "Linting all modules..."
-	@for dir in argocdclient auth clickhouse github kafka logger otel vault yaml; do \
-		if [ -d "$$dir" ]; then \
-			echo "Linting $$dir module..."; \
-			(cd $$dir && go mod tidy && golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...); \
-		else \
-			echo "Directory $$dir not found, skipping..."; \
-		fi; \
-	done
+	@if [ -z "$(PKG)" ]; then \
+		echo "Linting all modules..."; \
+		for dir in argocdclient auth clickhouse github kafka logger otel vault yaml; do \
+			if [ -d "$$dir" ]; then \
+				echo "Linting $$dir module..."; \
+				(cd $$dir && go mod tidy && golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...); \
+			else \
+				echo "Directory $$dir not found, skipping..."; \
+			fi; \
+		done; \
+	else \
+		echo "Linting $(PKG) module..."; \
+		(cd $(PKG) && go mod tidy && golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...); \
+	fi
 
 .PHONY: test
 test:
-	@echo "Testing all modules..."
-	@for dir in argocdclient auth clickhouse github kafka logger otel vault yaml; do \
-		if [ -d "$$dir" ]; then \
-			echo "Testing $$dir module..."; \
-			(cd $$dir && go mod download && go test -cover -coverprofile=coverage.txt ./...); \
-		else \
-			echo "Directory $$dir not found, skipping..."; \
-		fi; \
-	done
+	@if [ -z "$(PKG)" ]; then \
+		echo "Testing all modules..."; \
+		for dir in argocdclient auth clickhouse github kafka logger otel vault yaml; do \
+			if [ -d "$$dir" ]; then \
+				echo "Testing $$dir module..."; \
+				(cd $$dir && go mod download && go test -cover -coverprofile=coverage.txt ./...); \
+			else \
+				echo "Directory $$dir not found, skipping..."; \
+			fi; \
+		done; \
+	else \
+		echo "Testing $(PKG) module..."; \
+		(cd $(PKG) && go mod download && go test -cover -coverprofile=coverage.txt ./...); \
+	fi
 
 .PHONY: fmt
 fmt:
@@ -46,6 +56,18 @@ bump:
 		if [ -d "$$dir" ]; then \
 			echo "Bumping $$dir module..."; \
 			(cd $$dir && go get -u && go mod tidy ); \
+		else \
+			echo "Directory $$dir not found, skipping..."; \
+		fi; \
+	done
+
+.PHONY: tidy
+tidy:
+	@echo "Tidying up module dependencies..."
+	@for dir in argocdclient auth clickhouse github kafka logger otel vault yaml; do \
+		if [ -d "$$dir" ]; then \
+			echo "Tidying $$dir module..."; \
+			(cd $$dir && go mod tidy); \
 		else \
 			echo "Directory $$dir not found, skipping..."; \
 		fi; \

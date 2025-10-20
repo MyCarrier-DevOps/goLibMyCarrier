@@ -14,7 +14,7 @@ import (
 
 // ClickhouseSessionInterface defines the interface for ClickHouse session operations
 type ClickhouseSessionInterface interface {
-	Connect(ch *ClickhouseConfig, context context.Context) error
+	Connect(ch *ClickhouseConfig, ctx context.Context) error
 	Query(ctx context.Context, query string) (driver.Rows, error)
 	Exec(ctx context.Context, stmt string) error
 	Close() error
@@ -33,7 +33,7 @@ type ConfigValidatorInterface interface {
 
 // SessionFactoryInterface defines the interface for creating ClickHouse sessions
 type SessionFactoryInterface interface {
-	NewSession(ch *ClickhouseConfig, context context.Context) (ClickhouseSessionInterface, error)
+	NewSession(ch *ClickhouseConfig, ctx context.Context) (ClickhouseSessionInterface, error)
 }
 
 // ClickhouseSession implements ClickhouseSessionInterface
@@ -145,13 +145,13 @@ type DefaultSessionFactory struct{}
 // NewSession implements SessionFactoryInterface
 func (f *DefaultSessionFactory) NewSession(
 	ch *ClickhouseConfig,
-	context context.Context,
+	ctx context.Context,
 ) (ClickhouseSessionInterface, error) {
-	return NewClickhouseSession(ch, context)
+	return NewClickhouseSession(ch, ctx)
 }
 
 // NewClickhouseSession creates a new Clickhouse session.
-func NewClickhouseSession(ch *ClickhouseConfig, context context.Context) (*ClickhouseSession, error) {
+func NewClickhouseSession(ch *ClickhouseConfig, ctx context.Context) (*ClickhouseSession, error) {
 	if ch == nil {
 		return nil, fmt.Errorf("clickhouse config cannot be nil")
 	}
@@ -164,7 +164,7 @@ func NewClickhouseSession(ch *ClickhouseConfig, context context.Context) (*Click
 		skipVerify: ch.ChSkipVerify == "true",
 	}
 
-	err := conn.Connect(ch, context)
+	err := conn.Connect(ch, ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -173,16 +173,15 @@ func NewClickhouseSession(ch *ClickhouseConfig, context context.Context) (*Click
 }
 
 // Connect to ClickHouse database
-func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, context context.Context) error {
+func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Context) error {
 	if ch == nil {
 		return fmt.Errorf("clickhouse config cannot be nil")
 	}
-	if context == nil {
+	if ctx == nil {
 		return fmt.Errorf("context cannot be nil")
 	}
 
 	var (
-		ctx       = context
 		conn, err = clickhouse.Open(&clickhouse.Options{
 			Addr: []string{ch.ChHostname + ":" + ch.ChPort},
 			Auth: clickhouse.Auth{
