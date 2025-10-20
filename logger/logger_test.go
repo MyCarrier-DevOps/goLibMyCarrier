@@ -15,16 +15,6 @@ func TestNewAppLogger(t *testing.T) {
 	})
 }
 
-func TestSetKlogLevel(t *testing.T) {
-	convey.Convey("Set klog level", t, func() {
-		convey.Convey("Set level to 2", func() {
-			SetKlogLevel(2)
-			// No direct way to verify klog level, but we can ensure no panic occurs
-			convey.So(true, convey.ShouldBeTrue)
-		})
-	})
-}
-
 func TestWithLogger(t *testing.T) {
 	convey.Convey("Add logger to context", t, func() {
 		log := NewAppLogger()

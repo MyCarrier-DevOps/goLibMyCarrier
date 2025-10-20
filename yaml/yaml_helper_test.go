@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"go.yaml.in/yaml/v4"
 )
 
 // getTestCases returns test cases for WriteYamlFileWithStyle
@@ -625,4 +627,411 @@ func interfaceEqual(a, b interface{}) bool {
 	default:
 		return a == b
 	}
+}
+
+func TestReadYamlFile(t *testing.T) {
+	// Create a temp directory for our test files
+	tmpDir, err := os.MkdirTemp("", "yaml-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer func() {
+		if rmErr := os.RemoveAll(tmpDir); rmErr != nil {
+			t.Logf("Failed to remove temp directory: %v", rmErr)
+		}
+	}()
+
+	tests := []struct {
+		name      string
+		content   string
+		expected  map[string]interface{}
+		expectErr bool
+	}{
+		{
+			name: "simple_yaml_file",
+			content: `name: test-service
+version: 1.0.0
+enabled: true`,
+			expected: map[string]interface{}{
+				"name":    "test-service",
+				"version": "1.0.0",
+				"enabled": true,
+			},
+			expectErr: false,
+		},
+		{
+			name: "nested_yaml_file",
+			content: `database:
+  host: localhost
+  port: 5432
+  credentials:
+    user: admin
+    password: secret`,
+			expected: map[string]interface{}{
+				"database": map[string]interface{}{
+					"host": "localhost",
+					"port": 5432,
+					"credentials": map[string]interface{}{
+						"user":     "admin",
+						"password": "secret",
+					},
+				},
+			},
+			expectErr: false,
+		},
+		{
+			name: "array_yaml_file",
+			content: `services:
+  - api
+  - web
+  - database
+ports:
+  - 80
+  - 443
+  - 8080`,
+			expected: map[string]interface{}{
+				"services": []interface{}{"api", "web", "database"},
+				"ports":    []interface{}{80, 443, 8080},
+			},
+			expectErr: false,
+		},
+		{
+			name: "invalid_yaml",
+			content: `name: test
+invalid: [unclosed
+malformed`,
+			expected:  nil,
+			expectErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create test file
+			testFile := filepath.Join(tmpDir, tt.name+".yaml")
+			err := os.WriteFile(testFile, []byte(tt.content), 0644)
+			if err != nil {
+				t.Fatalf("Failed to create test file: %v", err)
+			}
+
+			// Test ReadYamlFile
+			result, err := ReadYamlFile(testFile)
+
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if !yamlDataEqual(result, tt.expected) {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+
+	// Test non-existent file error
+	t.Run("non_existent_file", func(t *testing.T) {
+		_, err := ReadYamlFile(filepath.Join(tmpDir, "non_existent.yaml"))
+		if err == nil {
+			t.Error("Expected error for non-existent file")
+		}
+	})
+}
+
+func TestReadYamlFileRaw(t *testing.T) {
+	// Create a temp directory for our test files
+	tmpDir, err := os.MkdirTemp("", "yaml-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer func() {
+		if rmErr := os.RemoveAll(tmpDir); rmErr != nil {
+			t.Logf("Failed to remove temp directory: %v", rmErr)
+		}
+	}()
+
+	tests := []struct {
+		name      string
+		content   string
+		expectErr bool
+		validate  func(*testing.T, *yaml.Node)
+	}{
+		{
+			name: "simple_raw_yaml",
+			content: `name: test-api
+version: 1.0.0`,
+			expectErr: false,
+			validate: func(t *testing.T, node *yaml.Node) {
+				if node == nil {
+					t.Error("Expected non-nil node")
+					return
+				}
+				// The root node should be a document node
+				if node.Kind != yaml.DocumentNode {
+					t.Errorf("Expected DocumentNode, got %v", node.Kind)
+				}
+			},
+		},
+		{
+			name: "flow_style_arrays_raw",
+			content: `filters: ["TestCategory=coreapitest", "Priority=High"]
+tags: ["dev", "staging", "prod"]`,
+			expectErr: false,
+			validate: func(t *testing.T, node *yaml.Node) {
+				if node == nil {
+					t.Error("Expected non-nil node")
+					return
+				}
+				// Verify we can decode the node
+				var result map[string]interface{}
+				err := node.Decode(&result)
+				if err != nil {
+					t.Errorf("Failed to decode node: %v", err)
+				}
+			},
+		},
+		{
+			name: "complex_nested_raw",
+			content: `applications:
+  api:
+    name: "test-api"
+    testdefinitions:
+      - filters: ["TestCategory=coreapitest"]
+        timeout: 300
+      - filters: ["TestCategory=integration"]
+        timeout: 600`,
+			expectErr: false,
+			validate: func(t *testing.T, node *yaml.Node) {
+				if node == nil {
+					t.Error("Expected non-nil node")
+					return
+				}
+				var result map[string]interface{}
+				err := node.Decode(&result)
+				if err != nil {
+					t.Errorf("Failed to decode node: %v", err)
+				}
+			},
+		},
+		{
+			name: "invalid_yaml_raw",
+			content: `name: test
+invalid: [unclosed
+malformed: {key`,
+			expectErr: true,
+			validate:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create test file
+			testFile := filepath.Join(tmpDir, tt.name+".yaml")
+			err := os.WriteFile(testFile, []byte(tt.content), 0644)
+			if err != nil {
+				t.Fatalf("Failed to create test file: %v", err)
+			}
+
+			// Test ReadYamlFileRaw
+			node, err := ReadYamlFileRaw(testFile)
+
+			if tt.expectErr {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("Unexpected error: %v", err)
+				return
+			}
+
+			if tt.validate != nil {
+				tt.validate(t, node)
+			}
+		})
+	}
+
+	// Test non-existent file error
+	t.Run("non_existent_file_raw", func(t *testing.T) {
+		_, err := ReadYamlFileRaw(filepath.Join(tmpDir, "non_existent.yaml"))
+		if err == nil {
+			t.Error("Expected error for non-existent file")
+		}
+	})
+}
+
+func TestWriteYamlFileWithStyleErrors(t *testing.T) {
+	tests := []struct {
+		name      string
+		setupFunc func(t *testing.T) (string, map[string]interface{})
+		expectErr bool
+	}{
+		{
+			name: "invalid_directory",
+			setupFunc: func(t *testing.T) (string, map[string]interface{}) {
+				// Use a path that doesn't exist and can't be created
+				invalidPath := "/nonexistent/directory/test.yaml"
+				data := map[string]interface{}{"test": "data"}
+				return invalidPath, data
+			},
+			expectErr: true,
+		},
+		{
+			name: "valid_write",
+			setupFunc: func(t *testing.T) (string, map[string]interface{}) {
+				tmpDir, err := os.MkdirTemp("", "yaml-test")
+				if err != nil {
+					t.Fatalf("Failed to create temp directory: %v", err)
+				}
+				t.Cleanup(func() {
+					os.RemoveAll(tmpDir)
+				})
+				filePath := filepath.Join(tmpDir, "test.yaml")
+				data := map[string]interface{}{
+					"name": "test",
+					"tags": []string{"tag1", "tag2"},
+				}
+				return filePath, data
+			},
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filePath, data := tt.setupFunc(t)
+			err := WriteYamlFileWithStyle(filePath, data)
+
+			if tt.expectErr {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestReadYamlFileWithStyleErrors(t *testing.T) {
+	// Create a temp directory for our test files
+	tmpDir, err := os.MkdirTemp("", "yaml-test")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer func() {
+		if rmErr := os.RemoveAll(tmpDir); rmErr != nil {
+			t.Logf("Failed to remove temp directory: %v", rmErr)
+		}
+	}()
+
+	tests := []struct {
+		name      string
+		setupFunc func(t *testing.T) string
+		expectErr bool
+	}{
+		{
+			name: "non_existent_file",
+			setupFunc: func(t *testing.T) string {
+				return filepath.Join(tmpDir, "does_not_exist.yaml")
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid_yaml_content",
+			setupFunc: func(t *testing.T) string {
+				testFile := filepath.Join(tmpDir, "invalid.yaml")
+				invalidContent := `name: test
+invalid: [unclosed array
+malformed: {key: value`
+				err := os.WriteFile(testFile, []byte(invalidContent), 0644)
+				if err != nil {
+					t.Fatalf("Failed to create test file: %v", err)
+				}
+				return testFile
+			},
+			expectErr: true,
+		},
+		{
+			name: "valid_yaml_file",
+			setupFunc: func(t *testing.T) string {
+				testFile := filepath.Join(tmpDir, "valid.yaml")
+				validContent := `name: test-api
+version: 1.0.0
+tags: ["dev", "prod"]`
+				err := os.WriteFile(testFile, []byte(validContent), 0644)
+				if err != nil {
+					t.Fatalf("Failed to create test file: %v", err)
+				}
+				return testFile
+			},
+			expectErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			filePath := tt.setupFunc(t)
+			_, err := ReadYamlFileWithStyle(filePath)
+
+			if tt.expectErr {
+				if err == nil {
+					t.Error("Expected error but got none")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("Unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestProcessNodeEdgeCases(t *testing.T) {
+	// Test processNode with nil node
+	t.Run("nil_node", func(t *testing.T) {
+		// This should not panic
+		processNode(nil)
+	})
+
+	// Test processNode with empty node
+	t.Run("empty_node", func(t *testing.T) {
+		var node yaml.Node
+		processNode(&node)
+		// Should not panic
+	})
+
+	// Test processNode with sequence containing non-scalar nodes
+	t.Run("sequence_with_maps", func(t *testing.T) {
+		tmpDir, err := os.MkdirTemp("", "yaml-test")
+		if err != nil {
+			t.Fatalf("Failed to create temp directory: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		data := map[string]interface{}{
+			"items": []interface{}{
+				map[string]interface{}{
+					"name": "item1",
+					"tags": []string{"tag1"},
+				},
+			},
+		}
+
+		filePath := filepath.Join(tmpDir, "test.yaml")
+		err = WriteYamlFileWithStyle(filePath, data)
+		if err != nil {
+			t.Errorf("Unexpected error: %v", err)
+		}
+	})
 }

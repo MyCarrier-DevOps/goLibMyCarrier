@@ -2,13 +2,10 @@ package logger
 
 import (
 	"context"
-	"flag"
 	"os"
-	"strconv"
 
 	zap "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	klog "k8s.io/klog/v2"
 )
 
 // Logger constants
@@ -40,11 +37,6 @@ func NewAppLogger() *zap.SugaredLogger {
 		panic(err)
 	}
 	return logger.Named(appName).Sugar()
-}
-
-func SetKlogLevel(level int) {
-	klog.InitFlags(nil)
-	_ = flag.Set("v", strconv.Itoa(level))
 }
 
 type loggerKey struct{}

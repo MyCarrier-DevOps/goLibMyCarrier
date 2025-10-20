@@ -41,13 +41,19 @@ func (c *Client) GetManifests(revision, argoAppName string) ([]string, error) {
 
 	// Handle 4xx client errors (these weren't retried)
 	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("error reading body: %w", err)
+		}
 		return nil, fmt.Errorf("client error %d: %s", resp.StatusCode, string(body))
 	}
 
 	// Handle any remaining 5xx errors that exhausted retries
 	if resp.StatusCode >= 500 {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("error reading body: %w", err)
+		}
 		return nil, fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
 	}
 
