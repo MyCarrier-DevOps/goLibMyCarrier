@@ -42,17 +42,16 @@ func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]
 
 		// Check for HTTP error status codes
 		if resp.StatusCode >= 500 {
-			body, readErr := io.ReadAll(resp.Body)
+			_, readErr := io.ReadAll(resp.Body)
 			closeErr := resp.Body.Close()
+			lastErr = fmt.Errorf("server error %d (attempt %d/%d)", resp.StatusCode, attempt+1, maxRetries)
 			if readErr != nil {
-				lastErr = fmt.Errorf("server error %d, failed to read body (attempt %d/%d): %w",
+				lastErr = fmt.Errorf("server error %d (attempt %d/%d), failed to read body: %w",
 					resp.StatusCode, attempt+1, maxRetries, readErr)
-			} else {
-				lastErr = fmt.Errorf("server error %d (attempt %d/%d)", resp.StatusCode, attempt+1, maxRetries)
-				_ = body // Read body but don't use it to match test expectations
 			}
-			if closeErr != nil && lastErr == nil {
-				lastErr = fmt.Errorf("error closing response body: %w", closeErr)
+			if closeErr != nil {
+				lastErr = fmt.Errorf("server error %d (attempt %d/%d), failed to close body: %w",
+					resp.StatusCode, attempt+1, maxRetries, closeErr)
 			}
 			continue
 		} else if resp.StatusCode >= 400 {
