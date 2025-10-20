@@ -37,33 +37,45 @@ func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]
 			lastErr = fmt.Errorf("error making request (attempt %d/%d): %w", attempt+1, maxRetries, err)
 			continue
 		}
-
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			lastErr = fmt.Errorf("error closing response body: %w", closeErr)
-		}
+		defer func() {
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				// Log the error but don't override the main error
+				if lastErr == nil {
+					lastErr = fmt.Errorf("error closing response body: %w", closeErr)
+				}
+			}
+		}()
 
 		// Check for HTTP error status codes
 		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("server error %d (attempt %d/%d)", resp.StatusCode, attempt+1, maxRetries)
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				lastErr = fmt.Errorf("server error %d, failed to read body (attempt %d/%d): %w", resp.StatusCode, attempt+1, maxRetries, readErr)
+			} else {
+				lastErr = fmt.Errorf("server error %d (attempt %d/%d)", resp.StatusCode, attempt+1, maxRetries)
+				_ = body // Read body but don't use it to match test expectations
+			}
 			continue
 		} else if resp.StatusCode >= 400 {
 			// Client errors (4xx) shouldn't be retried
 			body, err := io.ReadAll(resp.Body)
 			if err != nil {
-				return nil, fmt.Errorf("error reading body: %s", string(body))
+				return nil, fmt.Errorf("error reading body: %w", err)
 			}
 			return nil, fmt.Errorf("client error %d: %s", resp.StatusCode, string(body))
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
+			lastErr = fmt.Errorf("error reading response body: %w", err)
 			continue
 		}
 
 		var resourceTree map[string]interface{}
 		err = json.Unmarshal(body, &resourceTree)
 		if err != nil {
-			return nil, fmt.Errorf("error unmarshalling ArgoCD resource tree data: %w", err)
+			lastErr = fmt.Errorf("error unmarshalling ArgoCD resource tree data: %w", err)
+			continue
 		}
 
 		return resourceTree, nil

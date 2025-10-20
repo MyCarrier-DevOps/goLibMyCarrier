@@ -270,8 +270,8 @@ func TestGetArgoApplicationResourceTree_InvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected JSON unmarshal error, got nil")
 	}
-	expectedErrMsg := "error unmarshalling ArgoCD resource tree data"
-	if err.Error()[:len(expectedErrMsg)] != expectedErrMsg {
+	expectedErrMsg := "failed after 3 attempts, last error: error unmarshalling ArgoCD resource tree data"
+	if len(err.Error()) < len(expectedErrMsg) || err.Error()[:len(expectedErrMsg)] != expectedErrMsg {
 		t.Errorf("expected error to start with '%s', got: %v", expectedErrMsg, err)
 	}
 }
