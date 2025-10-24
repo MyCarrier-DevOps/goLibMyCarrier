@@ -3,6 +3,7 @@ package vault
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/vault-client-go"
@@ -49,8 +50,15 @@ type AppRoleAuthenticator struct{}
 // ViperConfigLoader implements configuration loading using Viper
 type ViperConfigLoader struct{}
 
+// viperMutex protects concurrent access to Viper operations
+var viperMutex sync.Mutex
+
 // ViperConfigLoader implements ConfigLoader interface
 func (v *ViperConfigLoader) LoadConfig() (*VaultConfig, error) {
+	// Lock to protect concurrent access to Viper
+	viperMutex.Lock()
+	defer viperMutex.Unlock()
+
 	// Bind environment variables
 	if err := viper.BindEnv("vaultaddress", "VAULT_ADDRESS"); err != nil {
 		return nil, fmt.Errorf("error binding environment variable VAULT_ADDRESS: %w", err)
