@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/hashicorp/vault-client-go"
@@ -870,5 +871,51 @@ func TestAppRoleAuthenticator_Authenticate_WithBothCredentials(t *testing.T) {
 	} else {
 		// This is expected - the authentication will fail without a real Vault
 		t.Logf("Authenticate failed as expected: %v", err)
+	}
+}
+
+// TestVaultLoadConfig_Concurrent tests that VaultLoadConfig is safe for concurrent use
+func TestVaultLoadConfig_Concurrent(t *testing.T) {
+	// Set environment variables for testing
+	os.Setenv("VAULT_ADDRESS", "http://localhost:8200")
+	os.Setenv("VAULT_ROLE_ID", "test_role_id")
+	os.Setenv("VAULT_SECRET_ID", "test_secret_id")
+	defer func() {
+		os.Unsetenv("VAULT_ADDRESS")
+		os.Unsetenv("VAULT_ROLE_ID")
+		os.Unsetenv("VAULT_SECRET_ID")
+	}()
+
+	// Run multiple goroutines concurrently calling VaultLoadConfig
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	errChan := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			config, err := VaultLoadConfig()
+			if err != nil {
+				errChan <- fmt.Errorf("goroutine %d: %w", id, err)
+				return
+			}
+			if config.VaultAddress != "http://localhost:8200" {
+				errChan <- fmt.Errorf("goroutine %d: unexpected vault address: %s", id, config.VaultAddress)
+				return
+			}
+			if config.Credentials.RoleID != "test_role_id" {
+				errChan <- fmt.Errorf("goroutine %d: unexpected role ID: %s", id, config.Credentials.RoleID)
+				return
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errChan)
+
+	// Check for any errors
+	for err := range errChan {
+		t.Errorf("Concurrent test error: %v", err)
 	}
 }
