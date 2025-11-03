@@ -62,11 +62,14 @@ func (c *Client) GetManifests(revision, argoAppName string) ([]string, error) {
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
 
-	var manifestData []string
-	err = json.Unmarshal(body, &manifestData)
+	// ArgoCD API returns manifests wrapped in an object: {"manifests":[...]}
+	var response struct {
+		Manifests []string `json:"manifests"`
+	}
+	err = json.Unmarshal(body, &response)
 	if err != nil {
 		return nil, fmt.Errorf("error unmarshalling manifest data: %w", err)
 	}
 
-	return manifestData, nil
+	return response.Manifests, nil
 }

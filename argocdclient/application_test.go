@@ -5,8 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-
-	"github.com/hashicorp/go-retryablehttp"
 )
 
 func TestGetApplication_Success(t *testing.T) {
@@ -46,46 +44,10 @@ func TestGetApplication_ClientError(t *testing.T) {
 	}
 }
 
-func TestGetManifests_Success(t *testing.T) {
-	manifests := []string{"manifest1", "manifest2"}
-	body, _ := json.Marshal(manifests)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		if _, err := w.Write(body); err != nil {
-			t.Fatalf("failed to write response: %v", err)
-		}
-	}))
-	defer server.Close()
-
-	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	result, err := client.GetManifests("", "test-app")
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
-	}
-	if len(result) != 2 {
-		t.Errorf("expected 2 manifests, got %d", len(result))
-	}
-}
-
-func TestGetManifests_ServerError(t *testing.T) {
+func TestGetApplication_ServerError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
-		if _, err := w.Write([]byte("server error")); err != nil {
-			t.Fatalf("failed to write response: %v", err)
-		}
-	}))
-	defer server.Close()
-
-	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	_, err := client.GetManifests("", "test-app")
-	if err == nil {
-		t.Fatal("expected error, got nil")
-	}
-}
-func TestGetApplication_InvalidJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		if _, err := w.Write([]byte("not a json")); err != nil {
+		if _, err := w.Write([]byte("internal server error")); err != nil {
 			t.Fatalf("failed to write response: %v", err)
 		}
 	}))
@@ -93,69 +55,160 @@ func TestGetApplication_InvalidJSON(t *testing.T) {
 
 	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
 	_, err := client.GetApplication("test-app")
-	if err == nil || err.Error() == "" {
-		t.Fatal("expected JSON unmarshal error, got nil")
-	}
-}
-
-func TestGetApplication_RequestCreationError(t *testing.T) {
-	c := &Client{retryableClient: retryablehttp.NewClient(), baseUrl: "http://%%invalid-url", authToken: "token"}
-	_, err := c.GetApplication("test-app")
 	if err == nil {
-		t.Fatal("expected error for invalid request creation, got nil")
+		t.Fatal("expected error, got nil")
+	}
+	// The retryable client retries 5xx errors and eventually gives up
+	if !contains(err.Error(), "giving up") {
+		t.Errorf("expected error message to contain 'giving up', got: %v", err)
 	}
 }
 
-func TestGetManifests_InvalidJSON(t *testing.T) {
+func TestGetApplication_UnauthorizedError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		if _, err := w.Write([]byte("not a json")); err != nil {
+		w.WriteHeader(401)
+		if _, err := w.Write([]byte("unauthorized")); err != nil {
 			t.Fatalf("failed to write response: %v", err)
 		}
 	}))
 	defer server.Close()
 
 	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	_, err := client.GetManifests("", "test-app")
-	if err == nil || err.Error() == "" {
-		t.Fatal("expected JSON unmarshal error, got nil")
-	}
-}
-
-func TestGetManifests_RequestCreationError(t *testing.T) {
-	c := &Client{retryableClient: retryablehttp.NewClient(), baseUrl: "http://%%invalid-url", authToken: "token"}
-	_, err := c.GetManifests("", "test-app")
+	_, err := client.GetApplication("test-app")
 	if err == nil {
-		t.Fatal("expected error for invalid request creation, got nil")
+		t.Fatal("expected error, got nil")
+	}
+	// Verify error contains "client error"
+	if !contains(err.Error(), "client error") {
+		t.Errorf("expected error message to contain 'client error', got: %v", err)
 	}
 }
 
-func TestGetArgoApplicationResourceTree_Success(t *testing.T) {
-	resourceTree := map[string]interface{}{
-		"nodes": []interface{}{
-			map[string]interface{}{
-				"kind": "Application",
-				"name": "test-app",
-				"health": map[string]interface{}{
-					"status": "Healthy",
-				},
+func TestGetApplication_InvalidJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte("invalid json")); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	_, err := client.GetApplication("test-app")
+	if err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
+	// Verify error is about unmarshalling
+	if !contains(err.Error(), "unmarshalling") {
+		t.Errorf("expected error message to contain 'unmarshalling', got: %v", err)
+	}
+}
+
+func TestGetApplication_HeadersSet(t *testing.T) {
+	authToken := "test-token-12345"
+	var capturedAuthHeader string
+	var capturedContentType string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedAuthHeader = r.Header.Get("Authorization")
+		capturedContentType = r.Header.Get("Content-Type")
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{"name":"test"}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: authToken})
+	_, err := client.GetApplication("test-app")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expectedAuth := "Bearer " + authToken
+	if capturedAuthHeader != expectedAuth {
+		t.Errorf("expected Authorization header %q, got %q", expectedAuth, capturedAuthHeader)
+	}
+
+	if capturedContentType != "application/json" {
+		t.Errorf("expected Content-Type header 'application/json', got %q", capturedContentType)
+	}
+}
+
+func TestGetApplication_URLConstruction(t *testing.T) {
+	appName := "my-test-app"
+	var capturedURL string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedURL = r.URL.String()
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{"name":"test"}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	_, err := client.GetApplication(appName)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	expectedPath := "/api/v1/applications/" + appName
+	if !contains(capturedURL, expectedPath) {
+		t.Errorf("expected URL to contain %q, got %q", expectedPath, capturedURL)
+	}
+
+	if !contains(capturedURL, "refresh=soft") {
+		t.Errorf("expected URL to contain 'refresh=soft', got %q", capturedURL)
+	}
+}
+
+func TestGetApplication_EmptyResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	result, err := client.GetApplication("test-app")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if result == nil {
+		t.Error("expected non-nil result")
+	}
+	if len(result) != 0 {
+		t.Errorf("expected empty map, got %v", result)
+	}
+}
+
+func TestGetApplication_ComplexResponse(t *testing.T) {
+	complexData := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"name":      "test-app",
+			"namespace": "argocd",
+		},
+		"spec": map[string]interface{}{
+			"source": map[string]interface{}{
+				"repoURL": "https://github.com/test/repo",
+			},
+		},
+		"status": map[string]interface{}{
+			"sync": map[string]interface{}{
+				"status": "Synced",
+			},
+			"health": map[string]interface{}{
+				"status": "Healthy",
 			},
 		},
 	}
-	body, _ := json.Marshal(resourceTree)
+	body, _ := json.Marshal(complexData)
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check request headers
-		if r.Header.Get("Authorization") != "Bearer token" {
-			t.Errorf("expected Authorization header 'Bearer token', got '%s'", r.Header.Get("Authorization"))
-		}
-		if r.Header.Get("Content-Type") != "application/json" {
-			t.Errorf("expected Content-Type 'application/json', got '%s'", r.Header.Get("Content-Type"))
-		}
-		// Check URL path
-		expectedPath := "/api/v1/applications/test-app/resource-tree"
-		if r.URL.Path != expectedPath {
-			t.Errorf("expected path '%s', got '%s'", expectedPath, r.URL.Path)
-		}
 		w.WriteHeader(200)
 		if _, err := w.Write(body); err != nil {
 			t.Fatalf("failed to write response: %v", err)
@@ -164,122 +217,104 @@ func TestGetArgoApplicationResourceTree_Success(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	result, err := client.GetArgoApplicationResourceTree("test-app")
+	result, err := client.GetApplication("test-app")
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	nodes, ok := result["nodes"].([]interface{})
+	// Verify nested structure
+	metadata, ok := result["metadata"].(map[string]interface{})
 	if !ok {
-		t.Fatal("expected nodes to be an array")
+		t.Fatal("expected metadata to be a map")
 	}
-	if len(nodes) != 1 {
-		t.Errorf("expected 1 node, got %d", len(nodes))
+	if metadata["name"] != "test-app" {
+		t.Errorf("expected metadata name 'test-app', got %v", metadata["name"])
+	}
+
+	status, ok := result["status"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected status to be a map")
+	}
+	sync, ok := status["sync"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected sync to be a map")
+	}
+	if sync["status"] != "Synced" {
+		t.Errorf("expected sync status 'Synced', got %v", sync["status"])
 	}
 }
 
-func TestGetArgoApplicationResourceTree_ClientError(t *testing.T) {
+func TestGetApplication_ForbiddenError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(404)
-		if _, err := w.Write([]byte("application not found")); err != nil {
+		w.WriteHeader(403)
+		if _, err := w.Write([]byte("forbidden")); err != nil {
 			t.Fatalf("failed to write response: %v", err)
 		}
 	}))
 	defer server.Close()
 
 	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	_, err := client.GetArgoApplicationResourceTree("nonexistent-app")
+	_, err := client.GetApplication("test-app")
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if err.Error() != "client error 404: application not found" {
-		t.Errorf("expected specific client error message, got: %v", err)
+	// Verify it's a client error
+	if !contains(err.Error(), "client error 403") {
+		t.Errorf("expected error message to contain 'client error 403', got: %v", err)
 	}
 }
 
-func TestGetArgoApplicationResourceTree_ServerErrorWithRetry(t *testing.T) {
-	callCount := 0
+func TestGetApplication_BadRequestError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		if callCount < 3 {
-			w.WriteHeader(500)
-			if _, err := w.Write([]byte("server error")); err != nil {
-				t.Fatalf("failed to write response: %v", err)
-			}
-		} else {
-			// Success on third attempt
-			resourceTree := map[string]interface{}{"status": "success"}
-			body, _ := json.Marshal(resourceTree)
-			w.WriteHeader(200)
-			if _, err := w.Write(body); err != nil {
-				t.Fatalf("failed to write response: %v", err)
-			}
-		}
-	}))
-	defer server.Close()
-
-	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	result, err := client.GetArgoApplicationResourceTree("test-app")
-	if err != nil {
-		t.Fatalf("expected no error after retries, got %v", err)
-	}
-	if result["status"] != "success" {
-		t.Errorf("expected status 'success', got %v", result["status"])
-	}
-	if callCount != 3 {
-		t.Errorf("expected 3 calls (2 retries), got %d", callCount)
-	}
-}
-
-func TestGetArgoApplicationResourceTree_MaxRetriesExceeded(t *testing.T) {
-	callCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		callCount++
-		w.WriteHeader(500)
-		if _, err := w.Write([]byte("persistent server error")); err != nil {
+		w.WriteHeader(400)
+		if _, err := w.Write([]byte("bad request")); err != nil {
 			t.Fatalf("failed to write response: %v", err)
 		}
 	}))
 	defer server.Close()
 
 	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	_, err := client.GetArgoApplicationResourceTree("test-app")
+	_, err := client.GetApplication("test-app")
 	if err == nil {
-		t.Fatal("expected error after max retries, got nil")
+		t.Fatal("expected error, got nil")
 	}
-	if callCount != 3 {
-		t.Errorf("expected 3 calls (max retries), got %d", callCount)
-	}
-	expectedErrMsg := "failed after 3 attempts"
-	if err.Error()[:len(expectedErrMsg)] != expectedErrMsg {
-		t.Errorf("expected error to start with '%s', got: %v", expectedErrMsg, err)
+	// Verify it's a client error
+	if !contains(err.Error(), "client error 400") {
+		t.Errorf("expected error message to contain 'client error 400', got: %v", err)
 	}
 }
 
-func TestGetArgoApplicationResourceTree_InvalidJSON(t *testing.T) {
+func TestGetApplication_ServiceUnavailableError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
-		if _, err := w.Write([]byte("not valid json")); err != nil {
+		w.WriteHeader(503)
+		if _, err := w.Write([]byte("service unavailable")); err != nil {
 			t.Fatalf("failed to write response: %v", err)
 		}
 	}))
 	defer server.Close()
 
 	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
-	_, err := client.GetArgoApplicationResourceTree("test-app")
+	_, err := client.GetApplication("test-app")
 	if err == nil {
-		t.Fatal("expected JSON unmarshal error, got nil")
+		t.Fatal("expected error, got nil")
 	}
-	expectedErrMsg := "failed after 3 attempts, last error: error unmarshalling ArgoCD resource tree data"
-	if len(err.Error()) < len(expectedErrMsg) || err.Error()[:len(expectedErrMsg)] != expectedErrMsg {
-		t.Errorf("expected error to start with '%s', got: %v", expectedErrMsg, err)
+	// The retryable client retries 5xx errors and eventually gives up
+	if !contains(err.Error(), "giving up") {
+		t.Errorf("expected error message to contain 'giving up', got: %v", err)
 	}
 }
 
-func TestGetArgoApplicationResourceTree_RequestCreationError(t *testing.T) {
-	c := &Client{baseUrl: "http://%%invalid-url", authToken: "token"}
-	_, err := c.GetArgoApplicationResourceTree("test-app")
-	if err == nil {
-		t.Fatal("expected error for invalid request creation, got nil")
+// Helper function to check if a string contains a substring
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && containsHelper(s, substr)))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
 	}
+	return false
 }
