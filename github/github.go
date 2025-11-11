@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/golang-jwt/jwt"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-github/v73/github"
 	"github.com/jferrl/go-githubauth"
 	"github.com/spf13/viper"
