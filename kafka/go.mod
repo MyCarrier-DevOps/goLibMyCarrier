@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/kafka
 
-go 1.25.2
+go 1.25.4
 
 require (
 	github.com/segmentio/kafka-go v0.4.49
@@ -25,7 +25,7 @@ require (
 	github.com/xdg-go/scram v1.1.2 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/sys v0.37.0 // indirect
+	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.30.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
