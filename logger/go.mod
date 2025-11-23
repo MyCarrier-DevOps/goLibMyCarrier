@@ -4,7 +4,7 @@ go 1.25.4
 
 require (
 	github.com/smartystreets/goconvey v1.8.1
-	go.uber.org/zap v1.27.0
+	go.uber.org/zap v1.27.1
 )
 
 require (

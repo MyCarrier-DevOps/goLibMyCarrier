@@ -775,12 +775,6 @@ func TestOtelEndpointConfiguration_NoEndpoint(t *testing.T) {
 		t.Fatalf("initOtel() should not return error when no endpoint is configured, got: %v", err)
 	}
 
-	// Check that noop exporter message was logged
-	output := buf.String()
-	if !strings.Contains(output, "no OTLP endpoint configured, using noop exporter") {
-		t.Errorf("Expected log to contain noop exporter message, got: %s", output)
-	}
-
 	// Verify tracer was still created
 	if logger.tracer == nil {
 		t.Error("Tracer should be created even with noop exporter")
@@ -1429,11 +1423,6 @@ func TestOtelLogger_initOtel_NoEndpoint(t *testing.T) {
 		t.Errorf("initOtel() with no endpoint should not return error, got: %v", err)
 	}
 
-	output := buf.String()
-	if !strings.Contains(output, "no OTLP endpoint configured, using noop exporter") {
-		t.Errorf("Expected log to contain noop exporter message, got: %s", output)
-	}
-
 	// Should have set up a tracer even without endpoint
 	if logger.tracer == nil {
 		t.Error("Expected tracer to be set even without endpoint")
@@ -1721,8 +1710,16 @@ func TestOtelLogger_formatOtlpEndpoint_EdgeCases(t *testing.T) {
 		{"just protocol https", "https://", "http://https:/"},
 		{"ip address without port", "192.168.1.100", "http://192.168.1.100"},
 		{"hostname with path", "collector.example.com/v1/traces", "http://collector.example.com/v1/traces"},
-		{"https with path and trailing slash", "https://collector.example.com/v1/traces/", "https://collector.example.com/v1/traces"},
-		{"http with path no trailing slash", "http://collector.example.com/v1/traces", "http://collector.example.com/v1/traces"},
+		{
+			"https with path and trailing slash",
+			"https://collector.example.com/v1/traces/",
+			"https://collector.example.com/v1/traces",
+		},
+		{
+			"http with path no trailing slash",
+			"http://collector.example.com/v1/traces",
+			"http://collector.example.com/v1/traces",
+		},
 	}
 
 	for _, tt := range tests {

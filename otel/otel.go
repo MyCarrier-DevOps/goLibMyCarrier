@@ -346,7 +346,6 @@ func (l *OtelLogger) initOtel() error {
 	// Get and validate OTLP endpoint
 	otlpEndpoint := l.getOtlpEndpoint()
 	if otlpEndpoint == "" {
-		l.fallbackLog.Printf("OpenTelemetry enabled but no OTLP endpoint configured, using noop exporter")
 		l.tracer = otel.Tracer(instrumentationName)
 		return nil
 	}

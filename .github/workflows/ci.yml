@@ -65,6 +65,20 @@ jobs:
         run: |
           go mod tidy
           golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...
+  
+  vuln:
+    name: check-sec-${{ matrix.module }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ^1.25
+      - name: Run vulnerability scan on ${{ matrix.module }} module
+        run: make check-sec PKG=${{ matrix.module }}
 
   # Check that all unit tests passed
   unit-tests-check:
@@ -101,12 +115,30 @@ jobs:
           fi
           echo "All lint jobs passed"
 
+  # Check that all vuln jobs passed
+  vuln-check:
+    name: "Vulnerability scan status check"
+    runs-on: ubuntu-latest
+    needs: vuln
+    if: always()
+    steps:
+      - name: Check vulnerability scan results
+        run: |
+          echo "Vulnerability scan jobs completed"
+          # This job will fail if any of the matrix vuln jobs failed
+          if [[ "${{ needs.vuln.result }}" != "success" ]]; then
+            echo "Some vulnerability scan jobs failed"
+            exit 1
+          fi
+          echo "All vulnerability scan jobs passed"
+
   release:
     name: Create Release
     runs-on: ubuntu-latest
     needs: 
       - unit-tests-check
       - lint-check
+      - vuln-check
     if: github.ref == 'refs/heads/main'
     steps:
     - name: Checkout code

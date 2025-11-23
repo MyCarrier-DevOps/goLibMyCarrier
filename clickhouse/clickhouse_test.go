@@ -55,7 +55,11 @@ func (m *MockConn) QueryRow(ctx context.Context, query string, args ...interface
 	return mArgs.Get(0).(driver.Row)
 }
 
-func (m *MockConn) PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error) {
+func (m *MockConn) PrepareBatch(
+	ctx context.Context,
+	query string,
+	opts ...driver.PrepareBatchOption,
+) (driver.Batch, error) {
 	mArgs := m.Called(ctx, query, opts)
 	if mArgs.Get(0) == nil {
 		return nil, mArgs.Error(1)
