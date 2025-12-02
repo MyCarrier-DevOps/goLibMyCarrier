@@ -1,11 +1,11 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/github
 
-go 1.25.4
+go 1.25.5
 
 require (
-	github.com/go-git/go-git/v5 v5.16.3
+	github.com/go-git/go-git/v5 v5.16.4
 	github.com/golang-jwt/jwt/v5 v5.3.0
-	github.com/google/go-github/v73 v73.0.0
+	github.com/google/go-github/v79 v79.0.0
 	github.com/jferrl/go-githubauth v1.5.0
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
