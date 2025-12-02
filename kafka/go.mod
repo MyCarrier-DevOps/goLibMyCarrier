@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/kafka
 
-go 1.25.4
+go 1.25.5
 
 require (
 	github.com/segmentio/kafka-go v0.4.49
