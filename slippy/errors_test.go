@@ -1,5 +1,4 @@
 package slippy
-package slippy
 
 import (
 	"errors"
@@ -8,9 +7,9 @@ import (
 
 func TestSlipError_Error(t *testing.T) {
 	tests := []struct {
-		name          string
-		err           *SlipError
-		expectedMsg   string
+		name        string
+		err         *SlipError
+		expectedMsg string
 	}{
 		{
 			name: "with correlation ID",
