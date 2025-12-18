@@ -171,6 +171,27 @@ func (m *MockClickhouseSession) Conn() driver.Conn {
 	return args.Get(0).(driver.Conn)
 }
 
+func (m *MockClickhouseSession) QueryWithArgs(ctx context.Context, query string, queryArgs ...any) (driver.Rows, error) {
+	args := m.Called(ctx, query, queryArgs)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(driver.Rows), args.Error(1)
+}
+
+func (m *MockClickhouseSession) ExecWithArgs(ctx context.Context, stmt string, execArgs ...any) error {
+	args := m.Called(ctx, stmt, execArgs)
+	return args.Error(0)
+}
+
+func (m *MockClickhouseSession) QueryRow(ctx context.Context, query string, queryArgs ...any) driver.Row {
+	args := m.Called(ctx, query, queryArgs)
+	if args.Get(0) == nil {
+		return nil
+	}
+	return args.Get(0).(driver.Row)
+}
+
 // MockConfigLoader implements ConfigLoaderInterface for testing
 type MockConfigLoader struct {
 	mock.Mock

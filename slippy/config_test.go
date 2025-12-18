@@ -5,6 +5,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -25,8 +27,15 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestConfigFromEnv(t *testing.T) {
-	// Save original env vars
-	origDSN := os.Getenv("SLIPPY_CLICKHOUSE_DSN")
+	// Save original env vars for ClickHouse (loaded via clickhouse package)
+	origCHHost := os.Getenv("CLICKHOUSE_HOSTNAME")
+	origCHPort := os.Getenv("CLICKHOUSE_PORT")
+	origCHUser := os.Getenv("CLICKHOUSE_USERNAME")
+	origCHPass := os.Getenv("CLICKHOUSE_PASSWORD")
+	origCHDB := os.Getenv("CLICKHOUSE_DATABASE")
+	origCHSkip := os.Getenv("CLICKHOUSE_SKIP_VERIFY")
+
+	// Save original env vars for Slippy
 	origAppID := os.Getenv("SLIPPY_GITHUB_APP_ID")
 	origKey := os.Getenv("SLIPPY_GITHUB_APP_PRIVATE_KEY")
 	origEnterprise := os.Getenv("SLIPPY_GITHUB_ENTERPRISE_URL")
@@ -37,7 +46,12 @@ func TestConfigFromEnv(t *testing.T) {
 
 	// Restore env vars after test
 	defer func() {
-		os.Setenv("SLIPPY_CLICKHOUSE_DSN", origDSN)
+		os.Setenv("CLICKHOUSE_HOSTNAME", origCHHost)
+		os.Setenv("CLICKHOUSE_PORT", origCHPort)
+		os.Setenv("CLICKHOUSE_USERNAME", origCHUser)
+		os.Setenv("CLICKHOUSE_PASSWORD", origCHPass)
+		os.Setenv("CLICKHOUSE_DATABASE", origCHDB)
+		os.Setenv("CLICKHOUSE_SKIP_VERIFY", origCHSkip)
 		os.Setenv("SLIPPY_GITHUB_APP_ID", origAppID)
 		os.Setenv("SLIPPY_GITHUB_APP_PRIVATE_KEY", origKey)
 		os.Setenv("SLIPPY_GITHUB_ENTERPRISE_URL", origEnterprise)
@@ -47,8 +61,15 @@ func TestConfigFromEnv(t *testing.T) {
 		os.Setenv("SLIPPY_ANCESTRY_DEPTH", origDepth)
 	}()
 
-	// Set test values
-	os.Setenv("SLIPPY_CLICKHOUSE_DSN", "clickhouse://test:test@localhost:9000/testdb")
+	// Set test values for ClickHouse (via clickhouse package env vars)
+	os.Setenv("CLICKHOUSE_HOSTNAME", "localhost")
+	os.Setenv("CLICKHOUSE_PORT", "9000")
+	os.Setenv("CLICKHOUSE_USERNAME", "testuser")
+	os.Setenv("CLICKHOUSE_PASSWORD", "testpass")
+	os.Setenv("CLICKHOUSE_DATABASE", "testdb")
+	os.Setenv("CLICKHOUSE_SKIP_VERIFY", "true")
+
+	// Set test values for Slippy
 	os.Setenv("SLIPPY_GITHUB_APP_ID", "12345")
 	os.Setenv("SLIPPY_GITHUB_APP_PRIVATE_KEY", "test-private-key")
 	os.Setenv("SLIPPY_GITHUB_ENTERPRISE_URL", "https://github.example.com")
@@ -59,9 +80,27 @@ func TestConfigFromEnv(t *testing.T) {
 
 	cfg := ConfigFromEnv()
 
-	if cfg.ClickHouseDSN != "clickhouse://test:test@localhost:9000/testdb" {
-		t.Errorf("ClickHouseDSN = %q, want expected DSN", cfg.ClickHouseDSN)
+	// Verify ClickHouse config was loaded
+	if cfg.ClickHouseConfig == nil {
+		t.Error("ClickHouseConfig should not be nil")
+	} else {
+		if cfg.ClickHouseConfig.ChHostname != "localhost" {
+			t.Errorf("ChHostname = %q, want 'localhost'", cfg.ClickHouseConfig.ChHostname)
+		}
+		if cfg.ClickHouseConfig.ChPort != "9000" {
+			t.Errorf("ChPort = %q, want '9000'", cfg.ClickHouseConfig.ChPort)
+		}
+		if cfg.ClickHouseConfig.ChUsername != "testuser" {
+			t.Errorf("ChUsername = %q, want 'testuser'", cfg.ClickHouseConfig.ChUsername)
+		}
+		if cfg.ClickHouseConfig.ChPassword != "testpass" {
+			t.Errorf("ChPassword = %q, want 'testpass'", cfg.ClickHouseConfig.ChPassword)
+		}
+		if cfg.ClickHouseConfig.ChDatabase != "testdb" {
+			t.Errorf("ChDatabase = %q, want 'testdb'", cfg.ClickHouseConfig.ChDatabase)
+		}
 	}
+
 	if cfg.GitHubAppID != 12345 {
 		t.Errorf("GitHubAppID = %d, want 12345", cfg.GitHubAppID)
 	}
@@ -117,6 +156,16 @@ func TestConfigFromEnv_InvalidValues(t *testing.T) {
 }
 
 func TestConfig_Validate(t *testing.T) {
+	// Helper to create a valid ClickHouseConfig for tests
+	validCHConfig := &ch.ClickhouseConfig{
+		ChHostname:   "localhost",
+		ChPort:       "9000",
+		ChDatabase:   "testdb",
+		ChUsername:   "user",
+		ChPassword:   "pass",
+		ChSkipVerify: "true",
+	}
+
 	tests := []struct {
 		name      string
 		config    Config
@@ -126,7 +175,7 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "valid config",
 			config: Config{
-				ClickHouseDSN:    "clickhouse://localhost/db",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key-content",
 				HoldTimeout:      time.Minute,
@@ -136,7 +185,7 @@ func TestConfig_Validate(t *testing.T) {
 			wantError: false,
 		},
 		{
-			name: "missing ClickHouseDSN",
+			name: "missing ClickHouseConfig",
 			config: Config{
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
@@ -150,7 +199,7 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "missing GitHubAppID",
 			config: Config{
-				ClickHouseDSN:    "dsn",
+				ClickHouseConfig: validCHConfig,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
@@ -162,11 +211,11 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "missing GitHubPrivateKey",
 			config: Config{
-				ClickHouseDSN: "dsn",
-				GitHubAppID:   12345,
-				HoldTimeout:   time.Minute,
-				PollInterval:  time.Second,
-				AncestryDepth: 10,
+				ClickHouseConfig: validCHConfig,
+				GitHubAppID:      12345,
+				HoldTimeout:      time.Minute,
+				PollInterval:     time.Second,
+				AncestryDepth:    10,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -174,7 +223,7 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "zero HoldTimeout",
 			config: Config{
-				ClickHouseDSN:    "dsn",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      0,
@@ -187,7 +236,7 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "negative HoldTimeout",
 			config: Config{
-				ClickHouseDSN:    "dsn",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      -time.Minute,
@@ -200,7 +249,7 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "zero PollInterval",
 			config: Config{
-				ClickHouseDSN:    "dsn",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
@@ -213,7 +262,7 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "zero AncestryDepth",
 			config: Config{
-				ClickHouseDSN:    "dsn",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,

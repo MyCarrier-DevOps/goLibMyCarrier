@@ -1,5 +1,3 @@
-//go:build !unittest
-
 package slippy
 
 import (
@@ -9,8 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ClickHouse/clickhouse-go/v2"
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
 // ClickHouseStore implements SlipStore using ClickHouse as the backend.
@@ -18,7 +15,7 @@ import (
 // consistent with MyCarrier's organization-wide use of correlation_id to
 // identify jobs across all systems.
 type ClickHouseStore struct {
-	conn clickhouse.Conn
+	session ch.ClickhouseSessionInterface
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -30,53 +27,50 @@ type ClickHouseStoreOptions struct {
 	MigrateOptions MigrateOptions
 }
 
-// NewClickHouseStore creates a new ClickHouse-backed slip store.
+// NewClickHouseStoreFromConfig creates a new ClickHouse-backed slip store from config.
 // By default, this runs all pending migrations to ensure the schema is up to date.
-// Use NewClickHouseStoreWithOptions for more control over initialization.
-func NewClickHouseStore(dsn string) (*ClickHouseStore, error) {
-	return NewClickHouseStoreWithOptions(dsn, ClickHouseStoreOptions{})
-}
-
-// NewClickHouseStoreWithOptions creates a new ClickHouse-backed slip store with custom options.
-func NewClickHouseStoreWithOptions(dsn string, opts ClickHouseStoreOptions) (*ClickHouseStore, error) {
-	clickhouseOpts, err := clickhouse.ParseDSN(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse DSN: %w", err)
-	}
-
-	conn, err := clickhouse.Open(clickhouseOpts)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open connection: %w", err)
-	}
-
-	// Test connection
+func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseStoreOptions) (*ClickHouseStore, error) {
 	ctx := context.Background()
-	if err := conn.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("failed to ping ClickHouse: %w", err)
+	session, err := ch.NewClickhouseSession(config, ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create ClickHouse session: %w", err)
 	}
 
 	// Run migrations unless explicitly skipped
 	if !opts.SkipMigrations {
-		if _, err := RunMigrations(ctx, conn, opts.MigrateOptions); err != nil {
-			conn.Close()
+		if _, err := RunMigrations(ctx, session.Conn(), opts.MigrateOptions); err != nil {
+			session.Close()
 			return nil, fmt.Errorf("failed to run migrations: %w", err)
 		}
 	}
 
-	return &ClickHouseStore{conn: conn}, nil
+	return &ClickHouseStore{session: session}, nil
 }
 
-// NewClickHouseStoreFromConn creates a store from an existing connection.
+// NewClickHouseStoreFromSession creates a store from an existing session.
 // Migrations are NOT run automatically when using this constructor.
 // Use RunMigrations explicitly if needed.
-func NewClickHouseStoreFromConn(conn clickhouse.Conn) *ClickHouseStore {
-	return &ClickHouseStore{conn: conn}
+func NewClickHouseStoreFromSession(session ch.ClickhouseSessionInterface) *ClickHouseStore {
+	return &ClickHouseStore{session: session}
 }
 
-// Conn returns the underlying ClickHouse connection.
+// NewClickHouseStoreFromConn creates a store from an existing driver connection.
+// Migrations are NOT run automatically when using this constructor.
+// This is provided for backward compatibility with existing code.
+func NewClickHouseStoreFromConn(conn ch.Conn) *ClickHouseStore {
+	return &ClickHouseStore{session: ch.NewSessionFromConn(conn)}
+}
+
+// Session returns the underlying ClickHouse session interface.
+// This can be used for running custom queries or migrations.
+func (s *ClickHouseStore) Session() ch.ClickhouseSessionInterface {
+	return s.session
+}
+
+// Conn returns the underlying ClickHouse driver connection.
 // This can be used for running migrations or custom queries.
-func (s *ClickHouseStore) Conn() clickhouse.Conn {
-	return s.conn
+func (s *ClickHouseStore) Conn() ch.Conn {
+	return s.session.Conn()
 }
 
 // Create persists a new routing slip.
@@ -133,7 +127,7 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`
 
-	err = s.conn.Exec(ctx, query,
+	err = s.session.ExecWithArgs(ctx, query,
 		slip.CorrelationID,
 		slip.Repository,
 		slip.Branch,
@@ -237,9 +231,9 @@ func (s *ClickHouseStore) FindByCommits(ctx context.Context, repository string, 
 		LIMIT 1
 	`
 
-	row := s.conn.QueryRow(ctx, query,
-		clickhouse.Named("repository", repository),
-		clickhouse.Named("commits", commits),
+	row := s.session.QueryRow(ctx, query,
+		ch.Named("repository", repository),
+		ch.Named("commits", commits),
 	)
 
 	slip, matchedCommit, err := s.scanSlipWithMatch(row)
@@ -322,12 +316,12 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 
 // Close releases any resources held by the store.
 func (s *ClickHouseStore) Close() error {
-	return s.conn.Close()
+	return s.session.Close()
 }
 
 // scanSlip executes a query and scans the result into a Slip.
 func (s *ClickHouseStore) scanSlip(ctx context.Context, query string, args ...interface{}) (*Slip, error) {
-	row := s.conn.QueryRow(ctx, query, args...)
+	row := s.session.QueryRow(ctx, query, args...)
 
 	var slip Slip
 	var statusStr string
@@ -421,7 +415,7 @@ func (s *ClickHouseStore) scanSlip(ctx context.Context, query string, args ...in
 }
 
 // scanSlipWithMatch scans a slip with an additional matched_commit column.
-func (s *ClickHouseStore) scanSlipWithMatch(row driver.Row) (*Slip, string, error) {
+func (s *ClickHouseStore) scanSlipWithMatch(row ch.Row) (*Slip, string, error) {
 	var slip Slip
 	var statusStr string
 	var componentsJSON, stepTimestampsJSON, stateHistoryJSON string

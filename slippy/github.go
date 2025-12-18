@@ -2,8 +2,6 @@
 //
 // This file re-exports GitHub types from the goLibMyCarrier/github package
 // for backward compatibility and convenience within the slippy package.
-//go:build !unittest
-
 package slippy
 
 import (

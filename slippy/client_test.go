@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
 func TestNewClientWithDependencies(t *testing.T) {
@@ -363,6 +365,16 @@ func TestClient_Accessors(t *testing.T) {
 // Note: We can't test successful NewClient without real ClickHouse/GitHub connections,
 // but we can test that invalid configurations are rejected before any connections are made.
 func TestNewClient_ValidationErrors(t *testing.T) {
+	// Helper to create a valid ClickHouseConfig for tests
+	validCHConfig := &ch.ClickhouseConfig{
+		ChHostname:   "localhost",
+		ChPort:       "9000",
+		ChDatabase:   "testdb",
+		ChUsername:   "user",
+		ChPassword:   "pass",
+		ChSkipVerify: "true",
+	}
+
 	tests := []struct {
 		name    string
 		config  Config
@@ -374,7 +386,7 @@ func TestNewClient_ValidationErrors(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "missing ClickHouseDSN",
+			name: "missing ClickHouseConfig",
 			config: Config{
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
@@ -387,7 +399,7 @@ func TestNewClient_ValidationErrors(t *testing.T) {
 		{
 			name: "missing GitHubAppID",
 			config: Config{
-				ClickHouseDSN:    "clickhouse://localhost/db",
+				ClickHouseConfig: validCHConfig,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
@@ -398,18 +410,18 @@ func TestNewClient_ValidationErrors(t *testing.T) {
 		{
 			name: "missing GitHubPrivateKey",
 			config: Config{
-				ClickHouseDSN: "clickhouse://localhost/db",
-				GitHubAppID:   12345,
-				HoldTimeout:   time.Minute,
-				PollInterval:  time.Second,
-				AncestryDepth: 10,
+				ClickHouseConfig: validCHConfig,
+				GitHubAppID:      12345,
+				HoldTimeout:      time.Minute,
+				PollInterval:     time.Second,
+				AncestryDepth:    10,
 			},
 			wantErr: true,
 		},
 		{
 			name: "zero HoldTimeout",
 			config: Config{
-				ClickHouseDSN:    "clickhouse://localhost/db",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      0,
@@ -421,7 +433,7 @@ func TestNewClient_ValidationErrors(t *testing.T) {
 		{
 			name: "zero PollInterval",
 			config: Config{
-				ClickHouseDSN:    "clickhouse://localhost/db",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
@@ -433,7 +445,7 @@ func TestNewClient_ValidationErrors(t *testing.T) {
 		{
 			name: "zero AncestryDepth",
 			config: Config{
-				ClickHouseDSN:    "clickhouse://localhost/db",
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,

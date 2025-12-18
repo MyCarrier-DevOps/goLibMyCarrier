@@ -5,14 +5,17 @@ import (
 	"os"
 	"strconv"
 	"time"
+
+	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
 // Config holds configuration for the slippy client.
 // It includes connection settings, authentication, and behavior options.
 type Config struct {
-	// ClickHouseDSN is the connection string for ClickHouse
-	// Format: clickhouse://user:password@host:port/database
-	ClickHouseDSN string
+	// ClickHouseConfig holds the ClickHouse connection parameters.
+	// Use clickhouse.ClickhouseLoadConfig() to load from environment variables,
+	// or construct manually with hostname, port, username, password, database, and skipVerify.
+	ClickHouseConfig *ch.ClickhouseConfig
 
 	// GitHubAppID is the GitHub App ID for authentication
 	GitHubAppID int64
@@ -51,7 +54,8 @@ func DefaultConfig() Config {
 
 // ConfigFromEnv loads configuration from environment variables.
 // Environment variables:
-//   - SLIPPY_CLICKHOUSE_DSN: ClickHouse connection string
+//   - CLICKHOUSE_HOSTNAME, CLICKHOUSE_PORT, CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
+//     CLICKHOUSE_DATABASE, CLICKHOUSE_SKIP_VERIFY: ClickHouse connection settings
 //   - SLIPPY_GITHUB_APP_ID: GitHub App ID
 //   - SLIPPY_GITHUB_APP_PRIVATE_KEY: Private key (PEM content or file path)
 //   - SLIPPY_GITHUB_ENTERPRISE_URL: GitHub Enterprise base URL (optional)
@@ -62,9 +66,9 @@ func DefaultConfig() Config {
 func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
 
-	// ClickHouse
-	if dsn := os.Getenv("SLIPPY_CLICKHOUSE_DSN"); dsn != "" {
-		cfg.ClickHouseDSN = dsn
+	// ClickHouse - use the standard clickhouse config loader
+	if chConfig, err := ch.ClickhouseLoadConfig(); err == nil {
+		cfg.ClickHouseConfig = chConfig
 	}
 
 	// GitHub App authentication
@@ -97,8 +101,11 @@ func ConfigFromEnv() Config {
 // Validate checks that all required configuration is present and valid.
 // Returns an error describing any missing or invalid settings.
 func (c Config) Validate() error {
-	if c.ClickHouseDSN == "" {
-		return fmt.Errorf("%w: ClickHouseDSN is required", ErrInvalidConfiguration)
+	if c.ClickHouseConfig == nil {
+		return fmt.Errorf("%w: ClickHouseConfig is required", ErrInvalidConfiguration)
+	}
+	if err := ch.ClickhouseValidateConfig(c.ClickHouseConfig); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidConfiguration, err)
 	}
 	if c.GitHubAppID == 0 {
 		return fmt.Errorf("%w: GitHubAppID is required", ErrInvalidConfiguration)

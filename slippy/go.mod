@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.41.0
+	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.40
 	github.com/MyCarrier-DevOps/goLibMyCarrier/github v0.0.0
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.40
 	github.com/testcontainers/testcontainers-go v0.40.0
@@ -104,7 +105,7 @@ require (
 	github.com/go-faster/errors v0.7.1 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
-	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/paulmach/orb v0.12.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
@@ -122,3 +123,5 @@ replace github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator => ../clic
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/github => ../github
+
+replace github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse => ../clickhouse

@@ -29,8 +29,8 @@ func NewClient(config Config) (*Client, error) {
 		config.Logger = NopLogger()
 	}
 
-	// Initialize ClickHouse store
-	store, err := NewClickHouseStore(config.ClickHouseDSN)
+	// Initialize ClickHouse store from config
+	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %w", err)
 	}

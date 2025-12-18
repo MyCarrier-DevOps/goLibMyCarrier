@@ -1,5 +1,3 @@
-//go:build !unittest
-
 package slippy
 
 import "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator"
