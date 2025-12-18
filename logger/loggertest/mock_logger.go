@@ -55,10 +55,10 @@ type MockLogger struct {
 	mu sync.RWMutex
 
 	// Captured logs by level
-	InfoLogs    []LogEntry
-	DebugLogs   []LogEntry
-	WarnLogs    []LogEntry
-	ErrorLogs   []ErrorLogEntry
+	InfoLogs  []LogEntry
+	DebugLogs []LogEntry
+	WarnLogs  []LogEntry
+	ErrorLogs []ErrorLogEntry
 
 	// Fields set via WithFields
 	currentFields map[string]interface{}

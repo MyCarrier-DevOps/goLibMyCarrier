@@ -451,8 +451,8 @@ type MockBatch struct {
 	AppendStructErr   error
 
 	// Column behavior
-	ColumnFunc  func(idx int) driver.BatchColumn
-	ColumnData  map[int]driver.BatchColumn
+	ColumnFunc func(idx int) driver.BatchColumn
+	ColumnData map[int]driver.BatchColumn
 
 	// Flush behavior
 	FlushFunc  func() error
@@ -629,5 +629,6 @@ var _ ch.ClickhouseSessionInterface = (*MockSession)(nil)
 var _ driver.Rows = (*MockRows)(nil)
 var _ driver.Row = (*MockRow)(nil)
 var _ driver.Conn = (*MockConn)(nil)
+
 // Note: MockBatch doesn't fully implement driver.Batch because Columns() requires
 // an internal column.Interface type. Use MockBatch for basic batch testing only.

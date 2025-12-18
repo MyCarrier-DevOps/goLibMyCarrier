@@ -1066,4 +1066,3 @@ func TestClickHouseStore_FindByCommits_QueryError(t *testing.T) {
 		t.Error("expected error, got nil")
 	}
 }
-
