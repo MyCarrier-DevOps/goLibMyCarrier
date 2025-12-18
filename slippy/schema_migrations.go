@@ -211,4 +211,3 @@ func GetLatestMigrationVersion() int {
 	}
 	return migrations[len(migrations)-1].Version
 }
-

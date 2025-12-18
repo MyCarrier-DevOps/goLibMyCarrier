@@ -7,7 +7,7 @@ import (
 
 func TestNopLogger(t *testing.T) {
 	ctx := context.Background()
-	
+
 	t.Run("returns non-nil logger", func(t *testing.T) {
 		log := NopLogger()
 		if log == nil {

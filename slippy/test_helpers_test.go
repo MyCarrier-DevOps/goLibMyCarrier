@@ -31,7 +31,8 @@ func (l *testLogger) Warn(ctx context.Context, message string, fields map[string
 func (l *testLogger) Warning(ctx context.Context, message string, fields map[string]interface{}) {}
 
 // Error logs an error message (no-op in tests).
-func (l *testLogger) Error(ctx context.Context, message string, err error, fields map[string]interface{}) {}
+func (l *testLogger) Error(ctx context.Context, message string, err error, fields map[string]interface{}) {
+}
 
 // WithFields returns a new Logger with the given fields.
 func (l *testLogger) WithFields(fields map[string]interface{}) logger.Logger {

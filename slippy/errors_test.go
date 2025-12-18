@@ -1,4 +1,5 @@
 package slippy
+package slippy
 
 import (
 	"errors"

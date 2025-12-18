@@ -270,7 +270,7 @@ func TestClient_WaitForPrerequisites(t *testing.T) {
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{
 			HoldTimeout:  5 * time.Second, // Default
-			PollInterval: 1 * time.Second,  // Default
+			PollInterval: 1 * time.Second, // Default
 		})
 
 		slip := &Slip{

@@ -98,7 +98,7 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 				timeoutMsg := fmt.Sprintf("hold timeout exceeded after %v, still waiting for: %v",
 					opts.Timeout, result.RunningPrereqs)
 				c.logger.Error(ctx, "Hold timeout exceeded", nil, map[string]interface{}{
-					"timeout":        opts.Timeout.String(),
+					"timeout":         opts.Timeout.String(),
 					"running_prereqs": result.RunningPrereqs,
 				})
 
