@@ -6,19 +6,13 @@ Slippy is a Go library that provides **routing slip** functionality for CI/CD pi
 
 - [Overview](#overview)
 - [Execution Model](#execution-model)
-- [Slip Resolution](#slip-resolution)
 - [Core Concepts](#core-concepts)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Quick Start](#quick-start)
 - [Pipeline Stages](#pipeline-stages)
-- [Usage by Stage](#usage-by-stage)
-  - [Push Parsing Stage](#push-parsing-stage)
-  - [Build Stage](#build-stage)
-  - [Unit Test Stage](#unit-test-stage)
-  - [Dev Deployment Stage](#dev-deployment-stage)
-  - [Pre-Production Stage](#pre-production-stage)
-  - [Production Deployment Stage](#production-deployment-stage)
+- [Usage Patterns](#usage-patterns)
+- [Slip Resolution Strategies](#slip-resolution-strategies)
 - [Prerequisite Checking and Holds](#prerequisite-checking-and-holds)
 - [Error Handling](#error-handling)
 - [Testing](#testing)
@@ -55,57 +49,62 @@ Slippy implements the **Routing Slip** pattern for distributed pipeline orchestr
 **Slippy does NOT wrap job execution.** Instead, it operates as **bookends** around existing CI/CD jobs:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        CI/CD Job Execution                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│   ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐  │
-│   │   PRE-JOB    │    │   ACTUAL JOB     │    │   POST-JOB   │  │
-│   │   (Slippy)   │───▶│   (Your Code)    │───▶│   (Slippy)   │  │
-│   └──────────────┘    └──────────────────┘    └──────────────┘  │
-│                                                                  │
-│   • Resolve slip       • Build/Test/Deploy    • Update status   │
-│   • Check prereqs      • Any pipeline work    • Record outcome  │
-│   • Hold if needed                            • Update history  │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                          CI/CD Job Execution                              │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                           │
+│   ┌──────────────┐       ┌──────────────────┐       ┌──────────────┐     │
+│   │   PRE-JOB    │       │   ACTUAL JOB     │       │   POST-JOB   │     │
+│   │   (Slippy)   │──────▶│   (Your Code)    │──────▶│   (Slippy)   │     │
+│   └──────────────┘       └──────────────────┘       └──────────────┘     │
+│          │                        │                        │              │
+│          │   correlation_id       │   correlation_id       │              │
+│          └───────────────────────▶│───────────────────────▶│              │
+│                                                                           │
+│   • Resolve slip          • Build/Test/Deploy      • Update status       │
+│   • Check prereqs         • Any pipeline work      • Record outcome      │
+│   • Hold if needed        • Has correlation_id     • Has correlation_id  │
+│   • Output correlation_id                                                 │
+│                                                                           │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 Each stage involves **two separate slippy executions**:
 
-1. **Pre-Job Execution**: Resolves the slip, checks prerequisites, potentially holds
-2. **Post-Job Execution**: Updates step status based on job outcome
+1. **Pre-Job Execution**: Resolves the slip from context, checks prerequisites, outputs correlation ID
+2. **Actual Job**: Receives correlation ID from pre-job, performs work, passes it to post-job
+3. **Post-Job Execution**: Uses correlation ID directly to update step status
 
-### No Correlation ID at Runtime
+### Correlation ID Flow
 
-**Critical concept**: When slippy runs at the beginning or end of a job, it typically does **NOT** have the correlation ID. The correlation ID is an internal slip identifier that is not passed through the CI/CD system.
+**Only the pre-job needs to resolve the slip.** Once resolved, the correlation ID can be passed forward:
 
-Instead, slippy must **resolve** the correct slip using available context:
-
-| Available Context | Resolution Method |
-|-------------------|-------------------|
-| Commit SHA | `LoadByCommit()` or `ResolveSlip()` |
-| Git ref (HEAD, branch) | `ResolveSlip()` with ancestry walking |
-| Image tag | `ResolveSlip()` with tag parsing |
-| Repository + Branch | Query by repo/branch combination |
+| Phase | Has Correlation ID? | How to Get It |
+|-------|---------------------|---------------|
+| Pre-Job | ❌ No | Resolve from commit SHA, ancestry, or image tag |
+| Actual Job | ✅ Yes | Received from pre-job (env var, file, output) |
+| Post-Job | ✅ Yes | Received from job (env var, file, input) |
 
 ```go
-// ❌ WRONG - You won't have correlation ID
+// ❌ WRONG (in pre-job) - You don't have correlation ID yet
 slip, err := client.Load(ctx, correlationID) // Where would this come from?
 
-// ✅ CORRECT - Resolve from available context
+// ✅ CORRECT (in pre-job) - Resolve from available context
 result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-    Repository: os.Getenv("GITHUB_REPOSITORY"),  // Available in CI
-    Ref:        os.Getenv("GITHUB_SHA"),         // Available in CI
+    Repository: os.Getenv("GITHUB_REPOSITORY"),
+    Ref:        os.Getenv("GITHUB_SHA"),
 })
-slip := result.Slip
-correlationID := slip.CorrelationID  // Now you have it
+correlationID := result.Slip.CorrelationID  // Now you have it - pass it forward!
+
+// ✅ CORRECT (in post-job) - Use correlation ID from pre-job
+correlationID := os.Getenv("SLIPPY_CORRELATION_ID")  // Set by pre-job
+slip, err := client.Load(ctx, correlationID)         // Direct lookup, no resolution needed
 ```
 
 ### Typical Job Integration
 
 ```go
-// PRE-JOB: Run before the actual job starts
+// PRE-JOB: Resolve slip and output correlation ID
 func preJob(ctx context.Context, client *slippy.Client) (string, error) {
     // Resolve slip from CI environment context
     result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
@@ -132,28 +131,66 @@ func preJob(ctx context.Context, client *slippy.Client) (string, error) {
     // Mark step as running
     client.StartStep(ctx, correlationID, "dev_deploy", "")
     
+    // Return correlation ID to be passed to job and post-job
     return correlationID, nil
 }
 
-// POST-JOB: Run after the actual job completes
-func postJob(ctx context.Context, client *slippy.Client, jobSuccess bool) error {
-    // Resolve slip again (separate execution, no shared state)
-    result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-        Repository: os.Getenv("GITHUB_REPOSITORY"),
-        Ref:        os.Getenv("GITHUB_SHA"),
-    })
-    if err != nil {
-        return err
-    }
+// POST-JOB: Use correlation ID directly (no resolution needed)
+func postJob(ctx context.Context, client *slippy.Client, correlationID string, jobSuccess bool) error {
+    // correlationID was passed from pre-job through the actual job
+    // No need to resolve - just use it directly
     
-    correlationID := result.Slip.CorrelationID
-    
-    // Update based on job outcome
     if jobSuccess {
         return client.CompleteStep(ctx, correlationID, "dev_deploy", "")
     }
     return client.FailStep(ctx, correlationID, "dev_deploy", "", "job failed")
 }
+```
+
+### Passing Correlation ID Between Phases
+
+How you pass the correlation ID depends on your CI/CD system:
+
+**GitHub Actions:**
+```yaml
+jobs:
+  deploy:
+    steps:
+      - name: Pre-Job (Slippy)
+        id: prejob
+        run: |
+          CORRELATION_ID=$(slippy pre-job --repo $GITHUB_REPOSITORY --sha $GITHUB_SHA)
+          echo "correlation_id=$CORRELATION_ID" >> $GITHUB_OUTPUT
+      
+      - name: Actual Deploy
+        env:
+          SLIPPY_CORRELATION_ID: ${{ steps.prejob.outputs.correlation_id }}
+        run: ./deploy.sh
+      
+      - name: Post-Job (Slippy)
+        if: always()
+        run: slippy post-job --correlation-id ${{ steps.prejob.outputs.correlation_id }} --success ${{ job.status == 'success' }}
+```
+
+**Argo Workflows:**
+```yaml
+templates:
+  - name: deploy-with-slippy
+    steps:
+      - - name: pre-job
+          template: slippy-pre
+      - - name: deploy
+          template: actual-deploy
+          arguments:
+            parameters:
+              - name: correlation_id
+                value: "{{steps.pre-job.outputs.parameters.correlation_id}}"
+      - - name: post-job
+          template: slippy-post
+          arguments:
+            parameters:
+              - name: correlation_id
+                value: "{{steps.pre-job.outputs.parameters.correlation_id}}"
 ```
 
 ---
@@ -383,17 +420,16 @@ Slippy tracks the following standard pipeline stages:
 
 ---
 
-## Usage by Stage
+## Usage Patterns
 
-### Push Parsing Stage
+### Pattern 1: Slip Creation (Push Parsing Only)
 
-The push parsing stage is **unique** - it's the only stage where a slip is **created** (not resolved). This happens when Argo Events receives a push notification from GitHub.
+The push parsing stage is **unique** - it's the only stage where a slip is **created** (not resolved). This happens when Argo Events receives a push notification.
 
 ```go
-// Create a new slip for the push
-// This is the ONLY time correlation ID is generated
+// Create a new slip for the push - ONLY done once per commit
 slip, err := client.CreateFromPush(ctx, slippy.PushEvent{
-    CorrelationID: "corr-abc123-def456", // Generated by the system
+    CorrelationID: uuid.New().String(),  // Generated once, used everywhere
     Repository:    "myorg/myrepo",
     Branch:        "main",
     CommitSHA:     "abc123def456789...",
@@ -402,25 +438,55 @@ slip, err := client.CreateFromPush(ctx, slippy.PushEvent{
         {Name: "worker", DockerfilePath: "services/worker"},
     },
 })
-if err != nil {
-    log.Fatal(err)
-}
 
 // Mark push parsing as complete
-err = client.CompleteStep(ctx, slip.CorrelationID, "push_parsed", "")
+client.CompleteStep(ctx, slip.CorrelationID, "push_parsed", "")
 ```
 
-### Build Stage
+### Pattern 2: Simple Step (No Prerequisites)
 
-Build jobs run as separate processes. Each build pre-job and post-job must resolve the slip.
+Use this pattern for build, test, and other steps that don't need to wait for prerequisites.
 
-**Pre-Job (before build starts):**
 ```go
-func buildPreJob(ctx context.Context, client *slippy.Client, repo, commitSHA, componentName string) (string, error) {
-    // Resolve slip from commit context
+// PRE-JOB: Resolve slip and mark step as started
+func simplePreJob(ctx context.Context, client *slippy.Client, stepName, componentName string) (string, error) {
     result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-        Repository: repo,
-        Ref:        commitSHA,
+        Repository: os.Getenv("GITHUB_REPOSITORY"),
+        Ref:        os.Getenv("GITHUB_SHA"),
+    })
+    if err != nil {
+        return "", fmt.Errorf("failed to resolve slip: %w", err)
+    }
+    
+    correlationID := result.Slip.CorrelationID
+    client.StartStep(ctx, correlationID, stepName, componentName)
+    
+    return correlationID, nil  // Pass to job and post-job
+}
+
+// POST-JOB: Update step status (correlation ID passed from pre-job)
+func simplePostJob(ctx context.Context, client *slippy.Client, correlationID, stepName, componentName string, success bool) error {
+    if success {
+        return client.CompleteStep(ctx, correlationID, stepName, componentName)
+    }
+    return client.FailStep(ctx, correlationID, stepName, componentName, "step failed")
+}
+```
+
+**Applicable to:** `build`, `unit_test`, `secret_scan`, `dev_tests`, `preprod_tests`, `prod_tests`
+
+### Pattern 3: Gated Step (With Prerequisites)
+
+Use this pattern for deployment steps that must wait for upstream steps to complete.
+
+```go
+// PRE-JOB: Resolve slip, check prerequisites, then start step
+func gatedPreJob(ctx context.Context, client *slippy.Client, stepName string, prerequisites []string) (string, error) {
+    // Resolve slip (use ancestry for later stages that may have rebased)
+    result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
+        Repository:    os.Getenv("GITHUB_REPOSITORY"),
+        Ref:           os.Getenv("GITHUB_SHA"),  // Or "HEAD" for ancestry walking
+        AncestryDepth: 20,
     })
     if err != nil {
         return "", fmt.Errorf("failed to resolve slip: %w", err)
@@ -428,213 +494,69 @@ func buildPreJob(ctx context.Context, client *slippy.Client, repo, commitSHA, co
     
     correlationID := result.Slip.CorrelationID
     
-    // Mark build as started
-    err = client.StartStep(ctx, correlationID, "build", componentName)
-    if err != nil {
-        return "", err
-    }
-    
-    return correlationID, nil
-}
-```
-
-**Post-Job (after build completes):**
-```go
-func buildPostJob(ctx context.Context, client *slippy.Client, repo, commitSHA, componentName string, success bool) error {
-    // Resolve slip again (separate execution)
-    result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-        Repository: repo,
-        Ref:        commitSHA,
-    })
-    if err != nil {
-        return err
-    }
-    
-    correlationID := result.Slip.CorrelationID
-    
-    if success {
-        return client.CompleteStep(ctx, correlationID, "build", componentName)
-    }
-    return client.FailStep(ctx, correlationID, "build", componentName, "build failed")
-}
-```
-
-When all component builds complete, the aggregate `builds_completed` step is automatically updated.
-
-### Unit Test Stage
-
-Same pre-job/post-job pattern as builds:
-
-**Pre-Job:**
-```go
-result, _ := client.ResolveSlip(ctx, slippy.ResolveOptions{
-    Repository: repo,
-    Ref:        commitSHA,
-})
-client.StartStep(ctx, result.Slip.CorrelationID, "unit_test", componentName)
-```
-
-**Post-Job:**
-```go
-result, _ := client.ResolveSlip(ctx, slippy.ResolveOptions{
-    Repository: repo,
-    Ref:        commitSHA,
-})
-
-if testsPass {
-    client.CompleteStep(ctx, result.Slip.CorrelationID, "unit_test", componentName)
-} else {
-    client.FailStep(ctx, result.Slip.CorrelationID, "unit_test", componentName, "3 tests failed")
-}
-```
-
-### Dev Deployment Stage
-
-Deploy stages add prerequisite checking in the pre-job phase.
-
-**Pre-Job (with prerequisite hold):**
-```go
-func devDeployPreJob(ctx context.Context, client *slippy.Client) error {
-    // Resolve slip
-    result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-        Repository: os.Getenv("GITHUB_REPOSITORY"),
-        Ref:        os.Getenv("GITHUB_SHA"),
-    })
-    if err != nil {
-        return err
-    }
-    
-    correlationID := result.Slip.CorrelationID
-    
-    // Wait for prerequisites - this may HOLD the job
+    // Wait for prerequisites - may HOLD until satisfied or timeout
     err = client.WaitForPrerequisites(ctx, slippy.HoldOptions{
         CorrelationID: correlationID,
-        Prerequisites: []string{"builds_completed", "unit_tests_completed", "secret_scan_completed"},
-        StepName:      "dev_deploy",
+        Prerequisites: prerequisites,
+        StepName:      stepName,
         Timeout:       30 * time.Minute,
         PollInterval:  30 * time.Second,
     })
     if err != nil {
-        if errors.Is(err, slippy.ErrHoldTimeout) {
-            log.Printf("Timeout waiting for prerequisites")
-        } else if errors.Is(err, slippy.ErrPrerequisiteFailed) {
-            log.Printf("Prerequisites failed - aborting deploy")
+        // Handle specific error cases
+        if errors.Is(err, slippy.ErrPrerequisiteFailed) {
+            client.AbortStep(ctx, correlationID, stepName, "", "prerequisites failed")
         }
-        return err
+        return "", err
     }
 
-    // Prerequisites satisfied - mark as started
-    return client.StartStep(ctx, correlationID, "dev_deploy", "")
+    client.StartStep(ctx, correlationID, stepName, "")
+    return correlationID, nil
 }
-```
 
-**Post-Job:**
-```go
-func devDeployPostJob(ctx context.Context, client *slippy.Client, success bool) error {
-    result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-        Repository: os.Getenv("GITHUB_REPOSITORY"),
-        Ref:        os.Getenv("GITHUB_SHA"),
-    })
-    if err != nil {
-        return err
-    }
-    
+// POST-JOB: Same as simple pattern
+func gatedPostJob(ctx context.Context, client *slippy.Client, correlationID, stepName string, success bool) error {
     if success {
-        return client.CompleteStep(ctx, result.Slip.CorrelationID, "dev_deploy", "")
+        return client.CompleteStep(ctx, correlationID, stepName, "")
     }
-    return client.FailStep(ctx, result.Slip.CorrelationID, "dev_deploy", "", "deployment failed")
+    return client.FailStep(ctx, correlationID, stepName, "", "step failed")
 }
 ```
 
-### Pre-Production Stage
+**Applicable to:** `dev_deploy`, `preprod_deploy`, `prod_deploy`, `alert_gate`
 
-Pre-production may involve rebased commits, so ancestry resolution is critical.
-
-**Pre-Job:**
+**Example prerequisite configurations:**
 ```go
-func preprodPreJob(ctx context.Context, client *slippy.Client) error {
-    // Resolve slip using commit ancestry (handles rebases/squashes)
-    result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-        Repository:    os.Getenv("GITHUB_REPOSITORY"),
-        Ref:           "HEAD",           // Use HEAD to walk ancestry
-        AncestryDepth: 20,
-    })
-    if err != nil {
-        return err
-    }
-    
-    correlationID := result.Slip.CorrelationID
-    log.Printf("Resolved slip via %s (matched commit: %s)", result.ResolvedBy, result.MatchedCommit)
+// Dev deploy waits for CI completion
+devPrereqs := []string{"builds_completed", "unit_tests_completed", "secret_scan_completed"}
 
-    // Wait for dev environment success
-    err = client.WaitForPrerequisites(ctx, slippy.HoldOptions{
-        CorrelationID: correlationID,
-        Prerequisites: []string{"dev_deploy", "dev_tests"},
-        StepName:      "preprod_deploy",
-    })
-    if err != nil {
-        return err
-    }
+// Pre-prod waits for dev success
+preprodPrereqs := []string{"dev_deploy", "dev_tests"}
 
-    return client.StartStep(ctx, correlationID, "preprod_deploy", "")
-}
+// Prod waits for pre-prod success
+prodPrereqs := []string{"preprod_deploy", "preprod_tests"}
 ```
 
-### Production Deployment Stage
+### Pattern 4: Resolution with Fallback (Production)
 
-Production uses image tag parsing as a fallback resolution strategy.
+For production deployments where the commit may have been rebased/squashed, use image tag parsing as a fallback.
 
-**Pre-Job:**
 ```go
-func prodDeployPreJob(ctx context.Context, client *slippy.Client, imageTag string) error {
-    // Resolve slip - try ancestry first, fall back to image tag parsing
+func prodPreJob(ctx context.Context, client *slippy.Client, imageTag string) (string, error) {
     result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
         Repository:    os.Getenv("GITHUB_REPOSITORY"),
         Ref:           "HEAD",
-        ImageTag:      imageTag,  // Fallback: parse commit SHA from "myorg/api:abc123-1234567890"
+        ImageTag:      imageTag,  // Fallback: parse "myorg/api:abc123-1234567890"
         AncestryDepth: 20,
     })
     if err != nil {
-        return fmt.Errorf("failed to resolve slip: %w", err)
+        return "", err
     }
-
+    
+    // Continue with gated pattern...
     correlationID := result.Slip.CorrelationID
-    log.Printf("Resolved slip %s via %s", correlationID, result.ResolvedBy)
-
-    // Wait for pre-production success
-    err = client.WaitForPrerequisites(ctx, slippy.HoldOptions{
-        CorrelationID: correlationID,
-        Prerequisites: []string{"preprod_deploy", "preprod_tests"},
-        StepName:      "prod_deploy",
-        Timeout:       60 * time.Minute,
-    })
-    if err != nil {
-        if errors.Is(err, slippy.ErrPrerequisiteFailed) {
-            client.AbortStep(ctx, correlationID, "prod_deploy", "", "pre-production failed")
-        }
-        return err
-    }
-
-    return client.StartStep(ctx, correlationID, "prod_deploy", "")
-}
-```
-
-**Post-Job:**
-```go
-func prodDeployPostJob(ctx context.Context, client *slippy.Client, imageTag string, success bool) error {
-    result, err := client.ResolveSlip(ctx, slippy.ResolveOptions{
-        Repository: os.Getenv("GITHUB_REPOSITORY"),
-        Ref:        "HEAD",
-        ImageTag:   imageTag,
-    })
-    if err != nil {
-        return err
-    }
-
-    if success {
-        return client.CompleteStep(ctx, result.Slip.CorrelationID, "prod_deploy", "")
-    }
-    return client.FailStep(ctx, result.Slip.CorrelationID, "prod_deploy", "", "production deployment failed")
+    // ... prerequisite checking and step start
+    return correlationID, nil
 }
 ```
 
