@@ -847,9 +847,3 @@ result, err := slippy.RunMigrations(ctx, conn, slippy.MigrateOptions{
 | `aborted` | Aborted due to upstream failure |
 | `timeout` | Exceeded time limit |
 | `skipped` | Intentionally skipped |
-
----
-
-## License
-
-Internal MyCarrier library - see repository license for details.
