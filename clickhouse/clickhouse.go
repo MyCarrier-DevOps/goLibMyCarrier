@@ -31,12 +31,6 @@ func Named(name string, value interface{}) driver.NamedValue {
 	return clickhouse.Named(name, value)
 }
 
-// ParseDSN parses a ClickHouse DSN string into Options.
-// Re-exported from clickhouse-go for convenience.
-func ParseDSN(dsn string) (*Options, error) {
-	return clickhouse.ParseDSN(dsn)
-}
-
 // ClickhouseSessionInterface defines the interface for ClickHouse session operations
 type ClickhouseSessionInterface interface {
 	Connect(ch *ClickhouseConfig, ctx context.Context) error

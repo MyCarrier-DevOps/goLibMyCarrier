@@ -140,6 +140,26 @@ func (m *MockRows) Err() error {
 	return args.Error(0)
 }
 
+// MockRow implements driver.Row for testing QueryRow
+type MockRow struct {
+	mock.Mock
+}
+
+func (m *MockRow) Err() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *MockRow) Scan(dest ...any) error {
+	args := m.Called(dest)
+	return args.Error(0)
+}
+
+func (m *MockRow) ScanStruct(dest any) error {
+	args := m.Called(dest)
+	return args.Error(0)
+}
+
 func (m *MockClickhouseSession) Connect(ch *ClickhouseConfig, context context.Context) error {
 	args := m.Called(ch, context)
 	return args.Error(0)
@@ -1237,4 +1257,243 @@ func TestClickhouseSession_Close_ConnectionError(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, expectedError, err)
 	mockConn.AssertExpectations(t)
+}
+
+// Test Named function (re-exported from clickhouse-go)
+func TestNamed(t *testing.T) {
+	result := Named("test_param", 42)
+	assert.Equal(t, "test_param", result.Name)
+	assert.Equal(t, 42, result.Value)
+}
+
+// Test QueryWithArgs
+func TestClickhouseSession_QueryWithArgs_Success(t *testing.T) {
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT * FROM test WHERE id = ?"
+
+	mockConn.On("Query", ctx, query, mock.Anything).Return(mockRows, nil)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	rows, err := session.QueryWithArgs(ctx, query, 1)
+
+	assert.NoError(t, err)
+	assert.Equal(t, mockRows, rows)
+	mockConn.AssertExpectations(t)
+}
+
+func TestClickhouseSession_QueryWithArgs_NilConnection(t *testing.T) {
+	ctx := context.Background()
+	session := &ClickhouseSession{conn: nil}
+
+	rows, err := session.QueryWithArgs(ctx, "SELECT 1", 1)
+
+	assert.Error(t, err)
+	assert.Nil(t, rows)
+	assert.Contains(t, err.Error(), "connection is not established")
+}
+
+func TestClickhouseSession_QueryWithArgs_Error(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	query := "SELECT * FROM test WHERE id = ?"
+	expectedError := errors.New("query failed")
+
+	mockConn.On("Query", ctx, query, mock.Anything).Return(nil, expectedError)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	rows, err := session.QueryWithArgs(ctx, query, 1)
+
+	assert.Error(t, err)
+	assert.Nil(t, rows)
+	assert.Equal(t, expectedError, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test QueryRow
+func TestClickhouseSession_QueryRow(t *testing.T) {
+	mockConn := &MockConn{}
+	mockRow := &MockRow{}
+	ctx := context.Background()
+	query := "SELECT * FROM test WHERE id = ?"
+
+	mockConn.On("QueryRow", ctx, query, mock.Anything).Return(mockRow)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	row := session.QueryRow(ctx, query, 1)
+
+	assert.Equal(t, mockRow, row)
+	mockConn.AssertExpectations(t)
+}
+
+// Test ExecWithArgs
+func TestClickhouseSession_ExecWithArgs_Success(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INSERT INTO test (id) VALUES (?)"
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(nil)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.ExecWithArgs(ctx, stmt, 1)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+func TestClickhouseSession_ExecWithArgs_NilConnection(t *testing.T) {
+	ctx := context.Background()
+	session := &ClickhouseSession{conn: nil}
+
+	err := session.ExecWithArgs(ctx, "INSERT INTO test (id) VALUES (?)", 1)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "connection is not established")
+}
+
+func TestClickhouseSession_ExecWithArgs_Error(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INSERT INTO test (id) VALUES (?)"
+	expectedError := errors.New("exec failed")
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(expectedError)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.ExecWithArgs(ctx, stmt, 1)
+
+	assert.Error(t, err)
+	assert.Equal(t, expectedError, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test NewSessionFromConn and connWrapper
+func TestNewSessionFromConn(t *testing.T) {
+	mockConn := &MockConn{}
+
+	session := NewSessionFromConn(mockConn)
+
+	assert.NotNil(t, session)
+	assert.Equal(t, mockConn, session.Conn())
+}
+
+func TestConnWrapper_Connect(t *testing.T) {
+	mockConn := &MockConn{}
+	wrapper := NewSessionFromConn(mockConn)
+
+	// Connect should be a no-op for connWrapper
+	err := wrapper.Connect(&ClickhouseConfig{}, context.Background())
+	assert.NoError(t, err)
+}
+
+func TestConnWrapper_Query(t *testing.T) {
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT 1"
+
+	mockConn.On("Query", ctx, query, mock.Anything).Return(mockRows, nil)
+
+	wrapper := NewSessionFromConn(mockConn)
+	rows, err := wrapper.Query(ctx, query)
+
+	assert.NoError(t, err)
+	assert.Equal(t, mockRows, rows)
+	mockConn.AssertExpectations(t)
+}
+
+func TestConnWrapper_QueryWithArgs(t *testing.T) {
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT * FROM test WHERE id = ?"
+
+	mockConn.On("Query", ctx, query, mock.Anything).Return(mockRows, nil)
+
+	wrapper := NewSessionFromConn(mockConn)
+	rows, err := wrapper.QueryWithArgs(ctx, query, 1)
+
+	assert.NoError(t, err)
+	assert.Equal(t, mockRows, rows)
+	mockConn.AssertExpectations(t)
+}
+
+func TestConnWrapper_QueryRow(t *testing.T) {
+	mockConn := &MockConn{}
+	mockRow := &MockRow{}
+	ctx := context.Background()
+	query := "SELECT * FROM test WHERE id = ?"
+
+	mockConn.On("QueryRow", ctx, query, mock.Anything).Return(mockRow)
+
+	wrapper := NewSessionFromConn(mockConn)
+	row := wrapper.QueryRow(ctx, query, 1)
+
+	assert.Equal(t, mockRow, row)
+	mockConn.AssertExpectations(t)
+}
+
+func TestConnWrapper_Exec(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "CREATE TABLE test (id UInt32)"
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(nil)
+
+	wrapper := NewSessionFromConn(mockConn)
+	err := wrapper.Exec(ctx, stmt)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+func TestConnWrapper_ExecWithArgs(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INSERT INTO test (id) VALUES (?)"
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(nil)
+
+	wrapper := NewSessionFromConn(mockConn)
+	err := wrapper.ExecWithArgs(ctx, stmt, 1)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+func TestConnWrapper_Close(t *testing.T) {
+	mockConn := &MockConn{}
+
+	mockConn.On("Close").Return(nil)
+
+	wrapper := NewSessionFromConn(mockConn)
+	err := wrapper.Close()
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+func TestConnWrapper_Conn(t *testing.T) {
+	mockConn := &MockConn{}
+
+	wrapper := NewSessionFromConn(mockConn)
+	conn := wrapper.Conn()
+
+	assert.Equal(t, mockConn, conn)
 }
