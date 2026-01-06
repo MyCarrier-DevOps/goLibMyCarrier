@@ -19,12 +19,29 @@ on:
       - main
 
 jobs:
+  # Discover all Go modules dynamically
+  discover:
+    name: Discover modules
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.find-modules.outputs.modules }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find Go modules
+        id: find-modules
+        run: |
+          # Find all directories containing go.mod, excluding root
+          MODULES=$(find . -name "go.mod" -not -path "./go.mod" -exec dirname {} \; | sed 's|^\./||' | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "modules=$MODULES" >> $GITHUB_OUTPUT
+          echo "Found modules: $MODULES"
+
   unit-tests:
     name: unit-test-${{ matrix.module }}
     runs-on: ubuntu-latest
+    needs: discover
     strategy:
       matrix:
-        module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
+        module: ${{ fromJson(needs.discover.outputs.modules) }}
     permissions:
       contents: read
       actions: read
@@ -38,7 +55,9 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: |
           go mod download
-          go test -cover -coverprofile=../coverage-${{ matrix.module }}.out -covermode=atomic ./...
+          # Exclude test fixture packages (e.g., loggertest, slippytest) from test and coverage
+          PKGS=$(go list ./... | grep -v 'test' || echo "./...")
+          go test -cover -coverprofile=../coverage-${{ matrix.module }}.out -covermode=atomic $PKGS
           go tool cover -func=../coverage-${{ matrix.module }}.out
       - name: check ${{ matrix.module }} test coverage
         uses: vladopajic/go-test-coverage@v2
@@ -50,9 +69,10 @@ jobs:
   lint:
     name: lint-${{ matrix.module }}
     runs-on: ubuntu-latest
+    needs: discover
     strategy:
       matrix:
-        module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
+        module: ${{ fromJson(needs.discover.outputs.modules) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
@@ -69,9 +89,10 @@ jobs:
   vuln:
     name: check-sec-${{ matrix.module }}
     runs-on: ubuntu-latest
+    needs: discover
     strategy:
       matrix:
-        module: [argocdclient, auth, clickhouse, github, kafka, logger, otel, vault, yaml]
+        module: ${{ fromJson(needs.discover.outputs.modules) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
@@ -92,7 +113,6 @@ jobs:
           echo "Unit tests completed"
           # This job will fail if any of the matrix unit test jobs failed
           if [[ "${{ needs.unit-tests.result }}" != "success" ]]; then
-
             echo "Some unit tests failed"
             exit 1
           fi
@@ -136,6 +156,7 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     needs: 
+      - discover
       - unit-tests-check
       - lint-check
       - vuln-check
@@ -151,36 +172,72 @@ jobs:
       with:
         versionSpec: '6.0.x'
     - name: Calculate Version
-      id: calculate_version # step id used as reference for output values
+      id: calculate_version
       uses: gittools/actions/gitversion/execute@v3.1.11
       with:
         useConfigFile: true
         disableCache: true
         configFilePath: .github/Gitversion.yml
-    - name: Create Tags
+    - name: Create and push tags
+      id: create_tags
+      env:
+        MODULES: ${{ needs.discover.outputs.modules }}
+        VERSION: ${{ steps.calculate_version.outputs.majorMinorPatch }}
       run: |
         git config user.name "$GITHUB_ACTOR"
         git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+        
+        # Create and push tags for each module dynamically
+        MODULE_LIST=""
+        for module in $(echo "$MODULES" | jq -r '.[]'); do
+          echo "Creating tag for $module/v$VERSION"
+          git tag -a "$module/v$VERSION" -m "Release $module/v$VERSION"
+          git push origin "$module/v$VERSION"
+          MODULE_LIST="$MODULE_LIST- **$module** - $(head -1 $module/README.md 2>/dev/null | sed 's/^# //' || echo "$module package")\n"
+        done
+        
+        # Store module list for release notes
+        echo "module_list<<EOF" >> $GITHUB_OUTPUT
+        echo -e "$MODULE_LIST" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    - name: Generate release body
+      id: release_body
+      env:
+        MODULES: ${{ needs.discover.outputs.modules }}
+        VERSION: ${{ steps.calculate_version.outputs.majorMinorPatch }}
+      run: |
+        # Generate package list for release notes
+        PACKAGE_LIST=""
+        DOC_LIST=""
+        for module in $(echo "$MODULES" | jq -r '.[]'); do
+          DESC=$(head -1 "$module/README.md" 2>/dev/null | sed 's/^# //' || echo "$module package")
+          PACKAGE_LIST="$PACKAGE_LIST- **$module** - $DESC\n"
+          DOC_LIST="$DOC_LIST- [$module](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/$module@v$VERSION)\n"
+        done
+        
+        cat << EOF > release_body.md
+        # goLibMyCarrier v$VERSION
+        
+        This release includes updates to all Go packages in the goLibMyCarrier collection.
+        
+        ## Packages Released
+        
+        All packages have been tagged with version \`v$VERSION\`:
 
-        git tag -a argocdclient/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release argocdclient/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a auth/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release auth/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a github/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release github/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a kafka/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release kafka/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a logger/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release logger/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a otel/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release otel/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a vault/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release vault/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-        git tag -a yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }} -m "Release yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }}"
-
-        git push origin argocdclient/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin auth/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin clickhouse/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin github/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin kafka/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin logger/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin otel/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin vault/v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        git push origin yaml/v${{ steps.calculate_version.outputs.majorMinorPatch }}
+        $(echo -e "$PACKAGE_LIST")
+        
+        ## Installation
+        
+        Install any package using:
+        \`\`\`bash
+        go get github.com/MyCarrier-DevOps/goLibMyCarrier/<package>@v$VERSION
+        \`\`\`
+        
+        ## Documentation
+        
+        View package documentation on pkg.go.dev:
+        $(echo -e "$DOC_LIST")
+        EOF
     - name: Create Release
       uses: actions/create-release@v1
       env:
@@ -188,49 +245,6 @@ jobs:
       with:
         tag_name: v${{ steps.calculate_version.outputs.majorMinorPatch }}
         release_name: Release v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        body: |
-          # goLibMyCarrier v${{ steps.calculate_version.outputs.majorMinorPatch }}
-          
-          This release includes updates to all Go packages in the goLibMyCarrier collection.
-          
-          ## Packages Released
-          
-          All packages have been tagged with version `v${{ steps.calculate_version.outputs.majorMinorPatch }}`:
-
-          - **argocdclient** - ArgoCD client utilities
-          - **auth** - Authentication middleware for Gin framework
-          - **clickhouse** - ClickHouse database utilities  
-          - **github** - GitHub authentication and interaction utilities
-          - **kafka** - Kafka producer and consumer utilities
-          - **logger** - Pre-configured Zap logger
-          - **otel** - OpenTelemetry integration for distributed tracing
-          - **vault** - HashiCorp Vault interaction utilities
-          - **yaml** - YAML file read/write utilities
-          
-          ## Installation
-          
-          Install any package using:
-          ```bash
-          go get github.com/MyCarrier-DevOps/goLibMyCarrier/<package>@v${{ steps.calculate_version.outputs.majorMinorPatch }}
-          ```
-          
-          For example:
-          ```bash
-          go get github.com/MyCarrier-DevOps/goLibMyCarrier/kafka@v${{ steps.calculate_version.outputs.majorMinorPatch }}
-          go get github.com/MyCarrier-DevOps/goLibMyCarrier/auth@v${{ steps.calculate_version.outputs.majorMinorPatch }}
-          ```
-          
-          ## Documentation
-          
-          View package documentation on pkg.go.dev:
-          - [argocdclient](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [auth](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/auth@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [clickhouse](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [github](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/github@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [kafka](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [logger](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/logger@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [otel](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/otel@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [vault](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/vault@v${{ steps.calculate_version.outputs.majorMinorPatch }})
-          - [yaml](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml@v${{ steps.calculate_version.outputs.majorMinorPatch }})
+        body_path: release_body.md
         draft: false
         prerelease: false
