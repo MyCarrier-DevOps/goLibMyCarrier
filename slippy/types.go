@@ -1,6 +1,10 @@
 // Package slippy provides routing slip functionality for CI/CD pipeline orchestration.
 // It tracks the state of pipeline executions across multiple steps and components,
 // enabling hold/proceed decisions based on prerequisite completion status.
+//
+// The library uses a JSON configuration to define the pipeline steps, their
+// prerequisites, and aggregation relationships. This makes the library flexible
+// and unopinionated about the specific CI/CD workflow being tracked.
 package slippy
 
 import (
@@ -41,34 +45,57 @@ type Slip struct {
 	// Status is the overall slip status
 	Status SlipStatus `json:"status" ch:"status"`
 
-	// Components is the list of buildable components in this repository
-	Components []Component `json:"components" ch:"components"`
-
 	// Steps maps step names to their current state
+	// This is dynamically populated based on the pipeline configuration
 	Steps map[string]Step `json:"steps" ch:"-"`
+
+	// Aggregates maps aggregate step names to their component data
+	// For steps with "aggregates" in config, this holds per-component details
+	Aggregates map[string][]ComponentStepData `json:"aggregates" ch:"-"`
 
 	// StateHistory is the complete audit trail of state transitions
 	StateHistory []StateHistoryEntry `json:"state_history" ch:"-"`
 }
 
-// Component represents a buildable component within a repository.
-// Each component typically corresponds to a Dockerfile and produces
-// a container image.
-type Component struct {
-	// Name is the unique identifier for this component within the repo
-	Name string `json:"name"`
+// ComponentStepData represents per-component data for aggregate steps.
+// This replaces the old Component struct for tracking component-level step progress.
+type ComponentStepData struct {
+	// Component is the unique identifier for this component within the repo
+	Component string `json:"component"`
 
-	// DockerfilePath is the path to the Dockerfile relative to repo root
-	DockerfilePath string `json:"dockerfile_path"`
+	// DockerfilePath is the path to the Dockerfile relative to repo root (for builds)
+	DockerfilePath string `json:"dockerfile_path,omitempty"`
 
-	// BuildStatus is the current build status for this component
-	BuildStatus StepStatus `json:"build_status"`
+	// Status is the current status for this component's step
+	Status StepStatus `json:"status"`
 
-	// UnitTestStatus is the current unit test status for this component
-	UnitTestStatus StepStatus `json:"unit_test_status"`
+	// StartedAt is when this component's step began executing
+	StartedAt *time.Time `json:"started_at,omitempty"`
 
-	// ImageTag is the container image tag after successful build
+	// CompletedAt is when this component's step finished
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+
+	// Actor is the system or user that performed this step
+	Actor string `json:"actor,omitempty"`
+
+	// Error contains error details if the step failed
+	Error string `json:"error,omitempty"`
+
+	// ImageTag is the container image tag (for build steps)
 	ImageTag string `json:"image_tag,omitempty"`
+}
+
+// ApplyStatusTransition updates the component's status and sets appropriate timestamps.
+// This centralizes the common pattern of setting StartedAt when running
+// and CompletedAt when terminal.
+func (c *ComponentStepData) ApplyStatusTransition(status StepStatus, now time.Time) {
+	c.Status = status
+	if status == StepStatusRunning && c.StartedAt == nil {
+		c.StartedAt = &now
+	}
+	if status.IsTerminal() && c.CompletedAt == nil {
+		c.CompletedAt = &now
+	}
 }
 
 // Step represents a pipeline step's current state.
@@ -89,6 +116,22 @@ type Step struct {
 
 	// Error contains error details if the step failed
 	Error string `json:"error,omitempty"`
+
+	// HeldReason explains why the step is held (if Status is held)
+	HeldReason string `json:"held_reason,omitempty"`
+}
+
+// ApplyStatusTransition updates the step's status and sets appropriate timestamps.
+// This centralizes the common pattern of setting StartedAt when running
+// and CompletedAt when terminal.
+func (s *Step) ApplyStatusTransition(status StepStatus, now time.Time) {
+	s.Status = status
+	if status == StepStatusRunning && s.StartedAt == nil {
+		s.StartedAt = &now
+	}
+	if status.IsTerminal() && s.CompletedAt == nil {
+		s.CompletedAt = &now
+	}
 }
 
 // StateHistoryEntry records a single state transition for audit purposes.
@@ -127,7 +170,7 @@ type SlipOptions struct {
 	// CommitSHA is the full git commit SHA
 	CommitSHA string
 
-	// Components defines the components to track
+	// Components defines the components to track (for aggregate steps)
 	Components []ComponentDefinition
 }
 
@@ -138,29 +181,4 @@ type ComponentDefinition struct {
 
 	// DockerfilePath is the path to the Dockerfile
 	DockerfilePath string
-}
-
-// PipelineSteps defines all the standard pipeline step names.
-// These are the steps that slippy tracks for each pipeline execution.
-var PipelineSteps = []string{
-	"push_parsed",
-	"builds_completed",
-	"unit_tests_completed",
-	"secret_scan_completed",
-	"dev_deploy",
-	"dev_tests",
-	"preprod_deploy",
-	"preprod_tests",
-	"prod_release_created",
-	"prod_deploy",
-	"prod_tests",
-	"alert_gate",
-	"prod_steady_state",
-}
-
-// AggregateStepMap maps component-level steps to their aggregate steps.
-// When all components complete a step, the aggregate is updated.
-var AggregateStepMap = map[string]string{
-	"build":     "builds_completed",
-	"unit_test": "unit_tests_completed",
 }

@@ -49,6 +49,16 @@ type SlipError struct {
 	Err error
 }
 
+// NewSlipError creates a new SlipError with the given operation and underlying error.
+// The correlationID is the unique identifier for the routing slip.
+func NewSlipError(op, correlationID string, err error) *SlipError {
+	return &SlipError{
+		Op:            op,
+		CorrelationID: correlationID,
+		Err:           err,
+	}
+}
+
 // Error returns the error message.
 func (e *SlipError) Error() string {
 	if e.CorrelationID != "" {
@@ -60,16 +70,6 @@ func (e *SlipError) Error() string {
 // Unwrap returns the underlying error for errors.Is/As support.
 func (e *SlipError) Unwrap() error {
 	return e.Err
-}
-
-// NewSlipError creates a new SlipError with the given operation and underlying error.
-// The correlationID is the unique identifier for the routing slip.
-func NewSlipError(op string, correlationID string, err error) *SlipError {
-	return &SlipError{
-		Op:            op,
-		CorrelationID: correlationID,
-		Err:           err,
-	}
 }
 
 // StepError wraps an error with additional context about a step operation.
@@ -91,6 +91,18 @@ type StepError struct {
 	Err error
 }
 
+// NewStepError creates a new StepError.
+// The correlationID is the unique identifier for the routing slip.
+func NewStepError(op, correlationID, stepName, componentName string, err error) *StepError {
+	return &StepError{
+		Op:            op,
+		CorrelationID: correlationID,
+		StepName:      stepName,
+		ComponentName: componentName,
+		Err:           err,
+	}
+}
+
 // Error returns the error message.
 func (e *StepError) Error() string {
 	msg := e.Op + " step " + e.StepName
@@ -108,18 +120,6 @@ func (e *StepError) Unwrap() error {
 	return e.Err
 }
 
-// NewStepError creates a new StepError.
-// The correlationID is the unique identifier for the routing slip.
-func NewStepError(op, correlationID, stepName, componentName string, err error) *StepError {
-	return &StepError{
-		Op:            op,
-		CorrelationID: correlationID,
-		StepName:      stepName,
-		ComponentName: componentName,
-		Err:           err,
-	}
-}
-
 // ResolveError wraps an error that occurred during slip resolution.
 type ResolveError struct {
 	// Repository is the repository being resolved
@@ -132,6 +132,15 @@ type ResolveError struct {
 	Err error
 }
 
+// NewResolveError creates a new ResolveError.
+func NewResolveError(repository, ref string, err error) *ResolveError {
+	return &ResolveError{
+		Repository: repository,
+		Ref:        ref,
+		Err:        err,
+	}
+}
+
 // Error returns the error message.
 func (e *ResolveError) Error() string {
 	return "resolve slip for " + e.Repository + "@" + e.Ref + ": " + e.Err.Error()
@@ -140,13 +149,4 @@ func (e *ResolveError) Error() string {
 // Unwrap returns the underlying error.
 func (e *ResolveError) Unwrap() error {
 	return e.Err
-}
-
-// NewResolveError creates a new ResolveError.
-func NewResolveError(repository, ref string, err error) *ResolveError {
-	return &ResolveError{
-		Repository: repository,
-		Ref:        ref,
-		Err:        err,
-	}
 }

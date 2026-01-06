@@ -275,7 +275,7 @@ func mergeFields(base, additional map[string]interface{}) map[string]interface{}
 
 // containsString checks if s contains substr.
 func containsString(s, substr string) bool {
-	if len(substr) == 0 {
+	if substr == "" {
 		return true
 	}
 	if len(s) < len(substr) {

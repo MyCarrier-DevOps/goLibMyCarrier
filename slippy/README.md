@@ -819,16 +819,18 @@ Uses `ReplacingMergeTree` engine for efficient updates via INSERT.
 Migrations are managed automatically on client creation. To run migrations manually:
 
 ```go
-import "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator"
+// Load pipeline configuration
+config, err := slippy.LoadPipelineConfig()
+if err != nil {
+    log.Fatal(err)
+}
 
-// Get migration definitions
-migrations := slippy.SlippyMigrations()
-
-// Run migrations
+// Run migrations with the pipeline config
 result, err := slippy.RunMigrations(ctx, conn, slippy.MigrateOptions{
-    Database:    "ci",
-    DryRun:      false,
-    TargetVersion: 0, // 0 = latest
+    Database:       "ci",
+    DryRun:         false,
+    TargetVersion:  0, // 0 = latest
+    PipelineConfig: config,
 })
 ```
 

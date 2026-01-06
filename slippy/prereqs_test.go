@@ -230,7 +230,8 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 	t.Run("component-specific build prerequisite", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-prereq-comp-1",
@@ -238,8 +239,8 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 			Branch:        "main",
 			CommitSHA:     "prereqcomp1",
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "my-service", BuildStatus: StepStatusCompleted},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {{Component: "my-service", Status: StepStatusCompleted}},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -259,7 +260,8 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 	t.Run("component-specific unit_test prerequisite", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-prereq-comp-2",
@@ -267,8 +269,8 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 			Branch:        "main",
 			CommitSHA:     "prereqcomp2",
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "my-service", UnitTestStatus: StepStatusFailed},
+			Aggregates: map[string][]ComponentStepData{
+				"unit_tests": {{Component: "my-service", Status: StepStatusFailed}},
 			},
 			Steps: make(map[string]Step),
 		}

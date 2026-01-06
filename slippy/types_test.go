@@ -24,30 +24,38 @@ func TestSlip_Initialization(t *testing.T) {
 	}
 }
 
-func TestSlip_WithComponents(t *testing.T) {
+func TestSlip_WithAggregates(t *testing.T) {
 	slip := &Slip{
 		CorrelationID: "test-corr-002",
-		Components: []Component{
-			{
-				Name:           "api",
-				DockerfilePath: "services/api/Dockerfile",
-				BuildStatus:    StepStatusPending,
-				UnitTestStatus: StepStatusPending,
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {
+				{
+					Component: "api",
+					Status:    StepStatusPending,
+				},
+				{
+					Component: "worker",
+					Status:    StepStatusPending,
+				},
 			},
-			{
-				Name:           "worker",
-				DockerfilePath: "services/worker/Dockerfile",
-				BuildStatus:    StepStatusPending,
-				UnitTestStatus: StepStatusPending,
+			"unit_tests": {
+				{
+					Component: "api",
+					Status:    StepStatusPending,
+				},
+				{
+					Component: "worker",
+					Status:    StepStatusPending,
+				},
 			},
 		},
 	}
 
-	if len(slip.Components) != 2 {
-		t.Errorf("len(Components) = %d, want 2", len(slip.Components))
+	if len(slip.Aggregates["builds"]) != 2 {
+		t.Errorf("len(Aggregates[builds]) = %d, want 2", len(slip.Aggregates["builds"]))
 	}
-	if slip.Components[0].Name != "api" {
-		t.Errorf("Components[0].Name = %q, want 'api'", slip.Components[0].Name)
+	if slip.Aggregates["builds"][0].Component != "api" {
+		t.Errorf("Aggregates[builds][0].Component = %q, want 'api'", slip.Aggregates["builds"][0].Component)
 	}
 }
 
@@ -96,26 +104,6 @@ func TestSlip_WithStateHistory(t *testing.T) {
 	}
 	if slip.StateHistory[0].Step != "push_parsed" {
 		t.Errorf("StateHistory[0].Step = %q, want 'push_parsed'", slip.StateHistory[0].Step)
-	}
-}
-
-func TestComponent_Fields(t *testing.T) {
-	comp := Component{
-		Name:           "api",
-		DockerfilePath: "services/api/Dockerfile",
-		BuildStatus:    StepStatusCompleted,
-		UnitTestStatus: StepStatusRunning,
-		ImageTag:       "v1.2.3",
-	}
-
-	if comp.Name != "api" {
-		t.Errorf("Name = %q, want 'api'", comp.Name)
-	}
-	if comp.BuildStatus != StepStatusCompleted {
-		t.Errorf("BuildStatus = %v, want %v", comp.BuildStatus, StepStatusCompleted)
-	}
-	if comp.ImageTag != "v1.2.3" {
-		t.Errorf("ImageTag = %q, want 'v1.2.3'", comp.ImageTag)
 	}
 }
 
@@ -186,39 +174,73 @@ func TestComponentDefinition_Fields(t *testing.T) {
 	}
 }
 
-func TestPipelineSteps(t *testing.T) {
-	expectedSteps := []string{
-		"push_parsed",
-		"builds_completed",
-		"unit_tests_completed",
-		"secret_scan_completed",
-		"dev_deploy",
-		"dev_tests",
-		"preprod_deploy",
-		"preprod_tests",
-		"prod_release_created",
-		"prod_deploy",
-		"prod_tests",
-		"alert_gate",
-		"prod_steady_state",
+func TestPipelineConfig_GetAggregateStep(t *testing.T) {
+	config := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline",
+		Steps: []StepConfig{
+			{Name: "push_parsed", Description: "Push parsed"},
+			{Name: "builds_completed", Description: "Builds completed", Aggregates: "build"},
+			{Name: "unit_tests_completed", Description: "Unit tests completed", Aggregates: "unit_test"},
+			{Name: "dev_deploy", Description: "Dev deploy"},
+		},
 	}
-
-	if len(PipelineSteps) != len(expectedSteps) {
-		t.Errorf("len(PipelineSteps) = %d, want %d", len(PipelineSteps), len(expectedSteps))
-	}
-
-	for i, step := range expectedSteps {
-		if PipelineSteps[i] != step {
-			t.Errorf("PipelineSteps[%d] = %q, want %q", i, PipelineSteps[i], step)
+	// Initialize internal maps
+	config.stepsByName = make(map[string]*StepConfig)
+	config.aggregateMap = make(map[string]string)
+	for i := range config.Steps {
+		step := &config.Steps[i]
+		config.stepsByName[step.Name] = step
+		if step.Aggregates != "" {
+			config.aggregateMap[step.Aggregates] = step.Name
 		}
+	}
+
+	// Test finding aggregate steps - GetAggregateStep returns the step name as a string
+	if step := config.GetAggregateStep("build"); step != "builds_completed" {
+		t.Errorf("GetAggregateStep('build') should return 'builds_completed', got '%s'", step)
+	}
+	if step := config.GetAggregateStep("unit_test"); step != "unit_tests_completed" {
+		t.Errorf("GetAggregateStep('unit_test') should return 'unit_tests_completed', got '%s'", step)
+	}
+	if step := config.GetAggregateStep("nonexistent"); step != "" {
+		t.Errorf("GetAggregateStep('nonexistent') should return empty string, got '%s'", step)
 	}
 }
 
-func TestAggregateStepMap(t *testing.T) {
-	if AggregateStepMap["build"] != "builds_completed" {
-		t.Errorf("AggregateStepMap['build'] = %q, want 'builds_completed'", AggregateStepMap["build"])
+func TestPipelineConfig_GetEffectivePrerequisites(t *testing.T) {
+	config := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline",
+		Steps: []StepConfig{
+			{Name: "push_parsed", Description: "Push parsed"},
+			{Name: "builds_completed", Description: "Builds completed", Aggregates: "build", Prerequisites: []string{"push_parsed"}},
+			{Name: "alert_gate", Description: "Alert gate", IsGate: true, Prerequisites: []string{"builds_completed"}},
+			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"alert_gate"}},
+		},
 	}
-	if AggregateStepMap["unit_test"] != "unit_tests_completed" {
-		t.Errorf("AggregateStepMap['unit_test'] = %q, want 'unit_tests_completed'", AggregateStepMap["unit_test"])
+	// Initialize internal maps
+	config.stepsByName = make(map[string]*StepConfig)
+	config.gateSteps = make([]string, 0)
+	for i := range config.Steps {
+		step := &config.Steps[i]
+		config.stepsByName[step.Name] = step
+		if step.IsGate {
+			config.gateSteps = append(config.gateSteps, step.Name)
+		}
+	}
+
+	// Test effective prerequisites
+	prereqs := config.GetEffectivePrerequisites("dev_deploy")
+	if len(prereqs) != 1 || prereqs[0] != "alert_gate" {
+		t.Errorf("GetEffectivePrerequisites('dev_deploy') = %v, want ['alert_gate']", prereqs)
+	}
+
+	// First step has no prerequisites
+	prereqs = config.GetEffectivePrerequisites("push_parsed")
+	if len(prereqs) != 0 {
+		t.Errorf("GetEffectivePrerequisites('push_parsed') = %v, want []", prereqs)
 	}
 }

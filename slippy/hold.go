@@ -104,7 +104,11 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 
 				// Update step to timeout status
 				if opts.StepName != "" {
-					_ = c.TimeoutStep(ctx, opts.CorrelationID, opts.StepName, opts.ComponentName, timeoutMsg)
+					if err := c.TimeoutStep(ctx, opts.CorrelationID, opts.StepName, opts.ComponentName, timeoutMsg); err != nil {
+						c.logger.Warn(ctx, "Failed to set step timeout status", map[string]interface{}{
+							"error": err.Error(),
+						})
+					}
 				}
 
 				return fmt.Errorf("%w: %s", ErrHoldTimeout, timeoutMsg)
@@ -190,8 +194,10 @@ func (c *Client) WaitForPrerequisitesWithResult(ctx context.Context, opts HoldOp
 		result.Message = err.Error()
 		// Try to get failed prereqs from the slip
 		if slip, loadErr := c.store.Load(ctx, opts.CorrelationID); loadErr == nil {
-			prereqResult, _ := c.CheckPrerequisites(ctx, slip, opts.Prerequisites, opts.ComponentName)
-			result.FailedPrereqs = prereqResult.FailedPrereqs
+			prereqResult, checkErr := c.CheckPrerequisites(ctx, slip, opts.Prerequisites, opts.ComponentName)
+			if checkErr == nil {
+				result.FailedPrereqs = prereqResult.FailedPrereqs
+			}
 		}
 		return result, err
 

@@ -62,7 +62,11 @@ func NewMockGraphQLClient() *MockGraphQLClient {
 
 // GetCommitAncestry retrieves the commit ancestry for a given ref.
 // Returns commits from newest to oldest, limited by depth.
-func (m *MockGraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref string, depth int) ([]string, error) {
+func (m *MockGraphQLClient) GetCommitAncestry(
+	ctx context.Context,
+	owner, repo, ref string,
+	depth int,
+) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

@@ -103,40 +103,51 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 }
 
 // initializeSlipForPush creates a fully initialized slip for a push event.
+// Steps are initialized from the pipeline configuration rather than hardcoded.
 func (c *Client) initializeSlipForPush(opts PushOptions) *Slip {
 	now := time.Now()
 
-	// Initialize components
-	components := make([]Component, len(opts.Components))
-	for i, def := range opts.Components {
-		components[i] = Component{
-			Name:           def.Name,
-			DockerfilePath: def.DockerfilePath,
-			BuildStatus:    StepStatusPending,
-			UnitTestStatus: StepStatusPending,
-		}
-	}
+	// Initialize all pipeline steps from config as pending
+	// The first step (typically push_parsed) starts as running
+	steps := make(map[string]Step)
+	aggregates := make(map[string][]ComponentStepData)
+	var firstStep string
 
-	// Initialize all pipeline steps as pending (push_parsed starts as running)
-	steps := map[string]Step{
-		"push_parsed":           {Status: StepStatusRunning, StartedAt: &now},
-		"builds_completed":      {Status: StepStatusPending},
-		"unit_tests_completed":  {Status: StepStatusPending},
-		"secret_scan_completed": {Status: StepStatusPending},
-		"dev_deploy":            {Status: StepStatusPending},
-		"dev_tests":             {Status: StepStatusPending},
-		"preprod_deploy":        {Status: StepStatusPending},
-		"preprod_tests":         {Status: StepStatusPending},
-		"prod_release_created":  {Status: StepStatusPending},
-		"prod_deploy":           {Status: StepStatusPending},
-		"prod_tests":            {Status: StepStatusPending},
-		"alert_gate":            {Status: StepStatusPending},
-		"prod_steady_state":     {Status: StepStatusPending},
+	if c.pipelineConfig != nil {
+		for i, stepConfig := range c.pipelineConfig.Steps {
+			step := Step{Status: StepStatusPending}
+
+			// First step starts as running
+			if i == 0 {
+				firstStep = stepConfig.Name
+				step.Status = StepStatusRunning
+				step.StartedAt = &now
+			}
+
+			steps[stepConfig.Name] = step
+
+			// Initialize aggregate columns with component data
+			if stepConfig.Aggregates != "" {
+				columnName := pluralize(stepConfig.Aggregates)
+				componentData := make([]ComponentStepData, len(opts.Components))
+				for j, def := range opts.Components {
+					componentData[j] = ComponentStepData{
+						Component: def.Name,
+						Status:    StepStatusPending,
+					}
+				}
+				aggregates[columnName] = componentData
+			}
+		}
+	} else {
+		// Fallback to default first step if no config (for backward compatibility)
+		firstStep = "push_parsed"
+		steps["push_parsed"] = Step{Status: StepStatusRunning, StartedAt: &now}
 	}
 
 	history := []StateHistoryEntry{
 		{
-			Step:      "push_parsed",
+			Step:      firstStep,
 			Status:    StepStatusRunning,
 			Timestamp: now,
 			Actor:     "slippy-library",
@@ -152,8 +163,8 @@ func (c *Client) initializeSlipForPush(opts PushOptions) *Slip {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 		Status:        SlipStatusInProgress,
-		Components:    components,
 		Steps:         steps,
+		Aggregates:    aggregates,
 		StateHistory:  history,
 	}
 }

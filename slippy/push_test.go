@@ -87,7 +87,8 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 	t.Run("success - new slip", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		opts := PushOptions{
 			CorrelationID: "corr-push-1",
@@ -122,15 +123,15 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			t.Errorf("expected Status 'in_progress', got '%s'", slip.Status)
 		}
 
-		// Verify components
-		if len(slip.Components) != 2 {
-			t.Fatalf("expected 2 components, got %d", len(slip.Components))
+		// Verify aggregates have component data
+		if len(slip.Aggregates["builds"]) != 2 {
+			t.Fatalf("expected 2 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
 		}
-		if slip.Components[0].Name != "svc-a" {
-			t.Errorf("expected first component 'svc-a', got '%s'", slip.Components[0].Name)
+		if slip.Aggregates["builds"][0].Component != "svc-a" {
+			t.Errorf("expected first component 'svc-a', got '%s'", slip.Aggregates["builds"][0].Component)
 		}
-		if slip.Components[0].BuildStatus != StepStatusPending {
-			t.Errorf("expected BuildStatus 'pending', got '%s'", slip.Components[0].BuildStatus)
+		if slip.Aggregates["builds"][0].Status != StepStatusPending {
+			t.Errorf("expected build status 'pending', got '%s'", slip.Aggregates["builds"][0].Status)
 		}
 
 		// Verify steps were initialized
@@ -322,7 +323,8 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 func TestClient_InitializeSlipForPush(t *testing.T) {
 	store := NewMockStore()
 	github := NewMockGitHubAPI()
-	client := NewClientWithDependencies(store, github, Config{})
+	config := testPipelineConfig()
+	client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 	opts := PushOptions{
 		CorrelationID: "corr-init-1",
@@ -362,31 +364,23 @@ func TestClient_InitializeSlipForPush(t *testing.T) {
 		t.Error("expected UpdatedAt to be set")
 	}
 
-	// Verify components
-	if len(slip.Components) != 2 {
-		t.Fatalf("expected 2 components, got %d", len(slip.Components))
+	// Verify aggregates have component data (test config has builds_completed with "build" aggregate)
+	if len(slip.Aggregates["builds"]) != 2 {
+		t.Fatalf("expected 2 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
 	}
-	if slip.Components[0].Name != "frontend" {
-		t.Errorf("expected first component 'frontend', got '%s'", slip.Components[0].Name)
+	if slip.Aggregates["builds"][0].Component != "frontend" {
+		t.Errorf("expected first component 'frontend', got '%s'", slip.Aggregates["builds"][0].Component)
 	}
-	if slip.Components[0].DockerfilePath != "frontend/Dockerfile" {
-		t.Errorf("expected DockerfilePath 'frontend/Dockerfile', got '%s'", slip.Components[0].DockerfilePath)
+	if slip.Aggregates["builds"][1].Component != "backend" {
+		t.Errorf("expected second component 'backend', got '%s'", slip.Aggregates["builds"][1].Component)
 	}
-	if slip.Components[1].Name != "backend" {
-		t.Errorf("expected second component 'backend', got '%s'", slip.Components[1].Name)
-	}
-	if slip.Components[0].BuildStatus != StepStatusPending {
-		t.Errorf("expected BuildStatus 'pending', got '%s'", slip.Components[0].BuildStatus)
-	}
-	if slip.Components[0].UnitTestStatus != StepStatusPending {
-		t.Errorf("expected UnitTestStatus 'pending', got '%s'", slip.Components[0].UnitTestStatus)
+	if slip.Aggregates["builds"][0].Status != StepStatusPending {
+		t.Errorf("expected build status 'pending', got '%s'", slip.Aggregates["builds"][0].Status)
 	}
 
-	// Verify all pipeline steps are initialized
+	// Verify all pipeline steps from test config are initialized
 	expectedSteps := []string{
-		"push_parsed", "builds_completed", "unit_tests_completed", "secret_scan_completed",
-		"dev_deploy", "dev_tests", "preprod_deploy", "preprod_tests",
-		"prod_release_created", "prod_deploy", "prod_tests", "alert_gate", "prod_steady_state",
+		"push_parsed", "builds_completed", "unit_tests_completed", "dev_deploy",
 	}
 	for _, stepName := range expectedSteps {
 		if _, ok := slip.Steps[stepName]; !ok {
@@ -423,7 +417,8 @@ func TestClient_InitializeSlipForPush(t *testing.T) {
 func TestClient_InitializeSlipForPush_EmptyComponents(t *testing.T) {
 	store := NewMockStore()
 	github := NewMockGitHubAPI()
-	client := NewClientWithDependencies(store, github, Config{})
+	config := testPipelineConfig()
+	client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 	opts := PushOptions{
 		CorrelationID: "corr-init-empty",
@@ -435,11 +430,12 @@ func TestClient_InitializeSlipForPush_EmptyComponents(t *testing.T) {
 
 	slip := client.initializeSlipForPush(opts)
 
-	// Verify components is empty but not nil
-	if slip.Components == nil {
-		t.Error("expected Components to be initialized (not nil)")
+	// Verify aggregates have empty component data
+	if slip.Aggregates == nil {
+		t.Error("expected Aggregates to be initialized (not nil)")
 	}
-	if len(slip.Components) != 0 {
-		t.Errorf("expected 0 components, got %d", len(slip.Components))
+	// With no components, the aggregates should have empty arrays
+	if len(slip.Aggregates["builds"]) != 0 {
+		t.Errorf("expected 0 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
 	}
 }

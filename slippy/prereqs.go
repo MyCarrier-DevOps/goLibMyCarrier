@@ -7,7 +7,12 @@ import (
 
 // CheckPrerequisites checks if all prerequisites are satisfied for a step.
 // It returns a PrereqResult with details about each prerequisite's status.
-func (c *Client) CheckPrerequisites(ctx context.Context, slip *Slip, prerequisites []string, componentName string) (PrereqResult, error) {
+func (c *Client) CheckPrerequisites(
+	ctx context.Context,
+	slip *Slip,
+	prerequisites []string,
+	componentName string,
+) (PrereqResult, error) {
 	result := PrereqResult{
 		Status:           PrereqStatusCompleted,
 		CompletedPrereqs: make([]string, 0),
@@ -42,22 +47,23 @@ func (c *Client) CheckPrerequisites(ctx context.Context, slip *Slip, prerequisit
 }
 
 // getPrereqStatus gets the status of a specific prerequisite.
+// For component-specific steps, it looks up the component in the aggregate data.
 func (c *Client) getPrereqStatus(ctx context.Context, slip *Slip, prereq, componentName string) StepStatus {
-	// Check if it's a component-specific step
-	if componentName != "" {
-		if prereq == "build" {
-			for _, comp := range slip.Components {
-				if comp.Name == componentName {
-					return comp.BuildStatus
+	// Check if it's a component-specific step within an aggregate
+	if componentName != "" && c.pipelineConfig != nil {
+		// Look up if this prereq is a component type for any aggregate step
+		aggregateStep := c.pipelineConfig.GetAggregateStep(prereq)
+		if aggregateStep != "" {
+			columnName := pluralize(prereq)
+			if componentData, ok := slip.Aggregates[columnName]; ok {
+				for _, comp := range componentData {
+					if comp.Component == componentName {
+						return comp.Status
+					}
 				}
 			}
-		}
-		if prereq == "unit_test" {
-			for _, comp := range slip.Components {
-				if comp.Name == componentName {
-					return comp.UnitTestStatus
-				}
-			}
+			// Component not found in aggregate data - still pending
+			return StepStatusPending
 		}
 	}
 
@@ -74,7 +80,12 @@ func (c *Client) getPrereqStatus(ctx context.Context, slip *Slip, prereq, compon
 
 // AllPrerequisitesMet returns true if all prerequisites are completed successfully.
 // The correlationID is the unique identifier for the routing slip.
-func (c *Client) AllPrerequisitesMet(ctx context.Context, correlationID string, prerequisites []string, componentName string) (bool, error) {
+func (c *Client) AllPrerequisitesMet(
+	ctx context.Context,
+	correlationID string,
+	prerequisites []string,
+	componentName string,
+) (bool, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return false, err
@@ -90,7 +101,12 @@ func (c *Client) AllPrerequisitesMet(ctx context.Context, correlationID string, 
 
 // AnyPrerequisiteFailed returns true if any prerequisite has failed.
 // The correlationID is the unique identifier for the routing slip.
-func (c *Client) AnyPrerequisiteFailed(ctx context.Context, correlationID string, prerequisites []string, componentName string) (bool, []string, error) {
+func (c *Client) AnyPrerequisiteFailed(
+	ctx context.Context,
+	correlationID string,
+	prerequisites []string,
+	componentName string,
+) (anyFailed bool, failedPrereqs []string, err error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return false, nil, err
@@ -106,7 +122,12 @@ func (c *Client) AnyPrerequisiteFailed(ctx context.Context, correlationID string
 
 // GetPendingPrerequisites returns the list of prerequisites that are not yet completed.
 // The correlationID is the unique identifier for the routing slip.
-func (c *Client) GetPendingPrerequisites(ctx context.Context, correlationID string, prerequisites []string, componentName string) ([]string, error) {
+func (c *Client) GetPendingPrerequisites(
+	ctx context.Context,
+	correlationID string,
+	prerequisites []string,
+	componentName string,
+) ([]string, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return nil, err

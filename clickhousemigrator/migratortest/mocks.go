@@ -201,7 +201,11 @@ func (m *MockConn) AsyncInsert(ctx context.Context, query string, wait bool, arg
 }
 
 // PrepareBatch prepares a batch insert.
-func (m *MockConn) PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error) {
+func (m *MockConn) PrepareBatch(
+	ctx context.Context,
+	query string,
+	opts ...driver.PrepareBatchOption,
+) (driver.Batch, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

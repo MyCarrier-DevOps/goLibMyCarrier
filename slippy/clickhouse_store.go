@@ -4,18 +4,27 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
+	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator"
 )
 
 // ClickHouseStore implements SlipStore using ClickHouse as the backend.
 // The store uses correlation_id as the unique identifier for routing slips,
 // consistent with MyCarrier's organization-wide use of correlation_id to
 // identify jobs across all systems.
+//
+// The store is config-driven: the pipeline configuration determines which
+// step columns exist and how they are queried.
 type ClickHouseStore struct {
-	session ch.ClickhouseSessionInterface
+	session        ch.ClickhouseSessionInterface
+	pipelineConfig *PipelineConfig
+	database       string
+	queryBuilder   *SlipQueryBuilder
+	scanner        *SlipScanner
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -25,6 +34,15 @@ type ClickHouseStoreOptions struct {
 
 	// MigrateOptions configures migration behavior (only used if SkipMigrations is false)
 	MigrateOptions MigrateOptions
+
+	// PipelineConfig defines the pipeline steps (required for dynamic schema)
+	PipelineConfig *PipelineConfig
+
+	// Database is the ClickHouse database name (default: "ci")
+	Database string
+
+	// Logger for migration output
+	Logger clickhousemigrator.Logger
 }
 
 // NewClickHouseStoreFromConfig creates a new ClickHouse-backed slip store from config.
@@ -36,29 +54,71 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		return nil, fmt.Errorf("failed to create ClickHouse session: %w", err)
 	}
 
+	if opts.Database == "" {
+		opts.Database = "ci"
+	}
+
+	store := &ClickHouseStore{
+		session:        session,
+		pipelineConfig: opts.PipelineConfig,
+		database:       opts.Database,
+		queryBuilder:   NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
+		scanner:        NewSlipScanner(opts.PipelineConfig),
+	}
+
 	// Run migrations unless explicitly skipped
 	if !opts.SkipMigrations {
-		if _, err := RunMigrations(ctx, session.Conn(), opts.MigrateOptions); err != nil {
-			session.Close()
+		migrateOpts := opts.MigrateOptions
+		migrateOpts.Database = opts.Database
+		migrateOpts.PipelineConfig = opts.PipelineConfig
+		migrateOpts.Logger = opts.Logger
+
+		if _, err := RunMigrations(ctx, session.Conn(), migrateOpts); err != nil {
+			closeErr := session.Close()
+			if closeErr != nil {
+				return nil, fmt.Errorf("failed to run migrations: %w (also failed to close session: %w)", err, closeErr)
+			}
 			return nil, fmt.Errorf("failed to run migrations: %w", err)
 		}
 	}
 
-	return &ClickHouseStore{session: session}, nil
+	return store, nil
 }
 
 // NewClickHouseStoreFromSession creates a store from an existing session.
 // Migrations are NOT run automatically when using this constructor.
 // Use RunMigrations explicitly if needed.
-func NewClickHouseStoreFromSession(session ch.ClickhouseSessionInterface) *ClickHouseStore {
-	return &ClickHouseStore{session: session}
+func NewClickHouseStoreFromSession(
+	session ch.ClickhouseSessionInterface,
+	pipelineConfig *PipelineConfig,
+	database string,
+) *ClickHouseStore {
+	if database == "" {
+		database = "ci"
+	}
+	return &ClickHouseStore{
+		session:        session,
+		pipelineConfig: pipelineConfig,
+		database:       database,
+		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:        NewSlipScanner(pipelineConfig),
+	}
 }
 
 // NewClickHouseStoreFromConn creates a store from an existing driver connection.
 // Migrations are NOT run automatically when using this constructor.
 // This is provided for backward compatibility with existing code.
-func NewClickHouseStoreFromConn(conn ch.Conn) *ClickHouseStore {
-	return &ClickHouseStore{session: ch.NewSessionFromConn(conn)}
+func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, database string) *ClickHouseStore {
+	if database == "" {
+		database = "ci"
+	}
+	return &ClickHouseStore{
+		session:        ch.NewSessionFromConn(conn),
+		pipelineConfig: pipelineConfig,
+		database:       database,
+		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:        NewSlipScanner(pipelineConfig),
+	}
 }
 
 // Session returns the underlying ClickHouse session interface.
@@ -73,32 +133,28 @@ func (s *ClickHouseStore) Conn() ch.Conn {
 	return s.session.Conn()
 }
 
+// PipelineConfig returns the pipeline configuration.
+func (s *ClickHouseStore) PipelineConfig() *PipelineConfig {
+	return s.pipelineConfig
+}
+
 // Create persists a new routing slip.
 // The slip's CorrelationID is used as the unique identifier.
 func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
-	// Serialize components to JSON
-	componentsJSON, err := json.Marshal(slip.Components)
-	if err != nil {
-		return fmt.Errorf("failed to marshal components: %w", err)
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
 	}
 
-	// Serialize step timestamps
-	stepTimestamps := make(map[string]interface{})
-	for name, step := range slip.Steps {
-		ts := make(map[string]interface{})
-		if step.StartedAt != nil {
-			ts["started_at"] = step.StartedAt.Format(time.RFC3339Nano)
-		}
-		if step.CompletedAt != nil {
-			ts["completed_at"] = step.CompletedAt.Format(time.RFC3339Nano)
-		}
-		if len(ts) > 0 {
-			stepTimestamps[name] = ts
-		}
-	}
-	stepTimestampsJSON, err := json.Marshal(stepTimestamps)
+	// Build dynamic column lists using query builder
+	stepColumns, stepPlaceholders, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	aggregateColumns, aggregatePlaceholders, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+		slip.Aggregates,
+	)
+
+	// Serialize step details (timing, actor, errors)
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
 	if err != nil {
-		return fmt.Errorf("failed to marshal step timestamps: %w", err)
+		return fmt.Errorf("failed to marshal step details: %w", err)
 	}
 
 	// Serialize state history
@@ -107,27 +163,16 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		return fmt.Errorf("failed to marshal state history: %w", err)
 	}
 
-	// Extract step statuses
-	getStepStatus := func(name string) string {
-		if step, ok := slip.Steps[name]; ok {
-			return string(step.Status)
-		}
-		return string(StepStatusPending)
-	}
+	// Build the INSERT query dynamically
+	var columns []string
+	var placeholders []string
+	var values []interface{}
 
-	query := `
-		INSERT INTO ci.routing_slips (
-			correlation_id, repository, branch, commit_sha,
-			created_at, updated_at, status, components,
-			push_parsed_status, builds_completed_status, unit_tests_completed_status,
-			secret_scan_completed_status, dev_deploy_status, dev_tests_status,
-			preprod_deploy_status, preprod_tests_status, prod_release_created_status,
-			prod_deploy_status, prod_tests_status, alert_gate_status, prod_steady_state_status,
-			step_timestamps, state_history
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-
-	err = s.session.ExecWithArgs(ctx, query,
+	// Core columns
+	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory)
+	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	values = append(values,
 		slip.CorrelationID,
 		slip.Repository,
 		slip.Branch,
@@ -135,25 +180,23 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		slip.CreatedAt,
 		slip.UpdatedAt,
 		string(slip.Status),
-		string(componentsJSON),
-		getStepStatus("push_parsed"),
-		getStepStatus("builds_completed"),
-		getStepStatus("unit_tests_completed"),
-		getStepStatus("secret_scan_completed"),
-		getStepStatus("dev_deploy"),
-		getStepStatus("dev_tests"),
-		getStepStatus("preprod_deploy"),
-		getStepStatus("preprod_tests"),
-		getStepStatus("prod_release_created"),
-		getStepStatus("prod_deploy"),
-		getStepStatus("prod_tests"),
-		getStepStatus("alert_gate"),
-		getStepStatus("prod_steady_state"),
-		string(stepTimestampsJSON),
+		string(stepDetailsJSON),
 		string(stateHistoryJSON),
 	)
 
-	if err != nil {
+	// Step status columns
+	columns = append(columns, stepColumns...)
+	placeholders = append(placeholders, stepPlaceholders...)
+	values = append(values, stepValues...)
+
+	// Aggregate JSON columns
+	columns = append(columns, aggregateColumns...)
+	placeholders = append(placeholders, aggregatePlaceholders...)
+	values = append(values, aggregateValues...)
+
+	query := s.queryBuilder.BuildInsertQuery(columns, placeholders)
+
+	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
 		return fmt.Errorf("failed to insert slip: %w", err)
 	}
 
@@ -164,81 +207,52 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 // The correlation_id is the unique identifier for routing slips and is used
 // organization-wide to identify jobs across all systems.
 func (s *ClickHouseStore) Load(ctx context.Context, correlationID string) (*Slip, error) {
-	query := `
-		SELECT 
-			correlation_id, repository, branch, commit_sha,
-			created_at, updated_at, status, components,
-			push_parsed_status, builds_completed_status, unit_tests_completed_status,
-			secret_scan_completed_status, dev_deploy_status, dev_tests_status,
-			preprod_deploy_status, preprod_tests_status, prod_release_created_status,
-			prod_deploy_status, prod_tests_status, alert_gate_status, prod_steady_state_status,
-			step_timestamps, state_history
-		FROM ci.routing_slips FINAL
-		WHERE correlation_id = ?
-		LIMIT 1
-	`
+	if s.pipelineConfig == nil {
+		return nil, fmt.Errorf("pipeline config is required for store operations")
+	}
 
+	query := s.queryBuilder.BuildSelectQuery("WHERE correlation_id = ?", "LIMIT 1")
 	return s.scanSlip(ctx, query, correlationID)
 }
 
 // LoadByCommit retrieves a slip by repository and commit SHA.
 func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
-	query := `
-		SELECT 
-			correlation_id, repository, branch, commit_sha,
-			created_at, updated_at, status, components,
-			push_parsed_status, builds_completed_status, unit_tests_completed_status,
-			secret_scan_completed_status, dev_deploy_status, dev_tests_status,
-			preprod_deploy_status, preprod_tests_status, prod_release_created_status,
-			prod_deploy_status, prod_tests_status, alert_gate_status, prod_steady_state_status,
-			step_timestamps, state_history
-		FROM ci.routing_slips FINAL
-		WHERE repository = ? AND commit_sha = ?
-		ORDER BY created_at DESC
-		LIMIT 1
-	`
+	if s.pipelineConfig == nil {
+		return nil, fmt.Errorf("pipeline config is required for store operations")
+	}
 
+	query := s.queryBuilder.BuildSelectQuery(
+		"WHERE repository = ? AND commit_sha = ?",
+		"ORDER BY created_at DESC LIMIT 1",
+	)
 	return s.scanSlip(ctx, query, repository, commitSHA)
 }
 
 // FindByCommits finds a slip matching any commit in the ordered list.
 // Returns the slip for the first (most recent) matching commit.
-func (s *ClickHouseStore) FindByCommits(ctx context.Context, repository string, commits []string) (*Slip, string, error) {
+func (s *ClickHouseStore) FindByCommits(
+	ctx context.Context,
+	repository string,
+	commits []string,
+) (*Slip, string, error) {
+	if s.pipelineConfig == nil {
+		return nil, "", fmt.Errorf("pipeline config is required for store operations")
+	}
+
 	if len(commits) == 0 {
 		return nil, "", fmt.Errorf("no commits provided")
 	}
 
-	// Build query with ordered commit matching using arrayJoin
-	query := `
-		WITH commits AS (
-			SELECT 
-				arrayJoin(range(1, length({commits:Array(String)}) + 1)) AS priority,
-				{commits:Array(String)}[priority] AS commit_sha
-		)
-		SELECT 
-			s.correlation_id, s.repository, s.branch, s.commit_sha,
-			s.created_at, s.updated_at, s.status, s.components,
-			s.push_parsed_status, s.builds_completed_status, s.unit_tests_completed_status,
-			s.secret_scan_completed_status, s.dev_deploy_status, s.dev_tests_status,
-			s.preprod_deploy_status, s.preprod_tests_status, s.prod_release_created_status,
-			s.prod_deploy_status, s.prod_tests_status, s.alert_gate_status, s.prod_steady_state_status,
-			s.step_timestamps, s.state_history,
-			c.commit_sha AS matched_commit
-		FROM ci.routing_slips s FINAL
-		INNER JOIN commits c ON s.commit_sha = c.commit_sha
-		WHERE s.repository = {repository:String}
-		ORDER BY c.priority ASC
-		LIMIT 1
-	`
+	query := s.queryBuilder.BuildFindByCommitsQuery()
 
 	row := s.session.QueryRow(ctx, query,
 		ch.Named("repository", repository),
 		ch.Named("commits", commits),
 	)
 
-	slip, matchedCommit, err := s.scanSlipWithMatch(row)
+	slip, matchedCommit, err := s.scanner.ScanSlipWithMatch(row)
 	if err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return nil, "", ErrSlipNotFound
 		}
 		return nil, "", fmt.Errorf("failed to query slip by commits: %w", err)
@@ -258,47 +272,43 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 
 // UpdateStep updates a specific step's status.
 // The correlationID is the unique identifier for the routing slip.
-func (s *ClickHouseStore) UpdateStep(ctx context.Context, correlationID, stepName, componentName string, status StepStatus) error {
+func (s *ClickHouseStore) UpdateStep(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status StepStatus,
+) error {
 	// Load the current slip
 	slip, err := s.Load(ctx, correlationID)
 	if err != nil {
 		return err
 	}
 
-	// Update the step
 	now := time.Now()
+
+	// Handle component-level updates for aggregate steps
 	if componentName != "" {
-		// Component-specific step (build or unit_test)
-		for i := range slip.Components {
-			if slip.Components[i].Name == componentName {
-				switch stepName {
-				case "build":
-					slip.Components[i].BuildStatus = status
-				case "unit_test":
-					slip.Components[i].UnitTestStatus = status
-				}
-				break
+		if err := s.updateComponentInAggregate(slip, stepName, componentName, status, now); err == nil {
+			// Component was updated, also update the aggregate
+			aggregateStep := s.pipelineConfig.GetAggregateStep(stepName)
+			if aggregateStep != "" {
+				s.updateAggregateStatus(slip, aggregateStep, pluralize(stepName))
 			}
 		}
 	}
 
-	// Always update the step map
-	step := slip.Steps[stepName]
-	step.Status = status
-	if status == StepStatusRunning && step.StartedAt == nil {
-		step.StartedAt = &now
-	}
-	if status.IsTerminal() && step.CompletedAt == nil {
-		step.CompletedAt = &now
-	}
-	slip.Steps[stepName] = step
+	// Update pipeline-level steps
+	s.updatePipelineStep(slip, stepName, status, now)
 
 	return s.Update(ctx, slip)
 }
 
-// UpdateComponentStatus updates a component's build or test status.
+// UpdateComponentStatus updates a component's step status.
 // The correlationID is the unique identifier for the routing slip.
-func (s *ClickHouseStore) UpdateComponentStatus(ctx context.Context, correlationID, componentName, stepType string, status StepStatus) error {
+func (s *ClickHouseStore) UpdateComponentStatus(
+	ctx context.Context,
+	correlationID, componentName, stepType string,
+	status StepStatus,
+) error {
 	return s.UpdateStep(ctx, correlationID, stepType, componentName, status)
 }
 
@@ -322,188 +332,135 @@ func (s *ClickHouseStore) Close() error {
 // scanSlip executes a query and scans the result into a Slip.
 func (s *ClickHouseStore) scanSlip(ctx context.Context, query string, args ...interface{}) (*Slip, error) {
 	row := s.session.QueryRow(ctx, query, args...)
-
-	var slip Slip
-	var statusStr string
-	var componentsJSON, stepTimestampsJSON, stateHistoryJSON string
-	var stepStatuses [13]string
-
-	err := row.Scan(
-		&slip.CorrelationID,
-		&slip.Repository,
-		&slip.Branch,
-		&slip.CommitSHA,
-		&slip.CreatedAt,
-		&slip.UpdatedAt,
-		&statusStr,
-		&componentsJSON,
-		&stepStatuses[0],  // push_parsed
-		&stepStatuses[1],  // builds_completed
-		&stepStatuses[2],  // unit_tests_completed
-		&stepStatuses[3],  // secret_scan_completed
-		&stepStatuses[4],  // dev_deploy
-		&stepStatuses[5],  // dev_tests
-		&stepStatuses[6],  // preprod_deploy
-		&stepStatuses[7],  // preprod_tests
-		&stepStatuses[8],  // prod_release_created
-		&stepStatuses[9],  // prod_deploy
-		&stepStatuses[10], // prod_tests
-		&stepStatuses[11], // alert_gate
-		&stepStatuses[12], // prod_steady_state
-		&stepTimestampsJSON,
-		&stateHistoryJSON,
-	)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, ErrSlipNotFound
-		}
-		return nil, fmt.Errorf("failed to scan slip: %w", err)
-	}
-
-	// Parse status
-	slip.Status = SlipStatus(statusStr)
-
-	// Parse components JSON
-	if err := json.Unmarshal([]byte(componentsJSON), &slip.Components); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal components: %w", err)
-	}
-
-	// Build steps map from denormalized columns
-	slip.Steps = map[string]Step{
-		"push_parsed":           {Status: StepStatus(stepStatuses[0])},
-		"builds_completed":      {Status: StepStatus(stepStatuses[1])},
-		"unit_tests_completed":  {Status: StepStatus(stepStatuses[2])},
-		"secret_scan_completed": {Status: StepStatus(stepStatuses[3])},
-		"dev_deploy":            {Status: StepStatus(stepStatuses[4])},
-		"dev_tests":             {Status: StepStatus(stepStatuses[5])},
-		"preprod_deploy":        {Status: StepStatus(stepStatuses[6])},
-		"preprod_tests":         {Status: StepStatus(stepStatuses[7])},
-		"prod_release_created":  {Status: StepStatus(stepStatuses[8])},
-		"prod_deploy":           {Status: StepStatus(stepStatuses[9])},
-		"prod_tests":            {Status: StepStatus(stepStatuses[10])},
-		"alert_gate":            {Status: StepStatus(stepStatuses[11])},
-		"prod_steady_state":     {Status: StepStatus(stepStatuses[12])},
-	}
-
-	// Parse step timestamps and merge into steps
-	var stepTimestamps map[string]map[string]string
-	if err := json.Unmarshal([]byte(stepTimestampsJSON), &stepTimestamps); err == nil {
-		for name, ts := range stepTimestamps {
-			if step, ok := slip.Steps[name]; ok {
-				if startedStr, ok := ts["started_at"]; ok {
-					if t, err := time.Parse(time.RFC3339Nano, startedStr); err == nil {
-						step.StartedAt = &t
-					}
-				}
-				if completedStr, ok := ts["completed_at"]; ok {
-					if t, err := time.Parse(time.RFC3339Nano, completedStr); err == nil {
-						step.CompletedAt = &t
-					}
-				}
-				slip.Steps[name] = step
-			}
-		}
-	}
-
-	// Parse state history JSON
-	if err := json.Unmarshal([]byte(stateHistoryJSON), &slip.StateHistory); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal state history: %w", err)
-	}
-
-	return &slip, nil
+	return s.scanner.ScanSlipFromRow(row)
 }
 
-// scanSlipWithMatch scans a slip with an additional matched_commit column.
-func (s *ClickHouseStore) scanSlipWithMatch(row ch.Row) (*Slip, string, error) {
-	var slip Slip
-	var statusStr string
-	var componentsJSON, stepTimestampsJSON, stateHistoryJSON string
-	var stepStatuses [13]string
-	var matchedCommit string
+// buildStepDetails builds the step_details JSON from the slip.
+func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
+	details := make(map[string]interface{})
 
-	err := row.Scan(
-		&slip.CorrelationID,
-		&slip.Repository,
-		&slip.Branch,
-		&slip.CommitSHA,
-		&slip.CreatedAt,
-		&slip.UpdatedAt,
-		&statusStr,
-		&componentsJSON,
-		&stepStatuses[0],
-		&stepStatuses[1],
-		&stepStatuses[2],
-		&stepStatuses[3],
-		&stepStatuses[4],
-		&stepStatuses[5],
-		&stepStatuses[6],
-		&stepStatuses[7],
-		&stepStatuses[8],
-		&stepStatuses[9],
-		&stepStatuses[10],
-		&stepStatuses[11],
-		&stepStatuses[12],
-		&stepTimestampsJSON,
-		&stateHistoryJSON,
-		&matchedCommit,
-	)
+	for stepName, step := range slip.Steps {
+		stepDetail := make(map[string]interface{})
 
-	if err != nil {
-		return nil, "", err
-	}
+		if step.StartedAt != nil {
+			stepDetail["started_at"] = step.StartedAt.Format(time.RFC3339Nano)
+		}
+		if step.CompletedAt != nil {
+			stepDetail["completed_at"] = step.CompletedAt.Format(time.RFC3339Nano)
+		}
+		if step.Actor != "" {
+			stepDetail["actor"] = step.Actor
+		}
+		if step.Error != "" {
+			stepDetail["error"] = step.Error
+		}
+		if step.HeldReason != "" {
+			stepDetail["held_reason"] = step.HeldReason
+		}
 
-	// Parse status
-	slip.Status = SlipStatus(statusStr)
-
-	// Parse components JSON
-	if err := json.Unmarshal([]byte(componentsJSON), &slip.Components); err != nil {
-		return nil, "", fmt.Errorf("failed to unmarshal components: %w", err)
-	}
-
-	// Build steps map
-	slip.Steps = map[string]Step{
-		"push_parsed":           {Status: StepStatus(stepStatuses[0])},
-		"builds_completed":      {Status: StepStatus(stepStatuses[1])},
-		"unit_tests_completed":  {Status: StepStatus(stepStatuses[2])},
-		"secret_scan_completed": {Status: StepStatus(stepStatuses[3])},
-		"dev_deploy":            {Status: StepStatus(stepStatuses[4])},
-		"dev_tests":             {Status: StepStatus(stepStatuses[5])},
-		"preprod_deploy":        {Status: StepStatus(stepStatuses[6])},
-		"preprod_tests":         {Status: StepStatus(stepStatuses[7])},
-		"prod_release_created":  {Status: StepStatus(stepStatuses[8])},
-		"prod_deploy":           {Status: StepStatus(stepStatuses[9])},
-		"prod_tests":            {Status: StepStatus(stepStatuses[10])},
-		"alert_gate":            {Status: StepStatus(stepStatuses[11])},
-		"prod_steady_state":     {Status: StepStatus(stepStatuses[12])},
-	}
-
-	// Parse step timestamps
-	var stepTimestamps map[string]map[string]string
-	if err := json.Unmarshal([]byte(stepTimestampsJSON), &stepTimestamps); err == nil {
-		for name, ts := range stepTimestamps {
-			if step, ok := slip.Steps[name]; ok {
-				if startedStr, ok := ts["started_at"]; ok {
-					if t, err := time.Parse(time.RFC3339Nano, startedStr); err == nil {
-						step.StartedAt = &t
-					}
-				}
-				if completedStr, ok := ts["completed_at"]; ok {
-					if t, err := time.Parse(time.RFC3339Nano, completedStr); err == nil {
-						step.CompletedAt = &t
-					}
-				}
-				slip.Steps[name] = step
-			}
+		if len(stepDetail) > 0 {
+			details[stepName] = stepDetail
 		}
 	}
 
-	// Parse state history
-	if err := json.Unmarshal([]byte(stateHistoryJSON), &slip.StateHistory); err != nil {
-		return nil, "", fmt.Errorf("failed to unmarshal state history: %w", err)
+	return details
+}
+
+// updateComponentInAggregate updates a component's status within an aggregate column.
+// Returns nil if successful, error if the step is not an aggregate step.
+func (s *ClickHouseStore) updateComponentInAggregate(
+	slip *Slip,
+	stepName, componentName string,
+	status StepStatus,
+	now time.Time,
+) error {
+	aggregateStep := s.pipelineConfig.GetAggregateStep(stepName)
+	if aggregateStep == "" {
+		return fmt.Errorf("step %s is not a component step", stepName)
 	}
 
-	return &slip, matchedCommit, nil
+	columnName := pluralize(stepName)
+	if slip.Aggregates == nil {
+		slip.Aggregates = make(map[string][]ComponentStepData)
+	}
+
+	componentData := slip.Aggregates[columnName]
+	found := false
+	for i := range componentData {
+		if componentData[i].Component == componentName {
+			componentData[i].ApplyStatusTransition(status, now)
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		newData := ComponentStepData{Component: componentName}
+		newData.ApplyStatusTransition(status, now)
+		componentData = append(componentData, newData)
+	}
+
+	slip.Aggregates[columnName] = componentData
+	return nil
+}
+
+// updatePipelineStep updates a pipeline step's status if it exists.
+func (s *ClickHouseStore) updatePipelineStep(slip *Slip, stepName string, status StepStatus, now time.Time) {
+	if s.pipelineConfig.GetStep(stepName) == nil {
+		return
+	}
+
+	step := slip.Steps[stepName]
+	step.ApplyStatusTransition(status, now)
+	slip.Steps[stepName] = step
+}
+
+// updateAggregateStatus updates the aggregate step status based on component statuses.
+func (s *ClickHouseStore) updateAggregateStatus(slip *Slip, aggregateStepName, columnName string) {
+	componentData := slip.Aggregates[columnName]
+	if len(componentData) == 0 {
+		return
+	}
+
+	// Determine aggregate status from components
+	aggregateStatus := s.computeAggregateStatus(componentData)
+	if aggregateStatus == StepStatusPending {
+		return // No change needed
+	}
+
+	step := slip.Steps[aggregateStepName]
+	step.ApplyStatusTransition(aggregateStatus, time.Now())
+	slip.Steps[aggregateStepName] = step
+}
+
+// computeAggregateStatus determines the aggregate status from component statuses.
+func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepData) StepStatus {
+	allCompleted := true
+	anyRunning := false
+	anyFailed := false
+
+	for _, comp := range componentData {
+		if comp.Status.IsFailure() {
+			anyFailed = true
+		}
+		if !comp.Status.IsSuccess() {
+			allCompleted = false
+		}
+		if comp.Status.IsRunning() {
+			anyRunning = true
+		}
+	}
+
+	if anyFailed {
+		return StepStatusFailed
+	}
+	if allCompleted {
+		return StepStatusCompleted
+	}
+	if anyRunning {
+		return StepStatusRunning
+	}
+	return StepStatusPending
 }
 
 // Ensure ClickHouseStore implements SlipStore.

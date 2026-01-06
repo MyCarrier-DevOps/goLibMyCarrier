@@ -114,6 +114,16 @@ func (l *StdLogger) WithFields(fields map[string]interface{}) Logger {
 	}
 }
 
+// IsDebugEnabled returns whether debug logging is enabled.
+func (l *StdLogger) IsDebugEnabled() bool {
+	return l.debug
+}
+
+// SetDebug enables or disables debug logging.
+func (l *StdLogger) SetDebug(debug bool) {
+	l.debug = debug
+}
+
 // log formats and outputs the log message.
 func (l *StdLogger) log(level, message string, fields map[string]interface{}) {
 	// Merge base fields with provided fields
@@ -140,14 +150,4 @@ func (l *StdLogger) log(level, message string, fields map[string]interface{}) {
 	}
 
 	l.logger.Printf("[%s] %s%s", level, message, fieldsStr)
-}
-
-// IsDebugEnabled returns whether debug logging is enabled.
-func (l *StdLogger) IsDebugEnabled() bool {
-	return l.debug
-}
-
-// SetDebug enables or disables debug logging.
-func (l *StdLogger) SetDebug(debug bool) {
-	l.debug = debug
 }

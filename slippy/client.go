@@ -12,14 +12,16 @@ import (
 // The correlationID is the single, canonical identifier for a routing slip
 // throughout its entire lifecycle.
 type Client struct {
-	store  SlipStore
-	github GitHubAPI
-	config Config
-	logger Logger
+	store          SlipStore
+	github         GitHubAPI
+	config         Config
+	pipelineConfig *PipelineConfig
+	logger         Logger
 }
 
 // NewClient creates a new slippy client with all dependencies.
 // It validates the configuration and initializes the ClickHouse store and GitHub client.
+// The pipeline configuration must be set in the Config.
 func NewClient(config Config) (*Client, error) {
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -29,8 +31,11 @@ func NewClient(config Config) (*Client, error) {
 		config.Logger = NopLogger()
 	}
 
-	// Initialize ClickHouse store from config
-	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{})
+	// Initialize ClickHouse store from config (migrations run based on pipeline config)
+	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{
+		PipelineConfig: config.PipelineConfig,
+		Database:       config.Database,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %w", err)
 	}
@@ -42,10 +47,11 @@ func NewClient(config Config) (*Client, error) {
 	}
 
 	return &Client{
-		store:  store,
-		github: githubClient,
-		config: config,
-		logger: config.Logger,
+		store:          store,
+		github:         githubClient,
+		config:         config,
+		pipelineConfig: config.PipelineConfig,
+		logger:         config.Logger,
 	}, nil
 }
 
@@ -65,12 +71,16 @@ func NewClientWithDependencies(store SlipStore, github GitHubAPI, config Config)
 	if config.AncestryDepth == 0 {
 		config.AncestryDepth = DefaultConfig().AncestryDepth
 	}
+	if config.Database == "" {
+		config.Database = DefaultConfig().Database
+	}
 
 	return &Client{
-		store:  store,
-		github: github,
-		config: config,
-		logger: config.Logger,
+		store:          store,
+		github:         github,
+		config:         config,
+		pipelineConfig: config.PipelineConfig,
+		logger:         config.Logger,
 	}
 }
 
@@ -132,4 +142,9 @@ func (c *Client) GitHub() GitHubAPI {
 // Config returns the client configuration.
 func (c *Client) Config() Config {
 	return c.config
+}
+
+// PipelineConfig returns the pipeline configuration.
+func (c *Client) PipelineConfig() *PipelineConfig {
+	return c.pipelineConfig
 }

@@ -138,6 +138,12 @@ func (c *Client) RunPreExecution(ctx context.Context, opts PreExecutionOptions) 
 
 		if err != nil {
 			switch holdResult.Outcome {
+			case HoldOutcomeProceeded:
+				// This shouldn't happen with an error, but handle exhaustively
+				result.Outcome = PreExecutionOutcomeAbort
+				result.Message = err.Error()
+				return result, err
+
 			case HoldOutcomeTimeout:
 				result.Outcome = PreExecutionOutcomeTimeout
 				result.Message = holdResult.Message
@@ -151,11 +157,6 @@ func (c *Client) RunPreExecution(ctx context.Context, opts PreExecutionOptions) 
 			case HoldOutcomeCancelled:
 				result.Outcome = PreExecutionOutcomeAbort
 				result.Message = "operation cancelled"
-				return result, err
-
-			default:
-				result.Outcome = PreExecutionOutcomeAbort
-				result.Message = err.Error()
 				return result, err
 			}
 		}
@@ -254,7 +255,12 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		c.logger.Info(ctx, "Pipeline complete! Updating slip status to completed", map[string]interface{}{
 			"correlation_id": correlationID,
 		})
-		_ = c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted)
+		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted); err != nil {
+			c.logger.Warn(ctx, "Failed to update slip status to completed", map[string]interface{}{
+				"correlation_id": correlationID,
+				"error":          err.Error(),
+			})
+		}
 		return true, SlipStatusCompleted
 	}
 
@@ -265,7 +271,12 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 				"correlation_id": correlationID,
 				"step_name":      stepName,
 			})
-			_ = c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed)
+			if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed); err != nil {
+				c.logger.Warn(ctx, "Failed to update slip status to failed", map[string]interface{}{
+					"correlation_id": correlationID,
+					"error":          err.Error(),
+				})
+			}
 			return true, SlipStatusFailed
 		}
 	}

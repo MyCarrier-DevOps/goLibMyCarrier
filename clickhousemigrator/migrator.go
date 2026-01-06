@@ -241,7 +241,10 @@ func (m *Migrator) GetSchemaVersion(ctx context.Context) (int, error) {
 
 // SetSchemaVersion sets the schema version.
 func (m *Migrator) SetSchemaVersion(ctx context.Context, version int) error {
-	insertSQL := fmt.Sprintf(`INSERT INTO %s (version, applied_at) VALUES (?, now())`, m.qualifiedTableName(m.schemaVersionTableName()))
+	insertSQL := fmt.Sprintf(
+		`INSERT INTO %s (version, applied_at) VALUES (?, now())`,
+		m.qualifiedTableName(m.schemaVersionTableName()),
+	)
 
 	if err := m.conn.Exec(ctx, insertSQL, uint32(version)); err != nil {
 		return fmt.Errorf("failed to set schema version to %d: %w", version, err)
@@ -336,6 +339,62 @@ func (m *Migrator) AddMigrations(migrations []Migration) {
 // SetExpectedTables sets the expected tables for schema validation.
 func (m *Migrator) SetExpectedTables(tables []string) {
 	m.expectedTables = tables
+}
+
+// GetLatestVersion returns the highest migration version available.
+func (m *Migrator) GetLatestVersion() int {
+	if len(m.migrations) == 0 {
+		return 0
+	}
+	return m.migrations[len(m.migrations)-1].Version
+}
+
+// GetPendingMigrations returns migrations that haven't been applied yet.
+func (m *Migrator) GetPendingMigrations(ctx context.Context) ([]Migration, error) {
+	currentVersion, err := m.GetSchemaVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var pending []Migration
+	for _, migration := range m.migrations {
+		if migration.Version > currentVersion {
+			pending = append(pending, migration)
+		}
+	}
+
+	return pending, nil
+}
+
+// IsMigrationApplied checks if a specific migration version has been applied.
+func (m *Migrator) IsMigrationApplied(ctx context.Context, version int) (bool, error) {
+	currentVersion, err := m.GetSchemaVersion(ctx)
+	if err != nil {
+		return false, err
+	}
+	return version <= currentVersion, nil
+}
+
+// Conn returns the underlying driver.Conn.
+func (m *Migrator) Conn() driver.Conn {
+	return m.conn
+}
+
+// schemaVersionTableName returns the name of the schema version table.
+// If a table prefix is set, returns "{prefix}_schema_version", otherwise "schema_version".
+func (m *Migrator) schemaVersionTableName() string {
+	if m.tablePrefix != "" {
+		return fmt.Sprintf("%s_schema_version", m.tablePrefix)
+	}
+	return "schema_version"
+}
+
+// qualifiedTableName returns the fully qualified table name with database prefix if set.
+func (m *Migrator) qualifiedTableName(table string) string {
+	if m.database != "" {
+		return fmt.Sprintf("%s.%s", m.database, table)
+	}
+	return table
 }
 
 // migrateUp applies migrations from currentVersion to targetVersion.
@@ -458,60 +517,4 @@ func (m *Migrator) sortMigrations() {
 	sort.Slice(m.migrations, func(i, j int) bool {
 		return m.migrations[i].Version < m.migrations[j].Version
 	})
-}
-
-// GetLatestVersion returns the highest migration version available.
-func (m *Migrator) GetLatestVersion() int {
-	if len(m.migrations) == 0 {
-		return 0
-	}
-	return m.migrations[len(m.migrations)-1].Version
-}
-
-// GetPendingMigrations returns migrations that haven't been applied yet.
-func (m *Migrator) GetPendingMigrations(ctx context.Context) ([]Migration, error) {
-	currentVersion, err := m.GetSchemaVersion(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	var pending []Migration
-	for _, migration := range m.migrations {
-		if migration.Version > currentVersion {
-			pending = append(pending, migration)
-		}
-	}
-
-	return pending, nil
-}
-
-// IsMigrationApplied checks if a specific migration version has been applied.
-func (m *Migrator) IsMigrationApplied(ctx context.Context, version int) (bool, error) {
-	currentVersion, err := m.GetSchemaVersion(ctx)
-	if err != nil {
-		return false, err
-	}
-	return version <= currentVersion, nil
-}
-
-// Conn returns the underlying driver.Conn.
-func (m *Migrator) Conn() driver.Conn {
-	return m.conn
-}
-
-// schemaVersionTableName returns the name of the schema version table.
-// If a table prefix is set, returns "{prefix}_schema_version", otherwise "schema_version".
-func (m *Migrator) schemaVersionTableName() string {
-	if m.tablePrefix != "" {
-		return fmt.Sprintf("%s_schema_version", m.tablePrefix)
-	}
-	return "schema_version"
-}
-
-// qualifiedTableName returns the fully qualified table name with database prefix if set.
-func (m *Migrator) qualifiedTableName(table string) string {
-	if m.database != "" {
-		return fmt.Sprintf("%s.%s", m.database, table)
-	}
-	return table
 }

@@ -70,7 +70,7 @@ func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, err
 	var privateKey []byte
 
 	// Support both inline key and file path
-	if len(cfg.PrivateKey) > 0 && cfg.PrivateKey[0] == '-' {
+	if cfg.PrivateKey != "" && cfg.PrivateKey[0] == '-' {
 		// Looks like PEM content (starts with "-----BEGIN")
 		privateKey = []byte(cfg.PrivateKey)
 	} else {
@@ -113,25 +113,6 @@ func (g *GraphQLClient) GetGraphQLURL() string {
 	return "https://api.github.com/graphql"
 }
 
-// generateAppJWT creates a JWT for authenticating as the GitHub App.
-func (g *GraphQLClient) generateAppJWT() (string, error) {
-	now := time.Now()
-	claims := jwt.MapClaims{
-		"iat": now.Unix(),
-		"exp": now.Add(10 * time.Minute).Unix(),
-		"iss": g.appID,
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-
-	key, err := jwt.ParseRSAPrivateKeyFromPEM(g.privateKey)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse private key: %w", err)
-	}
-
-	return token.SignedString(key)
-}
-
 // DiscoverInstallationID finds the installation ID for a given organization.
 // Results are cached to avoid repeated API calls.
 func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) (int64, error) {
@@ -155,23 +136,30 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 
 	// Query all installations for this app
 	req, err := http.NewRequestWithContext(ctx, "GET",
-		g.GetAPIBaseURL()+"/app/installations", nil)
+		g.GetAPIBaseURL()+"/app/installations", http.NoBody)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+jwtToken)
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("X-Github-Api-Version", "2022-11-28")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query installations: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			g.logger.Debug(ctx, "Failed to close response body", map[string]interface{}{"error": closeErr.Error()})
+		}
+	}()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return 0, fmt.Errorf("failed to query installations: %s (could not read body: %w)", resp.Status, readErr)
+		}
 		return 0, fmt.Errorf("failed to query installations: %s - %s", resp.Status, string(body))
 	}
 
@@ -327,4 +315,23 @@ func (g *GraphQLClient) GetCachedInstallationIDs() map[string]int64 {
 		result[k] = v
 	}
 	return result
+}
+
+// generateAppJWT creates a JWT for authenticating as the GitHub App.
+func (g *GraphQLClient) generateAppJWT() (string, error) {
+	now := time.Now()
+	claims := jwt.MapClaims{
+		"iat": now.Unix(),
+		"exp": now.Add(10 * time.Minute).Unix(),
+		"iss": g.appID,
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+
+	key, err := jwt.ParseRSAPrivateKeyFromPEM(g.privateKey)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse private key: %w", err)
+	}
+
+	return token.SignedString(key)
 }

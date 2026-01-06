@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -12,10 +13,42 @@ import (
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse/clickhousetest"
 )
 
+// testPipelineConfig returns a minimal pipeline config for testing.
+// The config is properly initialized with internal lookup maps.
+func testPipelineConfig() *PipelineConfig {
+	config := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline config",
+		Steps: []StepConfig{
+			{Name: "push_parsed", Description: "Push parsed"},
+			{Name: "builds_completed", Description: "Builds completed", Aggregates: "build", Prerequisites: []string{"push_parsed"}},
+			{Name: "unit_tests_completed", Description: "Unit tests completed", Aggregates: "unit_test", Prerequisites: []string{"builds_completed"}},
+			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"unit_tests_completed"}},
+		},
+	}
+	// Initialize internal lookup maps (same as what LoadPipelineConfig does)
+	config.stepsByName = make(map[string]*StepConfig)
+	config.aggregateMap = make(map[string]string)
+	config.gateSteps = make([]string, 0)
+	for i := range config.Steps {
+		step := &config.Steps[i]
+		step.order = i
+		config.stepsByName[step.Name] = step
+		if step.Aggregates != "" {
+			config.aggregateMap[step.Aggregates] = step.Name
+		}
+		if step.IsGate {
+			config.gateSteps = append(config.gateSteps, step.Name)
+		}
+	}
+	return config
+}
+
 // TestNewClickHouseStoreFromSession tests creating a store from an existing session.
 func TestNewClickHouseStoreFromSession(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	if store == nil {
 		t.Fatal("expected store to be non-nil")
@@ -28,7 +61,7 @@ func TestNewClickHouseStoreFromSession(t *testing.T) {
 // TestClickHouseStore_Session tests the Session accessor method.
 func TestClickHouseStore_Session(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	session := store.Session()
 	if session == nil {
@@ -42,7 +75,7 @@ func TestClickHouseStore_Conn(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		ConnConn: mockConn,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	conn := store.Conn()
 	if conn != mockConn {
@@ -57,7 +90,7 @@ func TestClickHouseStore_Conn(t *testing.T) {
 func TestClickHouseStore_Close(t *testing.T) {
 	t.Run("successful close", func(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		err := store.Close()
 		if err != nil {
@@ -73,7 +106,7 @@ func TestClickHouseStore_Close(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			CloseErr: expectedErr,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		err := store.Close()
 		if err != expectedErr {
@@ -86,7 +119,7 @@ func TestClickHouseStore_Close(t *testing.T) {
 func TestClickHouseStore_Create(t *testing.T) {
 	t.Run("successful create", func(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		slip := &Slip{
 			CorrelationID: "test-corr-001",
@@ -96,8 +129,8 @@ func TestClickHouseStore_Create(t *testing.T) {
 			Status:        SlipStatusPending,
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
-			Components: []Component{
-				{Name: "api", BuildStatus: StepStatusPending},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {{Component: "api", Status: StepStatusPending}},
 			},
 			Steps: map[string]Step{
 				"push_parsed": {Status: StepStatusCompleted},
@@ -118,7 +151,7 @@ func TestClickHouseStore_Create(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			ExecWithArgsErr: expectedErr,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		slip := &Slip{
 			CorrelationID: "test-corr-001",
@@ -141,7 +174,7 @@ func TestClickHouseStore_Create(t *testing.T) {
 
 	t.Run("create with step timestamps", func(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		now := time.Now()
 		slip := &Slip{
@@ -173,7 +206,7 @@ func TestClickHouseStore_Create(t *testing.T) {
 
 	t.Run("create with state history", func(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		now := time.Now()
 		slip := &Slip{
@@ -216,7 +249,7 @@ func TestClickHouseStore_Load(t *testing.T) {
 			},
 		}
 		mockSession.QueryRowRow = mockRow
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		_, err := store.Load(context.Background(), "nonexistent")
 		if !errors.Is(err, ErrSlipNotFound) {
@@ -232,7 +265,7 @@ func TestClickHouseStore_Load(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			QueryRowRow: mockRow,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		_, err := store.Load(context.Background(), "test-corr-001")
 		if err == nil {
@@ -250,7 +283,7 @@ func TestClickHouseStore_LoadByCommit(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			QueryRowRow: mockRow,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		_, err := store.LoadByCommit(context.Background(), "myorg/myrepo", "nonexistent")
 		if !errors.Is(err, ErrSlipNotFound) {
@@ -263,7 +296,7 @@ func TestClickHouseStore_LoadByCommit(t *testing.T) {
 func TestClickHouseStore_FindByCommits(t *testing.T) {
 	t.Run("find by commits empty list", func(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		_, _, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{})
 		if err == nil {
@@ -278,7 +311,7 @@ func TestClickHouseStore_FindByCommits(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			QueryRowRow: mockRow,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		_, _, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{"abc123", "def456"})
 		if !errors.Is(err, ErrSlipNotFound) {
@@ -291,7 +324,7 @@ func TestClickHouseStore_FindByCommits(t *testing.T) {
 func TestClickHouseStore_Update(t *testing.T) {
 	t.Run("successful update", func(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		slip := &Slip{
 			CorrelationID: "test-corr-001",
@@ -323,7 +356,7 @@ func TestClickHouseStore_UpdateStep(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			QueryRowRow: mockRow,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
 		if !errors.Is(err, ErrSlipNotFound) {
@@ -341,7 +374,7 @@ func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			QueryRowRow: mockRow,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		err := store.UpdateComponentStatus(context.Background(), "test-corr-001", "api", "build", StepStatusCompleted)
 		if !errors.Is(err, ErrSlipNotFound) {
@@ -359,7 +392,7 @@ func TestClickHouseStore_AppendHistory(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{
 			QueryRowRow: mockRow,
 		}
-		store := NewClickHouseStoreFromSession(mockSession)
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		entry := StateHistoryEntry{
 			Timestamp: time.Now(),
@@ -377,7 +410,7 @@ func TestClickHouseStore_AppendHistory(t *testing.T) {
 // TestNewClickHouseStoreFromConn tests creating a store from an existing connection.
 func TestNewClickHouseStoreFromConn(t *testing.T) {
 	mockConn := &clickhousetest.MockConn{}
-	store := NewClickHouseStoreFromConn(mockConn)
+	store := NewClickHouseStoreFromConn(mockConn, testPipelineConfig(), "ci")
 
 	if store == nil {
 		t.Fatal("expected store to be non-nil")
@@ -392,13 +425,16 @@ func TestNewClickHouseStoreFromConn(t *testing.T) {
 	}
 }
 
-// createMockScanRow creates a mock row that returns valid slip data
+// createMockScanRow creates a mock row that returns valid slip data for the test config.
+// Column layout for test config (4 steps, 2 aggregates):
+// 0: correlation_id, 1: repository, 2: branch, 3: commit_sha
+// 4: created_at, 5: updated_at, 6: status
+// 7: step_details (JSON), 8: state_history (JSON)
+// 9-12: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
+// 13: builds (aggregate JSON), 14: unit_tests (aggregate JSON)
 func createMockScanRow(correlationID, repository, branch, commitSHA string, status SlipStatus) *clickhousetest.MockRow {
 	now := time.Now()
-	componentsJSON, _ := json.Marshal([]Component{
-		{Name: "api", BuildStatus: StepStatusCompleted},
-	})
-	stepTimestampsJSON, _ := json.Marshal(map[string]map[string]string{
+	stepDetailsJSON, _ := json.Marshal(map[string]map[string]interface{}{
 		"push_parsed": {
 			"started_at":   now.Format(time.RFC3339Nano),
 			"completed_at": now.Format(time.RFC3339Nano),
@@ -407,11 +443,18 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 	stateHistoryJSON, _ := json.Marshal([]StateHistoryEntry{
 		{Timestamp: now, Step: "push_parsed", Status: StepStatusCompleted},
 	})
+	buildsJSON, _ := json.Marshal([]ComponentStepData{
+		{Component: "api", Status: StepStatusCompleted},
+	})
+	unitTestsJSON, _ := json.Marshal([]ComponentStepData{
+		{Component: "api", Status: StepStatusPending},
+	})
 
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			if len(dest) < 23 {
-				return errors.New("not enough scan destinations")
+			// Test config has 4 steps, 2 aggregates = 15 columns
+			if len(dest) < 15 {
+				return fmt.Errorf("not enough scan destinations: got %d, want 15", len(dest))
 			}
 			// Set correlation_id
 			if ptr, ok := dest[0].(*string); ok {
@@ -441,23 +484,27 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 			if ptr, ok := dest[6].(*string); ok {
 				*ptr = string(status)
 			}
-			// Set components JSON
+			// Set step_details JSON
 			if ptr, ok := dest[7].(*string); ok {
-				*ptr = string(componentsJSON)
+				*ptr = string(stepDetailsJSON)
 			}
-			// Set step statuses (13 steps)
-			for i := 8; i < 21; i++ {
+			// Set state_history JSON
+			if ptr, ok := dest[8].(*string); ok {
+				*ptr = string(stateHistoryJSON)
+			}
+			// Set step statuses (4 steps)
+			for i := 9; i < 13; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = string(StepStatusPending)
 				}
 			}
-			// Set step_timestamps JSON
-			if ptr, ok := dest[21].(*string); ok {
-				*ptr = string(stepTimestampsJSON)
+			// Set builds aggregate JSON
+			if ptr, ok := dest[13].(*string); ok {
+				*ptr = string(buildsJSON)
 			}
-			// Set state_history JSON
-			if ptr, ok := dest[22].(*string); ok {
-				*ptr = string(stateHistoryJSON)
+			// Set unit_tests aggregate JSON
+			if ptr, ok := dest[14].(*string); ok {
+				*ptr = string(unitTestsJSON)
 			}
 			return nil
 		},
@@ -470,7 +517,7 @@ func TestClickHouseStore_Load_Success(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	slip, err := store.Load(context.Background(), "test-corr-001")
 	if err != nil {
@@ -488,11 +535,9 @@ func TestClickHouseStore_Load_Success(t *testing.T) {
 	if slip.Branch != "main" {
 		t.Errorf("expected branch 'main', got '%s'", slip.Branch)
 	}
-	if len(slip.Components) != 1 {
-		t.Errorf("expected 1 component, got %d", len(slip.Components))
-	}
-	if len(slip.Steps) != 13 {
-		t.Errorf("expected 13 steps, got %d", len(slip.Steps))
+	// Test pipeline config has 4 steps
+	if len(slip.Steps) != 4 {
+		t.Errorf("expected 4 steps, got %d", len(slip.Steps))
 	}
 	if len(slip.StateHistory) != 1 {
 		t.Errorf("expected 1 state history entry, got %d", len(slip.StateHistory))
@@ -505,7 +550,7 @@ func TestClickHouseStore_LoadByCommit_Success(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	slip, err := store.LoadByCommit(context.Background(), "myorg/myrepo", "abc123")
 	if err != nil {
@@ -527,7 +572,7 @@ func TestClickHouseStore_Load_ErrNoRows(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	_, err := store.Load(context.Background(), "nonexistent")
 	if !errors.Is(err, ErrSlipNotFound) {
@@ -535,8 +580,9 @@ func TestClickHouseStore_Load_ErrNoRows(t *testing.T) {
 	}
 }
 
-// TestClickHouseStore_Load_InvalidComponentsJSON tests invalid components JSON handling.
-func TestClickHouseStore_Load_InvalidComponentsJSON(t *testing.T) {
+// TestClickHouseStore_Load_InvalidAggregateJSON tests that invalid aggregate JSON is handled gracefully.
+// Invalid aggregate JSON should not cause an error - it just results in empty aggregates.
+func TestClickHouseStore_Load_InvalidAggregateJSON(t *testing.T) {
 	now := time.Now()
 	mockRow := &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
@@ -562,21 +608,26 @@ func TestClickHouseStore_Load_InvalidComponentsJSON(t *testing.T) {
 			if ptr, ok := dest[6].(*string); ok {
 				*ptr = "pending"
 			}
-			// Invalid JSON for components
+			// Valid JSON for step_details
 			if ptr, ok := dest[7].(*string); ok {
-				*ptr = "not valid json"
+				*ptr = "{}"
 			}
-			// Set step statuses
-			for i := 8; i < 21; i++ {
+			// Valid JSON for state_history
+			if ptr, ok := dest[8].(*string); ok {
+				*ptr = "[]"
+			}
+			// Set step statuses (4 steps)
+			for i := 9; i < 13; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = "pending"
 				}
 			}
-			// Valid JSON for timestamps and history
-			if ptr, ok := dest[21].(*string); ok {
-				*ptr = "{}"
+			// Invalid JSON for builds aggregate - should be handled gracefully
+			if ptr, ok := dest[13].(*string); ok {
+				*ptr = "not valid json"
 			}
-			if ptr, ok := dest[22].(*string); ok {
+			// Valid JSON for unit_tests aggregate
+			if ptr, ok := dest[14].(*string); ok {
 				*ptr = "[]"
 			}
 			return nil
@@ -585,18 +636,24 @@ func TestClickHouseStore_Load_InvalidComponentsJSON(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	_, err := store.Load(context.Background(), "test-corr-001")
-	if err == nil {
-		t.Error("expected error for invalid components JSON, got nil")
+	slip, err := store.Load(context.Background(), "test-corr-001")
+	// Invalid aggregate JSON should not cause an error
+	if err != nil {
+		t.Errorf("expected no error for invalid aggregate JSON, got %v", err)
+	}
+	// The builds aggregate should be empty due to invalid JSON
+	if slip != nil && len(slip.Aggregates["builds"]) != 0 {
+		t.Errorf("expected empty builds aggregate due to invalid JSON, got %d items", len(slip.Aggregates["builds"]))
 	}
 }
 
 // TestClickHouseStore_Load_InvalidStateHistoryJSON tests invalid state history JSON handling.
 func TestClickHouseStore_Load_InvalidStateHistoryJSON(t *testing.T) {
 	now := time.Now()
-	componentsJSON, _ := json.Marshal([]Component{})
+	buildsJSON, _ := json.Marshal([]ComponentStepData{})
+	unitTestsJSON, _ := json.Marshal([]ComponentStepData{})
 	mockRow := &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
 			// Set required fields
@@ -621,23 +678,26 @@ func TestClickHouseStore_Load_InvalidStateHistoryJSON(t *testing.T) {
 			if ptr, ok := dest[6].(*string); ok {
 				*ptr = "pending"
 			}
-			// Valid components JSON
+			// Valid step_details JSON
 			if ptr, ok := dest[7].(*string); ok {
-				*ptr = string(componentsJSON)
+				*ptr = "{}"
 			}
-			// Set step statuses
-			for i := 8; i < 21; i++ {
+			// Invalid state history JSON
+			if ptr, ok := dest[8].(*string); ok {
+				*ptr = "not valid json"
+			}
+			// Set step statuses (4 steps)
+			for i := 9; i < 13; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = "pending"
 				}
 			}
-			// Valid timestamps JSON
-			if ptr, ok := dest[21].(*string); ok {
-				*ptr = "{}"
+			// Valid aggregate JSONs
+			if ptr, ok := dest[13].(*string); ok {
+				*ptr = string(buildsJSON)
 			}
-			// Invalid state history JSON
-			if ptr, ok := dest[22].(*string); ok {
-				*ptr = "not valid json"
+			if ptr, ok := dest[14].(*string); ok {
+				*ptr = string(unitTestsJSON)
 			}
 			return nil
 		},
@@ -645,7 +705,7 @@ func TestClickHouseStore_Load_InvalidStateHistoryJSON(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	_, err := store.Load(context.Background(), "test-corr-001")
 	if err == nil {
@@ -659,7 +719,7 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
 	if err != nil {
@@ -680,7 +740,7 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateStep(context.Background(), "test-corr-001", "builds_completed", "api", StepStatusCompleted)
 	if err != nil {
@@ -694,7 +754,7 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateComponentStatus(context.Background(), "test-corr-001", "api", "build", StepStatusCompleted)
 	if err != nil {
@@ -708,7 +768,7 @@ func TestClickHouseStore_AppendHistory_Success(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	entry := StateHistoryEntry{
 		Timestamp: time.Now(),
@@ -724,18 +784,27 @@ func TestClickHouseStore_AppendHistory_Success(t *testing.T) {
 }
 
 // createMockScanRowWithMatch creates a mock row for FindByCommits that includes matchedCommit.
+// Column layout for test config (4 steps, 2 aggregates) + matched_commit:
+// 0: correlation_id, 1: repository, 2: branch, 3: commit_sha
+// 4: created_at, 5: updated_at, 6: status
+// 7: step_details (JSON), 8: state_history (JSON)
+// 9-12: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
+// 13: builds (aggregate JSON), 14: unit_tests (aggregate JSON)
+// 15: matched_commit
 func createMockScanRowWithMatch(correlationID, repository, branch, commitSHA, matchedCommit string, status SlipStatus) *clickhousetest.MockRow {
 	now := time.Now()
-	componentsJSON, _ := json.Marshal([]Component{
-		{Name: "api", BuildStatus: StepStatusCompleted},
-	})
-	stepTimestampsJSON, _ := json.Marshal(map[string]map[string]string{})
+	stepDetailsJSON, _ := json.Marshal(map[string]map[string]interface{}{})
 	stateHistoryJSON, _ := json.Marshal([]StateHistoryEntry{})
+	buildsJSON, _ := json.Marshal([]ComponentStepData{
+		{Component: "api", Status: StepStatusCompleted},
+	})
+	unitTestsJSON, _ := json.Marshal([]ComponentStepData{})
 
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			if len(dest) < 24 {
-				return errors.New("not enough scan destinations for scanSlipWithMatch")
+			// Test config has 4 steps, 2 aggregates + matched_commit = 16 columns
+			if len(dest) < 16 {
+				return fmt.Errorf("not enough scan destinations for scanSlipWithMatch: got %d, want 16", len(dest))
 			}
 			// Set correlation_id
 			if ptr, ok := dest[0].(*string); ok {
@@ -765,26 +834,30 @@ func createMockScanRowWithMatch(correlationID, repository, branch, commitSHA, ma
 			if ptr, ok := dest[6].(*string); ok {
 				*ptr = string(status)
 			}
-			// Set components JSON
+			// Set step_details JSON
 			if ptr, ok := dest[7].(*string); ok {
-				*ptr = string(componentsJSON)
+				*ptr = string(stepDetailsJSON)
 			}
-			// Set step statuses (13 steps)
-			for i := 8; i < 21; i++ {
+			// Set state_history JSON
+			if ptr, ok := dest[8].(*string); ok {
+				*ptr = string(stateHistoryJSON)
+			}
+			// Set step statuses (4 steps)
+			for i := 9; i < 13; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = string(StepStatusPending)
 				}
 			}
-			// Set step_timestamps JSON
-			if ptr, ok := dest[21].(*string); ok {
-				*ptr = string(stepTimestampsJSON)
+			// Set builds aggregate JSON
+			if ptr, ok := dest[13].(*string); ok {
+				*ptr = string(buildsJSON)
 			}
-			// Set state_history JSON
-			if ptr, ok := dest[22].(*string); ok {
-				*ptr = string(stateHistoryJSON)
+			// Set unit_tests aggregate JSON
+			if ptr, ok := dest[14].(*string); ok {
+				*ptr = string(unitTestsJSON)
 			}
 			// Set matched_commit
-			if ptr, ok := dest[23].(*string); ok {
+			if ptr, ok := dest[15].(*string); ok {
 				*ptr = matchedCommit
 			}
 			return nil
@@ -798,7 +871,7 @@ func TestClickHouseStore_FindByCommits_Success(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	slip, matchedCommit, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{"abc123", "def456"})
 	if err != nil {
@@ -812,8 +885,8 @@ func TestClickHouseStore_FindByCommits_Success(t *testing.T) {
 	}
 }
 
-// TestClickHouseStore_FindByCommits_InvalidComponentsJSON tests invalid components JSON in FindByCommits.
-func TestClickHouseStore_FindByCommits_InvalidComponentsJSON(t *testing.T) {
+// TestClickHouseStore_FindByCommits_InvalidAggregateJSON tests that invalid aggregate JSON is handled gracefully in FindByCommits.
+func TestClickHouseStore_FindByCommits_InvalidAggregateJSON(t *testing.T) {
 	now := time.Now()
 	mockRow := &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
@@ -839,25 +912,30 @@ func TestClickHouseStore_FindByCommits_InvalidComponentsJSON(t *testing.T) {
 			if ptr, ok := dest[6].(*string); ok {
 				*ptr = "pending"
 			}
-			// Invalid JSON for components
+			// Valid step_details JSON
 			if ptr, ok := dest[7].(*string); ok {
-				*ptr = "not valid json"
+				*ptr = "{}"
 			}
-			// Set step statuses
-			for i := 8; i < 21; i++ {
+			// Valid state_history JSON
+			if ptr, ok := dest[8].(*string); ok {
+				*ptr = "[]"
+			}
+			// Set step statuses (4 steps)
+			for i := 9; i < 13; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = "pending"
 				}
 			}
-			// Valid JSON for timestamps and history
-			if ptr, ok := dest[21].(*string); ok {
-				*ptr = "{}"
+			// Invalid JSON for builds aggregate - should be handled gracefully
+			if ptr, ok := dest[13].(*string); ok {
+				*ptr = "not valid json"
 			}
-			if ptr, ok := dest[22].(*string); ok {
+			// Valid JSON for unit_tests aggregate
+			if ptr, ok := dest[14].(*string); ok {
 				*ptr = "[]"
 			}
 			// Matched commit
-			if ptr, ok := dest[23].(*string); ok {
+			if ptr, ok := dest[15].(*string); ok {
 				*ptr = "abc123"
 			}
 			return nil
@@ -866,18 +944,24 @@ func TestClickHouseStore_FindByCommits_InvalidComponentsJSON(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	_, _, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{"abc123"})
-	if err == nil {
-		t.Error("expected error for invalid components JSON, got nil")
+	slip, _, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{"abc123"})
+	// Invalid aggregate JSON should not cause an error
+	if err != nil {
+		t.Errorf("expected no error for invalid aggregate JSON, got %v", err)
+	}
+	// The builds aggregate should be empty due to invalid JSON
+	if slip != nil && len(slip.Aggregates["builds"]) != 0 {
+		t.Errorf("expected empty builds aggregate due to invalid JSON, got %d items", len(slip.Aggregates["builds"]))
 	}
 }
 
 // TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON tests invalid state history JSON in FindByCommits.
 func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 	now := time.Now()
-	componentsJSON, _ := json.Marshal([]Component{})
+	buildsJSON, _ := json.Marshal([]ComponentStepData{})
+	unitTestsJSON, _ := json.Marshal([]ComponentStepData{})
 	mockRow := &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
 			// Set required fields
@@ -902,26 +986,29 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 			if ptr, ok := dest[6].(*string); ok {
 				*ptr = "pending"
 			}
-			// Valid components JSON
+			// Valid step_details JSON
 			if ptr, ok := dest[7].(*string); ok {
-				*ptr = string(componentsJSON)
+				*ptr = "{}"
 			}
-			// Set step statuses
-			for i := 8; i < 21; i++ {
+			// Invalid state history JSON
+			if ptr, ok := dest[8].(*string); ok {
+				*ptr = "not valid json"
+			}
+			// Set step statuses (4 steps)
+			for i := 9; i < 13; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = "pending"
 				}
 			}
-			// Valid timestamps JSON
-			if ptr, ok := dest[21].(*string); ok {
-				*ptr = "{}"
+			// Valid aggregate JSONs
+			if ptr, ok := dest[13].(*string); ok {
+				*ptr = string(buildsJSON)
 			}
-			// Invalid state history JSON
-			if ptr, ok := dest[22].(*string); ok {
-				*ptr = "not valid json"
+			if ptr, ok := dest[14].(*string); ok {
+				*ptr = string(unitTestsJSON)
 			}
 			// Matched commit
-			if ptr, ok := dest[23].(*string); ok {
+			if ptr, ok := dest[15].(*string); ok {
 				*ptr = "abc123"
 			}
 			return nil
@@ -930,7 +1017,7 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	_, _, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{"abc123"})
 	if err == nil {
@@ -941,9 +1028,10 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 // TestClickHouseStore_Load_WithStepTimestamps tests parsing step timestamps from JSON.
 func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 	now := time.Now()
-	componentsJSON, _ := json.Marshal([]Component{})
-	// Create step timestamps with both started_at and completed_at
-	stepTimestampsJSON, _ := json.Marshal(map[string]map[string]string{
+	buildsJSON, _ := json.Marshal([]ComponentStepData{})
+	unitTestsJSON, _ := json.Marshal([]ComponentStepData{})
+	// Create step details with both started_at and completed_at
+	stepDetailsJSON, _ := json.Marshal(map[string]map[string]interface{}{
 		"push_parsed": {
 			"started_at":   now.Format(time.RFC3339Nano),
 			"completed_at": now.Format(time.RFC3339Nano),
@@ -977,19 +1065,26 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 			if ptr, ok := dest[6].(*string); ok {
 				*ptr = "pending"
 			}
+			// Set step_details JSON
 			if ptr, ok := dest[7].(*string); ok {
-				*ptr = string(componentsJSON)
+				*ptr = string(stepDetailsJSON)
 			}
-			for i := 8; i < 21; i++ {
+			// Set state_history JSON
+			if ptr, ok := dest[8].(*string); ok {
+				*ptr = string(stateHistoryJSON)
+			}
+			// Set step statuses (4 steps)
+			for i := 9; i < 13; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = "pending"
 				}
 			}
-			if ptr, ok := dest[21].(*string); ok {
-				*ptr = string(stepTimestampsJSON)
+			// Set aggregate JSONs
+			if ptr, ok := dest[13].(*string); ok {
+				*ptr = string(buildsJSON)
 			}
-			if ptr, ok := dest[22].(*string); ok {
-				*ptr = string(stateHistoryJSON)
+			if ptr, ok := dest[14].(*string); ok {
+				*ptr = string(unitTestsJSON)
 			}
 			return nil
 		},
@@ -997,7 +1092,7 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	slip, err := store.Load(context.Background(), "test-corr-001")
 	if err != nil {
@@ -1026,7 +1121,7 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 // TestClickHouseStore_Update_UpdatesTimestamp tests that Update sets UpdatedAt.
 func TestClickHouseStore_Update_UpdatesTimestamp(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	originalTime := time.Now().Add(-1 * time.Hour)
 	slip := &Slip{
@@ -1059,7 +1154,7 @@ func TestClickHouseStore_FindByCommits_QueryError(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
-	store := NewClickHouseStoreFromSession(mockSession)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	_, _, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{"abc123"})
 	if err == nil {

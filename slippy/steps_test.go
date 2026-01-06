@@ -264,7 +264,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 	t.Run("builds_completed - all success", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-agg-1",
@@ -274,9 +275,11 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "svc-a", BuildStatus: StepStatusCompleted},
-				{Name: "svc-b", BuildStatus: StepStatusCompleted},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {
+					{Component: "svc-a", Status: StepStatusCompleted},
+					{Component: "svc-b", Status: StepStatusCompleted},
+				},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -304,7 +307,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 	t.Run("builds_completed - one failed", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-agg-2",
@@ -314,9 +318,11 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "svc-a", BuildStatus: StepStatusCompleted},
-				{Name: "svc-b", BuildStatus: StepStatusFailed},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {
+					{Component: "svc-a", Status: StepStatusCompleted},
+					{Component: "svc-b", Status: StepStatusFailed},
+				},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -343,7 +349,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 	t.Run("builds_completed - still running", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-agg-3",
@@ -353,9 +360,11 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "svc-a", BuildStatus: StepStatusCompleted},
-				{Name: "svc-b", BuildStatus: StepStatusRunning}, // Still running
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {
+					{Component: "svc-a", Status: StepStatusCompleted},
+					{Component: "svc-b", Status: StepStatusRunning}, // Still running
+				},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -382,7 +391,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 	t.Run("unit_tests_completed aggregate", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-agg-4",
@@ -392,9 +402,11 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "svc-a", UnitTestStatus: StepStatusCompleted},
-				{Name: "svc-b", UnitTestStatus: StepStatusCompleted},
+			Aggregates: map[string][]ComponentStepData{
+				"unit_tests": {
+					{Component: "svc-a", Status: StepStatusCompleted},
+					{Component: "svc-b", Status: StepStatusCompleted},
+				},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -477,7 +489,8 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-img-1",
@@ -487,8 +500,10 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "my-service", DockerfilePath: "Dockerfile"},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {
+					{Component: "my-service"},
+				},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -504,15 +519,16 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			t.Fatal("expected Update to be called")
 		}
 		updatedSlip := store.UpdateCalls[0].Slip
-		if updatedSlip.Components[0].ImageTag != "mycarrier/my-service:abc123-1234567890" {
-			t.Errorf("expected image tag to be set, got '%s'", updatedSlip.Components[0].ImageTag)
+		if updatedSlip.Aggregates["builds"][0].ImageTag != "mycarrier/my-service:abc123-1234567890" {
+			t.Errorf("expected image tag to be set, got '%s'", updatedSlip.Aggregates["builds"][0].ImageTag)
 		}
 	})
 
 	t.Run("component not found", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		slip := &Slip{
 			CorrelationID: "corr-img-2",
@@ -522,8 +538,10 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
-			Components: []Component{
-				{Name: "other-service", DockerfilePath: "Dockerfile"},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {
+					{Component: "other-service"},
+				},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -543,7 +561,8 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 	t.Run("slip not found", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
 		err := client.SetComponentImageTag(ctx, "nonexistent", "my-service", "some:tag")
 		if err == nil {
@@ -568,7 +587,7 @@ func createTestSlip(correlationID string) *Slip {
 		CreatedAt:     now,
 		UpdatedAt:     now,
 		Status:        SlipStatusInProgress,
-		Components:    []Component{},
+		Aggregates:    map[string][]ComponentStepData{},
 		Steps:         make(map[string]Step),
 		StateHistory:  []StateHistoryEntry{},
 	}

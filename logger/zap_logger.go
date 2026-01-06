@@ -83,6 +83,12 @@ func (l *ZapLogger) Sugar() *zap.SugaredLogger {
 	return l.sugar
 }
 
+// Sync flushes any buffered log entries.
+// Applications should take care to call Sync before exiting.
+func (l *ZapLogger) Sync() error {
+	return l.sugar.Sync()
+}
+
 // logWithFields is a helper that converts map fields to zap's key-value pairs.
 func (l *ZapLogger) logWithFields(logFn func(string, ...interface{}), message string, fields map[string]interface{}) {
 	allFields := l.mergeFields(fields)
@@ -112,10 +118,4 @@ func (l *ZapLogger) mergeFields(fields map[string]interface{}) map[string]interf
 		result[k] = v
 	}
 	return result
-}
-
-// Sync flushes any buffered log entries.
-// Applications should take care to call Sync before exiting.
-func (l *ZapLogger) Sync() error {
-	return l.sugar.Sync()
 }

@@ -23,10 +23,20 @@ package slippytest
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/slippy"
 )
+
+// pluralize converts a singular step name to its plural form for column naming.
+// This matches the pluralize function in the slippy package.
+func pluralize(name string) string {
+	if strings.HasSuffix(name, "s") {
+		return name + "es"
+	}
+	return name + "s"
+}
 
 // MockStore is an in-memory implementation of slippy.SlipStore for testing.
 //
@@ -210,7 +220,11 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 }
 
 // FindByCommits finds a slip matching any commit in the ordered list.
-func (m *MockStore) FindByCommits(ctx context.Context, repository string, commits []string) (*slippy.Slip, string, error) {
+func (m *MockStore) FindByCommits(
+	ctx context.Context,
+	repository string,
+	commits []string,
+) (*slippy.Slip, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -257,7 +271,11 @@ func (m *MockStore) Update(ctx context.Context, slip *slippy.Slip) error {
 }
 
 // UpdateStep updates a specific step's status.
-func (m *MockStore) UpdateStep(ctx context.Context, correlationID, stepName, componentName string, status slippy.StepStatus) error {
+func (m *MockStore) UpdateStep(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status slippy.StepStatus,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -293,7 +311,11 @@ func (m *MockStore) UpdateStep(ctx context.Context, correlationID, stepName, com
 }
 
 // UpdateComponentStatus updates a component's build or test status.
-func (m *MockStore) UpdateComponentStatus(ctx context.Context, correlationID, componentName, stepType string, status slippy.StepStatus) error {
+func (m *MockStore) UpdateComponentStatus(
+	ctx context.Context,
+	correlationID, componentName, stepType string,
+	status slippy.StepStatus,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -317,16 +339,15 @@ func (m *MockStore) UpdateComponentStatus(ctx context.Context, correlationID, co
 		return slippy.ErrSlipNotFound
 	}
 
-	// Update the component status
-	for i, comp := range slip.Components {
-		if comp.Name == componentName {
-			switch stepType {
-			case "build":
-				slip.Components[i].BuildStatus = status
-			case "unit_test":
-				slip.Components[i].UnitTestStatus = status
+	// Update the component status in the Aggregates
+	// stepType is the component type (e.g., "build", "unit_test")
+	columnName := pluralize(stepType)
+	if componentData, ok := slip.Aggregates[columnName]; ok {
+		for i := range componentData {
+			if componentData[i].Component == componentName {
+				componentData[i].Status = status
+				return nil
 			}
-			return nil
 		}
 	}
 
@@ -422,17 +443,21 @@ func DeepCopySlip(slip *slippy.Slip) *slippy.Slip {
 		Status:        slip.Status,
 	}
 
-	// Deep copy components
-	if slip.Components != nil {
-		cpy.Components = make([]slippy.Component, len(slip.Components))
-		copy(cpy.Components, slip.Components)
-	}
-
 	// Deep copy steps map
 	if slip.Steps != nil {
 		cpy.Steps = make(map[string]slippy.Step, len(slip.Steps))
 		for k, v := range slip.Steps {
 			cpy.Steps[k] = v
+		}
+	}
+
+	// Deep copy aggregates
+	if slip.Aggregates != nil {
+		cpy.Aggregates = make(map[string][]slippy.ComponentStepData)
+		for k, v := range slip.Aggregates {
+			componentData := make([]slippy.ComponentStepData, len(v))
+			copy(componentData, v)
+			cpy.Aggregates[k] = componentData
 		}
 	}
 

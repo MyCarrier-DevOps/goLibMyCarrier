@@ -7,6 +7,7 @@ import (
 	"context"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
@@ -381,7 +382,11 @@ func (m *MockConn) Exec(ctx context.Context, query string, args ...any) error {
 }
 
 // PrepareBatch implements driver.Conn.PrepareBatch
-func (m *MockConn) PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error) {
+func (m *MockConn) PrepareBatch(
+	ctx context.Context,
+	query string,
+	opts ...driver.PrepareBatchOption,
+) (driver.Batch, error) {
 	if m.PrepareBatchFunc != nil {
 		return m.PrepareBatchFunc(ctx, query, opts...)
 	}
@@ -554,74 +559,120 @@ func (m *MockBatch) Columns() []driver.BatchColumn {
 
 // copyValue is a helper to copy values for Scan operations.
 // It handles common types used in ClickHouse queries.
-func copyValue(dest any, src any) {
+func copyValue(dest, src any) {
 	if src == nil {
 		return
 	}
+
+	// Try to copy using type-specific helpers
+	if copyIntTypes(dest, src) {
+		return
+	}
+	if copyUintTypes(dest, src) {
+		return
+	}
+	if copyOtherTypes(dest, src) {
+		return
+	}
+}
+
+// copyIntTypes handles signed integer types.
+func copyIntTypes(dest, src any) bool {
 	switch d := dest.(type) {
-	case *string:
-		if s, ok := src.(string); ok {
-			*d = s
-		}
 	case *int:
 		if i, ok := src.(int); ok {
 			*d = i
+			return true
 		}
 	case *int8:
 		if i, ok := src.(int8); ok {
 			*d = i
+			return true
 		}
 	case *int16:
 		if i, ok := src.(int16); ok {
 			*d = i
+			return true
 		}
 	case *int32:
 		if i, ok := src.(int32); ok {
 			*d = i
+			return true
 		}
 	case *int64:
 		if i, ok := src.(int64); ok {
 			*d = i
+			return true
 		}
+	}
+	return false
+}
+
+// copyUintTypes handles unsigned integer types.
+func copyUintTypes(dest, src any) bool {
+	switch d := dest.(type) {
 	case *uint:
 		if i, ok := src.(uint); ok {
 			*d = i
+			return true
 		}
 	case *uint8:
 		if i, ok := src.(uint8); ok {
 			*d = i
+			return true
 		}
 	case *uint16:
 		if i, ok := src.(uint16); ok {
 			*d = i
+			return true
 		}
 	case *uint32:
 		if i, ok := src.(uint32); ok {
 			*d = i
+			return true
 		}
 	case *uint64:
 		if i, ok := src.(uint64); ok {
 			*d = i
+			return true
+		}
+	}
+	return false
+}
+
+// copyOtherTypes handles string, float, bool, and other types.
+func copyOtherTypes(dest, src any) bool {
+	switch d := dest.(type) {
+	case *string:
+		if s, ok := src.(string); ok {
+			*d = s
+			return true
 		}
 	case *float32:
 		if f, ok := src.(float32); ok {
 			*d = f
+			return true
 		}
 	case *float64:
 		if f, ok := src.(float64); ok {
 			*d = f
+			return true
 		}
 	case *bool:
 		if b, ok := src.(bool); ok {
 			*d = b
+			return true
 		}
 	case *[]byte:
 		if b, ok := src.([]byte); ok {
 			*d = b
+			return true
 		}
 	case *any:
 		*d = src
+		return true
 	}
+	return false
 }
 
 // Compile-time interface assertions

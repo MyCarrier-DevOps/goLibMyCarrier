@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator"
 )
 
@@ -22,6 +23,10 @@ type MigrateOptions struct {
 
 	// Database to use for migrations. Defaults to "ci".
 	Database string
+
+	// PipelineConfig defines the pipeline steps for dynamic schema generation.
+	// Required for dynamic migrations.
+	PipelineConfig *PipelineConfig
 }
 
 // MigrateResult contains information about the migration run.
@@ -41,7 +46,13 @@ type MigrateResult struct {
 
 // RunMigrations ensures the slippy schema is up to date.
 // It creates the schema_version table if needed and applies any pending migrations.
+// A PipelineConfig is required to generate the dynamic schema.
 func RunMigrations(ctx context.Context, conn driver.Conn, opts MigrateOptions) (*MigrateResult, error) {
+	// Validate required config
+	if opts.PipelineConfig == nil {
+		return nil, fmt.Errorf("PipelineConfig is required for migrations")
+	}
+
 	// Set defaults
 	if opts.Database == "" {
 		opts.Database = "ci"
@@ -55,11 +66,17 @@ func RunMigrations(ctx context.Context, conn driver.Conn, opts MigrateOptions) (
 		return nil, fmt.Errorf("failed to ensure database exists: %w", err)
 	}
 
+	// Get dynamic migrations from pipeline config
+	migrations, err := GetDynamicMigrations(ctx, conn, opts.PipelineConfig, opts.Database, opts.Logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dynamic migrations: %w", err)
+	}
+
 	// Create the migrator with slippy-specific table prefix
 	migrator, err := clickhousemigrator.NewMigrator(
 		conn,
 		opts.Logger,
-		clickhousemigrator.WithMigrations(SlippyMigrations()),
+		clickhousemigrator.WithMigrations(migrations),
 		clickhousemigrator.WithDatabase(opts.Database),
 		clickhousemigrator.WithTablePrefix("slippy"), // Creates slippy_schema_version table
 	)
@@ -81,7 +98,7 @@ func RunMigrations(ctx context.Context, conn driver.Conn, opts MigrateOptions) (
 	// Determine target version
 	targetVersion := opts.TargetVersion
 	if targetVersion == 0 {
-		targetVersion = GetLatestMigrationVersion()
+		targetVersion = GetDynamicMigrationVersion(opts.PipelineConfig)
 	}
 
 	result := &MigrateResult{
@@ -90,11 +107,12 @@ func RunMigrations(ctx context.Context, conn driver.Conn, opts MigrateOptions) (
 	}
 
 	// Determine direction
-	if targetVersion > startVersion {
+	switch {
+	case targetVersion > startVersion:
 		result.Direction = "up"
-	} else if targetVersion < startVersion {
+	case targetVersion < startVersion:
 		result.Direction = "down"
-	} else {
+	default:
 		result.Direction = "none"
 		opts.Logger.Info(ctx, "Schema is already at target version", map[string]interface{}{
 			"target_version": targetVersion,
@@ -139,15 +157,25 @@ func RunMigrations(ctx context.Context, conn driver.Conn, opts MigrateOptions) (
 }
 
 // ValidateSchema checks that all required tables and views exist.
-func ValidateSchema(ctx context.Context, conn driver.Conn, database string) error {
+// A PipelineConfig is required to know which schema elements to validate.
+func ValidateSchema(ctx context.Context, conn driver.Conn, config *PipelineConfig, database string) error {
+	if config == nil {
+		return fmt.Errorf("PipelineConfig is required for schema validation")
+	}
 	if database == "" {
 		database = "ci"
+	}
+
+	// Get dynamic migrations from pipeline config
+	migrations, err := GetDynamicMigrations(ctx, conn, config, database, nil)
+	if err != nil {
+		return fmt.Errorf("failed to get dynamic migrations: %w", err)
 	}
 
 	migrator, err := clickhousemigrator.NewMigrator(
 		conn,
 		nil, // Use NopLogger
-		clickhousemigrator.WithMigrations(SlippyMigrations()),
+		clickhousemigrator.WithMigrations(migrations),
 		clickhousemigrator.WithDatabase(database),
 		clickhousemigrator.WithTablePrefix("slippy"),
 	)
@@ -164,10 +192,11 @@ func GetCurrentSchemaVersion(ctx context.Context, conn driver.Conn, database str
 		database = "ci"
 	}
 
+	// Use empty migrations - we just need to query the schema version table
 	migrator, err := clickhousemigrator.NewMigrator(
 		conn,
 		nil, // Use NopLogger
-		clickhousemigrator.WithMigrations(SlippyMigrations()),
+		clickhousemigrator.WithMigrations([]clickhousemigrator.Migration{}),
 		clickhousemigrator.WithDatabase(database),
 		clickhousemigrator.WithTablePrefix("slippy"),
 	)
@@ -179,15 +208,30 @@ func GetCurrentSchemaVersion(ctx context.Context, conn driver.Conn, database str
 }
 
 // GetPendingMigrations returns the list of migrations that have not yet been applied.
-func GetPendingMigrations(ctx context.Context, conn driver.Conn, database string) ([]clickhousemigrator.Migration, error) {
+// A PipelineConfig is required to know which migrations should exist.
+func GetPendingMigrations(
+	ctx context.Context,
+	conn driver.Conn,
+	config *PipelineConfig,
+	database string,
+) ([]clickhousemigrator.Migration, error) {
+	if config == nil {
+		return nil, fmt.Errorf("PipelineConfig is required for pending migrations")
+	}
 	if database == "" {
 		database = "ci"
+	}
+
+	// Get dynamic migrations from pipeline config
+	migrations, err := GetDynamicMigrations(ctx, conn, config, database, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get dynamic migrations: %w", err)
 	}
 
 	migrator, err := clickhousemigrator.NewMigrator(
 		conn,
 		nil, // Use NopLogger
-		clickhousemigrator.WithMigrations(SlippyMigrations()),
+		clickhousemigrator.WithMigrations(migrations),
 		clickhousemigrator.WithDatabase(database),
 		clickhousemigrator.WithTablePrefix("slippy"),
 	)

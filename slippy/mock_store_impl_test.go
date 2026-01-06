@@ -331,8 +331,8 @@ func TestMockStore_UpdateComponentStatus(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{
 			CorrelationID: "test",
-			Components: []Component{
-				{Name: "api", BuildStatus: StepStatusPending},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {{Component: "api", Status: StepStatusPending}},
 			},
 		})
 
@@ -342,8 +342,8 @@ func TestMockStore_UpdateComponentStatus(t *testing.T) {
 		}
 
 		// Verify component was updated
-		comp := store.Slips["test"].Components[0]
-		if comp.BuildStatus != StepStatusCompleted {
+		comp := store.Slips["test"].Aggregates["builds"][0]
+		if comp.Status != StepStatusCompleted {
 			t.Error("Component build status not updated")
 		}
 
@@ -357,8 +357,8 @@ func TestMockStore_UpdateComponentStatus(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{
 			CorrelationID: "test",
-			Components: []Component{
-				{Name: "api", UnitTestStatus: StepStatusPending},
+			Aggregates: map[string][]ComponentStepData{
+				"unit_tests": {{Component: "api", Status: StepStatusPending}},
 			},
 		})
 
@@ -368,8 +368,8 @@ func TestMockStore_UpdateComponentStatus(t *testing.T) {
 		}
 
 		// Verify component was updated
-		comp := store.Slips["test"].Components[0]
-		if comp.UnitTestStatus != StepStatusCompleted {
+		comp := store.Slips["test"].Aggregates["unit_tests"][0]
+		if comp.Status != StepStatusCompleted {
 			t.Error("Component unit_test status not updated")
 		}
 	})
@@ -388,7 +388,9 @@ func TestMockStore_UpdateComponentStatus(t *testing.T) {
 		store.UpdateComponentError = errors.New("component error")
 		store.AddSlip(&Slip{
 			CorrelationID: "test",
-			Components:    []Component{{Name: "api"}},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {{Component: "api", Status: StepStatusPending}},
+			},
 		})
 
 		err := store.UpdateComponentStatus(ctx, "test", "api", "build", StepStatusCompleted)

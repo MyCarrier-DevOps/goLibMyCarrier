@@ -2,8 +2,17 @@ package slippy
 
 import (
 	"context"
+	"strings"
 	"sync"
 )
+
+// pluralizeMock converts a singular step name to its plural form for column naming.
+func pluralizeMock(name string) string {
+	if strings.HasSuffix(name, "s") {
+		return name + "es"
+	}
+	return name + "s"
+}
 
 // MockStore is an in-memory implementation of SlipStore for testing.
 // It provides configurable behavior and tracking of method calls.
@@ -283,16 +292,14 @@ func (m *MockStore) UpdateComponentStatus(ctx context.Context, correlationID, co
 		return ErrSlipNotFound
 	}
 
-	// Update the component status
-	for i, comp := range slip.Components {
-		if comp.Name == componentName {
-			switch stepType {
-			case "build":
-				slip.Components[i].BuildStatus = status
-			case "unit_test":
-				slip.Components[i].UnitTestStatus = status
+	// Update the component status in Aggregates
+	columnName := pluralizeMock(stepType)
+	if componentData, ok := slip.Aggregates[columnName]; ok {
+		for i := range componentData {
+			if componentData[i].Component == componentName {
+				componentData[i].Status = status
+				return nil
 			}
-			return nil
 		}
 	}
 
@@ -375,7 +382,7 @@ func deepCopySlip(slip *Slip) *Slip {
 		return nil
 	}
 
-	copy := &Slip{
+	cpy := &Slip{
 		CorrelationID: slip.CorrelationID,
 		Repository:    slip.Repository,
 		Branch:        slip.Branch,
@@ -385,31 +392,33 @@ func deepCopySlip(slip *Slip) *Slip {
 		Status:        slip.Status,
 	}
 
-	// Deep copy components
-	if slip.Components != nil {
-		copy.Components = make([]Component, len(slip.Components))
-		for i, comp := range slip.Components {
-			copy.Components[i] = comp
+	// Deep copy steps map
+	if slip.Steps != nil {
+		cpy.Steps = make(map[string]Step, len(slip.Steps))
+		for k, v := range slip.Steps {
+			cpy.Steps[k] = v
 		}
 	}
 
-	// Deep copy steps map
-	if slip.Steps != nil {
-		copy.Steps = make(map[string]Step, len(slip.Steps))
-		for k, v := range slip.Steps {
-			copy.Steps[k] = v
+	// Deep copy aggregates
+	if slip.Aggregates != nil {
+		cpy.Aggregates = make(map[string][]ComponentStepData)
+		for k, v := range slip.Aggregates {
+			componentData := make([]ComponentStepData, len(v))
+			copy(componentData, v)
+			cpy.Aggregates[k] = componentData
 		}
 	}
 
 	// Deep copy state history
 	if slip.StateHistory != nil {
-		copy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
+		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
 		for i, entry := range slip.StateHistory {
-			copy.StateHistory[i] = entry
+			cpy.StateHistory[i] = entry
 		}
 	}
 
-	return copy
+	return cpy
 }
 
 // Ensure MockStore implements SlipStore.

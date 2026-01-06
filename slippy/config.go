@@ -17,6 +17,12 @@ type Config struct {
 	// or construct manually with hostname, port, username, password, database, and skipVerify.
 	ClickHouseConfig *ch.ClickhouseConfig
 
+	// PipelineConfig holds the pipeline step configuration.
+	// This defines all steps, their prerequisites, and aggregation relationships.
+	// Load via LoadPipelineConfig() from SLIPPY_PIPELINE_CONFIG env var,
+	// or LoadPipelineConfigFromFile() for a specific file path.
+	PipelineConfig *PipelineConfig
+
 	// GitHubAppID is the GitHub App ID for authentication
 	GitHubAppID int64
 
@@ -41,6 +47,9 @@ type Config struct {
 
 	// AncestryDepth is how many commits to check for slip resolution (default: 20)
 	AncestryDepth int
+
+	// Database is the ClickHouse database name (default: "ci")
+	Database string
 }
 
 // DefaultConfig returns a Config with sensible default values.
@@ -49,6 +58,7 @@ func DefaultConfig() Config {
 		HoldTimeout:   60 * time.Minute,
 		PollInterval:  60 * time.Second,
 		AncestryDepth: 20,
+		Database:      "ci",
 	}
 }
 
@@ -56,6 +66,7 @@ func DefaultConfig() Config {
 // Environment variables:
 //   - CLICKHOUSE_HOSTNAME, CLICKHOUSE_PORT, CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
 //     CLICKHOUSE_DATABASE, CLICKHOUSE_SKIP_VERIFY: ClickHouse connection settings
+//   - SLIPPY_PIPELINE_CONFIG: Pipeline configuration (file path or raw JSON)
 //   - SLIPPY_GITHUB_APP_ID: GitHub App ID
 //   - SLIPPY_GITHUB_APP_PRIVATE_KEY: Private key (PEM content or file path)
 //   - SLIPPY_GITHUB_ENTERPRISE_URL: GitHub Enterprise base URL (optional)
@@ -63,12 +74,18 @@ func DefaultConfig() Config {
 //   - SLIPPY_POLL_INTERVAL: Interval between prereq checks (e.g., "60s")
 //   - SLIPPY_SHADOW_MODE: Set to "true" for shadow mode
 //   - SLIPPY_ANCESTRY_DEPTH: Number of commits to check (default: 20)
+//   - SLIPPY_DATABASE: ClickHouse database name (default: "ci")
 func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
 
 	// ClickHouse - use the standard clickhouse config loader
 	if chConfig, err := ch.ClickhouseLoadConfig(); err == nil {
 		cfg.ClickHouseConfig = chConfig
+	}
+
+	// Pipeline configuration
+	if pipelineConfig, err := LoadPipelineConfig(); err == nil {
+		cfg.PipelineConfig = pipelineConfig
 	}
 
 	// GitHub App authentication
@@ -95,6 +112,10 @@ func ConfigFromEnv() Config {
 		}
 	}
 
+	if database := os.Getenv("SLIPPY_DATABASE"); database != "" {
+		cfg.Database = database
+	}
+
 	return cfg
 }
 
@@ -105,7 +126,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("%w: ClickHouseConfig is required", ErrInvalidConfiguration)
 	}
 	if err := ch.ClickhouseValidateConfig(c.ClickHouseConfig); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidConfiguration, err)
+		return fmt.Errorf("%w: %w", ErrInvalidConfiguration, err)
+	}
+	if c.PipelineConfig == nil {
+		return fmt.Errorf("%w: PipelineConfig is required (set SLIPPY_PIPELINE_CONFIG)", ErrInvalidConfiguration)
 	}
 	if c.GitHubAppID == 0 {
 		return fmt.Errorf("%w: GitHubAppID is required", ErrInvalidConfiguration)
@@ -125,6 +149,18 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// ValidateMinimal checks only the minimum required configuration.
+// This is useful when not all features are needed (e.g., GitHub auth for tests).
+func (c Config) ValidateMinimal() error {
+	if c.ClickHouseConfig == nil {
+		return fmt.Errorf("%w: ClickHouseConfig is required", ErrInvalidConfiguration)
+	}
+	if c.PipelineConfig == nil {
+		return fmt.Errorf("%w: PipelineConfig is required", ErrInvalidConfiguration)
+	}
+	return nil
+}
+
 // WithLogger returns a copy of the config with the specified logger.
 func (c Config) WithLogger(logger Logger) Config {
 	c.Logger = logger
@@ -134,6 +170,18 @@ func (c Config) WithLogger(logger Logger) Config {
 // WithShadowMode returns a copy of the config with shadow mode enabled.
 func (c Config) WithShadowMode(enabled bool) Config {
 	c.ShadowMode = enabled
+	return c
+}
+
+// WithPipelineConfig returns a copy of the config with the specified pipeline config.
+func (c Config) WithPipelineConfig(pipelineConfig *PipelineConfig) Config {
+	c.PipelineConfig = pipelineConfig
+	return c
+}
+
+// WithDatabase returns a copy of the config with the specified database name.
+func (c Config) WithDatabase(database string) Config {
+	c.Database = database
 	return c
 }
 

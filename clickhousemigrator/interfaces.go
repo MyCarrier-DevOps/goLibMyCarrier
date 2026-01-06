@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/logger"
 )
 

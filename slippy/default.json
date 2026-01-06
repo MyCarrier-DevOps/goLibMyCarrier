@@ -1,0 +1,75 @@
+{
+  "version": "1.0",
+  "name": "mycarrier-ci-pipeline",
+  "description": "MyCarrier CI/CD pipeline configuration for routing slip orchestration",
+  "steps": [
+    {
+      "name": "push_parsed",
+      "description": "Initial push event processing - parses webhook and creates routing slip",
+      "prerequisites": []
+    },
+    {
+      "name": "builds_completed",
+      "description": "All component container builds finished successfully",
+      "prerequisites": ["push_parsed"],
+      "aggregates": "build"
+    },
+    {
+      "name": "unit_tests_completed",
+      "description": "All component unit tests finished successfully",
+      "prerequisites": ["push_parsed"],
+      "aggregates": "unit_test"
+    },
+    {
+      "name": "secret_scan_completed",
+      "description": "Security secret scanning finished - checks for leaked credentials",
+      "prerequisites": ["push_parsed"]
+    },
+    {
+      "name": "dev_deploy",
+      "description": "Deployment to development environment via GitOps",
+      "prerequisites": ["builds_completed", "unit_tests_completed", "secret_scan_completed"]
+    },
+    {
+      "name": "dev_tests",
+      "description": "Integration and smoke tests in development environment",
+      "prerequisites": ["dev_deploy"]
+    },
+    {
+      "name": "preprod_deploy",
+      "description": "Deployment to pre-production environment via GitOps",
+      "prerequisites": ["dev_tests"]
+    },
+    {
+      "name": "preprod_tests",
+      "description": "Integration and smoke tests in pre-production environment",
+      "prerequisites": ["preprod_deploy"]
+    },
+    {
+      "name": "prod_release_created",
+      "description": "GitHub release created for production deployment",
+      "prerequisites": ["preprod_tests"]
+    },
+    {
+      "name": "prod_deploy",
+      "description": "Deployment to production environment via GitOps",
+      "prerequisites": ["prod_release_created"]
+    },
+    {
+      "name": "prod_tests",
+      "description": "Smoke tests in production environment",
+      "prerequisites": ["prod_deploy"]
+    },
+    {
+      "name": "alert_gate",
+      "description": "Alert monitoring gate - verifies no anomalies in monitoring systems",
+      "prerequisites": ["prod_tests"],
+      "is_gate": true
+    },
+    {
+      "name": "prod_steady_state",
+      "description": "Production confirmed stable - pipeline complete",
+      "prerequisites": ["alert_gate"]
+    }
+  ]
+}

@@ -33,7 +33,12 @@ func (c *Client) AppendHistoryEntry(ctx context.Context, correlationID string, e
 // RecordTransition records a state transition with the given parameters.
 // This is a convenience method for common state changes.
 // The correlationID is the unique identifier for the routing slip.
-func (c *Client) RecordTransition(ctx context.Context, correlationID, stepName, componentName string, status StepStatus, message string) error {
+func (c *Client) RecordTransition(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status StepStatus,
+	message string,
+) error {
 	entry := StateHistoryEntry{
 		Step:      stepName,
 		Component: componentName,
@@ -75,7 +80,10 @@ func (c *Client) GetStepHistory(ctx context.Context, correlationID, stepName str
 
 // GetComponentHistory retrieves history entries for a specific component.
 // The correlationID is the unique identifier for the routing slip.
-func (c *Client) GetComponentHistory(ctx context.Context, correlationID, componentName string) ([]StateHistoryEntry, error) {
+func (c *Client) GetComponentHistory(
+	ctx context.Context,
+	correlationID, componentName string,
+) ([]StateHistoryEntry, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return nil, NewSlipError("get component history", correlationID, err)
@@ -109,7 +117,11 @@ func (c *Client) GetRecentHistory(ctx context.Context, correlationID string, lim
 
 // GetHistorySince retrieves history entries since a given timestamp.
 // The correlationID is the unique identifier for the routing slip.
-func (c *Client) GetHistorySince(ctx context.Context, correlationID string, since time.Time) ([]StateHistoryEntry, error) {
+func (c *Client) GetHistorySince(
+	ctx context.Context,
+	correlationID string,
+	since time.Time,
+) ([]StateHistoryEntry, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return nil, NewSlipError("get history since", correlationID, err)

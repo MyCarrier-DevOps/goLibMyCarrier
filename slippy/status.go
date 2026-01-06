@@ -35,8 +35,11 @@ func (s SlipStatus) IsTerminal() bool {
 	switch s {
 	case SlipStatusCompleted, SlipStatusFailed, SlipStatusCompensated:
 		return true
+	case SlipStatusPending, SlipStatusInProgress, SlipStatusCompensating:
+		return false
+	default:
+		return false
 	}
-	return false
 }
 
 // StepStatus represents the status of an individual pipeline step.
@@ -84,8 +87,11 @@ func (s StepStatus) IsTerminal() bool {
 	case StepStatusCompleted, StepStatusFailed, StepStatusError,
 		StepStatusAborted, StepStatusTimeout, StepStatusSkipped:
 		return true
+	case StepStatusPending, StepStatusHeld, StepStatusRunning:
+		return false
+	default:
+		return false
 	}
-	return false
 }
 
 // IsSuccess returns true if the step status indicates success
@@ -100,8 +106,13 @@ func (s StepStatus) IsFailure() bool {
 	switch s {
 	case StepStatusFailed, StepStatusError, StepStatusAborted, StepStatusTimeout:
 		return true
+	case StepStatusPending, StepStatusHeld, StepStatusRunning:
+		return false
+	case StepStatusCompleted, StepStatusSkipped:
+		return false
+	default:
+		return false
 	}
-	return false
 }
 
 // IsRunning returns true if the step is actively executing or held.

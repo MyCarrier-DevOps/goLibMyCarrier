@@ -166,6 +166,17 @@ func TestConfig_Validate(t *testing.T) {
 		ChSkipVerify: "true",
 	}
 
+	// Helper to create a valid PipelineConfig for tests
+	validPipelineConfig := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline",
+		Steps: []StepConfig{
+			{Name: "push_parsed", Description: "Push parsed"},
+			{Name: "builds_completed", Description: "Builds completed", Prerequisites: []string{"push_parsed"}},
+		},
+	}
+
 	tests := []struct {
 		name      string
 		config    Config
@@ -176,6 +187,7 @@ func TestConfig_Validate(t *testing.T) {
 			name: "valid config",
 			config: Config{
 				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key-content",
 				HoldTimeout:      time.Minute,
@@ -187,6 +199,20 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "missing ClickHouseConfig",
 			config: Config{
+				PipelineConfig:   validPipelineConfig,
+				GitHubAppID:      12345,
+				GitHubPrivateKey: "key",
+				HoldTimeout:      time.Minute,
+				PollInterval:     time.Second,
+				AncestryDepth:    10,
+			},
+			wantError: true,
+			errorIs:   ErrInvalidConfiguration,
+		},
+		{
+			name: "missing PipelineConfig",
+			config: Config{
+				ClickHouseConfig: validCHConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
@@ -200,6 +226,7 @@ func TestConfig_Validate(t *testing.T) {
 			name: "missing GitHubAppID",
 			config: Config{
 				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
@@ -212,6 +239,7 @@ func TestConfig_Validate(t *testing.T) {
 			name: "missing GitHubPrivateKey",
 			config: Config{
 				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
 				GitHubAppID:      12345,
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
@@ -224,6 +252,7 @@ func TestConfig_Validate(t *testing.T) {
 			name: "zero HoldTimeout",
 			config: Config{
 				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      0,
@@ -237,6 +266,7 @@ func TestConfig_Validate(t *testing.T) {
 			name: "negative HoldTimeout",
 			config: Config{
 				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      -time.Minute,
@@ -250,6 +280,7 @@ func TestConfig_Validate(t *testing.T) {
 			name: "zero PollInterval",
 			config: Config{
 				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
@@ -263,6 +294,7 @@ func TestConfig_Validate(t *testing.T) {
 			name: "zero AncestryDepth",
 			config: Config{
 				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
 				GitHubAppID:      12345,
 				GitHubPrivateKey: "key",
 				HoldTimeout:      time.Minute,
