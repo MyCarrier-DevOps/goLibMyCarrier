@@ -9,6 +9,7 @@ Slippy is a Go library that provides **routing slip** functionality for CI/CD pi
 - [Core Concepts](#core-concepts)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Pipeline Configuration](#pipeline-configuration)
 - [Quick Start](#quick-start)
 - [Pipeline Stages](#pipeline-stages)
 - [Usage Patterns](#usage-patterns)
@@ -245,32 +246,37 @@ A `Slip` represents the complete state of a pipeline execution:
 
 ```go
 type Slip struct {
-    CorrelationID string              // Unique identifier
-    Repository    string              // Full repo name (owner/repo)
-    Branch        string              // Git branch
-    CommitSHA     string              // Full git commit SHA
-    Status        SlipStatus          // Overall status
-    Components    []Component         // Buildable components
-    Steps         map[string]Step     // Pipeline step states
-    StateHistory  []StateHistoryEntry // Audit trail
+    CorrelationID string                           // Unique identifier
+    Repository    string                           // Full repo name (owner/repo)
+    Branch        string                           // Git branch
+    CommitSHA     string                           // Full git commit SHA
+    Status        SlipStatus                       // Overall status
+    Steps         map[string]Step                  // Pipeline step states
+    Aggregates    map[string][]ComponentStepData   // Per-component data for aggregate steps
+    StateHistory  []StateHistoryEntry              // Audit trail
     CreatedAt     time.Time
     UpdatedAt     time.Time
 }
 ```
 
-### Components
+### Aggregates and Component Tracking
 
-Components represent individual buildable units within a repository (typically Docker images):
+Aggregate steps (like `builds_completed`) track per-component progress. The `Aggregates` map holds component-level data:
 
 ```go
-type Component struct {
-    Name           string     // Unique identifier (e.g., "api", "worker")
-    DockerfilePath string     // Path to Dockerfile
-    BuildStatus    StepStatus // Current build status
-    UnitTestStatus StepStatus // Current test status
-    ImageTag       string     // Resulting image tag
+type ComponentStepData struct {
+    Component      string     // Unique identifier (e.g., "api", "worker")
+    DockerfilePath string     // Path to Dockerfile (for builds)
+    Status         StepStatus // Current status for this component's step
+    StartedAt      *time.Time // When this component's step began
+    CompletedAt    *time.Time // When this component's step finished
+    Actor          string     // System/user that performed this step
+    Error          string     // Error details if failed
+    ImageTag       string     // Container image tag (for build steps)
 }
 ```
+
+When all components in an aggregate complete, the parent step (e.g., `builds_completed`) is automatically updated.
 
 ### Steps
 
@@ -310,6 +316,8 @@ Slippy can be configured via environment variables:
 | `CLICKHOUSE_PASSWORD` | ClickHouse password | required |
 | `CLICKHOUSE_DATABASE` | ClickHouse database | required |
 | `CLICKHOUSE_SKIP_VERIFY` | Skip TLS verification | `false` |
+| `SLIPPY_PIPELINE_CONFIG` | Pipeline configuration (file path or raw JSON) | required |
+| `SLIPPY_DATABASE` | ClickHouse database name for slippy tables | `ci` |
 | `SLIPPY_GITHUB_APP_ID` | GitHub App ID | required |
 | `SLIPPY_GITHUB_APP_PRIVATE_KEY` | GitHub App private key (PEM content or path) | required |
 | `SLIPPY_GITHUB_ENTERPRISE_URL` | GitHub Enterprise base URL | empty (uses github.com) |
@@ -332,9 +340,16 @@ if err != nil {
     log.Fatal(err)
 }
 
+// Load pipeline configuration (from file or environment)
+pipelineConfig, err := slippy.LoadPipelineConfig()
+if err != nil {
+    log.Fatal(err)
+}
+
 // Create slippy config
 config := slippy.Config{
     ClickHouseConfig:    chConfig,
+    PipelineConfig:      pipelineConfig,
     GitHubAppID:         123456,
     GitHubPrivateKey:    "/path/to/private-key.pem",
     GitHubEnterpriseURL: "https://github.mycompany.com", // optional
@@ -342,6 +357,7 @@ config := slippy.Config{
     PollInterval:        30 * time.Second,
     AncestryDepth:       20,
     ShadowMode:          false,
+    Database:            "ci",
 }
 
 // Create client
@@ -351,6 +367,98 @@ if err != nil {
 }
 defer client.Close()
 ```
+
+---
+
+## Pipeline Configuration
+
+Slippy uses a JSON configuration to define the pipeline steps, their prerequisites, and aggregation relationships. This makes the library flexible and unopinionated about the specific CI/CD workflow being tracked.
+
+### Configuration Loading
+
+Pipeline configuration can be loaded from:
+- A file path (if the environment variable looks like a path)
+- Raw JSON content (if the environment variable contains JSON)
+
+```go
+// From environment variable SLIPPY_PIPELINE_CONFIG
+pipelineConfig, err := slippy.LoadPipelineConfig()
+
+// From a specific file
+pipelineConfig, err := slippy.LoadPipelineConfigFromFile("/path/to/pipeline.json")
+
+// From a string (JSON or file path)
+pipelineConfig, err := slippy.LoadPipelineConfigFromString(configValue)
+```
+
+### Configuration Schema
+
+```json
+{
+  "version": "1.0",
+  "name": "my-pipeline",
+  "description": "Description of your CI/CD pipeline",
+  "steps": [
+    {
+      "name": "push_parsed",
+      "description": "Initial push event processing",
+      "prerequisites": []
+    },
+    {
+      "name": "builds_completed",
+      "description": "All component builds finished",
+      "prerequisites": ["push_parsed"],
+      "aggregates": "build"
+    },
+    {
+      "name": "dev_deploy",
+      "description": "Deploy to development",
+      "prerequisites": ["builds_completed", "unit_tests_completed"],
+      "is_gate": false
+    }
+  ]
+}
+```
+
+### Step Configuration Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | ✅ | Unique identifier for the step (used in column names) |
+| `description` | string | ❌ | Human-readable description |
+| `prerequisites` | string[] | ✅ | Step names that must complete before this step |
+| `aggregates` | string | ❌ | Component-level step name this step aggregates |
+| `is_gate` | bool | ❌ | If true, this step's status is an implicit prerequisite for subsequent steps |
+
+### Aggregate Steps
+
+Aggregate steps automatically track per-component progress. When you define:
+
+```json
+{
+  "name": "builds_completed",
+  "aggregates": "build"
+}
+```
+
+Slippy will:
+1. Create a JSON column `builds` (pluralized) for per-component tracking
+2. Automatically update `builds_completed` when all components finish
+3. Mark it completed if all succeed, or failed if any fail
+
+### Gate Steps
+
+Steps marked with `is_gate: true` act as checkpoints. If a gate fails, subsequent steps are automatically blocked.
+
+### Validation Rules
+
+The configuration is validated on load:
+- Must have at least one step
+- First step must have no prerequisites
+- No duplicate step names
+- All prerequisites must reference valid steps
+- No circular dependencies
+- Each aggregate name can only be used once
 
 ---
 
@@ -400,13 +508,13 @@ func main() {
 
 ## Pipeline Stages
 
-Slippy tracks the following standard pipeline stages:
+The default MyCarrier pipeline configuration (`default.json`) tracks the following stages. Your pipeline configuration may differ based on your specific workflow needs.
 
 | Stage | Step Name | Description |
 |-------|-----------|-------------|
 | Push Parsing | `push_parsed` | Initial commit processing |
-| Build | `builds_completed` | All component builds done |
-| Unit Tests | `unit_tests_completed` | All unit tests passed |
+| Build | `builds_completed` | All component builds done (aggregates `build`) |
+| Unit Tests | `unit_tests_completed` | All unit tests passed (aggregates `unit_test`) |
 | Secret Scan | `secret_scan_completed` | Security scanning passed |
 | Dev Deploy | `dev_deploy` | Deployed to dev environment |
 | Dev Tests | `dev_tests` | Dev environment tests passed |
@@ -415,7 +523,7 @@ Slippy tracks the following standard pipeline stages:
 | Prod Release | `prod_release_created` | Production release created |
 | Prod Deploy | `prod_deploy` | Deployed to production |
 | Prod Tests | `prod_tests` | Production tests passed |
-| Alert Gate | `alert_gate` | Alert monitoring passed |
+| Alert Gate | `alert_gate` | Alert monitoring passed (gate step) |
 | Steady State | `prod_steady_state` | Production is stable |
 
 ---
@@ -428,7 +536,7 @@ The push parsing stage is **unique** - it's the only stage where a slip is **cre
 
 ```go
 // Create a new slip for the push - ONLY done once per commit
-slip, err := client.CreateFromPush(ctx, slippy.PushEvent{
+slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
     CorrelationID: uuid.New().String(),  // Generated once, used everywhere
     Repository:    "myorg/myrepo",
     Branch:        "main",
@@ -733,11 +841,15 @@ func TestPreJobLogic(t *testing.T) {
     store := slippytest.NewMockStore()
     github := slippytest.NewMockGitHubAPI()
     
+    // Load pipeline config (or create minimal test config)
+    pipelineConfig, _ := slippy.LoadPipelineConfigFromFile("testdata/pipeline.json")
+    
     // Create client with mock dependencies
     client := slippy.NewClientWithDependencies(store, github, slippy.Config{
-        HoldTimeout:   5 * time.Second,
-        PollInterval:  100 * time.Millisecond,
-        AncestryDepth: 10,
+        PipelineConfig: pipelineConfig,
+        HoldTimeout:    5 * time.Second,
+        PollInterval:   100 * time.Millisecond,
+        AncestryDepth:  10,
     })
 
     // Pre-populate test data (simulating existing slip from push parsing)
