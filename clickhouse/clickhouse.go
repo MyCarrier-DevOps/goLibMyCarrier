@@ -12,13 +12,35 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
+// Re-export driver types so consumers don't need to import the driver package directly.
+// This provides a clean abstraction layer over the underlying ClickHouse driver.
+type (
+	// Conn is the ClickHouse connection type
+	Conn = driver.Conn
+	// Rows represents query result rows
+	Rows = driver.Rows
+	// Row represents a single query result row
+	Row = driver.Row
+	// Options is the ClickHouse connection options type
+	Options = clickhouse.Options
+)
+
+// Named creates a named parameter for use in queries.
+// Re-exported from clickhouse-go for convenience.
+func Named(name string, value interface{}) driver.NamedValue {
+	return clickhouse.Named(name, value)
+}
+
 // ClickhouseSessionInterface defines the interface for ClickHouse session operations
 type ClickhouseSessionInterface interface {
 	Connect(ch *ClickhouseConfig, ctx context.Context) error
-	Query(ctx context.Context, query string) (driver.Rows, error)
+	Query(ctx context.Context, query string) (Rows, error)
+	QueryWithArgs(ctx context.Context, query string, args ...interface{}) (Rows, error)
+	QueryRow(ctx context.Context, query string, args ...interface{}) Row
 	Exec(ctx context.Context, stmt string) error
+	ExecWithArgs(ctx context.Context, stmt string, args ...interface{}) error
 	Close() error
-	Conn() driver.Conn
+	Conn() Conn
 }
 
 // ConfigLoaderInterface defines the interface for configuration loading
@@ -38,7 +60,7 @@ type SessionFactoryInterface interface {
 
 // ClickhouseSession implements ClickhouseSessionInterface
 type ClickhouseSession struct {
-	conn       driver.Conn
+	conn       Conn
 	db         string
 	addr       []string
 	username   string
@@ -212,7 +234,7 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 }
 
 // Query ClickHouse database
-func (ch *ClickhouseSession) Query(ctx context.Context, query string) (driver.Rows, error) {
+func (ch *ClickhouseSession) Query(ctx context.Context, query string) (Rows, error) {
 	if ch.conn == nil {
 		return nil, fmt.Errorf("clickhouse connection is not established")
 	}
@@ -223,12 +245,41 @@ func (ch *ClickhouseSession) Query(ctx context.Context, query string) (driver.Ro
 	return rows, nil
 }
 
+// QueryWithArgs executes a query with arguments and returns rows
+func (ch *ClickhouseSession) QueryWithArgs(ctx context.Context, query string, args ...interface{}) (Rows, error) {
+	if ch.conn == nil {
+		return nil, fmt.Errorf("clickhouse connection is not established")
+	}
+	rows, err := ch.conn.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// QueryRow executes a query with arguments and returns a single row
+func (ch *ClickhouseSession) QueryRow(ctx context.Context, query string, args ...interface{}) Row {
+	return ch.conn.QueryRow(ctx, query, args...)
+}
+
 // Exec ClickHouse query
 func (ch *ClickhouseSession) Exec(ctx context.Context, stmt string) error {
 	if ch.conn == nil {
 		return fmt.Errorf("clickhouse connection is not established")
 	}
 	err := ch.conn.Exec(ctx, stmt)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// ExecWithArgs executes a statement with arguments
+func (ch *ClickhouseSession) ExecWithArgs(ctx context.Context, stmt string, args ...interface{}) error {
+	if ch.conn == nil {
+		return fmt.Errorf("clickhouse connection is not established")
+	}
+	err := ch.conn.Exec(ctx, stmt, args...)
 	if err != nil {
 		return err
 	}
@@ -246,6 +297,54 @@ func (ch *ClickhouseSession) Close() error {
 }
 
 // return ClickHouse connection
-func (ch *ClickhouseSession) Conn() driver.Conn {
+func (ch *ClickhouseSession) Conn() Conn {
 	return ch.conn
 }
+
+// connWrapper wraps a Conn to implement ClickhouseSessionInterface.
+// This is useful when you already have a connection and need to use
+// code that expects a ClickhouseSessionInterface.
+type connWrapper struct {
+	conn Conn
+}
+
+// NewSessionFromConn creates a ClickhouseSessionInterface from an existing connection.
+// This is useful for backward compatibility or when you already have an established connection.
+func NewSessionFromConn(conn Conn) ClickhouseSessionInterface {
+	return &connWrapper{conn: conn}
+}
+
+func (w *connWrapper) Connect(cfg *ClickhouseConfig, ctx context.Context) error {
+	return nil // Already connected
+}
+
+func (w *connWrapper) Query(ctx context.Context, query string) (Rows, error) {
+	return w.conn.Query(ctx, query)
+}
+
+func (w *connWrapper) QueryWithArgs(ctx context.Context, query string, args ...interface{}) (Rows, error) {
+	return w.conn.Query(ctx, query, args...)
+}
+
+func (w *connWrapper) QueryRow(ctx context.Context, query string, args ...interface{}) Row {
+	return w.conn.QueryRow(ctx, query, args...)
+}
+
+func (w *connWrapper) Exec(ctx context.Context, stmt string) error {
+	return w.conn.Exec(ctx, stmt)
+}
+
+func (w *connWrapper) ExecWithArgs(ctx context.Context, stmt string, args ...interface{}) error {
+	return w.conn.Exec(ctx, stmt, args...)
+}
+
+func (w *connWrapper) Close() error {
+	return w.conn.Close()
+}
+
+func (w *connWrapper) Conn() Conn {
+	return w.conn
+}
+
+// Ensure connWrapper implements ClickhouseSessionInterface.
+var _ ClickhouseSessionInterface = (*connWrapper)(nil)

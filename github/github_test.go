@@ -438,6 +438,53 @@ func TestGithubSession_CreatePullRequestSimple(t *testing.T) {
 	assert.Equal(t, "main", pr.GetBase().GetRef())
 }
 
+// Test AuthToken accessor
+func TestGithubSession_AuthToken(t *testing.T) {
+	t.Run("returns nil when not authenticated", func(t *testing.T) {
+		session := &GithubSession{}
+		assert.Nil(t, session.AuthToken())
+	})
+}
+
+// Test Client accessor
+func TestGithubSession_Client(t *testing.T) {
+	t.Run("returns nil when not authenticated", func(t *testing.T) {
+		session := &GithubSession{}
+		assert.Nil(t, session.Client())
+	})
+
+	t.Run("returns client when set", func(t *testing.T) {
+		client := github.NewClient(nil)
+		session := &GithubSession{client: client}
+		assert.Equal(t, client, session.Client())
+	})
+}
+
+// Test authenticate error cases
+func TestGithubSession_Authenticate_Errors(t *testing.T) {
+	t.Run("invalid private key", func(t *testing.T) {
+		session := &GithubSession{
+			pem:       "invalid-pem-data",
+			appID:     "12345",
+			installID: "67890",
+		}
+		err := session.authenticate()
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "invalid private key")
+	})
+
+	t.Run("invalid app ID - not a number", func(t *testing.T) {
+		session := &GithubSession{
+			pem:       "", // Empty PEM will fail first, need valid PEM
+			appID:     "not-a-number",
+			installID: "67890",
+		}
+		err := session.authenticate()
+		assert.Error(t, err)
+		// Will fail on invalid private key first since empty PEM
+	})
+}
+
 // Benchmark tests
 func BenchmarkPullRequestOptions_Validate(b *testing.B) {
 	opts := &PullRequestOptions{

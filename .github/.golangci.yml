@@ -98,6 +98,8 @@ linters:
     govet:
       disable:
         - fieldalignment
+    gomoddirectives:
+      replace-local: true # Temporary: Allow local replacements for multi-module development
     nakedret:
       max-func-lines: 1
     nestif:
