@@ -246,7 +246,7 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 			},
 
 			TLS: &tls.Config{
-				InsecureSkipVerify: false,
+				InsecureSkipVerify: chsession.skipVerify,
 			},
 		})
 		if err != nil {
