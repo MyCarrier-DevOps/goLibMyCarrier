@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/stretchr/testify/assert"
@@ -191,7 +192,11 @@ func (m *MockClickhouseSession) Conn() driver.Conn {
 	return args.Get(0).(driver.Conn)
 }
 
-func (m *MockClickhouseSession) QueryWithArgs(ctx context.Context, query string, queryArgs ...any) (driver.Rows, error) {
+func (m *MockClickhouseSession) QueryWithArgs(
+	ctx context.Context,
+	query string,
+	queryArgs ...any,
+) (driver.Rows, error) {
 	args := m.Called(ctx, query, queryArgs)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -452,6 +457,8 @@ func TestDefaultConfigValidator_ValidateConfig(t *testing.T) {
 
 // Test DefaultSessionFactory
 func TestDefaultSessionFactory_NewSession(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	// This test is limited since it would require actual ClickHouse connection
 	// In a real scenario, you'd want to mock the underlying ClickHouse driver
 	factory := &DefaultSessionFactory{}
@@ -739,6 +746,8 @@ func TestClickhouseLoadConfig_InvalidSkipVerify(t *testing.T) {
 
 // Test NewClickhouseSession success scenario
 func TestNewClickhouseSession_Success(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	config := &ClickhouseConfig{
 		ChHostname:   "localhost",
 		ChUsername:   "default",
@@ -779,6 +788,8 @@ func TestNewClickhouseSession_NilConfig(t *testing.T) {
 
 // Test ClickhouseSession Connect method with actual struct
 func TestClickhouseSession_Connect(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
 		ChHostname:   "localhost",
@@ -804,6 +815,8 @@ func TestClickhouseSession_Connect(t *testing.T) {
 
 // Test ClickhouseSession Connect with invalid config
 func TestClickhouseSession_Connect_InvalidConfig(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
 		ChHostname:   "invalid-host-that-does-not-exist",
@@ -823,6 +836,8 @@ func TestClickhouseSession_Connect_InvalidConfig(t *testing.T) {
 
 // Test ClickhouseSession Query method
 func TestClickhouseSession_Query(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	ctx := context.Background()
 	query := "SELECT 1"
@@ -837,6 +852,8 @@ func TestClickhouseSession_Query(t *testing.T) {
 
 // Test ClickhouseSession Exec method
 func TestClickhouseSession_Exec(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	ctx := context.Background()
 	stmt := "CREATE TABLE test (id UInt32) ENGINE = Memory"
@@ -850,6 +867,8 @@ func TestClickhouseSession_Exec(t *testing.T) {
 
 // Test ClickhouseSession Close method
 func TestClickhouseSession_Close(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 
 	err := session.Close()
@@ -865,6 +884,8 @@ func TestClickhouseSession_Close(t *testing.T) {
 
 // Test ClickhouseSession Conn method
 func TestClickhouseSession_Conn(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 
 	conn := session.Conn()
@@ -920,6 +941,8 @@ func TestClickhouseSession_Connect_NilConfig(t *testing.T) {
 
 // Test Connect method with nil context
 func TestClickhouseSession_Connect_NilContext(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
 		ChHostname:   "localhost",
@@ -939,6 +962,8 @@ func TestClickhouseSession_Connect_NilContext(t *testing.T) {
 
 // Test Connect method with malformed hostname
 func TestClickhouseSession_Connect_MalformedHostname(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
 		ChHostname:   "invalid-host-with-special-chars@#$%",
@@ -964,6 +989,8 @@ func TestClickhouseSession_Connect_MalformedHostname(t *testing.T) {
 
 // Test Connect method with invalid port
 func TestClickhouseSession_Connect_InvalidPort(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
 		ChHostname:   "localhost",
@@ -983,6 +1010,8 @@ func TestClickhouseSession_Connect_InvalidPort(t *testing.T) {
 
 // Test Close method with valid connection (simulated)
 func TestClickhouseSession_Close_WithConnection(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 
 	// Test close without connection (should not error)
@@ -992,6 +1021,8 @@ func TestClickhouseSession_Close_WithConnection(t *testing.T) {
 
 // Test Query and Exec with better error scenarios
 func TestClickhouseSession_Query_WithEmptyQuery(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	ctx := context.Background()
 	query := ""
@@ -1004,6 +1035,8 @@ func TestClickhouseSession_Query_WithEmptyQuery(t *testing.T) {
 }
 
 func TestClickhouseSession_Exec_WithEmptyStatement(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	ctx := context.Background()
 	stmt := ""
@@ -1016,6 +1049,8 @@ func TestClickhouseSession_Exec_WithEmptyStatement(t *testing.T) {
 
 // Test Query and Exec with nil context
 func TestClickhouseSession_Query_NilContext(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	query := "SELECT 1"
 
@@ -1027,6 +1062,8 @@ func TestClickhouseSession_Query_NilContext(t *testing.T) {
 }
 
 func TestClickhouseSession_Exec_NilContext(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	stmt := "SELECT 1"
 
@@ -1056,6 +1093,8 @@ func TestClickhouseLoadConfig_SkipVerifyFalse(t *testing.T) {
 
 // Test NewClickhouseSession with skip verify false
 func TestNewClickhouseSession_SkipVerifyFalse(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	config := &ClickhouseConfig{
 		ChHostname:   "localhost",
 		ChUsername:   "default",
@@ -1083,6 +1122,8 @@ func TestNewClickhouseSession_SkipVerifyFalse(t *testing.T) {
 
 // Test Connect with different port configurations
 func TestClickhouseSession_Connect_DifferentPorts(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
 		ChHostname:   "localhost",
@@ -1102,6 +1143,8 @@ func TestClickhouseSession_Connect_DifferentPorts(t *testing.T) {
 
 // Test session struct initialization
 func TestClickhouseSession_Initialization(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	config := &ClickhouseConfig{
 		ChHostname:   "test-host",
 		ChUsername:   "test-user",
@@ -1128,6 +1171,8 @@ func TestClickhouseSession_Initialization(t *testing.T) {
 
 // Test Close with nil connection (already tested but adding for completeness)
 func TestClickhouseSession_Close_NilConnection(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{
 		conn: nil,
 	}
@@ -1138,6 +1183,8 @@ func TestClickhouseSession_Close_NilConnection(t *testing.T) {
 
 // Test Conn method returns correct value
 func TestClickhouseSession_Conn_ReturnsCorrectValue(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	session := &ClickhouseSession{
 		conn: nil,
 	}
@@ -1148,6 +1195,8 @@ func TestClickhouseSession_Conn_ReturnsCorrectValue(t *testing.T) {
 
 // Test Query with successful connection
 func TestClickhouseSession_Query_Success(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	mockRows := &MockRows{}
 	ctx := context.Background()
@@ -1168,12 +1217,14 @@ func TestClickhouseSession_Query_Success(t *testing.T) {
 
 // Test Query with connection error
 func TestClickhouseSession_Query_ConnectionError(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	ctx := context.Background()
 	query := "SELECT 1"
 	expectedError := errors.New("query failed")
 
-	mockConn.On("Query", ctx, query, mock.Anything).Return(nil, expectedError)
+	mockConn.On("Query", ctx, query, mock.Anything).Return(nil, expectedError).Times(4) // initial + 3 retries
 
 	session := &ClickhouseSession{
 		conn: mockConn,
@@ -1183,12 +1234,14 @@ func TestClickhouseSession_Query_ConnectionError(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Nil(t, rows)
-	assert.Equal(t, expectedError, err)
+	assert.Contains(t, err.Error(), "query failed")
 	mockConn.AssertExpectations(t)
 }
 
 // Test Exec with successful connection
 func TestClickhouseSession_Exec_Success(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	ctx := context.Background()
 	stmt := "CREATE TABLE test (id UInt32) ENGINE = Memory"
@@ -1207,12 +1260,14 @@ func TestClickhouseSession_Exec_Success(t *testing.T) {
 
 // Test Exec with connection error
 func TestClickhouseSession_Exec_ConnectionError(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	ctx := context.Background()
 	stmt := "INVALID SQL"
 	expectedError := errors.New("exec failed")
 
-	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(expectedError)
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(expectedError).Times(4) // initial + 3 retries
 
 	session := &ClickhouseSession{
 		conn: mockConn,
@@ -1221,12 +1276,14 @@ func TestClickhouseSession_Exec_ConnectionError(t *testing.T) {
 	err := session.Exec(ctx, stmt)
 
 	assert.Error(t, err)
-	assert.Equal(t, expectedError, err)
+	assert.Contains(t, err.Error(), "exec failed")
 	mockConn.AssertExpectations(t)
 }
 
 // Test Close with successful connection close
 func TestClickhouseSession_Close_Success(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 
 	mockConn.On("Close").Return(nil)
@@ -1243,6 +1300,8 @@ func TestClickhouseSession_Close_Success(t *testing.T) {
 
 // Test Close with connection close error
 func TestClickhouseSession_Close_ConnectionError(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	expectedError := errors.New("close failed")
 
@@ -1268,6 +1327,8 @@ func TestNamed(t *testing.T) {
 
 // Test QueryWithArgs
 func TestClickhouseSession_QueryWithArgs_Success(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	mockRows := &MockRows{}
 	ctx := context.Background()
@@ -1287,6 +1348,8 @@ func TestClickhouseSession_QueryWithArgs_Success(t *testing.T) {
 }
 
 func TestClickhouseSession_QueryWithArgs_NilConnection(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	ctx := context.Background()
 	session := &ClickhouseSession{conn: nil}
 
@@ -1298,12 +1361,14 @@ func TestClickhouseSession_QueryWithArgs_NilConnection(t *testing.T) {
 }
 
 func TestClickhouseSession_QueryWithArgs_Error(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	ctx := context.Background()
 	query := "SELECT * FROM test WHERE id = ?"
 	expectedError := errors.New("query failed")
 
-	mockConn.On("Query", ctx, query, mock.Anything).Return(nil, expectedError)
+	mockConn.On("Query", ctx, query, mock.Anything).Return(nil, expectedError).Times(4) // initial + 3 retries
 
 	session := &ClickhouseSession{
 		conn: mockConn,
@@ -1313,12 +1378,14 @@ func TestClickhouseSession_QueryWithArgs_Error(t *testing.T) {
 
 	assert.Error(t, err)
 	assert.Nil(t, rows)
-	assert.Equal(t, expectedError, err)
+	assert.Contains(t, err.Error(), "query failed")
 	mockConn.AssertExpectations(t)
 }
 
 // Test QueryRow
 func TestClickhouseSession_QueryRow(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	mockRow := &MockRow{}
 	ctx := context.Background()
@@ -1338,6 +1405,8 @@ func TestClickhouseSession_QueryRow(t *testing.T) {
 
 // Test ExecWithArgs
 func TestClickhouseSession_ExecWithArgs_Success(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	ctx := context.Background()
 	stmt := "INSERT INTO test (id) VALUES (?)"
@@ -1355,6 +1424,8 @@ func TestClickhouseSession_ExecWithArgs_Success(t *testing.T) {
 }
 
 func TestClickhouseSession_ExecWithArgs_NilConnection(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	ctx := context.Background()
 	session := &ClickhouseSession{conn: nil}
 
@@ -1365,12 +1436,14 @@ func TestClickhouseSession_ExecWithArgs_NilConnection(t *testing.T) {
 }
 
 func TestClickhouseSession_ExecWithArgs_Error(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	ctx := context.Background()
 	stmt := "INSERT INTO test (id) VALUES (?)"
 	expectedError := errors.New("exec failed")
 
-	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(expectedError)
+	mockConn.On("Exec", ctx, stmt, mock.Anything).Return(expectedError).Times(4) // initial + 3 retries
 
 	session := &ClickhouseSession{
 		conn: mockConn,
@@ -1379,12 +1452,14 @@ func TestClickhouseSession_ExecWithArgs_Error(t *testing.T) {
 	err := session.ExecWithArgs(ctx, stmt, 1)
 
 	assert.Error(t, err)
-	assert.Equal(t, expectedError, err)
+	assert.Contains(t, err.Error(), "exec failed")
 	mockConn.AssertExpectations(t)
 }
 
 // Test NewSessionFromConn and connWrapper
 func TestNewSessionFromConn(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 
 	session := NewSessionFromConn(mockConn)
@@ -1394,6 +1469,8 @@ func TestNewSessionFromConn(t *testing.T) {
 }
 
 func TestConnWrapper_Connect(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	wrapper := NewSessionFromConn(mockConn)
 
@@ -1403,6 +1480,8 @@ func TestConnWrapper_Connect(t *testing.T) {
 }
 
 func TestConnWrapper_Query(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	mockRows := &MockRows{}
 	ctx := context.Background()
@@ -1419,6 +1498,8 @@ func TestConnWrapper_Query(t *testing.T) {
 }
 
 func TestConnWrapper_QueryWithArgs(t *testing.T) {
+	defer setTestRetryIntervals()()
+
 	mockConn := &MockConn{}
 	mockRows := &MockRows{}
 	ctx := context.Background()
@@ -1496,4 +1577,387 @@ func TestConnWrapper_Conn(t *testing.T) {
 	conn := wrapper.Conn()
 
 	assert.Equal(t, mockConn, conn)
+}
+
+// Retry Logic Tests
+
+// Fast retry intervals for testing to avoid slow tests
+var testRetryIntervals = []time.Duration{5 * time.Millisecond, 10 * time.Millisecond, 15 * time.Millisecond}
+
+// setTestRetryIntervals temporarily sets faster retry intervals for tests
+func setTestRetryIntervals() func() {
+	original := DefaultRetryIntervals
+	DefaultRetryIntervals = testRetryIntervals
+	return func() {
+		DefaultRetryIntervals = original
+	}
+}
+
+// Test retryOperation with immediate success
+func TestRetryOperation_ImmediateSuccess(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx := context.Background()
+	callCount := 0
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return nil
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 1, callCount, "operation should succeed on first attempt")
+}
+
+// Test retryOperation with eventual success after retries
+func TestRetryOperation_SuccessAfterRetries(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx := context.Background()
+	callCount := 0
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		if callCount < 3 {
+			return errors.New("temporary failure")
+		}
+		return nil
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, 3, callCount, "operation should succeed on third attempt")
+}
+
+// Test retryOperation with all retries failing
+func TestRetryOperation_AllRetriesFail(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx := context.Background()
+	callCount := 0
+	expectedError := errors.New("persistent failure")
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return expectedError
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, 4, callCount, "operation should be attempted 4 times (initial + 3 retries)")
+	assert.Contains(t, err.Error(), "operation failed after 3 retries")
+}
+
+// Test retryOperation with context cancellation
+func TestRetryOperation_ContextCancellation(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	callCount := 0
+
+	// Cancel context after first failure
+	go func() {
+		// Wait a bit to ensure first attempt happens, but cancel before all retries complete
+		time.Sleep(15 * time.Millisecond) // After initial + first retry (5ms)
+		cancel()
+	}()
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return errors.New("failure")
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "operation cancelled after")
+	// Should have tried at least once, but not all retries
+	assert.GreaterOrEqual(t, callCount, 1)
+	assert.LessOrEqual(t, callCount, 4)
+}
+
+// Test retryOperation with context timeout
+func TestRetryOperation_ContextTimeout(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+
+	callCount := 0
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return errors.New("failure")
+	})
+
+	assert.Error(t, err)
+	// With timeouts at 10ms, 20ms, 30ms, and context timeout at 25ms,
+	// we should get at least 2 attempts (initial + one retry at 10ms)
+	assert.GreaterOrEqual(t, callCount, 2)
+}
+
+// Test Query with retry on failure then success
+func TestClickhouseSession_Query_WithRetrySuccess(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT 1"
+	callCount := 0
+
+	// First two calls fail, third succeeds
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(nil, errors.New("temporary error")).
+		Times(2)
+
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(mockRows, nil).
+		Once()
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	// Add a hook to track calls
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Run(func(args mock.Arguments) {
+			callCount++
+		}).Maybe()
+
+	rows, err := session.Query(ctx, query)
+
+	assert.NoError(t, err)
+	assert.NotNil(t, rows)
+	mockConn.AssertExpectations(t)
+}
+
+// Test Exec with retry on failure then success
+func TestClickhouseSession_Exec_WithRetrySuccess(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INSERT INTO test VALUES (1)"
+
+	// First call fails, second succeeds
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(errors.New("temporary error")).
+		Once()
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(nil).
+		Once()
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Exec(ctx, stmt)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test QueryWithArgs with retry
+func TestClickhouseSession_QueryWithArgs_WithRetry(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT * FROM test WHERE id = ?"
+
+	// First call fails, second succeeds
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(nil, errors.New("temporary error")).
+		Once()
+
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(mockRows, nil).
+		Once()
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	rows, err := session.QueryWithArgs(ctx, query, 1)
+
+	assert.NoError(t, err)
+	assert.Equal(t, mockRows, rows)
+	mockConn.AssertExpectations(t)
+}
+
+// Test ExecWithArgs with retry
+func TestClickhouseSession_ExecWithArgs_WithRetry(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INSERT INTO test (id) VALUES (?)"
+
+	// First call fails, second succeeds
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(errors.New("temporary error")).
+		Once()
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(nil).
+		Once()
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.ExecWithArgs(ctx, stmt, 1)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test connWrapper Query with retry
+func TestConnWrapper_Query_WithRetry(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT 1"
+
+	// First call fails, second succeeds
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(nil, errors.New("temporary error")).
+		Once()
+
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(mockRows, nil).
+		Once()
+
+	wrapper := NewSessionFromConn(mockConn)
+	rows, err := wrapper.Query(ctx, query)
+
+	assert.NoError(t, err)
+	assert.Equal(t, mockRows, rows)
+	mockConn.AssertExpectations(t)
+}
+
+// Test connWrapper QueryWithArgs with retry
+func TestConnWrapper_QueryWithArgs_WithRetry(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	mockRows := &MockRows{}
+	ctx := context.Background()
+	query := "SELECT * FROM test WHERE id = ?"
+
+	// First call fails, second succeeds
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(nil, errors.New("temporary error")).
+		Once()
+
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(mockRows, nil).
+		Once()
+
+	wrapper := NewSessionFromConn(mockConn)
+	rows, err := wrapper.QueryWithArgs(ctx, query, 1)
+
+	assert.NoError(t, err)
+	assert.Equal(t, mockRows, rows)
+	mockConn.AssertExpectations(t)
+}
+
+// Test connWrapper Exec with retry
+func TestConnWrapper_Exec_WithRetry(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "CREATE TABLE test (id UInt32)"
+
+	// First call fails, second succeeds
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(errors.New("temporary error")).
+		Once()
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(nil).
+		Once()
+
+	wrapper := NewSessionFromConn(mockConn)
+	err := wrapper.Exec(ctx, stmt)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test connWrapper ExecWithArgs with retry
+func TestConnWrapper_ExecWithArgs_WithRetry(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INSERT INTO test (id) VALUES (?)"
+
+	// First call fails, second succeeds
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(errors.New("temporary error")).
+		Once()
+
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(nil).
+		Once()
+
+	wrapper := NewSessionFromConn(mockConn)
+	err := wrapper.ExecWithArgs(ctx, stmt, 1)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+// Test that Query retries exhaust after multiple failures
+func TestClickhouseSession_Query_RetryExhaustion(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	query := "SELECT 1"
+	expectedError := errors.New("persistent error")
+
+	// All attempts fail
+	mockConn.On("Query", ctx, query, mock.Anything).
+		Return(nil, expectedError).
+		Times(4) // initial + 3 retries
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	rows, err := session.Query(ctx, query)
+
+	assert.Error(t, err)
+	assert.Nil(t, rows)
+	assert.Contains(t, err.Error(), "operation failed after 3 retries")
+	mockConn.AssertExpectations(t)
+}
+
+// Test that Exec retries exhaust after multiple failures
+func TestClickhouseSession_Exec_RetryExhaustion(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	stmt := "INSERT INTO test VALUES (1)"
+	expectedError := errors.New("persistent error")
+
+	// All attempts fail
+	mockConn.On("Exec", ctx, stmt, mock.Anything).
+		Return(expectedError).
+		Times(4) // initial + 3 retries
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Exec(ctx, stmt)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "operation failed after 3 retries")
+	mockConn.AssertExpectations(t)
 }

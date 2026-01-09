@@ -409,7 +409,12 @@ func TestClient_AnyPrerequisiteFailed(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		failed, failedList, err := client.AnyPrerequisiteFailed(ctx, "corr-anyfail-1", []string{"push_parsed", "builds_completed"}, "")
+		failed, failedList, err := client.AnyPrerequisiteFailed(
+			ctx,
+			"corr-anyfail-1",
+			[]string{"push_parsed", "builds_completed"},
+			"",
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -441,7 +446,12 @@ func TestClient_AnyPrerequisiteFailed(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		failed, failedList, err := client.AnyPrerequisiteFailed(ctx, "corr-anyfail-2", []string{"push_parsed", "builds_completed", "unit_tests"}, "")
+		failed, failedList, err := client.AnyPrerequisiteFailed(
+			ctx,
+			"corr-anyfail-2",
+			[]string{"push_parsed", "builds_completed", "unit_tests"},
+			"",
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -490,7 +500,12 @@ func TestClient_GetPendingPrerequisites(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		pending, err := client.GetPendingPrerequisites(ctx, "corr-pending-1", []string{"push_parsed", "builds_completed", "unit_tests"}, "")
+		pending, err := client.GetPendingPrerequisites(
+			ctx,
+			"corr-pending-1",
+			[]string{"push_parsed", "builds_completed", "unit_tests"},
+			"",
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -521,7 +536,12 @@ func TestClient_GetPendingPrerequisites(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		pending, err := client.GetPendingPrerequisites(ctx, "corr-pending-2", []string{"push_parsed", "builds_completed"}, "")
+		pending, err := client.GetPendingPrerequisites(
+			ctx,
+			"corr-pending-2",
+			[]string{"push_parsed", "builds_completed"},
+			"",
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -551,7 +571,12 @@ func TestClient_GetPendingPrerequisites(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		pending, err := client.GetPendingPrerequisites(ctx, "corr-pending-3", []string{"push_parsed", "builds_completed"}, "")
+		pending, err := client.GetPendingPrerequisites(
+			ctx,
+			"corr-pending-3",
+			[]string{"push_parsed", "builds_completed"},
+			"",
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

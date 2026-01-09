@@ -2,7 +2,7 @@ SHELL:=/bin/bash
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
-LIB_DIRS := argocdclient auth clickhouse github kafka logger otel vault yaml
+LIB_DIRS := argocdclient auth clickhouse clickhousemigrator github kafka logger otel slippy vault yaml
 
 .PHONY: lint
 lint: install-tools

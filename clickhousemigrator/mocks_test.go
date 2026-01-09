@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/logger"
 )
 
@@ -334,7 +335,11 @@ func (c *MockConn) AsyncInsert(ctx context.Context, query string, wait bool, arg
 }
 
 // PrepareBatch implements driver.Conn.
-func (c *MockConn) PrepareBatch(ctx context.Context, query string, opts ...driver.PrepareBatchOption) (driver.Batch, error) {
+func (c *MockConn) PrepareBatch(
+	ctx context.Context,
+	query string,
+	opts ...driver.PrepareBatchOption,
+) (driver.Batch, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.PrepareBatchCalls = append(c.PrepareBatchCalls, PrepareBatchCall{Query: query})

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/spf13/viper"
 
@@ -29,6 +30,38 @@ type (
 // Re-exported from clickhouse-go for convenience.
 func Named(name string, value interface{}) driver.NamedValue {
 	return clickhouse.Named(name, value)
+}
+
+// DefaultRetryIntervals are the default retry intervals for production use.
+// This can be overridden in tests for faster execution.
+var DefaultRetryIntervals = []time.Duration{2 * time.Second, 3 * time.Second, 5 * time.Second}
+
+// retryOperation retries a clickhouse operation with exponential backoff.
+// It will retry on failure using DefaultRetryIntervals (2s, 3s, and 5s by default).
+// Tests can override DefaultRetryIntervals for faster execution.
+func retryOperation(ctx context.Context, operation func() error) error {
+	backoffIntervals := DefaultRetryIntervals
+
+	// First attempt
+	err := operation()
+	if err == nil {
+		return nil
+	}
+
+	// Retry with backoff
+	for i, interval := range backoffIntervals {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("operation cancelled after %d retries: %w", i, ctx.Err())
+		case <-time.After(interval):
+			err = operation()
+			if err == nil {
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("operation failed after %d retries: %w", len(backoffIntervals), err)
 }
 
 // ClickhouseSessionInterface defines the interface for ClickHouse session operations
@@ -203,8 +236,8 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 		return fmt.Errorf("context cannot be nil")
 	}
 
-	var (
-		conn, err = clickhouse.Open(&clickhouse.Options{
+	return retryOperation(ctx, func() error {
+		conn, err := clickhouse.Open(&clickhouse.Options{
 			Addr: []string{ch.ChHostname + ":" + ch.ChPort},
 			Auth: clickhouse.Auth{
 				Database: ch.ChDatabase,
@@ -213,24 +246,24 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 			},
 
 			TLS: &tls.Config{
-				InsecureSkipVerify: false,
+				InsecureSkipVerify: chsession.skipVerify,
 			},
 		})
-	)
-	if err != nil {
-		return fmt.Errorf("error connecting to ClickHouse: %w", err)
-	}
-
-	if err := conn.Ping(ctx); err != nil {
-		var exception *clickhouse.Exception
-		if errors.As(err, &exception) {
-			return fmt.Errorf("exception [%d] %s %s", exception.Code, exception.Message, exception.StackTrace)
+		if err != nil {
+			return fmt.Errorf("error connecting to ClickHouse: %w", err)
 		}
-		return err
-	}
 
-	chsession.conn = conn
-	return nil
+		if err := conn.Ping(ctx); err != nil {
+			var exception *clickhouse.Exception
+			if errors.As(err, &exception) {
+				return fmt.Errorf("exception [%d] %s %s", exception.Code, exception.Message, exception.StackTrace)
+			}
+			return err
+		}
+
+		chsession.conn = conn
+		return nil
+	})
 }
 
 // Query ClickHouse database
@@ -238,11 +271,13 @@ func (ch *ClickhouseSession) Query(ctx context.Context, query string) (Rows, err
 	if ch.conn == nil {
 		return nil, fmt.Errorf("clickhouse connection is not established")
 	}
-	rows, err := ch.conn.Query(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	return rows, nil
+	var rows Rows
+	err := retryOperation(ctx, func() error {
+		var queryErr error
+		rows, queryErr = ch.conn.Query(ctx, query)
+		return queryErr
+	})
+	return rows, err
 }
 
 // QueryWithArgs executes a query with arguments and returns rows
@@ -250,14 +285,18 @@ func (ch *ClickhouseSession) QueryWithArgs(ctx context.Context, query string, ar
 	if ch.conn == nil {
 		return nil, fmt.Errorf("clickhouse connection is not established")
 	}
-	rows, err := ch.conn.Query(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	return rows, nil
+	var rows Rows
+	err := retryOperation(ctx, func() error {
+		var queryErr error
+		rows, queryErr = ch.conn.Query(ctx, query, args...)
+		return queryErr
+	})
+	return rows, err
 }
 
 // QueryRow executes a query with arguments and returns a single row
+// Note: QueryRow doesn't return an error directly; errors are deferred until Scan() is called.
+// Therefore, retry logic is not applicable here.
 func (ch *ClickhouseSession) QueryRow(ctx context.Context, query string, args ...interface{}) Row {
 	return ch.conn.QueryRow(ctx, query, args...)
 }
@@ -267,11 +306,9 @@ func (ch *ClickhouseSession) Exec(ctx context.Context, stmt string) error {
 	if ch.conn == nil {
 		return fmt.Errorf("clickhouse connection is not established")
 	}
-	err := ch.conn.Exec(ctx, stmt)
-	if err != nil {
-		return err
-	}
-	return nil
+	return retryOperation(ctx, func() error {
+		return ch.conn.Exec(ctx, stmt)
+	})
 }
 
 // ExecWithArgs executes a statement with arguments
@@ -279,11 +316,9 @@ func (ch *ClickhouseSession) ExecWithArgs(ctx context.Context, stmt string, args
 	if ch.conn == nil {
 		return fmt.Errorf("clickhouse connection is not established")
 	}
-	err := ch.conn.Exec(ctx, stmt, args...)
-	if err != nil {
-		return err
-	}
-	return nil
+	return retryOperation(ctx, func() error {
+		return ch.conn.Exec(ctx, stmt, args...)
+	})
 }
 
 // Close ClickHouse connection
@@ -319,11 +354,23 @@ func (w *connWrapper) Connect(cfg *ClickhouseConfig, ctx context.Context) error 
 }
 
 func (w *connWrapper) Query(ctx context.Context, query string) (Rows, error) {
-	return w.conn.Query(ctx, query)
+	var rows Rows
+	err := retryOperation(ctx, func() error {
+		var queryErr error
+		rows, queryErr = w.conn.Query(ctx, query)
+		return queryErr
+	})
+	return rows, err
 }
 
 func (w *connWrapper) QueryWithArgs(ctx context.Context, query string, args ...interface{}) (Rows, error) {
-	return w.conn.Query(ctx, query, args...)
+	var rows Rows
+	err := retryOperation(ctx, func() error {
+		var queryErr error
+		rows, queryErr = w.conn.Query(ctx, query, args...)
+		return queryErr
+	})
+	return rows, err
 }
 
 func (w *connWrapper) QueryRow(ctx context.Context, query string, args ...interface{}) Row {
@@ -331,11 +378,15 @@ func (w *connWrapper) QueryRow(ctx context.Context, query string, args ...interf
 }
 
 func (w *connWrapper) Exec(ctx context.Context, stmt string) error {
-	return w.conn.Exec(ctx, stmt)
+	return retryOperation(ctx, func() error {
+		return w.conn.Exec(ctx, stmt)
+	})
 }
 
 func (w *connWrapper) ExecWithArgs(ctx context.Context, stmt string, args ...interface{}) error {
-	return w.conn.Exec(ctx, stmt, args...)
+	return retryOperation(ctx, func() error {
+		return w.conn.Exec(ctx, stmt, args...)
+	})
 }
 
 func (w *connWrapper) Close() error {

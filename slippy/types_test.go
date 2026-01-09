@@ -216,7 +216,12 @@ func TestPipelineConfig_GetEffectivePrerequisites(t *testing.T) {
 		Description: "Test pipeline",
 		Steps: []StepConfig{
 			{Name: "push_parsed", Description: "Push parsed"},
-			{Name: "builds_completed", Description: "Builds completed", Aggregates: "build", Prerequisites: []string{"push_parsed"}},
+			{
+				Name:          "builds_completed",
+				Description:   "Builds completed",
+				Aggregates:    "build",
+				Prerequisites: []string{"push_parsed"},
+			},
 			{Name: "alert_gate", Description: "Alert gate", IsGate: true, Prerequisites: []string{"builds_completed"}},
 			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"alert_gate"}},
 		},
