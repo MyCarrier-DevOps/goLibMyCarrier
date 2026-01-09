@@ -442,7 +442,13 @@ func TestClient_UpdateComponentBuildStatus(t *testing.T) {
 		slip := createTestSlip("corr-comp-build-1")
 		store.AddSlip(slip)
 
-		err := client.UpdateComponentBuildStatus(ctx, "corr-comp-build-1", "my-service", StepStatusCompleted, "build succeeded")
+		err := client.UpdateComponentBuildStatus(
+			ctx,
+			"corr-comp-build-1",
+			"my-service",
+			StepStatusCompleted,
+			"build succeeded",
+		)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

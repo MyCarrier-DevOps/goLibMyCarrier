@@ -234,7 +234,11 @@ func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 }
 
 // UpdateStep updates a specific step's status.
-func (m *MockStore) UpdateStep(ctx context.Context, correlationID, stepName, componentName string, status StepStatus) error {
+func (m *MockStore) UpdateStep(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status StepStatus,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -269,7 +273,11 @@ func (m *MockStore) UpdateStep(ctx context.Context, correlationID, stepName, com
 }
 
 // UpdateComponentStatus updates a component's build or test status.
-func (m *MockStore) UpdateComponentStatus(ctx context.Context, correlationID, componentName, stepType string, status StepStatus) error {
+func (m *MockStore) UpdateComponentStatus(
+	ctx context.Context,
+	correlationID, componentName, stepType string,
+	status StepStatus,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

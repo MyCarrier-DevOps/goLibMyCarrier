@@ -4,8 +4,8 @@ go 1.25.5
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.42.0
-	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.40
-	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.3.40
+	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.41
+	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.3.41
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.41
 )
 
@@ -54,7 +54,7 @@ require (
 
 require (
 	github.com/ClickHouse/ch-go v0.69.0 // indirect
-	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator v0.0.0
+	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator v1.3.41
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
 	github.com/go-faster/errors v0.7.1 // indirect

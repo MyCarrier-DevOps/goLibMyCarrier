@@ -22,8 +22,18 @@ func testPipelineConfig() *PipelineConfig {
 		Description: "Test pipeline config",
 		Steps: []StepConfig{
 			{Name: "push_parsed", Description: "Push parsed"},
-			{Name: "builds_completed", Description: "Builds completed", Aggregates: "build", Prerequisites: []string{"push_parsed"}},
-			{Name: "unit_tests_completed", Description: "Unit tests completed", Aggregates: "unit_test", Prerequisites: []string{"builds_completed"}},
+			{
+				Name:          "builds_completed",
+				Description:   "Builds completed",
+				Aggregates:    "build",
+				Prerequisites: []string{"push_parsed"},
+			},
+			{
+				Name:          "unit_tests_completed",
+				Description:   "Unit tests completed",
+				Aggregates:    "unit_test",
+				Prerequisites: []string{"builds_completed"},
+			},
 			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"unit_tests_completed"}},
 		},
 	}
@@ -791,7 +801,10 @@ func TestClickHouseStore_AppendHistory_Success(t *testing.T) {
 // 9-12: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
 // 13: builds (aggregate JSON), 14: unit_tests (aggregate JSON)
 // 15: matched_commit
-func createMockScanRowWithMatch(correlationID, repository, branch, commitSHA, matchedCommit string, status SlipStatus) *clickhousetest.MockRow {
+func createMockScanRowWithMatch(
+	correlationID, repository, branch, commitSHA, matchedCommit string,
+	status SlipStatus,
+) *clickhousetest.MockRow {
 	now := time.Now()
 	stepDetailsJSON, _ := json.Marshal(map[string]map[string]interface{}{})
 	stateHistoryJSON, _ := json.Marshal([]StateHistoryEntry{})
@@ -867,7 +880,14 @@ func createMockScanRowWithMatch(correlationID, repository, branch, commitSHA, ma
 
 // TestClickHouseStore_FindByCommits_Success tests successful FindByCommits.
 func TestClickHouseStore_FindByCommits_Success(t *testing.T) {
-	mockRow := createMockScanRowWithMatch("test-corr-001", "myorg/myrepo", "main", "abc123", "abc123", SlipStatusPending)
+	mockRow := createMockScanRowWithMatch(
+		"test-corr-001",
+		"myorg/myrepo",
+		"main",
+		"abc123",
+		"abc123",
+		SlipStatusPending,
+	)
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
 	}
