@@ -85,8 +85,8 @@ func TestMockGitHubAPI_GetCommitAncestry(t *testing.T) {
 	t.Run("tracks calls", func(t *testing.T) {
 		mock := NewMockGitHubAPI()
 
-		mock.GetCommitAncestry(ctx, "org1", "repo1", "main", 5)
-		mock.GetCommitAncestry(ctx, "org2", "repo2", "feature", 10)
+		_, _ = mock.GetCommitAncestry(ctx, "org1", "repo1", "main", 5)
+		_, _ = mock.GetCommitAncestry(ctx, "org2", "repo2", "feature", 10)
 
 		if len(mock.GetCommitAncestryCalls) != 2 {
 			t.Fatalf("expected 2 calls, got %d", len(mock.GetCommitAncestryCalls))
@@ -122,7 +122,7 @@ func TestMockGitHubAPI_Reset(t *testing.T) {
 
 	// Configure some state
 	mock.SetAncestry("owner", "repo", "main", []string{"c1", "c2"})
-	mock.GetCommitAncestry(ctx, "owner", "repo", "main", 10)
+	_, _ = mock.GetCommitAncestry(ctx, "owner", "repo", "main", 10)
 	mock.ClearCache()
 	mock.GetCommitAncestryError = errors.New("some error")
 	mock.GetCommitAncestryErrorFor["owner/repo:bad"] = errors.New("bad ref")

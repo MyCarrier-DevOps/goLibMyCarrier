@@ -226,9 +226,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected validation error")
 		}
-		if !errors.Is(err, nil) { // just check it's an error
-			// Error message should indicate validation failure
-		}
+		// Error occurred as expected - validation failure
 	})
 
 	t.Run("store create error", func(t *testing.T) {

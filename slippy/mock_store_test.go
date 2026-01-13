@@ -421,9 +421,7 @@ func deepCopySlip(slip *Slip) *Slip {
 	// Deep copy state history
 	if slip.StateHistory != nil {
 		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
-		for i, entry := range slip.StateHistory {
-			cpy.StateHistory[i] = entry
-		}
+		copy(cpy.StateHistory, slip.StateHistory)
 	}
 
 	return cpy

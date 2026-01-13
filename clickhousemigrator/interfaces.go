@@ -73,3 +73,25 @@ type Migration struct {
 	// DownSQL is the SQL to revert this migration.
 	DownSQL string `json:"down_sql"`
 }
+
+// SchemaEnsurer represents an idempotent schema operation that runs every time.
+// Unlike migrations which are version-gated (run once), ensurers always execute
+// and must use idempotent SQL (e.g., ADD COLUMN IF NOT EXISTS).
+//
+// Use cases:
+//   - Dynamic columns based on configuration (e.g., pipeline steps)
+//   - Indexes that should always exist
+//   - Any schema that can change based on runtime configuration
+//
+// Ensurers run AFTER all versioned migrations complete successfully.
+type SchemaEnsurer struct {
+	// Name identifies this ensurer for logging purposes.
+	Name string `json:"name"`
+
+	// Description explains what this ensurer does.
+	Description string `json:"description"`
+
+	// SQL is the idempotent SQL to execute. Must handle already-existing state gracefully.
+	// Examples: ADD COLUMN IF NOT EXISTS, CREATE INDEX IF NOT EXISTS
+	SQL string `json:"sql"`
+}

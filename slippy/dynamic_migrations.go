@@ -2,8 +2,6 @@ package slippy
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -191,23 +189,37 @@ func (m *DynamicMigrationManager) GetAggregateColumns() []string {
 	return columns
 }
 
-// generateMigrationsFromConfig creates all migrations needed for the current config.
+// Core schema uses versioned migrations (run once):
+// - v1: Base routing_slips table
+// - v2: History materialized view
+//
+// Dynamic schema uses ensurers (run every time, must be idempotent):
+// - Step columns (ADD COLUMN IF NOT EXISTS)
+// - Secondary indexes (ADD INDEX IF NOT EXISTS)
+
+// generateMigrationsFromConfig creates the core versioned migrations.
+// These define the table structure and run once per version.
 func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemigrator.Migration {
-	migrations := make([]clickhousemigrator.Migration, 0)
+	return []clickhousemigrator.Migration{
+		m.generateBaseTableMigration(),
+		m.generateHistoryViewMigration(),
+	}
+}
 
-	// Migration 1: Create base routing_slips table with core columns
-	// Migration 2: Create history materialized view
-	migrations = append(migrations, m.generateBaseTableMigration(), m.generateHistoryViewMigration())
+// GenerateEnsurers creates idempotent schema operations for dynamic columns.
+// These run every time and handle step columns based on configuration.
+func (m *DynamicMigrationManager) GenerateEnsurers() []clickhousemigrator.SchemaEnsurer {
+	ensurers := make([]clickhousemigrator.SchemaEnsurer, 0)
 
-	// Migration 3+: Add columns for each step (allows incremental schema evolution)
-	stepMigrations := m.generateStepMigrations()
-	migrations = append(migrations, stepMigrations...)
+	// Add ensurers for each step column
+	for _, step := range m.config.Steps {
+		ensurers = append(ensurers, m.generateStepColumnEnsurer(step))
+	}
 
-	// Final migration: Add secondary indexes
-	indexVersion := 3 + len(stepMigrations)
-	migrations = append(migrations, m.generateIndexMigration(indexVersion))
+	// Add ensurer for secondary indexes
+	ensurers = append(ensurers, m.generateIndexEnsurer())
 
-	return migrations
+	return ensurers
 }
 
 // generateBaseTableMigration creates the core routing_slips table.
@@ -262,6 +274,9 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 
 // generateHistoryViewMigration creates the materialized view for historical tracking.
 func (m *DynamicMigrationManager) generateHistoryViewMigration() clickhousemigrator.Migration {
+	// NOTE: state_history.entries is a Dynamic type in ClickHouse's JSON column.
+	// We use dynamicElement() to extract the Array from the Dynamic type,
+	// which allows ARRAY JOIN to work properly without converting to String.
 	return clickhousemigrator.Migration{
 		Version:     2,
 		Name:        "create_routing_slip_history_mv",
@@ -274,91 +289,59 @@ func (m *DynamicMigrationManager) generateHistoryViewMigration() clickhousemigra
 			AS SELECT
 				correlation_id,
 				repository,
-				JSONExtractString(entry, 'step') AS step,
-				JSONExtractString(entry, 'component') AS component,
-				JSONExtractString(entry, 'status') AS status,
-				parseDateTimeBestEffort(JSONExtractString(entry, 'timestamp')) AS timestamp,
-				JSONExtractString(entry, 'actor') AS actor,
-				JSONExtractString(entry, 'message') AS message
+				entry.step::String AS step,
+				entry.component::String AS component,
+				entry.status::String AS status,
+				parseDateTimeBestEffort(entry.timestamp::String) AS timestamp,
+				entry.actor::String AS actor,
+				entry.message::String AS message
 			FROM %s.routing_slips
-			ARRAY JOIN JSONExtractArrayRaw(toString(state_history), 'entries') AS entry
+			ARRAY JOIN dynamicElement(state_history.entries, 'Array(JSON)') AS entry
 		`, m.database, m.database),
 		DownSQL: fmt.Sprintf(`DROP VIEW IF EXISTS %s.routing_slip_history_mv`, m.database),
 	}
 }
 
-// generateStepMigrations creates migrations for each step column.
-func (m *DynamicMigrationManager) generateStepMigrations() []clickhousemigrator.Migration {
-	migrations := make([]clickhousemigrator.Migration, 0)
-	version := 3 // Start after base table and history view
-
-	for _, step := range m.config.Steps {
-		migrations = append(migrations, m.generateStepColumnMigration(version, step))
-		version++
-	}
-
-	return migrations
-}
-
-// generateStepColumnMigration creates a migration for a single step.
-// ClickHouse supports adding multiple columns in a single ALTER TABLE using comma separation.
-func (m *DynamicMigrationManager) generateStepColumnMigration(
-	version int,
-	step StepConfig,
-) clickhousemigrator.Migration {
+// generateStepColumnEnsurer creates an idempotent ensurer for a step's columns.
+// Uses ADD COLUMN IF NOT EXISTS so it's safe to run every time.
+func (m *DynamicMigrationManager) generateStepColumnEnsurer(step StepConfig) clickhousemigrator.SchemaEnsurer {
 	statusColumn := fmt.Sprintf("%s_status", step.Name)
-	columnHash := computeColumnHash(step.Name)
 
-	var upSQL strings.Builder
-	var downSQL strings.Builder
-
-	// Add status column (and optionally aggregate column in same ALTER TABLE)
-	upSQL.WriteString(fmt.Sprintf(`
+	var sql strings.Builder
+	sql.WriteString(fmt.Sprintf(`
 		ALTER TABLE %s.routing_slips
 		ADD COLUMN IF NOT EXISTS %s Enum8(
 			'pending'=1, 'held'=2, 'running'=3, 'completed'=4,
 			'failed'=5, 'error'=6, 'aborted'=7, 'timeout'=8, 'skipped'=9
 		) DEFAULT 'pending'`, m.database, statusColumn))
 
-	// Down SQL is a no-op (we preserve columns for historical data)
-	downSQL.WriteString(fmt.Sprintf("-- Column %s preserved for historical data", statusColumn))
-
 	// If this is an aggregate step, add a JSON column for component data
 	// Array wrapped in object for ClickHouse JSON compatibility
 	if step.Aggregates != "" {
 		aggregateColumn := pluralize(step.Aggregates)
-		upSQL.WriteString(fmt.Sprintf(`,
+		sql.WriteString(fmt.Sprintf(`,
 		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '{"items":[]}'`, aggregateColumn))
-		downSQL.WriteString(fmt.Sprintf("\n-- Column %s preserved for historical data", aggregateColumn))
 	}
 
-	description := fmt.Sprintf("Adds %s column for step '%s'", statusColumn, step.Name)
+	description := fmt.Sprintf("Ensures %s column exists for step '%s'", statusColumn, step.Name)
 	if step.Aggregates != "" {
 		description += fmt.Sprintf(" and %s column for component data", pluralize(step.Aggregates))
 	}
 
-	return clickhousemigrator.Migration{
-		Version:     version,
-		Name:        fmt.Sprintf("add_step_%s_%s", step.Name, columnHash[:8]),
+	return clickhousemigrator.SchemaEnsurer{
+		Name:        fmt.Sprintf("ensure_step_%s", step.Name),
 		Description: description,
-		UpSQL:       upSQL.String(),
-		DownSQL:     downSQL.String(),
+		SQL:         sql.String(),
 	}
 }
 
-// generateIndexMigration creates a migration for secondary indexes.
-func (m *DynamicMigrationManager) generateIndexMigration(version int) clickhousemigrator.Migration {
-	var upSQL strings.Builder
-	var downSQL strings.Builder
+// generateIndexEnsurer creates an idempotent ensurer for secondary indexes.
+func (m *DynamicMigrationManager) generateIndexEnsurer() clickhousemigrator.SchemaEnsurer {
+	var sql strings.Builder
 
-	upSQL.WriteString(fmt.Sprintf(`
+	sql.WriteString(fmt.Sprintf(`
 		ALTER TABLE %s.routing_slips
 		ADD INDEX IF NOT EXISTS idx_status status TYPE set(10) GRANULARITY 1
-	`, m.database))
-
-	downSQL.WriteString(fmt.Sprintf(`
-		ALTER TABLE %s.routing_slips
-		DROP INDEX IF EXISTS idx_status
 	`, m.database))
 
 	// Add indexes for deploy steps (commonly queried for held status)
@@ -368,28 +351,15 @@ func (m *DynamicMigrationManager) generateIndexMigration(version int) clickhouse
 			statusColumn := fmt.Sprintf("%s_status", stepName)
 			indexName := fmt.Sprintf("idx_%s_held", stepName)
 
-			upSQL.WriteString(fmt.Sprintf(`,
+			sql.WriteString(fmt.Sprintf(`,
 		ADD INDEX IF NOT EXISTS %s %s TYPE set(10) GRANULARITY 1
 			`, indexName, statusColumn))
-
-			downSQL.WriteString(fmt.Sprintf(`,
-		DROP INDEX IF EXISTS %s
-			`, indexName))
 		}
 	}
 
-	return clickhousemigrator.Migration{
-		Version:     version,
-		Name:        "add_secondary_indexes",
-		Description: "Adds secondary indexes for status columns to optimize common queries",
-		UpSQL:       upSQL.String(),
-		DownSQL:     downSQL.String(),
+	return clickhousemigrator.SchemaEnsurer{
+		Name:        "ensure_secondary_indexes",
+		Description: "Ensures secondary indexes exist for status columns",
+		SQL:         sql.String(),
 	}
-}
-
-// computeColumnHash creates a short hash for a column name.
-// Used to create unique migration names that won't conflict if a step is removed and re-added.
-func computeColumnHash(name string) string {
-	hash := sha256.Sum256([]byte(name))
-	return hex.EncodeToString(hash[:])
 }

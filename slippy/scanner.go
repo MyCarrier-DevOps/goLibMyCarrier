@@ -2,7 +2,6 @@ package slippy
 
 import (
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -95,10 +94,7 @@ func (s *SlipScanner) PopulateSlipFromScan(ctx *scanContext) error {
 
 	// Parse step details from chcol.JSON and merge into steps
 	if ctx.stepDetailsJSON != nil {
-		stepDetailsBytes, err := json.Marshal(ctx.stepDetailsJSON)
-		if err == nil {
-			s.mergeStepDetails(slip, string(stepDetailsBytes))
-		}
+		s.mergeStepDetailsFromJSON(slip, ctx.stepDetailsJSON)
 	}
 
 	// Parse aggregate JSON columns from chcol.JSON (unwrap from object)
@@ -157,15 +153,23 @@ func (s *SlipScanner) ScanSlipWithMatch(row ch.Row) (*Slip, string, error) {
 	return ctx.slip, matchedCommit, nil
 }
 
-// mergeStepDetails parses step details JSON and merges timing/actor info into steps.
-func (s *SlipScanner) mergeStepDetails(slip *Slip, stepDetailsJSON string) {
-	var stepDetails map[string]map[string]interface{}
-	if err := json.Unmarshal([]byte(stepDetailsJSON), &stepDetails); err != nil {
-		return // Ignore parse errors, step details are optional
+// mergeStepDetailsFromJSON extracts step details from chcol.JSON and merges timing/actor info into steps.
+// It uses the NestedMap() method to get the data structure, which works with both
+// real ClickHouse data and test mocks using Scan().
+func (s *SlipScanner) mergeStepDetailsFromJSON(slip *Slip, jsonCol *chcol.JSON) {
+	// Get the nested map representation of the JSON
+	nestedMap := jsonCol.NestedMap()
+	if nestedMap == nil {
+		return
 	}
 
-	for name, details := range stepDetails {
+	for name, detailsRaw := range nestedMap {
 		step, ok := slip.Steps[name]
+		if !ok {
+			continue
+		}
+
+		details, ok := detailsRaw.(map[string]interface{})
 		if !ok {
 			continue
 		}
