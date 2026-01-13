@@ -50,6 +50,10 @@ type Config struct {
 
 	// Database is the ClickHouse database name (default: "ci")
 	Database string
+
+	// Internal fields for error tracking
+	clickhouseLoadErr error // Error from ClickHouse config loading
+	pipelineLoadErr   error // Error from pipeline config loading
 }
 
 // DefaultConfig returns a Config with sensible default values.
@@ -79,13 +83,19 @@ func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
 
 	// ClickHouse - use the standard clickhouse config loader
-	if chConfig, err := ch.ClickhouseLoadConfig(); err == nil {
+	chConfig, err := ch.ClickhouseLoadConfig()
+	if err == nil {
 		cfg.ClickHouseConfig = chConfig
+	} else {
+		cfg.clickhouseLoadErr = err
 	}
 
 	// Pipeline configuration
-	if pipelineConfig, err := LoadPipelineConfig(); err == nil {
+	pipelineConfig, err := LoadPipelineConfig()
+	if err == nil {
 		cfg.PipelineConfig = pipelineConfig
+	} else {
+		cfg.pipelineLoadErr = err
 	}
 
 	// GitHub App authentication
@@ -123,19 +133,45 @@ func ConfigFromEnv() Config {
 // Returns an error describing any missing or invalid settings.
 func (c Config) Validate() error {
 	if c.ClickHouseConfig == nil {
-		return fmt.Errorf("%w: ClickHouseConfig is required", ErrInvalidConfiguration)
+		if c.clickhouseLoadErr != nil {
+			return fmt.Errorf(
+				"%w: ClickHouse configuration failed to load: %w (check CLICKHOUSE_HOSTNAME, CLICKHOUSE_PORT, CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE env vars)",
+				ErrInvalidConfiguration,
+				c.clickhouseLoadErr,
+			)
+		}
+		return fmt.Errorf(
+			"%w: ClickHouseConfig is required (check CLICKHOUSE_* environment variables)",
+			ErrInvalidConfiguration,
+		)
 	}
 	if err := ch.ClickhouseValidateConfig(c.ClickHouseConfig); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfiguration, err)
 	}
 	if c.PipelineConfig == nil {
-		return fmt.Errorf("%w: PipelineConfig is required (set SLIPPY_PIPELINE_CONFIG)", ErrInvalidConfiguration)
+		if c.pipelineLoadErr != nil {
+			return fmt.Errorf(
+				"%w: Pipeline configuration failed to load: %w (check SLIPPY_PIPELINE_CONFIG env var)",
+				ErrInvalidConfiguration,
+				c.pipelineLoadErr,
+			)
+		}
+		return fmt.Errorf(
+			"%w: PipelineConfig is required (set SLIPPY_PIPELINE_CONFIG)",
+			ErrInvalidConfiguration,
+		)
 	}
 	if c.GitHubAppID == 0 {
-		return fmt.Errorf("%w: GitHubAppID is required", ErrInvalidConfiguration)
+		return fmt.Errorf(
+			"%w: GitHubAppID is required (set SLIPPY_GITHUB_APP_ID)",
+			ErrInvalidConfiguration,
+		)
 	}
 	if c.GitHubPrivateKey == "" {
-		return fmt.Errorf("%w: GitHubPrivateKey is required", ErrInvalidConfiguration)
+		return fmt.Errorf(
+			"%w: GitHubPrivateKey is required (set SLIPPY_GITHUB_APP_PRIVATE_KEY)",
+			ErrInvalidConfiguration,
+		)
 	}
 	if c.HoldTimeout <= 0 {
 		return fmt.Errorf("%w: HoldTimeout must be positive", ErrInvalidConfiguration)
