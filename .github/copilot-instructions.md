@@ -5,8 +5,7 @@
 **You MUST also follow all applicable instruction files in `.github/instructions/`:**
 - [go.instructions.md](.github/instructions/go.instructions.md) - Idiomatic Go patterns, naming conventions, error handling
 
-For the slippy package specifically, also reference:
-- [slippy/CLAUDE.md](slippy/CLAUDE.md) - Shadow mode, migrations, client patterns
+For the slippy package specifically, read [slippy/CLAUDE.md](slippy/CLAUDE.md) for shadow mode, migration, and client patterns.
 
 ## Architecture Overview
 
@@ -18,21 +17,17 @@ This is a **multi-module Go monorepo** where each subdirectory is an independent
 - **logger** - Zap-based structured logging with `LOG_LEVEL` and `LOG_APP_NAME` env vars
 - **kafka**, **vault**, **github**, **auth**, **otel** - Infrastructure integrations
 
-## Development Commands
+## Validation Workflow
 
-```bash
-# Single module
-make test PKG=slippy          # Test specific module
-make lint PKG=clickhouse      # Lint specific module
+Always keep the repo in a clean, validated state before handing work back. Run **repo-wide** commands when changes span multiple modules:
 
-# All modules
-make test                     # Test all modules
-make lint                     # Lint all (requires golangci-lint v2.5.0)
-make tidy                     # go mod tidy for all
-make check-sec                # govulncheck on all modules
-```
+- `make fmt`
+- `make tidy`
+- `make lint`
+- `make test`
+- `make check-sec` (security sweep when touching dependencies or external inputs)
 
-**Linting uses** `.github/.golangci.yml` - max line length is 120 chars (golines enforces this).
+When work is limited to a single module, you may additionally run the targeted variants (`make fmt PKG=<module>`, `make lint PKG=<module>`, `make test PKG=<module>`), but the repo-wide suite above must still be green before completion. Lint settings live in `.github/.golangci.yml`; rely on that config instead of ad-hoc rules. Every command listed here must finish with **zero errors** before you consider any task complete.
 
 ## Critical Patterns
 
@@ -54,23 +49,10 @@ if chConfig, err := ch.ClickhouseLoadConfig(); err == nil {
 }  // Error lost!
 ```
 
-### 2. Interface-Based Testing
-Define interfaces for external dependencies to enable mocking:
+### 2. Interface & Test Conventions
+Follow the shared guidance in `.github/instructions/go.instructions.md` for interface design, mocking strategy, and the `z_*.go` test file ordering pattern. Keep any repo-specific deviations documented there.
 
-```go
-// clickhouse/clickhouse.go re-exports driver types
-type Conn = driver.Conn
-type Rows = driver.Rows
-
-// slippy/interfaces.go defines mockable boundaries
-type SlipStore interface { ... }
-type GitHubAPI interface { ... }
-```
-
-### 3. Test File Naming
-Test files are prefixed with `z_` to run after main tests: `z_config_test.go`, `z_main_test.go`.
-
-### 4. Environment Variable Defaults
+### 3. Environment Variable Defaults
 Optional vars should have `viper.SetDefault()` before unmarshaling:
 
 ```go
@@ -81,7 +63,7 @@ viper.UnmarshalKey(...)  // Defaults apply if env not set
 
 ## Slippy-Specific Guidance
 
-The `slippy` package is the most complex. See **`slippy/CLAUDE.md`** for detailed patterns including:
+Highlights from the slippy instructions (see Additional Instructions for the link) that most often impact changes:
 - **Shadow mode** (`SLIPPY_SHADOW_MODE`) controls blocking vs non-blocking error handling
 - **Validate-first migrations** - check schema version before running migrations
 - **Nil client safety** - all operations must handle nil client gracefully
@@ -93,36 +75,6 @@ The `slippy` package is the most complex. See **`slippy/CLAUDE.md`** for detaile
 - Release creates tags for root module (`v1.3.43`) AND all submodules (`slippy/v1.3.43`)
 - pkg.go.dev refresh is automatic post-release
 - **75% test coverage threshold** enforced per module
-
-## Required Validation Before Completing Work
-
-**You MUST run these commands and ensure zero errors before considering any task complete:**
-
-```bash
-make fmt                      # Format all modules
-make tidy                     # Clean up dependencies
-make lint                     # Lint all modules - MUST pass with 0 issues
-make test                     # Test all modules - ALL tests MUST pass
-```
-
-If working on a specific module, at minimum run:
-```bash
-make fmt PKG=<module>
-make lint PKG=<module>
-make test PKG=<module>
-```
-
-**Non-negotiable requirements:**
-- All lint checks must pass with **0 issues**
-- All tests must pass with **0 failures**
-- No skipped validations - if a command fails, fix the issue before proceeding
-
-## Common Mistakes to Avoid
-
-1. **Don't silence config errors** - surface actual load failures, not generic "required" messages
-2. **Don't create "WithGracefulFallback" wrappers** - use shadow mode pattern instead
-3. **Run linter with project config**: `golangci-lint run --config ../.github/.golangci.yml`
-4. **Use absolute imports**: `github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse`
 
 ## Project State Documentation
 
