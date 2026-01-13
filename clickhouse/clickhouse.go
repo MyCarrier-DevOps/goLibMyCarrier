@@ -134,6 +134,10 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 		return nil, fmt.Errorf("failed to bind environment variable for chport: %w", err)
 	}
 
+	// Set defaults for optional fields
+	viper.SetDefault("chport", "9440")
+	viper.SetDefault("chskipverify", "false")
+
 	// Read environment variables
 	viper.AutomaticEnv()
 
@@ -166,11 +170,13 @@ func ClickhouseValidateConfig(clickhouseConfig *ClickhouseConfig) error {
 	if clickhouseConfig.ChDatabase == "" {
 		return fmt.Errorf("clickhouse database is required")
 	}
+	// Port and SkipVerify have defaults, so they should always be set
+	// But validate they have reasonable values if present
 	if clickhouseConfig.ChPort == "" {
-		return fmt.Errorf("clickhouse port is required")
+		return fmt.Errorf("clickhouse port is required (should default to 9440)")
 	}
 	if clickhouseConfig.ChSkipVerify == "" {
-		return fmt.Errorf("clickhouse skip verify is required")
+		return fmt.Errorf("clickhouse skip verify is required (should default to false)")
 	}
 	if clickhouseConfig.ChSkipVerify != "true" && clickhouseConfig.ChSkipVerify != "false" {
 		return fmt.Errorf("clickhouse skip verify must be true or false")

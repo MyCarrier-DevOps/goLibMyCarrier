@@ -4,30 +4,29 @@
   "description": "MyCarrier CI/CD pipeline configuration for routing slip orchestration",
   "steps": [
     {
-      "name": "push_parsed",
-      "description": "Initial push event processing - parses webhook and creates routing slip",
-      "prerequisites": []
-    },
-    {
       "name": "builds_completed",
       "description": "All component container builds finished successfully",
-      "prerequisites": ["push_parsed"],
+      "prerequisites": [],
       "aggregates": "build"
     },
     {
       "name": "unit_tests_completed",
       "description": "All component unit tests finished successfully",
-      "prerequisites": ["push_parsed"],
-      "aggregates": "unit_test"
+      "prerequisites": []
     },
     {
-      "name": "secret_scan_completed",
+      "name": "secret_scan",
       "description": "Security secret scanning finished - checks for leaked credentials",
-      "prerequisites": ["push_parsed"]
+      "prerequisites": []
+    },
+    {
+      "name": "package_artifact",
+      "description": "Published internal nuget/npm packages",
+      "prerequisites": []
     },
     {
       "name": "dev_deploy",
-      "description": "Deployment to development environment via GitOps",
+      "description": "Deployment to development/feature environment",
       "prerequisites": ["builds_completed", "unit_tests_completed", "secret_scan_completed"]
     },
     {
@@ -37,8 +36,8 @@
     },
     {
       "name": "preprod_deploy",
-      "description": "Deployment to pre-production environment via GitOps",
-      "prerequisites": ["dev_tests"]
+      "description": "Deployment to pre-production environment",
+      "prerequisites": ["builds_completed", "unit_tests_completed", "secret_scan_completed"]
     },
     {
       "name": "preprod_tests",
@@ -46,30 +45,25 @@
       "prerequisites": ["preprod_deploy"]
     },
     {
+      "name": "prod_gate",
+      "description": "Checks that the code is ready to be promoted to production",
+      "is_gate": true,
+      "prerequisites": ["preprod_deploy","preprod_tests"]
+    },
+    {
       "name": "prod_release_created",
       "description": "GitHub release created for production deployment",
-      "prerequisites": ["preprod_tests"]
+      "prerequisites": ["prod_gate"]
     },
     {
       "name": "prod_deploy",
-      "description": "Deployment to production environment via GitOps",
-      "prerequisites": ["prod_release_created"]
+      "description": "Deployment to production environment",
+      "prerequisites": ["prod_gate", "prod_release_created"]
     },
     {
       "name": "prod_tests",
       "description": "Smoke tests in production environment",
-      "prerequisites": ["prod_deploy"]
-    },
-    {
-      "name": "alert_gate",
-      "description": "Alert monitoring gate - verifies no anomalies in monitoring systems",
-      "prerequisites": ["prod_tests"],
-      "is_gate": true
-    },
-    {
-      "name": "prod_steady_state",
-      "description": "Production confirmed stable - pipeline complete",
-      "prerequisites": ["alert_gate"]
+      "prerequisites": ["prod_gate", "prod_deploy"]
     }
   ]
 }

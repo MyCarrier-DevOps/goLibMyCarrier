@@ -51,22 +51,22 @@ Slippy implements the **Routing Slip** pattern for distributed pipeline orchestr
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                          CI/CD Job Execution                              │
+│                          CI/CD Job Execution                             │
 ├──────────────────────────────────────────────────────────────────────────┤
-│                                                                           │
+│                                                                          │
 │   ┌──────────────┐       ┌──────────────────┐       ┌──────────────┐     │
 │   │   PRE-JOB    │       │   ACTUAL JOB     │       │   POST-JOB   │     │
 │   │   (Slippy)   │──────▶│   (Your Code)    │──────▶│   (Slippy)   │     │
 │   └──────────────┘       └──────────────────┘       └──────────────┘     │
-│          │                        │                        │              │
-│          │   correlation_id       │   correlation_id       │              │
-│          └───────────────────────▶│───────────────────────▶│              │
-│                                                                           │
+│          │                        │                        │             │
+│          │   correlation_id       │   correlation_id       │             │
+│          └───────────────────────▶│───────────────────────▶│             │
+│                                                                          │
 │   • Resolve slip          • Build/Test/Deploy      • Update status       │
 │   • Check prereqs         • Any pipeline work      • Record outcome      │
 │   • Hold if needed        • Has correlation_id     • Has correlation_id  │
-│   • Output correlation_id                                                 │
-│                                                                           │
+│   • Output correlation_id                                                │
+│                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 

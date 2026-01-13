@@ -123,19 +123,27 @@ func ConfigFromEnv() Config {
 // Returns an error describing any missing or invalid settings.
 func (c Config) Validate() error {
 	if c.ClickHouseConfig == nil {
-		return fmt.Errorf("%w: ClickHouseConfig is required", ErrInvalidConfiguration)
+		// Try to load again to get the actual error
+		if _, err := ch.ClickhouseLoadConfig(); err != nil {
+			return fmt.Errorf("%w: ClickHouse configuration failed to load: %w (check CLICKHOUSE_HOSTNAME, CLICKHOUSE_PORT, CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE env vars)", ErrInvalidConfiguration, err)
+		}
+		return fmt.Errorf("%w: ClickHouseConfig is required (check CLICKHOUSE_* environment variables)", ErrInvalidConfiguration)
 	}
 	if err := ch.ClickhouseValidateConfig(c.ClickHouseConfig); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidConfiguration, err)
 	}
 	if c.PipelineConfig == nil {
+		// Try to load again to get the actual error
+		if _, err := LoadPipelineConfig(); err != nil {
+			return fmt.Errorf("%w: Pipeline configuration failed to load: %w (check SLIPPY_PIPELINE_CONFIG env var)", ErrInvalidConfiguration, err)
+		}
 		return fmt.Errorf("%w: PipelineConfig is required (set SLIPPY_PIPELINE_CONFIG)", ErrInvalidConfiguration)
 	}
 	if c.GitHubAppID == 0 {
-		return fmt.Errorf("%w: GitHubAppID is required", ErrInvalidConfiguration)
+		return fmt.Errorf("%w: GitHubAppID is required (set SLIPPY_GITHUB_APP_ID)", ErrInvalidConfiguration)
 	}
 	if c.GitHubPrivateKey == "" {
-		return fmt.Errorf("%w: GitHubPrivateKey is required", ErrInvalidConfiguration)
+		return fmt.Errorf("%w: GitHubPrivateKey is required (set SLIPPY_GITHUB_APP_PRIVATE_KEY)", ErrInvalidConfiguration)
 	}
 	if c.HoldTimeout <= 0 {
 		return fmt.Errorf("%w: HoldTimeout must be positive", ErrInvalidConfiguration)
