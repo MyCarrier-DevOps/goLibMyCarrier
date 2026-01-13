@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/chcol"
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
@@ -26,10 +27,10 @@ func NewSlipScanner(config *PipelineConfig) *SlipScanner {
 type scanContext struct {
 	slip             *Slip
 	statusStr        string
-	stepDetailsJSON  string
-	stateHistoryJSON string
+	stepDetailsJSON  *chcol.JSON // Native ClickHouse JSON type
+	stateHistoryJSON *chcol.JSON // Native ClickHouse JSON type
 	stepStatuses     []string
-	aggregateJSONs   map[string]*string
+	aggregateJSONs   map[string]*chcol.JSON // Native ClickHouse JSON type
 	scanDest         []interface{}
 }
 
@@ -37,9 +38,11 @@ type scanContext struct {
 // The extraDest parameter allows adding additional destinations (e.g., matched_commit).
 func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 	ctx := &scanContext{
-		slip:           &Slip{},
-		stepStatuses:   make([]string, len(s.config.Steps)),
-		aggregateJSONs: make(map[string]*string),
+		slip:             &Slip{},
+		stepDetailsJSON:  chcol.NewJSON(),
+		stateHistoryJSON: chcol.NewJSON(),
+		stepStatuses:     make([]string, len(s.config.Steps)),
+		aggregateJSONs:   make(map[string]*chcol.JSON),
 	}
 
 	// Core column destinations
@@ -51,8 +54,8 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 		&ctx.slip.CreatedAt,
 		&ctx.slip.UpdatedAt,
 		&ctx.statusStr,
-		&ctx.stepDetailsJSON,
-		&ctx.stateHistoryJSON,
+		ctx.stepDetailsJSON,
+		ctx.stateHistoryJSON,
 	}
 
 	// Step status destinations
@@ -64,9 +67,9 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 	for _, step := range s.config.Steps {
 		if step.Aggregates != "" {
 			columnName := pluralize(step.Aggregates)
-			var jsonStr string
-			ctx.aggregateJSONs[columnName] = &jsonStr
-			ctx.scanDest = append(ctx.scanDest, &jsonStr)
+			jsonCol := chcol.NewJSON()
+			ctx.aggregateJSONs[columnName] = jsonCol
+			ctx.scanDest = append(ctx.scanDest, jsonCol)
 		}
 	}
 
@@ -90,23 +93,31 @@ func (s *SlipScanner) PopulateSlipFromScan(ctx *scanContext) error {
 		slip.Steps[step.Name] = Step{Status: StepStatus(ctx.stepStatuses[i])}
 	}
 
-	// Parse step details and merge into steps
-	s.mergeStepDetails(slip, ctx.stepDetailsJSON)
+	// Parse step details from chcol.JSON and merge into steps
+	if ctx.stepDetailsJSON != nil {
+		stepDetailsBytes, err := json.Marshal(ctx.stepDetailsJSON)
+		if err == nil {
+			s.mergeStepDetails(slip, string(stepDetailsBytes))
+		}
+	}
 
-	// Parse aggregate JSON columns
+	// Parse aggregate JSON columns from chcol.JSON (unwrap from object)
 	slip.Aggregates = make(map[string][]ComponentStepData)
-	for columnName, jsonPtr := range ctx.aggregateJSONs {
-		if jsonPtr != nil && *jsonPtr != "" {
-			var componentData []ComponentStepData
-			if err := json.Unmarshal([]byte(*jsonPtr), &componentData); err == nil {
-				slip.Aggregates[columnName] = componentData
+	for columnName, jsonCol := range ctx.aggregateJSONs {
+		if jsonCol != nil {
+			// Extract "items" array from the JSON object
+			if items, ok := chcol.ExtractJSONPathAs[[]ComponentStepData](jsonCol, "items"); ok {
+				slip.Aggregates[columnName] = items
 			}
 		}
 	}
 
-	// Parse state history JSON
-	if err := json.Unmarshal([]byte(ctx.stateHistoryJSON), &slip.StateHistory); err != nil {
-		return fmt.Errorf("failed to unmarshal state history: %w", err)
+	// Parse state history from chcol.JSON (unwrap from object)
+	if ctx.stateHistoryJSON != nil {
+		// Extract "entries" array from the JSON object
+		if entries, ok := chcol.ExtractJSONPathAs[[]StateHistoryEntry](ctx.stateHistoryJSON, "entries"); ok {
+			slip.StateHistory = entries
+		}
 	}
 
 	return nil

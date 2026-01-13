@@ -241,12 +241,10 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 				) DEFAULT 'pending',
 
 				-- Step execution details (timing, actor, errors for all steps)
-				-- Using String type for JSON data to support both objects and arrays
-				step_details String DEFAULT '{}',
+				step_details JSON DEFAULT '{}',
 
-				-- Complete audit trail (array of history entries)
-				-- Using String type because ClickHouse JSON type only supports objects, not arrays
-				state_history String DEFAULT '[]',
+				-- Complete audit trail (array wrapped in object for ClickHouse JSON compatibility)
+				state_history JSON DEFAULT '{"entries":[]}',
 
 				-- Bloom filter indexes
 				INDEX idx_repository repository TYPE bloom_filter GRANULARITY 1,
@@ -283,7 +281,7 @@ func (m *DynamicMigrationManager) generateHistoryViewMigration() clickhousemigra
 				JSONExtractString(entry, 'actor') AS actor,
 				JSONExtractString(entry, 'message') AS message
 			FROM %s.routing_slips
-			ARRAY JOIN JSONExtractArrayRaw(state_history) AS entry
+			ARRAY JOIN JSONExtractArrayRaw(toString(state_history), 'entries') AS entry
 		`, m.database, m.database),
 		DownSQL: fmt.Sprintf(`DROP VIEW IF EXISTS %s.routing_slip_history_mv`, m.database),
 	}
@@ -325,13 +323,12 @@ func (m *DynamicMigrationManager) generateStepColumnMigration(
 	// Down SQL is a no-op (we preserve columns for historical data)
 	downSQL.WriteString(fmt.Sprintf("-- Column %s preserved for historical data", statusColumn))
 
-	// If this is an aggregate step, add the JSON column in the same ALTER TABLE statement
-	// ClickHouse doesn't support multi-statement queries, so we use comma separation
+	// If this is an aggregate step, add a JSON column for component data
+	// Array wrapped in object for ClickHouse JSON compatibility
 	if step.Aggregates != "" {
 		aggregateColumn := pluralize(step.Aggregates)
-		// Use String type instead of JSON for array data compatibility
 		upSQL.WriteString(fmt.Sprintf(`,
-		ADD COLUMN IF NOT EXISTS %s String DEFAULT '[]'`, aggregateColumn))
+		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '{"items":[]}'`, aggregateColumn))
 		downSQL.WriteString(fmt.Sprintf("\n-- Column %s preserved for historical data", aggregateColumn))
 	}
 

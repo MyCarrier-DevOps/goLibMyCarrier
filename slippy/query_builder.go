@@ -155,14 +155,15 @@ func (b *SlipQueryBuilder) BuildAggregateColumnsAndValues(
 			}
 		}
 
-		// Marshal to JSON - empty slice if no data
+		// Wrap in object for ClickHouse JSON compatibility
 		if componentData == nil {
 			componentData = []ComponentStepData{}
 		}
-		jsonData, err := json.Marshal(componentData)
+		wrapper := map[string]interface{}{"items": componentData}
+		jsonData, err := json.Marshal(wrapper)
 		if err != nil {
-			// Use empty JSON array on marshal error
-			jsonData = []byte("[]")
+			// Use empty JSON object with array on marshal error
+			jsonData = []byte(`{"items":[]}`)
 		}
 		values = append(values, string(jsonData))
 	}
