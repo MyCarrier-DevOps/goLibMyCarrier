@@ -256,3 +256,35 @@ jobs:
         body_path: release_body.md
         draft: false
         prerelease: false
+    
+    - name: Refresh pkg.go.dev cache
+      env:
+        MODULES: ${{ needs.discover.outputs.modules }}
+        VERSION: ${{ steps.calculate_version.outputs.majorMinorPatch }}
+      run: |
+        # Request pkg.go.dev to fetch the new main module version
+        echo "Requesting pkg.go.dev refresh for main module v$VERSION"
+        curl -s "https://proxy.golang.org/github.com/!my!carrier-!dev!ops/go!lib!my!carrier/@v/v$VERSION.info" || true
+        
+        # Request pkg.go.dev to fetch each submodule version
+        for module in $(echo "$MODULES" | jq -r '.[]'); do
+          # Convert module path to Go module proxy format (uppercase letters become !lowercase)
+          ENCODED_MODULE=$(echo "$module" | sed 's/\([A-Z]\)/!\L\1/g')
+          echo "Requesting pkg.go.dev refresh for $module/v$VERSION"
+          curl -s "https://proxy.golang.org/github.com/!my!carrier-!dev!ops/go!lib!my!carrier/$ENCODED_MODULE/@v/v$VERSION.info" || true
+        done
+        
+        # Give the proxy a moment to process, then trigger pkg.go.dev documentation fetch
+        sleep 5
+        
+        # Trigger documentation generation for main module
+        echo "Triggering pkg.go.dev documentation for main module"
+        curl -s "https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier@v$VERSION" > /dev/null || true
+        
+        # Trigger documentation generation for each submodule
+        for module in $(echo "$MODULES" | jq -r '.[]'); do
+          echo "Triggering pkg.go.dev documentation for $module"
+          curl -s "https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/$module@v$VERSION" > /dev/null || true
+        done
+        
+        echo "pkg.go.dev refresh requests completed"

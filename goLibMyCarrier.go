@@ -1,3 +1,5 @@
+package goLibMyCarrier
+
 // Package goLibMyCarrier is a collection of reusable Go libraries for MyCarrier DevOps infrastructure.
 //
 // # Available Packages
@@ -25,8 +27,7 @@
 // # Documentation
 //
 // See README.md and individual package documentation for detailed usage information.
-package goLibMyCarrier
 
-// Version represents the current version of the goLibMyCarrier collection.
-// Individual packages are independently versioned using Git tags.
-const Version = "1.3.42"
+// Version is set at build time via ldflags or can be determined from module info.
+// Use debug.ReadBuildInfo() to get the actual version at runtime.
+var Version = "dev"
