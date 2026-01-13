@@ -25,7 +25,7 @@ type DynamicMigrationManager struct {
 
 // DynamicMigration represents a migration stored in the database.
 type DynamicMigration struct {
-	Version     int       `ch:"version"`
+	Version     uint32    `ch:"version"` // UInt32 in ClickHouse
 	Name        string    `ch:"name"`
 	Description string    `ch:"description"`
 	UpSQL       string    `ch:"up_sql"`
@@ -133,16 +133,17 @@ func (m *DynamicMigrationManager) GenerateAndStoreMigrations(
 	generatedMigrations := m.generateMigrationsFromConfig()
 
 	// Determine which migrations need to be stored
-	storedVersions := make(map[int]bool)
+	storedVersions := make(map[uint32]bool)
 	for _, mig := range storedMigrations {
 		storedVersions[mig.Version] = true
 	}
 
 	// Store any new migrations
 	for _, mig := range generatedMigrations {
-		if !storedVersions[mig.Version] {
+		version := uint32(mig.Version) // clickhousemigrator.Migration uses int
+		if !storedVersions[version] {
 			dynMig := DynamicMigration{
-				Version:     mig.Version,
+				Version:     version,
 				Name:        mig.Name,
 				Description: mig.Description,
 				UpSQL:       mig.UpSQL,
@@ -240,10 +241,12 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 				) DEFAULT 'pending',
 
 				-- Step execution details (timing, actor, errors for all steps)
-				step_details JSON DEFAULT '{}',
+				-- Using String type for JSON data to support both objects and arrays
+				step_details String DEFAULT '{}',
 
-				-- Complete audit trail
-				state_history JSON DEFAULT '[]',
+				-- Complete audit trail (array of history entries)
+				-- Using String type because ClickHouse JSON type only supports objects, not arrays
+				state_history String DEFAULT '[]',
 
 				-- Bloom filter indexes
 				INDEX idx_repository repository TYPE bloom_filter GRANULARITY 1,
@@ -300,6 +303,7 @@ func (m *DynamicMigrationManager) generateStepMigrations() []clickhousemigrator.
 }
 
 // generateStepColumnMigration creates a migration for a single step.
+// ClickHouse supports adding multiple columns in a single ALTER TABLE using comma separation.
 func (m *DynamicMigrationManager) generateStepColumnMigration(
 	version int,
 	step StepConfig,
@@ -310,31 +314,30 @@ func (m *DynamicMigrationManager) generateStepColumnMigration(
 	var upSQL strings.Builder
 	var downSQL strings.Builder
 
-	// Add status column
+	// Add status column (and optionally aggregate column in same ALTER TABLE)
 	upSQL.WriteString(fmt.Sprintf(`
 		ALTER TABLE %s.routing_slips
 		ADD COLUMN IF NOT EXISTS %s Enum8(
 			'pending'=1, 'held'=2, 'running'=3, 'completed'=4,
 			'failed'=5, 'error'=6, 'aborted'=7, 'timeout'=8, 'skipped'=9
-		) DEFAULT 'pending'
-	`, m.database, statusColumn))
+		) DEFAULT 'pending'`, m.database, statusColumn))
 
 	// Down SQL is a no-op (we preserve columns for historical data)
 	downSQL.WriteString(fmt.Sprintf("-- Column %s preserved for historical data", statusColumn))
 
-	// If this is an aggregate step, also add the JSON column for component data
+	// If this is an aggregate step, add the JSON column in the same ALTER TABLE statement
+	// ClickHouse doesn't support multi-statement queries, so we use comma separation
 	if step.Aggregates != "" {
 		aggregateColumn := pluralize(step.Aggregates)
-		upSQL.WriteString(fmt.Sprintf(`;
-		ALTER TABLE %s.routing_slips
-		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '[]'
-		`, m.database, aggregateColumn))
+		// Use String type instead of JSON for array data compatibility
+		upSQL.WriteString(fmt.Sprintf(`,
+		ADD COLUMN IF NOT EXISTS %s String DEFAULT '[]'`, aggregateColumn))
 		downSQL.WriteString(fmt.Sprintf("\n-- Column %s preserved for historical data", aggregateColumn))
 	}
 
 	description := fmt.Sprintf("Adds %s column for step '%s'", statusColumn, step.Name)
 	if step.Aggregates != "" {
-		description += fmt.Sprintf(" and %s JSON column for component data", pluralize(step.Aggregates))
+		description += fmt.Sprintf(" and %s column for component data", pluralize(step.Aggregates))
 	}
 
 	return clickhousemigrator.Migration{
