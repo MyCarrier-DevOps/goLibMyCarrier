@@ -190,6 +190,11 @@ jobs:
         git config user.name "$GITHUB_ACTOR"
         git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
         
+        # Create and push main library tag first
+        echo "Creating main library tag v$VERSION"
+        git tag -a "v$VERSION" -m "Release goLibMyCarrier v$VERSION"
+        git push origin "v$VERSION"
+        
         # Create and push tags for each module dynamically
         MODULE_LIST=""
         for module in $(echo "$MODULES" | jq -r '.[]'); do
