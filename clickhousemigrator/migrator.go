@@ -16,6 +16,7 @@ type Migrator struct {
 	conn             driver.Conn
 	logger           Logger
 	migrations       []Migration
+	ensurers         []SchemaEnsurer // Idempotent operations that run every time
 	expectedTables   []string
 	migrationTimeout time.Duration
 	database         string
@@ -30,6 +31,15 @@ func WithMigrations(migrations []Migration) MigratorOption {
 	return func(m *Migrator) {
 		m.migrations = append(m.migrations, migrations...)
 		m.sortMigrations()
+	}
+}
+
+// WithEnsurers adds schema ensurers to the migrator.
+// Ensurers are idempotent SQL operations that run every time after migrations complete.
+// Use for dynamic schema elements that depend on runtime configuration.
+func WithEnsurers(ensurers []SchemaEnsurer) MigratorOption {
+	return func(m *Migrator) {
+		m.ensurers = append(m.ensurers, ensurers...)
 	}
 }
 
@@ -145,6 +155,11 @@ func (m *Migrator) CreateTables(ctx context.Context) error {
 		m.logger.Info(ctx, "Database migration completed", map[string]interface{}{
 			"migrations_applied": migrationsApplied,
 		})
+	}
+
+	// Run schema ensurers (idempotent operations that always execute)
+	if err := m.runEnsurers(ctx); err != nil {
+		return err
 	}
 
 	m.logger.Info(ctx, "Database tables created successfully", nil)
@@ -380,6 +395,16 @@ func (m *Migrator) Conn() driver.Conn {
 	return m.conn
 }
 
+// GetEnsurers returns the list of schema ensurers.
+func (m *Migrator) GetEnsurers() []SchemaEnsurer {
+	return m.ensurers
+}
+
+// AddEnsurers adds additional schema ensurers to the migrator.
+func (m *Migrator) AddEnsurers(ensurers []SchemaEnsurer) {
+	m.ensurers = append(m.ensurers, ensurers...)
+}
+
 // schemaVersionTableName returns the name of the schema version table.
 // If a table prefix is set, returns "{prefix}_schema_version", otherwise "schema_version".
 func (m *Migrator) schemaVersionTableName() string {
@@ -507,6 +532,42 @@ func (m *Migrator) applyMigrationWithTimeout(ctx context.Context, migration Migr
 	m.logger.Info(ctx, "Migration applied successfully", map[string]interface{}{
 		"version": migration.Version,
 		"name":    migration.Name,
+	})
+
+	return nil
+}
+
+// runEnsurers executes all schema ensurers.
+// Ensurers are idempotent and always run, regardless of version tracking.
+func (m *Migrator) runEnsurers(ctx context.Context) error {
+	if len(m.ensurers) == 0 {
+		return nil
+	}
+
+	m.logger.Info(ctx, "Running schema ensurers", map[string]interface{}{
+		"count": len(m.ensurers),
+	})
+
+	for _, ensurer := range m.ensurers {
+		m.logger.Debug(ctx, "Running ensurer", map[string]interface{}{
+			"name":        ensurer.Name,
+			"description": ensurer.Description,
+		})
+
+		ensurerCtx, cancel := context.WithTimeout(ctx, m.migrationTimeout)
+		if err := m.conn.Exec(ensurerCtx, ensurer.SQL); err != nil {
+			cancel()
+			return fmt.Errorf("ensurer %q failed: %w", ensurer.Name, err)
+		}
+		cancel()
+
+		m.logger.Debug(ctx, "Ensurer completed", map[string]interface{}{
+			"name": ensurer.Name,
+		})
+	}
+
+	m.logger.Info(ctx, "Schema ensurers completed", map[string]interface{}{
+		"count": len(m.ensurers),
 	})
 
 	return nil

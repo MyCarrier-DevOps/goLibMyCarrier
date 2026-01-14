@@ -157,8 +157,9 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		return fmt.Errorf("failed to marshal step details: %w", err)
 	}
 
-	// Serialize state history
-	stateHistoryJSON, err := json.Marshal(slip.StateHistory)
+	// Serialize state history wrapped in object for ClickHouse JSON compatibility
+	stateHistoryWrapper := map[string]interface{}{"entries": slip.StateHistory}
+	stateHistoryJSON, err := json.Marshal(stateHistoryWrapper)
 	if err != nil {
 		return fmt.Errorf("failed to marshal state history: %w", err)
 	}

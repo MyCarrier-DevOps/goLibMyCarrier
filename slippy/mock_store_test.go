@@ -139,10 +139,12 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 
 // Load retrieves a slip by its correlation ID.
 func (m *MockStore) Load(ctx context.Context, correlationID string) (*Slip, error) {
+	m.mu.Lock()
+	m.LoadCalls = append(m.LoadCalls, correlationID)
+	m.mu.Unlock()
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-
-	m.LoadCalls = append(m.LoadCalls, correlationID)
 
 	if m.LoadError != nil {
 		return nil, m.LoadError
@@ -161,13 +163,15 @@ func (m *MockStore) Load(ctx context.Context, correlationID string) (*Slip, erro
 
 // LoadByCommit retrieves a slip by repository and commit SHA.
 func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+	m.mu.Lock()
 	m.LoadByCommitCalls = append(m.LoadByCommitCalls, LoadByCommitCall{
 		Repository: repository,
 		CommitSHA:  commitSHA,
 	})
+	m.mu.Unlock()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	if m.LoadByCommitError != nil {
 		return nil, m.LoadByCommitError
@@ -189,13 +193,15 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 
 // FindByCommits finds a slip matching any commit in the ordered list.
 func (m *MockStore) FindByCommits(ctx context.Context, repository string, commits []string) (*Slip, string, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+	m.mu.Lock()
 	m.FindByCommitsCalls = append(m.FindByCommitsCalls, FindByCommitsCall{
 		Repository: repository,
 		Commits:    commits,
 	})
+	m.mu.Unlock()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	if m.FindByCommitsError != nil {
 		return nil, "", m.FindByCommitsError
@@ -421,9 +427,7 @@ func deepCopySlip(slip *Slip) *Slip {
 	// Deep copy state history
 	if slip.StateHistory != nil {
 		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
-		for i, entry := range slip.StateHistory {
-			cpy.StateHistory[i] = entry
-		}
+		copy(cpy.StateHistory, slip.StateHistory)
 	}
 
 	return cpy

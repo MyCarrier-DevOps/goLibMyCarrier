@@ -66,17 +66,21 @@ func RunMigrations(ctx context.Context, conn driver.Conn, opts MigrateOptions) (
 		return nil, fmt.Errorf("failed to ensure database exists: %w", err)
 	}
 
-	// Get dynamic migrations from pipeline config
+	// Get versioned migrations (core schema: table + MV)
 	migrations, err := GetDynamicMigrations(ctx, conn, opts.PipelineConfig, opts.Database, opts.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get dynamic migrations: %w", err)
 	}
+
+	// Get ensurers (step columns + indexes - run every time)
+	ensurers := GetDynamicEnsurers(conn, opts.PipelineConfig, opts.Database, opts.Logger)
 
 	// Create the migrator with slippy-specific table prefix
 	migrator, err := clickhousemigrator.NewMigrator(
 		conn,
 		opts.Logger,
 		clickhousemigrator.WithMigrations(migrations),
+		clickhousemigrator.WithEnsurers(ensurers),
 		clickhousemigrator.WithDatabase(opts.Database),
 		clickhousemigrator.WithTablePrefix("slippy"), // Creates slippy_schema_version table
 	)
@@ -84,9 +88,9 @@ func RunMigrations(ctx context.Context, conn driver.Conn, opts MigrateOptions) (
 		return nil, fmt.Errorf("failed to create migrator: %w", err)
 	}
 
-	// Create the slippy_schema_version table if needed
+	// Create the slippy_schema_version table if needed and run migrations + ensurers
 	if err := migrator.CreateTables(ctx); err != nil {
-		return nil, fmt.Errorf("failed to create slippy_schema_version table: %w", err)
+		return nil, fmt.Errorf("failed to create tables: %w", err)
 	}
 
 	// Get current version
@@ -166,16 +170,20 @@ func ValidateSchema(ctx context.Context, conn driver.Conn, config *PipelineConfi
 		database = "ci"
 	}
 
-	// Get dynamic migrations from pipeline config
+	// Get versioned migrations (core schema)
 	migrations, err := GetDynamicMigrations(ctx, conn, config, database, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get dynamic migrations: %w", err)
 	}
 
+	// Get ensurers (step columns + indexes)
+	ensurers := GetDynamicEnsurers(conn, config, database, nil)
+
 	migrator, err := clickhousemigrator.NewMigrator(
 		conn,
 		nil, // Use NopLogger
 		clickhousemigrator.WithMigrations(migrations),
+		clickhousemigrator.WithEnsurers(ensurers),
 		clickhousemigrator.WithDatabase(database),
 		clickhousemigrator.WithTablePrefix("slippy"),
 	)

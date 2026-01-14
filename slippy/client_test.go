@@ -470,10 +470,9 @@ func TestNewClient_ValidationErrors(t *testing.T) {
 						t.Error("expected non-empty error message")
 					}
 				}
-			} else {
-				// Note: valid configs will still fail because we don't have real connections
-				// This is expected behavior - we're testing that validation runs first
 			}
+			// Note: valid configs will still fail because we don't have real connections
+			// This is expected behavior - we're testing that validation runs first
 		})
 	}
 }
