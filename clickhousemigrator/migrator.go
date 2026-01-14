@@ -395,6 +395,16 @@ func (m *Migrator) Conn() driver.Conn {
 	return m.conn
 }
 
+// GetEnsurers returns the list of schema ensurers.
+func (m *Migrator) GetEnsurers() []SchemaEnsurer {
+	return m.ensurers
+}
+
+// AddEnsurers adds additional schema ensurers to the migrator.
+func (m *Migrator) AddEnsurers(ensurers []SchemaEnsurer) {
+	m.ensurers = append(m.ensurers, ensurers...)
+}
+
 // schemaVersionTableName returns the name of the schema version table.
 // If a table prefix is set, returns "{prefix}_schema_version", otherwise "schema_version".
 func (m *Migrator) schemaVersionTableName() string {
@@ -561,16 +571,6 @@ func (m *Migrator) runEnsurers(ctx context.Context) error {
 	})
 
 	return nil
-}
-
-// GetEnsurers returns the list of schema ensurers.
-func (m *Migrator) GetEnsurers() []SchemaEnsurer {
-	return m.ensurers
-}
-
-// AddEnsurers adds additional schema ensurers to the migrator.
-func (m *Migrator) AddEnsurers(ensurers []SchemaEnsurer) {
-	m.ensurers = append(m.ensurers, ensurers...)
 }
 
 // sortMigrations sorts migrations by version.
