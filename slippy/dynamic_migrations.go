@@ -93,7 +93,15 @@ func (m *DynamicMigrationManager) GetStoredMigrations(ctx context.Context) (migr
 
 	for rows.Next() {
 		var mig DynamicMigration
-		if err := rows.Scan(&mig.Version, &mig.Name, &mig.Description, &mig.UpSQL, &mig.DownSQL, &mig.AppliedAt, &mig.ConfigHash); err != nil {
+		if err := rows.Scan(
+			&mig.Version,
+			&mig.Name,
+			&mig.Description,
+			&mig.UpSQL,
+			&mig.DownSQL,
+			&mig.AppliedAt,
+			&mig.ConfigHash,
+		); err != nil {
 			return nil, fmt.Errorf("failed to scan migration: %w", err)
 		}
 		migrations = append(migrations, mig)
