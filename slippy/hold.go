@@ -104,7 +104,13 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 
 				// Update step to timeout status
 				if opts.StepName != "" {
-					if err := c.TimeoutStep(ctx, opts.CorrelationID, opts.StepName, opts.ComponentName, timeoutMsg); err != nil {
+					if err := c.TimeoutStep(
+						ctx,
+						opts.CorrelationID,
+						opts.StepName,
+						opts.ComponentName,
+						timeoutMsg,
+					); err != nil {
 						c.logger.Warn(ctx, "Failed to set step timeout status", map[string]interface{}{
 							"error": err.Error(),
 						})

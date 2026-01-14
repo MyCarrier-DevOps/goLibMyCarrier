@@ -1,6 +1,6 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 13, 2026  
+> **Last Updated:** January 14, 2026  
 > **Status:** Multi-module Go library with slippy schema ensurer architecture complete (branch: fix/slippy)
 
 ---
@@ -51,11 +51,23 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 ### ClickHouse Package
 - **Retry logic** with configurable intervals (default: 2s, 3s, 5s)
 - **Optional defaults** - `CLICKHOUSE_PORT` defaults to "9440", `CLICKHOUSE_SKIP_VERIFY` to "false"
-- **Viper-based config** - environment variable loading with SetDefault support
+- **Isolated Viper instance** - uses `viper.New()` to avoid global state pollution
 
 ---
 
 ## Recent Changes
+
+### January 14, 2026 — Isolated Viper Instances (branch: fix/slippy)
+
+**Problem:** Global viper state (`SetEnvPrefix`) caused cross-package interference. When `pushhookparser` loaded slippy config (which loaded ClickHouse config with `CLICKHOUSE` prefix), later calls to `viper.GetString("PAYLOAD")` looked for `CLICKHOUSE_PAYLOAD` instead of `PAYLOAD`.
+
+**Solution:** Refactored config loading to use isolated viper instances (`viper.New()`) instead of the global viper singleton.
+
+**Changes:**
+- `clickhouse/clickhouse.go`: `ClickhouseLoadConfig()` now uses `v := viper.New()` instead of global `viper.SetEnvPrefix()`
+- Consumer applications (pushhookparser) can safely use `os.Getenv()` for simple env vars without prefix concerns
+
+**Architectural Decision:** See "Isolated Viper Instances" in Architectural Decisions section below.
 
 ### January 13, 2026 — Schema Ensurer Architecture (branch: fix/slippy)
 
@@ -147,6 +159,15 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 ---
 
 ## Architectural Decisions
+
+### Isolated Viper Instances
+**Decision:** Use `viper.New()` for isolated instances instead of the global viper singleton when loading package-specific configuration.
+**Rationale:** Viper's global functions (`SetEnvPrefix`, `AutomaticEnv`, etc.) modify shared state. When multiple packages set different prefixes, the last one wins, causing other packages to fail to read their environment variables. For example, `CLICKHOUSE` prefix causes `viper.GetString("PAYLOAD")` to look for `CLICKHOUSE_PAYLOAD`.
+**Implementation:**
+- Library packages (e.g., `clickhouse`, `slippy`) use `v := viper.New()` and call all methods on `v`
+- Consumer applications can use either isolated instances or `os.Getenv()` for simple unprefixed vars
+- Never call `viper.SetEnvPrefix()` on the global instance in library code
+**Anti-pattern:** Using global `viper.SetEnvPrefix()` in library packages that may be imported by applications using viper for other purposes.
 
 ### ClickHouse JSON Column Pattern
 **Decision:** Use native JSON type with arrays wrapped in objects. Never use String type to store complex data.

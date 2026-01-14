@@ -56,9 +56,32 @@ Follow the shared guidance in `.github/instructions/go.instructions.md` for inte
 Optional vars should have `viper.SetDefault()` before unmarshaling:
 
 ```go
-viper.SetDefault("chport", "9440")
-viper.SetDefault("chskipverify", "false")
-viper.UnmarshalKey(...)  // Defaults apply if env not set
+v := viper.New()  // Always use isolated instance in library code
+v.SetEnvPrefix("MYPREFIX")
+v.SetDefault("port", "9440")
+v.SetDefault("skipverify", "false")
+v.AutomaticEnv()
+v.Unmarshal(&config)  // Defaults apply if env not set
+```
+
+### 4. Isolated Viper Instances (CRITICAL)
+**Never use global viper functions in library packages.** Global state causes cross-package interference when multiple packages use different env prefixes.
+
+```go
+// Good: Isolated instance - does not affect other packages
+func LoadConfig() (*Config, error) {
+    v := viper.New()
+    v.SetEnvPrefix("CLICKHOUSE")
+    v.BindEnv("hostname", "CLICKHOUSE_HOSTNAME")
+    // ...
+}
+
+// Bad: Global state - breaks other packages using viper
+func LoadConfig() (*Config, error) {
+    viper.SetEnvPrefix("CLICKHOUSE")  // Affects ALL viper.GetString() calls!
+    viper.BindEnv("hostname", "CLICKHOUSE_HOSTNAME")
+    // ...
+}
 ```
 
 ## Slippy-Specific Guidance

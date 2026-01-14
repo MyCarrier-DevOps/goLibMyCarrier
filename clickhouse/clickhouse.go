@@ -111,40 +111,43 @@ type ClickhouseConfig struct {
 }
 
 // LoadConfig loads the configuration from environment variables using Viper.
+// Uses an isolated viper instance to avoid global state pollution that could
+// affect other packages using viper with different env prefixes.
 func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
-	viper.SetEnvPrefix("CLICKHOUSE")
+	v := viper.New() // Isolated instance - does not affect global viper state
+	v.SetEnvPrefix("CLICKHOUSE")
 
 	// Bind environment variables
-	if err := viper.BindEnv("chhostname", "CLICKHOUSE_HOSTNAME"); err != nil {
+	if err := v.BindEnv("chhostname", "CLICKHOUSE_HOSTNAME"); err != nil {
 		return nil, fmt.Errorf("failed to bind environment variable for chhostname: %w", err)
 	}
-	if err := viper.BindEnv("chusername", "CLICKHOUSE_USERNAME"); err != nil {
+	if err := v.BindEnv("chusername", "CLICKHOUSE_USERNAME"); err != nil {
 		return nil, fmt.Errorf("failed to bind environment variable for chusername: %w", err)
 	}
-	if err := viper.BindEnv("chpassword", "CLICKHOUSE_PASSWORD"); err != nil {
+	if err := v.BindEnv("chpassword", "CLICKHOUSE_PASSWORD"); err != nil {
 		return nil, fmt.Errorf("failed to bind environment variable for chpassword: %w", err)
 	}
-	if err := viper.BindEnv("chdatabase", "CLICKHOUSE_DATABASE"); err != nil {
+	if err := v.BindEnv("chdatabase", "CLICKHOUSE_DATABASE"); err != nil {
 		return nil, fmt.Errorf("failed to bind environment variable for chdatabase: %w", err)
 	}
-	if err := viper.BindEnv("chskipverify", "CLICKHOUSE_SKIP_VERIFY"); err != nil {
+	if err := v.BindEnv("chskipverify", "CLICKHOUSE_SKIP_VERIFY"); err != nil {
 		return nil, fmt.Errorf("failed to bind environment variable for chskipverify: %w", err)
 	}
-	if err := viper.BindEnv("chport", "CLICKHOUSE_PORT"); err != nil {
+	if err := v.BindEnv("chport", "CLICKHOUSE_PORT"); err != nil {
 		return nil, fmt.Errorf("failed to bind environment variable for chport: %w", err)
 	}
 
 	// Set defaults for optional fields
-	viper.SetDefault("chport", "9440")
-	viper.SetDefault("chskipverify", "false")
+	v.SetDefault("chport", "9440")
+	v.SetDefault("chskipverify", "false")
 
 	// Read environment variables
-	viper.AutomaticEnv()
+	v.AutomaticEnv()
 
 	var ClickhouseConfig ClickhouseConfig
 
 	// Unmarshal environment variables into the Config struct
-	if err := viper.Unmarshal(&ClickhouseConfig); err != nil {
+	if err := v.Unmarshal(&ClickhouseConfig); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
