@@ -98,6 +98,21 @@ func TestClickHouseStore_Conn(t *testing.T) {
 	}
 }
 
+// TestClickHouseStore_PipelineConfig tests the PipelineConfig accessor method.
+func TestClickHouseStore_PipelineConfig(t *testing.T) {
+	config := testPipelineConfig()
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, config, "ci")
+
+	gotConfig := store.PipelineConfig()
+	if gotConfig != config {
+		t.Fatal("expected PipelineConfig to return the same config")
+	}
+	if gotConfig.Name != "test-pipeline" {
+		t.Errorf("expected pipeline name 'test-pipeline', got '%s'", gotConfig.Name)
+	}
+}
+
 // TestClickHouseStore_Close tests the Close method.
 func TestClickHouseStore_Close(t *testing.T) {
 	t.Run("successful close", func(t *testing.T) {

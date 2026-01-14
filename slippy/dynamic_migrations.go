@@ -197,15 +197,6 @@ func (m *DynamicMigrationManager) GetAggregateColumns() []string {
 // - Step columns (ADD COLUMN IF NOT EXISTS)
 // - Secondary indexes (ADD INDEX IF NOT EXISTS)
 
-// generateMigrationsFromConfig creates the core versioned migrations.
-// These define the table structure and run once per version.
-func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemigrator.Migration {
-	return []clickhousemigrator.Migration{
-		m.generateBaseTableMigration(),
-		m.generateHistoryViewMigration(),
-	}
-}
-
 // GenerateEnsurers creates idempotent schema operations for dynamic columns.
 // These run every time and handle step columns based on configuration.
 func (m *DynamicMigrationManager) GenerateEnsurers() []clickhousemigrator.SchemaEnsurer {
@@ -220,6 +211,15 @@ func (m *DynamicMigrationManager) GenerateEnsurers() []clickhousemigrator.Schema
 	ensurers = append(ensurers, m.generateIndexEnsurer())
 
 	return ensurers
+}
+
+// generateMigrationsFromConfig creates the core versioned migrations.
+// These define the table structure and run once per version.
+func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemigrator.Migration {
+	return []clickhousemigrator.Migration{
+		m.generateBaseTableMigration(),
+		m.generateHistoryViewMigration(),
+	}
 }
 
 // generateBaseTableMigration creates the core routing_slips table.
