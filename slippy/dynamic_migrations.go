@@ -21,6 +21,54 @@ type DynamicMigrationManager struct {
 	logger   clickhousemigrator.Logger
 }
 
+type enumValue struct {
+	label string
+	code  int
+}
+
+var (
+	slipStatusEnumValues = []enumValue{
+		{label: string(SlipStatusPending), code: 1},
+		{label: string(SlipStatusInProgress), code: 2},
+		{label: string(SlipStatusCompleted), code: 3},
+		{label: string(SlipStatusFailed), code: 4},
+		{label: string(SlipStatusCompensating), code: 5},
+		{label: string(SlipStatusCompensated), code: 6},
+	}
+
+	stepStatusEnumValues = []enumValue{
+		{label: string(StepStatusPending), code: 1},
+		{label: string(StepStatusHeld), code: 2},
+		{label: string(StepStatusRunning), code: 3},
+		{label: string(StepStatusCompleted), code: 4},
+		{label: string(StepStatusFailed), code: 5},
+		{label: string(StepStatusError), code: 6},
+		{label: string(StepStatusAborted), code: 7},
+		{label: string(StepStatusTimeout), code: 8},
+		{label: string(StepStatusSkipped), code: 9},
+	}
+)
+
+func formatEnumValues(values []enumValue, indent string) string {
+	lines := make([]string, len(values))
+	for i, v := range values {
+		line := fmt.Sprintf("%s'%s' = %d", indent, v.label, v.code)
+		if i < len(values)-1 {
+			line += ","
+		}
+		lines[i] = line
+	}
+	return strings.Join(lines, "\n")
+}
+
+func slipStatusEnumDefinition(indent string) string {
+	return formatEnumValues(slipStatusEnumValues, indent)
+}
+
+func stepStatusEnumDefinition(indent string) string {
+	return formatEnumValues(stepStatusEnumValues, indent)
+}
+
 // DynamicMigration represents a migration stored in the database.
 type DynamicMigration struct {
 	Version     uint32    `ch:"version"` // UInt32 in ClickHouse
@@ -232,6 +280,8 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 
 // generateBaseTableMigration creates the core routing_slips table.
 func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrator.Migration {
+	slipStatusEnum := slipStatusEnumDefinition("\t\t\t\t")
+	defaultSlipStatus := string(SlipStatusPending)
 	return clickhousemigrator.Migration{
 		Version:     1,
 		Name:        "create_routing_slips_base",
@@ -252,13 +302,8 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 
 				-- Overall slip status
 				status Enum8(
-					'pending' = 1,
-					'in_progress' = 2,
-					'completed' = 3,
-					'failed' = 4,
-					'compensating' = 5,
-					'compensated' = 6
-				) DEFAULT 'pending',
+%s
+				) DEFAULT '%s',
 
 				-- Step execution details (timing, actor, errors for all steps)
 				step_details JSON DEFAULT '{}',
@@ -275,7 +320,7 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 			ORDER BY (correlation_id)
 			PARTITION BY toYYYYMM(created_at)
 			SETTINGS index_granularity = 8192
-		`, m.database),
+		`, m.database, slipStatusEnum, defaultSlipStatus),
 		DownSQL: fmt.Sprintf(`DROP TABLE IF EXISTS %s.routing_slips`, m.database),
 	}
 }
@@ -314,14 +359,18 @@ func (m *DynamicMigrationManager) generateHistoryViewMigration() clickhousemigra
 // Uses ADD COLUMN IF NOT EXISTS so it's safe to run every time.
 func (m *DynamicMigrationManager) generateStepColumnEnsurer(step StepConfig) clickhousemigrator.SchemaEnsurer {
 	statusColumn := fmt.Sprintf("%s_status", step.Name)
+	stepStatusEnum := stepStatusEnumDefinition("\t\t\t\t")
+	defaultStepStatus := string(StepStatusPending)
 
 	var sql strings.Builder
 	sql.WriteString(fmt.Sprintf(`
 		ALTER TABLE %s.routing_slips
 		ADD COLUMN IF NOT EXISTS %s Enum8(
-			'pending'=1, 'held'=2, 'running'=3, 'completed'=4,
-			'failed'=5, 'error'=6, 'aborted'=7, 'timeout'=8, 'skipped'=9
-		) DEFAULT 'pending'`, m.database, statusColumn))
+%s
+		) DEFAULT '%s',
+		MODIFY COLUMN %s Enum8(
+%s
+		)`, m.database, statusColumn, stepStatusEnum, defaultStepStatus, statusColumn, stepStatusEnum))
 
 	// If this is an aggregate step, add a JSON column for component data
 	// Array wrapped in object for ClickHouse JSON compatibility

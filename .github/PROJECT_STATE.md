@@ -41,7 +41,6 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Config error capture** - stores load errors for proper surfacing in validation
 - **ClickHouse store** - slip persistence with query builders and scanners
 - **Native JSON handling** - uses `chcol.JSON` for ClickHouse JSON columns
-- See `slippy/CLAUDE.md` for detailed patterns
 
 ### ClickHouse Migrator Package
 - **Versioned migrations** - one-time schema changes tracked in migrations table
