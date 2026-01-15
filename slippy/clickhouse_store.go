@@ -276,7 +276,7 @@ func (s *ClickHouseStore) FindAllByCommits(
 	ctx context.Context,
 	repository string,
 	commits []string,
-) ([]SlipWithCommit, error) {
+) (results []SlipWithCommit, err error) {
 	if s.pipelineConfig == nil {
 		return nil, fmt.Errorf("pipeline config is required for store operations")
 	}
@@ -294,13 +294,17 @@ func (s *ClickHouseStore) FindAllByCommits(
 	if err != nil {
 		return nil, fmt.Errorf("failed to query slips by commits: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		closeErr := rows.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("failed to close rows: %w", closeErr)
+		}
+	}()
 
-	var results []SlipWithCommit
 	for rows.Next() {
-		slip, matchedCommit, err := s.scanner.ScanSlipWithMatchFromRows(rows)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan slip from rows: %w", err)
+		slip, matchedCommit, scanErr := s.scanner.ScanSlipWithMatchFromRows(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("failed to scan slip from rows: %w", scanErr)
 		}
 		results = append(results, SlipWithCommit{Slip: slip, MatchedCommit: matchedCommit})
 	}
