@@ -328,10 +328,12 @@ func TestClient_Close(t *testing.T) {
 func TestClient_Accessors(t *testing.T) {
 	store := NewMockStore()
 	github := NewMockGitHubAPI()
+	pipelineConfig := testPipelineConfig()
 	config := Config{
-		HoldTimeout:   30 * time.Minute,
-		PollInterval:  45 * time.Second,
-		AncestryDepth: 25,
+		HoldTimeout:    30 * time.Minute,
+		PollInterval:   45 * time.Second,
+		AncestryDepth:  25,
+		PipelineConfig: pipelineConfig,
 	}
 	client := NewClientWithDependencies(store, github, config)
 
@@ -350,13 +352,126 @@ func TestClient_Accessors(t *testing.T) {
 	t.Run("Config", func(t *testing.T) {
 		cfg := client.Config()
 		if cfg.HoldTimeout != 30*time.Minute {
-			t.Errorf("expected HoldTimeout 30m, got %v", cfg.HoldTimeout)
+			t.Errorf("Config().HoldTimeout = %v, want 30m", cfg.HoldTimeout)
 		}
-		if cfg.PollInterval != 45*time.Second {
-			t.Errorf("expected PollInterval 45s, got %v", cfg.PollInterval)
+	})
+
+	t.Run("PipelineConfig", func(t *testing.T) {
+		pc := client.PipelineConfig()
+		if pc == nil {
+			t.Error("PipelineConfig() should return non-nil")
 		}
-		if cfg.AncestryDepth != 25 {
-			t.Errorf("expected AncestryDepth 25, got %v", cfg.AncestryDepth)
+		if pc != pipelineConfig {
+			t.Error("PipelineConfig() should return the pipeline config from config")
+		}
+	})
+}
+
+func TestClient_AbandonSlip(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("success - abandon pending slip", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		now := time.Now()
+		slip := &Slip{
+			CorrelationID: "corr-abandon-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+			Status:        SlipStatusPending,
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(slip)
+
+		err := client.AbandonSlip(ctx, "corr-abandon-1", "corr-new-slip")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Verify the update was made
+		if len(store.UpdateCalls) != 1 {
+			t.Errorf("expected 1 Update call, got %d", len(store.UpdateCalls))
+		}
+		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
+			t.Errorf("expected status Abandoned, got %s", store.UpdateCalls[0].Slip.Status)
+		}
+	})
+
+	t.Run("skip - already terminal", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		now := time.Now()
+		slip := &Slip{
+			CorrelationID: "corr-abandon-2",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "def456",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+			Status:        SlipStatusCompleted, // Already terminal
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(slip)
+
+		err := client.AbandonSlip(ctx, "corr-abandon-2", "corr-new-slip")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Should NOT have updated since already terminal
+		if len(store.UpdateCalls) != 0 {
+			t.Errorf("expected 0 Update calls for terminal slip, got %d", len(store.UpdateCalls))
+		}
+	})
+
+	t.Run("error - slip not found", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		err := client.AbandonSlip(ctx, "nonexistent", "corr-new-slip")
+		if err == nil {
+			t.Fatal("expected error")
+		}
+
+		var slipErr *SlipError
+		if !errors.As(err, &slipErr) {
+			t.Fatalf("expected SlipError, got %T", err)
+		}
+		if slipErr.Op != "abandon" {
+			t.Errorf("expected op 'abandon', got '%s'", slipErr.Op)
+		}
+	})
+
+	t.Run("error - update fails", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		now := time.Now()
+		slip := &Slip{
+			CorrelationID: "corr-abandon-3",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "ghi789",
+			CreatedAt:     now,
+			UpdatedAt:     now,
+			Status:        SlipStatusInProgress,
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(slip)
+		store.UpdateError = errors.New("database error")
+
+		err := client.AbandonSlip(ctx, "corr-abandon-3", "corr-new-slip")
+		if err == nil {
+			t.Fatal("expected error")
 		}
 	})
 }
