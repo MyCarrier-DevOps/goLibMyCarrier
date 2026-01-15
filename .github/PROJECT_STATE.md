@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 14, 2026  
-> **Status:** Multi-module Go library with slippy schema ensurer architecture complete (branch: fix/slippy)
+> **Last Updated:** January 15, 2026  
+> **Status:** Multi-module Go library with ancestry tracking (branch: slippy/ancestry-tracking)
 
 ---
 
@@ -41,7 +41,33 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Config error capture** - stores load errors for proper surfacing in validation
 - **ClickHouse store** - slip persistence with query builders and scanners
 - **Native JSON handling** - uses `chcol.JSON` for ClickHouse JSON columns
+- **Ancestry tracking** - maintains full commit lineage chain in `Ancestry` JSON field
+- **Progressive depth ancestry search** - starts at 25 commits, expands to 100 if no ancestor found
+- **Ancestry inheritance** - child slips inherit parent's ancestry chain for complete lineage
 - See `slippy/CLAUDE.md` for detailed patterns
+
+### Ancestry Tracking (January 15, 2026)
+Slips now track their complete commit ancestry chain, enabling:
+- **Lineage preservation**: Each slip stores the full chain of ancestor commits in `Ancestry` JSON field
+- **Ancestor resolution**: On new push, searches commit history to find existing slips and mark them abandoned
+- **Progressive depth**: Starts with 25 commits, expands to 100 if no ancestor found (configurable)
+- **Chain inheritance**: Child slips inherit parent's ancestry + parent's commit, building complete history
+- **Single abandonment**: Only the most recent non-terminal ancestor is abandoned (not entire chain)
+
+**Data Model:**
+```go
+type Slip struct {
+    // ... other fields
+    Ancestry chcol.JSON[[]string] `ch:"ancestry"` // JSON array of commit SHAs
+}
+```
+
+**Flow:**
+1. Push event arrives with commit list
+2. `findAncestorSlipsWithProgressiveDepth()` searches for existing slips in commit history
+3. If ancestor found: inherit its `Ancestry` chain + add ancestor's commit SHA
+4. Abandon the most recent non-terminal ancestor slip
+5. New slip created with inherited ancestry chain
 
 ### ClickHouse Migrator Package
 - **Versioned migrations** - one-time schema changes tracked in migrations table
@@ -56,6 +82,43 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 ---
 
 ## Recent Changes
+
+### January 15, 2026 — Ancestry Tracking & Progressive Depth Search (branch: slippy/ancestry-tracking)
+
+**Problem:** 
+1. No way to track full commit lineage across slip generations
+2. Large pushes with many commits between slips (>25) caused ancestor resolution to fail
+
+**Solution:** 
+1. Added `Ancestry` JSON field to store complete commit chain; child slips inherit parent's ancestry
+2. Implemented progressive depth search - starts at `AncestryDepth` (default 25), expands to `AncestryMaxDepth` (default 100) if no ancestor found
+
+**New Configuration:**
+- `SLIPPY_ANCESTRY_DEPTH`: Initial search depth (default: 25)
+- `SLIPPY_ANCESTRY_MAX_DEPTH`: Maximum depth for progressive expansion (default: 100)
+
+**Changes:**
+- `slippy/config.go`: Added `AncestryMaxDepth` field with env var loading and validation
+- `slippy/push.go`: New `findAncestorSlipsWithProgressiveDepth()` function, refactored `resolveAndAbandonAncestors()`
+- `slippy/clickhouse_store.go`: Fixed `FindAllByCommits` to use named returns for proper `rows.Close()` error handling
+- `slippy/client.go`: Combined parameter types in `AbandonSlip` per lint requirements
+- `slippy/mock_store_test.go`: Added `FindAllByCommitsError`, `FindAllByCommitsCalls`, ancestry deep copy
+- `slippy/slippytest/mock_store.go`: Mirrored `FindAllByCommits` support for external test fixtures
+
+**New Features:**
+- **Ancestry inheritance**: Child slips inherit parent's ancestry chain for full lineage preservation
+- **Only most recent abandoned**: Only the first (most recent) non-terminal ancestor is abandoned
+- **Failed step tracking**: Records which step failed in ancestor slip for debugging
+
+**Test Coverage:**
+- Added comprehensive tests for `resolveAndAbandonAncestors` (was 24.1%)
+- Added comprehensive tests for `findAncestorSlipsWithProgressiveDepth` (was 47.8%)
+- Added tests for `AbandonSlip`, `ValidateMinimal`, `WithPipelineConfig`, `WithDatabase`
+- Coverage improved from 63% → **76.6%** (exceeds 75% threshold)
+
+**Current Status:**
+- ✅ `make lint PKG=slippy` - 0 issues
+- ✅ `make test PKG=slippy` - all pass, 76.6% coverage
 
 ### January 14, 2026 — Isolated Viper Instances (branch: fix/slippy)
 
@@ -153,12 +216,19 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 
 ## Current Focus
 
-1. **Branch fix/slippy** - Schema ensurer architecture complete, ready for PR review
+1. **Branch slippy/ancestry-tracking** - Ancestry tracking with progressive depth search complete, ready for testing
 2. **Validation requirements** - All modules must pass `make fmt`, `make lint`, `make test`
+3. **Next: Extend pushhookparser** - Update pushhookparser slippy integration with new functionality
 
 ---
 
 ## Architectural Decisions
+
+### Never Bypass Linting Rules
+**Decision:** Never use `//nolint` directives, `_ =` to ignore return values, or any mechanism to circumvent lint errors without explicit user permission.
+**Rationale:** Lint rules exist for code quality. Bypassing them hides real issues and creates technical debt. The proper fix is always to resolve the underlying problem.
+**Implementation:** When a lint error is encountered, fix the code properly. If a rule seems genuinely wrong for the situation, discuss with user before bypassing.
+**Anti-pattern:** Adding `//nolint:errcheck` or `_ = someFunc()` to silence warnings.
 
 ### Isolated Viper Instances
 **Decision:** Use `viper.New()` for isolated instances instead of the global viper singleton when loading package-specific configuration.
@@ -195,6 +265,26 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 **Rationale:** Simplifies dependency management for consumers; ensures compatibility.
 **Implementation:** CI creates root tag first, then submodule tags with same version.
 
+### Proper Error Handling for rows.Close()
+**Decision:** Use named return values with deferred close to properly handle `rows.Close()` errors.
+**Rationale:** Never use `_ = rows.Close()` to bypass errcheck. Named returns allow capturing close errors properly.
+**Implementation:**
+```go
+func FindAllByCommits(...) (results []SlipWithCommit, err error) {
+    rows, err := db.Query(...)
+    if err != nil { return nil, err }
+    defer func() {
+        closeErr := rows.Close()
+        if err == nil && closeErr != nil {
+            err = fmt.Errorf("failed to close rows: %w", closeErr)
+        }
+    }()
+    // ... scan rows ...
+    return results, nil
+}
+```
+**Anti-pattern:** Using `_ = rows.Close()` or `//nolint:errcheck` to suppress lint warnings.
+
 ### Two Migration Types (Versioned + Ensurers)
 **Decision:** Use versioned migrations for core schema, idempotent ensurers for dynamic columns.
 **Rationale:** Adding a step to pipeline config shouldn't require version bump; step columns are order-independent.
@@ -209,8 +299,8 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 ## Technical Debt / Known Issues
 
 - [ ] `slippytest` package shows 0% coverage (test fixture, expected)
-- [ ] Some slippy functions at 0% coverage: `NewClickHouseStoreFromConfig`, `ValidateMinimal`, `PipelineConfig()`
-- [ ] `NewClient` in slippy at 18.2% coverage - needs more test scenarios
+- [ ] `NewClickHouseStoreFromConfig` at 0% coverage - requires real ClickHouse connection
+- [ ] `NewClient` in slippy at 18.2% coverage - requires real ClickHouse/GitHub connections
 - [ ] `chcol.JSON` mocking limitations - step_details timestamp parsing cannot be unit tested (requires integration tests)
 
 ---
@@ -218,9 +308,10 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 ## Next Steps (Not Yet Implemented)
 
 ### Immediate
-- [ ] Create PR for fix/slippy branch if not already open
-- [ ] Merge fix/slippy after CI passes
-- [ ] Verify pkg.go.dev indexes new version correctly
+- [ ] Extend pushhookparser with new progressive depth ancestry support
+- [ ] Run full repo-wide `make lint` and `make test` 
+- [ ] Create PR for slippy/ancestry-tracking branch
+- [ ] Merge after CI passes
 
 ### Future
 - [ ] Integration tests for slippy with real ClickHouse (currently unit tests with mocks)
