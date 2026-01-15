@@ -200,6 +200,7 @@ func (m *DynamicMigrationManager) GetAggregateColumns() []string {
 // Core schema uses versioned migrations (run once):
 // - v1: Base routing_slips table
 // - v2: History materialized view
+// - v3: Ancestry column and abandoned status
 //
 // Dynamic schema uses ensurers (run every time, must be idempotent):
 // - Step columns (ADD COLUMN IF NOT EXISTS)
@@ -227,6 +228,7 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 	return []clickhousemigrator.Migration{
 		m.generateBaseTableMigration(),
 		m.generateHistoryViewMigration(),
+		m.generateAncestryMigration(),
 	}
 }
 
@@ -257,7 +259,8 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 					'completed' = 3,
 					'failed' = 4,
 					'compensating' = 5,
-					'compensated' = 6
+					'compensated' = 6,
+					'abandoned' = 7
 				) DEFAULT 'pending',
 
 				-- Step execution details (timing, actor, errors for all steps)
@@ -265,6 +268,9 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 
 				-- Complete audit trail (array wrapped in object for ClickHouse JSON compatibility)
 				state_history JSON DEFAULT '{"entries":[]}',
+
+				-- Ancestry chain tracking prior slips (array wrapped in object for ClickHouse JSON compatibility)
+				ancestry JSON DEFAULT '{"chain":[]}',
 
 				-- Bloom filter indexes
 				INDEX idx_repository repository TYPE bloom_filter GRANULARITY 1,
@@ -340,6 +346,41 @@ func (m *DynamicMigrationManager) generateStepColumnEnsurer(step StepConfig) cli
 		Name:        fmt.Sprintf("ensure_step_%s", step.Name),
 		Description: description,
 		SQL:         sql.String(),
+	}
+}
+
+// generateAncestryMigration creates the migration for ancestry tracking.
+// This adds the ancestry column and updates the status enum to include 'abandoned'.
+func (m *DynamicMigrationManager) generateAncestryMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     3,
+		Name:        "add_ancestry_column",
+		Description: "Adds ancestry column for tracking slip lineage and abandoned status",
+		UpSQL: fmt.Sprintf(`
+			ALTER TABLE %s.routing_slips
+			ADD COLUMN IF NOT EXISTS ancestry JSON DEFAULT '{"chain":[]}',
+			MODIFY COLUMN status Enum8(
+				'pending' = 1,
+				'in_progress' = 2,
+				'completed' = 3,
+				'failed' = 4,
+				'compensating' = 5,
+				'compensated' = 6,
+				'abandoned' = 7
+			)
+		`, m.database),
+		DownSQL: fmt.Sprintf(`
+			ALTER TABLE %s.routing_slips
+			DROP COLUMN IF EXISTS ancestry,
+			MODIFY COLUMN status Enum8(
+				'pending' = 1,
+				'in_progress' = 2,
+				'completed' = 3,
+				'failed' = 4,
+				'compensating' = 5,
+				'compensated' = 6
+			)
+		`, m.database),
 	}
 }
 

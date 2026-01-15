@@ -47,7 +47,7 @@ func (b *SlipQueryBuilder) BuildSelectColumns() []string {
 	columns := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus,
-		ColumnStepDetails, ColumnStateHistory,
+		ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
 	}
 
 	// Add step status columns
@@ -111,6 +111,27 @@ func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 		WHERE s.repository = {repository:String}
 		ORDER BY c.priority ASC
 		LIMIT 1
+	`, selectColumns, b.database)
+}
+
+// BuildFindAllByCommitsQuery builds a query to find all slips matching commits in the list.
+// Returns slips ordered by commit priority (most recent commit's slip first).
+func (b *SlipQueryBuilder) BuildFindAllByCommitsQuery() string {
+	selectColumns := b.BuildSelectColumnsWithPrefix("s.")
+
+	return fmt.Sprintf(`
+		WITH commits AS (
+			SELECT 
+				arrayJoin(range(1, length({commits:Array(String)}) + 1)) AS priority,
+				{commits:Array(String)}[priority] AS commit_sha
+		)
+		SELECT 
+			%s,
+			c.commit_sha AS matched_commit
+		FROM %s.routing_slips s FINAL
+		INNER JOIN commits c ON s.commit_sha = c.commit_sha
+		WHERE s.repository = {repository:String}
+		ORDER BY c.priority ASC
 	`, selectColumns, b.database)
 }
 

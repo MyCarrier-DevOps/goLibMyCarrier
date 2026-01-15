@@ -121,6 +121,35 @@ func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, sta
 	return nil
 }
 
+// AbandonSlip marks a slip as abandoned, indicating it was superseded by a newer slip.
+// This should only be called on slips that are not already in a terminal state.
+// Returns an error if the slip is already terminal.
+func (c *Client) AbandonSlip(ctx context.Context, correlationID string, supersededBy string) error {
+	slip, err := c.store.Load(ctx, correlationID)
+	if err != nil {
+		return NewSlipError("abandon", correlationID, err)
+	}
+
+	if slip.Status.IsTerminal() {
+		c.logger.Info(ctx, "Slip already terminal, skipping abandon", map[string]interface{}{
+			"correlation_id": correlationID,
+			"status":         string(slip.Status),
+		})
+		return nil
+	}
+
+	slip.Status = SlipStatusAbandoned
+	if err := c.store.Update(ctx, slip); err != nil {
+		return NewSlipError("abandon", correlationID, err)
+	}
+
+	c.logger.Info(ctx, "Abandoned slip", map[string]interface{}{
+		"correlation_id": correlationID,
+		"superseded_by":  supersededBy,
+	})
+	return nil
+}
+
 // Close releases resources held by the client.
 func (c *Client) Close() error {
 	if c.store != nil {

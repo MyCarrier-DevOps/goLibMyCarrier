@@ -29,6 +29,7 @@ type scanContext struct {
 	statusStr        string
 	stepDetailsJSON  *chcol.JSON // Native ClickHouse JSON type
 	stateHistoryJSON *chcol.JSON // Native ClickHouse JSON type
+	ancestryJSON     *chcol.JSON // Native ClickHouse JSON type for ancestry chain
 	stepStatuses     []string
 	aggregateJSONs   map[string]*chcol.JSON // Native ClickHouse JSON type
 	scanDest         []interface{}
@@ -41,11 +42,12 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 		slip:             &Slip{},
 		stepDetailsJSON:  chcol.NewJSON(),
 		stateHistoryJSON: chcol.NewJSON(),
+		ancestryJSON:     chcol.NewJSON(),
 		stepStatuses:     make([]string, len(s.config.Steps)),
 		aggregateJSONs:   make(map[string]*chcol.JSON),
 	}
 
-	// Core column destinations
+	// Core column destinations (order must match BuildSelectColumns)
 	ctx.scanDest = []interface{}{
 		&ctx.slip.CorrelationID,
 		&ctx.slip.Repository,
@@ -56,6 +58,7 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 		&ctx.statusStr,
 		ctx.stepDetailsJSON,
 		ctx.stateHistoryJSON,
+		ctx.ancestryJSON,
 	}
 
 	// Step status destinations
@@ -117,6 +120,14 @@ func (s *SlipScanner) PopulateSlipFromScan(ctx *scanContext) error {
 		}
 	}
 
+	// Parse ancestry from chcol.JSON (unwrap from object)
+	if ctx.ancestryJSON != nil {
+		// Extract "chain" array from the JSON object
+		if chain, ok := chcol.ExtractJSONPathAs[[]AncestryEntry](ctx.ancestryJSON, "chain"); ok {
+			slip.Ancestry = chain
+		}
+	}
+
 	return nil
 }
 
@@ -136,6 +147,23 @@ func (s *SlipScanner) ScanSlipFromRow(row ch.Row) (*Slip, error) {
 	}
 
 	return ctx.slip, nil
+}
+
+// ScanSlipWithMatchFromRows scans a slip with matched_commit from driver.Rows.
+// This is used for multi-row queries where we need to iterate.
+func (s *SlipScanner) ScanSlipWithMatchFromRows(rows ch.Rows) (*Slip, string, error) {
+	var matchedCommit string
+	ctx := s.BuildScanContext(&matchedCommit)
+
+	if err := rows.Scan(ctx.scanDest...); err != nil {
+		return nil, "", fmt.Errorf("failed to scan slip from rows: %w", err)
+	}
+
+	if err := s.PopulateSlipFromScan(ctx); err != nil {
+		return nil, "", err
+	}
+
+	return ctx.slip, matchedCommit, nil
 }
 
 // ScanSlipWithMatch scans a slip with an additional matched_commit column.

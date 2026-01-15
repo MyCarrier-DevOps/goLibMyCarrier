@@ -31,6 +31,11 @@ type SlipStore interface {
 	// The third return value is the matched commit SHA.
 	FindByCommits(ctx context.Context, repository string, commits []string) (*Slip, string, error)
 
+	// FindAllByCommits finds all slips matching any commit in the ordered list.
+	// Returns slips ordered by commit priority (first matching commit's slip first).
+	// Each result includes the slip and its matched commit SHA.
+	FindAllByCommits(ctx context.Context, repository string, commits []string) ([]SlipWithCommit, error)
+
 	// Update persists changes to an existing slip
 	Update(ctx context.Context, slip *Slip) error
 

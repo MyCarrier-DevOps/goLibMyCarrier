@@ -55,6 +55,7 @@ func GetDynamicMigrationVersion(config *PipelineConfig) int {
 	}
 	// Version 1: base table
 	// Version 2: history view
+	// Version 3: ancestry column and abandoned status
 	// Step columns and indexes are now ensurers, not versioned migrations
-	return 2
+	return 3
 }

@@ -220,6 +220,39 @@ func (m *MockStore) FindByCommits(ctx context.Context, repository string, commit
 	return nil, "", ErrSlipNotFound
 }
 
+// FindAllByCommits finds all slips matching any commit in the ordered list.
+func (m *MockStore) FindAllByCommits(ctx context.Context, repository string, commits []string) ([]SlipWithCommit, error) {
+	m.mu.Lock()
+	m.FindByCommitsCalls = append(m.FindByCommitsCalls, FindByCommitsCall{
+		Repository: repository,
+		Commits:    commits,
+	})
+	m.mu.Unlock()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.FindByCommitsError != nil {
+		return nil, m.FindByCommitsError
+	}
+
+	// Find all matching slips in commit order
+	var results []SlipWithCommit
+	for _, commit := range commits {
+		key := repository + ":" + commit
+		if correlationID, ok := m.CommitIndex[key]; ok {
+			if slip, ok := m.Slips[correlationID]; ok {
+				results = append(results, SlipWithCommit{
+					Slip:          deepCopySlip(slip),
+					MatchedCommit: commit,
+				})
+			}
+		}
+	}
+
+	return results, nil
+}
+
 // Update persists changes to an existing slip.
 func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 	m.mu.Lock()

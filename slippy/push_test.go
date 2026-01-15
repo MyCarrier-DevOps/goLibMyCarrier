@@ -335,7 +335,7 @@ func TestClient_InitializeSlipForPush(t *testing.T) {
 		},
 	}
 
-	slip := client.initializeSlipForPush(opts)
+	slip := client.initializeSlipForPush(opts, nil)
 
 	// Verify basic fields
 	if slip.CorrelationID != "corr-init-1" {
@@ -426,7 +426,7 @@ func TestClient_InitializeSlipForPush_EmptyComponents(t *testing.T) {
 		Components:    []ComponentDefinition{}, // Empty
 	}
 
-	slip := client.initializeSlipForPush(opts)
+	slip := client.initializeSlipForPush(opts, nil)
 
 	// Verify aggregates have empty component data
 	if slip.Aggregates == nil {

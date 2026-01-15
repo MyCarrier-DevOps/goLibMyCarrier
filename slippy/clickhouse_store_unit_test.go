@@ -456,9 +456,9 @@ func TestNewClickHouseStoreFromConn(t *testing.T) {
 // Column layout for test config (4 steps, 2 aggregates):
 // 0: correlation_id, 1: repository, 2: branch, 3: commit_sha
 // 4: created_at, 5: updated_at, 6: status
-// 7: step_details (JSON), 8: state_history (JSON)
-// 9-12: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
-// 13: builds (aggregate JSON), 14: unit_tests (aggregate JSON)
+// 7: step_details (JSON), 8: state_history (JSON), 9: ancestry (JSON)
+// 10-13: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
+// 14: builds (aggregate JSON), 15: unit_tests (aggregate JSON)
 func createMockScanRow(correlationID, repository, branch, commitSHA string, status SlipStatus) *clickhousetest.MockRow {
 	now := time.Now()
 
@@ -475,6 +475,10 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 			{Timestamp: now, Step: "push_parsed", Status: StepStatusCompleted},
 		},
 	}
+	// Ancestry wrapped in object for ClickHouse JSON compatibility
+	ancestryData := map[string]interface{}{
+		"chain": []AncestryEntry{},
+	}
 	// Aggregates wrapped in object for ClickHouse JSON compatibility
 	buildsData := map[string]interface{}{
 		"items": []ComponentStepData{
@@ -489,9 +493,9 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			// Test config has 4 steps, 2 aggregates = 15 columns
-			if len(dest) < 15 {
-				return fmt.Errorf("not enough scan destinations: got %d, want 15", len(dest))
+			// Test config has 4 steps, 2 aggregates + ancestry = 16 columns
+			if len(dest) < 16 {
+				return fmt.Errorf("not enough scan destinations: got %d, want 16", len(dest))
 			}
 			// Set correlation_id
 			if ptr, ok := dest[0].(*string); ok {
@@ -535,23 +539,30 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 				data, _ := json.Marshal(stateHistoryData)
 				*ptr = string(data)
 			}
-			// Set step statuses (4 steps)
-			for i := 9; i < 13; i++ {
+			// Set ancestry JSON - use Scan with map data for *chcol.JSON
+			if jsonPtr, ok := dest[9].(*chcol.JSON); ok {
+				_ = jsonPtr.Scan(ancestryData)
+			} else if ptr, ok := dest[9].(*string); ok {
+				data, _ := json.Marshal(ancestryData)
+				*ptr = string(data)
+			}
+			// Set step statuses (4 steps, now at indices 10-13)
+			for i := 10; i < 14; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = string(StepStatusPending)
 				}
 			}
-			// Set builds aggregate JSON - use Scan with map data for *chcol.JSON
-			if jsonPtr, ok := dest[13].(*chcol.JSON); ok {
+			// Set builds aggregate JSON - use Scan with map data for *chcol.JSON (now at index 14)
+			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(buildsData)
-			} else if ptr, ok := dest[13].(*string); ok {
+			} else if ptr, ok := dest[14].(*string); ok {
 				data, _ := json.Marshal(buildsData)
 				*ptr = string(data)
 			}
-			// Set unit_tests aggregate JSON - use Scan with map data for *chcol.JSON
-			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
+			// Set unit_tests aggregate JSON - use Scan with map data for *chcol.JSON (now at index 15)
+			if jsonPtr, ok := dest[15].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(unitTestsData)
-			} else if ptr, ok := dest[14].(*string); ok {
+			} else if ptr, ok := dest[15].(*string); ok {
 				data, _ := json.Marshal(unitTestsData)
 				*ptr = string(data)
 			}
@@ -858,10 +869,10 @@ func TestClickHouseStore_AppendHistory_Success(t *testing.T) {
 // Column layout for test config (4 steps, 2 aggregates) + matched_commit:
 // 0: correlation_id, 1: repository, 2: branch, 3: commit_sha
 // 4: created_at, 5: updated_at, 6: status
-// 7: step_details (JSON), 8: state_history (JSON)
-// 9-12: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
-// 13: builds (aggregate JSON), 14: unit_tests (aggregate JSON)
-// 15: matched_commit
+// 7: step_details (JSON), 8: state_history (JSON), 9: ancestry (JSON)
+// 10-13: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
+// 14: builds (aggregate JSON), 15: unit_tests (aggregate JSON)
+// 16: matched_commit
 func createMockScanRowWithMatch(
 	correlationID, repository, branch, commitSHA, matchedCommit string,
 	status SlipStatus,
@@ -872,6 +883,9 @@ func createMockScanRowWithMatch(
 	stepDetailsData := map[string]map[string]interface{}{}
 	stateHistoryData := map[string]interface{}{
 		"entries": []StateHistoryEntry{},
+	}
+	ancestryData := map[string]interface{}{
+		"chain": []AncestryEntry{},
 	}
 	buildsData := map[string]interface{}{
 		"items": []ComponentStepData{
@@ -884,9 +898,9 @@ func createMockScanRowWithMatch(
 
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			// Test config has 4 steps, 2 aggregates + matched_commit = 16 columns
-			if len(dest) < 16 {
-				return fmt.Errorf("not enough scan destinations for scanSlipWithMatch: got %d, want 16", len(dest))
+			// Test config has 4 steps, 2 aggregates + ancestry + matched_commit = 17 columns
+			if len(dest) < 17 {
+				return fmt.Errorf("not enough scan destinations for scanSlipWithMatch: got %d, want 17", len(dest))
 			}
 			// Set correlation_id
 			if ptr, ok := dest[0].(*string); ok {
@@ -930,28 +944,35 @@ func createMockScanRowWithMatch(
 				data, _ := json.Marshal(stateHistoryData)
 				*ptr = string(data)
 			}
-			// Set step statuses (4 steps)
-			for i := 9; i < 13; i++ {
+			// Set ancestry JSON
+			if jsonPtr, ok := dest[9].(*chcol.JSON); ok {
+				_ = jsonPtr.Scan(ancestryData)
+			} else if ptr, ok := dest[9].(*string); ok {
+				data, _ := json.Marshal(ancestryData)
+				*ptr = string(data)
+			}
+			// Set step statuses (4 steps, now at indices 10-13)
+			for i := 10; i < 14; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = string(StepStatusPending)
 				}
 			}
-			// Set builds aggregate JSON
-			if jsonPtr, ok := dest[13].(*chcol.JSON); ok {
+			// Set builds aggregate JSON (now at index 14)
+			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(buildsData)
-			} else if ptr, ok := dest[13].(*string); ok {
+			} else if ptr, ok := dest[14].(*string); ok {
 				data, _ := json.Marshal(buildsData)
 				*ptr = string(data)
 			}
-			// Set unit_tests aggregate JSON
-			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
+			// Set unit_tests aggregate JSON (now at index 15)
+			if jsonPtr, ok := dest[15].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(unitTestsData)
-			} else if ptr, ok := dest[14].(*string); ok {
+			} else if ptr, ok := dest[15].(*string); ok {
 				data, _ := json.Marshal(unitTestsData)
 				*ptr = string(data)
 			}
-			// Set matched_commit
-			if ptr, ok := dest[15].(*string); ok {
+			// Set matched_commit (now at index 16)
+			if ptr, ok := dest[16].(*string); ok {
 				*ptr = matchedCommit
 			}
 			return nil
@@ -1070,6 +1091,9 @@ func TestClickHouseStore_FindByCommits_InvalidAggregateJSON(t *testing.T) {
 func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 	now := time.Now()
 	// Create data structures wrapped in objects for ClickHouse JSON compatibility
+	ancestryData := map[string]interface{}{
+		"chain": []AncestryEntry{},
+	}
 	buildsData := map[string]interface{}{
 		"items": []ComponentStepData{},
 	}
@@ -1108,21 +1132,25 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 			if jsonPtr, ok := dest[8].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(map[string]interface{}{"invalid_key": "invalid_value"})
 			}
-			// Set step statuses (4 steps)
-			for i := 9; i < 13; i++ {
+			// Valid ancestry JSON
+			if jsonPtr, ok := dest[9].(*chcol.JSON); ok {
+				_ = jsonPtr.Scan(ancestryData)
+			}
+			// Set step statuses (4 steps, now at indices 10-13)
+			for i := 10; i < 14; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = "pending"
 				}
 			}
-			// Valid aggregate JSONs
-			if jsonPtr, ok := dest[13].(*chcol.JSON); ok {
+			// Valid aggregate JSONs (now at indices 14-15)
+			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(buildsData)
 			}
-			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
+			if jsonPtr, ok := dest[15].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(unitTestsData)
 			}
-			// Matched commit
-			if ptr, ok := dest[15].(*string); ok {
+			// Matched commit (now at index 16)
+			if ptr, ok := dest[16].(*string); ok {
 				*ptr = "abc123"
 			}
 			return nil

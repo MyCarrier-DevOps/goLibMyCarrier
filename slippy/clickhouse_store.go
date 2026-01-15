@@ -164,15 +164,22 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		return fmt.Errorf("failed to marshal state history: %w", err)
 	}
 
+	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
+	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
+	ancestryJSON, err := json.Marshal(ancestryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ancestry: %w", err)
+	}
+
 	// Build the INSERT query dynamically
 	var columns []string
 	var placeholders []string
 	var values []interface{}
 
-	// Core columns
+	// Core columns (order must match scanner expectations)
 	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
-		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory)
-	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?", "?", "?")
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry)
+	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
 	values = append(values,
 		slip.CorrelationID,
 		slip.Repository,
@@ -183,6 +190,7 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		string(slip.Status),
 		string(stepDetailsJSON),
 		string(stateHistoryJSON),
+		string(ancestryJSON),
 	)
 
 	// Step status columns
@@ -260,6 +268,44 @@ func (s *ClickHouseStore) FindByCommits(
 	}
 
 	return slip, matchedCommit, nil
+}
+
+// FindAllByCommits finds all slips matching any commit in the ordered list.
+// Returns slips ordered by commit priority (first matching commit's slip first).
+func (s *ClickHouseStore) FindAllByCommits(
+	ctx context.Context,
+	repository string,
+	commits []string,
+) ([]SlipWithCommit, error) {
+	if s.pipelineConfig == nil {
+		return nil, fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	if len(commits) == 0 {
+		return nil, nil // No commits to search, return empty slice (not an error)
+	}
+
+	query := s.queryBuilder.BuildFindAllByCommitsQuery()
+
+	rows, err := s.session.QueryWithArgs(ctx, query,
+		ch.Named("repository", repository),
+		ch.Named("commits", commits),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query slips by commits: %w", err)
+	}
+	defer rows.Close()
+
+	var results []SlipWithCommit
+	for rows.Next() {
+		slip, matchedCommit, err := s.scanner.ScanSlipWithMatchFromRows(rows)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan slip from rows: %w", err)
+		}
+		results = append(results, SlipWithCommit{Slip: slip, MatchedCommit: matchedCommit})
+	}
+
+	return results, nil
 }
 
 // Update persists changes to an existing slip.

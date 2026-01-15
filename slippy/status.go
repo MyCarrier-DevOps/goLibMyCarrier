@@ -22,6 +22,9 @@ const (
 
 	// SlipStatusCompensated indicates compensation completed
 	SlipStatusCompensated SlipStatus = "compensated"
+
+	// SlipStatusAbandoned indicates the slip was superseded by a newer slip
+	SlipStatusAbandoned SlipStatus = "abandoned"
 )
 
 // String returns the string representation of the slip status.
@@ -30,10 +33,10 @@ func (s SlipStatus) String() string {
 }
 
 // IsTerminal returns true if the slip status is a terminal state
-// (completed, failed, or compensated).
+// (completed, failed, compensated, or abandoned).
 func (s SlipStatus) IsTerminal() bool {
 	switch s {
-	case SlipStatusCompleted, SlipStatusFailed, SlipStatusCompensated:
+	case SlipStatusCompleted, SlipStatusFailed, SlipStatusCompensated, SlipStatusAbandoned:
 		return true
 	case SlipStatusPending, SlipStatusInProgress, SlipStatusCompensating:
 		return false
