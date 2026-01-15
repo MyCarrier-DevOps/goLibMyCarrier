@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // Client is the main entry point for slippy operations.
@@ -130,11 +131,7 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 		return NewSlipError("abandon", correlationID, err)
 	}
 
-	if slip.Status.IsTerminal() {
-		c.logger.Info(ctx, "Slip already terminal, skipping abandon", map[string]interface{}{
-			"correlation_id": correlationID,
-			"status":         string(slip.Status),
-		})
+	if c.checkTerminalStatus(ctx, slip, "abandon") {
 		return nil
 	}
 
@@ -160,11 +157,7 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 		return NewSlipError("promote", correlationID, err)
 	}
 
-	if slip.Status.IsTerminal() {
-		c.logger.Info(ctx, "Slip already terminal, skipping promote", map[string]interface{}{
-			"correlation_id": correlationID,
-			"status":         string(slip.Status),
-		})
+	if c.checkTerminalStatus(ctx, slip, "promote") {
 		return nil
 	}
 
@@ -207,4 +200,34 @@ func (c *Client) Config() Config {
 // PipelineConfig returns the pipeline configuration.
 func (c *Client) PipelineConfig() *PipelineConfig {
 	return c.pipelineConfig
+}
+
+// applyHoldDefaults applies default values for timeout and poll interval if not set.
+// This centralizes the defaulting logic used across WaitForPrerequisites and RunPreExecution.
+func (c *Client) applyHoldDefaults(
+	timeout, pollInterval time.Duration,
+) (appliedTimeout, appliedPollInterval time.Duration) {
+	appliedTimeout = timeout
+	if appliedTimeout == 0 {
+		appliedTimeout = c.config.HoldTimeout
+	}
+	appliedPollInterval = pollInterval
+	if appliedPollInterval == 0 {
+		appliedPollInterval = c.config.PollInterval
+	}
+	return appliedTimeout, appliedPollInterval
+}
+
+// checkTerminalStatus checks if a slip is already in a terminal state.
+// If terminal, logs a message and returns true. Otherwise returns false.
+// This centralizes the terminal check logic used in AbandonSlip and PromoteSlip.
+func (c *Client) checkTerminalStatus(ctx context.Context, slip *Slip, operation string) bool {
+	if slip.Status.IsTerminal() {
+		c.logger.Info(ctx, fmt.Sprintf("Slip already terminal, skipping %s", operation), map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+			"status":         string(slip.Status),
+		})
+		return true
+	}
+	return false
 }

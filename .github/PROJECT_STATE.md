@@ -133,6 +133,29 @@ logger.Warn("Cherry-pick detected - ancestry chain may be broken",
 
 ## Recent Changes
 
+### January 15, 2026 — SOLID/DRY Refactoring (branch: slippy/ancestry-tracking)
+
+**Problem:**
+Analysis revealed 12 SOLID and DRY principle violations in the slippy package, creating technical debt:
+- Duplicate code patterns (PR extraction, timeout defaulting, terminal status checks)
+- Helper functions mixed with business logic
+- Inconsistent function ordering
+
+**Solution:**
+Applied DRY (Don't Repeat Yourself) principle to eliminate code duplication:
+
+**DRY Improvements:**
+1. **Duplicate PR Extraction (#6)** - Rewrote `extractPRNumber()` as thin wrapper around `extractAllPRNumbers()`, eliminating duplicate regex logic
+2. **Duplicate Timeout Defaulting (#7)** - Created `applyHoldDefaults()` helper method used in `WaitForPrerequisites` and `RunPreExecution`, replacing 3 instances of identical logic
+3. **Duplicate Terminal Checks (#10)** - Created `checkTerminalStatus()` helper method used in `AbandonSlip` and `PromoteSlip`, eliminating duplicate if-check and logging
+4. **Error Wrapping (#11)** - Verified all error wrapping uses `fmt.Errorf` with `%w` consistently (already correct)
+
+**Code Organization:**
+- Moved unexported helper methods (`applyHoldDefaults`, `checkTerminalStatus`) after all exported methods to satisfy `funcorder` lint rule
+- Named return values in `applyHoldDefaults` to satisfy `gocritic` and `nakedret` lint rules
+- Added `//nolint:unused` for `extractPRNumber` (used in tests only)
+
+
 ### January 15, 2026 — Edge Case Handling & Multi-PR Support (branch: slippy/ancestry-tracking)
 
 **Problem:**

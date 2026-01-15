@@ -16,24 +16,17 @@ var prNumberRegex = regexp.MustCompile(`(?:#|pull request #)(\d+)`)
 // cherryPickRegex detects cherry-pick commits
 var cherryPickRegex = regexp.MustCompile(`(?i)\b(cherry.pick|cherry-pick|picked from|backport)\b`)
 
-// extractPRNumber extracts a pull request number from a commit message.
 // extractPRNumber extracts the first PR number from a commit message.
 // Returns 0 if no PR number is found.
-// Handles common squash merge formats:
-//   - "Add feature (#42)" - GitHub squash merge default
-//   - "Merge pull request #42 from owner/branch" - GitHub merge commit
+// This is a convenience wrapper around extractAllPRNumbers for callers that only need the first match.
 //
-//nolint:unused // Kept for backwards compatibility, use extractAllPRNumbers for new code
+//nolint:unused // Used in tests only
 func extractPRNumber(commitMessage string) int {
-	matches := prNumberRegex.FindStringSubmatch(commitMessage)
-	if len(matches) < 2 {
+	numbers := extractAllPRNumbers(commitMessage)
+	if len(numbers) == 0 {
 		return 0
 	}
-	prNum, err := strconv.Atoi(matches[1])
-	if err != nil {
-		return 0
-	}
-	return prNum
+	return numbers[0]
 }
 
 // extractAllPRNumbers extracts all PR numbers from a commit message.
