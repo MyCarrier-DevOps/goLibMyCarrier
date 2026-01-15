@@ -90,6 +90,10 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Slip
 // resolveAndAbandonAncestors fetches commit ancestry from GitHub,
 // finds any existing slips for those commits, abandons non-terminal ones,
 // and returns the ancestry chain for recording on the new slip.
+//
+// This uses progressive depth searching: starts with AncestryDepth (default 25),
+// and if no ancestor slip is found, expands to AncestryMaxDepth (default 100).
+// This handles cases where pushes contain many commits or there are gaps between slips.
 func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOptions) ([]AncestryEntry, error) {
 	// Parse owner/repo for GitHub API
 	parts := strings.SplitN(opts.Repository, "/", 2)
@@ -98,47 +102,26 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	}
 	owner, repo := parts[0], parts[1]
 
-	// Get commit ancestry from GitHub
-	// Start from the current commit to find its ancestors
-	commits, err := c.github.GetCommitAncestry(ctx, owner, repo, opts.CommitSHA, c.config.AncestryDepth)
+	// Progressive depth search: start with initial depth, expand if no ancestor found
+	ancestorSlips, err := c.findAncestorSlipsWithProgressiveDepth(ctx, owner, repo, opts)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get commit ancestry: %w", err)
-	}
-
-	// Skip the first commit if it's the current one (we're looking for ancestors)
-	// The current commit may or may not be in the list depending on the API behavior
-	if len(commits) > 0 && commits[0] == opts.CommitSHA {
-		commits = commits[1:]
-	}
-
-	if len(commits) == 0 {
-		c.logger.Debug(ctx, "No ancestor commits found", map[string]interface{}{
-			"commit": shortSHA(opts.CommitSHA),
-		})
-		return nil, nil
-	}
-
-	// Find all slips matching ancestor commits
-	ancestorSlips, err := c.store.FindAllByCommits(ctx, opts.Repository, commits)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find ancestor slips: %w", err)
+		return nil, err
 	}
 
 	if len(ancestorSlips) == 0 {
-		c.logger.Debug(ctx, "No ancestor slips found", map[string]interface{}{
-			"commit":            shortSHA(opts.CommitSHA),
-			"ancestors_checked": len(commits),
-		})
 		return nil, nil
 	}
 
 	// Build ancestry chain and abandon non-terminal slips
+	// We only process the first (most recent) ancestor slip for abandonment,
+	// but inherit its ancestry chain to maintain full lineage history.
 	var ancestry []AncestryEntry
-	for _, ancestorSlip := range ancestorSlips {
+	for i, ancestorSlip := range ancestorSlips {
 		slip := ancestorSlip.Slip
 
-		// Abandon non-terminal slips (they're being superseded by this new commit)
-		if !slip.Status.IsTerminal() {
+		// Only the first (most recent) non-terminal slip needs abandonment
+		// Earlier slips should already be in terminal states
+		if i == 0 && !slip.Status.IsTerminal() {
 			c.logger.Info(ctx, "Abandoning superseded slip", map[string]interface{}{
 				"superseded_id":      slip.CorrelationID,
 				"superseded_commit":  shortSHA(slip.CommitSHA),
@@ -176,6 +159,16 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 			FailedStep:    failedStep,
 			CreatedAt:     slip.CreatedAt,
 		})
+
+		// Inherit ancestor's ancestry chain (only from the first/most recent ancestor)
+		// This ensures we maintain full lineage even when commits exceed AncestryDepth
+		if i == 0 && len(slip.Ancestry) > 0 {
+			c.logger.Debug(ctx, "Inheriting ancestry from parent slip", map[string]interface{}{
+				"parent_id":         slip.CorrelationID,
+				"inherited_entries": len(slip.Ancestry),
+			})
+			ancestry = append(ancestry, slip.Ancestry...)
+		}
 	}
 
 	c.logger.Info(ctx, "Resolved ancestry chain", map[string]interface{}{
@@ -184,6 +177,77 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	})
 
 	return ancestry, nil
+}
+
+// findAncestorSlipsWithProgressiveDepth searches for ancestor slips using progressive depth.
+// It starts with AncestryDepth and expands to AncestryMaxDepth if no ancestors are found.
+// This handles cases where many commits occur between slip creations (e.g., large pushes).
+func (c *Client) findAncestorSlipsWithProgressiveDepth(
+	ctx context.Context,
+	owner, repo string,
+	opts PushOptions,
+) ([]SlipWithCommit, error) {
+	// Define search depths: initial, then max if needed
+	depths := []int{c.config.AncestryDepth}
+	if c.config.AncestryMaxDepth > c.config.AncestryDepth {
+		depths = append(depths, c.config.AncestryMaxDepth)
+	}
+
+	for i, depth := range depths {
+		isRetry := i > 0
+
+		if isRetry {
+			c.logger.Debug(ctx, "Expanding ancestry search depth", map[string]interface{}{
+				"commit":         shortSHA(opts.CommitSHA),
+				"previous_depth": depths[i-1],
+				"new_depth":      depth,
+			})
+		}
+
+		// Get commit ancestry from GitHub
+		commits, err := c.github.GetCommitAncestry(ctx, owner, repo, opts.CommitSHA, depth)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get commit ancestry: %w", err)
+		}
+
+		// Skip the first commit if it's the current one (we're looking for ancestors)
+		if len(commits) > 0 && commits[0] == opts.CommitSHA {
+			commits = commits[1:]
+		}
+
+		if len(commits) == 0 {
+			c.logger.Debug(ctx, "No ancestor commits found", map[string]interface{}{
+				"commit": shortSHA(opts.CommitSHA),
+				"depth":  depth,
+			})
+			return nil, nil // No point retrying if there are no commits at all
+		}
+
+		// Find all slips matching ancestor commits
+		ancestorSlips, err := c.store.FindAllByCommits(ctx, opts.Repository, commits)
+		if err != nil {
+			return nil, fmt.Errorf("failed to find ancestor slips: %w", err)
+		}
+
+		if len(ancestorSlips) > 0 {
+			c.logger.Debug(ctx, "Found ancestor slips", map[string]interface{}{
+				"commit":            shortSHA(opts.CommitSHA),
+				"ancestors_checked": len(commits),
+				"ancestors_found":   len(ancestorSlips),
+				"depth_used":        depth,
+			})
+			return ancestorSlips, nil
+		}
+
+		// No ancestors found at this depth
+		c.logger.Debug(ctx, "No ancestor slips found at depth", map[string]interface{}{
+			"commit":            shortSHA(opts.CommitSHA),
+			"ancestors_checked": len(commits),
+			"depth":             depth,
+		})
+	}
+
+	return nil, nil
 }
 
 // handlePushRetry resets a slip for retry processing.

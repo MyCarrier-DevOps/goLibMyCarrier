@@ -437,3 +437,508 @@ func TestClient_InitializeSlipForPush_EmptyComponents(t *testing.T) {
 		t.Errorf("expected 0 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
 	}
 }
+
+func TestClient_resolveAndAbandonAncestors(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("no ancestor commits found", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// No ancestry configured - GetCommitAncestry returns empty
+		opts := PushOptions{
+			CorrelationID: "corr-new-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+		}
+
+		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if ancestry != nil {
+			t.Errorf("expected nil ancestry, got %v", ancestry)
+		}
+	})
+
+	t.Run("finds and abandons ancestor slip", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// Setup: ancestor slip exists at commit "parent123"
+		now := time.Now()
+		ancestorSlip := &Slip{
+			CorrelationID: "corr-ancestor-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "parent123",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusInProgress, // Non-terminal - should be abandoned
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(ancestorSlip)
+
+		// Configure GitHub to return ancestry chain
+		github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123", "grandparent456"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-2",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+		}
+
+		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Verify ancestry chain was built
+		if len(ancestry) != 1 {
+			t.Fatalf("expected 1 ancestry entry, got %d", len(ancestry))
+		}
+		if ancestry[0].CorrelationID != "corr-ancestor-1" {
+			t.Errorf("expected ancestor ID 'corr-ancestor-1', got '%s'", ancestry[0].CorrelationID)
+		}
+
+		// Verify ancestor was abandoned
+		if len(store.UpdateCalls) != 1 {
+			t.Fatalf("expected 1 Update call (abandon), got %d", len(store.UpdateCalls))
+		}
+		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
+			t.Errorf("expected ancestor to be abandoned, got status '%s'", store.UpdateCalls[0].Slip.Status)
+		}
+	})
+
+	t.Run("inherits ancestry from parent slip", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// Setup: ancestor slip with its own ancestry chain
+		now := time.Now()
+		ancestorSlip := &Slip{
+			CorrelationID: "corr-parent-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "parent123",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusCompleted, // Terminal - won't be abandoned
+			Steps:         make(map[string]Step),
+			Ancestry: []AncestryEntry{
+				{
+					CorrelationID: "corr-grandparent-1",
+					CommitSHA:     "grandparent456",
+					Status:        SlipStatusCompleted,
+					CreatedAt:     now.Add(-20 * time.Minute),
+				},
+			},
+		}
+		store.AddSlip(ancestorSlip)
+
+		// Configure GitHub to return ancestry chain
+		github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-3",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+		}
+
+		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Verify ancestry chain includes both direct parent and inherited ancestors
+		if len(ancestry) != 2 {
+			t.Fatalf("expected 2 ancestry entries (parent + inherited), got %d", len(ancestry))
+		}
+		if ancestry[0].CorrelationID != "corr-parent-1" {
+			t.Errorf("expected first entry 'corr-parent-1', got '%s'", ancestry[0].CorrelationID)
+		}
+		if ancestry[1].CorrelationID != "corr-grandparent-1" {
+			t.Errorf("expected second entry (inherited) 'corr-grandparent-1', got '%s'", ancestry[1].CorrelationID)
+		}
+
+		// Verify no abandonment (ancestor was terminal)
+		if len(store.UpdateCalls) != 0 {
+			t.Errorf("expected 0 Update calls (ancestor was terminal), got %d", len(store.UpdateCalls))
+		}
+	})
+
+	t.Run("records failed step in ancestry", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// Setup: ancestor slip that failed at a specific step
+		now := time.Now()
+		ancestorSlip := &Slip{
+			CorrelationID: "corr-failed-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "failed123",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"push_parsed": {Status: StepStatusCompleted},
+				"unit_tests":  {Status: StepStatusFailed}, // This one failed
+				"dev_deploy":  {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(ancestorSlip)
+
+		github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "failed123"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-4",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+		}
+
+		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Verify failed step is recorded
+		if len(ancestry) != 1 {
+			t.Fatalf("expected 1 ancestry entry, got %d", len(ancestry))
+		}
+		if ancestry[0].FailedStep != "unit_tests" {
+			t.Errorf("expected FailedStep 'unit_tests', got '%s'", ancestry[0].FailedStep)
+		}
+		if ancestry[0].Status != SlipStatusFailed {
+			t.Errorf("expected Status 'failed', got '%s'", ancestry[0].Status)
+		}
+	})
+
+	t.Run("invalid repository format", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		opts := PushOptions{
+			CorrelationID: "corr-invalid",
+			Repository:    "invalid-repo-format", // Missing owner/repo separator
+			CommitSHA:     "abc123",
+		}
+
+		_, err := client.resolveAndAbandonAncestors(ctx, opts)
+		if err == nil {
+			t.Fatal("expected error for invalid repository format")
+		}
+	})
+
+	t.Run("GitHub API error", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		github.GetCommitAncestryError = errors.New("GitHub API unavailable")
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		opts := PushOptions{
+			CorrelationID: "corr-err-1",
+			Repository:    "owner/repo",
+			CommitSHA:     "abc123",
+		}
+
+		_, err := client.resolveAndAbandonAncestors(ctx, opts)
+		if err == nil {
+			t.Fatal("expected error from GitHub API")
+		}
+	})
+
+	t.Run("store FindAllByCommits error", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		store.FindAllByCommitsError = errors.New("database unavailable")
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// Configure GitHub to return ancestry
+		github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-err-2",
+			Repository:    "owner/repo",
+			CommitSHA:     "abc123",
+		}
+
+		_, err := client.resolveAndAbandonAncestors(ctx, opts)
+		if err == nil {
+			t.Fatal("expected error from store")
+		}
+	})
+}
+
+func TestClient_findAncestorSlipsWithProgressiveDepth(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("finds ancestor at initial depth", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// Setup: ancestor slip exists
+		now := time.Now()
+		ancestorSlip := &Slip{
+			CorrelationID: "corr-ancestor-init",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "parent123",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusInProgress,
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(ancestorSlip)
+
+		// Configure ancestry with just a few commits (within initial depth)
+		github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-init",
+			Repository:    "owner/repo",
+			CommitSHA:     "abc123",
+		}
+
+		results, err := client.findAncestorSlipsWithProgressiveDepth(ctx, "owner", "repo", opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		if results[0].Slip.CorrelationID != "corr-ancestor-init" {
+			t.Errorf("expected 'corr-ancestor-init', got '%s'", results[0].Slip.CorrelationID)
+		}
+
+		// Verify only one GetCommitAncestry call (initial depth was sufficient)
+		if len(github.GetCommitAncestryCalls) != 1 {
+			t.Errorf("expected 1 GetCommitAncestry call, got %d", len(github.GetCommitAncestryCalls))
+		}
+		if github.GetCommitAncestryCalls[0].Depth != 25 {
+			t.Errorf("expected initial depth 25, got %d", github.GetCommitAncestryCalls[0].Depth)
+		}
+	})
+
+	t.Run("expands to max depth when no ancestor at initial depth", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// Setup: ancestor slip exists at a commit far in the ancestry
+		now := time.Now()
+		ancestorSlip := &Slip{
+			CorrelationID: "corr-ancestor-deep",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "deep123", // Far in ancestry
+			CreatedAt:     now.Add(-60 * time.Minute),
+			UpdatedAt:     now.Add(-60 * time.Minute),
+			Status:        SlipStatusCompleted,
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(ancestorSlip)
+
+		// Create a commit chain that's longer than initial depth
+		// Simulate: at depth 25, we only see commits without slips
+		// At depth 100, we find the slip at "deep123"
+		longCommitChain := make([]string, 50)
+		longCommitChain[0] = "abc123" // Current commit
+		for i := 1; i < 49; i++ {
+			longCommitChain[i] = "intermediate" + string(rune('a'+i))
+		}
+		longCommitChain[49] = "deep123" // The ancestor with a slip
+
+		github.SetAncestry("owner", "repo", "abc123", longCommitChain)
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-deep",
+			Repository:    "owner/repo",
+			CommitSHA:     "abc123",
+		}
+
+		results, err := client.findAncestorSlipsWithProgressiveDepth(ctx, "owner", "repo", opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result (found at max depth), got %d", len(results))
+		}
+		if results[0].Slip.CorrelationID != "corr-ancestor-deep" {
+			t.Errorf("expected 'corr-ancestor-deep', got '%s'", results[0].Slip.CorrelationID)
+		}
+
+		// Verify two GetCommitAncestry calls (initial + expanded)
+		if len(github.GetCommitAncestryCalls) != 2 {
+			t.Errorf("expected 2 GetCommitAncestry calls, got %d", len(github.GetCommitAncestryCalls))
+		}
+		if github.GetCommitAncestryCalls[0].Depth != 25 {
+			t.Errorf("expected first call depth 25, got %d", github.GetCommitAncestryCalls[0].Depth)
+		}
+		if github.GetCommitAncestryCalls[1].Depth != 100 {
+			t.Errorf("expected second call depth 100, got %d", github.GetCommitAncestryCalls[1].Depth)
+		}
+	})
+
+	t.Run("no commits returns nil", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// No ancestry configured - returns empty
+		opts := PushOptions{
+			CorrelationID: "corr-no-commits",
+			Repository:    "owner/repo",
+			CommitSHA:     "abc123",
+		}
+
+		results, err := client.findAncestorSlipsWithProgressiveDepth(ctx, "owner", "repo", opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if results != nil {
+			t.Errorf("expected nil results for no commits, got %v", results)
+		}
+
+		// Should only call once - no point retrying with no commits
+		if len(github.GetCommitAncestryCalls) != 1 {
+			t.Errorf("expected 1 GetCommitAncestry call, got %d", len(github.GetCommitAncestryCalls))
+		}
+	})
+
+	t.Run("skips current commit in ancestry", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// Slip exists at the CURRENT commit (should be skipped)
+		now := time.Now()
+		currentSlip := &Slip{
+			CorrelationID: "corr-current",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123", // Same as current commit
+			CreatedAt:     now,
+			UpdatedAt:     now,
+			Status:        SlipStatusInProgress,
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(currentSlip)
+
+		// Parent slip
+		parentSlip := &Slip{
+			CorrelationID: "corr-parent",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "parent123",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusCompleted,
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(parentSlip)
+
+		// Ancestry includes current commit first
+		github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-skip",
+			Repository:    "owner/repo",
+			CommitSHA:     "abc123",
+		}
+
+		results, err := client.findAncestorSlipsWithProgressiveDepth(ctx, "owner", "repo", opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Should find parent, not current
+		if len(results) != 1 {
+			t.Fatalf("expected 1 result, got %d", len(results))
+		}
+		if results[0].Slip.CorrelationID != "corr-parent" {
+			t.Errorf("expected 'corr-parent', got '%s'", results[0].Slip.CorrelationID)
+		}
+	})
+
+	t.Run("does not expand if max depth equals initial", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 25, // Same as initial - no expansion
+		})
+
+		// Configure ancestry without matching slips
+		github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123", "grandparent456"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-no-expand",
+			Repository:    "owner/repo",
+			CommitSHA:     "abc123",
+		}
+
+		results, err := client.findAncestorSlipsWithProgressiveDepth(ctx, "owner", "repo", opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// No slips found
+		if results != nil {
+			t.Errorf("expected nil results, got %v", results)
+		}
+
+		// Only one call - no expansion when max == initial
+		if len(github.GetCommitAncestryCalls) != 1 {
+			t.Errorf("expected 1 GetCommitAncestry call (no expansion), got %d", len(github.GetCommitAncestryCalls))
+		}
+	})
+}
+
