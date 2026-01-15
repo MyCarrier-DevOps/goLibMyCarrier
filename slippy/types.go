@@ -60,6 +60,11 @@ type Slip struct {
 	// Ordered most-recent-first, so Ancestry[0] is the immediate parent.
 	// Nil or empty if this is the first slip for this commit lineage.
 	Ancestry []AncestryEntry `json:"ancestry" ch:"-"`
+
+	// PromotedTo holds the correlation ID of the slip this was promoted to.
+	// Set when status is "promoted" (e.g., after a squash merge creates a new slip).
+	// Empty if not promoted.
+	PromotedTo string `json:"promoted_to,omitempty" ch:"promoted_to"`
 }
 
 // AncestryEntry records metadata about a prior slip in the ancestry chain.

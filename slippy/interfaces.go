@@ -59,6 +59,11 @@ type GitHubAPI interface {
 	// Returns a slice of commit SHAs in order from newest to oldest.
 	GetCommitAncestry(ctx context.Context, owner, repo, ref string, depth int) ([]string, error)
 
+	// GetPRHeadCommit retrieves the head commit SHA for a pull request.
+	// This is used to link squash merge commits back to the original feature branch slip.
+	// Returns the SHA of the PR's head commit before merging.
+	GetPRHeadCommit(ctx context.Context, owner, repo string, prNumber int) (string, error)
+
 	// ClearCache clears any cached data (useful for testing)
 	ClearCache()
 }

@@ -24,7 +24,13 @@ const (
 	SlipStatusCompensated SlipStatus = "compensated"
 
 	// SlipStatusAbandoned indicates the slip was superseded by a newer slip
+	// via a direct push that overwrote work in progress
 	SlipStatusAbandoned SlipStatus = "abandoned"
+
+	// SlipStatusPromoted indicates the slip's code was promoted to another branch
+	// via a PR merge (typically squash merge). Unlike abandoned, this is a successful
+	// terminal state - the work continued in a new slip on the target branch.
+	SlipStatusPromoted SlipStatus = "promoted"
 )
 
 // String returns the string representation of the slip status.
@@ -33,10 +39,10 @@ func (s SlipStatus) String() string {
 }
 
 // IsTerminal returns true if the slip status is a terminal state
-// (completed, failed, compensated, or abandoned).
+// (completed, failed, compensated, abandoned, or promoted).
 func (s SlipStatus) IsTerminal() bool {
 	switch s {
-	case SlipStatusCompleted, SlipStatusFailed, SlipStatusCompensated, SlipStatusAbandoned:
+	case SlipStatusCompleted, SlipStatusFailed, SlipStatusCompensated, SlipStatusAbandoned, SlipStatusPromoted:
 		return true
 	case SlipStatusPending, SlipStatusInProgress, SlipStatusCompensating:
 		return false

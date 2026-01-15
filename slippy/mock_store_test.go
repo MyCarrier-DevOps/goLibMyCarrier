@@ -445,6 +445,7 @@ func deepCopySlip(slip *Slip) *Slip {
 		CreatedAt:     slip.CreatedAt,
 		UpdatedAt:     slip.UpdatedAt,
 		Status:        slip.Status,
+		PromotedTo:    slip.PromotedTo,
 	}
 
 	// Deep copy steps map

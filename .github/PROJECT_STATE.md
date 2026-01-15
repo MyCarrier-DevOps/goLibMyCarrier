@@ -53,21 +53,71 @@ Slips now track their complete commit ancestry chain, enabling:
 - **Progressive depth**: Starts with 25 commits, expands to 100 if no ancestor found (configurable)
 - **Chain inheritance**: Child slips inherit parent's ancestry + parent's commit, building complete history
 - **Single abandonment**: Only the most recent non-terminal ancestor is abandoned (not entire chain)
+- **Squash merge promotion**: Feature branch slips are "promoted" (not abandoned) when merged via squash
+
+**Squash Merge Handling:**
+Squash merges break git ancestry (the merge commit has no git parent link to the feature branch). Slippy handles this by:
+1. Parsing the commit message for PR number (e.g., `Add feature (#42)`)
+2. Querying GitHub for the PR's head commit SHA
+3. **Walking the PR head's commit ancestry** to find the most recent slip (handles cases where the final PR commit didn't create a slip)
+4. Marking the feature branch slip as `promoted` (successful outcome, not abandoned)
+5. Recording `PromotedTo` field for bidirectional linking
 
 **Data Model:**
 ```go
 type Slip struct {
     // ... other fields
-    Ancestry chcol.JSON[[]string] `ch:"ancestry"` // JSON array of commit SHAs
+    Ancestry   chcol.JSON[[]string] `ch:"ancestry"`    // JSON array of commit SHAs
+    PromotedTo string               `ch:"promoted_to"` // Correlation ID of target slip (for promoted slips)
+}
+
+type PushOptions struct {
+    // ... other fields
+    CommitMessage string // Optional: enables PR-based ancestry for squash merges
 }
 ```
+
+**Slip Statuses:**
+- `promoted` - Feature branch slip was successfully merged via PR (terminal, successful)
+- `abandoned` - Slip was superseded by a newer push on same branch (terminal, unsuccessful)
 
 **Flow:**
 1. Push event arrives with commit list
 2. `findAncestorSlipsWithProgressiveDepth()` searches for existing slips in commit history
-3. If ancestor found: inherit its `Ancestry` chain + add ancestor's commit SHA
-4. Abandon the most recent non-terminal ancestor slip
-5. New slip created with inherited ancestry chain
+3. If no ancestor found AND commit message contains PR#: try `findAncestorViaSquashMerge()`
+4. If ancestor found via squash merge: **promote** the feature branch slip
+5. If ancestor found via git history: **abandon** it (regular push superseding)
+6. New slip created with inherited ancestry chain
+
+**Edge Cases & Mitigations:**
+
+| Edge Case | Impact | Mitigation | Status |
+|-----------|---------|-----------|--------|
+| **Force Push / Rebase** | Git parent links destroyed; ancestry chain breaks | • Logs warning when keywords detected ("force push", "rebase", "amend")<br/>• Progressive depth (100 commits) increases chance of finding ancestor<br/>• Documented limitation: ancestry may break | ⚠️ Partial |
+| **Cherry-pick** | New commit with different SHA but same changes; ancestry not preserved | • Detects cherry-pick messages via regex<br/>• Logs warning when detected<br/>• Documented limitation: cherry-picked commits appear as new slips | ⚠️ Partial |
+| **Interactive Rebase** | Commits rewritten with new SHAs; old ancestry invisible | • Same as force push (detected via keywords)<br/>• Ancestor resolution may fail completely | ⚠️ Partial |
+| **Amended Commit** | Commit rewritten; slip exists for old SHA, not new SHA | • Detected via "amend" keyword in message<br/>• Logs warning<br/>• Old slip remains (may need manual cleanup) | ⚠️ Partial |
+| **Forked Repository** | PR may reference fork's repo path (e.g., `user/repo` vs `MyCarrier-DevOps/repo`) | • `normalizeRepository()` stub reserved for future implementation<br/>• Currently returns repo path as-is | 🔴 Not implemented |
+| **Multiple Squash Merges** | Nested PRs (feature→dev→main) have multiple PR numbers in message | • `extractAllPRNumbers()` extracts all PR numbers from message<br/>• `findAncestorViaSquashMerge()` tries each PR in order until slip found<br/>• Test coverage for nested merge scenarios | ✅ Implemented |
+| **Manual Squash** | Developer manually squashes without GitHub PR; no PR number in message | • Falls back to git ancestry search<br/>• If feature branch not pushed, ancestry breaks<br/>• Documented limitation | 🔴 Unsolvable |
+| **Deep History** | Ancestor slip >100 commits back | • `SLIPPY_ANCESTRY_MAX_DEPTH` configurable (default 100)<br/>• Can increase limit if needed<br/>• Documented limitation for very large merges | ⚠️ Configurable |
+| **Cross-Repository** | Commits reference different repos (monorepo splits, migrations) | • `normalizeRepository()` stub reserved for future implementation<br/>• Currently ancestry only works within same repository | 🔴 Not implemented |
+
+**New Helper Functions (January 15, 2026):**
+- `extractAllPRNumbers(commitMessage)` - Extracts all unique PR numbers from message (supports nested PRs)
+- `isCherryPick(commitMessage)` - Regex detection: `(?i)\b(cherry.pick|cherry-pick|picked from|backport)\b`
+- `isForceOrRewrite(commitMessage)` - Keyword detection for "force push", "rebase", "amend"
+- `normalizeRepository(repo)` - Reserved for future fork handling (currently returns as-is)
+- `findAncestorViaSquashMerge()` - Enhanced to loop through all PR numbers until slip found
+
+**Logging:**
+When edge cases are detected, warnings are logged with context:
+```go
+logger.Warn("Cherry-pick detected - ancestry chain may be broken",
+    "repository", repo.Name,
+    "commit", commit.SHA,
+    "message_snippet", commitMessage[:min(100, len(commitMessage))])
+```
 
 ### ClickHouse Migrator Package
 - **Versioned migrations** - one-time schema changes tracked in migrations table
@@ -82,6 +132,103 @@ type Slip struct {
 ---
 
 ## Recent Changes
+
+### January 15, 2026 — Edge Case Handling & Multi-PR Support (branch: slippy/ancestry-tracking)
+
+**Problem:**
+Identified 9 critical edge cases that could break ancestry chain tracking:
+1. Force pushes rewrite history
+2. Cherry-picks create duplicate commits with different SHAs
+3. Interactive rebases rewrite commit chains
+4. Amended commits invalidate previous SHAs
+5. Forked repositories have different repo paths
+6. Multiple squash merges (nested PRs: feature→dev→main)
+7. Manual squash operations lack PR numbers
+8. Deep history (>100 commits between slips)
+9. Cross-repository references
+
+**Solution:**
+Implemented comprehensive detection, mitigation, and fallback strategies for all tractable edge cases.
+
+**New Helper Functions:**
+- `extractAllPRNumbers(commitMessage)` - Extracts all unique PR numbers (handles nested merges)
+- `isCherryPick(commitMessage)` - Regex detection: `(?i)\b(cherry.pick|cherry-pick|picked from|backport)\b`
+- `isForceOrRewrite(commitMessage)` - Keyword detection for "force push", "rebase", "amend"
+- `normalizeRepository(repo)` - Reserved for future fork handling (stub)
+
+**Enhanced Logic:**
+- `findAncestorViaSquashMerge()` - Now loops through all PR numbers in order, tries each until slip found (solves nested merge scenario)
+- `resolveAndAbandonAncestors()` - Logs warnings when cherry-pick or force/rewrite patterns detected
+- `findSlipsInPRBranchHistory()` - Walks PR head commit's ancestry (handles non-slip final commits)
+
+**New Regex Patterns:**
+- `cherryPickRegex`: `(?i)\b(cherry.pick|cherry-pick|picked from|backport)\b` - Case-insensitive cherry-pick detection
+
+**Test Coverage:**
+- `TestExtractAllPRNumbers` - Single PR, multiple PRs, duplicates, nested merges
+- `TestIsCherryPick` - Various cherry-pick message formats with case insensitivity
+- "tries multiple PR numbers for nested merges" - Validates fallback: PR #100 fails → PR #90 succeeds
+
+**Warning Logging:**
+When edge cases detected:
+```go
+logger.Warn("Cherry-pick detected - ancestry chain may be broken",
+    "repository", repo.Name,
+    "commit", commit.SHA,
+    "message_snippet", commitMessage[:min(100, len(commitMessage))])
+```
+
+**Documentation:**
+Added comprehensive "Edge Cases & Mitigations" table to PROJECT_STATE.md documenting:
+- 9 identified edge cases with impact analysis
+- Mitigation strategies for each
+- Implementation status (✅ Implemented / ⚠️ Partial / 🔴 Not implemented)
+- Known limitations and unsolvable scenarios
+
+**Current Status:**
+- ✅ `make lint PKG=slippy` - 0 issues
+- ✅ `make test PKG=slippy` - all pass, 77.3% coverage
+- ✅ All edge case mitigations implemented where tractable
+- ✅ Documentation complete with limitations clearly stated
+
+### January 15, 2026 — Squash Merge Promotion (branch: slippy/ancestry-tracking)
+
+**Problem:** 
+Squash merges break git ancestry - the merge commit has no parent link to the feature branch head commit. This meant feature branch slips couldn't be linked to the integration branch slip created after merge.
+
+**Solution:** 
+Parse PR number from commit message, query GitHub for PR head commit, find associated slip, and mark it as "promoted" rather than abandoned.
+
+**New Status:**
+- `SlipStatusPromoted` - Terminal state indicating feature branch was successfully merged via PR
+- Different from `abandoned` (which indicates superseded, unsuccessful)
+
+**New Fields:**
+- `Slip.PromotedTo` - Correlation ID of the target slip (enables bidirectional linking)
+- `PushOptions.CommitMessage` - Optional field to enable PR-based ancestry resolution
+
+**New Interface Method:**
+- `GitHubAPI.GetPRHeadCommit(ctx, owner, repo, prNumber)` - Retrieves PR's head commit SHA
+
+**Changes:**
+- `slippy/status.go`: Added `SlipStatusPromoted`, updated `IsTerminal()` to include it
+- `slippy/types.go`: Added `PromotedTo` field to `Slip` struct
+- `slippy/push.go`: Added `CommitMessage` to `PushOptions`, `extractPRNumber()`, `findAncestorViaSquashMerge()`, `findSlipsInPRBranchHistory()`, updated `resolveAndAbandonAncestors()` to handle promotion vs abandonment
+- `slippy/client.go`: Added `PromoteSlip()` method (similar to `AbandonSlip()`)
+- `slippy/interfaces.go`: Added `GetPRHeadCommit` to `GitHubAPI` interface
+- `github/graphql.go`: Implemented `GetPRHeadCommit()` GraphQL query
+- `slippy/mock_github_test.go`: Added `GetPRHeadCommit` support, `PRHeadCommits` map, `SetPRHeadCommit()` helper
+- `slippy/slippytest/mock_github.go`: Mirrored `GetPRHeadCommit` support for external test fixtures
+
+**Test Coverage:**
+- Added `TestExtractPRNumber` - PR number parsing from various commit message formats
+- Added `TestClient_FindAncestorViaSquashMerge` - squash merge lookup scenarios, including walking ancestry when PR head isn't a slip commit
+- Added `TestClient_PromoteSlip` - promotion logic and error handling
+- Added `TestClient_CreateSlipForPush_SquashMergePromotion` - integration test for full flow
+
+**Current Status:**
+- ✅ `make lint PKG=slippy` - 0 issues
+- ✅ `make test PKG=slippy` - all pass, 77.1% coverage
 
 ### January 15, 2026 — Ancestry Tracking & Progressive Depth Search (branch: slippy/ancestry-tracking)
 

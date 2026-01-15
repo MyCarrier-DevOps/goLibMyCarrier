@@ -150,6 +150,37 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 	return nil
 }
 
+// PromoteSlip marks a slip as promoted, indicating its code was promoted to another branch
+// via a PR merge (typically squash merge). Unlike abandon, this is a successful outcome -
+// the slip's work continues in the new slip on the target branch.
+// The promotedTo parameter records the correlation ID of the new slip for bidirectional linking.
+func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo string) error {
+	slip, err := c.store.Load(ctx, correlationID)
+	if err != nil {
+		return NewSlipError("promote", correlationID, err)
+	}
+
+	if slip.Status.IsTerminal() {
+		c.logger.Info(ctx, "Slip already terminal, skipping promote", map[string]interface{}{
+			"correlation_id": correlationID,
+			"status":         string(slip.Status),
+		})
+		return nil
+	}
+
+	slip.Status = SlipStatusPromoted
+	slip.PromotedTo = promotedTo
+	if err := c.store.Update(ctx, slip); err != nil {
+		return NewSlipError("promote", correlationID, err)
+	}
+
+	c.logger.Info(ctx, "Promoted slip", map[string]interface{}{
+		"correlation_id": correlationID,
+		"promoted_to":    promotedTo,
+	})
+	return nil
+}
+
 // Close releases resources held by the client.
 func (c *Client) Close() error {
 	if c.store != nil {
