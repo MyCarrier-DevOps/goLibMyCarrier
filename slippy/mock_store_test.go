@@ -26,26 +26,28 @@ type MockStore struct {
 	CommitIndex map[string]string
 
 	// Call tracking
-	CreateCalls          []CreateCall
-	LoadCalls            []string
-	LoadByCommitCalls    []LoadByCommitCall
-	FindByCommitsCalls   []FindByCommitsCall
-	UpdateCalls          []UpdateCall
-	UpdateStepCalls      []UpdateStepCall
-	UpdateComponentCalls []UpdateComponentCall
-	AppendHistoryCalls   []AppendHistoryCall
-	CloseCalls           int
+	CreateCalls           []CreateCall
+	LoadCalls             []string
+	LoadByCommitCalls     []LoadByCommitCall
+	FindByCommitsCalls    []FindByCommitsCall
+	FindAllByCommitsCalls []FindAllByCommitsCall
+	UpdateCalls           []UpdateCall
+	UpdateStepCalls       []UpdateStepCall
+	UpdateComponentCalls  []UpdateComponentCall
+	AppendHistoryCalls    []AppendHistoryCall
+	CloseCalls            int
 
 	// Error injection for testing error paths
-	CreateError          error
-	LoadError            error
-	LoadByCommitError    error
-	FindByCommitsError   error
-	UpdateError          error
-	UpdateStepError      error
-	UpdateComponentError error
-	AppendHistoryError   error
-	CloseError           error
+	CreateError           error
+	LoadError             error
+	LoadByCommitError     error
+	FindByCommitsError    error
+	FindAllByCommitsError error
+	UpdateError           error
+	UpdateStepError       error
+	UpdateComponentError  error
+	AppendHistoryError    error
+	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
 	CreateErrorFor          map[string]error
@@ -68,6 +70,12 @@ type LoadByCommitCall struct {
 
 // FindByCommitsCall records a FindByCommits call.
 type FindByCommitsCall struct {
+	Repository string
+	Commits    []string
+}
+
+// FindAllByCommitsCall records a FindAllByCommits call.
+type FindAllByCommitsCall struct {
 	Repository string
 	Commits    []string
 }
@@ -223,7 +231,7 @@ func (m *MockStore) FindByCommits(ctx context.Context, repository string, commit
 // FindAllByCommits finds all slips matching any commit in the ordered list.
 func (m *MockStore) FindAllByCommits(ctx context.Context, repository string, commits []string) ([]SlipWithCommit, error) {
 	m.mu.Lock()
-	m.FindByCommitsCalls = append(m.FindByCommitsCalls, FindByCommitsCall{
+	m.FindAllByCommitsCalls = append(m.FindAllByCommitsCalls, FindAllByCommitsCall{
 		Repository: repository,
 		Commits:    commits,
 	})
@@ -232,8 +240,8 @@ func (m *MockStore) FindAllByCommits(ctx context.Context, repository string, com
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	if m.FindByCommitsError != nil {
-		return nil, m.FindByCommitsError
+	if m.FindAllByCommitsError != nil {
+		return nil, m.FindAllByCommitsError
 	}
 
 	// Find all matching slips in commit order
@@ -461,6 +469,12 @@ func deepCopySlip(slip *Slip) *Slip {
 	if slip.StateHistory != nil {
 		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
 		copy(cpy.StateHistory, slip.StateHistory)
+	}
+
+	// Deep copy ancestry chain
+	if slip.Ancestry != nil {
+		cpy.Ancestry = make([]AncestryEntry, len(slip.Ancestry))
+		copy(cpy.Ancestry, slip.Ancestry)
 	}
 
 	return cpy
