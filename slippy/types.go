@@ -55,6 +55,44 @@ type Slip struct {
 
 	// StateHistory is the complete audit trail of state transitions
 	StateHistory []StateHistoryEntry `json:"state_history" ch:"-"`
+
+	// Ancestry tracks the chain of prior slips that this slip supersedes.
+	// Ordered most-recent-first, so Ancestry[0] is the immediate parent.
+	// Nil or empty if this is the first slip for this commit lineage.
+	Ancestry []AncestryEntry `json:"ancestry" ch:"-"`
+
+	// PromotedTo holds the correlation ID of the slip this was promoted to.
+	// Set when status is "promoted" (e.g., after a squash merge creates a new slip).
+	// Empty if not promoted.
+	PromotedTo string `json:"promoted_to,omitempty" ch:"promoted_to"`
+}
+
+// AncestryEntry records metadata about a prior slip in the ancestry chain.
+type AncestryEntry struct {
+	// CorrelationID is the unique identifier of the ancestor slip
+	CorrelationID string `json:"correlation_id"`
+
+	// CommitSHA is the git commit SHA of the ancestor slip
+	CommitSHA string `json:"commit_sha"`
+
+	// Status is the final status of the ancestor slip (failed, completed, abandoned)
+	Status SlipStatus `json:"status"`
+
+	// FailedStep is the step that failed (if Status is failed)
+	FailedStep string `json:"failed_step,omitempty"`
+
+	// CreatedAt is when the ancestor slip was created
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// SlipWithCommit pairs a slip with the commit SHA that matched it.
+// Used by FindAllByCommits to return multiple matching slips with their matched commits.
+type SlipWithCommit struct {
+	// Slip is the routing slip
+	Slip *Slip
+
+	// MatchedCommit is the commit SHA that matched this slip
+	MatchedCommit string
 }
 
 // ComponentStepData represents per-component data for aggregate steps.

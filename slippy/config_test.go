@@ -18,8 +18,11 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.PollInterval != 60*time.Second {
 		t.Errorf("PollInterval = %v, want 60s", cfg.PollInterval)
 	}
-	if cfg.AncestryDepth != 20 {
-		t.Errorf("AncestryDepth = %d, want 20", cfg.AncestryDepth)
+	if cfg.AncestryDepth != 25 {
+		t.Errorf("AncestryDepth = %d, want 25", cfg.AncestryDepth)
+	}
+	if cfg.AncestryMaxDepth != 100 {
+		t.Errorf("AncestryMaxDepth = %d, want 100", cfg.AncestryMaxDepth)
 	}
 	if cfg.ShadowMode {
 		t.Error("ShadowMode should default to false")
@@ -150,7 +153,7 @@ func TestConfigFromEnv_InvalidValues(t *testing.T) {
 		t.Errorf("HoldTimeout should be default for invalid value, got %v", cfg.HoldTimeout)
 	}
 	// Negative depth should not be applied
-	if cfg.AncestryDepth != 20 {
+	if cfg.AncestryDepth != 25 {
 		t.Errorf("AncestryDepth should be default for negative value, got %d", cfg.AncestryDepth)
 	}
 }
@@ -193,6 +196,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: false,
 		},
@@ -205,6 +209,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -218,6 +223,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -231,6 +237,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -244,6 +251,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -258,6 +266,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      0,
 				PollInterval:     time.Second,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -272,6 +281,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      -time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -286,6 +296,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     0,
 				AncestryDepth:    10,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -300,6 +311,7 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    0,
+				AncestryMaxDepth: 100,
 			},
 			wantError: true,
 			errorIs:   ErrInvalidConfiguration,
@@ -377,5 +389,108 @@ func TestConfig_GitHubConfig(t *testing.T) {
 	}
 	if ghConfig.EnterpriseURL != "https://github.enterprise.com" {
 		t.Errorf("EnterpriseURL = %q, want expected URL", ghConfig.EnterpriseURL)
+	}
+}
+
+func TestConfig_ValidateMinimal(t *testing.T) {
+	validCHConfig := &ch.ClickhouseConfig{
+		ChHostname:   "localhost",
+		ChPort:       "9000",
+		ChDatabase:   "testdb",
+		ChUsername:   "user",
+		ChPassword:   "pass",
+		ChSkipVerify: "true",
+	}
+
+	validPipelineConfig := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline",
+		Steps: []StepConfig{
+			{Name: "push_parsed", Description: "Push parsed"},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		config    Config
+		wantError bool
+	}{
+		{
+			name: "valid minimal config",
+			config: Config{
+				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
+			},
+			wantError: false,
+		},
+		{
+			name: "missing ClickHouseConfig",
+			config: Config{
+				PipelineConfig: validPipelineConfig,
+			},
+			wantError: true,
+		},
+		{
+			name: "missing PipelineConfig",
+			config: Config{
+				ClickHouseConfig: validCHConfig,
+			},
+			wantError: true,
+		},
+		{
+			name:      "missing both",
+			config:    Config{},
+			wantError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.config.ValidateMinimal()
+			if tt.wantError {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestConfig_WithPipelineConfig(t *testing.T) {
+	cfg := DefaultConfig()
+
+	pipelineConfig := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline",
+	}
+
+	newCfg := cfg.WithPipelineConfig(pipelineConfig)
+
+	if newCfg.PipelineConfig != pipelineConfig {
+		t.Error("WithPipelineConfig should set the pipeline config")
+	}
+	// Original should be unchanged
+	if cfg.PipelineConfig != nil {
+		t.Error("original config should not be modified")
+	}
+}
+
+func TestConfig_WithDatabase(t *testing.T) {
+	cfg := DefaultConfig()
+
+	newCfg := cfg.WithDatabase("custom_db")
+
+	if newCfg.Database != "custom_db" {
+		t.Errorf("WithDatabase should set database to 'custom_db', got '%s'", newCfg.Database)
+	}
+	// Original should be unchanged (default is "ci")
+	if cfg.Database != "ci" {
+		t.Errorf("original config should have default database 'ci', got '%s'", cfg.Database)
 	}
 }

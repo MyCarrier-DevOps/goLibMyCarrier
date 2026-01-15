@@ -292,6 +292,48 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 	return commits, nil
 }
 
+// GetPRHeadCommit retrieves the head commit SHA for a pull request.
+// This is used to link squash merge commits back to the original feature branch slip.
+// Returns the SHA of the PR's head commit before merging.
+func (g *GraphQLClient) GetPRHeadCommit(ctx context.Context, owner, repo string, prNumber int) (string, error) {
+	// Get authenticated client for this organization
+	client, err := g.GetClientForOrg(ctx, owner)
+	if err != nil {
+		return "", fmt.Errorf("failed to get client for org %s: %w", owner, err)
+	}
+
+	var query struct {
+		Repository struct {
+			PullRequest struct {
+				HeadRefOid string
+			} `graphql:"pullRequest(number: $prNumber)"`
+		} `graphql:"repository(owner: $owner, name: $repo)"`
+	}
+
+	variables := map[string]interface{}{
+		"owner":    githubv4.String(owner),
+		"repo":     githubv4.String(repo),
+		"prNumber": githubv4.Int(prNumber),
+	}
+
+	if err := client.Query(ctx, &query, variables); err != nil {
+		return "", fmt.Errorf("failed to query PR head commit: %w", err)
+	}
+
+	headCommit := query.Repository.PullRequest.HeadRefOid
+	if headCommit == "" {
+		return "", fmt.Errorf("PR #%d not found or has no head commit", prNumber)
+	}
+
+	g.logger.Debug(ctx, "Retrieved PR head commit", map[string]interface{}{
+		"owner":       owner,
+		"repo":        repo,
+		"pr_number":   prNumber,
+		"head_commit": headCommit[:7], // Short SHA for logging
+	})
+	return headCommit, nil
+}
+
 // ClearCache clears the installation and client caches.
 // This is useful for testing or when installations change.
 func (g *GraphQLClient) ClearCache() {

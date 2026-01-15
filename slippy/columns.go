@@ -13,6 +13,7 @@ const (
 	ColumnStatus        = "status"
 	ColumnStepDetails   = "step_details"
 	ColumnStateHistory  = "state_history"
+	ColumnAncestry      = "ancestry"
 )
 
 // Table name constants

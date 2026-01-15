@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // Client is the main entry point for slippy operations.
@@ -121,6 +122,58 @@ func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, sta
 	return nil
 }
 
+// AbandonSlip marks a slip as abandoned, indicating it was superseded by a newer slip.
+// This should only be called on slips that are not already in a terminal state.
+// Returns an error if the slip is already terminal.
+func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy string) error {
+	slip, err := c.store.Load(ctx, correlationID)
+	if err != nil {
+		return NewSlipError("abandon", correlationID, err)
+	}
+
+	if c.checkTerminalStatus(ctx, slip, "abandon") {
+		return nil
+	}
+
+	slip.Status = SlipStatusAbandoned
+	if err := c.store.Update(ctx, slip); err != nil {
+		return NewSlipError("abandon", correlationID, err)
+	}
+
+	c.logger.Info(ctx, "Abandoned slip", map[string]interface{}{
+		"correlation_id": correlationID,
+		"superseded_by":  supersededBy,
+	})
+	return nil
+}
+
+// PromoteSlip marks a slip as promoted, indicating its code was promoted to another branch
+// via a PR merge (typically squash merge). Unlike abandon, this is a successful outcome -
+// the slip's work continues in the new slip on the target branch.
+// The promotedTo parameter records the correlation ID of the new slip for bidirectional linking.
+func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo string) error {
+	slip, err := c.store.Load(ctx, correlationID)
+	if err != nil {
+		return NewSlipError("promote", correlationID, err)
+	}
+
+	if c.checkTerminalStatus(ctx, slip, "promote") {
+		return nil
+	}
+
+	slip.Status = SlipStatusPromoted
+	slip.PromotedTo = promotedTo
+	if err := c.store.Update(ctx, slip); err != nil {
+		return NewSlipError("promote", correlationID, err)
+	}
+
+	c.logger.Info(ctx, "Promoted slip", map[string]interface{}{
+		"correlation_id": correlationID,
+		"promoted_to":    promotedTo,
+	})
+	return nil
+}
+
 // Close releases resources held by the client.
 func (c *Client) Close() error {
 	if c.store != nil {
@@ -147,4 +200,34 @@ func (c *Client) Config() Config {
 // PipelineConfig returns the pipeline configuration.
 func (c *Client) PipelineConfig() *PipelineConfig {
 	return c.pipelineConfig
+}
+
+// applyHoldDefaults applies default values for timeout and poll interval if not set.
+// This centralizes the defaulting logic used across WaitForPrerequisites and RunPreExecution.
+func (c *Client) applyHoldDefaults(
+	timeout, pollInterval time.Duration,
+) (appliedTimeout, appliedPollInterval time.Duration) {
+	appliedTimeout = timeout
+	if appliedTimeout == 0 {
+		appliedTimeout = c.config.HoldTimeout
+	}
+	appliedPollInterval = pollInterval
+	if appliedPollInterval == 0 {
+		appliedPollInterval = c.config.PollInterval
+	}
+	return appliedTimeout, appliedPollInterval
+}
+
+// checkTerminalStatus checks if a slip is already in a terminal state.
+// If terminal, logs a message and returns true. Otherwise returns false.
+// This centralizes the terminal check logic used in AbandonSlip and PromoteSlip.
+func (c *Client) checkTerminalStatus(ctx context.Context, slip *Slip, operation string) bool {
+	if slip.Status.IsTerminal() {
+		c.logger.Info(ctx, fmt.Sprintf("Slip already terminal, skipping %s", operation), map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+			"status":         string(slip.Status),
+		})
+		return true
+	}
+	return false
 }

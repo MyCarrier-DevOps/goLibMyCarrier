@@ -45,8 +45,13 @@ type Config struct {
 	// ShadowMode if true, never actually hold/skip - useful for gradual rollout
 	ShadowMode bool
 
-	// AncestryDepth is how many commits to check for slip resolution (default: 20)
+	// AncestryDepth is the initial number of commits to check for slip resolution (default: 25)
+	// If no ancestor is found, slippy will progressively increase up to AncestryMaxDepth.
 	AncestryDepth int
+
+	// AncestryMaxDepth is the maximum number of commits to check when no ancestor is found (default: 100)
+	// This handles cases where many commits occur between slip creations.
+	AncestryMaxDepth int
 
 	// Database is the ClickHouse database name (default: "ci")
 	Database string
@@ -59,10 +64,11 @@ type Config struct {
 // DefaultConfig returns a Config with sensible default values.
 func DefaultConfig() Config {
 	return Config{
-		HoldTimeout:   60 * time.Minute,
-		PollInterval:  60 * time.Second,
-		AncestryDepth: 20,
-		Database:      "ci",
+		HoldTimeout:      60 * time.Minute,
+		PollInterval:     60 * time.Second,
+		AncestryDepth:    25,
+		AncestryMaxDepth: 100,
+		Database:         "ci",
 	}
 }
 
@@ -77,7 +83,8 @@ func DefaultConfig() Config {
 //   - SLIPPY_HOLD_TIMEOUT: Max time to wait for prerequisites (e.g., "60m")
 //   - SLIPPY_POLL_INTERVAL: Interval between prereq checks (e.g., "60s")
 //   - SLIPPY_SHADOW_MODE: Set to "true" for shadow mode
-//   - SLIPPY_ANCESTRY_DEPTH: Number of commits to check (default: 20)
+//   - SLIPPY_ANCESTRY_DEPTH: Initial ancestry search depth (default: 25)
+//   - SLIPPY_ANCESTRY_MAX_DEPTH: Max depth for progressive search (default: 100)
 //   - SLIPPY_DATABASE: ClickHouse database name (default: "ci")
 func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
@@ -119,6 +126,12 @@ func ConfigFromEnv() Config {
 	if depth := os.Getenv("SLIPPY_ANCESTRY_DEPTH"); depth != "" {
 		if d, err := strconv.Atoi(depth); err == nil && d > 0 {
 			cfg.AncestryDepth = d
+		}
+	}
+
+	if maxDepth := os.Getenv("SLIPPY_ANCESTRY_MAX_DEPTH"); maxDepth != "" {
+		if d, err := strconv.Atoi(maxDepth); err == nil && d > 0 {
+			cfg.AncestryMaxDepth = d
 		}
 	}
 
@@ -181,6 +194,10 @@ func (c Config) Validate() error {
 	}
 	if c.AncestryDepth <= 0 {
 		return fmt.Errorf("%w: AncestryDepth must be positive", ErrInvalidConfiguration)
+	}
+	if c.AncestryMaxDepth < c.AncestryDepth {
+		return fmt.Errorf("%w: AncestryMaxDepth (%d) must be >= AncestryDepth (%d)",
+			ErrInvalidConfiguration, c.AncestryMaxDepth, c.AncestryDepth)
 	}
 	return nil
 }

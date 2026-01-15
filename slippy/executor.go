@@ -118,14 +118,7 @@ func (c *Client) RunPreExecution(ctx context.Context, opts PreExecutionOptions) 
 	// Step 2: Check prerequisites
 	if len(opts.Prerequisites) > 0 {
 		// Apply defaults
-		timeout := opts.HoldTimeout
-		if timeout == 0 {
-			timeout = c.config.HoldTimeout
-		}
-		pollInterval := opts.PollInterval
-		if pollInterval == 0 {
-			pollInterval = c.config.PollInterval
-		}
+		timeout, pollInterval := c.applyHoldDefaults(opts.HoldTimeout, opts.PollInterval)
 
 		holdResult, err := c.WaitForPrerequisitesWithResult(ctx, HoldOptions{
 			CorrelationID: slip.CorrelationID,

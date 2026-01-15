@@ -19,6 +19,8 @@ This is a **multi-module Go monorepo** where each subdirectory is an independent
 
 ## Validation Workflow
 
+**CRITICAL: Never bypass linting rules.** Do not use `//nolint` directives, `_ =` to ignore errors, or any other mechanism to circumvent lint errors without explicit user permission. Always fix the underlying issue properly.
+
 Always keep the repo in a clean, validated state before handing work back. Run **repo-wide** commands when changes span multiple modules:
 
 - `make fmt`

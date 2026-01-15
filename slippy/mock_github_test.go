@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -12,15 +13,21 @@ type MockGitHubAPI struct {
 	// Ancestry maps "owner/repo:ref" -> []string (commit ancestry)
 	Ancestry map[string][]string
 
+	// PRHeadCommits maps "owner/repo:prNumber" -> string (PR head commit SHA)
+	PRHeadCommits map[string]string
+
 	// Call tracking
 	GetCommitAncestryCalls []GetCommitAncestryCall
+	GetPRHeadCommitCalls   []GetPRHeadCommitCall
 	ClearCacheCalls        int
 
 	// Error injection
 	GetCommitAncestryError error
+	GetPRHeadCommitError   error
 
 	// Conditional error injection (returns error only for specific refs)
 	GetCommitAncestryErrorFor map[string]error
+	GetPRHeadCommitErrorFor   map[string]error
 }
 
 // GetCommitAncestryCall records a GetCommitAncestry call
@@ -31,11 +38,20 @@ type GetCommitAncestryCall struct {
 	Depth int
 }
 
+// GetPRHeadCommitCall records a GetPRHeadCommit call
+type GetPRHeadCommitCall struct {
+	Owner    string
+	Repo     string
+	PRNumber int
+}
+
 // NewMockGitHubAPI creates a new MockGitHubAPI with initialized maps.
 func NewMockGitHubAPI() *MockGitHubAPI {
 	return &MockGitHubAPI{
 		Ancestry:                  make(map[string][]string),
+		PRHeadCommits:             make(map[string]string),
 		GetCommitAncestryErrorFor: make(map[string]error),
+		GetPRHeadCommitErrorFor:   make(map[string]error),
 	}
 }
 
@@ -75,6 +91,35 @@ func (m *MockGitHubAPI) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 	return ancestry, nil
 }
 
+// GetPRHeadCommit retrieves the head commit SHA for a pull request.
+func (m *MockGitHubAPI) GetPRHeadCommit(ctx context.Context, owner, repo string, prNumber int) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.GetPRHeadCommitCalls = append(m.GetPRHeadCommitCalls, GetPRHeadCommitCall{
+		Owner:    owner,
+		Repo:     repo,
+		PRNumber: prNumber,
+	})
+
+	if m.GetPRHeadCommitError != nil {
+		return "", m.GetPRHeadCommitError
+	}
+
+	key := fmt.Sprintf("%s/%s:%d", owner, repo, prNumber)
+	if err, ok := m.GetPRHeadCommitErrorFor[key]; ok {
+		return "", err
+	}
+
+	// Look up the PR head commit
+	headCommit, ok := m.PRHeadCommits[key]
+	if !ok {
+		return "", fmt.Errorf("PR #%d not found", prNumber)
+	}
+
+	return headCommit, nil
+}
+
 // ClearCache clears any cached data.
 func (m *MockGitHubAPI) ClearCache() {
 	m.mu.Lock()
@@ -92,14 +137,27 @@ func (m *MockGitHubAPI) SetAncestry(owner, repo, ref string, commits []string) {
 	m.Ancestry[key] = commits
 }
 
+// SetPRHeadCommit configures the head commit for a specific PR.
+func (m *MockGitHubAPI) SetPRHeadCommit(owner, repo string, prNumber int, headCommit string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	key := fmt.Sprintf("%s/%s:%d", owner, repo, prNumber)
+	m.PRHeadCommits[key] = headCommit
+}
+
 // Reset clears all configured ancestry and call tracking.
 func (m *MockGitHubAPI) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	m.Ancestry = make(map[string][]string)
+	m.PRHeadCommits = make(map[string]string)
 	m.GetCommitAncestryCalls = nil
+	m.GetPRHeadCommitCalls = nil
 	m.ClearCacheCalls = 0
 	m.GetCommitAncestryError = nil
+	m.GetPRHeadCommitError = nil
 	m.GetCommitAncestryErrorFor = make(map[string]error)
+	m.GetPRHeadCommitErrorFor = make(map[string]error)
 }

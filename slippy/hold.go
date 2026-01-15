@@ -33,12 +33,7 @@ type HoldOptions struct {
 // Returns nil if prerequisites are satisfied, error if failed or timeout.
 func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) error {
 	// Apply defaults from config
-	if opts.Timeout == 0 {
-		opts.Timeout = c.config.HoldTimeout
-	}
-	if opts.PollInterval == 0 {
-		opts.PollInterval = c.config.PollInterval
-	}
+	opts.Timeout, opts.PollInterval = c.applyHoldDefaults(opts.Timeout, opts.PollInterval)
 
 	if len(opts.Prerequisites) == 0 {
 		return nil

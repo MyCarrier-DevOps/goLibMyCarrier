@@ -31,6 +31,11 @@ type SlipStore interface {
 	// The third return value is the matched commit SHA.
 	FindByCommits(ctx context.Context, repository string, commits []string) (*Slip, string, error)
 
+	// FindAllByCommits finds all slips matching any commit in the ordered list.
+	// Returns slips ordered by commit priority (first matching commit's slip first).
+	// Each result includes the slip and its matched commit SHA.
+	FindAllByCommits(ctx context.Context, repository string, commits []string) ([]SlipWithCommit, error)
+
 	// Update persists changes to an existing slip
 	Update(ctx context.Context, slip *Slip) error
 
@@ -53,6 +58,11 @@ type GitHubAPI interface {
 	// GetCommitAncestry retrieves the commit ancestry for a given ref.
 	// Returns a slice of commit SHAs in order from newest to oldest.
 	GetCommitAncestry(ctx context.Context, owner, repo, ref string, depth int) ([]string, error)
+
+	// GetPRHeadCommit retrieves the head commit SHA for a pull request.
+	// This is used to link squash merge commits back to the original feature branch slip.
+	// Returns the SHA of the PR's head commit before merging.
+	GetPRHeadCommit(ctx context.Context, owner, repo string, prNumber int) (string, error)
 
 	// ClearCache clears any cached data (useful for testing)
 	ClearCache()
