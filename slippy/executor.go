@@ -157,11 +157,8 @@ func (c *Client) RunPreExecution(ctx context.Context, opts PreExecutionOptions) 
 
 	// Step 3: Prerequisites satisfied, mark as running
 	if err := c.StartStep(ctx, slip.CorrelationID, opts.StepName, opts.ComponentName); err != nil {
-		c.logger.Error(ctx, "Failed to start step", err, map[string]interface{}{
-			"step_name":      opts.StepName,
-			"component_name": opts.ComponentName,
-		})
-		// Don't fail - we can still proceed
+		// Return error - let caller decide if this should be blocking based on shadow mode
+		return nil, fmt.Errorf("failed to start step %s: %w", opts.StepName, err)
 	}
 
 	result.Outcome = PreExecutionOutcomeProceed
@@ -228,19 +225,28 @@ func (c *Client) RunPostExecution(ctx context.Context, opts PostExecutionOptions
 	}
 
 	// Check if pipeline is complete
-	result.SlipCompleted, result.SlipStatus = c.checkPipelineCompletion(ctx, opts.CorrelationID)
+	var completionErr error
+	result.SlipCompleted, result.SlipStatus, completionErr = c.checkPipelineCompletion(ctx, opts.CorrelationID)
+	if completionErr != nil {
+		// Log but still return the result - completion check failure shouldn't prevent
+		// the post-execution from completing, but we add it to the result for visibility
+		c.logger.Error(ctx, "Pipeline completion check error", completionErr, map[string]interface{}{
+			"correlation_id": opts.CorrelationID,
+		})
+		// Return the error so callers can decide how to handle it based on shadow mode
+		return result, fmt.Errorf("post-execution completed but pipeline status update failed: %w", completionErr)
+	}
 
 	return result, nil
 }
 
 // checkPipelineCompletion checks if the entire pipeline is complete and updates slip status.
-func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID string) (bool, SlipStatus) {
+// Returns (completed, status, error). The error is returned rather than swallowed to allow
+// callers (and shadow mode settings) to decide how to handle failures.
+func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID string) (bool, SlipStatus, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
-		c.logger.Error(ctx, "Failed to load slip for completion check", err, map[string]interface{}{
-			"correlation_id": correlationID,
-		})
-		return false, ""
+		return false, "", fmt.Errorf("%w: failed to load slip for completion check: %s", ErrSlipNotFound, err.Error())
 	}
 
 	// Check if prod_steady_state is completed
@@ -249,12 +255,9 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 			"correlation_id": correlationID,
 		})
 		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted); err != nil {
-			c.logger.Warn(ctx, "Failed to update slip status to completed", map[string]interface{}{
-				"correlation_id": correlationID,
-				"error":          err.Error(),
-			})
+			return true, SlipStatusCompleted, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
-		return true, SlipStatusCompleted
+		return true, SlipStatusCompleted, nil
 	}
 
 	// Check if any terminal step failed (pipeline failed)
@@ -265,16 +268,13 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 				"step_name":      stepName,
 			})
 			if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed); err != nil {
-				c.logger.Warn(ctx, "Failed to update slip status to failed", map[string]interface{}{
-					"correlation_id": correlationID,
-					"error":          err.Error(),
-				})
+				return true, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 			}
-			return true, SlipStatusFailed
+			return true, SlipStatusFailed, nil
 		}
 	}
 
-	return false, slip.Status
+	return false, slip.Status, nil
 }
 
 // ParsePrerequisites parses a comma-separated string of prerequisites.

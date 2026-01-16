@@ -101,10 +101,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Verify the returned slip
 		if slip.CorrelationID != "corr-push-1" {
@@ -185,10 +186,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			Components:    []ComponentDefinition{},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Should return the existing slip (not create new)
 		if slip.CorrelationID != "corr-push-retry" {
@@ -307,13 +309,17 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			CommitSHA:     "histerr123",
 		}
 
-		// Should succeed even though history append fails
-		slip, err := client.CreateSlipForPush(ctx, opts)
-		if err != nil {
-			t.Fatalf("expected success (history error is non-fatal), got: %v", err)
+		// Now returns error - history errors are no longer swallowed
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected error for history append failure")
 		}
-		if slip == nil {
-			t.Fatal("expected non-nil slip")
+		if !errors.Is(err, ErrHistoryAppendFailed) {
+			t.Errorf("expected ErrHistoryAppendFailed, got: %v", err)
+		}
+		// Result should be nil when there's an error
+		if result != nil {
+			t.Error("expected nil result on error")
 		}
 	})
 }
@@ -1430,10 +1436,11 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Verify the new slip was created
 		if slip.CorrelationID != "corr-merge-commit" {
@@ -1491,10 +1498,11 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Verify ancestry was resolved via git history
 		if len(slip.Ancestry) != 1 {

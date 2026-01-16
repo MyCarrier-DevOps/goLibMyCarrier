@@ -114,6 +114,23 @@ func (o PushOptions) Validate() error {
 	return nil
 }
 
+// CreateSlipResult contains the result of slip creation including any warnings.
+type CreateSlipResult struct {
+	// Slip is the created routing slip
+	Slip *Slip
+
+	// Warnings contains non-fatal errors that occurred during creation.
+	// These don't prevent slip creation but may indicate issues like:
+	// - GitHub App not installed (ancestry resolution failed)
+	// - Failed to abandon/promote ancestor slips
+	// Callers can inspect these to decide if they should be treated as errors.
+	Warnings []error
+
+	// AncestryResolved indicates whether ancestry was successfully resolved.
+	// If false, the slip was created without ancestry tracking.
+	AncestryResolved bool
+}
+
 // CreateSlipForPush creates a new routing slip for a git push event.
 // If a slip already exists for this commit (retry scenario), it resets
 // the push_parsed step and returns the existing slip.
@@ -121,7 +138,12 @@ func (o PushOptions) Validate() error {
 // This function also resolves the commit ancestry chain via GitHub,
 // finds any existing slips for ancestor commits, and ensures they are
 // in a terminal state (abandoning non-terminal slips that are being superseded).
-func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Slip, error) {
+//
+// The returned CreateSlipResult contains both the slip and any non-fatal errors
+// that occurred during processing (e.g., ancestry resolution failures).
+// Callers should check Warnings for issues that didn't prevent slip creation
+// but may indicate configuration problems (like missing GitHub App installation).
+func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*CreateSlipResult, error) {
 	if err := opts.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid push options: %w", err)
 	}
@@ -131,21 +153,26 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Slip
 		"commit":     shortSHA(opts.CommitSHA),
 	})
 
+	result := &CreateSlipResult{
+		Warnings: make([]error, 0),
+	}
+
 	// Check for existing slip (retry detection)
 	existingSlip, err := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
 	if err == nil && existingSlip != nil {
-		return c.handlePushRetry(ctx, existingSlip)
+		slip, err := c.handlePushRetry(ctx, existingSlip)
+		if err != nil {
+			return nil, err
+		}
+		result.Slip = slip
+		result.AncestryResolved = len(slip.Ancestry) > 0
+		return result, nil
 	}
 
 	// Resolve ancestry chain and abandon superseded slips
-	ancestry, err := c.resolveAndAbandonAncestors(ctx, opts)
-	if err != nil {
-		// Log but don't fail - ancestry is informational
-		c.logger.Warn(ctx, "Failed to resolve ancestry", map[string]interface{}{
-			"error": err.Error(),
-		})
-		ancestry = nil
-	}
+	ancestry, ancestryWarnings := c.resolveAndAbandonAncestorsWithWarnings(ctx, opts)
+	result.Warnings = append(result.Warnings, ancestryWarnings...)
+	result.AncestryResolved = len(ancestry) > 0 || len(ancestryWarnings) == 0
 
 	// Create new slip with full initialization including ancestry
 	slip := c.initializeSlipForPush(opts, ancestry)
@@ -154,12 +181,16 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Slip
 		return nil, fmt.Errorf("failed to create slip: %w", err)
 	}
 
+	result.Slip = slip
+
 	c.logger.Info(ctx, "Created routing slip", map[string]interface{}{
 		"correlation_id": slip.CorrelationID,
 		"components":     len(opts.Components),
 		"ancestors":      len(ancestry),
+		"warnings":       len(result.Warnings),
 	})
-	return slip, nil
+
+	return result, nil
 }
 
 // resolveAndAbandonAncestors fetches commit ancestry from GitHub,
@@ -173,18 +204,57 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Slip
 // For squash merges (when CommitMessage contains a PR reference like "#42"),
 // if no ancestor is found via git history, falls back to PR-based lookup.
 // This finds the original feature branch slip and marks it as "promoted" (not abandoned).
+//
+// Deprecated: Use resolveAndAbandonAncestorsWithWarnings instead for better error visibility.
 func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOptions) ([]AncestryEntry, error) {
+	ancestry, warnings := c.resolveAndAbandonAncestorsWithWarnings(ctx, opts)
+	if len(warnings) > 0 {
+		// Return the first warning as an error for backward compatibility
+		return ancestry, warnings[0]
+	}
+	return ancestry, nil
+}
+
+// resolveAndAbandonAncestorsWithWarnings fetches commit ancestry from GitHub,
+// finds any existing slips for those commits, abandons non-terminal ones,
+// and returns the ancestry chain along with any warnings encountered.
+//
+// Unlike resolveAndAbandonAncestors, this function collects ALL errors as warnings
+// rather than failing on the first error. This allows slip creation to proceed
+// while giving callers visibility into what went wrong.
+//
+// Warnings may include:
+// - GitHub App not installed on organization
+// - Failed to fetch commit ancestry from GitHub API
+// - Failed to promote/abandon ancestor slips
+// - Invalid repository format
+func (c *Client) resolveAndAbandonAncestorsWithWarnings(ctx context.Context, opts PushOptions) ([]AncestryEntry, []error) {
+	warnings := make([]error, 0)
+
 	// Parse owner/repo for GitHub API
 	parts := strings.SplitN(opts.Repository, "/", 2)
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid repository format: %s", opts.Repository)
+		warnings = append(warnings, NewAncestryError(
+			opts.Repository,
+			opts.CommitSHA,
+			"setup",
+			fmt.Errorf("invalid repository format: %s (expected owner/repo)", opts.Repository),
+		))
+		return nil, warnings
 	}
 	owner, repo := parts[0], parts[1]
 
 	// Progressive depth search: start with initial depth, expand if no ancestor found
 	ancestorSlips, err := c.findAncestorSlipsWithProgressiveDepth(ctx, owner, repo, opts)
 	if err != nil {
-		return nil, err
+		warnings = append(warnings, NewAncestryError(
+			opts.Repository,
+			opts.CommitSHA,
+			"github_api",
+			err,
+		))
+		// Return early with the warning - can't continue without ancestry info
+		return nil, warnings
 	}
 
 	// Detect potential edge cases that might break ancestry
@@ -222,6 +292,7 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	}
 
 	if len(ancestorSlips) == 0 {
+		// No ancestors found is not an error - this might be the first commit
 		return nil, nil
 	}
 
@@ -246,11 +317,14 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 				})
 
 				if err := c.PromoteSlip(ctx, slip.CorrelationID, opts.CorrelationID); err != nil {
-					c.logger.Warn(ctx, "Failed to promote feature branch slip", map[string]interface{}{
-						"error":          err.Error(),
-						"correlation_id": slip.CorrelationID,
-					})
-					// Continue - don't fail slip creation due to promotion failure
+					warnings = append(warnings, NewAncestorUpdateError(
+						opts.Repository,
+						opts.CommitSHA,
+						"promote",
+						slip.CorrelationID,
+						fmt.Errorf("failed to promote feature branch slip: %w", err),
+					))
+					// Continue - still build ancestry chain
 				} else {
 					// Update the local copy to reflect the promotion
 					slip.Status = SlipStatusPromoted
@@ -265,11 +339,14 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 				})
 
 				if err := c.AbandonSlip(ctx, slip.CorrelationID, opts.CorrelationID); err != nil {
-					c.logger.Warn(ctx, "Failed to abandon superseded slip", map[string]interface{}{
-						"error":          err.Error(),
-						"correlation_id": slip.CorrelationID,
-					})
-					// Continue - don't fail slip creation due to abandonment failure
+					warnings = append(warnings, NewAncestorUpdateError(
+						opts.Repository,
+						opts.CommitSHA,
+						"abandon",
+						slip.CorrelationID,
+						fmt.Errorf("failed to abandon superseded slip: %w", err),
+					))
+					// Continue - still build ancestry chain
 				} else {
 					// Update the local copy to reflect the abandonment
 					slip.Status = SlipStatusAbandoned
@@ -311,9 +388,10 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 		"commit":       shortSHA(opts.CommitSHA),
 		"ancestors":    len(ancestry),
 		"squash_merge": isSquashMerge,
+		"warnings":     len(warnings),
 	})
 
-	return ancestry, nil
+	return ancestry, warnings
 }
 
 // findAncestorViaSquashMerge attempts to find an ancestor slip by parsing
@@ -549,10 +627,9 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 	}
 
 	if err := c.store.AppendHistory(ctx, slip.CorrelationID, entry); err != nil {
-		c.logger.Error(ctx, "Failed to append history for retry", err, map[string]interface{}{
-			"correlation_id": slip.CorrelationID,
-		})
-		// Non-fatal - continue
+		// Return the error - audit trail is important
+		return nil, fmt.Errorf("%w: retry push_parsed reset succeeded but history append failed: %s",
+			ErrHistoryAppendFailed, err.Error())
 	}
 
 	// Reload to get updated slip

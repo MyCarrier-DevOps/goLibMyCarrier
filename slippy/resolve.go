@@ -35,6 +35,10 @@ type ResolveResult struct {
 
 	// MatchedCommit is the commit SHA that matched
 	MatchedCommit string
+
+	// Warnings contains non-fatal errors encountered during resolution.
+	// For example, ancestry lookup might fail but image tag resolution succeeds.
+	Warnings []error
 }
 
 // ResolveSlip finds the correct routing slip for a workflow execution.
@@ -44,6 +48,10 @@ type ResolveResult struct {
 // Resolution order:
 // 1. Commit ancestry via GitHub GraphQL API (walks git history)
 // 2. Image tag extraction (parses commit SHA from image tag)
+//
+// The returned ResolveResult includes a Warnings slice containing any errors
+// encountered during resolution. For example, if ancestry lookup fails but
+// image tag resolution succeeds, the ancestry error is included as a warning.
 func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*ResolveResult, error) {
 	if opts.AncestryDepth == 0 {
 		opts.AncestryDepth = c.config.AncestryDepth
@@ -55,6 +63,8 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 		return nil, err
 	}
 
+	var warnings []error
+
 	// Primary: Commit ancestry via GitHub GraphQL API
 	if opts.Ref != "" {
 		c.logger.Info(ctx, "Resolving slip via commit ancestry", map[string]interface{}{
@@ -64,9 +74,13 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 
 		commits, err := c.github.GetCommitAncestry(ctx, owner, repo, opts.Ref, opts.AncestryDepth)
 		if err != nil {
-			c.logger.Warn(ctx, "Failed to get commit ancestry", map[string]interface{}{
-				"error": err.Error(),
+			// Log the error at ERROR level - this is important information
+			c.logger.Error(ctx, "Failed to get commit ancestry", err, map[string]interface{}{
+				"repository": opts.Repository,
+				"ref":        opts.Ref,
 			})
+			// Capture as warning - we'll try fallback resolution
+			warnings = append(warnings, fmt.Errorf("ancestry resolution failed: %w", err))
 		} else if len(commits) > 0 {
 			slip, matchedCommit, err := c.store.FindByCommits(ctx, opts.Repository, commits)
 			if err == nil && slip != nil {
@@ -78,6 +92,7 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 					Slip:          slip,
 					ResolvedBy:    "ancestry",
 					MatchedCommit: matchedCommit,
+					Warnings:      warnings,
 				}, nil
 			}
 		}
@@ -96,11 +111,13 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 				c.logger.Info(ctx, "Resolved slip via image tag", map[string]interface{}{
 					"correlation_id": slip.CorrelationID,
 					"commit":         shortSHA(commitSHA),
+					"warnings":       len(warnings),
 				})
 				return &ResolveResult{
 					Slip:          slip,
 					ResolvedBy:    "image_tag",
 					MatchedCommit: commitSHA,
+					Warnings:      warnings, // Include any ancestry warnings
 				}, nil
 			}
 		}

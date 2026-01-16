@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 15, 2026  
-> **Status:** Multi-module Go library with ancestry tracking (branch: slippy/ancestry-tracking)
+> **Last Updated:** January 16, 2026  
+> **Status:** Multi-module Go library with comprehensive error handling (branch: feature/improved-error-handling)
 
 ---
 
@@ -27,7 +27,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 | `slippy` | Routing slip orchestration for CI/CD pipelines | Active development |
 | `logger` | Zap-based structured logging | Stable |
 | `kafka` | Kafka producer/consumer utilities | Stable |
-| `github` | GitHub API client with App authentication | Stable |
+| `github` | GitHub API client with App authentication | Updated - structured errors |
 | `vault` | HashiCorp Vault integration | Stable |
 | `auth` | Gin authentication middleware | Stable |
 | `otel` | OpenTelemetry instrumentation | Stable |
@@ -64,18 +64,8 @@ Squash merges break git ancestry (the merge commit has no git parent link to the
 5. Recording `PromotedTo` field for bidirectional linking
 
 **Data Model:**
-```go
-type Slip struct {
-    // ... other fields
-    Ancestry   chcol.JSON[[]string] `ch:"ancestry"`    // JSON array of commit SHAs
-    PromotedTo string               `ch:"promoted_to"` // Correlation ID of target slip (for promoted slips)
-}
-
-type PushOptions struct {
-    // ... other fields
-    CommitMessage string // Optional: enables PR-based ancestry for squash merges
-}
-```
+- [Slip struct with Ancestry and PromotedTo fields](slippy/types.go#L15-L50)
+- [PushOptions with CommitMessage field](slippy/push.go#L25-L45)
 
 **Slip Statuses:**
 - `promoted` - Feature branch slip was successfully merged via PR (terminal, successful)
@@ -111,13 +101,7 @@ type PushOptions struct {
 - `findAncestorViaSquashMerge()` - Enhanced to loop through all PR numbers until slip found
 
 **Logging:**
-When edge cases are detected, warnings are logged with context:
-```go
-logger.Warn("Cherry-pick detected - ancestry chain may be broken",
-    "repository", repo.Name,
-    "commit", commit.SHA,
-    "message_snippet", commitMessage[:min(100, len(commitMessage))])
-```
+When edge cases are detected, warnings are logged with context. See [resolveAndAbandonAncestorsWithWarnings](slippy/push.go#L200-L280) for implementation.
 
 ### ClickHouse Migrator Package
 - **Versioned migrations** - one-time schema changes tracked in migrations table
@@ -132,6 +116,68 @@ logger.Warn("Cherry-pick detected - ancestry chain may be broken",
 ---
 
 ## Recent Changes
+
+### January 16, 2026 — Comprehensive Error Handling (branch: feature/improved-error-handling)
+
+**Problem:**
+Ancestry tracking was not working. Root cause: GitHub App was not installed on the MyCarrier-Engineering organization. However, this was difficult to diagnose because:
+1. Errors were being silently swallowed with `logger.Error()` calls
+2. No actionable information about what was wrong
+3. Shadow mode was being checked inside library functions instead of at call sites
+
+**Solution:**
+Complete error handling overhaul ensuring ALL errors are returned (never swallowed) with actionable messages. Shadow mode handling moved to call sites.
+
+**New Files:**
+- `github/errors.go` - Structured error types for GitHub API operations
+
+**New Error Types (github package):**
+- Sentinel errors: [ErrNoInstallation, ErrAuthenticationFailed](github/errors.go#L12-L20)
+- [InstallationError](github/errors.go#L41-L80) - includes list of available orgs for actionable debugging
+- [GraphQLError](github/errors.go#L85-L130) - detailed API error with query context
+
+**New Error Types (slippy package):**
+- Sentinel errors: [ErrAncestryResolutionFailed, ErrAncestorUpdateFailed, ErrHistoryAppendFailed, ErrSlipStatusUpdateFailed](slippy/errors.go#L38-L60)
+- [AncestryError](slippy/errors.go#L171-L250) - phase-based error tracking with phases: "github_api", "slip_lookup", "abandon", "promote"
+
+**New Return Type:**
+- [CreateSlipResult](slippy/push.go#L117-L130) - replaces direct `*Slip` return, includes `Warnings []error` and `AncestryResolved bool`
+
+**API Changes:**
+| Function | Old Signature | New Signature |
+|----------|---------------|---------------|
+| `CreateSlipForPush` | `(*Slip, error)` | `(*CreateSlipResult, error)` |
+| `checkPipelineCompletion` | `(bool, SlipStatus)` | `(bool, SlipStatus, error)` |
+| `UpdateStepWithStatus` | Returns single error | Returns `ErrHistoryAppendFailed` + aggregate errors |
+| `WaitForPrerequisites` | Swallowed HoldStep errors | Returns HoldStep errors |
+| `RunPreExecution` | Swallowed StartStep errors | Returns StartStep errors |
+| `ResolveResult` | No warnings | Added `Warnings []error` field |
+
+**Key Principle:**
+The slippy library now returns ALL errors. Shadow mode handling happens at the **call site**, not inside the library. See [IsShadowMode](slippy/config.go) for the toggle and the "Never Swallow Errors" architectural decision below for the pattern.
+
+**Files Modified:**
+- `github/errors.go` (NEW) - Structured error types
+- `github/graphql.go` - `DiscoverInstallationID`, `GetCommitAncestry`, `GetPRHeadCommit` use new errors
+- `slippy/errors.go` - Added new sentinel errors and `AncestryError` type
+- `slippy/types.go` - Added `CreateSlipResult` struct
+- `slippy/push.go` - `CreateSlipForPush` returns `CreateSlipResult`, `resolveAndAbandonAncestorsWithWarnings` collects warnings
+- `slippy/executor.go` - `checkPipelineCompletion` returns 3 values, `RunPreExecution` returns StartStep errors
+- `slippy/steps.go` - `UpdateStepWithStatus` returns history append and aggregate errors
+- `slippy/hold.go` - `WaitForPrerequisites` returns HoldStep errors
+- `slippy/resolve.go` - `ResolveResult` includes Warnings field
+
+**Test Updates:**
+All tests updated to match new signatures. Tests pass with coverage above 75% threshold.
+
+**Current Status:**
+- ✅ `make lint PKG=slippy` - 0 issues
+- ✅ `make test PKG=slippy` - all pass
+- ✅ `make lint PKG=github` - 0 issues
+- ✅ `make test PKG=github` - all pass
+- ✅ All errors returned, none swallowed
+
+---
 
 ### January 15, 2026 — SOLID/DRY Refactoring (branch: slippy/ancestry-tracking)
 
@@ -193,13 +239,7 @@ Implemented comprehensive detection, mitigation, and fallback strategies for all
 - "tries multiple PR numbers for nested merges" - Validates fallback: PR #100 fails → PR #90 succeeds
 
 **Warning Logging:**
-When edge cases detected:
-```go
-logger.Warn("Cherry-pick detected - ancestry chain may be broken",
-    "repository", repo.Name,
-    "commit", commit.SHA,
-    "message_snippet", commitMessage[:min(100, len(commitMessage))])
-```
+When edge cases detected, warnings are logged. See [resolveAndAbandonAncestorsWithWarnings](slippy/push.go#L200-L280) for implementation.
 
 **Documentation:**
 Added comprehensive "Edge Cases & Mitigations" table to PROJECT_STATE.md documenting:
@@ -386,19 +426,23 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ## Current Focus
 
-1. **Branch slippy/ancestry-tracking** - Ancestry tracking with progressive depth search complete, ready for testing
+1. **Error handling complete** - All errors returned with actionable messages, ready for release
 2. **Validation requirements** - All modules must pass `make fmt`, `make lint`, `make test`
-3. **Next: Extend pushhookparser** - Update pushhookparser slippy integration with new functionality
+3. **Next: Publish new version** - Tag and publish new goLibMyCarrier version with error handling changes
 
 ---
 
 ## Architectural Decisions
 
-### Never Bypass Linting Rules
-**Decision:** Never use `//nolint` directives, `_ =` to ignore return values, or any mechanism to circumvent lint errors without explicit user permission.
-**Rationale:** Lint rules exist for code quality. Bypassing them hides real issues and creates technical debt. The proper fix is always to resolve the underlying problem.
-**Implementation:** When a lint error is encountered, fix the code properly. If a rule seems genuinely wrong for the situation, discuss with user before bypassing.
-**Anti-pattern:** Adding `//nolint:errcheck` or `_ = someFunc()` to silence warnings.
+### Never Swallow Errors
+**Decision:** Library functions must ALWAYS return errors. Never use `logger.Error()` and continue silently.
+**Rationale:** Callers need full visibility to make informed decisions. Shadow mode handling belongs at call sites, not inside libraries.
+**Implementation:**
+- All functions return errors they encounter
+- Use structured error types with actionable messages
+- Collect non-fatal errors as warnings in result structs
+- Call sites decide whether to block or continue based on shadow mode
+**Anti-pattern:** `logger.Errorf("something failed: %v", err)` without returning the error.
 
 ### Isolated Viper Instances
 **Decision:** Use `viper.New()` for isolated instances instead of the global viper singleton when loading package-specific configuration.
@@ -438,21 +482,7 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 ### Proper Error Handling for rows.Close()
 **Decision:** Use named return values with deferred close to properly handle `rows.Close()` errors.
 **Rationale:** Never use `_ = rows.Close()` to bypass errcheck. Named returns allow capturing close errors properly.
-**Implementation:**
-```go
-func FindAllByCommits(...) (results []SlipWithCommit, err error) {
-    rows, err := db.Query(...)
-    if err != nil { return nil, err }
-    defer func() {
-        closeErr := rows.Close()
-        if err == nil && closeErr != nil {
-            err = fmt.Errorf("failed to close rows: %w", closeErr)
-        }
-    }()
-    // ... scan rows ...
-    return results, nil
-}
-```
+**Implementation:** See [FindAllByCommits](slippy/clickhouse_store.go#L273-L320) for the pattern.
 **Anti-pattern:** Using `_ = rows.Close()` or `//nolint:errcheck` to suppress lint warnings.
 
 ### Two Migration Types (Versioned + Ensurers)
@@ -478,12 +508,12 @@ func FindAllByCommits(...) (results []SlipWithCommit, err error) {
 ## Next Steps (Not Yet Implemented)
 
 ### Immediate
-- [ ] Extend pushhookparser with new progressive depth ancestry support
-- [ ] Run full repo-wide `make lint` and `make test` 
-- [ ] Create PR for slippy/ancestry-tracking branch
-- [ ] Merge after CI passes
+- [ ] Publish new goLibMyCarrier version with error handling changes
+- [ ] Update pushhookparser to use new `CreateSlipResult` return type
+- [ ] Run full repo-wide `make lint` and `make test`
 
 ### Future
 - [ ] Integration tests for slippy with real ClickHouse (currently unit tests with mocks)
 - [ ] CLI tooling for slippy operations (manual slip inspection, cleanup)
 - [ ] Additional logger adapters beyond Zap
+- [ ] Implement `normalizeRepository()` for fork handling

@@ -77,11 +77,10 @@ func (c *Client) UpdateStepWithStatus(
 	}
 
 	if err := c.store.AppendHistory(ctx, correlationID, entry); err != nil {
-		c.logger.Error(ctx, "Failed to append history", err, map[string]interface{}{
-			"correlation_id": correlationID,
-			"step_name":      stepName,
-		})
-		// Non-fatal - continue
+		// Return the error - callers/shadow mode should decide if this is blocking
+		// The step update succeeded, but the audit trail is incomplete
+		return fmt.Errorf("%w: step %s updated to %s but history append failed: %s",
+			ErrHistoryAppendFailed, stepName, status, err.Error())
 	}
 
 	c.logger.Info(ctx, "Updated step", map[string]interface{}{
@@ -94,12 +93,9 @@ func (c *Client) UpdateStepWithStatus(
 		aggregateStep := c.pipelineConfig.GetAggregateStep(stepName)
 		if aggregateStep != "" {
 			if err := c.checkAndUpdateAggregate(ctx, correlationID, stepName, aggregateStep); err != nil {
-				c.logger.Error(ctx, "Failed to update aggregate", err, map[string]interface{}{
-					"correlation_id": correlationID,
-					"step_name":      stepName,
-					"aggregate_step": aggregateStep,
-				})
-				// Non-fatal
+				// Return the error - aggregate status is important for pipeline flow
+				return fmt.Errorf("step %s updated but aggregate %s update failed: %w",
+					stepName, aggregateStep, err)
 			}
 		}
 	}
