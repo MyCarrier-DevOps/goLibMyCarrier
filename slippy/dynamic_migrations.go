@@ -260,14 +260,15 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 					'failed' = 4,
 					'compensating' = 5,
 					'compensated' = 6,
-					'abandoned' = 7
-				) DEFAULT 'pending',
+				'abandoned' = 7,
+				'promoted' = 8
+			) DEFAULT 'pending',
 
-				-- Step execution details (timing, actor, errors for all steps)
-				step_details JSON DEFAULT '{}',
+			-- Step execution details (timing, actor, errors for all steps)
+			step_details JSON DEFAULT '{}',
 
-				-- Complete audit trail (array wrapped in object for ClickHouse JSON compatibility)
-				state_history JSON DEFAULT '{"entries":[]}',
+			-- Complete audit trail (array wrapped in object for ClickHouse JSON compatibility)
+			state_history JSON DEFAULT '{"entries":[]}',
 
 				-- Ancestry chain tracking prior slips (array wrapped in object for ClickHouse JSON compatibility)
 				ancestry JSON DEFAULT '{"chain":[]}',
@@ -366,7 +367,8 @@ func (m *DynamicMigrationManager) generateAncestryMigration() clickhousemigrator
 				'failed' = 4,
 				'compensating' = 5,
 				'compensated' = 6,
-				'abandoned' = 7
+				'abandoned' = 7,
+				'promoted' = 8
 			)
 		`, m.database),
 		DownSQL: fmt.Sprintf(`
