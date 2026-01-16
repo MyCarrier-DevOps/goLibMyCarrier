@@ -355,7 +355,10 @@ func TestDiscoverInstallationID_NotFound(t *testing.T) {
 	_, err = client.DiscoverInstallationID(ctx, "unknown-org")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no installation found for organization: unknown-org")
+	// Updated: Error message now includes actionable guidance
+	assert.Contains(t, err.Error(), "GitHub App not installed")
+	assert.Contains(t, err.Error(), "unknown-org")
+	assert.Contains(t, err.Error(), "other-org") // Should list available orgs
 }
 
 func TestDiscoverInstallationID_CachesResults(t *testing.T) {
@@ -484,8 +487,10 @@ func TestDiscoverInstallationID_APIError(t *testing.T) {
 	_, err = client.DiscoverInstallationID(ctx, "my-org")
 
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to query installations")
+	// Updated: Error message now includes actionable guidance
+	assert.Contains(t, err.Error(), "failed to authenticate GitHub App")
 	assert.Contains(t, err.Error(), "401")
+	assert.Contains(t, err.Error(), "Check SLIPPY_GITHUB_APP_ID")
 }
 
 func TestDiscoverInstallationID_InvalidJSON(t *testing.T) {
