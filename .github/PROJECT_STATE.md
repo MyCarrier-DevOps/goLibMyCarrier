@@ -494,6 +494,20 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - Ensurers use `IF NOT EXISTS` to be idempotent
 - Consumers must always call `RunMigrations()` (not just when version mismatches)
 
+### Update Existing Functions, Never Create New Versions
+**Decision:** When changing a function's signature or behavior, update the existing function rather than creating a new function with a modified name (e.g., `FooWithWarnings`, `FooV2`).
+**Rationale:** Creating new function versions leads to:
+- Code duplication and maintenance burden
+- Wrapper functions that just call the new version
+- Confusion about which function to use
+- Deprecated functions that linger in the codebase
+**Implementation:**
+- Modify the existing function signature directly
+- Update all call sites and tests to use the new signature
+- Use result structs (e.g., `CreateSlipResult`) to add return values without breaking existing callers
+- Never create `FooWithWarnings`, `FooV2`, `FooNew` variants
+**Anti-pattern:** Creating `resolveAndAbandonAncestorsWithWarnings` instead of updating `resolveAndAbandonAncestors`.
+
 ---
 
 ## Technical Debt / Known Issues

@@ -463,9 +463,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		if ancestry != nil {
@@ -505,9 +505,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		// Verify ancestry chain was built
@@ -567,9 +567,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		// Verify ancestry chain includes both direct parent and inherited ancestors
@@ -624,9 +624,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		// Verify failed step is recorded
@@ -655,9 +655,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		_, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err == nil {
-			t.Fatal("expected error for invalid repository format")
+		_, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) == 0 {
+			t.Fatal("expected warning for invalid repository format")
 		}
 	})
 
@@ -676,9 +676,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		_, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err == nil {
-			t.Fatal("expected error from GitHub API")
+		_, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) == 0 {
+			t.Fatal("expected warning from GitHub API")
 		}
 	})
 
@@ -700,9 +700,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		_, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err == nil {
-			t.Fatal("expected error from store")
+		_, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) == 0 {
+			t.Fatal("expected warning from store")
 		}
 	})
 }

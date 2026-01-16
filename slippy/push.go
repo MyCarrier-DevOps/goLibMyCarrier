@@ -170,7 +170,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	}
 
 	// Resolve ancestry chain and abandon superseded slips
-	ancestry, ancestryWarnings := c.resolveAndAbandonAncestorsWithWarnings(ctx, opts)
+	ancestry, ancestryWarnings := c.resolveAndAbandonAncestors(ctx, opts)
 	result.Warnings = append(result.Warnings, ancestryWarnings...)
 	result.AncestryResolved = len(ancestry) > 0 || len(ancestryWarnings) == 0
 
@@ -195,7 +195,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 
 // resolveAndAbandonAncestors fetches commit ancestry from GitHub,
 // finds any existing slips for those commits, abandons non-terminal ones,
-// and returns the ancestry chain for recording on the new slip.
+// and returns the ancestry chain along with any warnings encountered.
 //
 // This uses progressive depth searching: starts with AncestryDepth (default 25),
 // and if no ancestor slip is found, expands to AncestryMaxDepth (default 100).
@@ -205,30 +205,15 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 // if no ancestor is found via git history, falls back to PR-based lookup.
 // This finds the original feature branch slip and marks it as "promoted" (not abandoned).
 //
-// Deprecated: Use resolveAndAbandonAncestorsWithWarnings instead for better error visibility.
-func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOptions) ([]AncestryEntry, error) {
-	ancestry, warnings := c.resolveAndAbandonAncestorsWithWarnings(ctx, opts)
-	if len(warnings) > 0 {
-		// Return the first warning as an error for backward compatibility
-		return ancestry, warnings[0]
-	}
-	return ancestry, nil
-}
-
-// resolveAndAbandonAncestorsWithWarnings fetches commit ancestry from GitHub,
-// finds any existing slips for those commits, abandons non-terminal ones,
-// and returns the ancestry chain along with any warnings encountered.
-//
-// Unlike resolveAndAbandonAncestors, this function collects ALL errors as warnings
-// rather than failing on the first error. This allows slip creation to proceed
-// while giving callers visibility into what went wrong.
+// This function collects ALL errors as warnings rather than failing on the first error.
+// This allows slip creation to proceed while giving callers visibility into what went wrong.
 //
 // Warnings may include:
 // - GitHub App not installed on organization
 // - Failed to fetch commit ancestry from GitHub API
 // - Failed to promote/abandon ancestor slips
 // - Invalid repository format
-func (c *Client) resolveAndAbandonAncestorsWithWarnings(ctx context.Context, opts PushOptions) ([]AncestryEntry, []error) {
+func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOptions) ([]AncestryEntry, []error) {
 	warnings := make([]error, 0)
 
 	// Parse owner/repo for GitHub API
