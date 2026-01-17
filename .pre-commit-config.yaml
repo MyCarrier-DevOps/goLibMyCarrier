@@ -1,0 +1,19 @@
+# Install: pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  - repo: local
+    hooks:
+      - id: make-tidy
+        name: Go Module Tidy
+        entry: make tidy
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: make-fmt
+        name: Go Format
+        entry: make fmt
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]

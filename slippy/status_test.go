@@ -253,7 +253,11 @@ func TestAllSlipStatusesInEnum(t *testing.T) {
 	for statusName, statusValue := range discoveredStatuses {
 		enumValue, exists := enumValues[statusValue]
 		if !exists {
-			t.Errorf("SlipStatus constant %s = %q is missing from enum definition in dynamic_migrations.go", statusName, statusValue)
+			t.Errorf(
+				"SlipStatus constant %s = %q is missing from enum definition in dynamic_migrations.go",
+				statusName,
+				statusValue,
+			)
 			continue
 		}
 		if enumValue < 1 {
@@ -286,7 +290,11 @@ func TestAllSlipStatusesInEnum(t *testing.T) {
 
 	// Verify counts match
 	if len(discoveredStatuses) != len(enumValues) {
-		t.Errorf("Mismatch: %d slip statuses in status.go but %d enum values in dynamic_migrations.go", len(discoveredStatuses), len(enumValues))
+		t.Errorf(
+			"Mismatch: %d slip statuses in status.go but %d enum values in dynamic_migrations.go",
+			len(discoveredStatuses),
+			len(enumValues),
+		)
 		t.Logf("Discovered statuses: %v", discoveredStatuses)
 		t.Logf("Enum values: %v", enumValues)
 	}
@@ -398,7 +406,11 @@ func TestAllStepStatusesInEnum(t *testing.T) {
 	for statusName, statusValue := range discoveredStatuses {
 		enumValue, exists := enumValues[statusValue]
 		if !exists {
-			t.Errorf("StepStatus constant %s = %q is missing from enum definition in generateStepColumnEnsurer() in dynamic_migrations.go", statusName, statusValue)
+			t.Errorf(
+				"StepStatus constant %s = %q is missing from enum definition in generateStepColumnEnsurer() in dynamic_migrations.go",
+				statusName,
+				statusValue,
+			)
 			continue
 		}
 		if enumValue < 1 {
@@ -431,7 +443,11 @@ func TestAllStepStatusesInEnum(t *testing.T) {
 
 	// Verify counts match
 	if len(discoveredStatuses) != len(enumValues) {
-		t.Errorf("Mismatch: %d step statuses in status.go but %d enum values in dynamic_migrations.go", len(discoveredStatuses), len(enumValues))
+		t.Errorf(
+			"Mismatch: %d step statuses in status.go but %d enum values in dynamic_migrations.go",
+			len(discoveredStatuses),
+			len(enumValues),
+		)
 		t.Logf("Discovered statuses: %v", discoveredStatuses)
 		t.Logf("Enum values: %v", enumValues)
 	}

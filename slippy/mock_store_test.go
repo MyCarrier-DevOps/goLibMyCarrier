@@ -229,7 +229,11 @@ func (m *MockStore) FindByCommits(ctx context.Context, repository string, commit
 }
 
 // FindAllByCommits finds all slips matching any commit in the ordered list.
-func (m *MockStore) FindAllByCommits(ctx context.Context, repository string, commits []string) ([]SlipWithCommit, error) {
+func (m *MockStore) FindAllByCommits(
+	ctx context.Context,
+	repository string,
+	commits []string,
+) ([]SlipWithCommit, error) {
 	m.mu.Lock()
 	m.FindAllByCommitsCalls = append(m.FindAllByCommitsCalls, FindAllByCommitsCall{
 		Repository: repository,

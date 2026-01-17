@@ -1043,7 +1043,12 @@ func TestExtractAllPRNumbers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractAllPRNumbers(tt.commitMessage)
 			if len(result) != len(tt.expected) {
-				t.Errorf("extractAllPRNumbers(%q) returned %d PRs, want %d", tt.commitMessage, len(result), len(tt.expected))
+				t.Errorf(
+					"extractAllPRNumbers(%q) returned %d PRs, want %d",
+					tt.commitMessage,
+					len(result),
+					len(tt.expected),
+				)
 				return
 			}
 			for i, pr := range tt.expected {
@@ -1281,7 +1286,7 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 		github.GetPRHeadCommitErrorFor = map[string]error{
 			"owner/repo:100": errors.New("PR not found"),
 		}
-		
+
 		// Second PR (#90) has the slip
 		github.SetPRHeadCommit("owner", "repo", 90, "feature-sha")
 		github.SetAncestry("owner", "repo", "feature-sha", []string{"feature-sha"})
@@ -1301,7 +1306,7 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 		if result.Slip.CorrelationID != "corr-feature" {
 			t.Errorf("expected correlation ID 'corr-feature', got '%s'", result.Slip.CorrelationID)
 		}
-		
+
 		// Should have tried both PRs
 		if len(github.GetPRHeadCommitCalls) < 2 {
 			t.Errorf("expected at least 2 GetPRHeadCommit calls, got %d", len(github.GetPRHeadCommitCalls))
