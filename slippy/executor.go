@@ -228,12 +228,8 @@ func (c *Client) RunPostExecution(ctx context.Context, opts PostExecutionOptions
 	var completionErr error
 	result.SlipCompleted, result.SlipStatus, completionErr = c.checkPipelineCompletion(ctx, opts.CorrelationID)
 	if completionErr != nil {
-		// Log but still return the result - completion check failure shouldn't prevent
-		// the post-execution from completing, but we add it to the result for visibility
-		c.logger.Error(ctx, "Pipeline completion check error", completionErr, map[string]interface{}{
-			"correlation_id": opts.CorrelationID,
-		})
-		// Return the error so callers can decide how to handle it based on shadow mode
+		// Return the error - let caller decide how to log based on shadow mode
+		// Don't log here to avoid duplicate logging when caller also logs
 		return result, fmt.Errorf("post-execution completed but pipeline status update failed: %w", completionErr)
 	}
 

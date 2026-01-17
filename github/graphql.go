@@ -157,8 +157,10 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 
 	if resp.StatusCode != http.StatusOK {
 		body, readErr := io.ReadAll(resp.Body)
-		bodyStr := "(could not read body)"
-		if readErr == nil {
+		var bodyStr string
+		if readErr != nil {
+			bodyStr = fmt.Sprintf("(could not read body: %v)", readErr)
+		} else {
 			bodyStr = string(body)
 		}
 		// Detect authentication vs other errors
@@ -198,13 +200,8 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 		}
 	}
 
-	// Log clearly what organizations ARE available
-	g.logger.Error(ctx, "GitHub App not installed for organization", ErrNoInstallation, map[string]interface{}{
-		"requested_org":  org,
-		"available_orgs": availableOrgs,
-		"action":         "Install GitHub App on organization via Settings → Applications → Configure",
-	})
-
+	// Return error with available orgs - let caller decide how to log based on shadow mode
+	// The InstallationError includes available orgs for actionable debugging
 	return 0, NewInstallationNotFoundError(org, availableOrgs)
 }
 

@@ -126,8 +126,11 @@ type CreateSlipResult struct {
 	// Callers can inspect these to decide if they should be treated as errors.
 	Warnings []error
 
-	// AncestryResolved indicates whether ancestry was successfully resolved.
-	// If false, the slip was created without ancestry tracking.
+	// AncestryResolved indicates whether ancestry resolution completed without errors.
+	// True means the resolution attempt succeeded (whether or not ancestors exist).
+	// False means resolution failed (e.g., GitHub API error, missing installation).
+	// Note: A first commit has no ancestors, but AncestryResolved=true because
+	// the resolution attempt itself succeeded.
 	AncestryResolved bool
 }
 

@@ -1,6 +1,9 @@
 package slippy
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Sentinel errors for common error conditions.
 // These can be used with errors.Is() for error handling.
@@ -178,6 +181,7 @@ type AncestryError struct {
 	CommitSHA string
 
 	// Phase indicates where the failure occurred:
+	// "setup" - Failed during initial setup (e.g., invalid repository format)
 	// "github_api" - Failed to query GitHub for commit ancestry
 	// "slip_lookup" - Failed to query database for ancestor slips
 	// "abandon" - Failed to abandon a superseded ancestor slip
@@ -220,21 +224,18 @@ func (e *AncestryError) Error() string {
 	}
 
 	switch e.Phase {
+	case "setup":
+		return fmt.Sprintf("ancestry resolution failed for %s@%s: setup error - %v", e.Repository, shortSHA, e.Err)
 	case "github_api":
-		return "ancestry resolution failed for " + e.Repository + "@" + shortSHA +
-			": GitHub API error - " + e.Err.Error() +
-			" (check GitHub App installation and credentials)"
+		return fmt.Sprintf("ancestry resolution failed for %s@%s: GitHub API error - %v (check GitHub App installation and credentials)", e.Repository, shortSHA, e.Err)
 	case "slip_lookup":
-		return "ancestry resolution failed for " + e.Repository + "@" + shortSHA +
-			": database query failed - " + e.Err.Error()
+		return fmt.Sprintf("ancestry resolution failed for %s@%s: database query failed - %v", e.Repository, shortSHA, e.Err)
 	case "abandon":
-		return "failed to abandon superseded slip " + e.AncestorCorrelationID +
-			" for " + e.Repository + "@" + shortSHA + ": " + e.Err.Error()
+		return fmt.Sprintf("failed to abandon superseded slip %s for %s@%s: %v", e.AncestorCorrelationID, e.Repository, shortSHA, e.Err)
 	case "promote":
-		return "failed to promote feature branch slip " + e.AncestorCorrelationID +
-			" for " + e.Repository + "@" + shortSHA + ": " + e.Err.Error()
+		return fmt.Sprintf("failed to promote feature branch slip %s for %s@%s: %v", e.AncestorCorrelationID, e.Repository, shortSHA, e.Err)
 	default:
-		return "ancestry error for " + e.Repository + "@" + shortSHA + ": " + e.Err.Error()
+		return fmt.Sprintf("ancestry error for %s@%s: %v", e.Repository, shortSHA, e.Err)
 	}
 }
 
@@ -243,7 +244,10 @@ func (e *AncestryError) Unwrap() error {
 	switch e.Phase {
 	case "abandon", "promote":
 		return ErrAncestorUpdateFailed
+	case "setup", "github_api", "slip_lookup":
+		return ErrAncestryResolutionFailed
 	default:
+		// Fallback for any future phases - resolution failed is the safe default
 		return ErrAncestryResolutionFailed
 	}
 }
