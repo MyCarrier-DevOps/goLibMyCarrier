@@ -65,14 +65,19 @@ func TestGetClientForOrg_DiscoveryError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	_, err = client.GetClientForOrg(ctx, "unknown-org")
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to query installations")
+	// Updated error message with actionable guidance
+	assert.Contains(t, err.Error(), "failed to authenticate GitHub App")
+	assert.Contains(t, err.Error(), "Check SLIPPY_GITHUB_APP_ID")
 }
 
 // TestGetCommitAncestry_Success tests successful commit ancestry retrieval
@@ -133,7 +138,10 @@ func TestGetCommitAncestry_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -154,7 +162,10 @@ func TestGetCommitAncestry_ClientError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -212,14 +223,19 @@ func TestGetCommitAncestry_GraphQLError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	_, err = client.GetCommitAncestry(ctx, "test-owner", "test-repo", "main", 25)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to query commit history")
+	// Updated: GraphQL errors now include structured context
+	assert.Contains(t, err.Error(), "GetCommitAncestry failed")
+	assert.Contains(t, err.Error(), "test-owner/test-repo")
 }
 
 // TestGetPRHeadCommit_Success tests successful PR head commit retrieval
@@ -274,7 +290,10 @@ func TestGetPRHeadCommit_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -292,7 +311,10 @@ func TestGetPRHeadCommit_ClientError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -350,14 +372,19 @@ func TestGetPRHeadCommit_GraphQLError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	_, err = client.GetPRHeadCommit(ctx, "test-owner", "test-repo", 42)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to query PR head commit")
+	// Updated: GraphQL errors now include structured context
+	assert.Contains(t, err.Error(), "GetPRHeadCommit failed")
+	assert.Contains(t, err.Error(), "test-owner/test-repo")
 }
 
 // TestGetPRHeadCommit_EmptyHeadRefOid tests error handling when PR has no head commit
@@ -409,14 +436,19 @@ func TestGetPRHeadCommit_EmptyHeadRefOid(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	_, err = client.GetPRHeadCommit(ctx, "test-owner", "test-repo", 999)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "PR #999 not found or has no head commit")
+	// Updated: PR not found error message
+	assert.Contains(t, err.Error(), "pull request not found")
+	assert.Contains(t, err.Error(), "PR #999")
 }
 
 // TestGetCommitAncestry_EmptyResult tests handling of empty commit history
@@ -470,7 +502,10 @@ func TestGetCommitAncestry_EmptyResult(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -488,7 +523,10 @@ func TestGetClientForOrg_ContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, nil)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -501,7 +539,7 @@ func TestGetClientForOrg_ContextCancellation(t *testing.T) {
 // TestGetPRHeadCommit_ShortSHALogging tests that short SHA is logged correctly
 func TestGetPRHeadCommit_ShortSHALogging(t *testing.T) {
 	mockLog := &mockLogger{fields: make(map[string]interface{})}
-	
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Mock JWT endpoint for installation discovery
 		if r.URL.Path == "/api/v3/app/installations" {
@@ -549,7 +587,10 @@ func TestGetPRHeadCommit_ShortSHALogging(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, mockLog)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		mockLog,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -557,7 +598,7 @@ func TestGetPRHeadCommit_ShortSHALogging(t *testing.T) {
 	headCommit, err := client.GetPRHeadCommit(ctx, "test-owner", "test-repo", 42)
 	require.NoError(t, err)
 	assert.Equal(t, "1234567890abcdef", headCommit)
-	
+
 	// Verify debug logging was called
 	mockLog.mu.Lock()
 	defer mockLog.mu.Unlock()
@@ -567,7 +608,7 @@ func TestGetPRHeadCommit_ShortSHALogging(t *testing.T) {
 // TestGetCommitAncestry_DebugLogging tests that debug logging includes correct information
 func TestGetCommitAncestry_DebugLogging(t *testing.T) {
 	mockLog := &mockLogger{fields: make(map[string]interface{})}
-	
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Mock JWT endpoint for installation discovery
 		if r.URL.Path == "/api/v3/app/installations" {
@@ -620,7 +661,10 @@ func TestGetCommitAncestry_DebugLogging(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewGraphQLClient(GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL}, mockLog)
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		mockLog,
+	)
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -628,7 +672,7 @@ func TestGetCommitAncestry_DebugLogging(t *testing.T) {
 	commits, err := client.GetCommitAncestry(ctx, "test-owner", "test-repo", "main", 25)
 	require.NoError(t, err)
 	assert.Len(t, commits, 2)
-	
+
 	// Verify debug logging was called
 	mockLog.mu.Lock()
 	defer mockLog.mu.Unlock()

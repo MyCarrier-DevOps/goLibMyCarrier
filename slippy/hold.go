@@ -51,9 +51,8 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 	if opts.StepName != "" {
 		waitingFor := strings.Join(opts.Prerequisites, ", ")
 		if err := c.HoldStep(ctx, opts.CorrelationID, opts.StepName, opts.ComponentName, waitingFor); err != nil {
-			c.logger.Warn(ctx, "Failed to set held status", map[string]interface{}{
-				"error": err.Error(),
-			})
+			// Return the error - step status updates are important
+			return fmt.Errorf("failed to set held status for step %s: %w", opts.StepName, err)
 		}
 	}
 
@@ -106,9 +105,9 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 						opts.ComponentName,
 						timeoutMsg,
 					); err != nil {
-						c.logger.Warn(ctx, "Failed to set step timeout status", map[string]interface{}{
-							"error": err.Error(),
-						})
+						// Include the timeout status update failure in the error
+						return fmt.Errorf("%w: %s (additionally failed to set timeout status: %s)",
+							ErrHoldTimeout, timeoutMsg, err.Error())
 					}
 				}
 

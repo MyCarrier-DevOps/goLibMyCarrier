@@ -101,10 +101,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Verify the returned slip
 		if slip.CorrelationID != "corr-push-1" {
@@ -185,10 +186,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			Components:    []ComponentDefinition{},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Should return the existing slip (not create new)
 		if slip.CorrelationID != "corr-push-retry" {
@@ -307,13 +309,17 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			CommitSHA:     "histerr123",
 		}
 
-		// Should succeed even though history append fails
-		slip, err := client.CreateSlipForPush(ctx, opts)
-		if err != nil {
-			t.Fatalf("expected success (history error is non-fatal), got: %v", err)
+		// Now returns error - history errors are no longer swallowed
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected error for history append failure")
 		}
-		if slip == nil {
-			t.Fatal("expected non-nil slip")
+		if !errors.Is(err, ErrHistoryAppendFailed) {
+			t.Errorf("expected ErrHistoryAppendFailed, got: %v", err)
+		}
+		// Result should be nil when there's an error
+		if result != nil {
+			t.Error("expected nil result on error")
 		}
 	})
 }
@@ -457,9 +463,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		if ancestry != nil {
@@ -499,9 +505,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		// Verify ancestry chain was built
@@ -561,9 +567,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		// Verify ancestry chain includes both direct parent and inherited ancestors
@@ -618,9 +624,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		ancestry, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
 		// Verify failed step is recorded
@@ -649,9 +655,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		_, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err == nil {
-			t.Fatal("expected error for invalid repository format")
+		_, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) == 0 {
+			t.Fatal("expected warning for invalid repository format")
 		}
 	})
 
@@ -670,9 +676,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		_, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err == nil {
-			t.Fatal("expected error from GitHub API")
+		_, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) == 0 {
+			t.Fatal("expected warning from GitHub API")
 		}
 	})
 
@@ -694,9 +700,9 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			CommitSHA:     "abc123",
 		}
 
-		_, err := client.resolveAndAbandonAncestors(ctx, opts)
-		if err == nil {
-			t.Fatal("expected error from store")
+		_, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) == 0 {
+			t.Fatal("expected warning from store")
 		}
 	})
 }
@@ -1037,7 +1043,12 @@ func TestExtractAllPRNumbers(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			result := extractAllPRNumbers(tt.commitMessage)
 			if len(result) != len(tt.expected) {
-				t.Errorf("extractAllPRNumbers(%q) returned %d PRs, want %d", tt.commitMessage, len(result), len(tt.expected))
+				t.Errorf(
+					"extractAllPRNumbers(%q) returned %d PRs, want %d",
+					tt.commitMessage,
+					len(result),
+					len(tt.expected),
+				)
 				return
 			}
 			for i, pr := range tt.expected {
@@ -1275,7 +1286,7 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 		github.GetPRHeadCommitErrorFor = map[string]error{
 			"owner/repo:100": errors.New("PR not found"),
 		}
-		
+
 		// Second PR (#90) has the slip
 		github.SetPRHeadCommit("owner", "repo", 90, "feature-sha")
 		github.SetAncestry("owner", "repo", "feature-sha", []string{"feature-sha"})
@@ -1295,7 +1306,7 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 		if result.Slip.CorrelationID != "corr-feature" {
 			t.Errorf("expected correlation ID 'corr-feature', got '%s'", result.Slip.CorrelationID)
 		}
-		
+
 		// Should have tried both PRs
 		if len(github.GetPRHeadCommitCalls) < 2 {
 			t.Errorf("expected at least 2 GetPRHeadCommit calls, got %d", len(github.GetPRHeadCommitCalls))
@@ -1430,10 +1441,11 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Verify the new slip was created
 		if slip.CorrelationID != "corr-merge-commit" {
@@ -1491,10 +1503,11 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			},
 		}
 
-		slip, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
+		slip := result.Slip
 
 		// Verify ancestry was resolved via git history
 		if len(slip.Ancestry) != 1 {

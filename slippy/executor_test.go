@@ -465,7 +465,10 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		completed, status := client.checkPipelineCompletion(ctx, "corr-completion-1")
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-1")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 		if completed {
 			t.Error("expected pipeline to not be complete")
 		}
@@ -491,7 +494,10 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		completed, status := client.checkPipelineCompletion(ctx, "corr-completion-2")
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-2")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 		if !completed {
 			t.Error("expected pipeline to be complete")
 		}
@@ -519,7 +525,10 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		completed, status := client.checkPipelineCompletion(ctx, "corr-completion-3")
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-3")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 		if !completed {
 			t.Error("expected pipeline to be marked complete (failed)")
 		}
@@ -528,12 +537,15 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 	})
 
-	t.Run("slip not found", func(t *testing.T) {
+	t.Run("slip not found returns error", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
 
-		completed, status := client.checkPipelineCompletion(ctx, "nonexistent")
+		completed, status, err := client.checkPipelineCompletion(ctx, "nonexistent")
+		if err == nil {
+			t.Error("expected error for nonexistent slip")
+		}
 		if completed {
 			t.Error("expected pipeline to not be marked complete for nonexistent slip")
 		}
@@ -560,7 +572,10 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		completed, status := client.checkPipelineCompletion(ctx, "corr-completion-4")
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-4")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 		if !completed {
 			t.Error("expected pipeline to be marked complete (aborted)")
 		}
@@ -587,7 +602,10 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		completed, status := client.checkPipelineCompletion(ctx, "corr-completion-5")
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-5")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
 		if !completed {
 			t.Error("expected pipeline to be marked complete (timeout)")
 		}

@@ -157,16 +157,24 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 
 	if resp.StatusCode != http.StatusOK {
 		body, readErr := io.ReadAll(resp.Body)
+		var bodyStr string
 		if readErr != nil {
-			return 0, fmt.Errorf("failed to query installations: %s (could not read body: %w)", resp.Status, readErr)
+			bodyStr = fmt.Sprintf("(could not read body: %v)", readErr)
+		} else {
+			bodyStr = string(body)
 		}
-		return 0, fmt.Errorf("failed to query installations: %s - %s", resp.Status, string(body))
+		// Detect authentication vs other errors
+		isAuthErr := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
+		return 0, NewInstallationLookupError(org, fmt.Errorf("%s - %s", resp.Status, bodyStr), isAuthErr)
 	}
 
 	var installations []Installation
 	if err := json.NewDecoder(resp.Body).Decode(&installations); err != nil {
 		return 0, fmt.Errorf("failed to decode installations: %w", err)
 	}
+
+	// Collect all available organizations for error reporting
+	availableOrgs := make([]string, 0, len(installations))
 
 	// Find installation for the target organization
 	for _, inst := range installations {
@@ -175,6 +183,8 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 			"account":         inst.Account.Login,
 			"type":            inst.Account.Type,
 		})
+
+		availableOrgs = append(availableOrgs, inst.Account.Login)
 
 		// Cache all discovered installations
 		g.cacheMutex.Lock()
@@ -190,7 +200,9 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 		}
 	}
 
-	return 0, fmt.Errorf("no installation found for organization: %s", org)
+	// Return error with available orgs - let caller decide how to log based on shadow mode
+	// The InstallationError includes available orgs for actionable debugging
+	return 0, NewInstallationNotFoundError(org, availableOrgs)
 }
 
 // GetClientForOrg returns an authenticated GraphQL client for the given organization.
@@ -275,7 +287,7 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 	}
 
 	if err := client.Query(ctx, &query, variables); err != nil {
-		return nil, fmt.Errorf("failed to query commit history: %w", err)
+		return nil, NewGraphQLError("GetCommitAncestry", owner, repo, ref, err)
 	}
 
 	commits := make([]string, 0, len(query.Repository.Object.Commit.History.Nodes))
@@ -317,12 +329,12 @@ func (g *GraphQLClient) GetPRHeadCommit(ctx context.Context, owner, repo string,
 	}
 
 	if err := client.Query(ctx, &query, variables); err != nil {
-		return "", fmt.Errorf("failed to query PR head commit: %w", err)
+		return "", NewGraphQLError("GetPRHeadCommit", owner, repo, fmt.Sprintf("PR#%d", prNumber), err)
 	}
 
 	headCommit := query.Repository.PullRequest.HeadRefOid
 	if headCommit == "" {
-		return "", fmt.Errorf("PR #%d not found or has no head commit", prNumber)
+		return "", fmt.Errorf("%w: PR #%d in %s/%s", ErrPRNotFound, prNumber, owner, repo)
 	}
 
 	g.logger.Debug(ctx, "Retrieved PR head commit", map[string]interface{}{

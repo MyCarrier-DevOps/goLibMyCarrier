@@ -236,7 +236,7 @@ func TestClient_SkipStep(t *testing.T) {
 func TestClient_UpdateStepWithStatus(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("history append failure is non-fatal", func(t *testing.T) {
+	t.Run("history append failure returns error", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
@@ -245,15 +245,18 @@ func TestClient_UpdateStepWithStatus(t *testing.T) {
 		store.AddSlip(slip)
 		store.AppendHistoryError = errors.New("history append failed")
 
-		// Should not return error even though history append fails
+		// Now returns error - history errors are no longer swallowed
 		err := client.UpdateStepWithStatus(ctx, "corr-update-1", "dev_deploy", "", StepStatusCompleted, "done")
-		if err != nil {
-			t.Fatalf("expected success (history error is non-fatal), got: %v", err)
+		if err == nil {
+			t.Fatal("expected error for history append failure")
+		}
+		if !errors.Is(err, ErrHistoryAppendFailed) {
+			t.Errorf("expected ErrHistoryAppendFailed, got: %v", err)
 		}
 
-		// Verify the step was still updated
+		// Verify the step was still updated (step update succeeded, history failed)
 		if len(store.UpdateStepCalls) != 1 {
-			t.Error("expected step to be updated despite history error")
+			t.Error("expected step to be updated before history error")
 		}
 	})
 }
