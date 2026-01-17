@@ -225,15 +225,31 @@ func (e *AncestryError) Error() string {
 
 	switch e.Phase {
 	case "setup":
-		return fmt.Sprintf("ancestry resolution failed for %s@%s: setup error - %v", e.Repository, shortSHA, e.Err)
+		return fmt.Sprintf(
+			"ancestry resolution failed for %s@%s: setup error - %v",
+			e.Repository, shortSHA, e.Err,
+		)
 	case "github_api":
-		return fmt.Sprintf("ancestry resolution failed for %s@%s: GitHub API error - %v (check GitHub App installation and credentials)", e.Repository, shortSHA, e.Err)
+		return fmt.Sprintf(
+			"ancestry resolution failed for %s@%s: GitHub API error - %v "+
+				"(check GitHub App installation and credentials)",
+			e.Repository, shortSHA, e.Err,
+		)
 	case "slip_lookup":
-		return fmt.Sprintf("ancestry resolution failed for %s@%s: database query failed - %v", e.Repository, shortSHA, e.Err)
+		return fmt.Sprintf(
+			"ancestry resolution failed for %s@%s: database query failed - %v",
+			e.Repository, shortSHA, e.Err,
+		)
 	case "abandon":
-		return fmt.Sprintf("failed to abandon superseded slip %s for %s@%s: %v", e.AncestorCorrelationID, e.Repository, shortSHA, e.Err)
+		return fmt.Sprintf(
+			"failed to abandon superseded slip %s for %s@%s: %v",
+			e.AncestorCorrelationID, e.Repository, shortSHA, e.Err,
+		)
 	case "promote":
-		return fmt.Sprintf("failed to promote feature branch slip %s for %s@%s: %v", e.AncestorCorrelationID, e.Repository, shortSHA, e.Err)
+		return fmt.Sprintf(
+			"failed to promote feature branch slip %s for %s@%s: %v",
+			e.AncestorCorrelationID, e.Repository, shortSHA, e.Err,
+		)
 	default:
 		return fmt.Sprintf("ancestry error for %s@%s: %v", e.Repository, shortSHA, e.Err)
 	}
