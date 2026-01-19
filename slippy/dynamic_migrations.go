@@ -191,7 +191,8 @@ func (m *DynamicMigrationManager) GetAggregateColumns() []string {
 	columns := make([]string, 0)
 	for _, step := range m.config.Steps {
 		if step.Aggregates != "" {
-			columns = append(columns, pluralize(step.Aggregates))
+			// Column name is the step name (e.g., "builds")
+			columns = append(columns, step.Name)
 		}
 	}
 	return columns
@@ -237,7 +238,7 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 	return clickhousemigrator.Migration{
 		Version:     1,
 		Name:        "create_routing_slips_base",
-		Description: "Creates the base routing_slips table with core columns",
+		Description: "Creates the base routing_slips table with core columns using VersionedCollapsingMergeTree",
 		UpSQL: fmt.Sprintf(`
 			CREATE TABLE IF NOT EXISTS %s.routing_slips (
 				-- Primary identifier
@@ -260,25 +261,31 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 					'failed' = 4,
 					'compensating' = 5,
 					'compensated' = 6,
-				'abandoned' = 7,
-				'promoted' = 8
-			) DEFAULT 'pending',
+					'abandoned' = 7,
+					'promoted' = 8
+				) DEFAULT 'pending',
 
-			-- Step execution details (timing, actor, errors for all steps)
-			step_details JSON DEFAULT '{}',
+				-- Step execution details (timing, actor, errors for all steps)
+				step_details JSON DEFAULT '{}',
 
-			-- Complete audit trail (array wrapped in object for ClickHouse JSON compatibility)
-			state_history JSON DEFAULT '{"entries":[]}',
+				-- Complete audit trail (array wrapped in object for ClickHouse JSON compatibility)
+				state_history JSON DEFAULT '{"entries":[]}',
 
 				-- Ancestry chain tracking prior slips (array wrapped in object for ClickHouse JSON compatibility)
 				ancestry JSON DEFAULT '{"chain":[]}',
+
+				-- VersionedCollapsingMergeTree columns
+				-- sign: 1 = active row, -1 = cancelled row (for updates)
+				sign Int8 DEFAULT 1,
+				-- version: monotonically increasing version number for each correlation_id
+				version UInt32 DEFAULT 1,
 
 				-- Bloom filter indexes
 				INDEX idx_repository repository TYPE bloom_filter GRANULARITY 1,
 				INDEX idx_commit commit_sha TYPE bloom_filter GRANULARITY 1,
 				INDEX idx_branch branch TYPE bloom_filter GRANULARITY 1
 			)
-			ENGINE = ReplacingMergeTree(updated_at)
+			ENGINE = VersionedCollapsingMergeTree(sign, version)
 			ORDER BY (correlation_id)
 			PARTITION BY toYYYYMM(created_at)
 			SETTINGS index_granularity = 8192
@@ -333,14 +340,15 @@ func (m *DynamicMigrationManager) generateStepColumnEnsurer(step StepConfig) cli
 	// If this is an aggregate step, add a JSON column for component data
 	// Array wrapped in object for ClickHouse JSON compatibility
 	if step.Aggregates != "" {
-		aggregateColumn := pluralize(step.Aggregates)
+		// Column name is the step name (e.g., "builds")
+		aggregateColumn := step.Name
 		sql.WriteString(fmt.Sprintf(`,
 		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '{"items":[]}'`, aggregateColumn))
 	}
 
 	description := fmt.Sprintf("Ensures %s column exists for step '%s'", statusColumn, step.Name)
 	if step.Aggregates != "" {
-		description += fmt.Sprintf(" and %s column for component data", pluralize(step.Aggregates))
+		description += fmt.Sprintf(" and %s column for component data", step.Name)
 	}
 
 	return clickhousemigrator.SchemaEnsurer{

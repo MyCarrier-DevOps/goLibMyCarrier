@@ -361,15 +361,16 @@ func TestClickHouseStore_Update(t *testing.T) {
 			Status:        SlipStatusInProgress,
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
+			Version:       1, // Set initial version
 		}
 
 		err := store.Update(context.Background(), slip)
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)
 		}
-		// Update should update the UpdatedAt timestamp and call Create
-		if len(mockSession.ExecWithArgsCalls) != 1 {
-			t.Errorf("expected 1 ExecWithArgs call, got %d", len(mockSession.ExecWithArgsCalls))
+		// Update with VersionedCollapsingMergeTree inserts 2 rows: cancel row (sign=-1) and new row (sign=1)
+		if len(mockSession.ExecWithArgsCalls) != 2 {
+			t.Errorf("expected 2 ExecWithArgs calls (cancel + new), got %d", len(mockSession.ExecWithArgsCalls))
 		}
 	})
 }
@@ -493,9 +494,15 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			// Test config has 4 steps, 2 aggregates + ancestry = 16 columns
-			if len(dest) < 16 {
-				return fmt.Errorf("not enough scan destinations: got %d, want 16", len(dest))
+			// Test config has 4 steps, 2 aggregates + sign + version = 18 columns
+			// Column layout:
+			// 0-6: core fields (correlation_id, repository, branch, commit_sha, created_at, updated_at, status)
+			// 7-9: JSON fields (step_details, state_history, ancestry)
+			// 10: sign, 11: version
+			// 12-15: step statuses
+			// 16-17: aggregate JSON (builds, unit_tests)
+			if len(dest) < 18 {
+				return fmt.Errorf("not enough scan destinations: got %d, want 18", len(dest))
 			}
 			// Set correlation_id
 			if ptr, ok := dest[0].(*string); ok {
@@ -546,23 +553,31 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 				data, _ := json.Marshal(ancestryData)
 				*ptr = string(data)
 			}
-			// Set step statuses (4 steps, now at indices 10-13)
-			for i := 10; i < 14; i++ {
+			// Set sign (index 10)
+			if ptr, ok := dest[10].(*int8); ok {
+				*ptr = 1
+			}
+			// Set version (index 11)
+			if ptr, ok := dest[11].(*uint32); ok {
+				*ptr = 1
+			}
+			// Set step statuses (4 steps, now at indices 12-15)
+			for i := 12; i < 16; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = string(StepStatusPending)
 				}
 			}
-			// Set builds aggregate JSON - use Scan with map data for *chcol.JSON (now at index 14)
-			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
+			// Set builds aggregate JSON - use Scan with map data for *chcol.JSON (now at index 16)
+			if jsonPtr, ok := dest[16].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(buildsData)
-			} else if ptr, ok := dest[14].(*string); ok {
+			} else if ptr, ok := dest[16].(*string); ok {
 				data, _ := json.Marshal(buildsData)
 				*ptr = string(data)
 			}
-			// Set unit_tests aggregate JSON - use Scan with map data for *chcol.JSON (now at index 15)
-			if jsonPtr, ok := dest[15].(*chcol.JSON); ok {
+			// Set unit_tests aggregate JSON - use Scan with map data for *chcol.JSON (now at index 17)
+			if jsonPtr, ok := dest[17].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(unitTestsData)
-			} else if ptr, ok := dest[15].(*string); ok {
+			} else if ptr, ok := dest[17].(*string); ok {
 				data, _ := json.Marshal(unitTestsData)
 				*ptr = string(data)
 			}
@@ -807,12 +822,12 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
-	// Should have called QueryRow (for Load) and ExecWithArgs (for Create/Update)
+	// Should have called QueryRow (for Load) and ExecWithArgs twice (cancel + new row for VersionedCollapsingMergeTree)
 	if len(mockSession.QueryRowCalls) != 1 {
 		t.Errorf("expected 1 QueryRow call, got %d", len(mockSession.QueryRowCalls))
 	}
-	if len(mockSession.ExecWithArgsCalls) != 1 {
-		t.Errorf("expected 1 ExecWithArgs call, got %d", len(mockSession.ExecWithArgsCalls))
+	if len(mockSession.ExecWithArgsCalls) != 2 {
+		t.Errorf("expected 2 ExecWithArgs calls (cancel + new), got %d", len(mockSession.ExecWithArgsCalls))
 	}
 }
 
@@ -866,13 +881,14 @@ func TestClickHouseStore_AppendHistory_Success(t *testing.T) {
 }
 
 // createMockScanRowWithMatch creates a mock row for FindByCommits that includes matchedCommit.
-// Column layout for test config (4 steps, 2 aggregates) + matched_commit:
+// Column layout for test config (4 steps, 2 aggregates) + sign + version + matched_commit:
 // 0: correlation_id, 1: repository, 2: branch, 3: commit_sha
 // 4: created_at, 5: updated_at, 6: status
 // 7: step_details (JSON), 8: state_history (JSON), 9: ancestry (JSON)
-// 10-13: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
-// 14: builds (aggregate JSON), 15: unit_tests (aggregate JSON)
-// 16: matched_commit
+// 10: sign, 11: version
+// 12-15: step statuses (push_parsed, builds_completed, unit_tests_completed, dev_deploy)
+// 16: builds (aggregate JSON), 17: unit_tests (aggregate JSON)
+// 18: matched_commit
 func createMockScanRowWithMatch(
 	correlationID, repository, branch, commitSHA, matchedCommit string,
 	status SlipStatus,
@@ -898,9 +914,9 @@ func createMockScanRowWithMatch(
 
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			// Test config has 4 steps, 2 aggregates + ancestry + matched_commit = 17 columns
-			if len(dest) < 17 {
-				return fmt.Errorf("not enough scan destinations for scanSlipWithMatch: got %d, want 17", len(dest))
+			// Test config has 4 steps, 2 aggregates + sign + version + matched_commit = 19 columns
+			if len(dest) < 19 {
+				return fmt.Errorf("not enough scan destinations for scanSlipWithMatch: got %d, want 19", len(dest))
 			}
 			// Set correlation_id
 			if ptr, ok := dest[0].(*string); ok {
@@ -951,28 +967,36 @@ func createMockScanRowWithMatch(
 				data, _ := json.Marshal(ancestryData)
 				*ptr = string(data)
 			}
-			// Set step statuses (4 steps, now at indices 10-13)
-			for i := 10; i < 14; i++ {
+			// Set sign (index 10)
+			if ptr, ok := dest[10].(*int8); ok {
+				*ptr = 1
+			}
+			// Set version (index 11)
+			if ptr, ok := dest[11].(*uint32); ok {
+				*ptr = 1
+			}
+			// Set step statuses (4 steps, now at indices 12-15)
+			for i := 12; i < 16; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = string(StepStatusPending)
 				}
 			}
-			// Set builds aggregate JSON (now at index 14)
-			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
+			// Set builds aggregate JSON (now at index 16)
+			if jsonPtr, ok := dest[16].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(buildsData)
-			} else if ptr, ok := dest[14].(*string); ok {
+			} else if ptr, ok := dest[16].(*string); ok {
 				data, _ := json.Marshal(buildsData)
 				*ptr = string(data)
 			}
-			// Set unit_tests aggregate JSON (now at index 15)
-			if jsonPtr, ok := dest[15].(*chcol.JSON); ok {
+			// Set unit_tests aggregate JSON (now at index 17)
+			if jsonPtr, ok := dest[17].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(unitTestsData)
-			} else if ptr, ok := dest[15].(*string); ok {
+			} else if ptr, ok := dest[17].(*string); ok {
 				data, _ := json.Marshal(unitTestsData)
 				*ptr = string(data)
 			}
-			// Set matched_commit (now at index 16)
-			if ptr, ok := dest[16].(*string); ok {
+			// Set matched_commit (now at index 18)
+			if ptr, ok := dest[18].(*string); ok {
 				*ptr = matchedCommit
 			}
 			return nil
@@ -1102,6 +1126,14 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 	}
 	mockRow := &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
+			// Column layout for test config (4 steps, 2 aggregates) + sign + version + matched_commit:
+			// 0-6: core fields
+			// 7-9: JSON fields (step_details, state_history, ancestry)
+			// 10: sign, 11: version
+			// 12-15: step statuses
+			// 16-17: aggregate JSON
+			// 18: matched_commit
+
 			// Set required fields
 			if ptr, ok := dest[0].(*string); ok {
 				*ptr = "test-corr-001"
@@ -1136,21 +1168,29 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 			if jsonPtr, ok := dest[9].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(ancestryData)
 			}
-			// Set step statuses (4 steps, now at indices 10-13)
-			for i := 10; i < 14; i++ {
+			// Set sign (index 10)
+			if ptr, ok := dest[10].(*int8); ok {
+				*ptr = 1
+			}
+			// Set version (index 11)
+			if ptr, ok := dest[11].(*uint32); ok {
+				*ptr = 1
+			}
+			// Set step statuses (4 steps, now at indices 12-15)
+			for i := 12; i < 16; i++ {
 				if ptr, ok := dest[i].(*string); ok {
 					*ptr = "pending"
 				}
 			}
-			// Valid aggregate JSONs (now at indices 14-15)
-			if jsonPtr, ok := dest[14].(*chcol.JSON); ok {
+			// Valid aggregate JSONs (now at indices 16-17)
+			if jsonPtr, ok := dest[16].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(buildsData)
 			}
-			if jsonPtr, ok := dest[15].(*chcol.JSON); ok {
+			if jsonPtr, ok := dest[17].(*chcol.JSON); ok {
 				_ = jsonPtr.Scan(unitTestsData)
 			}
-			// Matched commit (now at index 16)
-			if ptr, ok := dest[16].(*string); ok {
+			// Matched commit (now at index 18)
+			if ptr, ok := dest[18].(*string); ok {
 				*ptr = "abc123"
 			}
 			return nil
@@ -1312,4 +1352,135 @@ func TestClickHouseStore_FindByCommits_QueryError(t *testing.T) {
 	if err == nil {
 		t.Error("expected error, got nil")
 	}
+}
+
+// TestClickHouseStore_OptimizeTable tests the OptimizeTable method.
+func TestClickHouseStore_OptimizeTable(t *testing.T) {
+	t.Run("successful optimize", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.OptimizeTable(context.Background())
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if len(mockSession.ExecCalls) != 1 {
+			t.Errorf("expected 1 Exec call, got %d", len(mockSession.ExecCalls))
+		}
+		expectedQuery := "OPTIMIZE TABLE ci.routing_slips FINAL"
+		if mockSession.ExecCalls[0].Stmt != expectedQuery {
+			t.Errorf("expected query %q, got %q", expectedQuery, mockSession.ExecCalls[0].Stmt)
+		}
+	})
+
+	t.Run("optimize with error", func(t *testing.T) {
+		expectedErr := errors.New("optimize error")
+		mockSession := &clickhousetest.MockSession{
+			ExecErr: expectedErr,
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.OptimizeTable(context.Background())
+		if err == nil {
+			t.Error("expected error, got nil")
+		}
+		if !errors.Is(err, expectedErr) {
+			t.Errorf("expected error to wrap %v, got %v", expectedErr, err)
+		}
+	})
+}
+
+// TestClickHouseStore_SetOptimizeAfterWrite tests the SetOptimizeAfterWrite method.
+func TestClickHouseStore_SetOptimizeAfterWrite(t *testing.T) {
+	t.Run("disable optimize after write", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		// Disable optimize after write
+		store.SetOptimizeAfterWrite(false)
+
+		slip := &Slip{
+			CorrelationID: "test-corr-001",
+			Repository:    "myorg/myrepo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusPending,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+		}
+
+		err := store.Create(context.Background(), slip)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		// Should have 1 ExecWithArgs call (INSERT) but no Exec calls (OPTIMIZE)
+		if len(mockSession.ExecWithArgsCalls) != 1 {
+			t.Errorf("expected 1 ExecWithArgs call, got %d", len(mockSession.ExecWithArgsCalls))
+		}
+		if len(mockSession.ExecCalls) != 0 {
+			t.Errorf("expected 0 Exec calls (optimize disabled), got %d", len(mockSession.ExecCalls))
+		}
+	})
+
+	t.Run("enable optimize after write", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		// Ensure it's enabled (default)
+		store.SetOptimizeAfterWrite(true)
+
+		slip := &Slip{
+			CorrelationID: "test-corr-002",
+			Repository:    "myorg/myrepo",
+			Branch:        "main",
+			CommitSHA:     "def456",
+			Status:        SlipStatusPending,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+		}
+
+		err := store.Create(context.Background(), slip)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+
+		// Should have 1 ExecWithArgs call (INSERT) and 1 Exec call (OPTIMIZE)
+		if len(mockSession.ExecWithArgsCalls) != 1 {
+			t.Errorf("expected 1 ExecWithArgs call, got %d", len(mockSession.ExecWithArgsCalls))
+		}
+		if len(mockSession.ExecCalls) != 1 {
+			t.Errorf("expected 1 Exec call (optimize enabled), got %d", len(mockSession.ExecCalls))
+		}
+	})
+
+	t.Run("optimize failure after insert", func(t *testing.T) {
+		expectedErr := errors.New("optimize error")
+		mockSession := &clickhousetest.MockSession{
+			ExecErr: expectedErr, // OPTIMIZE will fail
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		slip := &Slip{
+			CorrelationID: "test-corr-003",
+			Repository:    "myorg/myrepo",
+			Branch:        "main",
+			CommitSHA:     "ghi789",
+			Status:        SlipStatusPending,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+		}
+
+		err := store.Create(context.Background(), slip)
+		if err == nil {
+			t.Error("expected error, got nil")
+		}
+		// INSERT should succeed but OPTIMIZE should fail
+		if len(mockSession.ExecWithArgsCalls) != 1 {
+			t.Errorf("expected 1 ExecWithArgs call, got %d", len(mockSession.ExecWithArgsCalls))
+		}
+		if len(mockSession.ExecCalls) != 1 {
+			t.Errorf("expected 1 Exec call (optimize attempted), got %d", len(mockSession.ExecCalls))
+		}
+	})
 }

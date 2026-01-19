@@ -20,11 +20,12 @@ import (
 // The store is config-driven: the pipeline configuration determines which
 // step columns exist and how they are queried.
 type ClickHouseStore struct {
-	session        ch.ClickhouseSessionInterface
-	pipelineConfig *PipelineConfig
-	database       string
-	queryBuilder   *SlipQueryBuilder
-	scanner        *SlipScanner
+	session            ch.ClickhouseSessionInterface
+	pipelineConfig     *PipelineConfig
+	database           string
+	queryBuilder       *SlipQueryBuilder
+	scanner            *SlipScanner
+	optimizeAfterWrite bool // If true, runs OPTIMIZE TABLE after each write operation
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -43,6 +44,11 @@ type ClickHouseStoreOptions struct {
 
 	// Logger for migration output
 	Logger clickhousemigrator.Logger
+
+	// OptimizeAfterWrite if true, runs OPTIMIZE TABLE after each write operation.
+	// This ensures immediate deduplication with ReplacingMergeTree.
+	// Default: true for normal operations, set to false for migrations/bulk operations.
+	OptimizeAfterWrite *bool
 }
 
 // NewClickHouseStoreFromConfig creates a new ClickHouse-backed slip store from config.
@@ -58,12 +64,19 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		opts.Database = "ci"
 	}
 
+	// Default to true for OptimizeAfterWrite (normal operations)
+	optimizeAfterWrite := true
+	if opts.OptimizeAfterWrite != nil {
+		optimizeAfterWrite = *opts.OptimizeAfterWrite
+	}
+
 	store := &ClickHouseStore{
-		session:        session,
-		pipelineConfig: opts.PipelineConfig,
-		database:       opts.Database,
-		queryBuilder:   NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
-		scanner:        NewSlipScanner(opts.PipelineConfig),
+		session:            session,
+		pipelineConfig:     opts.PipelineConfig,
+		database:           opts.Database,
+		queryBuilder:       NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
+		scanner:            NewSlipScanner(opts.PipelineConfig),
+		optimizeAfterWrite: optimizeAfterWrite,
 	}
 
 	// Run migrations unless explicitly skipped
@@ -88,6 +101,7 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 // NewClickHouseStoreFromSession creates a store from an existing session.
 // Migrations are NOT run automatically when using this constructor.
 // Use RunMigrations explicitly if needed.
+// OptimizeAfterWrite defaults to true for normal operations.
 func NewClickHouseStoreFromSession(
 	session ch.ClickhouseSessionInterface,
 	pipelineConfig *PipelineConfig,
@@ -97,27 +111,30 @@ func NewClickHouseStoreFromSession(
 		database = "ci"
 	}
 	return &ClickHouseStore{
-		session:        session,
-		pipelineConfig: pipelineConfig,
-		database:       database,
-		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:        NewSlipScanner(pipelineConfig),
+		session:            session,
+		pipelineConfig:     pipelineConfig,
+		database:           database,
+		queryBuilder:       NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:            NewSlipScanner(pipelineConfig),
+		optimizeAfterWrite: true, // Default to true for normal operations
 	}
 }
 
 // NewClickHouseStoreFromConn creates a store from an existing driver connection.
 // Migrations are NOT run automatically when using this constructor.
 // This is provided for backward compatibility with existing code.
+// OptimizeAfterWrite defaults to true for normal operations.
 func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, database string) *ClickHouseStore {
 	if database == "" {
 		database = "ci"
 	}
 	return &ClickHouseStore{
-		session:        ch.NewSessionFromConn(conn),
-		pipelineConfig: pipelineConfig,
-		database:       database,
-		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:        NewSlipScanner(pipelineConfig),
+		session:            ch.NewSessionFromConn(conn),
+		pipelineConfig:     pipelineConfig,
+		database:           database,
+		queryBuilder:       NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:            NewSlipScanner(pipelineConfig),
+		optimizeAfterWrite: true, // Default to true for normal operations
 	}
 }
 
@@ -140,76 +157,49 @@ func (s *ClickHouseStore) PipelineConfig() *PipelineConfig {
 
 // Create persists a new routing slip.
 // The slip's CorrelationID is used as the unique identifier.
+// For VersionedCollapsingMergeTree, this inserts a row with sign=1 and version=1.
 func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
 
-	// Build dynamic column lists using query builder
-	stepColumns, stepPlaceholders, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
-	aggregateColumns, aggregatePlaceholders, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
-		slip.Aggregates,
-	)
-
-	// Serialize step details (timing, actor, errors)
-	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
-	if err != nil {
-		return fmt.Errorf("failed to marshal step details: %w", err)
+	// Set default sign and version for new slips
+	if slip.Sign == 0 {
+		slip.Sign = 1
+	}
+	if slip.Version == 0 {
+		slip.Version = 1
 	}
 
-	// Serialize state history wrapped in object for ClickHouse JSON compatibility
-	stateHistoryWrapper := map[string]interface{}{"entries": slip.StateHistory}
-	stateHistoryJSON, err := json.Marshal(stateHistoryWrapper)
-	if err != nil {
-		return fmt.Errorf("failed to marshal state history: %w", err)
+	if err := s.insertRow(ctx, slip); err != nil {
+		return fmt.Errorf("failed to create slip: %w", err)
 	}
 
-	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
-	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
-	ancestryJSON, err := json.Marshal(ancestryWrapper)
-	if err != nil {
-		return fmt.Errorf("failed to marshal ancestry: %w", err)
-	}
-
-	// Build the INSERT query dynamically
-	var columns []string
-	var placeholders []string
-	var values []interface{}
-
-	// Core columns (order must match scanner expectations)
-	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
-		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry)
-	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
-	values = append(values,
-		slip.CorrelationID,
-		slip.Repository,
-		slip.Branch,
-		slip.CommitSHA,
-		slip.CreatedAt,
-		slip.UpdatedAt,
-		string(slip.Status),
-		string(stepDetailsJSON),
-		string(stateHistoryJSON),
-		string(ancestryJSON),
-	)
-
-	// Step status columns
-	columns = append(columns, stepColumns...)
-	placeholders = append(placeholders, stepPlaceholders...)
-	values = append(values, stepValues...)
-
-	// Aggregate JSON columns
-	columns = append(columns, aggregateColumns...)
-	placeholders = append(placeholders, aggregatePlaceholders...)
-	values = append(values, aggregateValues...)
-
-	query := s.queryBuilder.BuildInsertQuery(columns, placeholders)
-
-	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
-		return fmt.Errorf("failed to insert slip: %w", err)
+	// Run OPTIMIZE TABLE if enabled
+	if s.optimizeAfterWrite {
+		if err := s.OptimizeTable(ctx); err != nil {
+			return fmt.Errorf("failed to optimize table after insert: %w", err)
+		}
 	}
 
 	return nil
+}
+
+// OptimizeTable runs OPTIMIZE TABLE to force immediate collapsing.
+// This is necessary with VersionedCollapsingMergeTree to ensure reads don't return
+// uncollapsed rows before background merges complete.
+func (s *ClickHouseStore) OptimizeTable(ctx context.Context) error {
+	query := fmt.Sprintf("OPTIMIZE TABLE %s.routing_slips FINAL", s.database)
+	if err := s.session.Exec(ctx, query); err != nil {
+		return fmt.Errorf("failed to optimize table: %w", err)
+	}
+	return nil
+}
+
+// SetOptimizeAfterWrite enables or disables automatic table optimization after writes.
+// This is useful for bulk operations where optimization should be deferred.
+func (s *ClickHouseStore) SetOptimizeAfterWrite(enabled bool) {
+	s.optimizeAfterWrite = enabled
 }
 
 // Load retrieves a slip by its correlation ID.
@@ -312,13 +302,40 @@ func (s *ClickHouseStore) FindAllByCommits(
 	return results, nil
 }
 
-// Update persists changes to an existing slip.
+// Update persists changes to an existing slip using VersionedCollapsingMergeTree semantics.
+// This inserts two rows: a cancel row (sign=-1) with the old version, and a new row (sign=1) with incremented version.
 func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Update updated_at timestamp
 	slip.UpdatedAt = time.Now()
 
-	// Use the same insert logic (ReplacingMergeTree handles upserts)
-	return s.Create(ctx, slip)
+	// Store the current version before incrementing
+	oldVersion := slip.Version
+
+	// Create a deep copy for the cancel row to prevent shared map/slice references
+	cancelSlip := deepCopySlip(slip)
+	cancelSlip.Sign = -1
+	cancelSlip.Version = oldVersion
+
+	if err := s.insertRow(ctx, cancelSlip); err != nil {
+		return fmt.Errorf("failed to insert cancel row: %w", err)
+	}
+
+	// Then, insert the new state with incremented version (sign=1)
+	slip.Sign = 1
+	slip.Version = oldVersion + 1
+
+	if err := s.insertRow(ctx, slip); err != nil {
+		return fmt.Errorf("failed to insert new row: %w", err)
+	}
+
+	// Run OPTIMIZE TABLE if enabled
+	if s.optimizeAfterWrite {
+		if err := s.OptimizeTable(ctx); err != nil {
+			return fmt.Errorf("failed to optimize table after update: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // UpdateStep updates a specific step's status.
@@ -339,10 +356,12 @@ func (s *ClickHouseStore) UpdateStep(
 	// Handle component-level updates for aggregate steps
 	if componentName != "" {
 		if err := s.updateComponentInAggregate(slip, stepName, componentName, status, now); err == nil {
-			// Component was updated, also update the aggregate
-			aggregateStep := s.pipelineConfig.GetAggregateStep(stepName)
-			if aggregateStep != "" {
-				s.updateAggregateStatus(slip, aggregateStep, pluralize(stepName))
+			// Component was updated, also update the aggregate step status
+			// The step's Aggregates field tells us which aggregate step to update
+			stepConfig := s.pipelineConfig.GetStep(stepName)
+			if stepConfig != nil && stepConfig.Aggregates != "" {
+				// Column name is the step name (e.g., "builds")
+				s.updateAggregateStatus(slip, stepConfig.Aggregates, stepName)
 			}
 		}
 	}
@@ -378,6 +397,83 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 // Close releases any resources held by the store.
 func (s *ClickHouseStore) Close() error {
 	return s.session.Close()
+}
+
+// insertRow is an internal method that inserts a single row without OPTIMIZE.
+// Used by both Create (for new slips) and Update (for cancel and new rows).
+func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	// Build dynamic column lists using query builder
+	stepColumns, stepPlaceholders, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	aggregateColumns, aggregatePlaceholders, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+		slip.Aggregates,
+	)
+
+	// Serialize step details (timing, actor, errors)
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	if err != nil {
+		return fmt.Errorf("failed to marshal step details: %w", err)
+	}
+
+	// Serialize state history wrapped in object for ClickHouse JSON compatibility
+	stateHistoryWrapper := map[string]interface{}{"entries": slip.StateHistory}
+	stateHistoryJSON, err := json.Marshal(stateHistoryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state history: %w", err)
+	}
+
+	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
+	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
+	ancestryJSON, err := json.Marshal(ancestryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ancestry: %w", err)
+	}
+
+	// Build the INSERT query dynamically
+	var columns []string
+	var placeholders []string
+	var values []interface{}
+
+	// Core columns (order must match scanner expectations)
+	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnSign, ColumnVersion)
+	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	values = append(values,
+		slip.CorrelationID,
+		slip.Repository,
+		slip.Branch,
+		slip.CommitSHA,
+		slip.CreatedAt,
+		slip.UpdatedAt,
+		string(slip.Status),
+		string(stepDetailsJSON),
+		string(stateHistoryJSON),
+		string(ancestryJSON),
+		slip.Sign,
+		slip.Version,
+	)
+
+	// Step status columns
+	columns = append(columns, stepColumns...)
+	placeholders = append(placeholders, stepPlaceholders...)
+	values = append(values, stepValues...)
+
+	// Aggregate JSON columns
+	columns = append(columns, aggregateColumns...)
+	placeholders = append(placeholders, aggregatePlaceholders...)
+	values = append(values, aggregateValues...)
+
+	query := s.queryBuilder.BuildInsertQuery(columns, placeholders)
+
+	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
+		return fmt.Errorf("failed to insert slip row: %w", err)
+	}
+
+	return nil
 }
 
 // scanSlip executes a query and scans the result into a Slip.
@@ -418,19 +514,27 @@ func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
 }
 
 // updateComponentInAggregate updates a component's status within an aggregate column.
-// Returns nil if successful, error if the step is not an aggregate step.
+// Returns nil if successful, error if the step is not a component-level step with aggregates.
 func (s *ClickHouseStore) updateComponentInAggregate(
 	slip *Slip,
 	stepName, componentName string,
 	status StepStatus,
 	now time.Time,
 ) error {
-	aggregateStep := s.pipelineConfig.GetAggregateStep(stepName)
-	if aggregateStep == "" {
-		return fmt.Errorf("step %s is not a component step", stepName)
+	// Get the step config to check if it has aggregate data
+	stepConfig := s.pipelineConfig.GetStep(stepName)
+	if stepConfig == nil {
+		return fmt.Errorf("step %s not found", stepName)
 	}
 
-	columnName := pluralize(stepName)
+	// Check if this step has component-level aggregates
+	if stepConfig.Aggregates == "" {
+		return fmt.Errorf("step %s does not have component aggregates", stepName)
+	}
+
+	// Column name is the step name itself (e.g., "builds")
+	columnName := stepName
+
 	if slip.Aggregates == nil {
 		slip.Aggregates = make(map[string][]ComponentStepData)
 	}
@@ -482,6 +586,60 @@ func (s *ClickHouseStore) updateAggregateStatus(slip *Slip, aggregateStepName, c
 	step := slip.Steps[aggregateStepName]
 	step.ApplyStatusTransition(aggregateStatus, time.Now())
 	slip.Steps[aggregateStepName] = step
+}
+
+// deepCopySlip creates a deep copy of a Slip to prevent shared map/slice references.
+// This is important for VersionedCollapsingMergeTree where we insert cancel rows
+// that must be independent from the new rows.
+func deepCopySlip(slip *Slip) *Slip {
+	if slip == nil {
+		return nil
+	}
+
+	cpy := &Slip{
+		CorrelationID: slip.CorrelationID,
+		Repository:    slip.Repository,
+		Branch:        slip.Branch,
+		CommitSHA:     slip.CommitSHA,
+		CreatedAt:     slip.CreatedAt,
+		UpdatedAt:     slip.UpdatedAt,
+		Status:        slip.Status,
+		PromotedTo:    slip.PromotedTo,
+		Sign:          slip.Sign,
+		Version:       slip.Version,
+	}
+
+	// Deep copy steps map
+	if slip.Steps != nil {
+		cpy.Steps = make(map[string]Step, len(slip.Steps))
+		for k, v := range slip.Steps {
+			cpy.Steps[k] = v
+		}
+	}
+
+	// Deep copy aggregates
+	if slip.Aggregates != nil {
+		cpy.Aggregates = make(map[string][]ComponentStepData)
+		for k, v := range slip.Aggregates {
+			componentData := make([]ComponentStepData, len(v))
+			copy(componentData, v)
+			cpy.Aggregates[k] = componentData
+		}
+	}
+
+	// Deep copy state history
+	if slip.StateHistory != nil {
+		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
+		copy(cpy.StateHistory, slip.StateHistory)
+	}
+
+	// Deep copy ancestry
+	if slip.Ancestry != nil {
+		cpy.Ancestry = make([]AncestryEntry, len(slip.Ancestry))
+		copy(cpy.Ancestry, slip.Ancestry)
+	}
+
+	return cpy
 }
 
 // computeAggregateStatus determines the aggregate status from component statuses.

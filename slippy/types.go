@@ -65,6 +65,16 @@ type Slip struct {
 	// Set when status is "promoted" (e.g., after a squash merge creates a new slip).
 	// Empty if not promoted.
 	PromotedTo string `json:"promoted_to,omitempty" ch:"promoted_to"`
+
+	// Sign is used by VersionedCollapsingMergeTree for row management.
+	// 1 = active row, -1 = cancelled/deleted row
+	// This field is managed internally by the store and should not be set manually.
+	Sign int8 `json:"-" ch:"sign"`
+
+	// Version is used by VersionedCollapsingMergeTree to track row versions.
+	// Higher versions take precedence during collapsing.
+	// This field is managed internally by the store and should not be set manually.
+	Version uint32 `json:"-" ch:"version"`
 }
 
 // AncestryEntry records metadata about a prior slip in the ancestry chain.

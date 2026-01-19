@@ -435,55 +435,5 @@ func (m *MockStore) AddSlip(slip *Slip) {
 	m.CommitIndex[key] = slip.CorrelationID
 }
 
-// deepCopySlip creates a deep copy of a Slip to prevent test interference.
-func deepCopySlip(slip *Slip) *Slip {
-	if slip == nil {
-		return nil
-	}
-
-	cpy := &Slip{
-		CorrelationID: slip.CorrelationID,
-		Repository:    slip.Repository,
-		Branch:        slip.Branch,
-		CommitSHA:     slip.CommitSHA,
-		CreatedAt:     slip.CreatedAt,
-		UpdatedAt:     slip.UpdatedAt,
-		Status:        slip.Status,
-		PromotedTo:    slip.PromotedTo,
-	}
-
-	// Deep copy steps map
-	if slip.Steps != nil {
-		cpy.Steps = make(map[string]Step, len(slip.Steps))
-		for k, v := range slip.Steps {
-			cpy.Steps[k] = v
-		}
-	}
-
-	// Deep copy aggregates
-	if slip.Aggregates != nil {
-		cpy.Aggregates = make(map[string][]ComponentStepData)
-		for k, v := range slip.Aggregates {
-			componentData := make([]ComponentStepData, len(v))
-			copy(componentData, v)
-			cpy.Aggregates[k] = componentData
-		}
-	}
-
-	// Deep copy state history
-	if slip.StateHistory != nil {
-		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
-		copy(cpy.StateHistory, slip.StateHistory)
-	}
-
-	// Deep copy ancestry chain
-	if slip.Ancestry != nil {
-		cpy.Ancestry = make([]AncestryEntry, len(slip.Ancestry))
-		copy(cpy.Ancestry, slip.Ancestry)
-	}
-
-	return cpy
-}
-
 // Ensure MockStore implements SlipStore.
 var _ SlipStore = (*MockStore)(nil)
