@@ -338,6 +338,67 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	return nil
 }
 
+// UpdateStep updates a specific step's status.
+// The correlationID is the unique identifier for the routing slip.
+func (s *ClickHouseStore) UpdateStep(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status StepStatus,
+) error {
+	// Load the current slip
+	slip, err := s.Load(ctx, correlationID)
+	if err != nil {
+		return err
+	}
+
+	now := time.Now()
+
+	// Handle component-level updates for aggregate steps
+	if componentName != "" {
+		if err := s.updateComponentInAggregate(slip, stepName, componentName, status, now); err == nil {
+			// Component was updated, also update the aggregate step status
+			// The step's Aggregates field tells us which aggregate step to update
+			stepConfig := s.pipelineConfig.GetStep(stepName)
+			if stepConfig != nil && stepConfig.Aggregates != "" {
+				// Column name is the step name (e.g., "builds")
+				s.updateAggregateStatus(slip, stepConfig.Aggregates, stepName)
+			}
+		}
+	}
+
+	// Update pipeline-level steps
+	s.updatePipelineStep(slip, stepName, status, now)
+
+	return s.Update(ctx, slip)
+}
+
+// UpdateComponentStatus updates a component's step status.
+// The correlationID is the unique identifier for the routing slip.
+func (s *ClickHouseStore) UpdateComponentStatus(
+	ctx context.Context,
+	correlationID, componentName, stepType string,
+	status StepStatus,
+) error {
+	return s.UpdateStep(ctx, correlationID, stepType, componentName, status)
+}
+
+// AppendHistory adds a state history entry to the slip.
+// The correlationID is the unique identifier for the routing slip.
+func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
+	slip, err := s.Load(ctx, correlationID)
+	if err != nil {
+		return err
+	}
+
+	slip.StateHistory = append(slip.StateHistory, entry)
+	return s.Update(ctx, slip)
+}
+
+// Close releases any resources held by the store.
+func (s *ClickHouseStore) Close() error {
+	return s.session.Close()
+}
+
 // insertRow is an internal method that inserts a single row without OPTIMIZE.
 // Used by both Create (for new slips) and Update (for cancel and new rows).
 func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
@@ -413,67 +474,6 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 	}
 
 	return nil
-}
-
-// UpdateStep updates a specific step's status.
-// The correlationID is the unique identifier for the routing slip.
-func (s *ClickHouseStore) UpdateStep(
-	ctx context.Context,
-	correlationID, stepName, componentName string,
-	status StepStatus,
-) error {
-	// Load the current slip
-	slip, err := s.Load(ctx, correlationID)
-	if err != nil {
-		return err
-	}
-
-	now := time.Now()
-
-	// Handle component-level updates for aggregate steps
-	if componentName != "" {
-		if err := s.updateComponentInAggregate(slip, stepName, componentName, status, now); err == nil {
-			// Component was updated, also update the aggregate step status
-			// The step's Aggregates field tells us which aggregate step to update
-			stepConfig := s.pipelineConfig.GetStep(stepName)
-			if stepConfig != nil && stepConfig.Aggregates != "" {
-				// Column name is the step name (e.g., "builds")
-				s.updateAggregateStatus(slip, stepConfig.Aggregates, stepName)
-			}
-		}
-	}
-
-	// Update pipeline-level steps
-	s.updatePipelineStep(slip, stepName, status, now)
-
-	return s.Update(ctx, slip)
-}
-
-// UpdateComponentStatus updates a component's step status.
-// The correlationID is the unique identifier for the routing slip.
-func (s *ClickHouseStore) UpdateComponentStatus(
-	ctx context.Context,
-	correlationID, componentName, stepType string,
-	status StepStatus,
-) error {
-	return s.UpdateStep(ctx, correlationID, stepType, componentName, status)
-}
-
-// AppendHistory adds a state history entry to the slip.
-// The correlationID is the unique identifier for the routing slip.
-func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
-	slip, err := s.Load(ctx, correlationID)
-	if err != nil {
-		return err
-	}
-
-	slip.StateHistory = append(slip.StateHistory, entry)
-	return s.Update(ctx, slip)
-}
-
-// Close releases any resources held by the store.
-func (s *ClickHouseStore) Close() error {
-	return s.session.Close()
 }
 
 // scanSlip executes a query and scans the result into a Slip.

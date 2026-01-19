@@ -110,21 +110,23 @@ func (s *SlipScanner) PopulateSlipFromScan(ctx *scanContext) error {
 	// and then unmarshaled to our Go structs for proper type conversion.
 	slip.Aggregates = make(map[string][]ComponentStepData)
 	for columnName, jsonCol := range ctx.aggregateJSONs {
-		if jsonCol != nil {
-			// Marshal to JSON bytes and unmarshal to Go structs
-			jsonBytes, err := jsonCol.MarshalJSON()
-			if err != nil {
-				continue
-			}
-
-			var wrapper struct {
-				Items []ComponentStepData `json:"items"`
-			}
-			if err := json.Unmarshal(jsonBytes, &wrapper); err != nil {
-				continue
-			}
-			slip.Aggregates[columnName] = wrapper.Items
+		if jsonCol == nil {
+			continue
 		}
+
+		// Marshal to JSON bytes and unmarshal to Go structs
+		jsonBytes, err := jsonCol.MarshalJSON()
+		if err != nil {
+			continue
+		}
+
+		var wrapper struct {
+			Items []ComponentStepData `json:"items"`
+		}
+		if err := json.Unmarshal(jsonBytes, &wrapper); err != nil {
+			continue
+		}
+		slip.Aggregates[columnName] = wrapper.Items
 	}
 
 	// Parse state history from chcol.JSON (unwrap from object)
