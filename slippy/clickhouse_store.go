@@ -311,12 +311,12 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Store the current version before incrementing
 	oldVersion := slip.Version
 
-	// First, insert a cancel row with the old version (sign=-1)
-	cancelSlip := *slip // shallow copy
+	// Create a deep copy for the cancel row to prevent shared map/slice references
+	cancelSlip := deepCopySlip(slip)
 	cancelSlip.Sign = -1
 	cancelSlip.Version = oldVersion
 
-	if err := s.insertRow(ctx, &cancelSlip); err != nil {
+	if err := s.insertRow(ctx, cancelSlip); err != nil {
 		return fmt.Errorf("failed to insert cancel row: %w", err)
 	}
 
@@ -586,6 +586,60 @@ func (s *ClickHouseStore) updateAggregateStatus(slip *Slip, aggregateStepName, c
 	step := slip.Steps[aggregateStepName]
 	step.ApplyStatusTransition(aggregateStatus, time.Now())
 	slip.Steps[aggregateStepName] = step
+}
+
+// deepCopySlip creates a deep copy of a Slip to prevent shared map/slice references.
+// This is important for VersionedCollapsingMergeTree where we insert cancel rows
+// that must be independent from the new rows.
+func deepCopySlip(slip *Slip) *Slip {
+	if slip == nil {
+		return nil
+	}
+
+	cpy := &Slip{
+		CorrelationID: slip.CorrelationID,
+		Repository:    slip.Repository,
+		Branch:        slip.Branch,
+		CommitSHA:     slip.CommitSHA,
+		CreatedAt:     slip.CreatedAt,
+		UpdatedAt:     slip.UpdatedAt,
+		Status:        slip.Status,
+		PromotedTo:    slip.PromotedTo,
+		Sign:          slip.Sign,
+		Version:       slip.Version,
+	}
+
+	// Deep copy steps map
+	if slip.Steps != nil {
+		cpy.Steps = make(map[string]Step, len(slip.Steps))
+		for k, v := range slip.Steps {
+			cpy.Steps[k] = v
+		}
+	}
+
+	// Deep copy aggregates
+	if slip.Aggregates != nil {
+		cpy.Aggregates = make(map[string][]ComponentStepData)
+		for k, v := range slip.Aggregates {
+			componentData := make([]ComponentStepData, len(v))
+			copy(componentData, v)
+			cpy.Aggregates[k] = componentData
+		}
+	}
+
+	// Deep copy state history
+	if slip.StateHistory != nil {
+		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
+		copy(cpy.StateHistory, slip.StateHistory)
+	}
+
+	// Deep copy ancestry
+	if slip.Ancestry != nil {
+		cpy.Ancestry = make([]AncestryEntry, len(slip.Ancestry))
+		copy(cpy.Ancestry, slip.Ancestry)
+	}
+
+	return cpy
 }
 
 // computeAggregateStatus determines the aggregate status from component statuses.
