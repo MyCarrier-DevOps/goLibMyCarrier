@@ -42,12 +42,13 @@ func (b *SlipQueryBuilder) BuildSelectQuery(whereClause, suffix string) string {
 }
 
 // BuildSelectColumns returns the ordered list of columns to select.
-// The order is: core columns, step status columns, aggregate JSON columns.
+// The order is: core columns, sign, version, step status columns, aggregate JSON columns.
 func (b *SlipQueryBuilder) BuildSelectColumns() []string {
 	columns := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus,
 		ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnSign, ColumnVersion,
 	}
 
 	// Add step status columns
@@ -55,10 +56,10 @@ func (b *SlipQueryBuilder) BuildSelectColumns() []string {
 		columns = append(columns, b.StepStatusColumn(step.Name))
 	}
 
-	// Add aggregate JSON columns
+	// Add aggregate JSON columns (column name is the step name, e.g., "builds")
 	for _, step := range b.config.Steps {
 		if step.Aggregates != "" {
-			columns = append(columns, pluralize(step.Aggregates))
+			columns = append(columns, step.Name)
 		}
 	}
 
@@ -88,9 +89,10 @@ func (b *SlipQueryBuilder) StepStatusColumn(stepName string) string {
 	return fmt.Sprintf("%s_status", stepName)
 }
 
-// AggregateColumn returns the JSON column name for an aggregate step.
-func (b *SlipQueryBuilder) AggregateColumn(aggregateName string) string {
-	return pluralize(aggregateName)
+// AggregateColumn returns the JSON column name for a step with component-level data.
+// The column name is just the step name (e.g., "builds" for the builds step).
+func (b *SlipQueryBuilder) AggregateColumn(stepName string) string {
+	return stepName
 }
 
 // BuildFindByCommitsQuery builds a query to find a slip by a list of commits.
@@ -164,7 +166,8 @@ func (b *SlipQueryBuilder) BuildAggregateColumnsAndValues(
 			continue
 		}
 
-		columnName := b.AggregateColumn(step.Aggregates)
+		// Column name is the step name (e.g., "builds")
+		columnName := b.AggregateColumn(step.Name)
 		columns = append(columns, columnName)
 		placeholders = append(placeholders, "?")
 

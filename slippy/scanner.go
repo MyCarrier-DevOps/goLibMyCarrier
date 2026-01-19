@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -59,6 +60,8 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 		ctx.stepDetailsJSON,
 		ctx.stateHistoryJSON,
 		ctx.ancestryJSON,
+		&ctx.slip.Sign,
+		&ctx.slip.Version,
 	}
 
 	// Step status destinations
@@ -69,7 +72,8 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 	// Aggregate JSON destinations
 	for _, step := range s.config.Steps {
 		if step.Aggregates != "" {
-			columnName := pluralize(step.Aggregates)
+			// Column name is the step name (e.g., "builds")
+			columnName := step.Name
 			jsonCol := chcol.NewJSON()
 			ctx.aggregateJSONs[columnName] = jsonCol
 			ctx.scanDest = append(ctx.scanDest, jsonCol)
@@ -102,29 +106,52 @@ func (s *SlipScanner) PopulateSlipFromScan(ctx *scanContext) error {
 	}
 
 	// Parse aggregate JSON columns from chcol.JSON (unwrap from object)
+	// The ClickHouse Go driver returns chcol.JSON which needs to be marshaled to JSON bytes
+	// and then unmarshaled to our Go structs for proper type conversion.
 	slip.Aggregates = make(map[string][]ComponentStepData)
 	for columnName, jsonCol := range ctx.aggregateJSONs {
 		if jsonCol != nil {
-			// Extract "items" array from the JSON object
-			if items, ok := chcol.ExtractJSONPathAs[[]ComponentStepData](jsonCol, "items"); ok {
-				slip.Aggregates[columnName] = items
+			// Marshal to JSON bytes and unmarshal to Go structs
+			jsonBytes, err := jsonCol.MarshalJSON()
+			if err != nil {
+				continue
 			}
+
+			var wrapper struct {
+				Items []ComponentStepData `json:"items"`
+			}
+			if err := json.Unmarshal(jsonBytes, &wrapper); err != nil {
+				continue
+			}
+			slip.Aggregates[columnName] = wrapper.Items
 		}
 	}
 
 	// Parse state history from chcol.JSON (unwrap from object)
 	if ctx.stateHistoryJSON != nil {
-		// Extract "entries" array from the JSON object
-		if entries, ok := chcol.ExtractJSONPathAs[[]StateHistoryEntry](ctx.stateHistoryJSON, "entries"); ok {
-			slip.StateHistory = entries
+		// Marshal to JSON bytes and unmarshal to Go structs
+		jsonBytes, err := ctx.stateHistoryJSON.MarshalJSON()
+		if err == nil {
+			var wrapper struct {
+				Entries []StateHistoryEntry `json:"entries"`
+			}
+			if err := json.Unmarshal(jsonBytes, &wrapper); err == nil {
+				slip.StateHistory = wrapper.Entries
+			}
 		}
 	}
 
 	// Parse ancestry from chcol.JSON (unwrap from object)
 	if ctx.ancestryJSON != nil {
-		// Extract "chain" array from the JSON object
-		if chain, ok := chcol.ExtractJSONPathAs[[]AncestryEntry](ctx.ancestryJSON, "chain"); ok {
-			slip.Ancestry = chain
+		// Marshal to JSON bytes and unmarshal to Go structs
+		jsonBytes, err := ctx.ancestryJSON.MarshalJSON()
+		if err == nil {
+			var wrapper struct {
+				Chain []AncestryEntry `json:"chain"`
+			}
+			if err := json.Unmarshal(jsonBytes, &wrapper); err == nil {
+				slip.Ancestry = wrapper.Chain
+			}
 		}
 	}
 

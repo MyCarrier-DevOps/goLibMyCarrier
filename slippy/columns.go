@@ -14,6 +14,10 @@ const (
 	ColumnStepDetails   = "step_details"
 	ColumnStateHistory  = "state_history"
 	ColumnAncestry      = "ancestry"
+
+	// VersionedCollapsingMergeTree columns
+	ColumnSign    = "sign"
+	ColumnVersion = "version"
 )
 
 // Table name constants
