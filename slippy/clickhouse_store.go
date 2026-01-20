@@ -421,10 +421,14 @@ func (s *ClickHouseStore) UpdateStep(
 	// Handle component-level updates via event sourcing to avoid write contention.
 	// This writes to slip_component_states using ReplacingMergeTree.
 	if componentName != "" {
-		if _, err := s.Load(ctx, correlationID); err != nil {
+		// First, insert the component state into the event sourcing table
+		if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status); err != nil {
 			return err
 		}
-		return s.insertComponentState(ctx, correlationID, stepName, componentName, status)
+
+		// Now update the aggregate status in the routing_slips table.
+		// This ensures the slip reflects the current state of all components.
+		return s.updateAggregateStatusFromComponentStates(ctx, correlationID, stepName)
 	}
 
 	var lastErr error
@@ -774,6 +778,53 @@ func (s *ClickHouseStore) insertComponentState(
 func (s *ClickHouseStore) optimizeComponentStatesTable(ctx context.Context) error {
 	query := fmt.Sprintf(`OPTIMIZE TABLE %s.%s FINAL`, s.database, TableSlipComponentStates)
 	return s.session.Exec(ctx, query)
+}
+
+// updateAggregateStatusFromComponentStates loads the slip, hydrates it with component states,
+// and persists the updated aggregate status back to the routing_slips table.
+// This is called after a component state update to ensure the slip reflects the current aggregate status.
+func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
+	ctx context.Context,
+	correlationID, componentStepName string,
+) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
+		// Load the slip (this will hydrate component states automatically)
+		slip, err := s.Load(ctx, correlationID)
+		if err != nil {
+			return fmt.Errorf("failed to load slip for aggregate update: %w", err)
+		}
+
+		// Get the aggregate step name from the component step name (e.g., "build" -> "builds_completed")
+		aggregateStepName := ""
+		if s.pipelineConfig != nil {
+			aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
+		}
+		if aggregateStepName == "" {
+			// No aggregate step configured for this component step, nothing to update
+			return nil
+		}
+
+		// The slip was already hydrated by Load(), so the step status should reflect
+		// the computed aggregate from all component states.
+		// Now persist this back to the database.
+		err = s.Update(ctx, slip)
+		if err == nil {
+			return nil // Success
+		}
+
+		// Check if this is a version conflict error
+		if errors.Is(err, ErrVersionConflict) {
+			lastErr = err
+			continue // Retry with fresh data
+		}
+
+		// Non-retryable error
+		return err
+	}
+
+	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
 // hydrateSlip fetches component states from the event sourcing table and merges them into the slip.
