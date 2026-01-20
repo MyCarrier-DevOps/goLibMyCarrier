@@ -84,7 +84,20 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 			// Capture as warning - we'll try fallback resolution
 			warnings = append(warnings, fmt.Errorf("ancestry resolution failed: %w", err))
 		} else if len(commits) > 0 {
+			c.logger.Info(ctx, "Got commit ancestry from GitHub", map[string]interface{}{
+				"repository":   opts.Repository,
+				"ref":          opts.Ref,
+				"commit_count": len(commits),
+				"first_commit": shortSHA(commits[0]),
+			})
+
 			slip, matchedCommit, err := c.store.FindByCommits(ctx, opts.Repository, commits)
+			if err != nil {
+				c.logger.Info(ctx, "FindByCommits returned error", map[string]interface{}{
+					"repository": opts.Repository,
+					"error":      err.Error(),
+				})
+			}
 			if err == nil && slip != nil {
 				c.logger.Info(ctx, "Resolved slip via ancestry", map[string]interface{}{
 					"correlation_id": slip.CorrelationID,
@@ -97,6 +110,16 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 					Warnings:      warnings,
 				}, nil
 			}
+			// Log when commits were found but no slip matched
+			c.logger.Info(ctx, "No slip found for ancestry commits", map[string]interface{}{
+				"repository":   opts.Repository,
+				"commit_count": len(commits),
+			})
+		} else {
+			c.logger.Info(ctx, "No commits returned from ancestry lookup", map[string]interface{}{
+				"repository": opts.Repository,
+				"ref":        opts.Ref,
+			})
 		}
 	}
 

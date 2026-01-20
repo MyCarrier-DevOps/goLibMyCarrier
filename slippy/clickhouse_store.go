@@ -868,14 +868,16 @@ func (s *ClickHouseStore) loadComponentStates(
 	correlationID string,
 ) (results []componentStateRow, err error) {
 	// We want the latest state for each component.
-	// ReplacingMergeTree eventually duplicates, but we use argMax to be sure given we might read unmerged parts.
+	// ReplacingMergeTree eventually deduplicates, but we use argMax to be sure given we might read unmerged parts.
+	// Note: We alias the max(timestamp) column as 'latest_ts' to avoid conflict with the 'timestamp' column
+	// used inside argMax functions. ClickHouse would otherwise interpret the alias as a nested aggregate.
 	query := fmt.Sprintf(`
 		SELECT
 			step,
 			component,
 			argMax(status, timestamp) as status,
 			argMax(message, timestamp) as message,
-			max(timestamp) as timestamp
+			max(timestamp) as latest_ts
 		FROM %s.%s
 		WHERE correlation_id = ?
 		GROUP BY step, component
