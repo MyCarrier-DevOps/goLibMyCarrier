@@ -421,6 +421,9 @@ func (s *ClickHouseStore) UpdateStep(
 	// Handle component-level updates via event sourcing to avoid write contention.
 	// This writes to slip_component_states using ReplacingMergeTree.
 	if componentName != "" {
+		if _, err := s.Load(ctx, correlationID); err != nil {
+			return err
+		}
 		return s.insertComponentState(ctx, correlationID, stepName, componentName, status)
 	}
 
@@ -774,7 +777,7 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		return nil
 	}
 
-	// Group states by step -> component
+	// Group states by component step -> component
 	stateMap := make(map[string]map[string]componentStateRow)
 	for _, state := range states {
 		if _, ok := stateMap[state.Step]; !ok {
@@ -784,8 +787,9 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 	}
 
 	// Update aggregates in the slip
-	for stepName, componentDataList := range slip.Aggregates {
-		stepStates, ok := stateMap[stepName]
+	for componentStepName, stepStates := range stateMap {
+		aggregateColumn := pluralize(componentStepName)
+		componentDataList, ok := slip.Aggregates[aggregateColumn]
 		if !ok {
 			continue
 		}
@@ -801,9 +805,9 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 			}
 
 			// Update component data
-			slip.Aggregates[stepName][i].Status = StepStatus(newState.Status)
+			slip.Aggregates[aggregateColumn][i].Status = StepStatus(newState.Status)
 			if newState.Message != "" {
-				slip.Aggregates[stepName][i].Error = newState.Message
+				slip.Aggregates[aggregateColumn][i].Error = newState.Message
 			}
 
 			// Infer timestamps
@@ -814,11 +818,11 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 				maxTime = ts
 			}
 
-			if StepStatus(newState.Status).IsRunning() && slip.Aggregates[stepName][i].StartedAt == nil {
-				slip.Aggregates[stepName][i].StartedAt = &ts
+			if StepStatus(newState.Status).IsRunning() && slip.Aggregates[aggregateColumn][i].StartedAt == nil {
+				slip.Aggregates[aggregateColumn][i].StartedAt = &ts
 			}
-			if StepStatus(newState.Status).IsTerminal() && slip.Aggregates[stepName][i].CompletedAt == nil {
-				slip.Aggregates[stepName][i].CompletedAt = &ts
+			if StepStatus(newState.Status).IsTerminal() && slip.Aggregates[aggregateColumn][i].CompletedAt == nil {
+				slip.Aggregates[aggregateColumn][i].CompletedAt = &ts
 			}
 
 			updated = true
@@ -826,13 +830,24 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 
 		if updated {
 			// Recompute the step status based on updated components
-			newStatus := s.computeAggregateStatus(slip.Aggregates[stepName])
+			newStatus := s.computeAggregateStatus(slip.Aggregates[aggregateColumn])
 
-			// Update the step status
-			step := slip.Steps[stepName]
+			aggregateStepName := ""
+			if s.pipelineConfig != nil {
+				aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
+			}
+			if aggregateStepName == "" {
+				continue
+			}
+
+			// Update the step status only if the step exists.
+			step, ok := slip.Steps[aggregateStepName]
+			if !ok {
+				continue
+			}
 			// We use the timestamp of the latest component update as the transition time
 			step.ApplyStatusTransition(newStatus, maxTime)
-			slip.Steps[stepName] = step
+			slip.Steps[aggregateStepName] = step
 		}
 	}
 
@@ -883,6 +898,9 @@ func (s *ClickHouseStore) loadComponentStates(
 			return nil, fmt.Errorf("failed to scan component state: %w", err)
 		}
 		results = append(results, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate component states: %w", err)
 	}
 	return results, nil
 }
