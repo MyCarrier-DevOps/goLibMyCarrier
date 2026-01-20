@@ -457,18 +457,25 @@ func TestClickHouseStore_UpdateStep(t *testing.T) {
 
 // TestClickHouseStore_UpdateComponentStatus tests the UpdateComponentStatus method.
 func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
-	t.Run("update component status - load fails", func(t *testing.T) {
-		mockRow := &clickhousetest.MockRow{
-			ScanErr: ErrSlipNotFound,
-		}
+	t.Run("update component status - uses insert", func(t *testing.T) {
+		execCalled := false
 		mockSession := &clickhousetest.MockSession{
-			QueryRowRow: mockRow,
+			ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+				execCalled = true
+				if !strings.Contains(stmt, "slip_component_states") {
+					return fmt.Errorf("expected insert into slip_component_states, got %s", stmt)
+				}
+				return nil
+			},
 		}
 		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		err := store.UpdateComponentStatus(context.Background(), "test-corr-001", "api", "build", StepStatusCompleted)
-		if !errors.Is(err, ErrSlipNotFound) {
-			t.Errorf("expected ErrSlipNotFound, got %v", err)
+		if err != nil {
+			t.Errorf("expected no error, got %v", err)
+		}
+		if !execCalled {
+			t.Error("expected ExecWithArgs to be called")
 		}
 	})
 }
@@ -660,6 +667,7 @@ func createMockSessionForUpdates(
 	queryCount := 0
 
 	return &clickhousetest.MockSession{
+		QueryWithArgsRows: &clickhousetest.MockRows{CloseErr: nil}, // Handle hydration query
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
 			queryCount++
 			// First query is Load (full slip), subsequent queries are getMaxVersion
@@ -688,6 +696,9 @@ func TestClickHouseStore_Load_Success(t *testing.T) {
 	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsRows: &clickhousetest.MockRows{
+			CloseErr: nil, // Handle Close() call in hydration
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -721,6 +732,9 @@ func TestClickHouseStore_LoadByCommit_Success(t *testing.T) {
 	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsRows: &clickhousetest.MockRows{
+			CloseErr: nil, // Handle Close() call in hydration
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -814,6 +828,10 @@ func TestClickHouseStore_Load_InvalidAggregateJSON(t *testing.T) {
 	}
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			// Mock successful hydration query with no results
+			return &clickhousetest.MockRows{}, nil
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -890,6 +908,10 @@ func TestClickHouseStore_Load_InvalidStateHistoryJSON(t *testing.T) {
 	}
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			// Mock successful hydration query with no results
+			return &clickhousetest.MockRows{}, nil
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -928,25 +950,47 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 
 // TestClickHouseStore_UpdateStep_WithComponent tests step update for a specific component.
 func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
-	// Use the helper that handles both Load and getMaxVersion queries
-	mockSession := createMockSessionForUpdates("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending, 1)
+	execCalled := false
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+			execCalled = true
+			if !strings.Contains(stmt, "slip_component_states") {
+				return fmt.Errorf("expected insert into slip_component_states, got %s", stmt)
+			}
+			return nil
+		},
+	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateStep(context.Background(), "test-corr-001", "builds_completed", "api", StepStatusCompleted)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
+	if !execCalled {
+		t.Error("expected ExecWithArgs to be called")
+	}
 }
 
 // TestClickHouseStore_UpdateComponentStatus_Success tests successful component status update.
 func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
-	// Use the helper that handles both Load and getMaxVersion queries
-	mockSession := createMockSessionForUpdates("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending, 1)
+	execCalled := false
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+			execCalled = true
+			if !strings.Contains(stmt, "slip_component_states") {
+				return fmt.Errorf("expected insert into slip_component_states, got %s", stmt)
+			}
+			return nil
+		},
+	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateComponentStatus(context.Background(), "test-corr-001", "api", "build", StepStatusCompleted)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
+	}
+	if !execCalled {
+		t.Error("expected ExecWithArgs to be called")
 	}
 }
 
@@ -1105,6 +1149,10 @@ func TestClickHouseStore_FindByCommits_Success(t *testing.T) {
 	)
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			// Mock successful hydration query with no results
+			return &clickhousetest.MockRows{}, nil
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -1185,6 +1233,10 @@ func TestClickHouseStore_FindByCommits_InvalidAggregateJSON(t *testing.T) {
 	}
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			// Mock successful hydration query with no results
+			return &clickhousetest.MockRows{}, nil
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -1287,6 +1339,10 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 	}
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			// Mock successful hydration query with no results
+			return &clickhousetest.MockRows{}, nil
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -1374,6 +1430,10 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 	}
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			// Mock successful hydration query with no results
+			return &clickhousetest.MockRows{}, nil
+		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 

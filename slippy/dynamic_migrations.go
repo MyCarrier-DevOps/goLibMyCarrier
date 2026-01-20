@@ -230,9 +230,11 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 		m.generateBaseTableMigration(),
 		m.generateHistoryViewMigration(),
 		m.generateAncestryMigration(),
+		m.generateComponentStatesTableMigration(),
 	}
 }
 
+// generateComponentStatesTableMigration creates the table for tracking component states via event sourcing.
 // generateBaseTableMigration creates the core routing_slips table.
 func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
@@ -291,6 +293,31 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 			SETTINGS index_granularity = 8192
 		`, m.database),
 		DownSQL: fmt.Sprintf(`DROP TABLE IF EXISTS %s.routing_slips`, m.database),
+	}
+}
+
+// This table uses ReplacingMergeTree to handle efficient concurrent updates.
+func (m *DynamicMigrationManager) generateComponentStatesTableMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     4,
+		Name:        "create_slip_component_states",
+		Description: "Creates table for high-concurrency component state tracking",
+		UpSQL: fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %s.slip_component_states (
+				correlation_id String,
+				step String,
+				component String,
+				status Enum8(
+					'pending'=1, 'held'=2, 'running'=3, 'completed'=4,
+					'failed'=5, 'error'=6, 'aborted'=7, 'timeout'=8, 'skipped'=9
+				),
+				message String,
+				timestamp DateTime64(6)
+			)
+			ENGINE = ReplacingMergeTree(timestamp)
+			ORDER BY (correlation_id, step, component)
+		`, m.database),
+		DownSQL: fmt.Sprintf(`DROP TABLE IF EXISTS %s.slip_component_states`, m.database),
 	}
 }
 

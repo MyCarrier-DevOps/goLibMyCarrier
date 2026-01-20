@@ -22,7 +22,7 @@ This is a **multi-module Go monorepo** where each subdirectory is an independent
 **CRITICAL: Never bypass linting rules.** Do not use `//nolint` directives, `_ =` to ignore errors, or any other mechanism to circumvent lint errors without explicit user permission. Always fix the underlying issue properly.
 
 **CRITICAL: Update existing functions, never create new versions unless explicitly instructed to do so.** When changing a function's signature or behavior, modify the existing function directly. Never create variants like `FooWithWarnings`, `FooV2`, or `FooNew`. Update all call sites and tests to use the new signature. Use result structs to add return values without breaking callers.
-W
+
 Always keep the repo in a clean, validated state before handing work back. Run **repo-wide** commands when changes span multiple modules:
 
 - `make fmt`
