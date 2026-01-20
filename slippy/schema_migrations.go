@@ -53,9 +53,17 @@ func GetDynamicMigrationVersion(config *PipelineConfig) int {
 	if config == nil || len(config.Steps) == 0 {
 		return 0
 	}
-	// Version 1: base table
-	// Version 2: history view
-	// Version 3: ancestry column and abandoned status
-	// Step columns and indexes are now ensurers, not versioned migrations
-	return 3
+
+	// Use the manager to generate the list of migrations based on the code definition.
+	// We pass nil for the connection because generateMigrationsFromConfig doesn't use it.
+	manager := NewDynamicMigrationManager(nil, config, "", nil)
+	migrations := manager.generateMigrationsFromConfig()
+
+	maxVersion := 0
+	for _, m := range migrations {
+		if m.Version > maxVersion {
+			maxVersion = m.Version
+		}
+	}
+	return maxVersion
 }
