@@ -747,6 +747,58 @@ func TestClickHouseStore_Load_Success(t *testing.T) {
 	}
 }
 
+// TestClickHouseStore_Load_HydratesComponentStates ensures component states hydrate aggregate columns and steps.
+func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
+	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
+	stateTimestamp := time.Now()
+	mockRows := &clickhousetest.MockRows{
+		NextData: []bool{true, false},
+		ScanFunc: func(dest ...any) error {
+			if ptr, ok := dest[0].(*string); ok {
+				*ptr = "build"
+			}
+			if ptr, ok := dest[1].(*string); ok {
+				*ptr = "api"
+			}
+			if ptr, ok := dest[2].(*string); ok {
+				*ptr = string(StepStatusCompleted)
+			}
+			if ptr, ok := dest[3].(*string); ok {
+				*ptr = "ok"
+			}
+			if ptr, ok := dest[4].(*time.Time); ok {
+				*ptr = stateTimestamp
+			}
+			return nil
+		},
+	}
+	mockSession := &clickhousetest.MockSession{
+		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return mockRows, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	slip, err := store.Load(context.Background(), "test-corr-001")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	components := slip.Aggregates["builds"]
+	if len(components) != 1 {
+		t.Fatalf("expected 1 component, got %d", len(components))
+	}
+	if components[0].Status != StepStatusCompleted {
+		t.Errorf("expected component status completed, got %s", components[0].Status)
+	}
+
+	aggregateStep := slip.Steps["builds_completed"]
+	if aggregateStep.Status != StepStatusCompleted {
+		t.Errorf("expected aggregate step completed, got %s", aggregateStep.Status)
+	}
+}
+
 // TestClickHouseStore_LoadByCommit_Success tests successful slip loading by commit.
 func TestClickHouseStore_LoadByCommit_Success(t *testing.T) {
 	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
@@ -993,6 +1045,23 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	}
 	if !execCalled {
 		t.Error("expected ExecWithArgs to be called")
+	}
+}
+
+func TestClickHouseStore_loadComponentStates_Err(t *testing.T) {
+	expectedErr := errors.New("rows error")
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return &clickhousetest.MockRows{
+				ErrErr: expectedErr,
+			}, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	_, err := store.loadComponentStates(context.Background(), "test-corr-001")
+	if !errors.Is(err, expectedErr) {
+		t.Errorf("expected error %v, got %v", expectedErr, err)
 	}
 }
 
