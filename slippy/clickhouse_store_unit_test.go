@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/chcol"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse/clickhousetest"
@@ -350,7 +352,23 @@ func TestClickHouseStore_FindByCommits(t *testing.T) {
 // TestClickHouseStore_Update tests the Update method.
 func TestClickHouseStore_Update(t *testing.T) {
 	t.Run("successful update", func(t *testing.T) {
-		mockSession := &clickhousetest.MockSession{}
+		// Create a mock row for getMaxVersion that returns version 1
+		versionRow := &clickhousetest.MockRow{
+			ScanFunc: func(dest ...any) error {
+				// Return version 1 as sql.NullInt64
+				if len(dest) > 0 {
+					if v, ok := dest[0].(*sql.NullInt64); ok {
+						v.Int64 = 1
+						v.Valid = true
+					}
+				}
+				return nil
+			},
+		}
+
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: versionRow,
+		}
 		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 		slip := &Slip{
@@ -361,7 +379,7 @@ func TestClickHouseStore_Update(t *testing.T) {
 			Status:        SlipStatusInProgress,
 			CreatedAt:     time.Now(),
 			UpdatedAt:     time.Now(),
-			Version:       1, // Set initial version
+			Version:       1, // Set initial version - must match what getMaxVersion returns
 		}
 
 		err := store.Update(context.Background(), slip)
@@ -371,6 +389,50 @@ func TestClickHouseStore_Update(t *testing.T) {
 		// Update with VersionedCollapsingMergeTree inserts 2 rows: cancel row (sign=-1) and new row (sign=1)
 		if len(mockSession.ExecWithArgsCalls) != 2 {
 			t.Errorf("expected 2 ExecWithArgs calls (cancel + new), got %d", len(mockSession.ExecWithArgsCalls))
+		}
+		// Verify version was incremented
+		if slip.Version != 2 {
+			t.Errorf("expected version to be 2 after update, got %d", slip.Version)
+		}
+	})
+
+	t.Run("version conflict error", func(t *testing.T) {
+		// Create a mock row for getMaxVersion that returns version 5 (different from slip.Version)
+		versionRow := &clickhousetest.MockRow{
+			ScanFunc: func(dest ...any) error {
+				if len(dest) > 0 {
+					if v, ok := dest[0].(*sql.NullInt64); ok {
+						v.Int64 = 5 // Return version 5, but slip has version 1
+						v.Valid = true
+					}
+				}
+				return nil
+			},
+		}
+
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: versionRow,
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		slip := &Slip{
+			CorrelationID: "test-corr-001",
+			Repository:    "myorg/myrepo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusInProgress,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+			Version:       1, // Slip has version 1, but DB has version 5
+		}
+
+		err := store.Update(context.Background(), slip)
+		if !errors.Is(err, ErrVersionConflict) {
+			t.Errorf("expected ErrVersionConflict, got %v", err)
+		}
+		// No inserts should have been made
+		if len(mockSession.ExecWithArgsCalls) != 0 {
+			t.Errorf("expected 0 ExecWithArgs calls on version conflict, got %d", len(mockSession.ExecWithArgsCalls))
 		}
 	})
 }
@@ -582,6 +644,41 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 				*ptr = string(data)
 			}
 			return nil
+		},
+	}
+}
+
+// createMockSessionForUpdates creates a mock session that can handle both Load queries (returning a full slip)
+// and getMaxVersion queries (returning a version number). This is needed because Update methods
+// now call getMaxVersion to implement optimistic locking.
+func createMockSessionForUpdates(
+	correlationID, repository, branch, commitSHA string,
+	status SlipStatus,
+	version uint32,
+) *clickhousetest.MockSession {
+	slipRow := createMockScanRow(correlationID, repository, branch, commitSHA, status)
+	queryCount := 0
+
+	return &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			queryCount++
+			// First query is Load (full slip), subsequent queries are getMaxVersion
+			if strings.Contains(query, "max(version)") {
+				// Return a mock row for getMaxVersion
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*sql.NullInt64); ok {
+								v.Int64 = int64(version)
+								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			// Return the slip row for Load queries
+			return slipRow
 		},
 	}
 }
@@ -812,19 +909,17 @@ func TestClickHouseStore_Load_InvalidStateHistoryJSON(t *testing.T) {
 
 // TestClickHouseStore_UpdateStep_Success tests successful step update.
 func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
-	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
-	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: mockRow,
-	}
+	// Use the helper that handles both Load and getMaxVersion queries
+	mockSession := createMockSessionForUpdates("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending, 1)
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
-	// Should have called QueryRow (for Load) and ExecWithArgs twice (cancel + new row for VersionedCollapsingMergeTree)
-	if len(mockSession.QueryRowCalls) != 1 {
-		t.Errorf("expected 1 QueryRow call, got %d", len(mockSession.QueryRowCalls))
+	// Should have called QueryRow twice (Load + getMaxVersion) and ExecWithArgs twice (cancel + new row)
+	if len(mockSession.QueryRowCalls) != 2 {
+		t.Errorf("expected 2 QueryRow calls (Load + getMaxVersion), got %d", len(mockSession.QueryRowCalls))
 	}
 	if len(mockSession.ExecWithArgsCalls) != 2 {
 		t.Errorf("expected 2 ExecWithArgs calls (cancel + new), got %d", len(mockSession.ExecWithArgsCalls))
@@ -833,10 +928,8 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 
 // TestClickHouseStore_UpdateStep_WithComponent tests step update for a specific component.
 func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
-	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
-	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: mockRow,
-	}
+	// Use the helper that handles both Load and getMaxVersion queries
+	mockSession := createMockSessionForUpdates("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending, 1)
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateStep(context.Background(), "test-corr-001", "builds_completed", "api", StepStatusCompleted)
@@ -847,10 +940,8 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 
 // TestClickHouseStore_UpdateComponentStatus_Success tests successful component status update.
 func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
-	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
-	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: mockRow,
-	}
+	// Use the helper that handles both Load and getMaxVersion queries
+	mockSession := createMockSessionForUpdates("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending, 1)
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateComponentStatus(context.Background(), "test-corr-001", "api", "build", StepStatusCompleted)
@@ -861,10 +952,8 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 
 // TestClickHouseStore_AppendHistory_Success tests successful history append.
 func TestClickHouseStore_AppendHistory_Success(t *testing.T) {
-	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
-	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: mockRow,
-	}
+	// Use the helper that handles both Load and getMaxVersion queries
+	mockSession := createMockSessionForUpdates("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending, 1)
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	entry := StateHistoryEntry{
@@ -1312,7 +1401,22 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 
 // TestClickHouseStore_Update_UpdatesTimestamp tests that Update sets UpdatedAt.
 func TestClickHouseStore_Update_UpdatesTimestamp(t *testing.T) {
-	mockSession := &clickhousetest.MockSession{}
+	// Create a mock row for getMaxVersion that returns version 1
+	versionRow := &clickhousetest.MockRow{
+		ScanFunc: func(dest ...any) error {
+			if len(dest) > 0 {
+				if v, ok := dest[0].(*sql.NullInt64); ok {
+					v.Int64 = 1
+					v.Valid = true
+				}
+			}
+			return nil
+		},
+	}
+
+	mockSession := &clickhousetest.MockSession{
+		QueryRowRow: versionRow,
+	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	originalTime := time.Now().Add(-1 * time.Hour)
@@ -1324,6 +1428,7 @@ func TestClickHouseStore_Update_UpdatesTimestamp(t *testing.T) {
 		Status:        SlipStatusInProgress,
 		CreatedAt:     originalTime,
 		UpdatedAt:     originalTime,
+		Version:       1, // Must match what getMaxVersion returns
 	}
 
 	err := store.Update(context.Background(), slip)

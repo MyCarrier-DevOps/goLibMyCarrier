@@ -24,6 +24,9 @@ type Client struct {
 // It validates the configuration and initializes the ClickHouse store and GitHub client.
 // The pipeline configuration must be set in the Config.
 func NewClient(config Config) (*Client, error) {
+	ctx := context.Background()
+	startTime := time.Now()
+
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
@@ -33,19 +36,30 @@ func NewClient(config Config) (*Client, error) {
 	}
 
 	// Initialize ClickHouse store from config (migrations run based on pipeline config)
+	storeStart := time.Now()
+	config.Logger.Info(ctx, "Creating ClickHouse store...", nil)
 	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{
 		PipelineConfig: config.PipelineConfig,
 		Database:       config.Database,
+		Logger:         config.Logger,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %w", err)
 	}
+	config.Logger.Info(ctx, "ClickHouse store created", map[string]interface{}{
+		"store_create_ms": time.Since(storeStart).Milliseconds(),
+	})
 
 	// Initialize GitHub client for commit ancestry resolution
+	githubStart := time.Now()
 	githubClient, err := NewGitHubClient(config.GitHubConfig(), config.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GitHub client: %w", err)
 	}
+	config.Logger.Info(ctx, "GitHub client created", map[string]interface{}{
+		"github_create_ms": time.Since(githubStart).Milliseconds(),
+		"total_client_ms":  time.Since(startTime).Milliseconds(),
+	})
 
 	return &Client{
 		store:          store,
