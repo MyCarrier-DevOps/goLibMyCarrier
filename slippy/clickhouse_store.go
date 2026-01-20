@@ -12,6 +12,12 @@ import (
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator"
 )
 
+const (
+	// DefaultMaxUpdateRetries is the default number of retry attempts for updates
+	// when a version conflict occurs due to concurrent modifications.
+	DefaultMaxUpdateRetries = 10
+)
+
 // ClickHouseStore implements SlipStore using ClickHouse as the backend.
 // The store uses correlation_id as the unique identifier for routing slips,
 // consistent with MyCarrier's organization-wide use of correlation_id to
@@ -26,6 +32,7 @@ type ClickHouseStore struct {
 	queryBuilder       *SlipQueryBuilder
 	scanner            *SlipScanner
 	optimizeAfterWrite bool // If true, runs OPTIMIZE TABLE after each write operation
+	maxUpdateRetries   int  // Maximum retry attempts for version conflicts
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -55,9 +62,21 @@ type ClickHouseStoreOptions struct {
 // By default, this runs all pending migrations to ensure the schema is up to date.
 func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseStoreOptions) (*ClickHouseStore, error) {
 	ctx := context.Background()
+	startTime := time.Now()
+
+	// Create ClickHouse connection
+	connStart := time.Now()
 	session, err := ch.NewClickhouseSession(config, ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create ClickHouse session: %w", err)
+	}
+	connDuration := time.Since(connStart)
+
+	// Log connection timing if logger is available
+	if opts.Logger != nil {
+		opts.Logger.Info(ctx, "ClickHouse connection established", map[string]interface{}{
+			"connection_ms": connDuration.Milliseconds(),
+		})
 	}
 
 	if opts.Database == "" {
@@ -77,10 +96,12 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		queryBuilder:       NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
 		scanner:            NewSlipScanner(opts.PipelineConfig),
 		optimizeAfterWrite: optimizeAfterWrite,
+		maxUpdateRetries:   DefaultMaxUpdateRetries, // Default retry count for version conflicts
 	}
 
 	// Run migrations unless explicitly skipped
 	if !opts.SkipMigrations {
+		migrateStart := time.Now()
 		migrateOpts := opts.MigrateOptions
 		migrateOpts.Database = opts.Database
 		migrateOpts.PipelineConfig = opts.PipelineConfig
@@ -92,6 +113,14 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 				return nil, fmt.Errorf("failed to run migrations: %w (also failed to close session: %w)", err, closeErr)
 			}
 			return nil, fmt.Errorf("failed to run migrations: %w", err)
+		}
+
+		// Log migration timing if logger is available
+		if opts.Logger != nil {
+			opts.Logger.Info(ctx, "Migrations completed", map[string]interface{}{
+				"migration_ms":   time.Since(migrateStart).Milliseconds(),
+				"total_store_ms": time.Since(startTime).Milliseconds(),
+			})
 		}
 	}
 
@@ -116,7 +145,8 @@ func NewClickHouseStoreFromSession(
 		database:           database,
 		queryBuilder:       NewSlipQueryBuilder(pipelineConfig, database),
 		scanner:            NewSlipScanner(pipelineConfig),
-		optimizeAfterWrite: true, // Default to true for normal operations
+		optimizeAfterWrite: true,                    // Default to true for normal operations
+		maxUpdateRetries:   DefaultMaxUpdateRetries, // Default retry count for version conflicts
 	}
 }
 
@@ -134,7 +164,8 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 		database:           database,
 		queryBuilder:       NewSlipQueryBuilder(pipelineConfig, database),
 		scanner:            NewSlipScanner(pipelineConfig),
-		optimizeAfterWrite: true, // Default to true for normal operations
+		optimizeAfterWrite: true,                    // Default to true for normal operations
+		maxUpdateRetries:   DefaultMaxUpdateRetries, // Default retry count for version conflicts
 	}
 }
 
@@ -303,26 +334,42 @@ func (s *ClickHouseStore) FindAllByCommits(
 }
 
 // Update persists changes to an existing slip using VersionedCollapsingMergeTree semantics.
-// This inserts two rows: a cancel row (sign=-1) with the old version, and a new row (sign=1) with incremented version.
+// This inserts two rows: a cancel row (sign=-1) with the current max version, and a new row (sign=1) with incremented version.
+//
+// Optimistic Locking: If the version in ClickHouse differs from the slip's version (indicating
+// another process modified the slip), this method returns ErrVersionConflict. Callers should
+// reload the slip and retry their operation.
+//
+// Atomic Version Increment: The version is fetched atomically from ClickHouse using max(version)
+// to prevent race conditions between concurrent updates.
 func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
+	// Get the current max version atomically from ClickHouse
+	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
+	if err != nil {
+		return fmt.Errorf("failed to get current version: %w", err)
+	}
+
+	// Optimistic locking: verify version hasn't changed since the slip was loaded
+	if currentVersion != slip.Version {
+		return fmt.Errorf("%w: expected version %d, but found version %d",
+			ErrVersionConflict, slip.Version, currentVersion)
+	}
+
 	// Update updated_at timestamp
 	slip.UpdatedAt = time.Now()
-
-	// Store the current version before incrementing
-	oldVersion := slip.Version
 
 	// Create a deep copy for the cancel row to prevent shared map/slice references
 	cancelSlip := deepCopySlip(slip)
 	cancelSlip.Sign = -1
-	cancelSlip.Version = oldVersion
+	cancelSlip.Version = currentVersion // Use the atomically fetched version
 
 	if err := s.insertRow(ctx, cancelSlip); err != nil {
 		return fmt.Errorf("failed to insert cancel row: %w", err)
 	}
 
-	// Then, insert the new state with incremented version (sign=1)
+	// Insert the new state with atomically incremented version (sign=1)
 	slip.Sign = 1
-	slip.Version = oldVersion + 1
+	slip.Version = currentVersion + 1
 
 	if err := s.insertRow(ctx, slip); err != nil {
 		return fmt.Errorf("failed to insert new row: %w", err)
@@ -338,41 +385,61 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	return nil
 }
 
-// UpdateStep updates a specific step's status.
+// UpdateStep updates a specific step's status with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
+// If a concurrent modification is detected, the slip is reloaded and the update is retried.
 func (s *ClickHouseStore) UpdateStep(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
-	// Load the current slip
-	slip, err := s.Load(ctx, correlationID)
-	if err != nil {
+	var lastErr error
+
+	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
+		// Load the current slip (reload on retry to get latest version)
+		slip, err := s.Load(ctx, correlationID)
+		if err != nil {
+			return err
+		}
+
+		now := time.Now()
+
+		// Handle component-level updates for aggregate steps
+		if componentName != "" {
+			if err := s.updateComponentInAggregate(slip, stepName, componentName, status, now); err == nil {
+				// Component was updated, also update the aggregate step status
+				// The step's Aggregates field tells us which aggregate step to update
+				stepConfig := s.pipelineConfig.GetStep(stepName)
+				if stepConfig != nil && stepConfig.Aggregates != "" {
+					// Column name is the step name (e.g., "builds")
+					s.updateAggregateStatus(slip, stepConfig.Aggregates, stepName)
+				}
+			}
+		}
+
+		// Update pipeline-level steps
+		s.updatePipelineStep(slip, stepName, status, now)
+
+		err = s.Update(ctx, slip)
+		if err == nil {
+			return nil // Success
+		}
+
+		// Check if this is a version conflict error
+		if errors.Is(err, ErrVersionConflict) {
+			lastErr = err
+			continue // Retry with fresh data
+		}
+
+		// Non-retryable error
 		return err
 	}
 
-	now := time.Now()
-
-	// Handle component-level updates for aggregate steps
-	if componentName != "" {
-		if err := s.updateComponentInAggregate(slip, stepName, componentName, status, now); err == nil {
-			// Component was updated, also update the aggregate step status
-			// The step's Aggregates field tells us which aggregate step to update
-			stepConfig := s.pipelineConfig.GetStep(stepName)
-			if stepConfig != nil && stepConfig.Aggregates != "" {
-				// Column name is the step name (e.g., "builds")
-				s.updateAggregateStatus(slip, stepConfig.Aggregates, stepName)
-			}
-		}
-	}
-
-	// Update pipeline-level steps
-	s.updatePipelineStep(slip, stepName, status, now)
-
-	return s.Update(ctx, slip)
+	// All retries exhausted
+	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
-// UpdateComponentStatus updates a component's step status.
+// UpdateComponentStatus updates a component's step status with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
 func (s *ClickHouseStore) UpdateComponentStatus(
 	ctx context.Context,
@@ -382,21 +449,63 @@ func (s *ClickHouseStore) UpdateComponentStatus(
 	return s.UpdateStep(ctx, correlationID, stepType, componentName, status)
 }
 
-// AppendHistory adds a state history entry to the slip.
+// AppendHistory adds a state history entry to the slip with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
-	slip, err := s.Load(ctx, correlationID)
-	if err != nil {
+	var lastErr error
+
+	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
+		slip, err := s.Load(ctx, correlationID)
+		if err != nil {
+			return err
+		}
+
+		slip.StateHistory = append(slip.StateHistory, entry)
+
+		err = s.Update(ctx, slip)
+		if err == nil {
+			return nil // Success
+		}
+
+		// Check if this is a version conflict error
+		if errors.Is(err, ErrVersionConflict) {
+			lastErr = err
+			continue // Retry with fresh data
+		}
+
+		// Non-retryable error
 		return err
 	}
 
-	slip.StateHistory = append(slip.StateHistory, entry)
-	return s.Update(ctx, slip)
+	// All retries exhausted
+	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
 // Close releases any resources held by the store.
 func (s *ClickHouseStore) Close() error {
 	return s.session.Close()
+}
+
+// getMaxVersion retrieves the current maximum version for a slip from ClickHouse.
+// This is used for atomic version increment to prevent race conditions.
+func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID string) (uint32, error) {
+	query := fmt.Sprintf(
+		"SELECT max(version) FROM %s.%s WHERE %s = ?",
+		s.database, TableRoutingSlips, ColumnCorrelationID,
+	)
+
+	row := s.session.QueryRow(ctx, query, correlationID)
+
+	var maxVersion sql.NullInt64
+	if err := row.Scan(&maxVersion); err != nil {
+		return 0, fmt.Errorf("failed to scan max version: %w", err)
+	}
+
+	if !maxVersion.Valid {
+		return 0, fmt.Errorf("no rows found for correlation_id %s", correlationID)
+	}
+
+	return uint32(maxVersion.Int64), nil
 }
 
 // insertRow is an internal method that inserts a single row without OPTIMIZE.

@@ -31,7 +31,8 @@ func NewAppLogger() *zap.SugaredLogger {
 	config := ConfigureLogLevelLogger(logLevel)
 	// Config customization goes here if any
 	config.EncoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
-	config.OutputPaths = []string{"stdout"}
+	// Output logs to stderr to avoid mixing with JSON output on stdout in CLI tools
+	config.OutputPaths = []string{"stderr"}
 	logger, err := config.Build()
 	if err != nil {
 		panic(err)
