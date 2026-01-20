@@ -242,7 +242,16 @@ func (s *ClickHouseStore) Load(ctx context.Context, correlationID string) (*Slip
 	}
 
 	query := s.queryBuilder.BuildSelectQuery("WHERE correlation_id = ?", "LIMIT 1")
-	return s.scanSlip(ctx, query, correlationID)
+	slip, err := s.scanSlip(ctx, query, correlationID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.hydrateSlip(ctx, slip); err != nil {
+		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
+	}
+
+	return slip, nil
 }
 
 // LoadByCommit retrieves a slip by repository and commit SHA.
@@ -255,7 +264,16 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 		"WHERE repository = ? AND commit_sha = ?",
 		"ORDER BY created_at DESC LIMIT 1",
 	)
-	return s.scanSlip(ctx, query, repository, commitSHA)
+	slip, err := s.scanSlip(ctx, query, repository, commitSHA)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.hydrateSlip(ctx, slip); err != nil {
+		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
+	}
+
+	return slip, nil
 }
 
 // FindByCommits finds a slip matching any commit in the ordered list.
@@ -286,6 +304,10 @@ func (s *ClickHouseStore) FindByCommits(
 			return nil, "", ErrSlipNotFound
 		}
 		return nil, "", fmt.Errorf("failed to query slip by commits: %w", err)
+	}
+
+	if err := s.hydrateSlip(ctx, slip); err != nil {
+		return nil, "", fmt.Errorf("failed to hydrate slip with component states: %w", err)
 	}
 
 	return slip, matchedCommit, nil
@@ -326,6 +348,9 @@ func (s *ClickHouseStore) FindAllByCommits(
 		slip, matchedCommit, scanErr := s.scanner.ScanSlipWithMatchFromRows(rows)
 		if scanErr != nil {
 			return nil, fmt.Errorf("failed to scan slip from rows: %w", scanErr)
+		}
+		if err := s.hydrateSlip(ctx, slip); err != nil {
+			return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
 		}
 		results = append(results, SlipWithCommit{Slip: slip, MatchedCommit: matchedCommit})
 	}
@@ -393,6 +418,15 @@ func (s *ClickHouseStore) UpdateStep(
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
+	// Handle component-level updates via event sourcing to avoid write contention.
+	// This writes to slip_component_states using ReplacingMergeTree.
+	if componentName != "" {
+		if _, err := s.Load(ctx, correlationID); err != nil {
+			return err
+		}
+		return s.insertComponentState(ctx, correlationID, stepName, componentName, status)
+	}
+
 	var lastErr error
 
 	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
@@ -403,19 +437,6 @@ func (s *ClickHouseStore) UpdateStep(
 		}
 
 		now := time.Now()
-
-		// Handle component-level updates for aggregate steps
-		if componentName != "" {
-			if err := s.updateComponentInAggregate(slip, stepName, componentName, status, now); err == nil {
-				// Component was updated, also update the aggregate step status
-				// The step's Aggregates field tells us which aggregate step to update
-				stepConfig := s.pipelineConfig.GetStep(stepName)
-				if stepConfig != nil && stepConfig.Aggregates != "" {
-					// Column name is the step name (e.g., "builds")
-					s.updateAggregateStatus(slip, stepConfig.Aggregates, stepName)
-				}
-			}
-		}
 
 		// Update pipeline-level steps
 		s.updatePipelineStep(slip, stepName, status, now)
@@ -622,52 +643,6 @@ func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
 	return details
 }
 
-// updateComponentInAggregate updates a component's status within an aggregate column.
-// Returns nil if successful, error if the step is not a component-level step with aggregates.
-func (s *ClickHouseStore) updateComponentInAggregate(
-	slip *Slip,
-	stepName, componentName string,
-	status StepStatus,
-	now time.Time,
-) error {
-	// Get the step config to check if it has aggregate data
-	stepConfig := s.pipelineConfig.GetStep(stepName)
-	if stepConfig == nil {
-		return fmt.Errorf("step %s not found", stepName)
-	}
-
-	// Check if this step has component-level aggregates
-	if stepConfig.Aggregates == "" {
-		return fmt.Errorf("step %s does not have component aggregates", stepName)
-	}
-
-	// Column name is the step name itself (e.g., "builds")
-	columnName := stepName
-
-	if slip.Aggregates == nil {
-		slip.Aggregates = make(map[string][]ComponentStepData)
-	}
-
-	componentData := slip.Aggregates[columnName]
-	found := false
-	for i := range componentData {
-		if componentData[i].Component == componentName {
-			componentData[i].ApplyStatusTransition(status, now)
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		newData := ComponentStepData{Component: componentName}
-		newData.ApplyStatusTransition(status, now)
-		componentData = append(componentData, newData)
-	}
-
-	slip.Aggregates[columnName] = componentData
-	return nil
-}
-
 // updatePipelineStep updates a pipeline step's status if it exists.
 func (s *ClickHouseStore) updatePipelineStep(slip *Slip, stepName string, status StepStatus, now time.Time) {
 	if s.pipelineConfig.GetStep(stepName) == nil {
@@ -677,24 +652,6 @@ func (s *ClickHouseStore) updatePipelineStep(slip *Slip, stepName string, status
 	step := slip.Steps[stepName]
 	step.ApplyStatusTransition(status, now)
 	slip.Steps[stepName] = step
-}
-
-// updateAggregateStatus updates the aggregate step status based on component statuses.
-func (s *ClickHouseStore) updateAggregateStatus(slip *Slip, aggregateStepName, columnName string) {
-	componentData := slip.Aggregates[columnName]
-	if len(componentData) == 0 {
-		return
-	}
-
-	// Determine aggregate status from components
-	aggregateStatus := s.computeAggregateStatus(componentData)
-	if aggregateStatus == StepStatusPending {
-		return // No change needed
-	}
-
-	step := slip.Steps[aggregateStepName]
-	step.ApplyStatusTransition(aggregateStatus, time.Now())
-	slip.Steps[aggregateStepName] = step
 }
 
 // deepCopySlip creates a deep copy of a Slip to prevent shared map/slice references.
@@ -779,6 +736,173 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 		return StepStatusRunning
 	}
 	return StepStatusPending
+}
+
+// insertComponentState inserts a new state for a component into the event sourcing table.
+func (s *ClickHouseStore) insertComponentState(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status StepStatus,
+) error {
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, s.database, TableSlipComponentStates)
+
+	// Note: We don't have a message passed in UpdateStep/UpdateComponentStatus signature currently.
+	// We pass empty string for message.
+	return s.session.ExecWithArgs(ctx, query,
+		correlationID,
+		stepName,
+		componentName,
+		string(status),
+		"", // message
+		time.Now(),
+	)
+}
+
+// hydrateSlip fetches component states from the event sourcing table and merges them into the slip.
+// This allows us to maintain accurate component state without updating the main slip row for every component change.
+func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
+	if slip == nil {
+		return nil
+	}
+
+	states, err := s.loadComponentStates(ctx, slip.CorrelationID)
+	if err != nil {
+		return err
+	}
+
+	if len(states) == 0 {
+		return nil
+	}
+
+	// Group states by component step -> component
+	stateMap := make(map[string]map[string]componentStateRow)
+	for _, state := range states {
+		if _, ok := stateMap[state.Step]; !ok {
+			stateMap[state.Step] = make(map[string]componentStateRow)
+		}
+		stateMap[state.Step][state.Component] = state
+	}
+
+	// Update aggregates in the slip
+	for componentStepName, stepStates := range stateMap {
+		aggregateColumn := pluralize(componentStepName)
+		componentDataList, ok := slip.Aggregates[aggregateColumn]
+		if !ok {
+			continue
+		}
+
+		updated := false
+		var maxTime time.Time
+
+		// Update each component's status if we have a newer state
+		for i, comp := range componentDataList {
+			newState, exists := stepStates[comp.Component]
+			if !exists {
+				continue
+			}
+
+			// Update component data
+			slip.Aggregates[aggregateColumn][i].Status = StepStatus(newState.Status)
+			if newState.Message != "" {
+				slip.Aggregates[aggregateColumn][i].Error = newState.Message
+			}
+
+			// Infer timestamps
+			// Since we only have the latest timestamp, we use it for both StartedAt (if running)
+			// and CompletedAt (if terminal), essentially updating the "last transition time".
+			ts := newState.Timestamp
+			if ts.After(maxTime) {
+				maxTime = ts
+			}
+
+			if StepStatus(newState.Status).IsRunning() && slip.Aggregates[aggregateColumn][i].StartedAt == nil {
+				slip.Aggregates[aggregateColumn][i].StartedAt = &ts
+			}
+			if StepStatus(newState.Status).IsTerminal() && slip.Aggregates[aggregateColumn][i].CompletedAt == nil {
+				slip.Aggregates[aggregateColumn][i].CompletedAt = &ts
+			}
+
+			updated = true
+		}
+
+		if updated {
+			// Recompute the step status based on updated components
+			newStatus := s.computeAggregateStatus(slip.Aggregates[aggregateColumn])
+
+			aggregateStepName := ""
+			if s.pipelineConfig != nil {
+				aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
+			}
+			if aggregateStepName == "" {
+				continue
+			}
+
+			// Update the step status only if the step exists.
+			step, ok := slip.Steps[aggregateStepName]
+			if !ok {
+				continue
+			}
+			// We use the timestamp of the latest component update as the transition time
+			step.ApplyStatusTransition(newStatus, maxTime)
+			slip.Steps[aggregateStepName] = step
+		}
+	}
+
+	return nil
+}
+
+type componentStateRow struct {
+	Step      string    `ch:"step"`
+	Component string    `ch:"component"`
+	Status    string    `ch:"status"`
+	Message   string    `ch:"message"`
+	Timestamp time.Time `ch:"timestamp"`
+}
+
+// loadComponentStates fetches the latest state for all components of a slip.
+func (s *ClickHouseStore) loadComponentStates(
+	ctx context.Context,
+	correlationID string,
+) (results []componentStateRow, err error) {
+	// We want the latest state for each component.
+	// ReplacingMergeTree eventually duplicates, but we use argMax to be sure given we might read unmerged parts.
+	query := fmt.Sprintf(`
+		SELECT
+			step,
+			component,
+			argMax(status, timestamp) as status,
+			argMax(message, timestamp) as message,
+			max(timestamp) as timestamp
+		FROM %s.%s
+		WHERE correlation_id = ?
+		GROUP BY step, component
+	`, s.database, TableSlipComponentStates)
+
+	rows, err := s.session.QueryWithArgs(ctx, query, correlationID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query component states: %w", err)
+	}
+	defer func() {
+		closeErr := rows.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("failed to close rows: %w", closeErr)
+		}
+	}()
+
+	for rows.Next() {
+		var row componentStateRow
+		if err := rows.Scan(&row.Step, &row.Component, &row.Status, &row.Message, &row.Timestamp); err != nil {
+			return nil, fmt.Errorf("failed to scan component state: %w", err)
+		}
+		results = append(results, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate component states: %w", err)
+	}
+	return results, nil
 }
 
 // Ensure ClickHouseStore implements SlipStore.

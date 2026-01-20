@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 16, 2026  
-> **Status:** Multi-module Go library with comprehensive error handling (branch: feature/improved-error-handling)
+> **Last Updated:** January 20, 2026  
+> **Status:** Multi-module Go library with comprehensive error handling (branch: feature/impl-event-sourcing)
 
 ---
 
@@ -44,7 +44,35 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Ancestry tracking** - maintains full commit lineage chain in `Ancestry` JSON field
 - **Progressive depth ancestry search** - starts at 25 commits, expands to 100 if no ancestor found
 - **Ancestry inheritance** - child slips inherit parent's ancestry chain for complete lineage
+- **Event Sourcing for Component Updates** - uses high-throughput `ReplacingMergeTree` for component states
 - See `slippy/CLAUDE.md` for detailed patterns
+
+### Component State Event Sourcing (January 20, 2026)
+- **Status:** Complete & Validated
+- **Architecture:** Moved component status updates (highly concurrent) to `slip_component_states` table (`ReplacingMergeTree`)
+- **Reasoning:** Eliminates lock contention/version conflicts on main `routing_slips` table during parallel build/test execution
+- **Pattern:** 
+  - Writes: Direct INSERTs (blind writes) - high throughput, no locking
+  - Reads: `Load()` performs hydration by querying latest state for each component and overlaying on `Slip` object
+- **Migration:** Version 4 `create_slip_component_states`
+- **Validation:** Unit tests updated and passing (Mocking blind inserts + hydration query)
+To resolve `ErrVersionConflict` during high-concurrency build fan-out (e.g., 50+ concurrent component updates), the data model was refactored:
+
+**Problem:**
+- Concurrent updates to the single `routing_slips` row (using `VersionedCollapsingMergeTree`) caused massive contention.
+- Optimistic locking retries failed when dozens of components updated simultaneously.
+
+**Solution:**
+1.  **Split Storage Model**:
+    *   **Main Slip**: Continues using `VersionedCollapsingMergeTree` in `routing_slips` for low-frequency updates (slip creation, pipeline step changes).
+    *   **Component States**: New `slip_component_states` table using `ReplacingMergeTree`.
+2.  **Lock-Free Writes**:
+    *   Component updates (via `UpdateComponentStatus`) are now simple `INSERT`s into `slip_component_states`.
+    *   No read-modify-write cycle, no optimistic locking, no retries needed.
+3.  **Read-Side Hydration**:
+    *   `Load()` fetches the base slip.
+    *   `hydrateSlip` fetches the latest state for each component from `slip_component_states`.
+    *   In-memory merging updates the `Slip.Aggregates` and recomputes aggregate step status.
 
 ### Ancestry Tracking (January 15, 2026)
 Slips now track their complete commit ancestry chain, enabling:
@@ -171,11 +199,6 @@ The slippy library now returns ALL errors. Shadow mode handling happens at the *
 All tests updated to match new signatures. Tests pass with coverage above 75% threshold.
 
 **Current Status:**
-- ✅ `make lint PKG=slippy` - 0 issues
-- ✅ `make test PKG=slippy` - all pass
-- ✅ `make lint PKG=github` - 0 issues
-- ✅ `make test PKG=github` - all pass
-- ✅ All errors returned, none swallowed
 
 ---
 

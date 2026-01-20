@@ -22,5 +22,6 @@ const (
 
 // Table name constants
 const (
-	TableRoutingSlips = "routing_slips"
+	TableRoutingSlips        = "routing_slips"
+	TableSlipComponentStates = "slip_component_states"
 )
