@@ -749,7 +749,6 @@ func TestClickHouseStore_Load_Success(t *testing.T) {
 
 // TestClickHouseStore_Load_HydratesComponentStates ensures component states hydrate aggregate columns and steps.
 func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
-	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 	stateTimestamp := time.Now()
 	mockRows := &clickhousetest.MockRows{
 		NextData: []bool{true, false},
@@ -773,14 +772,22 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 		},
 	}
 	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: mockRow,
 		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
 			return mockRows, nil
 		},
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	slip := &Slip{
+		CorrelationID: "test-corr-001",
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {{Component: "api", Status: StepStatusPending}},
+		},
+		Steps: map[string]Step{
+			"builds_completed": {Status: StepStatusPending},
+		},
+	}
 
-	slip, err := store.Load(context.Background(), "test-corr-001")
+	err := store.hydrateSlip(context.Background(), slip)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
