@@ -491,7 +491,7 @@ func (m *Migrator) createSchemaVersionTable(ctx context.Context) error {
 			version UInt32,
 			applied_at DateTime DEFAULT now64()
 		) ENGINE = MergeTree()
-		ORDER BY applied_at
+		ORDER BY (version, applied_at)
 		SETTINGS index_granularity = 8192
 	`, m.qualifiedTableName(m.schemaVersionTableName()))
 
