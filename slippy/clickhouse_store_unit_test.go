@@ -457,9 +457,29 @@ func TestClickHouseStore_UpdateStep(t *testing.T) {
 
 // TestClickHouseStore_UpdateComponentStatus tests the UpdateComponentStatus method.
 func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
+	t.Run("update component status - load fails", func(t *testing.T) {
+		mockRow := &clickhousetest.MockRow{
+			ScanErr: ErrSlipNotFound,
+		}
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: mockRow,
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.UpdateComponentStatus(context.Background(), "test-corr-001", "api", "build", StepStatusCompleted)
+		if !errors.Is(err, ErrSlipNotFound) {
+			t.Errorf("expected ErrSlipNotFound, got %v", err)
+		}
+	})
+
 	t.Run("update component status - uses insert", func(t *testing.T) {
 		execCalled := false
+		mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: mockRow,
+			QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+				return &clickhousetest.MockRows{}, nil
+			},
 			ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
 				execCalled = true
 				if !strings.Contains(stmt, "slip_component_states") {
@@ -951,7 +971,12 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 // TestClickHouseStore_UpdateStep_WithComponent tests step update for a specific component.
 func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	execCalled := false
+	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 	mockSession := &clickhousetest.MockSession{
+		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return &clickhousetest.MockRows{}, nil
+		},
 		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
 			execCalled = true
 			if !strings.Contains(stmt, "slip_component_states") {
@@ -962,7 +987,7 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	err := store.UpdateStep(context.Background(), "test-corr-001", "builds_completed", "api", StepStatusCompleted)
+	err := store.UpdateStep(context.Background(), "test-corr-001", "build", "api", StepStatusCompleted)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -974,7 +999,12 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 // TestClickHouseStore_UpdateComponentStatus_Success tests successful component status update.
 func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 	execCalled := false
+	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 	mockSession := &clickhousetest.MockSession{
+		QueryRowRow: mockRow,
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return &clickhousetest.MockRows{}, nil
+		},
 		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
 			execCalled = true
 			if !strings.Contains(stmt, "slip_component_states") {
