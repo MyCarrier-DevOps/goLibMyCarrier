@@ -15,7 +15,7 @@ import (
 const (
 	// DefaultMaxUpdateRetries is the default number of retry attempts for updates
 	// when a version conflict occurs due to concurrent modifications.
-	DefaultMaxUpdateRetries = 3
+	DefaultMaxUpdateRetries = 10
 )
 
 // ClickHouseStore implements SlipStore using ClickHouse as the backend.
