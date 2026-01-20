@@ -751,7 +751,7 @@ func (s *ClickHouseStore) insertComponentState(
 
 	// Note: We don't have a message passed in UpdateStep/UpdateComponentStatus signature currently.
 	// We pass empty string for message.
-	return s.session.ExecWithArgs(ctx, query,
+	err := s.session.ExecWithArgs(ctx, query,
 		correlationID,
 		stepName,
 		componentName,
@@ -759,6 +759,21 @@ func (s *ClickHouseStore) insertComponentState(
 		"", // message
 		time.Now(),
 	)
+	if err != nil {
+		return err
+	}
+
+	// Force merge to deduplicate rows in ReplacingMergeTree immediately.
+	// This ensures subsequent reads see the latest state without needing FINAL in SELECT.
+	return s.optimizeComponentStatesTable(ctx)
+}
+
+// optimizeComponentStatesTable forces a merge on the slip_component_states table.
+// This is necessary because ReplacingMergeTree deduplicates asynchronously during background merges.
+// Running OPTIMIZE TABLE FINAL ensures the latest state is immediately visible to subsequent queries.
+func (s *ClickHouseStore) optimizeComponentStatesTable(ctx context.Context) error {
+	query := fmt.Sprintf(`OPTIMIZE TABLE %s.%s FINAL`, s.database, TableSlipComponentStates)
+	return s.session.Exec(ctx, query)
 }
 
 // hydrateSlip fetches component states from the event sourcing table and merges them into the slip.
