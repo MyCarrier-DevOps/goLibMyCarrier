@@ -474,16 +474,33 @@ func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
 
 	t.Run("update component status - uses insert", func(t *testing.T) {
 		execCalled := false
-		mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
+		insertToComponentStatesCalled := false
+		slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 		mockSession := &clickhousetest.MockSession{
-			QueryRowRow: mockRow,
+			// Handle both Load and getMaxVersion queries
+			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+				if strings.Contains(query, "max(version)") {
+					return &clickhousetest.MockRow{
+						ScanFunc: func(dest ...any) error {
+							if len(dest) > 0 {
+								if v, ok := dest[0].(*sql.NullInt64); ok {
+									v.Int64 = 1
+									v.Valid = true
+								}
+							}
+							return nil
+						},
+					}
+				}
+				return slipRow
+			},
 			QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
 				return &clickhousetest.MockRows{}, nil
 			},
 			ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
 				execCalled = true
-				if !strings.Contains(stmt, "slip_component_states") {
-					return fmt.Errorf("expected insert into slip_component_states, got %s", stmt)
+				if strings.Contains(stmt, "slip_component_states") {
+					insertToComponentStatesCalled = true
 				}
 				return nil
 			},
@@ -496,6 +513,9 @@ func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
 		}
 		if !execCalled {
 			t.Error("expected ExecWithArgs to be called")
+		}
+		if !insertToComponentStatesCalled {
+			t.Error("expected insert into slip_component_states")
 		}
 	})
 }
@@ -780,7 +800,8 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 	slip := &Slip{
 		CorrelationID: "test-corr-001",
 		Aggregates: map[string][]ComponentStepData{
-			"builds": {{Component: "api", Status: StepStatusPending}},
+			// The aggregate column name is the step name (e.g., "builds_completed"), not the pluralized component step
+			"builds_completed": {{Component: "api", Status: StepStatusPending}},
 		},
 		Steps: map[string]Step{
 			"builds_completed": {Status: StepStatusPending},
@@ -792,7 +813,7 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	components := slip.Aggregates["builds"]
+	components := slip.Aggregates["builds_completed"]
 	if len(components) != 1 {
 		t.Fatalf("expected 1 component, got %d", len(components))
 	}
@@ -1030,16 +1051,33 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 // TestClickHouseStore_UpdateStep_WithComponent tests step update for a specific component.
 func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	execCalled := false
-	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
+	insertToComponentStatesCalled := false
+	slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: mockRow,
+		// Handle both Load and getMaxVersion queries
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			if strings.Contains(query, "max(version)") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*sql.NullInt64); ok {
+								v.Int64 = 1
+								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			return slipRow
+		},
 		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
 			return &clickhousetest.MockRows{}, nil
 		},
 		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
 			execCalled = true
-			if !strings.Contains(stmt, "slip_component_states") {
-				return fmt.Errorf("expected insert into slip_component_states, got %s", stmt)
+			if strings.Contains(stmt, "slip_component_states") {
+				insertToComponentStatesCalled = true
 			}
 			return nil
 		},
@@ -1052,6 +1090,9 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	}
 	if !execCalled {
 		t.Error("expected ExecWithArgs to be called")
+	}
+	if !insertToComponentStatesCalled {
+		t.Error("expected insert into slip_component_states")
 	}
 }
 
@@ -1075,16 +1116,33 @@ func TestClickHouseStore_loadComponentStates_Err(t *testing.T) {
 // TestClickHouseStore_UpdateComponentStatus_Success tests successful component status update.
 func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 	execCalled := false
-	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
+	insertToComponentStatesCalled := false
+	slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: mockRow,
+		// Handle both Load and getMaxVersion queries
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			if strings.Contains(query, "max(version)") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*sql.NullInt64); ok {
+								v.Int64 = 1
+								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			return slipRow
+		},
 		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
 			return &clickhousetest.MockRows{}, nil
 		},
 		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
 			execCalled = true
-			if !strings.Contains(stmt, "slip_component_states") {
-				return fmt.Errorf("expected insert into slip_component_states, got %s", stmt)
+			if strings.Contains(stmt, "slip_component_states") {
+				insertToComponentStatesCalled = true
 			}
 			return nil
 		},
@@ -1097,6 +1155,9 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 	}
 	if !execCalled {
 		t.Error("expected ExecWithArgs to be called")
+	}
+	if !insertToComponentStatesCalled {
+		t.Error("expected insert into slip_component_states")
 	}
 }
 

@@ -854,7 +854,19 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 
 	// Update aggregates in the slip
 	for componentStepName, stepStates := range stateMap {
-		aggregateColumn := pluralize(componentStepName)
+		// Get the aggregate step name from the component step name using pipeline config
+		// e.g., "build" -> "builds_completed"
+		aggregateStepName := ""
+		if s.pipelineConfig != nil {
+			aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
+		}
+		if aggregateStepName == "" {
+			// No aggregate step configured for this component step
+			continue
+		}
+
+		// The aggregate JSON column name is the aggregate step name (e.g., "builds_completed")
+		aggregateColumn := aggregateStepName
 		componentDataList, ok := slip.Aggregates[aggregateColumn]
 		if !ok {
 			continue
@@ -897,14 +909,6 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		if updated {
 			// Recompute the step status based on updated components
 			newStatus := s.computeAggregateStatus(slip.Aggregates[aggregateColumn])
-
-			aggregateStepName := ""
-			if s.pipelineConfig != nil {
-				aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
-			}
-			if aggregateStepName == "" {
-				continue
-			}
 
 			// Update the step status only if the step exists.
 			step, ok := slip.Steps[aggregateStepName]

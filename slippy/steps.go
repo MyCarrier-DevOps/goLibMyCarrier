@@ -113,8 +113,9 @@ func (c *Client) checkAndUpdateAggregate(ctx context.Context, correlationID, ste
 		return fmt.Errorf("failed to load slip for aggregate check: %w", err)
 	}
 
-	// Get component data from the aggregate column
-	columnName := pluralize(stepName)
+	// Get component data from the aggregate column.
+	// The aggregate JSON column is named after the aggregate step (e.g., "builds_completed")
+	columnName := aggregateStepName
 	componentData, ok := slip.Aggregates[columnName]
 	if !ok || len(componentData) == 0 {
 		c.logger.Debug(ctx, "No component data found for aggregate", map[string]interface{}{

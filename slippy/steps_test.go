@@ -279,7 +279,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"builds": {
+				// The aggregate column name is the step name (e.g., "builds_completed")
+				"builds_completed": {
 					{Component: "svc-a", Status: StepStatusCompleted},
 					{Component: "svc-b", Status: StepStatusCompleted},
 				},
@@ -322,7 +323,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"builds": {
+				// The aggregate column name is the step name (e.g., "builds_completed")
+				"builds_completed": {
 					{Component: "svc-a", Status: StepStatusCompleted},
 					{Component: "svc-b", Status: StepStatusFailed},
 				},
@@ -364,7 +366,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"builds": {
+				// The aggregate column name is the step name (e.g., "builds_completed")
+				"builds_completed": {
 					{Component: "svc-a", Status: StepStatusCompleted},
 					{Component: "svc-b", Status: StepStatusRunning}, // Still running
 				},
@@ -406,7 +409,8 @@ func TestClient_CheckAndUpdateAggregates(t *testing.T) {
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"unit_tests": {
+				// The aggregate column name is the step name (e.g., "unit_tests_completed")
+				"unit_tests_completed": {
 					{Component: "svc-a", Status: StepStatusCompleted},
 					{Component: "svc-b", Status: StepStatusCompleted},
 				},
