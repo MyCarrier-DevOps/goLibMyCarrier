@@ -385,28 +385,6 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	return nil
 }
 
-// getMaxVersion retrieves the current maximum version for a slip from ClickHouse.
-// This is used for atomic version increment to prevent race conditions.
-func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID string) (uint32, error) {
-	query := fmt.Sprintf(
-		"SELECT max(version) FROM %s.%s WHERE %s = ?",
-		s.database, TableRoutingSlips, ColumnCorrelationID,
-	)
-
-	row := s.session.QueryRow(ctx, query, correlationID)
-
-	var maxVersion sql.NullInt64
-	if err := row.Scan(&maxVersion); err != nil {
-		return 0, fmt.Errorf("failed to scan max version: %w", err)
-	}
-
-	if !maxVersion.Valid {
-		return 0, fmt.Errorf("no rows found for correlation_id %s", correlationID)
-	}
-
-	return uint32(maxVersion.Int64), nil
-}
-
 // UpdateStep updates a specific step's status with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
 // If a concurrent modification is detected, the slip is reloaded and the update is retried.
@@ -458,7 +436,7 @@ func (s *ClickHouseStore) UpdateStep(
 	}
 
 	// All retries exhausted
-	return fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
+	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
 // UpdateComponentStatus updates a component's step status with automatic retry on version conflicts.
@@ -500,12 +478,34 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 	}
 
 	// All retries exhausted
-	return fmt.Errorf("%w: %v", ErrMaxRetriesExceeded, lastErr)
+	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
 // Close releases any resources held by the store.
 func (s *ClickHouseStore) Close() error {
 	return s.session.Close()
+}
+
+// getMaxVersion retrieves the current maximum version for a slip from ClickHouse.
+// This is used for atomic version increment to prevent race conditions.
+func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID string) (uint32, error) {
+	query := fmt.Sprintf(
+		"SELECT max(version) FROM %s.%s WHERE %s = ?",
+		s.database, TableRoutingSlips, ColumnCorrelationID,
+	)
+
+	row := s.session.QueryRow(ctx, query, correlationID)
+
+	var maxVersion sql.NullInt64
+	if err := row.Scan(&maxVersion); err != nil {
+		return 0, fmt.Errorf("failed to scan max version: %w", err)
+	}
+
+	if !maxVersion.Valid {
+		return 0, fmt.Errorf("no rows found for correlation_id %s", correlationID)
+	}
+
+	return uint32(maxVersion.Int64), nil
 }
 
 // insertRow is an internal method that inserts a single row without OPTIMIZE.
