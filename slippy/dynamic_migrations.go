@@ -234,7 +234,6 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 	}
 }
 
-// generateComponentStatesTableMigration creates the table for tracking component states via event sourcing.
 // generateBaseTableMigration creates the core routing_slips table.
 func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
@@ -296,6 +295,7 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 	}
 }
 
+// generateComponentStatesTableMigration creates the table for tracking component states via event sourcing.
 // This table uses ReplacingMergeTree to handle efficient concurrent updates.
 func (m *DynamicMigrationManager) generateComponentStatesTableMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
