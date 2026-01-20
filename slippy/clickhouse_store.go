@@ -32,7 +32,7 @@ type ClickHouseStore struct {
 	queryBuilder       *SlipQueryBuilder
 	scanner            *SlipScanner
 	optimizeAfterWrite bool // If true, runs OPTIMIZE TABLE after each write operation
-	maxUpdateRetries   int  // Maximum retry attempts for version conflicts (default: 3)
+	maxUpdateRetries   int  // Maximum retry attempts for version conflicts
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
