@@ -21,26 +21,55 @@ const (
 	// so we set this high to ensure we don't fail unnecessarily.
 	DefaultMaxUpdateRetries = 100
 
-	// retryBaseDelay is the base delay for exponential backoff
+	// retryBaseDelay is the base delay for exponential backoff (version conflicts)
 	retryBaseDelay = 25 * time.Millisecond
 
-	// retryMaxDelay caps the maximum delay between retries
+	// retryMaxDelay caps the maximum delay between retries (version conflicts)
 	retryMaxDelay = 3 * time.Second
 
-	// retryMaxTotalTime is the maximum total time to spend retrying
+	// retryMaxTotalTime is the maximum total time to spend retrying version conflicts
 	// before giving up (5 minutes should handle any realistic contention)
 	retryMaxTotalTime = 5 * time.Minute
+
+	// slipNotFoundBaseDelay is the multiplier (in minutes) for linear backoff
+	// when waiting for a slip to be created. Uses formula: base * retry * minute
+	// Retry 1: 5min, Retry 2: 10min, Retry 3: 15min (30min total wait)
+	slipNotFoundBaseDelay = 5
+
+	// slipNotFoundMaxRetries is the maximum number of retries when slip doesn't exist.
+	// With linear backoff (5min + 10min + 15min), this gives ~30 minutes total wait time.
+	slipNotFoundMaxRetries = 3
 )
 
-// calculateBackoff returns an exponential backoff duration with jitter.
+// calculateBackoff returns an exponential backoff duration with jitter for version conflicts.
 // The formula is: min(retryMaxDelay, retryBaseDelay * 2^attempt) + random jitter
 func calculateBackoff(attempt int) time.Duration {
+	return calculateBackoffWithParams(attempt, retryBaseDelay, retryMaxDelay)
+}
+
+// calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
+// Uses linear backoff: 5min for 1st retry, 10min for 2nd, 15min for 3rd.
+// Formula: slipNotFoundBaseDelay * retryNumber * time.Minute
+// where retryNumber is 1-indexed (1, 2, 3).
+func calculateSlipNotFoundBackoff(retryNumber int) time.Duration {
+	if retryNumber < 1 {
+		retryNumber = 1
+	}
+	if retryNumber > slipNotFoundMaxRetries {
+		retryNumber = slipNotFoundMaxRetries
+	}
+	return time.Duration(slipNotFoundBaseDelay*retryNumber) * time.Minute
+}
+
+// calculateBackoffWithParams returns an exponential backoff duration with jitter.
+// The formula is: min(maxDelay, baseDelay * 2^attempt) + random jitter
+func calculateBackoffWithParams(attempt int, baseDelay, maxDelay time.Duration) time.Duration {
 	// Calculate exponential delay: baseDelay * 2^attempt
-	delay := retryBaseDelay * time.Duration(1<<uint(attempt))
+	delay := baseDelay * time.Duration(1<<uint(attempt))
 
 	// Cap at maximum delay
-	if delay > retryMaxDelay {
-		delay = retryMaxDelay
+	if delay > maxDelay {
+		delay = maxDelay
 	}
 
 	// Add jitter: ±25% of the delay to prevent thundering herd
@@ -477,19 +506,41 @@ func (s *ClickHouseStore) UpdateStep(
 
 	var lastErr error
 	startTime := time.Now()
+	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
 
 	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time
+		// Check if we've exceeded total retry time for version conflicts
 		if time.Since(startTime) > retryMaxTotalTime {
-			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-			retrySpan.EndError(err)
-			return err
+			// But allow continued retries if we're waiting for slip to exist
+			if lastErr == nil || !errors.Is(lastErr, ErrSlipNotFound) {
+				err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
+					ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
+				retrySpan.EndError(err)
+				return err
+			}
 		}
 
 		// Load the current slip (reload on retry to get latest version)
 		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+				lastErr = err
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				time.Sleep(backoff)
+				attempt-- // Don't count this against version conflict retries
+				continue
+			}
 			retrySpan.EndError(err)
 			return err
 		}
@@ -547,18 +598,40 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 
 	var lastErr error
 	startTime := time.Now()
+	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
 
 	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time
+		// Check if we've exceeded total retry time for version conflicts
 		if time.Since(startTime) > retryMaxTotalTime {
-			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-			retrySpan.EndError(err)
-			return err
+			// But allow continued retries if we're waiting for slip to exist
+			if lastErr == nil || !errors.Is(lastErr, ErrSlipNotFound) {
+				err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
+					ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
+				retrySpan.EndError(err)
+				return err
+			}
 		}
 
 		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+				lastErr = err
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				time.Sleep(backoff)
+				attempt-- // Don't count this against version conflict retries
+				continue
+			}
 			retrySpan.EndError(err)
 			return err
 		}
@@ -904,19 +977,41 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 
 	var lastErr error
 	startTime := time.Now()
+	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
 
 	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time
+		// Check if we've exceeded total retry time for version conflicts
 		if time.Since(startTime) > retryMaxTotalTime {
-			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-			retrySpan.EndError(err)
-			return err
+			// But allow continued retries if we're waiting for slip to exist
+			if lastErr == nil || !errors.Is(lastErr, ErrSlipNotFound) {
+				err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
+					ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
+				retrySpan.EndError(err)
+				return err
+			}
 		}
 
 		// Load the slip (this will hydrate component states automatically)
 		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+				lastErr = err
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				time.Sleep(backoff)
+				attempt-- // Don't count this against version conflict retries
+				continue
+			}
 			err = fmt.Errorf("failed to load slip for aggregate update: %w", err)
 			retrySpan.EndError(err)
 			return err
