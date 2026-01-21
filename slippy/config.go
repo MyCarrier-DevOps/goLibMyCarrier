@@ -56,6 +56,11 @@ type Config struct {
 	// Database is the ClickHouse database name (default: "ci")
 	Database string
 
+	// SkipMigrations if true, skips running migrations during store initialization.
+	// Set to true when the calling application trusts that another service
+	// (e.g., pushhookparser) has already run the necessary migrations.
+	SkipMigrations bool
+
 	// Internal fields for error tracking
 	clickhouseLoadErr error // Error from ClickHouse config loading
 	pipelineLoadErr   error // Error from pipeline config loading

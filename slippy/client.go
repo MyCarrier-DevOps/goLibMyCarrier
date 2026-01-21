@@ -37,13 +37,17 @@ func NewClient(config Config) (*Client, error) {
 		config.Logger = NopLogger()
 	}
 
-	// Initialize ClickHouse store from config (migrations run based on pipeline config)
+	// Initialize ClickHouse store from config
+	// Migrations are skipped if config.SkipMigrations is true (e.g., Slippy CLI trusts pushhookparser ran them)
 	storeStart := time.Now()
-	config.Logger.Info(ctx, "Creating ClickHouse store...", nil)
+	config.Logger.Info(ctx, "Creating ClickHouse store...", map[string]interface{}{
+		"skip_migrations": config.SkipMigrations,
+	})
 	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{
 		PipelineConfig: config.PipelineConfig,
 		Database:       config.Database,
 		Logger:         config.Logger,
+		SkipMigrations: config.SkipMigrations,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %w", err)
