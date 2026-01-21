@@ -73,11 +73,15 @@ func calculateBackoffWithParams(attempt int, baseDelay, maxDelay time.Duration) 
 	}
 
 	// Add jitter: ±25% of the delay to prevent thundering herd
-	jitter := time.Duration(rand.Int63n(int64(delay) / 2))
-	if rand.Intn(2) == 0 {
-		delay += jitter
-	} else {
-		delay -= jitter / 2 // Don't go below 75% of calculated delay
+	// Guard against zero delay which would cause rand.Int63n to panic
+	jitterRange := int64(delay) / 2
+	if jitterRange > 0 {
+		jitter := time.Duration(rand.Int63n(jitterRange))
+		if rand.Intn(2) == 0 {
+			delay += jitter
+		} else {
+			delay -= jitter / 2 // Don't go below 75% of calculated delay
+		}
 	}
 
 	return delay
