@@ -785,7 +785,7 @@ func (s *ClickHouseStore) optimizeComponentStatesTable(ctx context.Context) erro
 // This is called after a component state update to ensure the slip reflects the current aggregate status.
 func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 	ctx context.Context,
-	correlationID, componentStepName string,
+	correlationID, stepName string,
 ) error {
 	var lastErr error
 
@@ -796,13 +796,22 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 			return fmt.Errorf("failed to load slip for aggregate update: %w", err)
 		}
 
-		// Get the aggregate step name from the component step name (e.g., "build" -> "builds_completed")
+		// Determine the aggregate step name. The stepName could be either:
+		// 1. The component step name (e.g., "build") - need to look up the aggregate step
+		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
 		aggregateStepName := ""
 		if s.pipelineConfig != nil {
-			aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
+			// First, try to get aggregate step from component step name
+			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepName)
+			if aggregateStepName == "" {
+				// If not found, check if the step name IS an aggregate step
+				if s.pipelineConfig.IsAggregateStep(stepName) {
+					aggregateStepName = stepName
+				}
+			}
 		}
 		if aggregateStepName == "" {
-			// No aggregate step configured for this component step, nothing to update
+			// No aggregate step configured for this step, nothing to update
 			return nil
 		}
 
@@ -853,15 +862,23 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 	}
 
 	// Update aggregates in the slip
-	for componentStepName, stepStates := range stateMap {
-		// Get the aggregate step name from the component step name using pipeline config
-		// e.g., "build" -> "builds_completed"
+	for stepNameFromDB, stepStates := range stateMap {
+		// Determine the aggregate step name. The step name from the database could be either:
+		// 1. The component step name (e.g., "build") - need to look up the aggregate step
+		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
 		aggregateStepName := ""
 		if s.pipelineConfig != nil {
-			aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
+			// First, try to get aggregate step from component step name
+			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepNameFromDB)
+			if aggregateStepName == "" {
+				// If not found, check if the step name IS an aggregate step
+				if s.pipelineConfig.IsAggregateStep(stepNameFromDB) {
+					aggregateStepName = stepNameFromDB
+				}
+			}
 		}
 		if aggregateStepName == "" {
-			// No aggregate step configured for this component step
+			// No aggregate step configured for this step
 			continue
 		}
 

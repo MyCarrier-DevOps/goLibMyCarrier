@@ -90,7 +90,14 @@ func (c *Client) UpdateStepWithStatus(
 
 	// Check if this is a component step that affects an aggregate
 	if componentName != "" && c.pipelineConfig != nil {
+		// Determine the aggregate step name. The stepName could be either:
+		// 1. The component step name (e.g., "build") - need to look up the aggregate step
+		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
 		aggregateStep := c.pipelineConfig.GetAggregateStep(stepName)
+		if aggregateStep == "" && c.pipelineConfig.IsAggregateStep(stepName) {
+			// stepName is already an aggregate step
+			aggregateStep = stepName
+		}
 		if aggregateStep != "" {
 			if err := c.checkAndUpdateAggregate(ctx, correlationID, stepName, aggregateStep); err != nil {
 				// Return the error - aggregate status is important for pipeline flow
