@@ -557,20 +557,16 @@ func (s *ClickHouseStore) UpdateStep(
 		}
 	}()
 
-	var lastErr error
-	startTime := time.Now()
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
 
-	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time for version conflicts
-		if time.Since(startTime) > retryMaxTotalTime {
-			// But allow continued retries if we're waiting for slip to exist
-			if lastErr == nil || !errors.Is(lastErr, ErrSlipNotFound) {
-				err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-					ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-				retrySpan.EndError(err)
-				return err
-			}
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
 		}
 
 		// Load the current slip (reload on retry to get latest version)
@@ -585,15 +581,20 @@ func (s *ClickHouseStore) UpdateStep(
 					retrySpan.EndError(err)
 					return err
 				}
-				lastErr = err
 				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
 				retrySpan.RecordAttempt(backoff.Milliseconds())
 				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
 				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				time.Sleep(backoff)
-				attempt-- // Don't count this against version conflict retries
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
 				continue
 			}
+			// Non-retryable load error
 			retrySpan.EndError(err)
 			return err
 		}
@@ -609,25 +610,29 @@ func (s *ClickHouseStore) UpdateStep(
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error (transient, keep retrying)
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
 		if errors.Is(err, ErrVersionConflict) {
-			lastErr = err
+			versionConflictRetry++
+
 			// Apply exponential backoff with jitter before retrying
-			backoff := calculateBackoff(attempt)
+			backoff := calculateBackoff(versionConflictRetry)
 			retrySpan.RecordAttempt(backoff.Milliseconds())
-			time.Sleep(backoff)
-			continue
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
 		}
 
 		// Non-retryable error
 		retrySpan.EndError(err)
 		return err
 	}
-
-	// All retries exhausted
-	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
-	retrySpan.EndError(err)
-	return err
 }
 
 // UpdateComponentStatus updates a component's step status with automatic retry on version conflicts.
@@ -642,27 +647,24 @@ func (s *ClickHouseStore) UpdateComponentStatus(
 
 // AppendHistory adds a state history entry to the slip with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
-// Uses exponential backoff with jitter to handle concurrent modifications gracefully.
+// Version conflicts are transient and will retry indefinitely.
+// Only context cancellation or permanent errors stop the loop.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
 	// Start tracing span for the retry operation
 	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
 	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
 	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
 
-	var lastErr error
-	startTime := time.Now()
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
 
-	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time for version conflicts
-		if time.Since(startTime) > retryMaxTotalTime {
-			// But allow continued retries if we're waiting for slip to exist
-			if lastErr == nil || !errors.Is(lastErr, ErrSlipNotFound) {
-				err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-					ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-				retrySpan.EndError(err)
-				return err
-			}
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
 		}
 
 		slip, err := s.Load(retrySpan.Context(), correlationID)
@@ -676,15 +678,21 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 					retrySpan.EndError(err)
 					return err
 				}
-				lastErr = err
+
 				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
 				retrySpan.RecordAttempt(backoff.Milliseconds())
 				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
 				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				time.Sleep(backoff)
-				attempt-- // Don't count this against version conflict retries
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
 				continue
 			}
+			// Non-retryable load error
 			retrySpan.EndError(err)
 			return err
 		}
@@ -697,25 +705,29 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error (transient, keep retrying)
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
 		if errors.Is(err, ErrVersionConflict) {
-			lastErr = err
+			versionConflictRetry++
+
 			// Apply exponential backoff with jitter before retrying
-			backoff := calculateBackoff(attempt)
+			backoff := calculateBackoff(versionConflictRetry)
 			retrySpan.RecordAttempt(backoff.Milliseconds())
-			time.Sleep(backoff)
-			continue
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
 		}
 
 		// Non-retryable error
 		retrySpan.EndError(err)
 		return err
 	}
-
-	// All retries exhausted
-	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
-	retrySpan.EndError(err)
-	return err
 }
 
 // Close releases any resources held by the store.
@@ -1038,20 +1050,16 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 	retrySpan := startRetrySpan(ctx, "updateAggregateStatusFromComponentStates", correlationID)
 	retrySpan.AddAttribute("slippy.step_name", stepName)
 
-	var lastErr error
-	startTime := time.Now()
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
 
-	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time for version conflicts
-		if time.Since(startTime) > retryMaxTotalTime {
-			// But allow continued retries if we're waiting for slip to exist
-			if lastErr == nil || !errors.Is(lastErr, ErrSlipNotFound) {
-				err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-					ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-				retrySpan.EndError(err)
-				return err
-			}
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
 		}
 
 		// Load the slip (this will hydrate component states automatically)
@@ -1066,13 +1074,18 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 					retrySpan.EndError(err)
 					return err
 				}
-				lastErr = err
+
 				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
 				retrySpan.RecordAttempt(backoff.Milliseconds())
 				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
 				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				time.Sleep(backoff)
-				attempt-- // Don't count this against version conflict retries
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
 				continue
 			}
 			err = fmt.Errorf("failed to load slip for aggregate update: %w", err)
@@ -1109,24 +1122,29 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error (transient, keep retrying)
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
 		if errors.Is(err, ErrVersionConflict) {
-			lastErr = err
+			versionConflictRetry++
+
 			// Apply exponential backoff with jitter before retrying
-			backoff := calculateBackoff(attempt)
+			backoff := calculateBackoff(versionConflictRetry)
 			retrySpan.RecordAttempt(backoff.Milliseconds())
-			time.Sleep(backoff)
-			continue
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
 		}
 
 		// Non-retryable error
 		retrySpan.EndError(err)
 		return err
 	}
-
-	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
-	retrySpan.EndError(err)
-	return err
 }
 
 // hydrateSlip fetches component states from the event sourcing table and merges them into the slip.

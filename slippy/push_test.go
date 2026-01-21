@@ -518,12 +518,12 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Errorf("expected ancestor ID 'corr-ancestor-1', got '%s'", ancestry[0].CorrelationID)
 		}
 
-		// Verify ancestor was abandoned
-		if len(store.UpdateCalls) != 1 {
-			t.Fatalf("expected 1 Update call (abandon), got %d", len(store.UpdateCalls))
+		// Verify ancestor was abandoned (AbandonSlip uses ForceUpdate for terminal states)
+		if len(store.ForceUpdateCalls) != 1 {
+			t.Fatalf("expected 1 ForceUpdate call (abandon), got %d", len(store.ForceUpdateCalls))
 		}
-		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
-			t.Errorf("expected ancestor to be abandoned, got status '%s'", store.UpdateCalls[0].Slip.Status)
+		if store.ForceUpdateCalls[0].Slip.Status != SlipStatusAbandoned {
+			t.Errorf("expected ancestor to be abandoned, got status '%s'", store.ForceUpdateCalls[0].Slip.Status)
 		}
 	})
 
@@ -1393,7 +1393,7 @@ func TestClient_PromoteSlip(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-update-fail"] = slip
-		store.UpdateError = errors.New("database error")
+		store.ForceUpdateError = errors.New("database error")
 
 		err := client.PromoteSlip(ctx, "corr-update-fail", "corr-target")
 		if err == nil {
