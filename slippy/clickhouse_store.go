@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"time"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
@@ -15,8 +16,42 @@ import (
 const (
 	// DefaultMaxUpdateRetries is the default number of retry attempts for updates
 	// when a version conflict occurs due to concurrent modifications.
-	DefaultMaxUpdateRetries = 10
+	// Version conflicts are transient and will always eventually succeed,
+	// so we set this high to ensure we don't fail unnecessarily.
+	DefaultMaxUpdateRetries = 100
+
+	// retryBaseDelay is the base delay for exponential backoff
+	retryBaseDelay = 25 * time.Millisecond
+
+	// retryMaxDelay caps the maximum delay between retries
+	retryMaxDelay = 3 * time.Second
+
+	// retryMaxTotalTime is the maximum total time to spend retrying
+	// before giving up (5 minutes should handle any realistic contention)
+	retryMaxTotalTime = 5 * time.Minute
 )
+
+// calculateBackoff returns an exponential backoff duration with jitter.
+// The formula is: min(retryMaxDelay, retryBaseDelay * 2^attempt) + random jitter
+func calculateBackoff(attempt int) time.Duration {
+	// Calculate exponential delay: baseDelay * 2^attempt
+	delay := retryBaseDelay * time.Duration(1<<uint(attempt))
+
+	// Cap at maximum delay
+	if delay > retryMaxDelay {
+		delay = retryMaxDelay
+	}
+
+	// Add jitter: ±25% of the delay to prevent thundering herd
+	jitter := time.Duration(rand.Int63n(int64(delay) / 2))
+	if rand.Intn(2) == 0 {
+		delay += jitter
+	} else {
+		delay -= jitter / 2 // Don't go below 75% of calculated delay
+	}
+
+	return delay
+}
 
 // ClickHouseStore implements SlipStore using ClickHouse as the backend.
 // The store uses correlation_id as the unique identifier for routing slips,
@@ -412,7 +447,8 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 
 // UpdateStep updates a specific step's status with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
-// If a concurrent modification is detected, the slip is reloaded and the update is retried.
+// If a concurrent modification is detected, the slip is reloaded and the update is retried
+// with exponential backoff and jitter to prevent thundering herd.
 func (s *ClickHouseStore) UpdateStep(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
@@ -431,12 +467,31 @@ func (s *ClickHouseStore) UpdateStep(
 		return s.updateAggregateStatusFromComponentStates(ctx, correlationID, stepName)
 	}
 
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "UpdateStep", correlationID)
+	retrySpan.AddAttribute("slippy.step_name", stepName)
+	defer func() {
+		if retrySpan != nil {
+			// Span will be ended by success/error paths below
+		}
+	}()
+
 	var lastErr error
+	startTime := time.Now()
 
 	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
+		// Check if we've exceeded total retry time
+		if time.Since(startTime) > retryMaxTotalTime {
+			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
+				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
+			retrySpan.EndError(err)
+			return err
+		}
+
 		// Load the current slip (reload on retry to get latest version)
-		slip, err := s.Load(ctx, correlationID)
+		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
+			retrySpan.EndError(err)
 			return err
 		}
 
@@ -445,23 +500,31 @@ func (s *ClickHouseStore) UpdateStep(
 		// Update pipeline-level steps
 		s.updatePipelineStep(slip, stepName, status, now)
 
-		err = s.Update(ctx, slip)
+		err = s.Update(retrySpan.Context(), slip)
 		if err == nil {
+			retrySpan.EndSuccess()
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error
+		// Check if this is a version conflict error (transient, keep retrying)
 		if errors.Is(err, ErrVersionConflict) {
 			lastErr = err
-			continue // Retry with fresh data
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(attempt)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			time.Sleep(backoff)
+			continue
 		}
 
 		// Non-retryable error
+		retrySpan.EndError(err)
 		return err
 	}
 
 	// All retries exhausted
-	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
+	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
+	retrySpan.EndError(err)
+	return err
 }
 
 // UpdateComponentStatus updates a component's step status with automatic retry on version conflicts.
@@ -476,34 +539,58 @@ func (s *ClickHouseStore) UpdateComponentStatus(
 
 // AppendHistory adds a state history entry to the slip with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
+// Uses exponential backoff with jitter to handle concurrent modifications gracefully.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
+	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
+	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
+
 	var lastErr error
+	startTime := time.Now()
 
 	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		slip, err := s.Load(ctx, correlationID)
+		// Check if we've exceeded total retry time
+		if time.Since(startTime) > retryMaxTotalTime {
+			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
+				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
+			retrySpan.EndError(err)
+			return err
+		}
+
+		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
+			retrySpan.EndError(err)
 			return err
 		}
 
 		slip.StateHistory = append(slip.StateHistory, entry)
 
-		err = s.Update(ctx, slip)
+		err = s.Update(retrySpan.Context(), slip)
 		if err == nil {
+			retrySpan.EndSuccess()
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error
+		// Check if this is a version conflict error (transient, keep retrying)
 		if errors.Is(err, ErrVersionConflict) {
 			lastErr = err
-			continue // Retry with fresh data
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(attempt)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			time.Sleep(backoff)
+			continue
 		}
 
 		// Non-retryable error
+		retrySpan.EndError(err)
 		return err
 	}
 
 	// All retries exhausted
-	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
+	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
+	retrySpan.EndError(err)
+	return err
 }
 
 // Close releases any resources held by the store.
@@ -783,17 +870,33 @@ func (s *ClickHouseStore) optimizeComponentStatesTable(ctx context.Context) erro
 // updateAggregateStatusFromComponentStates loads the slip, hydrates it with component states,
 // and persists the updated aggregate status back to the routing_slips table.
 // This is called after a component state update to ensure the slip reflects the current aggregate status.
+// Uses exponential backoff with jitter to handle concurrent modifications gracefully.
 func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 	ctx context.Context,
 	correlationID, stepName string,
 ) error {
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "updateAggregateStatusFromComponentStates", correlationID)
+	retrySpan.AddAttribute("slippy.step_name", stepName)
+
 	var lastErr error
+	startTime := time.Now()
 
 	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
+		// Check if we've exceeded total retry time
+		if time.Since(startTime) > retryMaxTotalTime {
+			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
+				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
+			retrySpan.EndError(err)
+			return err
+		}
+
 		// Load the slip (this will hydrate component states automatically)
-		slip, err := s.Load(ctx, correlationID)
+		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
-			return fmt.Errorf("failed to load slip for aggregate update: %w", err)
+			err = fmt.Errorf("failed to load slip for aggregate update: %w", err)
+			retrySpan.EndError(err)
+			return err
 		}
 
 		// Determine the aggregate step name. The stepName could be either:
@@ -812,28 +915,37 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 		}
 		if aggregateStepName == "" {
 			// No aggregate step configured for this step, nothing to update
+			retrySpan.EndSuccess()
 			return nil
 		}
 
 		// The slip was already hydrated by Load(), so the step status should reflect
 		// the computed aggregate from all component states.
 		// Now persist this back to the database.
-		err = s.Update(ctx, slip)
+		err = s.Update(retrySpan.Context(), slip)
 		if err == nil {
+			retrySpan.EndSuccess()
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error
+		// Check if this is a version conflict error (transient, keep retrying)
 		if errors.Is(err, ErrVersionConflict) {
 			lastErr = err
-			continue // Retry with fresh data
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(attempt)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			time.Sleep(backoff)
+			continue
 		}
 
 		// Non-retryable error
+		retrySpan.EndError(err)
 		return err
 	}
 
-	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
+	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
+	retrySpan.EndError(err)
+	return err
 }
 
 // hydrateSlip fetches component states from the event sourcing table and merges them into the slip.
