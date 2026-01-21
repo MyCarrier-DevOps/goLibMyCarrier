@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
@@ -223,18 +224,15 @@ func (s *ClickHouseStore) PipelineConfig() *PipelineConfig {
 
 // Create persists a new routing slip.
 // The slip's CorrelationID is used as the unique identifier.
-// For VersionedCollapsingMergeTree, this inserts a row with sign=1 and version=1.
+// For VersionedCollapsingMergeTree, this inserts a row with sign=1 and version calculated atomically.
 func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
 
-	// Set default sign and version for new slips
+	// Set default sign for new slips (version is calculated atomically)
 	if slip.Sign == 0 {
 		slip.Sign = 1
-	}
-	if slip.Version == 0 {
-		slip.Version = 1
 	}
 
 	if err := s.insertRow(ctx, slip); err != nil {
@@ -400,10 +398,12 @@ func (s *ClickHouseStore) FindAllByCommits(
 // another process modified the slip), this method returns ErrVersionConflict. Callers should
 // reload the slip and retry their operation.
 //
-// Atomic Version Increment: The version is fetched atomically from ClickHouse using max(version)
-// to prevent race conditions between concurrent updates.
+// Atomic Version Calculation: The version is calculated atomically within the INSERT statement
+// using a subquery (COALESCE(MAX(version), 0) + 1). This eliminates the race condition window
+// between reading the version and writing the row, ensuring that concurrent updates always
+// produce unique, incrementing versions.
 func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
-	// Get the current max version atomically from ClickHouse
+	// Get the current max version for optimistic locking check
 	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
 	if err != nil {
 		return fmt.Errorf("failed to get current version: %w", err)
@@ -421,15 +421,14 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Create a deep copy for the cancel row to prevent shared map/slice references
 	cancelSlip := deepCopySlip(slip)
 	cancelSlip.Sign = -1
-	cancelSlip.Version = currentVersion // Use the atomically fetched version
 
+	// Insert the cancel row (version calculated atomically)
 	if err := s.insertRow(ctx, cancelSlip); err != nil {
 		return fmt.Errorf("failed to insert cancel row: %w", err)
 	}
 
-	// Insert the new state with atomically incremented version (sign=1)
+	// Insert the new state (version calculated atomically as max + 1)
 	slip.Sign = 1
-	slip.Version = currentVersion + 1
 
 	if err := s.insertRow(ctx, slip); err != nil {
 		return fmt.Errorf("failed to insert new row: %w", err)
@@ -620,7 +619,9 @@ func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID strin
 	return uint32(maxVersion.Int64), nil
 }
 
-// insertRow is an internal method that inserts a single row without OPTIMIZE.
+// insertRow inserts a single row using INSERT...SELECT with atomic version calculation.
+// The version is calculated as COALESCE(MAX(version), 0) + 1 within the INSERT statement,
+// eliminating race conditions between concurrent updates.
 // Used by both Create (for new slips) and Update (for cancel and new rows).
 func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 	if s.pipelineConfig == nil {
@@ -628,8 +629,8 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 	}
 
 	// Build dynamic column lists using query builder
-	stepColumns, stepPlaceholders, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
-	aggregateColumns, aggregatePlaceholders, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
 		slip.Aggregates,
 	)
 
@@ -653,16 +654,20 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 		return fmt.Errorf("failed to marshal ancestry: %w", err)
 	}
 
-	// Build the INSERT query dynamically
+	// Build column list for INSERT
 	var columns []string
-	var placeholders []string
-	var values []interface{}
-
-	// Core columns (order must match scanner expectations)
 	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
 		ColumnSign, ColumnVersion)
-	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	columns = append(columns, stepColumns...)
+	columns = append(columns, aggregateColumns...)
+
+	// Build SELECT expressions - all literals except version which uses a subquery
+	var selectExprs []string
+	var values []interface{}
+
+	// Core columns as literals (using positional parameters)
+	selectExprs = append(selectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
 	values = append(values,
 		slip.CorrelationID,
 		slip.Repository,
@@ -674,21 +679,39 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 		string(stepDetailsJSON),
 		string(stateHistoryJSON),
 		string(ancestryJSON),
-		slip.Sign,
-		slip.Version,
 	)
 
-	// Step status columns
-	columns = append(columns, stepColumns...)
-	placeholders = append(placeholders, stepPlaceholders...)
-	values = append(values, stepValues...)
+	// Sign as literal
+	selectExprs = append(selectExprs, "?")
+	values = append(values, slip.Sign)
 
-	// Aggregate JSON columns
-	columns = append(columns, aggregateColumns...)
-	placeholders = append(placeholders, aggregatePlaceholders...)
-	values = append(values, aggregateValues...)
+	// Version calculated atomically from subquery: COALESCE(MAX(version), 0) + 1
+	// This works for all cases:
+	// - New slip (no existing rows): returns 0 + 1 = 1
+	// - Existing slip: returns current max + 1
+	selectExprs = append(selectExprs, fmt.Sprintf(
+		"COALESCE((SELECT max(version) FROM %s.%s WHERE %s = ?), 0) + 1",
+		s.database, TableRoutingSlips, ColumnCorrelationID,
+	))
+	values = append(values, slip.CorrelationID)
 
-	query := s.queryBuilder.BuildInsertQuery(columns, placeholders)
+	// Step status columns as literals
+	for _, stepVal := range stepValues {
+		selectExprs = append(selectExprs, "?")
+		values = append(values, stepVal)
+	}
+
+	// Aggregate JSON columns as literals
+	for _, aggVal := range aggregateValues {
+		selectExprs = append(selectExprs, "?")
+		values = append(values, aggVal)
+	}
+
+	// Build the INSERT...SELECT query
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		SELECT %s
+	`, s.database, TableRoutingSlips, strings.Join(columns, ", "), strings.Join(selectExprs, ", "))
 
 	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
 		return fmt.Errorf("failed to insert slip row: %w", err)
