@@ -42,6 +42,63 @@ func correlationIDToTraceID(correlationID string) (trace.TraceID, bool) {
 	return traceID, true
 }
 
+// ContextWithCorrelationTrace returns a context that uses the correlation ID as the trace ID.
+// This allows callers (like pushhookparser) to create a parent span that ties all subsequent
+// slippy operations together under a single trace rooted in the correlation ID.
+//
+// Usage:
+//
+//	ctx := slippy.ContextWithCorrelationTrace(ctx, correlationID)
+//	ctx, span := tracer.Start(ctx, "MyOperation")
+//	defer span.End()
+//	// All slippy calls with this ctx will be children of this span
+//	store.UpdateStep(ctx, correlationID, "build", "", slippy.StatusCompleted)
+//
+// If the context already has a valid trace, it is returned unchanged.
+// If the correlation ID cannot be parsed as a UUID, the original context is returned.
+func ContextWithCorrelationTrace(ctx context.Context, correlationID string) context.Context {
+	// Don't override an existing valid trace
+	if trace.SpanContextFromContext(ctx).IsValid() {
+		return ctx
+	}
+
+	traceID, ok := correlationIDToTraceID(correlationID)
+	if !ok {
+		return ctx
+	}
+
+	// Create a span context with the correlation ID as trace ID
+	spanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		TraceFlags: trace.FlagsSampled,
+	})
+
+	return trace.ContextWithSpanContext(ctx, spanCtx)
+}
+
+// StartSpan creates a new span with the given name, using the correlation ID as the trace ID
+// if no existing trace is present. This is the primary entry point for external callers
+// (like pushhookparser) to begin tracing a routing slip operation.
+//
+// The returned span should be ended with span.End() when the operation completes.
+// The returned context should be passed to all subsequent slippy operations.
+//
+// Usage:
+//
+//	ctx, span := slippy.StartSpan(ctx, "ProcessPush", correlationID)
+//	defer span.End()
+//	// All slippy operations using ctx will be children of this span
+func StartSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
+	// Ensure we have a trace context rooted in the correlation ID
+	ctx = ContextWithCorrelationTrace(ctx, correlationID)
+
+	return tracer().Start(ctx, operationName,
+		trace.WithAttributes(
+			attribute.String("slippy.correlation_id", correlationID),
+		),
+	)
+}
+
 // RetrySpan represents a traced retry operation with metrics collection.
 type RetrySpan struct {
 	ctx           context.Context

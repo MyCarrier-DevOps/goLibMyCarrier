@@ -180,3 +180,103 @@ func TestRetrySpan_AddAttribute(t *testing.T) {
 
 	retrySpan.EndSuccess()
 }
+
+func TestContextWithCorrelationTrace(t *testing.T) {
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+	expectedTraceIDHex := "550e8400e29b41d4a716446655440000"
+
+	// Start with a fresh context
+	ctx := context.Background()
+
+	// Apply correlation trace
+	ctx = ContextWithCorrelationTrace(ctx, correlationID)
+
+	// Verify the trace ID was set
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.TraceID().String() != expectedTraceIDHex {
+		t.Errorf("trace ID = %s, want %s", spanCtx.TraceID().String(), expectedTraceIDHex)
+	}
+}
+
+func TestContextWithCorrelationTrace_PreservesExisting(t *testing.T) {
+	existingTraceID := trace.TraceID{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	}
+	existingSpanID := trace.SpanID{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18}
+
+	existingSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    existingTraceID,
+		SpanID:     existingSpanID,
+		TraceFlags: trace.FlagsSampled,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), existingSpanCtx)
+
+	// Try to apply a different correlation ID
+	correlationID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	ctx = ContextWithCorrelationTrace(ctx, correlationID)
+
+	// Should still have the existing trace ID
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.TraceID() != existingTraceID {
+		t.Errorf("trace ID = %s, want existing %s", spanCtx.TraceID().String(), existingTraceID.String())
+	}
+}
+
+func TestContextWithCorrelationTrace_InvalidUUID(t *testing.T) {
+	ctx := context.Background()
+
+	// Invalid correlation ID should return context unchanged
+	ctx = ContextWithCorrelationTrace(ctx, "not-a-uuid")
+
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.IsValid() {
+		t.Error("expected invalid span context for invalid UUID")
+	}
+}
+
+func TestStartSpan(t *testing.T) {
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+	expectedTraceIDHex := "550e8400e29b41d4a716446655440000"
+
+	ctx := context.Background()
+
+	// Start a span using the public API
+	ctx, span := StartSpan(ctx, "ProcessPush", correlationID)
+	defer span.End()
+
+	// Verify the trace ID matches the correlation ID
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.TraceID().String() != expectedTraceIDHex {
+		t.Errorf("trace ID = %s, want %s", spanCtx.TraceID().String(), expectedTraceIDHex)
+	}
+
+	// Note: span.IsRecording() returns false with no-op tracer, which is expected in tests
+	// In production with a configured OTel provider, spans will be recording
+}
+
+func TestStartSpan_ChildOfExistingTrace(t *testing.T) {
+	existingTraceID := trace.TraceID{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	}
+	existingSpanID := trace.SpanID{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18}
+
+	existingSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    existingTraceID,
+		SpanID:     existingSpanID,
+		TraceFlags: trace.FlagsSampled,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), existingSpanCtx)
+
+	// Start a span - should be child of existing trace
+	correlationID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	ctx, span := StartSpan(ctx, "ProcessPush", correlationID)
+	defer span.End()
+
+	// Should preserve existing trace ID
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.TraceID() != existingTraceID {
+		t.Errorf("trace ID = %s, want existing %s", spanCtx.TraceID().String(), existingTraceID.String())
+	}
+}
