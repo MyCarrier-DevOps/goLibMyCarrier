@@ -22,6 +22,13 @@ func tracer() trace.Tracer {
 	return otel.Tracer(tracerName)
 }
 
+// Tracer returns the OpenTelemetry tracer for creating spans.
+// This is the public API for external packages (like pushhookparser) to create spans
+// that are properly instrumented under the slippy tracer name.
+func Tracer() trace.Tracer {
+	return tracer()
+}
+
 // correlationIDToTraceID converts a UUID correlation ID to an OpenTelemetry trace ID.
 // UUIDs are 128-bit, which matches the trace ID size exactly.
 // Example: "550e8400-e29b-41d4-a716-446655440000" -> [16]byte trace ID
