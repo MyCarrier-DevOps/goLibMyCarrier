@@ -2,9 +2,10 @@ package slippy
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Client is the main entry point for slippy operations.
@@ -142,125 +143,70 @@ func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, sta
 // Returns an error if the slip is already terminal.
 // Uses exponential backoff with jitter to handle concurrent modifications gracefully.
 func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy string) error {
-	// Start tracing span for the retry operation
-	retrySpan := startRetrySpan(ctx, "AbandonSlip", correlationID)
-	retrySpan.AddAttribute("slippy.superseded_by", supersededBy)
+	// Start tracing span
+	ctx, span := StartSpan(ctx, "AbandonSlip", correlationID)
+	defer span.End()
+	span.SetAttributes(attribute.String("slippy.superseded_by", supersededBy))
 
-	var lastErr error
-	startTime := time.Now()
+	slip, err := c.store.Load(ctx, correlationID)
+	if err != nil {
+		return NewSlipError("abandon", correlationID, err)
+	}
 
-	for attempt := 0; attempt <= DefaultMaxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time
-		if time.Since(startTime) > retryMaxTotalTime {
-			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-			retrySpan.EndError(err)
-			return NewSlipError("abandon", correlationID, err)
-		}
-
-		slip, err := c.store.Load(retrySpan.Context(), correlationID)
-		if err != nil {
-			retrySpan.EndError(err)
-			return NewSlipError("abandon", correlationID, err)
-		}
-
-		if c.checkTerminalStatus(retrySpan.Context(), slip, "abandon") {
-			retrySpan.EndSuccess()
-			return nil
-		}
-
-		slip.Status = SlipStatusAbandoned
-		if err := c.store.Update(retrySpan.Context(), slip); err != nil {
-			// Check if this is a version conflict error (transient, keep retrying)
-			if errors.Is(err, ErrVersionConflict) {
-				lastErr = err
-				// Apply exponential backoff with jitter before retrying
-				backoff := calculateBackoff(attempt)
-				retrySpan.RecordAttempt(backoff.Milliseconds())
-				time.Sleep(backoff)
-				continue
-			}
-			// Non-retryable error
-			retrySpan.EndError(err)
-			return NewSlipError("abandon", correlationID, err)
-		}
-
-		c.logger.Info(retrySpan.Context(), "Abandoned slip", map[string]interface{}{
-			"correlation_id": correlationID,
-			"superseded_by":  supersededBy,
-		})
-		retrySpan.EndSuccess()
+	if c.checkTerminalStatus(ctx, slip, "abandon") {
 		return nil
 	}
 
-	// All retries exhausted
-	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
-	retrySpan.EndError(err)
-	return NewSlipError("abandon", correlationID, err)
+	slip.Status = SlipStatusAbandoned
+
+	// Use ForceUpdate to skip the optimistic locking check that would cause retries
+	// during high concurrency. The atomic versioning in insertRow still ensures
+	// correct, incrementing versions for VersionedCollapsingMergeTree.
+	if err := c.store.ForceUpdate(ctx, slip); err != nil {
+		return NewSlipError("abandon", correlationID, err)
+	}
+
+	c.logger.Info(ctx, "Abandoned slip", map[string]interface{}{
+		"correlation_id": correlationID,
+		"superseded_by":  supersededBy,
+	})
+	return nil
 }
 
 // PromoteSlip marks a slip as promoted, indicating its code was promoted to another branch
 // via a PR merge (typically squash merge). Unlike abandon, this is a successful outcome -
 // the slip's work continues in the new slip on the target branch.
 // The promotedTo parameter records the correlation ID of the new slip for bidirectional linking.
-// Uses exponential backoff with jitter to handle concurrent modifications gracefully.
 func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo string) error {
-	// Start tracing span for the retry operation
-	retrySpan := startRetrySpan(ctx, "PromoteSlip", correlationID)
-	retrySpan.AddAttribute("slippy.promoted_to", promotedTo)
+	// Start tracing span
+	ctx, span := StartSpan(ctx, "PromoteSlip", correlationID)
+	defer span.End()
+	span.SetAttributes(attribute.String("slippy.promoted_to", promotedTo))
 
-	var lastErr error
-	startTime := time.Now()
+	slip, err := c.store.Load(ctx, correlationID)
+	if err != nil {
+		return NewSlipError("promote", correlationID, err)
+	}
 
-	for attempt := 0; attempt <= DefaultMaxUpdateRetries; attempt++ {
-		// Check if we've exceeded total retry time
-		if time.Since(startTime) > retryMaxTotalTime {
-			err := fmt.Errorf("%w: exceeded maximum retry time of %v: last error: %w",
-				ErrMaxRetriesExceeded, retryMaxTotalTime, lastErr)
-			retrySpan.EndError(err)
-			return NewSlipError("promote", correlationID, err)
-		}
-
-		slip, err := c.store.Load(retrySpan.Context(), correlationID)
-		if err != nil {
-			retrySpan.EndError(err)
-			return NewSlipError("promote", correlationID, err)
-		}
-
-		if c.checkTerminalStatus(retrySpan.Context(), slip, "promote") {
-			retrySpan.EndSuccess()
-			return nil
-		}
-
-		slip.Status = SlipStatusPromoted
-		slip.PromotedTo = promotedTo
-		if err := c.store.Update(retrySpan.Context(), slip); err != nil {
-			// Check if this is a version conflict error (transient, keep retrying)
-			if errors.Is(err, ErrVersionConflict) {
-				lastErr = err
-				// Apply exponential backoff with jitter before retrying
-				backoff := calculateBackoff(attempt)
-				retrySpan.RecordAttempt(backoff.Milliseconds())
-				time.Sleep(backoff)
-				continue
-			}
-			// Non-retryable error
-			retrySpan.EndError(err)
-			return NewSlipError("promote", correlationID, err)
-		}
-
-		c.logger.Info(retrySpan.Context(), "Promoted slip", map[string]interface{}{
-			"correlation_id": correlationID,
-			"promoted_to":    promotedTo,
-		})
-		retrySpan.EndSuccess()
+	if c.checkTerminalStatus(ctx, slip, "promote") {
 		return nil
 	}
 
-	// All retries exhausted
-	err := fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
-	retrySpan.EndError(err)
-	return NewSlipError("promote", correlationID, err)
+	slip.Status = SlipStatusPromoted
+	slip.PromotedTo = promotedTo
+
+	// Use ForceUpdate to skip the optimistic locking check that would cause retries
+	// during high concurrency. The atomic versioning in insertRow still ensures
+	// correct, incrementing versions for VersionedCollapsingMergeTree.
+	if err := c.store.ForceUpdate(ctx, slip); err != nil {
+		return NewSlipError("promote", correlationID, err)
+	}
+
+	c.logger.Info(ctx, "Promoted slip", map[string]interface{}{
+		"correlation_id": correlationID,
+		"promoted_to":    promotedTo,
+	})
+	return nil
 }
 
 // Close releases resources held by the client.

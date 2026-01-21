@@ -477,6 +477,42 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	return nil
 }
 
+// ForceUpdate writes the slip to the database without optimistic locking checks.
+// This should ONLY be used for terminal state transitions (abandoned, promoted, completed)
+// where we want to write the state regardless of concurrent modifications.
+// The atomic versioning in insertRow still ensures unique version numbers.
+//
+// WARNING: Using this for non-terminal updates could cause lost updates. Use Update() instead.
+func (s *ClickHouseStore) ForceUpdate(ctx context.Context, slip *Slip) error {
+	// Update updated_at timestamp
+	slip.UpdatedAt = time.Now()
+
+	// Create a deep copy for the cancel row to prevent shared map/slice references
+	cancelSlip := deepCopySlip(slip)
+	cancelSlip.Sign = -1
+
+	// Insert the cancel row (version calculated atomically)
+	if err := s.insertRow(ctx, cancelSlip); err != nil {
+		return fmt.Errorf("failed to insert cancel row: %w", err)
+	}
+
+	// Insert the new state (version calculated atomically as max + 1)
+	slip.Sign = 1
+
+	if err := s.insertRow(ctx, slip); err != nil {
+		return fmt.Errorf("failed to insert new row: %w", err)
+	}
+
+	// Run OPTIMIZE TABLE if enabled
+	if s.optimizeAfterWrite {
+		if err := s.OptimizeTable(ctx); err != nil {
+			return fmt.Errorf("failed to optimize table after update: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // UpdateStep updates a specific step's status with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
 // If a concurrent modification is detected, the slip is reloaded and the update is retried
