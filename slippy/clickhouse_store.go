@@ -268,7 +268,7 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		slip.Sign = 1
 	}
 
-	if err := s.insertRow(ctx, slip); err != nil {
+	if err := s.insertRow(ctx, slip, 0); err != nil {
 		return fmt.Errorf("failed to create slip: %w", err)
 	}
 
@@ -435,6 +435,9 @@ func (s *ClickHouseStore) FindAllByCommits(
 // using a subquery (COALESCE(MAX(version), 0) + 1). This eliminates the race condition window
 // between reading the version and writing the row, ensuring that concurrent updates always
 // produce unique, incrementing versions.
+//
+// VersionedCollapsingMergeTree Semantics: Cancel rows MUST have the same version as the row
+// they cancel (with sign=-1). New state rows get the next version (with sign=1).
 func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Get the current max version for optimistic locking check
 	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
@@ -455,15 +458,16 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	cancelSlip := deepCopySlip(slip)
 	cancelSlip.Sign = -1
 
-	// Insert the cancel row (version calculated atomically)
-	if err := s.insertRow(ctx, cancelSlip); err != nil {
+	// Insert the cancel row with the SAME version as the row being canceled.
+	// VersionedCollapsingMergeTree requires matching versions for collapsing.
+	if err := s.insertRow(ctx, cancelSlip, currentVersion); err != nil {
 		return fmt.Errorf("failed to insert cancel row: %w", err)
 	}
 
-	// Insert the new state (version calculated atomically as max + 1)
+	// Insert the new state with atomically calculated next version (pass 0 to auto-calculate)
 	slip.Sign = 1
 
-	if err := s.insertRow(ctx, slip); err != nil {
+	if err := s.insertRow(ctx, slip, 0); err != nil {
 		return fmt.Errorf("failed to insert new row: %w", err)
 	}
 
@@ -480,10 +484,18 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 // ForceUpdate writes the slip to the database without optimistic locking checks.
 // This should ONLY be used for terminal state transitions (abandoned, promoted, completed)
 // where we want to write the state regardless of concurrent modifications.
-// The atomic versioning in insertRow still ensures unique version numbers.
+//
+// VersionedCollapsingMergeTree Semantics: Cancel rows MUST have the same version as the row
+// they cancel (with sign=-1). New state rows get the next version (with sign=1).
 //
 // WARNING: Using this for non-terminal updates could cause lost updates. Use Update() instead.
 func (s *ClickHouseStore) ForceUpdate(ctx context.Context, slip *Slip) error {
+	// Get the current max version for the cancel row
+	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
+	if err != nil {
+		return fmt.Errorf("failed to get current version: %w", err)
+	}
+
 	// Update updated_at timestamp
 	slip.UpdatedAt = time.Now()
 
@@ -491,15 +503,16 @@ func (s *ClickHouseStore) ForceUpdate(ctx context.Context, slip *Slip) error {
 	cancelSlip := deepCopySlip(slip)
 	cancelSlip.Sign = -1
 
-	// Insert the cancel row (version calculated atomically)
-	if err := s.insertRow(ctx, cancelSlip); err != nil {
+	// Insert the cancel row with the SAME version as the row being canceled.
+	// VersionedCollapsingMergeTree requires matching versions for collapsing.
+	if err := s.insertRow(ctx, cancelSlip, currentVersion); err != nil {
 		return fmt.Errorf("failed to insert cancel row: %w", err)
 	}
 
-	// Insert the new state (version calculated atomically as max + 1)
+	// Insert the new state with atomically calculated next version (pass 0 to auto-calculate)
 	slip.Sign = 1
 
-	if err := s.insertRow(ctx, slip); err != nil {
+	if err := s.insertRow(ctx, slip, 0); err != nil {
 		return fmt.Errorf("failed to insert new row: %w", err)
 	}
 
@@ -732,11 +745,14 @@ func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID strin
 	return uint32(maxVersion.Int64), nil
 }
 
-// insertRow inserts a single row using INSERT...SELECT with atomic version calculation.
-// The version is calculated as COALESCE(MAX(version), 0) + 1 within the INSERT statement,
-// eliminating race conditions between concurrent updates.
-// Used by both Create (for new slips) and Update (for cancel and new rows).
-func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
+// insertRow inserts a single row into the routing_slips table.
+// If version is 0, the version is calculated atomically as COALESCE(MAX(version), 0) + 1.
+// If version is non-zero, that specific version is used (for cancel rows in VersionedCollapsingMergeTree).
+//
+// VersionedCollapsingMergeTree requires:
+// - Cancel rows (sign=-1) must have the SAME version as the row they cancel
+// - New state rows (sign=1) get the next version
+func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uint32) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
@@ -775,7 +791,7 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 	columns = append(columns, stepColumns...)
 	columns = append(columns, aggregateColumns...)
 
-	// Build SELECT expressions - all literals except version which uses a subquery
+	// Build SELECT expressions - all literals except version which may use a subquery
 	var selectExprs []string
 	var values []interface{}
 
@@ -798,15 +814,22 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 	selectExprs = append(selectExprs, "?")
 	values = append(values, slip.Sign)
 
-	// Version calculated atomically from subquery: COALESCE(MAX(version), 0) + 1
-	// This works for all cases:
-	// - New slip (no existing rows): returns 0 + 1 = 1
-	// - Existing slip: returns current max + 1
-	selectExprs = append(selectExprs, fmt.Sprintf(
-		"COALESCE((SELECT max(version) FROM %s.%s WHERE %s = ?), 0) + 1",
-		s.database, TableRoutingSlips, ColumnCorrelationID,
-	))
-	values = append(values, slip.CorrelationID)
+	// Version: use provided version or calculate atomically
+	if version > 0 {
+		// Use the specific version provided (for cancel rows)
+		selectExprs = append(selectExprs, "?")
+		values = append(values, version)
+	} else {
+		// Calculate atomically from subquery: COALESCE(MAX(version), 0) + 1
+		// This works for all cases:
+		// - New slip (no existing rows): returns 0 + 1 = 1
+		// - Existing slip: returns current max + 1
+		selectExprs = append(selectExprs, fmt.Sprintf(
+			"COALESCE((SELECT max(version) FROM %s.%s WHERE %s = ?), 0) + 1",
+			s.database, TableRoutingSlips, ColumnCorrelationID,
+		))
+		values = append(values, slip.CorrelationID)
+	}
 
 	// Step status columns as literals
 	for _, stepVal := range stepValues {
