@@ -1497,6 +1497,12 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		updated := false
 		var maxTime time.Time
 
+		// Track the components that have actual state from the event sourcing table.
+		// These are the source of truth for aggregate status calculation.
+		// Original placeholder components (from pipeline config) that have no matching
+		// state entries should NOT be considered when computing aggregate status.
+		activeComponents := make([]ComponentStepData, 0, len(stepStates))
+
 		// Process each component state
 		for componentName, state := range stepStates {
 			ts := state.Timestamp
@@ -1504,45 +1510,49 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 				maxTime = ts
 			}
 
+			compData := ComponentStepData{
+				Component: componentName,
+				Status:    StepStatus(state.Status),
+			}
+			if state.Message != "" {
+				compData.Error = state.Message
+			}
+			if StepStatus(state.Status).IsRunning() {
+				compData.StartedAt = &ts
+			}
+			if StepStatus(state.Status).IsTerminal() {
+				compData.CompletedAt = &ts
+			}
+
+			// Track this component for aggregate status calculation
+			activeComponents = append(activeComponents, compData)
+
 			if idx, exists := existingComponents[componentName]; exists {
 				// Update existing component entry
-				slip.Aggregates[aggregateColumn][idx].Status = StepStatus(state.Status)
-				if state.Message != "" {
-					slip.Aggregates[aggregateColumn][idx].Error = state.Message
+				slip.Aggregates[aggregateColumn][idx].Status = compData.Status
+				if compData.Error != "" {
+					slip.Aggregates[aggregateColumn][idx].Error = compData.Error
 				}
-
-				if StepStatus(state.Status).IsRunning() && slip.Aggregates[aggregateColumn][idx].StartedAt == nil {
-					slip.Aggregates[aggregateColumn][idx].StartedAt = &ts
+				if compData.StartedAt != nil && slip.Aggregates[aggregateColumn][idx].StartedAt == nil {
+					slip.Aggregates[aggregateColumn][idx].StartedAt = compData.StartedAt
 				}
-				if StepStatus(state.Status).IsTerminal() && slip.Aggregates[aggregateColumn][idx].CompletedAt == nil {
-					slip.Aggregates[aggregateColumn][idx].CompletedAt = &ts
+				if compData.CompletedAt != nil && slip.Aggregates[aggregateColumn][idx].CompletedAt == nil {
+					slip.Aggregates[aggregateColumn][idx].CompletedAt = compData.CompletedAt
 				}
 			} else {
 				// Add new component entry - this handles the case where the aggregate
 				// was empty ({"items":[]}) but component states exist in the event sourcing table
-				newComp := ComponentStepData{
-					Component: componentName,
-					Status:    StepStatus(state.Status),
-				}
-				if state.Message != "" {
-					newComp.Error = state.Message
-				}
-				if StepStatus(state.Status).IsRunning() {
-					newComp.StartedAt = &ts
-				}
-				if StepStatus(state.Status).IsTerminal() {
-					newComp.CompletedAt = &ts
-				}
-
-				// Append to the aggregate
-				slip.Aggregates[aggregateColumn] = append(slip.Aggregates[aggregateColumn], newComp)
+				slip.Aggregates[aggregateColumn] = append(slip.Aggregates[aggregateColumn], compData)
 			}
 			updated = true
 		}
 
 		if updated {
-			// Recompute the step status based on updated components
-			newStatus := s.computeAggregateStatus(slip.Aggregates[aggregateColumn])
+			// Recompute the step status based on ACTIVE components only.
+			// Active components are those with entries in the component_states table.
+			// This excludes original placeholder components that have different names
+			// from the actual workflow component names.
+			newStatus := s.computeAggregateStatus(activeComponents)
 
 			// Update the step status only if the step exists.
 			step, ok := slip.Steps[aggregateStepName]

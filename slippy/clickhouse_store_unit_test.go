@@ -1035,7 +1035,7 @@ func TestClickHouseStore_Load_HydratesComponentStates_AggregateStepName(t *testi
 		t.Errorf("expected new component status completed, got %s", newComponent.Status)
 	}
 
-	// Original components should still be pending
+	// Original components should still be pending (they are placeholders, not updated)
 	for _, comp := range components {
 		if comp.Component == "ExampleApi" || comp.Component == "ExampleWorker" {
 			if comp.Status != StepStatusPending {
@@ -1044,10 +1044,125 @@ func TestClickHouseStore_Load_HydratesComponentStates_AggregateStepName(t *testi
 		}
 	}
 
-	// Aggregate step status should be "running" (some completed, some pending)
+	// Aggregate step status should be "completed" because the ONLY component state
+	// (mc.example.api) is completed. The original placeholder components (ExampleApi,
+	// ExampleWorker) don't have component state entries, so they are not considered
+	// when computing the aggregate status.
 	aggregateStep := slip.Steps[aggregateStepName]
-	if aggregateStep.Status != StepStatusRunning {
-		t.Errorf("expected aggregate step running (mixed states), got %s", aggregateStep.Status)
+	if aggregateStep.Status != StepStatusCompleted {
+		t.Errorf(
+			"expected aggregate step completed (only active component state is completed), got %s",
+			aggregateStep.Status,
+		)
+	}
+}
+
+// TestClickHouseStore_HydrateSlip_AllComponentStatesCompleted_AggregateCompleted tests
+// the scenario where ALL component states in the event sourcing table are completed,
+// but the original pipeline components have different names (e.g., "ExampleApi" vs "mc.example.api").
+// The aggregate status should be COMPLETED because all actual work is done,
+// regardless of the original placeholder components.
+//
+// This reproduces the production issue where:
+// - Pipeline defines: ExampleApi, ExampleWorker, etc. (pending placeholders)
+// - Workflows report: mc.example.api, mc.example.worker, etc. (completed)
+// - Expected: builds_status = "completed" (all real work is done)
+// - Actual bug: builds_status = "running" (mixed pending/completed)
+func TestClickHouseStore_HydrateSlip_AllComponentStatesCompleted_AggregateCompleted(t *testing.T) {
+	stateTimestamp := time.Now()
+	config := testPipelineConfig()
+	aggregateStepName := config.GetAggregateStep("build") // "builds"
+
+	// Mock returns ALL component states as completed (6 components like production)
+	componentNames := []string{
+		"mc.example.api",
+		"mc.example.inboundintegration.worker",
+		"mc.example.migrationtool",
+		"mc.example.outboundintegration.worker",
+		"mc.example.sagas.worker",
+		"tests",
+	}
+	currentIdx := 0
+
+	mockRows := &clickhousetest.MockRows{
+		NextFunc: func() bool {
+			return currentIdx < len(componentNames)
+		},
+		ScanFunc: func(dest ...any) error {
+			if ptr, ok := dest[0].(*string); ok {
+				*ptr = aggregateStepName // step = "builds"
+			}
+			if ptr, ok := dest[1].(*string); ok {
+				*ptr = componentNames[currentIdx] // component name
+			}
+			if ptr, ok := dest[2].(*string); ok {
+				*ptr = string(StepStatusCompleted) // ALL are completed
+			}
+			if ptr, ok := dest[3].(*string); ok {
+				*ptr = "build succeeded"
+			}
+			if ptr, ok := dest[4].(*time.Time); ok {
+				*ptr = stateTimestamp
+			}
+			currentIdx++
+			return nil
+		},
+	}
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return mockRows, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, config, "ci")
+
+	// Initial slip has DIFFERENT component names (from pipeline definition)
+	// These are placeholders that don't match the actual workflow component names
+	slip := &Slip{
+		CorrelationID: "test-corr-001",
+		Aggregates: map[string][]ComponentStepData{
+			aggregateStepName: {
+				{Component: "ExampleApi", Status: StepStatusPending},
+				{Component: "ExampleInboundIntegrationWorker", Status: StepStatusPending},
+				{Component: "ExampleMigrationTool", Status: StepStatusPending},
+				{Component: "ExampleOutboundIntegrationWorker", Status: StepStatusPending},
+				{Component: "ExampleSagasWorker", Status: StepStatusPending},
+				{Component: "testing.MCExampleAutomatedTests/Tests", Status: StepStatusPending},
+			},
+		},
+		Steps: map[string]Step{
+			aggregateStepName: {Status: StepStatusPending},
+		},
+	}
+
+	err := store.hydrateSlip(context.Background(), slip)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Should have 12 components: 6 original (pending) + 6 new (completed)
+	components := slip.Aggregates[aggregateStepName]
+	t.Logf("After hydration, %d components in aggregate:", len(components))
+	for _, c := range components {
+		t.Logf("  - %s: %s", c.Component, c.Status)
+	}
+
+	// Count completed components from event sourcing
+	completedCount := 0
+	for _, c := range components {
+		if c.Status == StepStatusCompleted {
+			completedCount++
+		}
+	}
+	t.Logf("Completed components: %d", completedCount)
+
+	// THE KEY ASSERTION: Since all 6 actual component states are completed,
+	// the aggregate status SHOULD be "completed", not "running".
+	// The original pending placeholders should not prevent completion.
+	aggregateStep := slip.Steps[aggregateStepName]
+	if aggregateStep.Status != StepStatusCompleted {
+		t.Errorf("expected aggregate step COMPLETED (all component states are completed), got %s", aggregateStep.Status)
+		t.Log("This is the production bug: aggregate remains 'running' because original")
+		t.Log("placeholder components (ExampleApi) don't match workflow names (mc.example.api)")
 	}
 }
 

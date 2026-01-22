@@ -224,7 +224,8 @@ func (s *testClickhouseSession) Conn() ch.Conn {
 	return s.conn
 }
 
-// createIntegrationTestSlip creates a slip with the given components for integration testing
+// createIntegrationTestSlip creates a slip with the given components for integration testing.
+// Uses the correct aggregate step names from the pipeline config (e.g., "builds_completed" not "builds").
 func createIntegrationTestSlip(correlationID string, components []string, pipelineConfig *PipelineConfig) *Slip {
 	slip := &Slip{
 		CorrelationID: correlationID,
@@ -246,21 +247,22 @@ func createIntegrationTestSlip(correlationID string, components []string, pipeli
 		slip.Steps[step.Name] = Step{Status: StepStatusPending}
 	}
 
-	// Initialize components for builds and unit_tests aggregates
-	buildsData := make([]ComponentStepData, 0, len(components))
-	unitTestsData := make([]ComponentStepData, 0, len(components))
-	for _, comp := range components {
-		buildsData = append(buildsData, ComponentStepData{
-			Component: comp,
-			Status:    StepStatusPending,
-		})
-		unitTestsData = append(unitTestsData, ComponentStepData{
-			Component: comp,
-			Status:    StepStatusPending,
-		})
+	// Initialize components for each aggregate step using correct step names.
+	// The aggregate step name (e.g., "builds_completed") is the key, not the step type (e.g., "build").
+	for _, step := range pipelineConfig.Steps {
+		if step.Aggregates != "" {
+			// This is an aggregate step - initialize components
+			aggregateData := make([]ComponentStepData, 0, len(components))
+			for _, comp := range components {
+				aggregateData = append(aggregateData, ComponentStepData{
+					Component: comp,
+					Status:    StepStatusPending,
+				})
+			}
+			// Use the step NAME (e.g., "builds_completed") as the aggregate key
+			slip.Aggregates[step.Name] = aggregateData
+		}
 	}
-	slip.Aggregates["builds"] = buildsData
-	slip.Aggregates["unit_tests"] = unitTestsData
 
 	return slip
 }
@@ -327,20 +329,22 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		t.Logf("Completing build for component %d: %s", i+1, component)
 
 		// UpdateComponentStatus signature: (ctx, correlationID, componentName, stepType, status)
+		// stepType is "build" (the Aggregates field value), not "builds" or "builds_completed"
 		if err := store.UpdateComponentStatus(
 			ctx,
 			correlationID,
 			component,
-			"builds",
+			"build",
 			StepStatusCompleted,
 		); err != nil {
 			t.Fatalf("failed to update build for %s: %v", component, err)
 		}
 
 		// Query raw data directly from ClickHouse
+		// Note: The aggregate column is named after the step name (builds_completed)
 		session := store.Session()
 		rows, err := session.QueryWithArgs(ctx, `
-			SELECT version, sign, builds 
+			SELECT version, sign, builds_completed 
 			FROM ci_test.routing_slips FINAL 
 			WHERE correlation_id = $1
 		`, correlationID)
@@ -351,15 +355,15 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 			for rows.Next() {
 				var version uint64
 				var sign int8
-				builds := chcol.NewJSON()
-				if err := rows.Scan(&version, &sign, builds); err != nil {
+				buildsCompleted := chcol.NewJSON()
+				if err := rows.Scan(&version, &sign, buildsCompleted); err != nil {
 					t.Logf("  → Error scanning: %v", err)
 				} else {
 					// Marshal to get the literal JSON representation
-					jsonBytes, _ := builds.MarshalJSON()
+					jsonBytes, _ := buildsCompleted.MarshalJSON()
 					t.Logf("  → Raw ClickHouse row after update %d:", i+1)
 					t.Logf("      version=%d sign=%d", version, sign)
-					t.Logf("      builds=%s", string(jsonBytes))
+					t.Logf("      builds_completed=%s", string(jsonBytes))
 				}
 			}
 		}
@@ -388,7 +392,7 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 	// Query final raw data directly from ClickHouse
 	session := store.Session()
 	rows, err := session.QueryWithArgs(ctx, `
-		SELECT version, sign, builds 
+		SELECT version, sign, builds_completed 
 		FROM ci_test.routing_slips FINAL 
 		WHERE correlation_id = $1
 	`, correlationID)
@@ -399,25 +403,26 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		for rows.Next() {
 			var finalVersion uint64
 			var finalSign int8
-			builds := chcol.NewJSON()
-			if err := rows.Scan(&finalVersion, &finalSign, builds); err != nil {
+			buildsCompleted := chcol.NewJSON()
+			if err := rows.Scan(&finalVersion, &finalSign, buildsCompleted); err != nil {
 				t.Logf("Error scanning final row: %v", err)
 			} else {
 				// Marshal to get the literal JSON representation
-				jsonBytes, _ := builds.MarshalJSON()
+				jsonBytes, _ := buildsCompleted.MarshalJSON()
 				t.Log("")
 				t.Log("═══════════════════════════════════════════════════════════════")
 				t.Log("FINAL RAW CLICKHOUSE ROW")
 				t.Log("═══════════════════════════════════════════════════════════════")
 				t.Logf("version=%d sign=%d", finalVersion, finalSign)
-				t.Logf("builds=%s", string(jsonBytes))
+				t.Logf("builds_completed=%s", string(jsonBytes))
 				t.Log("═══════════════════════════════════════════════════════════════")
 				t.Log("")
 			}
 		}
 	}
 
-	buildsData := finalSlip.Aggregates["builds"]
+	// Aggregates are keyed by step name (builds_completed), not step type (build)
+	buildsData := finalSlip.Aggregates["builds_completed"]
 
 	if len(buildsData) != len(components) {
 		t.Errorf("expected %d builds, got %d", len(components), len(buildsData))
@@ -517,7 +522,8 @@ func TestVersionedCollapsingMergeTree_ConcurrentUpdates(t *testing.T) {
 
 			t.Logf("Goroutine starting update for component: %s", comp)
 			// UpdateComponentStatus signature: (ctx, correlationID, componentName, stepType, status)
-			if err := store.UpdateComponentStatus(ctx, correlationID, comp, "builds", StepStatusCompleted); err != nil {
+			// stepType is "build" (the Aggregates field value), not "builds"
+			if err := store.UpdateComponentStatus(ctx, correlationID, comp, "build", StepStatusCompleted); err != nil {
 				errChan <- fmt.Errorf("failed to update build for %s: %w", comp, err)
 				return
 			}
@@ -544,7 +550,8 @@ func TestVersionedCollapsingMergeTree_ConcurrentUpdates(t *testing.T) {
 		t.Fatalf("failed to load final slip: %v", err)
 	}
 
-	buildsData := finalSlip.Aggregates["builds"]
+	// Aggregates are keyed by step name (builds_completed), not step type (build)
+	buildsData := finalSlip.Aggregates["builds_completed"]
 	t.Logf("Final slip builds after concurrent updates: %+v", buildsData)
 	t.Logf("Final slip version: %d, sign: %d", finalSlip.Version, finalSlip.Sign)
 
@@ -614,7 +621,8 @@ func TestVersionedCollapsingMergeTree_QueryWithFinal(t *testing.T) {
 	}
 
 	// Update component status
-	if err := store.UpdateComponentStatus(ctx, correlationID, "api", "builds", StepStatusCompleted); err != nil {
+	// stepType is "build" (the Aggregates field value), not "builds"
+	if err := store.UpdateComponentStatus(ctx, correlationID, "api", "build", StepStatusCompleted); err != nil {
 		t.Fatalf("failed to update build for api: %v", err)
 	}
 
@@ -631,8 +639,8 @@ func TestVersionedCollapsingMergeTree_QueryWithFinal(t *testing.T) {
 		t.Errorf("expected push_parsed to be completed, got %s", loadedSlip.Steps["push_parsed"].Status)
 	}
 
-	// Find the api build
-	buildsData := loadedSlip.Aggregates["builds"]
+	// Find the api build (aggregates keyed by step name, not step type)
+	buildsData := loadedSlip.Aggregates["builds_completed"]
 	var apiBuild *ComponentStepData
 	for i := range buildsData {
 		if buildsData[i].Component == "api" {
@@ -695,9 +703,12 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 	slip.CommitSHA = expectedCommit
 	slip.Ancestry = []AncestryEntry{{CommitSHA: "parent123", CorrelationID: "parent-corr"}}
 
-	// Add image tags to builds
-	for i := range slip.Aggregates["builds"] {
-		slip.Aggregates["builds"][i].ImageTag = fmt.Sprintf("%s:v1.0.0", slip.Aggregates["builds"][i].Component)
+	// Add image tags to builds (aggregates keyed by step name "builds_completed")
+	for i := range slip.Aggregates["builds_completed"] {
+		slip.Aggregates["builds_completed"][i].ImageTag = fmt.Sprintf(
+			"%s:v1.0.0",
+			slip.Aggregates["builds_completed"][i].Component,
+		)
 	}
 
 	if err := store.Create(ctx, slip); err != nil {
@@ -710,7 +721,8 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 	}
 
 	for _, comp := range components {
-		if err := store.UpdateComponentStatus(ctx, correlationID, comp, "builds", StepStatusCompleted); err != nil {
+		// stepType is "build" (the Aggregates field value), not "builds"
+		if err := store.UpdateComponentStatus(ctx, correlationID, comp, "build", StepStatusCompleted); err != nil {
 			t.Fatalf("failed to update build for %s: %v", comp, err)
 		}
 	}
@@ -748,8 +760,8 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 		t.Errorf("ancestry commit SHA mismatch: expected parent123, got %s", finalSlip.Ancestry[0].CommitSHA)
 	}
 
-	// Verify all builds have their data
-	buildsData := finalSlip.Aggregates["builds"]
+	// Verify all builds have their data (aggregates keyed by step name "builds_completed")
+	buildsData := finalSlip.Aggregates["builds_completed"]
 	buildsByComponent := make(map[string]ComponentStepData)
 	for _, build := range buildsData {
 		buildsByComponent[build.Component] = build
@@ -853,8 +865,15 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 		}
 	}
 
-	// Initialize the "builds_completed" aggregate with our components
-	// Per default.json, "builds_completed" step has aggregates="build" but the column/map key is the step name
+	// Find the aggregate step name that aggregates "build" components.
+	// In default.json, this is "builds" (not "builds_completed").
+	aggregateStepName := pipelineConfig.GetAggregateStep("build")
+	if aggregateStepName == "" {
+		t.Fatalf("no aggregate step found for 'build' component step")
+	}
+	t.Logf("Using aggregate step: %s", aggregateStepName)
+
+	// Initialize the aggregate with our components using the correct step name from config
 	buildComponents := make([]ComponentStepData, len(components))
 	for i, comp := range components {
 		buildComponents[i] = ComponentStepData{
@@ -862,7 +881,7 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 			Status:    StepStatusPending,
 		}
 	}
-	slip.Aggregates["builds_completed"] = buildComponents
+	slip.Aggregates[aggregateStepName] = buildComponents
 
 	// Create the initial slip
 	if err := store.Create(ctx, slip); err != nil {
@@ -870,10 +889,9 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 	}
 
 	t.Logf("Created slip %s with initial version %d", correlationID, slip.Version)
-	t.Logf("Components in 'build' aggregate: %v", components)
+	t.Logf("Components in '%s' aggregate: %v", aggregateStepName, components)
 
-	// Each worker will update a different component in the "build" aggregate step
-	// The step name is "builds_completed" which has aggregates="build" in default.json
+	// Each worker will update a different component in the aggregate step
 	// When calling UpdateStep with componentName, it writes to the component states table
 	numConcurrentUpdates := len(components)
 
@@ -887,15 +905,14 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 
 	for i := 0; i < numConcurrentUpdates; i++ {
 		wg.Add(1)
-		go func(workerID int, componentName string) {
+		go func(workerID int, componentName string, stepName string) {
 			defer wg.Done()
 
 			// Wait for all goroutines to be ready
 			startWg.Wait()
 
-			// Each worker updates a DIFFERENT component in the builds_completed step
+			// Each worker updates a DIFFERENT component in the aggregate step
 			// UpdateStep handles optimistic locking with retry via component state event sourcing
-			stepName := "builds_completed"
 			t.Logf("Worker %d: updating %s/%s to completed", workerID, stepName, componentName)
 
 			if err := store.UpdateStep(ctx, correlationID, stepName, componentName, StepStatusCompleted); err != nil {
@@ -905,7 +922,7 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 
 			t.Logf("Worker %d: %s/%s completed successfully", workerID, stepName, componentName)
 			successCount <- workerID
-		}(i, components[i])
+		}(i, components[i], aggregateStepName)
 	}
 
 	// Start all goroutines simultaneously
@@ -986,16 +1003,16 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 	}
 
 	// CRITICAL CHECK 2: Verify ALL component updates accumulated in the final slip
-	// Component states are stored in the "builds_completed" aggregate (step name, not "aggregates" value)
+	// Component states are stored in the aggregate step name from config
 	t.Log("")
 	t.Log("═══════════════════════════════════════════════════════════════")
-	t.Log("VERIFYING DATA ACCUMULATION IN 'builds_completed' AGGREGATE")
+	t.Logf("VERIFYING DATA ACCUMULATION IN '%s' AGGREGATE", aggregateStepName)
 	t.Log("═══════════════════════════════════════════════════════════════")
 
-	buildAggregate, exists := finalSlip.Aggregates["builds_completed"]
+	buildAggregate, exists := finalSlip.Aggregates[aggregateStepName]
 	if !exists {
 		t.Logf("Available aggregates: %v", finalSlip.Aggregates)
-		t.Fatalf("'builds_completed' aggregate not found in final slip - hydration may have failed")
+		t.Fatalf("'%s' aggregate not found in final slip - hydration may have failed", aggregateStepName)
 	}
 
 	// Build a map for easier lookup
@@ -1015,7 +1032,7 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 				fmt.Sprintf("%s (status=%s, expected=completed)", comp, status),
 			)
 		} else {
-			t.Logf("  ✓ builds_completed/%s = %s", comp, status)
+			t.Logf("  ✓ %s/%s = %s", aggregateStepName, comp, status)
 		}
 	}
 	t.Log("═══════════════════════════════════════════════════════════════")
@@ -1224,11 +1241,10 @@ func TestHydrateSlip_EmptyAggregates(t *testing.T) {
 		Branch:        "main",
 		CommitSHA:     "abc123def456",
 		Status:        SlipStatusInProgress,
+		// Steps match the pipeline config: push_parsed, builds_completed, unit_tests_completed, dev_deploy
 		Steps: map[string]Step{
 			"push_parsed":          {Status: StepStatusCompleted},
-			"builds":               {Status: StepStatusPending},
 			"builds_completed":     {Status: StepStatusRunning}, // Running, waiting for components
-			"unit_tests":           {Status: StepStatusPending},
 			"unit_tests_completed": {Status: StepStatusPending},
 			"dev_deploy":           {Status: StepStatusPending},
 		},
