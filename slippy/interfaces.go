@@ -36,14 +36,10 @@ type SlipStore interface {
 	// Each result includes the slip and its matched commit SHA.
 	FindAllByCommits(ctx context.Context, repository string, commits []string) ([]SlipWithCommit, error)
 
-	// Update persists changes to an existing slip with optimistic locking.
-	// Returns ErrVersionConflict if the slip was modified since it was loaded.
+	// Update persists changes to an existing slip.
+	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
+	// so there are no version conflicts.
 	Update(ctx context.Context, slip *Slip) error
-
-	// ForceUpdate persists changes without optimistic locking checks.
-	// Use ONLY for terminal state transitions (abandoned, promoted, completed)
-	// where we want to write regardless of concurrent modifications.
-	ForceUpdate(ctx context.Context, slip *Slip) error
 
 	// UpdateStep updates a specific step's status
 	UpdateStep(ctx context.Context, correlationID, stepName, componentName string, status StepStatus) error

@@ -393,12 +393,12 @@ func TestClient_AbandonSlip(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		// Verify the update was made (AbandonSlip uses ForceUpdate for terminal states)
-		if len(store.ForceUpdateCalls) != 1 {
-			t.Errorf("expected 1 ForceUpdate call, got %d", len(store.ForceUpdateCalls))
+		// Verify the update was made
+		if len(store.UpdateCalls) != 1 {
+			t.Errorf("expected 1 Update call, got %d", len(store.UpdateCalls))
 		}
-		if store.ForceUpdateCalls[0].Slip.Status != SlipStatusAbandoned {
-			t.Errorf("expected status Abandoned, got %s", store.ForceUpdateCalls[0].Slip.Status)
+		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
+			t.Errorf("expected status Abandoned, got %s", store.UpdateCalls[0].Slip.Status)
 		}
 	})
 
@@ -467,7 +467,7 @@ func TestClient_AbandonSlip(t *testing.T) {
 			Steps:         make(map[string]Step),
 		}
 		store.AddSlip(slip)
-		store.ForceUpdateError = errors.New("database error")
+		store.UpdateError = errors.New("database error")
 
 		err := client.AbandonSlip(ctx, "corr-abandon-3", "corr-new-slip")
 		if err == nil {

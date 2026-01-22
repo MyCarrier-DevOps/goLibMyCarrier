@@ -32,7 +32,6 @@ type MockStore struct {
 	FindByCommitsCalls    []FindByCommitsCall
 	FindAllByCommitsCalls []FindAllByCommitsCall
 	UpdateCalls           []UpdateCall
-	ForceUpdateCalls      []UpdateCall
 	UpdateStepCalls       []UpdateStepCall
 	UpdateComponentCalls  []UpdateComponentCall
 	AppendHistoryCalls    []AppendHistoryCall
@@ -45,7 +44,6 @@ type MockStore struct {
 	FindByCommitsError    error
 	FindAllByCommitsError error
 	UpdateError           error
-	ForceUpdateError      error
 	UpdateStepError       error
 	UpdateComponentError  error
 	AppendHistoryError    error
@@ -276,26 +274,6 @@ func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 
 	if m.UpdateError != nil {
 		return m.UpdateError
-	}
-
-	if _, ok := m.Slips[slip.CorrelationID]; !ok {
-		return ErrSlipNotFound
-	}
-
-	m.Slips[slip.CorrelationID] = deepCopySlip(slip)
-	return nil
-}
-
-// ForceUpdate persists changes to an existing slip without optimistic locking.
-// This is used for terminal state transitions (abandoned, promoted, completed).
-func (m *MockStore) ForceUpdate(ctx context.Context, slip *Slip) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.ForceUpdateCalls = append(m.ForceUpdateCalls, UpdateCall{Slip: slip})
-
-	if m.ForceUpdateError != nil {
-		return m.ForceUpdateError
 	}
 
 	if _, ok := m.Slips[slip.CorrelationID]; !ok {

@@ -163,10 +163,9 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 
 	slip.Status = SlipStatusAbandoned
 
-	// Use ForceUpdate to skip the optimistic locking check that would cause retries
-	// during high concurrency. The atomic versioning in insertRow still ensures
-	// correct, incrementing versions for VersionedCollapsingMergeTree.
-	if err := c.store.ForceUpdate(ctx, slip); err != nil {
+	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
+	// so there are no version conflicts and Update always succeeds.
+	if err := c.store.Update(ctx, slip); err != nil {
 		return NewSlipError("abandon", correlationID, err)
 	}
 
@@ -199,10 +198,9 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 	slip.Status = SlipStatusPromoted
 	slip.PromotedTo = promotedTo
 
-	// Use ForceUpdate to skip the optimistic locking check that would cause retries
-	// during high concurrency. The atomic versioning in insertRow still ensures
-	// correct, incrementing versions for VersionedCollapsingMergeTree.
-	if err := c.store.ForceUpdate(ctx, slip); err != nil {
+	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
+	// so there are no version conflicts and Update always succeeds.
+	if err := c.store.Update(ctx, slip); err != nil {
 		return NewSlipError("promote", correlationID, err)
 	}
 

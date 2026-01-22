@@ -263,14 +263,21 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
 
-	// Set default sign for new slips (version is calculated atomically)
+	// Set default sign for new slips
 	if slip.Sign == 0 {
 		slip.Sign = 1
 	}
 
-	if err := s.insertRow(ctx, slip, 0); err != nil {
+	// Generate timestamp-based version (nanoseconds since epoch)
+	// This ensures unique versions even if multiple Create calls happen concurrently
+	version := uint64(time.Now().UnixNano())
+
+	if err := s.insertRow(ctx, slip, version); err != nil {
 		return fmt.Errorf("failed to create slip: %w", err)
 	}
+
+	// Update the slip's version to the generated value
+	slip.Version = version
 
 	// Run OPTIMIZE TABLE if enabled
 	if s.optimizeAfterWrite {
@@ -425,102 +432,58 @@ func (s *ClickHouseStore) FindAllByCommits(
 }
 
 // Update persists changes to an existing slip using VersionedCollapsingMergeTree semantics.
-// This inserts two rows: a cancel row (sign=-1) with the current max version, and a new row (sign=1) with incremented version.
+// This inserts a cancel row (sign=-1) for the slip's current version and a new row (sign=1)
+// with a new nanosecond timestamp version.
 //
-// Optimistic Locking: If the version in ClickHouse differs from the slip's version (indicating
-// another process modified the slip), this method returns ErrVersionConflict. Callers should
-// reload the slip and retry their operation.
+// Post-Insert Verification: After inserting, we run OPTIMIZE TABLE and verify that our new
+// version is the winning (MAX) version. If another concurrent update's version is higher,
+// our update "lost" and we return ErrVersionConflict. Callers should reload and retry.
 //
-// Atomic Version Calculation: The version is calculated atomically within the INSERT statement
-// using a subquery (COALESCE(MAX(version), 0) + 1). This eliminates the race condition window
-// between reading the version and writing the row, ensuring that concurrent updates always
-// produce unique, incrementing versions.
+// Why post-insert verification works:
+// - Pre-insert checks fail because all concurrent goroutines can pass them simultaneously
+// - VCMT will collapse cancel+insert pairs with the same version
+// - After OPTIMIZE, only ONE sign=1 row can survive (the highest version)
+// - By checking if our version is the MAX, we know if we "won" the race
 //
-// VersionedCollapsingMergeTree Semantics: Cancel rows MUST have the same version as the row
-// they cancel (with sign=-1). New state rows get the next version (with sign=1).
+// Timestamp-Based Versioning: Each update generates a unique version using time.Now().UnixNano(),
+// guaranteeing unique versions across concurrent writers.
 func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
-	// Get the current max version for optimistic locking check
-	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
-	if err != nil {
-		return fmt.Errorf("failed to get current version: %w", err)
-	}
-
-	// Optimistic locking: verify version hasn't changed since the slip was loaded
-	if currentVersion != slip.Version {
-		return fmt.Errorf("%w: expected version %d, but found version %d",
-			ErrVersionConflict, slip.Version, currentVersion)
-	}
-
 	// Update updated_at timestamp
 	slip.UpdatedAt = time.Now()
-
-	// Create a deep copy for the cancel row to prevent shared map/slice references
-	cancelSlip := deepCopySlip(slip)
-	cancelSlip.Sign = -1
-
-	// Insert the cancel row with the SAME version as the row being canceled.
-	// VersionedCollapsingMergeTree requires matching versions for collapsing.
-	if err := s.insertRow(ctx, cancelSlip, currentVersion); err != nil {
-		return fmt.Errorf("failed to insert cancel row: %w", err)
-	}
-
-	// Insert the new state with atomically calculated next version (pass 0 to auto-calculate)
 	slip.Sign = 1
 
-	if err := s.insertRow(ctx, slip, 0); err != nil {
-		return fmt.Errorf("failed to insert new row: %w", err)
+	// Store the old version for the cancel row
+	oldVersion := slip.Version
+
+	// Generate new timestamp-based version (nanoseconds since epoch)
+	// This ensures unique versions across concurrent writers
+	newVersion := uint64(time.Now().UnixNano())
+
+	// Insert both cancel row and new row atomically
+	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
+		return fmt.Errorf("failed to insert atomic update: %w", err)
 	}
 
-	// Run OPTIMIZE TABLE if enabled
-	if s.optimizeAfterWrite {
-		if err := s.OptimizeTable(ctx); err != nil {
-			return fmt.Errorf("failed to optimize table after update: %w", err)
-		}
+	// Update the slip's version to the new value
+	slip.Version = newVersion
+
+	// Run OPTIMIZE TABLE to force immediate collapsing
+	// This is required for the post-insert verification to work correctly
+	if err := s.OptimizeTable(ctx); err != nil {
+		return fmt.Errorf("failed to optimize table after update: %w", err)
 	}
 
-	return nil
-}
-
-// ForceUpdate writes the slip to the database without optimistic locking checks.
-// This should ONLY be used for terminal state transitions (abandoned, promoted, completed)
-// where we want to write the state regardless of concurrent modifications.
-//
-// VersionedCollapsingMergeTree Semantics: Cancel rows MUST have the same version as the row
-// they cancel (with sign=-1). New state rows get the next version (with sign=1).
-//
-// WARNING: Using this for non-terminal updates could cause lost updates. Use Update() instead.
-func (s *ClickHouseStore) ForceUpdate(ctx context.Context, slip *Slip) error {
-	// Get the current max version for the cancel row
-	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
+	// Post-insert verification: check if our version "won" the race
+	// After OPTIMIZE, the highest version with sign=1 survives
+	// If our version isn't the current MAX, another concurrent update won
+	currentMaxVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
 	if err != nil {
-		return fmt.Errorf("failed to get current version: %w", err)
+		return fmt.Errorf("failed to verify update: %w", err)
 	}
 
-	// Update updated_at timestamp
-	slip.UpdatedAt = time.Now()
-
-	// Create a deep copy for the cancel row to prevent shared map/slice references
-	cancelSlip := deepCopySlip(slip)
-	cancelSlip.Sign = -1
-
-	// Insert the cancel row with the SAME version as the row being canceled.
-	// VersionedCollapsingMergeTree requires matching versions for collapsing.
-	if err := s.insertRow(ctx, cancelSlip, currentVersion); err != nil {
-		return fmt.Errorf("failed to insert cancel row: %w", err)
-	}
-
-	// Insert the new state with atomically calculated next version (pass 0 to auto-calculate)
-	slip.Sign = 1
-
-	if err := s.insertRow(ctx, slip, 0); err != nil {
-		return fmt.Errorf("failed to insert new row: %w", err)
-	}
-
-	// Run OPTIMIZE TABLE if enabled
-	if s.optimizeAfterWrite {
-		if err := s.OptimizeTable(ctx); err != nil {
-			return fmt.Errorf("failed to optimize table after update: %w", err)
-		}
+	if currentMaxVersion != newVersion {
+		return fmt.Errorf("%w: our version %d was superseded by version %d",
+			ErrVersionConflict, newVersion, currentMaxVersion)
 	}
 
 	return nil
@@ -736,8 +699,8 @@ func (s *ClickHouseStore) Close() error {
 }
 
 // getMaxVersion retrieves the current maximum version for a slip from ClickHouse.
-// This is used for atomic version increment to prevent race conditions.
-func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID string) (uint32, error) {
+// This is used for the optimistic locking check before atomic update.
+func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID string) (uint64, error) {
 	query := fmt.Sprintf(
 		"SELECT max(version) FROM %s.%s WHERE %s = ?",
 		s.database, TableRoutingSlips, ColumnCorrelationID,
@@ -754,7 +717,7 @@ func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID strin
 		return 0, fmt.Errorf("no rows found for correlation_id %s", correlationID)
 	}
 
-	return uint32(maxVersion.Int64), nil
+	return uint64(maxVersion.Int64), nil
 }
 
 // insertRow inserts a single row into the routing_slips table.
@@ -764,7 +727,7 @@ func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID strin
 // VersionedCollapsingMergeTree requires:
 // - Cancel rows (sign=-1) must have the SAME version as the row they cancel
 // - New state rows (sign=1) get the next version
-func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uint32) error {
+func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uint64) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
@@ -836,6 +799,8 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 		// This works for all cases:
 		// - New slip (no existing rows): returns 0 + 1 = 1
 		// - Existing slip: returns current max + 1
+		// Note: This is only used by Create(). Updates use insertAtomicUpdate() which
+		// handles both cancel and new rows in a single UNION ALL statement.
 		selectExprs = append(selectExprs, fmt.Sprintf(
 			"COALESCE((SELECT max(version) FROM %s.%s WHERE %s = ?), 0) + 1",
 			s.database, TableRoutingSlips, ColumnCorrelationID,
@@ -866,6 +831,489 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 	}
 
 	return nil
+}
+
+// insertAtomicUpdateWithVersions inserts cancel rows for all existing active rows and a new state row
+// in a single atomic INSERT statement.
+//
+// This uses INSERT...SELECT...UNION ALL to:
+// 1. Select all existing rows with sign=1 and version < newVersion, re-insert them with sign=-1
+// 2. Insert the new row with sign=1 and the new timestamp version
+//
+// The query structure is:
+//
+//	INSERT INTO routing_slips (columns...)
+//	SELECT columns..., -1 as sign, version FROM routing_slips
+//	    WHERE correlation_id = ? AND version < ? AND sign = 1
+//	UNION ALL
+//	SELECT <new_data>, 1 as sign, <new_version>
+//
+// This approach:
+// - Cancels ALL existing active rows (handles any uncollapsed duplicates)
+// - Uses timestamp-based versions to guarantee uniqueness
+// - Is fully atomic - either all rows are inserted or none
+func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
+	ctx context.Context,
+	slip *Slip,
+	oldVersion, newVersion uint64,
+) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	// Build dynamic column lists using query builder
+	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+		slip.Aggregates,
+	)
+
+	// Serialize step details (timing, actor, errors)
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	if err != nil {
+		return fmt.Errorf("failed to marshal step details: %w", err)
+	}
+
+	// Serialize state history wrapped in object for ClickHouse JSON compatibility
+	stateHistoryWrapper := map[string]interface{}{"entries": slip.StateHistory}
+	stateHistoryJSON, err := json.Marshal(stateHistoryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state history: %w", err)
+	}
+
+	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
+	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
+	ancestryJSON, err := json.Marshal(ancestryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ancestry: %w", err)
+	}
+
+	// Build column list for INSERT (must match SELECT order exactly)
+	var columns []string
+	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnSign, ColumnVersion)
+	columns = append(columns, stepColumns...)
+	columns = append(columns, aggregateColumns...)
+
+	// Build the SELECT for cancel rows - select existing rows with sign=1, re-insert with sign=-1
+	// We keep the original version so VersionedCollapsingMergeTree can collapse them properly
+	cancelSelectColumns := []string{
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		"-1",          // Flip sign to -1
+		ColumnVersion, // Keep original version for proper collapsing
+	}
+	cancelSelectColumns = append(cancelSelectColumns, stepColumns...)
+	cancelSelectColumns = append(cancelSelectColumns, aggregateColumns...)
+
+	cancelQuery := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s < ? AND %s = 1",
+		strings.Join(cancelSelectColumns, ", "),
+		s.database, TableRoutingSlips,
+		ColumnCorrelationID, ColumnVersion, ColumnSign,
+	)
+
+	// Build SELECT expressions for new row (sign=1, new timestamp version)
+	var newSelectExprs []string
+	var newValues []interface{}
+
+	// Core columns (10 columns) - need to cast JSON columns to match existing table schema
+	// ClickHouse requires explicit casting when UNION ALL combines JSON columns from table
+	// with string literals
+	newSelectExprs = append(newSelectExprs, "?", "?", "?", "?", "?", "?", "?",
+		"CAST(? AS JSON)", // step_details - cast to JSON
+		"CAST(? AS JSON)", // state_history - cast to JSON
+		"CAST(? AS JSON)") // ancestry - cast to JSON
+	newValues = append(newValues,
+		slip.CorrelationID,
+		slip.Repository,
+		slip.Branch,
+		slip.CommitSHA,
+		slip.CreatedAt,
+		slip.UpdatedAt,
+		string(slip.Status),
+		string(stepDetailsJSON),
+		string(stateHistoryJSON),
+		string(ancestryJSON),
+	)
+
+	// Sign for new row: 1
+	newSelectExprs = append(newSelectExprs, "1")
+
+	// Version for new row: new timestamp
+	newSelectExprs = append(newSelectExprs, "?")
+	newValues = append(newValues, newVersion)
+
+	// Step columns (Enum8 - no casting needed)
+	for _, stepVal := range stepValues {
+		newSelectExprs = append(newSelectExprs, "?")
+		newValues = append(newValues, stepVal)
+	}
+
+	// Aggregate columns (JSON type - need casting to match table schema in UNION ALL)
+	for _, aggVal := range aggregateValues {
+		newSelectExprs = append(newSelectExprs, "CAST(? AS JSON)")
+		newValues = append(newValues, aggVal)
+	}
+
+	// Combine: cancel query params (correlation_id, newVersion) + new row values
+	var values []interface{}
+	values = append(values, slip.CorrelationID, newVersion) // For cancel SELECT WHERE clause
+	values = append(values, newValues...)
+
+	// Build the INSERT...SELECT...UNION ALL query
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		%s
+		UNION ALL
+		SELECT %s
+	`, s.database, TableRoutingSlips, strings.Join(columns, ", "),
+		cancelQuery,
+		strings.Join(newSelectExprs, ", "))
+
+	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
+		return fmt.Errorf("failed to insert atomic update: %w", err)
+	}
+
+	return nil
+}
+
+// insertAtomicUpdate inserts both a cancel row and a new state row in a single atomic INSERT statement.
+// This uses INSERT...SELECT...UNION ALL to ensure both rows see the same MAX(version) at execution time,
+// eliminating the TOCTOU race condition that exists when inserting rows separately.
+//
+// The query structure is:
+//
+//	INSERT INTO routing_slips (columns...)
+//	SELECT <data>, -1 as sign, (SELECT max(version) FROM routing_slips WHERE correlation_id = ?) as version, <step_cols>, <agg_cols>
+//	UNION ALL
+//	SELECT <data>, 1 as sign, (SELECT max(version) FROM routing_slips WHERE correlation_id = ?) + 1 as version, <step_cols>, <agg_cols>
+//
+// Both subqueries evaluate MAX(version) at the same instant, guaranteeing:
+// - Cancel row gets the current max version (to cancel the existing row)
+// - New row gets max version + 1 (unique, incrementing version)
+func (s *ClickHouseStore) insertAtomicUpdate(ctx context.Context, slip *Slip) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	// Build dynamic column lists using query builder
+	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+		slip.Aggregates,
+	)
+
+	// Serialize step details (timing, actor, errors)
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	if err != nil {
+		return fmt.Errorf("failed to marshal step details: %w", err)
+	}
+
+	// Serialize state history wrapped in object for ClickHouse JSON compatibility
+	stateHistoryWrapper := map[string]interface{}{"entries": slip.StateHistory}
+	stateHistoryJSON, err := json.Marshal(stateHistoryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state history: %w", err)
+	}
+
+	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
+	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
+	ancestryJSON, err := json.Marshal(ancestryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ancestry: %w", err)
+	}
+
+	// Build column list for INSERT (must match SELECT order exactly)
+	// Order: core columns, sign, version, step columns, aggregate columns
+	var columns []string
+	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnSign, ColumnVersion)
+	columns = append(columns, stepColumns...)
+	columns = append(columns, aggregateColumns...)
+
+	// Version subquery that both rows will reference (evaluated once per row at insert time)
+	versionSubquery := fmt.Sprintf(
+		"(SELECT max(version) FROM %s.%s WHERE %s = ?)",
+		s.database, TableRoutingSlips, ColumnCorrelationID,
+	)
+
+	// Build SELECT expressions for cancel row (sign=-1, version=MAX)
+	var cancelSelectExprs []string
+	var cancelValues []interface{}
+
+	// Core columns (10 columns)
+	cancelSelectExprs = append(cancelSelectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	cancelValues = append(cancelValues,
+		slip.CorrelationID,
+		slip.Repository,
+		slip.Branch,
+		slip.CommitSHA,
+		slip.CreatedAt,
+		slip.UpdatedAt,
+		string(slip.Status),
+		string(stepDetailsJSON),
+		string(stateHistoryJSON),
+		string(ancestryJSON),
+	)
+
+	// Sign for cancel row: -1
+	cancelSelectExprs = append(cancelSelectExprs, "-1")
+
+	// Version for cancel row: MAX(version) from subquery
+	cancelSelectExprs = append(cancelSelectExprs, versionSubquery)
+	cancelValues = append(cancelValues, slip.CorrelationID)
+
+	// Step columns
+	for _, stepVal := range stepValues {
+		cancelSelectExprs = append(cancelSelectExprs, "?")
+		cancelValues = append(cancelValues, stepVal)
+	}
+
+	// Aggregate columns
+	for _, aggVal := range aggregateValues {
+		cancelSelectExprs = append(cancelSelectExprs, "?")
+		cancelValues = append(cancelValues, aggVal)
+	}
+
+	// Build SELECT expressions for new row (sign=1, version=MAX+1)
+	var newSelectExprs []string
+	var newValues []interface{}
+
+	// Core columns (10 columns)
+	newSelectExprs = append(newSelectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	newValues = append(newValues,
+		slip.CorrelationID,
+		slip.Repository,
+		slip.Branch,
+		slip.CommitSHA,
+		slip.CreatedAt,
+		slip.UpdatedAt,
+		string(slip.Status),
+		string(stepDetailsJSON),
+		string(stateHistoryJSON),
+		string(ancestryJSON),
+	)
+
+	// Sign for new row: 1
+	newSelectExprs = append(newSelectExprs, "1")
+
+	// Version for new row: MAX(version) + 1 from subquery
+	newSelectExprs = append(newSelectExprs, versionSubquery+" + 1")
+	newValues = append(newValues, slip.CorrelationID)
+
+	// Step columns
+	for _, stepVal := range stepValues {
+		newSelectExprs = append(newSelectExprs, "?")
+		newValues = append(newValues, stepVal)
+	}
+
+	// Aggregate columns
+	for _, aggVal := range aggregateValues {
+		newSelectExprs = append(newSelectExprs, "?")
+		newValues = append(newValues, aggVal)
+	}
+
+	// Combine values: cancel row values first, then new row values
+	var values []interface{}
+	values = append(values, cancelValues...)
+	values = append(values, newValues...)
+
+	// Build the INSERT...SELECT...UNION ALL query
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		SELECT %s
+		UNION ALL
+		SELECT %s
+	`, s.database, TableRoutingSlips, strings.Join(columns, ", "),
+		strings.Join(cancelSelectExprs, ", "),
+		strings.Join(newSelectExprs, ", "))
+
+	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
+		return fmt.Errorf("failed to insert atomic update: %w", err)
+	}
+
+	return nil
+}
+
+// insertAtomicUpdateConditional inserts both a cancel row and a new state row atomically,
+// but ONLY if the current max version matches the expected version.
+// Returns the number of rows inserted (0 if version mismatch, 2 if successful).
+//
+// This provides true atomic compare-and-swap semantics by using a conditional subquery:
+//
+//	INSERT INTO routing_slips (columns...)
+//	SELECT <data> FROM (SELECT 1) WHERE (SELECT max(version) FROM routing_slips WHERE correlation_id = ?) = ?
+//	UNION ALL
+//	SELECT <data> FROM (SELECT 1) WHERE (SELECT max(version) FROM routing_slips WHERE correlation_id = ?) = ?
+//
+// If the version doesn't match, the WHERE clause produces no rows, and no INSERT happens.
+func (s *ClickHouseStore) insertAtomicUpdateConditional(
+	ctx context.Context,
+	slip *Slip,
+	expectedVersion uint64,
+) (int, error) {
+	if s.pipelineConfig == nil {
+		return 0, fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	// Build dynamic column lists using query builder
+	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+		slip.Aggregates,
+	)
+
+	// Serialize step details (timing, actor, errors)
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal step details: %w", err)
+	}
+
+	// Serialize state history wrapped in object for ClickHouse JSON compatibility
+	stateHistoryWrapper := map[string]interface{}{"entries": slip.StateHistory}
+	stateHistoryJSON, err := json.Marshal(stateHistoryWrapper)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal state history: %w", err)
+	}
+
+	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
+	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
+	ancestryJSON, err := json.Marshal(ancestryWrapper)
+	if err != nil {
+		return 0, fmt.Errorf("failed to marshal ancestry: %w", err)
+	}
+
+	// Build column list for INSERT (must match SELECT order exactly)
+	var columns []string
+	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnSign, ColumnVersion)
+	columns = append(columns, stepColumns...)
+	columns = append(columns, aggregateColumns...)
+
+	// Version subquery and condition
+	versionSubquery := fmt.Sprintf(
+		"(SELECT max(version) FROM %s.%s WHERE %s = ?)",
+		s.database, TableRoutingSlips, ColumnCorrelationID,
+	)
+	// Condition: only produce rows if current max version equals expected version
+	versionCondition := versionSubquery + " = ?"
+
+	// Build SELECT expressions for cancel row (sign=-1, version=MAX)
+	var cancelSelectExprs []string
+	var cancelValues []interface{}
+
+	// Core columns (10 columns)
+	cancelSelectExprs = append(cancelSelectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	cancelValues = append(cancelValues,
+		slip.CorrelationID,
+		slip.Repository,
+		slip.Branch,
+		slip.CommitSHA,
+		slip.CreatedAt,
+		slip.UpdatedAt,
+		string(slip.Status),
+		string(stepDetailsJSON),
+		string(stateHistoryJSON),
+		string(ancestryJSON),
+	)
+
+	// Sign for cancel row: -1
+	cancelSelectExprs = append(cancelSelectExprs, "-1")
+
+	// Version for cancel row: use expectedVersion directly (which equals MAX if condition passes)
+	cancelSelectExprs = append(cancelSelectExprs, "?")
+	cancelValues = append(cancelValues, expectedVersion)
+
+	// Step columns
+	for _, stepVal := range stepValues {
+		cancelSelectExprs = append(cancelSelectExprs, "?")
+		cancelValues = append(cancelValues, stepVal)
+	}
+
+	// Aggregate columns
+	for _, aggVal := range aggregateValues {
+		cancelSelectExprs = append(cancelSelectExprs, "?")
+		cancelValues = append(cancelValues, aggVal)
+	}
+
+	// Add condition values: correlation_id for subquery + expected version for comparison
+	cancelValues = append(cancelValues, slip.CorrelationID, expectedVersion)
+
+	// Build SELECT expressions for new row (sign=1, version=MAX+1)
+	var newSelectExprs []string
+	var newValues []interface{}
+
+	// Core columns (10 columns)
+	newSelectExprs = append(newSelectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	newValues = append(newValues,
+		slip.CorrelationID,
+		slip.Repository,
+		slip.Branch,
+		slip.CommitSHA,
+		slip.CreatedAt,
+		slip.UpdatedAt,
+		string(slip.Status),
+		string(stepDetailsJSON),
+		string(stateHistoryJSON),
+		string(ancestryJSON),
+	)
+
+	// Sign for new row: 1
+	newSelectExprs = append(newSelectExprs, "1")
+
+	// Version for new row: expectedVersion + 1
+	newSelectExprs = append(newSelectExprs, "?")
+	newValues = append(newValues, expectedVersion+1)
+
+	// Step columns
+	for _, stepVal := range stepValues {
+		newSelectExprs = append(newSelectExprs, "?")
+		newValues = append(newValues, stepVal)
+	}
+
+	// Aggregate columns
+	for _, aggVal := range aggregateValues {
+		newSelectExprs = append(newSelectExprs, "?")
+		newValues = append(newValues, aggVal)
+	}
+
+	// Add condition values: correlation_id for subquery + expected version for comparison
+	newValues = append(newValues, slip.CorrelationID, expectedVersion)
+
+	// Combine values: cancel row values first, then new row values
+	var values []interface{}
+	values = append(values, cancelValues...)
+	values = append(values, newValues...)
+
+	// Build the conditional INSERT...SELECT...UNION ALL query
+	// The WHERE clause ensures rows are only produced if version matches
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		SELECT %s FROM (SELECT 1) WHERE %s
+		UNION ALL
+		SELECT %s FROM (SELECT 1) WHERE %s
+	`, s.database, TableRoutingSlips, strings.Join(columns, ", "),
+		strings.Join(cancelSelectExprs, ", "), versionCondition,
+		strings.Join(newSelectExprs, ", "), versionCondition)
+
+	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
+		return 0, fmt.Errorf("failed to insert conditional atomic update: %w", err)
+	}
+
+	// Check how many rows were actually inserted by querying the current max version
+	// If it's expectedVersion+1, our insert succeeded
+	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to verify insert: %w", err)
+	}
+
+	if currentVersion == expectedVersion+1 {
+		return 2, nil // Both rows inserted successfully
+	}
+
+	// Version mismatch - our insert was skipped or someone else inserted
+	return 0, nil
 }
 
 // scanSlip executes a query and scans the result into a Slip.

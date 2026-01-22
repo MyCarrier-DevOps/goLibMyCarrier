@@ -278,8 +278,8 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 				-- VersionedCollapsingMergeTree columns
 				-- sign: 1 = active row, -1 = cancelled row (for updates)
 				sign Int8 DEFAULT 1,
-				-- version: monotonically increasing version number for each correlation_id
-				version UInt32 DEFAULT 1,
+				-- version: nanosecond timestamp for unique version across concurrent writers
+				version UInt64 DEFAULT 1,
 
 				-- Bloom filter indexes
 				INDEX idx_repository repository TYPE bloom_filter GRANULARITY 1,

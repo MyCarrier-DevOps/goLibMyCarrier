@@ -386,9 +386,12 @@ func TestClickHouseStore_Update(t *testing.T) {
 		if err != nil {
 			t.Errorf("expected no error, got %v", err)
 		}
-		// Update with VersionedCollapsingMergeTree inserts 2 rows: cancel row (sign=-1) and new row (sign=1)
-		if len(mockSession.ExecWithArgsCalls) != 2 {
-			t.Errorf("expected 2 ExecWithArgs calls (cancel + new), got %d", len(mockSession.ExecWithArgsCalls))
+		// Update with VersionedCollapsingMergeTree inserts 2 rows atomically via UNION ALL: cancel row (sign=-1) and new row (sign=1)
+		if len(mockSession.ExecWithArgsCalls) != 1 {
+			t.Errorf(
+				"expected 1 ExecWithArgs call (atomic cancel + new via UNION ALL), got %d",
+				len(mockSession.ExecWithArgsCalls),
+			)
 		}
 		// Note: slip.Version is NOT updated after write because version is calculated atomically
 		// in the database via COALESCE(MAX(version), 0) + 1. To get the new version, caller
@@ -718,7 +721,7 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 func createMockSessionForUpdates(
 	correlationID, repository, branch, commitSHA string,
 	status SlipStatus,
-	version uint32,
+	version uint64,
 ) *clickhousetest.MockSession {
 	slipRow := createMockScanRow(correlationID, repository, branch, commitSHA, status)
 	queryCount := 0
@@ -1056,12 +1059,15 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
-	// Should have called QueryRow twice (Load + getMaxVersion) and ExecWithArgs twice (cancel + new row)
+	// Should have called QueryRow twice (Load + getMaxVersion) and ExecWithArgs once (atomic cancel + new via UNION ALL)
 	if len(mockSession.QueryRowCalls) != 2 {
 		t.Errorf("expected 2 QueryRow calls (Load + getMaxVersion), got %d", len(mockSession.QueryRowCalls))
 	}
-	if len(mockSession.ExecWithArgsCalls) != 2 {
-		t.Errorf("expected 2 ExecWithArgs calls (cancel + new), got %d", len(mockSession.ExecWithArgsCalls))
+	if len(mockSession.ExecWithArgsCalls) != 1 {
+		t.Errorf(
+			"expected 1 ExecWithArgs call (atomic cancel + new via UNION ALL), got %d",
+			len(mockSession.ExecWithArgsCalls),
+		)
 	}
 }
 
