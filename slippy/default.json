@@ -4,13 +4,13 @@
   "description": "MyCarrier CI/CD pipeline configuration for routing slip orchestration",
   "steps": [
     {
-      "name": "builds_completed",
+      "name": "builds",
       "description": "All component container builds finished successfully",
       "prerequisites": [],
       "aggregates": "build"
     },
     {
-      "name": "unit_tests_completed",
+      "name": "unit_tests",
       "description": "All component unit tests finished successfully",
       "prerequisites": []
     },
@@ -27,11 +27,7 @@
     {
       "name": "dev_deploy",
       "description": "Deployment to development/feature environment",
-      "prerequisites": [
-        "builds_completed",
-        "unit_tests_completed",
-        "secret_scan"
-      ]
+      "prerequisites": ["builds", "unit_tests", "secret_scan"]
     },
     {
       "name": "dev_tests",
@@ -41,11 +37,7 @@
     {
       "name": "preprod_deploy",
       "description": "Deployment to pre-production environment",
-      "prerequisites": [
-        "builds_completed",
-        "unit_tests_completed",
-        "secret_scan"
-      ]
+      "prerequisites": ["builds", "unit_tests", "secret_scan"]
     },
     {
       "name": "preprod_tests",

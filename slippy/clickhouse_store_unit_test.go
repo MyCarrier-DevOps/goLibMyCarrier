@@ -27,18 +27,18 @@ func testPipelineConfig() *PipelineConfig {
 		Steps: []StepConfig{
 			{Name: "push_parsed", Description: "Push parsed"},
 			{
-				Name:          "builds_completed",
+				Name:          "builds",
 				Description:   "Builds completed",
 				Aggregates:    "build",
 				Prerequisites: []string{"push_parsed"},
 			},
 			{
-				Name:          "unit_tests_completed",
+				Name:          "unit_tests",
 				Description:   "Unit tests completed",
 				Aggregates:    "unit_test",
-				Prerequisites: []string{"builds_completed"},
+				Prerequisites: []string{"builds"},
 			},
-			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"unit_tests_completed"}},
+			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"unit_tests"}},
 		},
 	}
 	// Initialize internal lookup maps (same as what LoadPipelineConfig does)
@@ -886,6 +886,14 @@ func TestClickHouseStore_Load_Success(t *testing.T) {
 // TestClickHouseStore_Load_HydratesComponentStates ensures component states hydrate aggregate columns and steps.
 func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 	stateTimestamp := time.Now()
+	config := testPipelineConfig()
+
+	// Get the aggregate step name from config - the step that aggregates "build"
+	buildAggregateStep := config.GetAggregateStep("build")
+	if buildAggregateStep == "" {
+		t.Fatal("expected config to have an aggregate step for 'build'")
+	}
+
 	mockRows := &clickhousetest.MockRows{
 		NextData: []bool{true, false},
 		ScanFunc: func(dest ...any) error {
@@ -912,15 +920,15 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 			return mockRows, nil
 		},
 	}
-	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store := NewClickHouseStoreFromSession(mockSession, config, "ci")
 	slip := &Slip{
 		CorrelationID: "test-corr-001",
 		Aggregates: map[string][]ComponentStepData{
-			// The aggregate column name is the step name (e.g., "builds_completed"), not the pluralized component step
-			"builds_completed": {{Component: "api", Status: StepStatusPending}},
+			// The aggregate column name is the step name from config
+			buildAggregateStep: {{Component: "api", Status: StepStatusPending}},
 		},
 		Steps: map[string]Step{
-			"builds_completed": {Status: StepStatusPending},
+			buildAggregateStep: {Status: StepStatusPending},
 		},
 	}
 
@@ -929,7 +937,7 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	components := slip.Aggregates["builds_completed"]
+	components := slip.Aggregates[buildAggregateStep]
 	if len(components) != 1 {
 		t.Fatalf("expected 1 component, got %d", len(components))
 	}
@@ -937,7 +945,7 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 		t.Errorf("expected component status completed, got %s", components[0].Status)
 	}
 
-	aggregateStep := slip.Steps["builds_completed"]
+	aggregateStep := slip.Steps[buildAggregateStep]
 	if aggregateStep.Status != StepStatusCompleted {
 		t.Errorf("expected aggregate step completed, got %s", aggregateStep.Status)
 	}
@@ -1678,6 +1686,8 @@ func TestClickHouseStore_FindByCommits_InvalidStateHistoryJSON(t *testing.T) {
 // The step_details timestamp parsing is verified through integration tests against real ClickHouse.
 func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 	now := time.Now()
+	config := testPipelineConfig()
+
 	// Create data structures wrapped in objects for ClickHouse JSON compatibility
 	buildsData := map[string]interface{}{
 		"items": []ComponentStepData{},
@@ -1744,7 +1754,7 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 			return &clickhousetest.MockRows{}, nil
 		},
 	}
-	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store := NewClickHouseStoreFromSession(mockSession, config, "ci")
 
 	slip, err := store.Load(context.Background(), "test-corr-001")
 	if err != nil {
@@ -1760,11 +1770,11 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 	}
 
 	// Verify steps exist (timestamps cannot be verified in unit tests due to chcol.JSON limitations)
-	if _, ok := slip.Steps["push_parsed"]; !ok {
-		t.Error("expected push_parsed step to exist")
-	}
-	if _, ok := slip.Steps["builds_completed"]; !ok {
-		t.Error("expected builds_completed step to exist")
+	// Check all steps from config exist
+	for _, step := range config.Steps {
+		if _, ok := slip.Steps[step.Name]; !ok {
+			t.Errorf("expected %s step to exist", step.Name)
+		}
 	}
 }
 

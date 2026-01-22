@@ -650,8 +650,9 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			steps[stepConfig.Name] = step
 
 			// Initialize aggregate columns with component data
+			// Column name is the step name (e.g., "builds_completed"), not the pluralized aggregate
 			if stepConfig.Aggregates != "" {
-				columnName := pluralize(stepConfig.Aggregates)
+				columnName := stepConfig.Name
 				componentData := make([]ComponentStepData, len(opts.Components))
 				for j, def := range opts.Components {
 					componentData[j] = ComponentStepData{

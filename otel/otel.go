@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/propagation"
@@ -21,6 +22,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
 )
 
 // Logger constants
@@ -35,8 +37,17 @@ const (
 	// OTel environment variables for configuration
 	OtelEndpointEnv     = "OTEL_EXPORTER_OTLP_ENDPOINT"
 	OtelHeadersEnv      = "OTEL_EXPORTER_OTLP_HEADERS"
+	OtelProtocolEnv     = "OTEL_EXPORTER_OTLP_PROTOCOL"
 	otelSdkDisabled     = "OTEL_SDK_DISABLED"
 	instrumentationName = "github.com/MyCarrier-DevOps/goLibMyCarrier/test/logger"
+
+	// Protocol constants
+	ProtocolGRPC = "grpc"
+	ProtocolHTTP = "http/protobuf"
+
+	// Default ports
+	DefaultGRPCPort = "4317"
+	DefaultHTTPPort = "4318"
 )
 
 // LogLevel represents the severity of a log entry
@@ -437,6 +448,12 @@ func (l *OtelLogger) createExporters(ctx context.Context, otlpEndpoint string) (
 	sdklog.Exporter,
 	error,
 ) {
+	// Determine protocol from environment variable (default to gRPC as it's more efficient)
+	protocol := strings.ToLower(os.Getenv(OtelProtocolEnv))
+	if protocol == "" {
+		protocol = ProtocolGRPC // Default to gRPC
+	}
+
 	// Extract just the host:port from the endpoint URL
 	endpointURL := otlpEndpoint
 	var isSecure bool
@@ -448,28 +465,24 @@ func (l *OtelLogger) createExporters(ctx context.Context, otlpEndpoint string) (
 		endpointURL = strings.TrimPrefix(otlpEndpoint, "http://")
 		isSecure = false
 	default:
-		// No scheme, assume HTTP
+		// No scheme, assume insecure
 		isSecure = false
 	}
 
-	// Create OTLP HTTP trace exporter
+	// Create trace exporter based on protocol
 	var traceExporter sdktrace.SpanExporter
 	var err error
-	if isSecure {
-		traceExporter, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpoint(endpointURL),
-		)
+
+	if protocol == ProtocolGRPC {
+		traceExporter, err = l.createGRPCTraceExporter(ctx, endpointURL, isSecure)
 	} else {
-		traceExporter, err = otlptracehttp.New(ctx,
-			otlptracehttp.WithEndpoint(endpointURL),
-			otlptracehttp.WithInsecure(),
-		)
+		traceExporter, err = l.createHTTPTraceExporter(ctx, endpointURL, isSecure)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
 
-	// Create OTLP HTTP log exporter
+	// Create OTLP HTTP log exporter (logs always use HTTP for now)
 	var logExporter sdklog.Exporter
 	if isSecure {
 		logExporter, err = otlploghttp.New(ctx,
@@ -486,6 +499,44 @@ func (l *OtelLogger) createExporters(ctx context.Context, otlpEndpoint string) (
 	}
 
 	return traceExporter, logExporter, nil
+}
+
+// createGRPCTraceExporter creates a gRPC-based OTLP trace exporter.
+// gRPC is more efficient for high-volume telemetry data.
+func (l *OtelLogger) createGRPCTraceExporter(
+	ctx context.Context,
+	endpoint string,
+	isSecure bool,
+) (sdktrace.SpanExporter, error) {
+	opts := []otlptracegrpc.Option{
+		otlptracegrpc.WithEndpoint(endpoint),
+	}
+
+	if !isSecure {
+		opts = append(opts, otlptracegrpc.WithInsecure())
+	}
+
+	// Add dial options for connection management
+	opts = append(opts, otlptracegrpc.WithDialOption(grpc.WithBlock()))
+
+	return otlptracegrpc.New(ctx, opts...)
+}
+
+// createHTTPTraceExporter creates an HTTP-based OTLP trace exporter.
+func (l *OtelLogger) createHTTPTraceExporter(
+	ctx context.Context,
+	endpoint string,
+	isSecure bool,
+) (sdktrace.SpanExporter, error) {
+	if isSecure {
+		return otlptracehttp.New(ctx,
+			otlptracehttp.WithEndpoint(endpoint),
+		)
+	}
+	return otlptracehttp.New(ctx,
+		otlptracehttp.WithEndpoint(endpoint),
+		otlptracehttp.WithInsecure(),
+	)
 }
 
 // parseLogLevel converts string to LogLevel
