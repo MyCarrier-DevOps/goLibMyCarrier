@@ -554,6 +554,10 @@ func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
 		execCalled := false
 		insertToComponentStatesCalled := false
 		slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
+
+		// Track the version being inserted so we can return it from max(version)
+		// This prevents infinite retry loops in the post-insert verification
+		var lastInsertedVersion uint64
 		mockSession := &clickhousetest.MockSession{
 			// Handle both Load and getMaxVersion queries
 			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
@@ -562,7 +566,9 @@ func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
 						ScanFunc: func(dest ...any) error {
 							if len(dest) > 0 {
 								if v, ok := dest[0].(*sql.NullInt64); ok {
-									v.Int64 = 1
+									// Return the version that was just inserted
+									// This simulates the successful "winning" scenario
+									v.Int64 = int64(lastInsertedVersion)
 									v.Valid = true
 								}
 							}
@@ -579,6 +585,16 @@ func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
 				execCalled = true
 				if strings.Contains(stmt, "slip_component_states") {
 					insertToComponentStatesCalled = true
+				}
+				// Capture the newVersion from the INSERT args for routing_slips
+				// In insertAtomicUpdateWithVersions, the args are:
+				// [0] = correlation_id, [1] = newVersion, [2...] = new row values
+				if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+					if len(args) >= 2 {
+						if v, ok := args[1].(uint64); ok {
+							lastInsertedVersion = v
+						}
+					}
 				}
 				return nil
 			},
@@ -781,27 +797,30 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 
 // createMockSessionForUpdates creates a mock session that can handle both Load queries (returning a full slip)
 // and getMaxVersion queries (returning a version number). This is needed because Update methods
-// now call getMaxVersion to implement optimistic locking.
+// now call getMaxVersion to implement optimistic locking (post-insert verification).
+// The mock tracks the version being inserted and returns it from subsequent max(version) queries.
 func createMockSessionForUpdates(
 	correlationID, repository, branch, commitSHA string,
 	status SlipStatus,
 	version uint64,
 ) *clickhousetest.MockSession {
 	slipRow := createMockScanRow(correlationID, repository, branch, commitSHA, status)
-	queryCount := 0
+
+	// Track the last inserted version to return from max(version) queries
+	// This is essential for the post-insert verification to succeed
+	var lastInsertedVersion uint64 = version
 
 	return &clickhousetest.MockSession{
 		QueryWithArgsRows: &clickhousetest.MockRows{CloseErr: nil}, // Handle hydration query
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
-			queryCount++
-			// First query is Load (full slip), subsequent queries are getMaxVersion
+			// getMaxVersion query
 			if strings.Contains(query, "max(version)") {
-				// Return a mock row for getMaxVersion
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
 						if len(dest) > 0 {
 							if v, ok := dest[0].(*sql.NullInt64); ok {
-								v.Int64 = int64(version)
+								// Return the last inserted version (or initial version if no insert yet)
+								v.Int64 = int64(lastInsertedVersion)
 								v.Valid = true
 							}
 						}
@@ -811,6 +830,19 @@ func createMockSessionForUpdates(
 			}
 			// Return the slip row for Load queries
 			return slipRow
+		},
+		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+			// Track the newVersion from INSERT statements for routing_slips
+			// In insertAtomicUpdateWithVersions, the args are:
+			// [0] = correlation_id, [1] = newVersion, [2...] = new row values
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				if len(args) >= 2 {
+					if v, ok := args[1].(uint64); ok {
+						lastInsertedVersion = v
+					}
+				}
+			}
+			return nil
 		},
 	}
 }
@@ -1140,6 +1172,9 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	execCalled := false
 	insertToComponentStatesCalled := false
 	slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
+
+	// Track the version being inserted so we can return it from max(version)
+	var lastInsertedVersion uint64
 	mockSession := &clickhousetest.MockSession{
 		// Handle both Load and getMaxVersion queries
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
@@ -1148,7 +1183,7 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 					ScanFunc: func(dest ...any) error {
 						if len(dest) > 0 {
 							if v, ok := dest[0].(*sql.NullInt64); ok {
-								v.Int64 = 1
+								v.Int64 = int64(lastInsertedVersion)
 								v.Valid = true
 							}
 						}
@@ -1165,6 +1200,14 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 			execCalled = true
 			if strings.Contains(stmt, "slip_component_states") {
 				insertToComponentStatesCalled = true
+			}
+			// Track newVersion from routing_slips INSERT
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				if len(args) >= 2 {
+					if v, ok := args[1].(uint64); ok {
+						lastInsertedVersion = v
+					}
+				}
 			}
 			return nil
 		},
@@ -1205,6 +1248,10 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 	execCalled := false
 	insertToComponentStatesCalled := false
 	slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
+
+	// Track the version being inserted so we can return it from max(version)
+	// This prevents infinite retry loops in the post-insert verification
+	var lastInsertedVersion uint64
 	mockSession := &clickhousetest.MockSession{
 		// Handle both Load and getMaxVersion queries
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
@@ -1213,7 +1260,7 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 					ScanFunc: func(dest ...any) error {
 						if len(dest) > 0 {
 							if v, ok := dest[0].(*sql.NullInt64); ok {
-								v.Int64 = 1
+								v.Int64 = int64(lastInsertedVersion)
 								v.Valid = true
 							}
 						}
@@ -1230,6 +1277,14 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 			execCalled = true
 			if strings.Contains(stmt, "slip_component_states") {
 				insertToComponentStatesCalled = true
+			}
+			// Track newVersion from routing_slips INSERT
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				if len(args) >= 2 {
+					if v, ok := args[1].(uint64); ok {
+						lastInsertedVersion = v
+					}
+				}
 			}
 			return nil
 		},
@@ -1715,21 +1770,34 @@ func TestClickHouseStore_Load_WithStepTimestamps(t *testing.T) {
 
 // TestClickHouseStore_Update_UpdatesTimestamp tests that Update sets UpdatedAt.
 func TestClickHouseStore_Update_UpdatesTimestamp(t *testing.T) {
-	// Create a mock row for getMaxVersion that returns version 1
-	versionRow := &clickhousetest.MockRow{
-		ScanFunc: func(dest ...any) error {
-			if len(dest) > 0 {
-				if v, ok := dest[0].(*sql.NullInt64); ok {
-					v.Int64 = 1
-					v.Valid = true
+	// Track the version being inserted so we can return it from max(version)
+	// This prevents infinite retry loops in the post-insert verification
+	var lastInsertedVersion uint64
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			return &clickhousetest.MockRow{
+				ScanFunc: func(dest ...any) error {
+					if len(dest) > 0 {
+						if v, ok := dest[0].(*sql.NullInt64); ok {
+							v.Int64 = int64(lastInsertedVersion)
+							v.Valid = true
+						}
+					}
+					return nil
+				},
+			}
+		},
+		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+			// Track newVersion from routing_slips INSERT
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				if len(args) >= 2 {
+					if v, ok := args[1].(uint64); ok {
+						lastInsertedVersion = v
+					}
 				}
 			}
 			return nil
 		},
-	}
-
-	mockSession := &clickhousetest.MockSession{
-		QueryRowRow: versionRow,
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
@@ -1742,7 +1810,7 @@ func TestClickHouseStore_Update_UpdatesTimestamp(t *testing.T) {
 		Status:        SlipStatusInProgress,
 		CreatedAt:     originalTime,
 		UpdatedAt:     originalTime,
-		Version:       1, // Must match what getMaxVersion returns
+		Version:       1, // Initial version (will be replaced with timestamp)
 	}
 
 	err := store.Update(context.Background(), slip)
