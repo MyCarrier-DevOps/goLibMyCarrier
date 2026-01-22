@@ -143,6 +143,11 @@ func (s *SlipScanner) PopulateSlipFromScan(ctx *scanContext) error {
 		}
 	}
 
+	// Reconstruct step timing from state_history for any steps missing timing in step_details.
+	// This handles the case where timing was lost due to version conflicts during concurrent updates.
+	// The state_history is append-only and contains authoritative timestamps for state transitions.
+	s.reconstructStepTimingFromHistory(slip)
+
 	// Parse ancestry from chcol.JSON (unwrap from object)
 	if ctx.ancestryJSON != nil {
 		// Marshal to JSON bytes and unmarshal to Go structs
@@ -253,5 +258,77 @@ func (s *SlipScanner) mergeStepDetailsFromJSON(slip *Slip, jsonCol *chcol.JSON) 
 		}
 
 		slip.Steps[name] = step
+	}
+}
+
+// reconstructStepTimingFromHistory fills in missing step timing from state_history entries.
+// This is critical for handling version conflicts where step_details timing was lost
+// because a concurrent update overwrote the slip before timing could be persisted.
+//
+// The state_history is append-only and contains authoritative timestamps for when
+// steps transitioned to "running" (StartedAt) and terminal states (CompletedAt).
+// By scanning history, we can recover timing that would otherwise be lost.
+//
+// This function only fills in MISSING timing - it does not overwrite existing values
+// from step_details, preserving any timing that was successfully persisted.
+func (s *SlipScanner) reconstructStepTimingFromHistory(slip *Slip) {
+	if len(slip.StateHistory) == 0 {
+		return
+	}
+
+	// Build a map of step timing from history entries.
+	// For each step (non-component entries only), find:
+	// - First "running" transition -> StartedAt
+	// - First terminal transition -> CompletedAt
+	type stepTiming struct {
+		startedAt   *time.Time
+		completedAt *time.Time
+	}
+	historyTiming := make(map[string]*stepTiming)
+
+	for i := range slip.StateHistory {
+		entry := &slip.StateHistory[i]
+
+		// Skip component-level entries - they're tracked in Aggregates
+		if entry.Component != "" {
+			continue
+		}
+
+		// Initialize timing struct if needed
+		if historyTiming[entry.Step] == nil {
+			historyTiming[entry.Step] = &stepTiming{}
+		}
+		timing := historyTiming[entry.Step]
+
+		// Capture the timestamp (make a copy to avoid pointer issues)
+		ts := entry.Timestamp
+
+		// Record first "running" transition as StartedAt
+		if entry.Status == StepStatusRunning && timing.startedAt == nil {
+			timing.startedAt = &ts
+		}
+
+		// Record first terminal transition as CompletedAt
+		if entry.Status.IsTerminal() && timing.completedAt == nil {
+			timing.completedAt = &ts
+		}
+	}
+
+	// Fill in missing timing for steps
+	for stepName, timing := range historyTiming {
+		step, ok := slip.Steps[stepName]
+		if !ok {
+			continue
+		}
+
+		// Only fill in if the step is missing timing
+		if step.StartedAt == nil && timing.startedAt != nil {
+			step.StartedAt = timing.startedAt
+		}
+		if step.CompletedAt == nil && timing.completedAt != nil {
+			step.CompletedAt = timing.completedAt
+		}
+
+		slip.Steps[stepName] = step
 	}
 }
