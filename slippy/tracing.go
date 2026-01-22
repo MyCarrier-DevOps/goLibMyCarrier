@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"strings"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -236,4 +237,70 @@ func (r *RetrySpan) AddAttribute(key string, value interface{}) {
 	case float64:
 		r.span.SetAttributes(attribute.Float64(key, v))
 	}
+}
+
+// RecordJobExecutionSpan creates a synthetic span representing the job execution duration.
+// This is called from PostJob to record the time between PreJob (startedAt) and PostJob (now).
+// The span is created and immediately ended with the appropriate timestamps.
+//
+// Parameters:
+//   - ctx: Context with trace information (should have correlation ID trace)
+//   - correlationID: The routing slip correlation ID
+//   - stepName: The step being executed (e.g., "builds", "unit-test")
+//   - componentName: Optional component name for aggregate steps
+//   - startedAt: When PreJob marked the step as running
+//   - success: Whether the job succeeded
+//   - errorMessage: Error message if the job failed
+func RecordJobExecutionSpan(
+	ctx context.Context,
+	correlationID string,
+	stepName string,
+	componentName string,
+	startedAt time.Time,
+	success bool,
+	errorMessage string,
+) {
+	// Ensure we have trace context from correlation ID
+	ctx = ContextWithCorrelationTrace(ctx, correlationID)
+
+	// Build span name: "JobExecution:step" or "JobExecution:step:component"
+	spanName := "JobExecution:" + stepName
+	if componentName != "" {
+		spanName = spanName + ":" + componentName
+	}
+
+	// Create span with the start time from PreJob
+	_, span := tracer().Start(ctx, spanName,
+		trace.WithTimestamp(startedAt),
+		trace.WithAttributes(
+			attribute.String("slippy.correlation_id", correlationID),
+			attribute.String("slippy.step", stepName),
+			attribute.String("slippy.component", componentName),
+			attribute.Bool("slippy.job.success", success),
+			attribute.String("slippy.job.started_at", startedAt.Format(time.RFC3339)),
+		),
+	)
+
+	// Set status based on success/failure
+	if success {
+		span.SetStatus(codes.Ok, "job_completed")
+	} else {
+		span.SetStatus(codes.Error, "job_failed")
+		if errorMessage != "" {
+			span.SetAttributes(attribute.String("slippy.job.error_message", errorMessage))
+			span.RecordError(&jobError{message: errorMessage})
+		}
+	}
+
+	// End the span now (this sets the end timestamp to time.Now())
+	span.End()
+}
+
+// jobError implements error interface for recording job failures
+type jobError struct {
+	message string
+}
+
+func (e *jobError) Error() string {
+	return e.message
 }
