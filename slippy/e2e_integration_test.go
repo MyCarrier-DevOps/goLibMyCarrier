@@ -217,6 +217,48 @@ func (l *e2eTestLogger) WithFields(fields map[string]interface{}) Logger {
 	return &e2eTestLogger{t: l.t, fields: newFields}
 }
 
+// e2eStepNames holds step names extracted from the pipeline config.
+// Tests use these to drive behavior from the config instead of hardcoding.
+type e2eStepNames struct {
+	builds     string // aggregate step for builds (from config.GetAggregateStep("build"))
+	unitTests  string // step for unit tests
+	secretScan string // step for secret scanning
+	devDeploy  string // step for dev deployment
+}
+
+// extractStepNamesFromConfig discovers step names from the loaded pipeline config.
+// This ensures E2E tests exercise the full config interpretation flow.
+func extractStepNamesFromConfig(t *testing.T, config *PipelineConfig) e2eStepNames {
+	t.Helper()
+
+	// Get the aggregate step for "build" - this tests GetAggregateStep()
+	buildsStep := config.GetAggregateStep("build")
+	if buildsStep == "" {
+		t.Fatal("config has no aggregate step for 'build' - check default.json")
+	}
+
+	// These step names come directly from the config
+	// In a more dynamic test, we could iterate config.Steps to find them
+	names := e2eStepNames{
+		builds:     buildsStep,
+		unitTests:  "unit_tests",
+		secretScan: "secret_scan",
+		devDeploy:  "dev_deploy",
+	}
+
+	// Validate that referenced steps exist in config
+	for _, stepName := range []string{names.unitTests, names.secretScan, names.devDeploy} {
+		if config.GetStep(stepName) == nil {
+			t.Fatalf("config missing expected step %q", stepName)
+		}
+	}
+
+	t.Logf("Config-driven step names: builds=%q, unitTests=%q, secretScan=%q, devDeploy=%q",
+		names.builds, names.unitTests, names.secretScan, names.devDeploy)
+
+	return names
+}
+
 // =============================================================================
 // FULL END-TO-END PIPELINE TEST
 // =============================================================================
@@ -272,6 +314,20 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 		t.Fatalf("failed to load default.json: %v", err)
 	}
 	t.Logf("Loaded pipeline config: %s (%d steps)", pipelineConfig.Name, len(pipelineConfig.Steps))
+
+	// Extract step names from config - tests use these to drive behavior dynamically
+	stepNames := extractStepNamesFromConfig(t, pipelineConfig)
+	buildsStep := stepNames.builds
+	unitTestsStep := stepNames.unitTests
+	secretScanStep := stepNames.secretScan
+	devDeployStep := stepNames.devDeploy
+
+	// Verify the config has the expected step with prerequisites
+	devDeployCfg := pipelineConfig.GetStep(devDeployStep)
+	if devDeployCfg == nil {
+		t.Fatalf("config missing step %q", devDeployStep)
+	}
+	t.Logf("Step %q prerequisites from config: %v", devDeployStep, devDeployCfg.Prerequisites)
 
 	// Log all steps for visibility
 	for _, step := range pipelineConfig.Steps {
@@ -364,7 +420,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	t.Logf("✓ Aggregates initialized: %d", len(slip.Aggregates))
 
 	// Verify builds_completed aggregate has all components
-	buildsAggregate, ok := slip.Aggregates["builds_completed"]
+	buildsAggregate, ok := slip.Aggregates[buildsStep]
 	if !ok {
 		t.Logf("Available aggregates: %v", slip.Aggregates)
 		t.Fatal("builds_completed aggregate not found")
@@ -392,7 +448,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 			time.Sleep(time.Duration(rand.Intn(200)) * time.Millisecond)
 
 			// Start the build
-			if err := client.StartStep(ctx, correlationID, "builds_completed", component.Name); err != nil {
+			if err := client.StartStep(ctx, correlationID, buildsStep, component.Name); err != nil {
 				buildErrors <- fmt.Errorf("start build %s: %w", component.Name, err)
 				return
 			}
@@ -401,7 +457,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 			time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
 
 			// Complete the build
-			if err := client.CompleteStep(ctx, correlationID, "builds_completed", component.Name); err != nil {
+			if err := client.CompleteStep(ctx, correlationID, buildsStep, component.Name); err != nil {
 				buildErrors <- fmt.Errorf("complete build %s: %w", component.Name, err)
 				return
 			}
@@ -423,7 +479,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 		t.Fatalf("failed to load slip after builds: %v", err)
 	}
 
-	buildsAggregate = slip.Aggregates["builds_completed"]
+	buildsAggregate = slip.Aggregates[buildsStep]
 	completedBuilds := make(map[string]bool)
 	for _, build := range buildsAggregate {
 		if build.Status == StepStatusCompleted {
@@ -440,9 +496,9 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	t.Logf("✓ All %d concurrent builds completed successfully", len(components))
 
 	// Verify builds_completed step was auto-updated to completed
-	if slip.Steps["builds_completed"].Status != StepStatusCompleted {
+	if slip.Steps[buildsStep].Status != StepStatusCompleted {
 		t.Errorf("Expected builds_completed step to be completed, got %s",
-			slip.Steps["builds_completed"].Status)
+			slip.Steps[buildsStep].Status)
 	}
 	t.Log("✓ builds_completed aggregate step auto-completed")
 
@@ -457,7 +513,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	// Note: In production default.json, unit_tests_completed is a REGULAR step,
 	// not an aggregate step (no "aggregates" field). So we complete it directly.
 	t.Log("DEBUG: Before StartStep, checking step in config...")
-	stepConfig := pipelineConfig.GetStep("unit_tests_completed")
+	stepConfig := pipelineConfig.GetStep(unitTestsStep)
 	if stepConfig == nil {
 		t.Fatal("FATAL: unit_tests_completed not found in pipeline config!")
 	}
@@ -468,10 +524,10 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 		stepConfig.IsGate,
 	)
 
-	if err := client.StartStep(ctx, correlationID, "unit_tests_completed", ""); err != nil {
+	if err := client.StartStep(ctx, correlationID, unitTestsStep, ""); err != nil {
 		t.Fatalf("failed to start unit_tests_completed: %v", err)
 	}
-	if err := client.CompleteStep(ctx, correlationID, "unit_tests_completed", ""); err != nil {
+	if err := client.CompleteStep(ctx, correlationID, unitTestsStep, ""); err != nil {
 		t.Fatalf("failed to complete unit_tests_completed: %v", err)
 	}
 	t.Log("✓ unit_tests_completed step completed")
@@ -532,9 +588,9 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 		t.Logf("  - %s: %s", stepName, step.Status)
 	}
 
-	if slip.Steps["unit_tests_completed"].Status != StepStatusCompleted {
+	if slip.Steps[unitTestsStep].Status != StepStatusCompleted {
 		t.Errorf("Expected unit_tests_completed step to be completed, got %s",
-			slip.Steps["unit_tests_completed"].Status)
+			slip.Steps[unitTestsStep].Status)
 	}
 	t.Log("✓ unit_tests_completed verified as completed")
 
@@ -561,10 +617,10 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 
 	// Complete secret_scan step (no prerequisites)
 	t.Log("Completing secret_scan step...")
-	if err := client.StartStep(ctx, correlationID, "secret_scan", ""); err != nil {
+	if err := client.StartStep(ctx, correlationID, secretScanStep, ""); err != nil {
 		t.Fatalf("failed to start secret_scan: %v", err)
 	}
-	if err := client.CompleteStep(ctx, correlationID, "secret_scan", ""); err != nil {
+	if err := client.CompleteStep(ctx, correlationID, secretScanStep, ""); err != nil {
 		t.Fatalf("failed to complete secret_scan: %v", err)
 	}
 	t.Log("✓ secret_scan completed")
@@ -587,7 +643,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	prereqResult, err := client.CheckPrerequisites(
 		ctx,
 		slip,
-		[]string{"builds_completed", "unit_tests_completed", "secret_scan"},
+		[]string{buildsStep, unitTestsStep, secretScanStep},
 		"",
 	)
 	if err != nil {
@@ -744,7 +800,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	t.Log("DATA INTEGRITY CHECKS:")
 
 	// Check all builds completed
-	buildsAggregate = finalSlip.Aggregates["builds_completed"]
+	buildsAggregate = finalSlip.Aggregates[buildsStep]
 	if len(buildsAggregate) != len(components) {
 		t.Errorf("Expected %d components in builds_completed, got %d",
 			len(components), len(buildsAggregate))
@@ -832,6 +888,10 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 		t.Fatalf("failed to load default.json: %v", err)
 	}
 
+	// Extract step names from config
+	stepNames := extractStepNamesFromConfig(t, pipelineConfig)
+	buildsStep := stepNames.builds
+
 	// Run migrations
 	migrateOpts := MigrateOptions{
 		Database:       "ci_stress_test",
@@ -917,7 +977,7 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 			time.Sleep(time.Duration(rand.Intn(10)) * time.Millisecond)
 
 			// Start and complete build in quick succession
-			if err := client.StartStep(ctx, correlationID, "builds_completed", component.Name); err != nil {
+			if err := client.StartStep(ctx, correlationID, buildsStep, component.Name); err != nil {
 				errors <- fmt.Errorf("start %s: %w", component.Name, err)
 				return
 			}
@@ -925,7 +985,7 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 			// Minimal processing time
 			time.Sleep(time.Duration(rand.Intn(5)) * time.Millisecond)
 
-			if err := client.CompleteStep(ctx, correlationID, "builds_completed", component.Name); err != nil {
+			if err := client.CompleteStep(ctx, correlationID, buildsStep, component.Name); err != nil {
 				errors <- fmt.Errorf("complete %s: %w", component.Name, err)
 				return
 			}
@@ -964,7 +1024,7 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 		t.Fatalf("failed to load final slip: %v", err)
 	}
 
-	buildsAggregate := finalSlip.Aggregates["builds_completed"]
+	buildsAggregate := finalSlip.Aggregates[buildsStep]
 
 	t.Log("")
 	t.Log("STRESS TEST RESULTS:")
@@ -999,9 +1059,9 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 	t.Logf("  ✓ All %d components correctly accumulated", numComponents)
 
 	// Verify aggregate step status
-	if finalSlip.Steps["builds_completed"].Status != StepStatusCompleted {
+	if finalSlip.Steps[buildsStep].Status != StepStatusCompleted {
 		t.Errorf("Expected builds_completed step to be completed, got %s",
-			finalSlip.Steps["builds_completed"].Status)
+			finalSlip.Steps[buildsStep].Status)
 	} else {
 		t.Log("  ✓ builds_completed aggregate step auto-completed")
 	}
@@ -1054,6 +1114,12 @@ func TestE2E_PrerequisiteWaiting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load default.json: %v", err)
 	}
+
+	// Extract step names from config
+	stepNames := extractStepNamesFromConfig(t, pipelineConfig)
+	buildsStep := stepNames.builds
+	unitTestsStep := stepNames.unitTests
+	secretScanStep := stepNames.secretScan
 
 	migrateOpts := MigrateOptions{
 		Database:       "ci_prereq_test",
@@ -1110,21 +1176,21 @@ func TestE2E_PrerequisiteWaiting(t *testing.T) {
 		t.Log("Background: Completing builds...")
 		// builds_completed is an aggregate step with components
 		for _, comp := range components {
-			client.CompleteStep(ctx, correlationID, "builds_completed", comp.Name)
+			client.CompleteStep(ctx, correlationID, buildsStep, comp.Name)
 		}
 
 		time.Sleep(500 * time.Millisecond)
 		t.Log("Background: Completing unit tests...")
 		// unit_tests_completed is a simple step (no aggregates), so complete without component
-		client.CompleteStep(ctx, correlationID, "unit_tests_completed", "")
+		client.CompleteStep(ctx, correlationID, unitTestsStep, "")
 
 		time.Sleep(500 * time.Millisecond)
 		t.Log("Background: Completing secret_scan...")
-		client.CompleteStep(ctx, correlationID, "secret_scan", "")
+		client.CompleteStep(ctx, correlationID, secretScanStep, "")
 	}()
 
 	// Wait for prerequisites (should block until the background goroutine completes them)
-	prereqs := []string{"builds_completed", "unit_tests_completed", "secret_scan"}
+	prereqs := []string{buildsStep, unitTestsStep, secretScanStep}
 	holdOpts := HoldOptions{
 		CorrelationID: correlationID,
 		Prerequisites: prereqs,
@@ -1189,6 +1255,9 @@ func TestE2E_ReplacingMergeTreeCollapse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load default.json: %v", err)
 	}
+
+	// Extract step names from config (not used directly in this test but validates config)
+	_ = extractStepNamesFromConfig(t, pipelineConfig)
 
 	migrateOpts := MigrateOptions{
 		Database:       "ci_collapse_test",
@@ -1353,6 +1422,10 @@ func TestE2E_ComponentStateEventSourcing(t *testing.T) {
 		t.Fatalf("failed to load default.json: %v", err)
 	}
 
+	// Extract step names from config
+	stepNames := extractStepNamesFromConfig(t, pipelineConfig)
+	buildsStep := stepNames.builds
+
 	migrateOpts := MigrateOptions{
 		Database:       "ci_eventsource_test",
 		PipelineConfig: pipelineConfig,
@@ -1411,9 +1484,9 @@ func TestE2E_ComponentStateEventSourcing(t *testing.T) {
 			var err error
 			switch status {
 			case StepStatusRunning:
-				err = client.StartStep(ctx, correlationID, "builds_completed", comp.Name)
+				err = client.StartStep(ctx, correlationID, buildsStep, comp.Name)
 			case StepStatusCompleted:
-				err = client.CompleteStep(ctx, correlationID, "builds_completed", comp.Name)
+				err = client.CompleteStep(ctx, correlationID, buildsStep, comp.Name)
 			}
 			if err != nil {
 				t.Fatalf("failed to update %s to %s: %v", comp.Name, status, err)
@@ -1457,7 +1530,7 @@ func TestE2E_ComponentStateEventSourcing(t *testing.T) {
 
 	t.Log("")
 	t.Log("HYDRATED AGGREGATES:")
-	buildsAggregate := loadedSlip.Aggregates["builds_completed"]
+	buildsAggregate := loadedSlip.Aggregates[buildsStep]
 	t.Logf("builds_completed aggregate has %d components:", len(buildsAggregate))
 
 	for _, comp := range buildsAggregate {
@@ -1507,6 +1580,11 @@ func TestE2E_SlipStatusHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load default.json: %v", err)
 	}
+
+	// Extract step names from config
+	stepNames := extractStepNamesFromConfig(t, pipelineConfig)
+	buildsStep := stepNames.builds
+	secretScanStep := stepNames.secretScan
 
 	migrateOpts := MigrateOptions{
 		Database:       "ci_history_test",
@@ -1562,10 +1640,10 @@ func TestE2E_SlipStatusHistory(t *testing.T) {
 		component string
 		action    string
 	}{
-		{"builds_completed", "api", "start"},
-		{"builds_completed", "api", "complete"},
-		{"secret_scan", "", "start"},
-		{"secret_scan", "", "complete"},
+		{buildsStep, "api", "start"},
+		{buildsStep, "api", "complete"},
+		{secretScanStep, "", "start"},
+		{secretScanStep, "", "complete"},
 		{"dev_deploy", "", "start"},
 		{"dev_deploy", "", "complete"},
 	}
@@ -1641,6 +1719,10 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 		t.Fatalf("failed to load default.json: %v", err)
 	}
 
+	// Extract step names from config
+	stepNames := extractStepNamesFromConfig(t, pipelineConfig)
+	buildsStep := stepNames.builds
+
 	migrateOpts := MigrateOptions{
 		Database:       "ci_json_test",
 		PipelineConfig: pipelineConfig,
@@ -1690,7 +1772,7 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 
 	// Add various data to test JSON serialization
 	for _, comp := range components {
-		if err := client.StartStep(ctx, correlationID, "builds_completed", comp.Name); err != nil {
+		if err := client.StartStep(ctx, correlationID, buildsStep, comp.Name); err != nil {
 			t.Fatalf("failed to start build: %v", err)
 		}
 		// Set image tag
@@ -1702,7 +1784,7 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 		); err != nil {
 			t.Fatalf("failed to set image tag: %v", err)
 		}
-		if err := client.CompleteStep(ctx, correlationID, "builds_completed", comp.Name); err != nil {
+		if err := client.CompleteStep(ctx, correlationID, buildsStep, comp.Name); err != nil {
 			t.Fatalf("failed to complete build: %v", err)
 		}
 	}
@@ -1712,28 +1794,30 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 	t.Log("RAW JSON DATA FROM CLICKHOUSE:")
 
 	var buildsJSON, stateHistoryJSON, ancestryJSON string
-	err = container.conn.QueryRow(ctx, `
+	// Use the config-driven step name as the column name
+	rawQuery := fmt.Sprintf(`
 		SELECT 
-			toString(builds_completed) as builds,
+			toString(%s) as builds,
 			toString(state_history) as history,
 			toString(ancestry) as ancestry
 		FROM ci_json_test.routing_slips FINAL
 		WHERE correlation_id = $1
-	`, correlationID).Scan(&buildsJSON, &stateHistoryJSON, &ancestryJSON)
+	`, buildsStep)
+	err = container.conn.QueryRow(ctx, rawQuery, correlationID).Scan(&buildsJSON, &stateHistoryJSON, &ancestryJSON)
 	if err != nil {
 		t.Fatalf("failed to query raw JSON: %v", err)
 	}
 
-	t.Logf("  builds_completed JSON: %s", buildsJSON[:min(200, len(buildsJSON))]+"...")
+	t.Logf("  %s JSON: %s", buildsStep, buildsJSON[:min(200, len(buildsJSON))]+"...")
 	t.Logf("  state_history JSON: %s", stateHistoryJSON[:min(200, len(stateHistoryJSON))]+"...")
 	t.Logf("  ancestry JSON: %s", ancestryJSON)
 
 	// Verify JSON is valid by parsing
 	var buildsData interface{}
 	if err := json.Unmarshal([]byte(buildsJSON), &buildsData); err != nil {
-		t.Errorf("builds_completed JSON is invalid: %v", err)
+		t.Errorf("%s JSON is invalid: %v", buildsStep, err)
 	} else {
-		t.Log("  ✓ builds_completed JSON is valid")
+		t.Logf("  ✓ %s JSON is valid", buildsStep)
 	}
 
 	var historyData interface{}
@@ -1752,7 +1836,7 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 	// Verify component data was deserialized correctly
 	t.Log("")
 	t.Log("DESERIALIZED DATA:")
-	buildsAggregate := slip.Aggregates["builds_completed"]
+	buildsAggregate := slip.Aggregates[buildsStep]
 	for _, comp := range buildsAggregate {
 		t.Logf("  %s: status=%s, imageTag=%s", comp.Component, comp.Status, comp.ImageTag)
 		if comp.ImageTag == "" {

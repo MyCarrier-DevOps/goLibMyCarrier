@@ -1133,16 +1133,24 @@ func (s *ClickHouseStore) updatePipelineStep(slip *Slip, stepName string, status
 }
 
 // computeAggregateStatus determines the aggregate status from component statuses.
+// The aggregate is:
+// - "failed" if any component has failed
+// - "completed" if all components are completed
+// - "running" if any component is running OR completed (work is in progress)
+// - "pending" if all components are pending (no work has started)
 func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepData) StepStatus {
 	allCompleted := true
 	anyRunning := false
+	anyCompleted := false
 	anyFailed := false
 
 	for _, comp := range componentData {
 		if comp.Status.IsFailure() {
 			anyFailed = true
 		}
-		if !comp.Status.IsSuccess() {
+		if comp.Status.IsSuccess() {
+			anyCompleted = true
+		} else {
 			allCompleted = false
 		}
 		if comp.Status.IsRunning() {
@@ -1156,7 +1164,8 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 	if allCompleted {
 		return StepStatusCompleted
 	}
-	if anyRunning {
+	// If any component is running or completed, the aggregate is "running" (in progress)
+	if anyRunning || anyCompleted {
 		return StepStatusRunning
 	}
 	return StepStatusPending

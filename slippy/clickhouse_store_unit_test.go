@@ -951,6 +951,106 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 	}
 }
 
+// TestClickHouseStore_Load_HydratesComponentStates_AggregateStepName tests hydration when
+// component states use the aggregate step name directly (e.g., "builds" instead of "build").
+// This is the scenario when the CLI passes --step builds --component api.
+func TestClickHouseStore_Load_HydratesComponentStates_AggregateStepName(t *testing.T) {
+	stateTimestamp := time.Now()
+	config := testPipelineConfig()
+
+	// The aggregate step name is "builds" (the step that aggregates "build")
+	aggregateStepName := "builds"
+
+	// Verify the config is set up correctly
+	if !config.IsAggregateStep(aggregateStepName) {
+		t.Fatalf("expected %q to be an aggregate step", aggregateStepName)
+	}
+
+	// Mock returns component state with step="builds" (aggregate step name, not component type)
+	mockRows := &clickhousetest.MockRows{
+		NextData: []bool{true, false},
+		ScanFunc: func(dest ...any) error {
+			if ptr, ok := dest[0].(*string); ok {
+				*ptr = "builds" // Using aggregate step name, not "build"
+			}
+			if ptr, ok := dest[1].(*string); ok {
+				*ptr = "mc.example.api" // Component name from workflow
+			}
+			if ptr, ok := dest[2].(*string); ok {
+				*ptr = string(StepStatusCompleted)
+			}
+			if ptr, ok := dest[3].(*string); ok {
+				*ptr = "ok"
+			}
+			if ptr, ok := dest[4].(*time.Time); ok {
+				*ptr = stateTimestamp
+			}
+			return nil
+		},
+	}
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return mockRows, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, config, "ci")
+
+	// Initial slip has different component names (from pipeline definition)
+	slip := &Slip{
+		CorrelationID: "test-corr-001",
+		Aggregates: map[string][]ComponentStepData{
+			aggregateStepName: {
+				{Component: "ExampleApi", Status: StepStatusPending},
+				{Component: "ExampleWorker", Status: StepStatusPending},
+			},
+		},
+		Steps: map[string]Step{
+			aggregateStepName: {Status: StepStatusPending},
+		},
+	}
+
+	err := store.hydrateSlip(context.Background(), slip)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Should have 3 components now: 2 original + 1 new from component states
+	components := slip.Aggregates[aggregateStepName]
+	if len(components) != 3 {
+		t.Fatalf("expected 3 components (2 original + 1 new), got %d: %+v", len(components), components)
+	}
+
+	// Find the new component and verify its status
+	var newComponent *ComponentStepData
+	for i := range components {
+		if components[i].Component == "mc.example.api" {
+			newComponent = &components[i]
+			break
+		}
+	}
+	if newComponent == nil {
+		t.Fatal("expected to find component 'mc.example.api' in aggregates")
+	}
+	if newComponent.Status != StepStatusCompleted {
+		t.Errorf("expected new component status completed, got %s", newComponent.Status)
+	}
+
+	// Original components should still be pending
+	for _, comp := range components {
+		if comp.Component == "ExampleApi" || comp.Component == "ExampleWorker" {
+			if comp.Status != StepStatusPending {
+				t.Errorf("expected original component %q status pending, got %s", comp.Component, comp.Status)
+			}
+		}
+	}
+
+	// Aggregate step status should be "running" (some completed, some pending)
+	aggregateStep := slip.Steps[aggregateStepName]
+	if aggregateStep.Status != StepStatusRunning {
+		t.Errorf("expected aggregate step running (mixed states), got %s", aggregateStep.Status)
+	}
+}
+
 // TestClickHouseStore_LoadByCommit_Success tests successful slip loading by commit.
 func TestClickHouseStore_LoadByCommit_Success(t *testing.T) {
 	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
