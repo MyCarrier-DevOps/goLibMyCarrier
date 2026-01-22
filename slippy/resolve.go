@@ -73,7 +73,8 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 		})
 
 		commits, err := c.github.GetCommitAncestry(ctx, owner, repo, opts.Ref, opts.AncestryDepth)
-		if err != nil {
+		switch {
+		case err != nil:
 			// Log at Info level - error is captured as warning and returned to caller
 			// Caller decides logging level based on shadow mode
 			c.logger.Info(ctx, "Failed to get commit ancestry, will try fallback", map[string]interface{}{
@@ -83,7 +84,7 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 			})
 			// Capture as warning - we'll try fallback resolution
 			warnings = append(warnings, fmt.Errorf("ancestry resolution failed: %w", err))
-		} else if len(commits) > 0 {
+		case len(commits) > 0:
 			c.logger.Info(ctx, "Got commit ancestry from GitHub", map[string]interface{}{
 				"repository":   opts.Repository,
 				"ref":          opts.Ref,
@@ -115,7 +116,7 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 				"repository":   opts.Repository,
 				"commit_count": len(commits),
 			})
-		} else {
+		default:
 			c.logger.Info(ctx, "No commits returned from ancestry lookup", map[string]interface{}{
 				"repository": opts.Repository,
 				"ref":        opts.Ref,

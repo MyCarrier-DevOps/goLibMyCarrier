@@ -26,7 +26,9 @@ func init() {
 }
 
 // integrationTestPipelineConfig returns a pipeline config for integration tests.
-// It defines a simple pipeline with builds as an aggregate step.
+// It defines a simple pipeline matching the production config structure where:
+// - builds_completed is the aggregate step that tracks component builds
+// - The "aggregates" field points to the component step type (e.g., "build")
 func integrationTestPipelineConfig() *PipelineConfig {
 	config := &PipelineConfig{
 		Version:     "1.0",
@@ -34,12 +36,16 @@ func integrationTestPipelineConfig() *PipelineConfig {
 		Description: "Pipeline for integration testing",
 		Steps: []StepConfig{
 			{Name: "push_parsed", Description: "Push event parsed"},
-			{Name: "builds", Description: "Component builds", Aggregates: "builds_completed"},
-			{Name: "builds_completed", Description: "All builds completed", Prerequisites: []string{"push_parsed"}},
-			{Name: "unit_tests", Description: "Component unit tests", Aggregates: "unit_tests_completed"},
+			{
+				Name:          "builds_completed",
+				Description:   "All builds completed",
+				Aggregates:    "build",
+				Prerequisites: []string{"push_parsed"},
+			},
 			{
 				Name:          "unit_tests_completed",
 				Description:   "All unit tests completed",
+				Aggregates:    "unit_test",
 				Prerequisites: []string{"builds_completed"},
 			},
 			{Name: "dev_deploy", Description: "Deploy to dev", Prerequisites: []string{"unit_tests_completed"}},
@@ -1183,4 +1189,154 @@ func TestAtomicUpdate_VersionSequence(t *testing.T) {
 
 	t.Logf("SUCCESS: Version sequence verified after %d updates", numUpdates)
 	t.Logf("Final version: %d, row count after OPTIMIZE: %d", finalSlip.Version, rowCount)
+}
+
+// TestHydrateSlip_EmptyAggregates tests that component states are properly hydrated
+// into slips even when the aggregate JSON column is empty ({"items":[]}).
+// This reproduces a bug where:
+//  1. A slip is created with empty aggregates (builds_completed = {"items":[]})
+//  2. Component states are written to slip_component_states table
+//  3. Loading the slip fails to populate the aggregate because hydrateSlip
+//     skips aggregates that don't have existing component entries
+func TestHydrateSlip_EmptyAggregates(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Setup
+	container, err := setupClickHouseContainer(ctx, t)
+	if err != nil {
+		t.Fatalf("Failed to start container: %v", err)
+	}
+	defer container.terminate(ctx)
+
+	pipelineConfig := integrationTestPipelineConfig()
+	store, err := createTestStore(ctx, t, container, pipelineConfig)
+	if err != nil {
+		t.Fatalf("Failed to create test store: %v", err)
+	}
+	defer store.Close()
+
+	// Create a slip with EMPTY aggregates (simulates what pushhookparser does)
+	correlationID := fmt.Sprintf("test-hydrate-%d", time.Now().UnixNano())
+	slip := &Slip{
+		CorrelationID: correlationID,
+		Repository:    "test-org/test-repo",
+		Branch:        "main",
+		CommitSHA:     "abc123def456",
+		Status:        SlipStatusInProgress,
+		Steps: map[string]Step{
+			"push_parsed":          {Status: StepStatusCompleted},
+			"builds":               {Status: StepStatusPending},
+			"builds_completed":     {Status: StepStatusRunning}, // Running, waiting for components
+			"unit_tests":           {Status: StepStatusPending},
+			"unit_tests_completed": {Status: StepStatusPending},
+			"dev_deploy":           {Status: StepStatusPending},
+		},
+		// IMPORTANT: Empty aggregates - this is the key to reproducing the bug
+		Aggregates: map[string][]ComponentStepData{
+			"builds_completed": {}, // Empty! No component entries yet
+		},
+	}
+
+	if err := store.Create(ctx, slip); err != nil {
+		t.Fatalf("Failed to create slip: %v", err)
+	}
+	t.Logf("Created slip %s with empty aggregates", correlationID)
+
+	// Now simulate components completing their builds by writing directly to slip_component_states
+	// This is what happens when slippy post-job runs for each component
+	components := []string{"api", "worker", "frontend"}
+	for _, comp := range components {
+		err := store.insertComponentState(ctx, correlationID, "builds_completed", comp, StepStatusCompleted)
+		if err != nil {
+			t.Fatalf("Failed to insert component state for %s: %v", comp, err)
+		}
+		t.Logf("Inserted component state: %s = completed", comp)
+	}
+
+	// Verify component states are in the database
+	states, err := store.loadComponentStates(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("Failed to load component states: %v", err)
+	}
+	t.Logf("Component states in database: %d", len(states))
+	for _, s := range states {
+		t.Logf("  %s/%s = %s", s.Step, s.Component, s.Status)
+	}
+
+	if len(states) != len(components) {
+		t.Fatalf("Expected %d component states, got %d", len(components), len(states))
+	}
+
+	// Now load the slip - this should hydrate the aggregate from component states
+	loadedSlip, err := store.Load(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("Failed to load slip: %v", err)
+	}
+
+	// Check that the aggregate was populated with component data
+	t.Log("")
+	t.Log("═══════════════════════════════════════════════════════════════")
+	t.Log("LOADED SLIP AGGREGATES")
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	buildsAggregate, ok := loadedSlip.Aggregates["builds_completed"]
+	if !ok {
+		t.Fatal("builds_completed aggregate not found in loaded slip")
+	}
+
+	t.Logf("builds_completed aggregate has %d components", len(buildsAggregate))
+	for _, comp := range buildsAggregate {
+		t.Logf("  %s: status=%s", comp.Component, comp.Status)
+	}
+
+	// THIS IS THE BUG: The aggregate should have been populated from component states
+	if len(buildsAggregate) == 0 {
+		t.Error("BUG REPRODUCED: builds_completed aggregate is empty after hydration!")
+		t.Error("Expected component states to be merged into the aggregate")
+	}
+
+	// Verify all components are present and completed
+	if len(buildsAggregate) != len(components) {
+		t.Errorf("Expected %d components in aggregate, got %d", len(components), len(buildsAggregate))
+	}
+
+	// Check that aggregate step status was computed correctly
+	buildsStep := loadedSlip.Steps["builds_completed"]
+	t.Logf("builds_completed step status: %s", buildsStep.Status)
+
+	// All components completed, so step should be completed
+	if buildsStep.Status != StepStatusCompleted {
+		t.Errorf("Expected builds_completed step status to be 'completed', got '%s'", buildsStep.Status)
+	}
+
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	// Also test the updateAggregateStatusFromComponentStates flow
+	// This simulates what happens after UpdateStep with a component name
+	t.Log("")
+	t.Log("Testing updateAggregateStatusFromComponentStates...")
+
+	// Add another component and verify it gets aggregated
+	err = store.UpdateStep(ctx, correlationID, "builds_completed", "scheduler", StepStatusCompleted)
+	if err != nil {
+		t.Fatalf("Failed to UpdateStep for scheduler: %v", err)
+	}
+
+	// Reload and verify
+	reloadedSlip, err := store.Load(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("Failed to reload slip: %v", err)
+	}
+
+	reloadedAggregate := reloadedSlip.Aggregates["builds_completed"]
+	t.Logf("After UpdateStep, aggregate has %d components", len(reloadedAggregate))
+
+	// Should now have 4 components: api, worker, frontend, scheduler
+	expectedCount := len(components) + 1
+	if len(reloadedAggregate) != expectedCount {
+		t.Errorf("Expected %d components after UpdateStep, got %d", expectedCount, len(reloadedAggregate))
+	}
+
+	t.Log("SUCCESS: Hydration test complete")
 }

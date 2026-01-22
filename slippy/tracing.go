@@ -95,6 +95,8 @@ func ContextWithCorrelationTrace(ctx context.Context, correlationID string) cont
 //	ctx, span := slippy.StartSpan(ctx, "ProcessPush", correlationID)
 //	defer span.End()
 //	// All slippy operations using ctx will be children of this span
+//
+//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
 func StartSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
 	// Ensure we have a trace context rooted in the correlation ID
 	ctx = ContextWithCorrelationTrace(ctx, correlationID)
@@ -119,6 +121,9 @@ type RetrySpan struct {
 // The correlation ID is used as the trace ID, allowing all operations on the same
 // routing slip to be correlated in the tracing backend.
 // The span will capture retry attempts, backoff durations, and success/failure.
+// The returned RetrySpan wraps the span and caller must call EndSuccess() or EndError().
+//
+//nolint:spancheck // Span is wrapped in RetrySpan; caller calls EndSuccess/EndError which calls span.End()
 func startRetrySpan(ctx context.Context, operationName, correlationID string) *RetrySpan {
 	// Try to use the correlation ID as the trace ID for better correlation
 	// If the context already has a valid trace, we create a child span instead

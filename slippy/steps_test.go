@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -236,27 +237,24 @@ func TestClient_SkipStep(t *testing.T) {
 func TestClient_UpdateStepWithStatus(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("history append failure returns error", func(t *testing.T) {
+	t.Run("combined step and history update error returns error", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
 
 		slip := createTestSlip("corr-update-1")
 		store.AddSlip(slip)
-		store.AppendHistoryError = errors.New("history append failed")
+		// Since UpdateStepWithHistory is now a combined operation, we inject error via UpdateStepError
+		store.UpdateStepError = errors.New("combined update failed")
 
-		// Now returns error - history errors are no longer swallowed
+		// Combined operation returns error
 		err := client.UpdateStepWithStatus(ctx, "corr-update-1", "dev_deploy", "", StepStatusCompleted, "done")
 		if err == nil {
-			t.Fatal("expected error for history append failure")
+			t.Fatal("expected error for combined update failure")
 		}
-		if !errors.Is(err, ErrHistoryAppendFailed) {
-			t.Errorf("expected ErrHistoryAppendFailed, got: %v", err)
-		}
-
-		// Verify the step was still updated (step update succeeded, history failed)
-		if len(store.UpdateStepCalls) != 1 {
-			t.Error("expected step to be updated before history error")
+		// Error is wrapped by NewStepError
+		if !strings.Contains(err.Error(), "combined update failed") {
+			t.Errorf("expected error to contain 'combined update failed', got: %v", err)
 		}
 	})
 }
@@ -514,7 +512,7 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"builds": {
+				"builds_completed": {
 					{Component: "my-service"},
 				},
 			},
@@ -532,8 +530,8 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			t.Fatal("expected Update to be called")
 		}
 		updatedSlip := store.UpdateCalls[0].Slip
-		if updatedSlip.Aggregates["builds"][0].ImageTag != "mycarrier/my-service:abc123-1234567890" {
-			t.Errorf("expected image tag to be set, got '%s'", updatedSlip.Aggregates["builds"][0].ImageTag)
+		if updatedSlip.Aggregates["builds_completed"][0].ImageTag != "mycarrier/my-service:abc123-1234567890" {
+			t.Errorf("expected image tag to be set, got '%s'", updatedSlip.Aggregates["builds_completed"][0].ImageTag)
 		}
 	})
 
@@ -552,7 +550,7 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			UpdatedAt:     time.Now(),
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"builds": {
+				"builds_completed": {
 					{Component: "other-service"},
 				},
 			},
