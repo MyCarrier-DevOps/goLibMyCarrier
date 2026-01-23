@@ -249,3 +249,172 @@ func TestPipelineConfig_GetEffectivePrerequisites(t *testing.T) {
 		t.Errorf("GetEffectivePrerequisites('push_parsed') = %v, want []", prereqs)
 	}
 }
+
+func TestComponentStepData_ApplyStatusTransition(t *testing.T) {
+	tests := []struct {
+		name            string
+		initialStatus   StepStatus
+		newStatus       StepStatus
+		hasStartedAt    bool
+		hasCompletedAt  bool
+		wantStartedAt   bool
+		wantCompletedAt bool
+	}{
+		{
+			name:            "pending to running sets startedAt",
+			initialStatus:   StepStatusPending,
+			newStatus:       StepStatusRunning,
+			hasStartedAt:    false,
+			hasCompletedAt:  false,
+			wantStartedAt:   true,
+			wantCompletedAt: false,
+		},
+		{
+			name:            "running to completed sets completedAt",
+			initialStatus:   StepStatusRunning,
+			newStatus:       StepStatusCompleted,
+			hasStartedAt:    true,
+			hasCompletedAt:  false,
+			wantStartedAt:   true,
+			wantCompletedAt: true,
+		},
+		{
+			name:            "running to failed sets completedAt",
+			initialStatus:   StepStatusRunning,
+			newStatus:       StepStatusFailed,
+			hasStartedAt:    true,
+			hasCompletedAt:  false,
+			wantStartedAt:   true,
+			wantCompletedAt: true,
+		},
+		{
+			name:            "does not overwrite existing startedAt",
+			initialStatus:   StepStatusRunning,
+			newStatus:       StepStatusRunning,
+			hasStartedAt:    true,
+			hasCompletedAt:  false,
+			wantStartedAt:   true,
+			wantCompletedAt: false,
+		},
+		{
+			name:            "does not overwrite existing completedAt",
+			initialStatus:   StepStatusCompleted,
+			newStatus:       StepStatusCompleted,
+			hasStartedAt:    true,
+			hasCompletedAt:  true,
+			wantStartedAt:   true,
+			wantCompletedAt: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldTime := time.Now().Add(-1 * time.Hour)
+			newTime := time.Now()
+
+			c := &ComponentStepData{
+				Component: "test",
+				Status:    tt.initialStatus,
+			}
+			if tt.hasStartedAt {
+				c.StartedAt = &oldTime
+			}
+			if tt.hasCompletedAt {
+				c.CompletedAt = &oldTime
+			}
+
+			c.ApplyStatusTransition(tt.newStatus, newTime)
+
+			if c.Status != tt.newStatus {
+				t.Errorf("Status = %v, want %v", c.Status, tt.newStatus)
+			}
+			if tt.wantStartedAt && c.StartedAt == nil {
+				t.Error("StartedAt should be set")
+			}
+			if !tt.wantStartedAt && c.StartedAt != nil {
+				t.Error("StartedAt should not be set")
+			}
+			if tt.wantCompletedAt && c.CompletedAt == nil {
+				t.Error("CompletedAt should be set")
+			}
+			if !tt.wantCompletedAt && c.CompletedAt != nil {
+				t.Error("CompletedAt should not be set")
+			}
+		})
+	}
+}
+
+func TestStep_ApplyStatusTransition(t *testing.T) {
+	tests := []struct {
+		name            string
+		initialStatus   StepStatus
+		newStatus       StepStatus
+		hasStartedAt    bool
+		hasCompletedAt  bool
+		wantStartedAt   bool
+		wantCompletedAt bool
+	}{
+		{
+			name:            "pending to running sets startedAt",
+			initialStatus:   StepStatusPending,
+			newStatus:       StepStatusRunning,
+			hasStartedAt:    false,
+			hasCompletedAt:  false,
+			wantStartedAt:   true,
+			wantCompletedAt: false,
+		},
+		{
+			name:            "running to completed sets completedAt",
+			initialStatus:   StepStatusRunning,
+			newStatus:       StepStatusCompleted,
+			hasStartedAt:    true,
+			hasCompletedAt:  false,
+			wantStartedAt:   true,
+			wantCompletedAt: true,
+		},
+		{
+			name:            "running to skipped sets completedAt",
+			initialStatus:   StepStatusRunning,
+			newStatus:       StepStatusSkipped,
+			hasStartedAt:    true,
+			hasCompletedAt:  false,
+			wantStartedAt:   true,
+			wantCompletedAt: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldTime := time.Now().Add(-1 * time.Hour)
+			newTime := time.Now()
+
+			s := &Step{
+				Status: tt.initialStatus,
+			}
+			if tt.hasStartedAt {
+				s.StartedAt = &oldTime
+			}
+			if tt.hasCompletedAt {
+				s.CompletedAt = &oldTime
+			}
+
+			s.ApplyStatusTransition(tt.newStatus, newTime)
+
+			if s.Status != tt.newStatus {
+				t.Errorf("Status = %v, want %v", s.Status, tt.newStatus)
+			}
+			if tt.wantStartedAt && s.StartedAt == nil {
+				t.Error("StartedAt should be set")
+			}
+			if !tt.wantStartedAt && s.StartedAt != nil {
+				t.Error("StartedAt should not be set")
+			}
+			if tt.wantCompletedAt && s.CompletedAt == nil {
+				t.Error("CompletedAt should be set")
+			}
+			if !tt.wantCompletedAt && s.CompletedAt != nil {
+				t.Error("CompletedAt should not be set")
+			}
+		})
+	}
+}

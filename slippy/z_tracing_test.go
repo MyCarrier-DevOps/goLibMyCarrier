@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"testing"
+	"time"
 
 	"go.opentelemetry.io/otel/trace"
 )
@@ -278,5 +279,94 @@ func TestStartSpan_ChildOfExistingTrace(t *testing.T) {
 	spanCtx := trace.SpanContextFromContext(ctx)
 	if spanCtx.TraceID() != existingTraceID {
 		t.Errorf("trace ID = %s, want existing %s", spanCtx.TraceID().String(), existingTraceID.String())
+	}
+}
+
+func TestTracer(t *testing.T) {
+	// Tracer() should return a non-nil tracer
+	tr := Tracer()
+	if tr == nil {
+		t.Error("Tracer() should not return nil")
+	}
+	// Should be the same as the internal tracer()
+	if tr != tracer() {
+		t.Error("Tracer() should return the same tracer as internal tracer()")
+	}
+}
+
+func TestRetrySpan_RecordVersionConflict(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	retrySpan := startRetrySpan(ctx, "TestOperation", correlationID)
+
+	// Should not panic
+	retrySpan.RecordVersionConflict(1, 2)
+	retrySpan.RecordVersionConflict(5, 10)
+
+	retrySpan.EndSuccess()
+}
+
+func TestRetrySpan_EndWithStatus(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	tests := []struct {
+		name    string
+		success bool
+		message string
+	}{
+		{"success", true, "operation completed"},
+		{"failure", false, "operation failed: timeout"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			retrySpan := startRetrySpan(ctx, "TestOperation", correlationID)
+
+			// Should not panic
+			retrySpan.EndWithStatus(tt.success, tt.message)
+		})
+	}
+}
+
+func TestRecordJobExecutionSpan(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+	startTime := time.Now().Add(-5 * time.Second)
+
+	tests := []struct {
+		name          string
+		stepName      string
+		componentName string
+		success       bool
+		errorMessage  string
+	}{
+		{"success without component", "builds", "", true, ""},
+		{"success with component", "builds", "svc-a", true, ""},
+		{"failure without error message", "builds", "", false, ""},
+		{"failure with error message", "builds", "svc-a", false, "build failed: exit code 1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Should not panic
+			RecordJobExecutionSpan(
+				ctx,
+				correlationID,
+				tt.stepName,
+				tt.componentName,
+				startTime,
+				tt.success,
+				tt.errorMessage,
+			)
+		})
+	}
+}
+
+func TestJobError(t *testing.T) {
+	err := &jobError{message: "build failed"}
+	if err.Error() != "build failed" {
+		t.Errorf("Error() = %q, want 'build failed'", err.Error())
 	}
 }

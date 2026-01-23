@@ -489,3 +489,27 @@ func parseStepStatusEnumsFromMigrations(t *testing.T, filename string) map[strin
 
 	return enumValues
 }
+
+func TestSlipStatus_IsTerminal_UnknownStatus(t *testing.T) {
+	// Test that unknown status values return false
+	unknownStatus := SlipStatus("unknown")
+	if unknownStatus.IsTerminal() {
+		t.Error("unknown SlipStatus should not be terminal")
+	}
+}
+
+func TestStepStatus_IsTerminal_UnknownStatus(t *testing.T) {
+	// Test that unknown status values return false
+	unknownStatus := StepStatus("unknown")
+	if unknownStatus.IsTerminal() {
+		t.Error("unknown StepStatus should not be terminal")
+	}
+}
+
+func TestStepStatus_IsFailure_UnknownStatus(t *testing.T) {
+	// Test that unknown status values return false
+	unknownStatus := StepStatus("unknown")
+	if unknownStatus.IsFailure() {
+		t.Error("unknown StepStatus should not be considered a failure")
+	}
+}

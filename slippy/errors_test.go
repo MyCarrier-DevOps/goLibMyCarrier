@@ -224,3 +224,170 @@ func TestSentinelErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestNewAncestryError(t *testing.T) {
+	underlying := errors.New("database connection lost")
+	err := NewAncestryError("owner/repo", "abc123def456", "slip_lookup", underlying)
+
+	if err.Repository != "owner/repo" {
+		t.Errorf("Repository = %q, want 'owner/repo'", err.Repository)
+	}
+	if err.CommitSHA != "abc123def456" {
+		t.Errorf("CommitSHA = %q, want 'abc123def456'", err.CommitSHA)
+	}
+	if err.Phase != "slip_lookup" {
+		t.Errorf("Phase = %q, want 'slip_lookup'", err.Phase)
+	}
+	if err.Err != underlying {
+		t.Errorf("Err = %v, want %v", err.Err, underlying)
+	}
+}
+
+func TestNewAncestorUpdateError(t *testing.T) {
+	underlying := errors.New("abandon failed")
+	err := NewAncestorUpdateError("owner/repo", "abc123", "abandon", "ancestor-corr-123", underlying)
+
+	if err.Repository != "owner/repo" {
+		t.Errorf("Repository = %q, want 'owner/repo'", err.Repository)
+	}
+	if err.AncestorCorrelationID != "ancestor-corr-123" {
+		t.Errorf("AncestorCorrelationID = %q, want 'ancestor-corr-123'", err.AncestorCorrelationID)
+	}
+	if err.Phase != "abandon" {
+		t.Errorf("Phase = %q, want 'abandon'", err.Phase)
+	}
+}
+
+func TestAncestryError_Error(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      *AncestryError
+		contains string
+	}{
+		{
+			name: "setup phase",
+			err: &AncestryError{
+				Repository: "owner/repo",
+				CommitSHA:  "abc123def456",
+				Phase:      "setup",
+				Err:        errors.New("init failed"),
+			},
+			contains: "setup error",
+		},
+		{
+			name: "github_api phase",
+			err: &AncestryError{
+				Repository: "owner/repo",
+				CommitSHA:  "abc123def456",
+				Phase:      "github_api",
+				Err:        errors.New("rate limited"),
+			},
+			contains: "GitHub API error",
+		},
+		{
+			name: "slip_lookup phase",
+			err: &AncestryError{
+				Repository: "owner/repo",
+				CommitSHA:  "abc123def456",
+				Phase:      "slip_lookup",
+				Err:        errors.New("db error"),
+			},
+			contains: "database query failed",
+		},
+		{
+			name: "abandon phase",
+			err: &AncestryError{
+				Repository:            "owner/repo",
+				CommitSHA:             "abc123def456",
+				Phase:                 "abandon",
+				AncestorCorrelationID: "old-slip-123",
+				Err:                   errors.New("timeout"),
+			},
+			contains: "failed to abandon superseded slip",
+		},
+		{
+			name: "promote phase",
+			err: &AncestryError{
+				Repository:            "owner/repo",
+				CommitSHA:             "abc123def456",
+				Phase:                 "promote",
+				AncestorCorrelationID: "feature-slip",
+				Err:                   errors.New("conflict"),
+			},
+			contains: "failed to promote feature branch slip",
+		},
+		{
+			name: "unknown phase",
+			err: &AncestryError{
+				Repository: "owner/repo",
+				CommitSHA:  "abc123def456",
+				Phase:      "unknown",
+				Err:        errors.New("mystery"),
+			},
+			contains: "ancestry error for",
+		},
+		{
+			name: "short commit SHA unchanged",
+			err: &AncestryError{
+				Repository: "owner/repo",
+				CommitSHA:  "abc",
+				Phase:      "setup",
+				Err:        errors.New("error"),
+			},
+			contains: "abc:",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := tt.err.Error()
+			if !containsString(msg, tt.contains) {
+				t.Errorf("Error() = %q, want to contain %q", msg, tt.contains)
+			}
+		})
+	}
+}
+
+func TestAncestryError_Unwrap(t *testing.T) {
+	tests := []struct {
+		name     string
+		phase    string
+		expected error
+	}{
+		{"abandon phase", "abandon", ErrAncestorUpdateFailed},
+		{"promote phase", "promote", ErrAncestorUpdateFailed},
+		{"setup phase", "setup", ErrAncestryResolutionFailed},
+		{"github_api phase", "github_api", ErrAncestryResolutionFailed},
+		{"slip_lookup phase", "slip_lookup", ErrAncestryResolutionFailed},
+		{"unknown phase", "unknown", ErrAncestryResolutionFailed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := &AncestryError{
+				Repository: "owner/repo",
+				CommitSHA:  "abc123",
+				Phase:      tt.phase,
+				Err:        errors.New("test"),
+			}
+			if !errors.Is(err, tt.expected) {
+				t.Errorf("Unwrap() for phase %q should return %v", tt.phase, tt.expected)
+			}
+		})
+	}
+}
+
+// containsString is a helper to check if a string contains a substring
+func containsString(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
+		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
+}
+
+func findSubstring(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
