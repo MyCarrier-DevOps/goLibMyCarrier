@@ -1,6 +1,6 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 22, 2026  
+> **Last Updated:** January 26, 2026  
 > **Status:** Multi-module Go library with comprehensive E2E integration tests (branch: test/slippy)
 
 ---
@@ -30,7 +30,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 | `github` | GitHub API client with App authentication | Updated - structured errors |
 | `vault` | HashiCorp Vault integration | Stable |
 | `auth` | Gin authentication middleware | Stable |
-| `otel` | OpenTelemetry instrumentation | Stable |
+| `otel` | OpenTelemetry instrumentation | Updated - gRPC log export |
 | `argocdclient` | ArgoCD application/manifest client | Stable |
 | `yaml` | YAML utilities | Stable |
 
@@ -144,6 +144,85 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### January 26, 2026 — OpenTelemetry Tracing Improvements (branch: test/slippy)
+
+**Problem:**
+1. OTLP log exporter was using HTTP/protobuf even when `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`, causing 415 errors when connecting to gRPC collectors
+2. Traces lacked proper SpanKind annotations (PRODUCER, CONSUMER, CLIENT, SERVER)
+3. Slippy CLI created wrapper spans (`Slippy.PreJob`, `Slippy.PostJob`) that obscured the actual trace hierarchy
+4. No trace continuity between pre-job and post-job (separate processes via Argo workflows)
+5. No visibility into time spent waiting for prerequisites
+
+**Solution:**
+Comprehensive OpenTelemetry improvements across otel and slippy packages.
+
+**otel Package Changes:**
+
+*New Functions:*
+- `createGRPCLogExporter(ctx, endpoint)` - Creates gRPC-based OTLP log exporter
+- `createHTTPLogExporter(ctx, endpoint)` - Creates HTTP/protobuf-based OTLP log exporter
+
+*Modified Functions:*
+- `createExporters()` - Now checks `OTEL_EXPORTER_OTLP_PROTOCOL` and routes log export to gRPC or HTTP accordingly
+
+*New Import:*
+- `go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc` - gRPC log exporter
+
+**slippy Package Changes:**
+
+*New Types:*
+- `SerializedSpanContext` - JSON-serializable span context for cross-process trace propagation
+  - Fields: `TraceID`, `SpanID`, `TraceFlags` (all strings)
+  - Enables passing trace context via Argo workflow artifacts
+
+*New Constants:*
+- `SpanKindInternal`, `SpanKindClient`, `SpanKindServer`, `SpanKindProducer`, `SpanKindConsumer` - OpenTelemetry span kind values
+
+*New Functions:*
+- `StartSpanWithKind(ctx, name, correlationID, kind)` - Creates span with explicit SpanKind
+- `StartProducerSpan(ctx, name, correlationID)` - Creates PRODUCER span (for sending messages)
+- `StartClientSpan(ctx, name, correlationID)` - Creates CLIENT span (for outbound calls)
+- `SerializeSpanContext(ctx)` - Extracts and serializes current span context to `*SerializedSpanContext`
+- `DeserializeSpanContext(ctx, serialized)` - Reconstructs span context from serialized form
+
+**Trace Architecture Changes:**
+
+*Removed:*
+- `Slippy.PreJob` wrapper span - was obscuring actual trace structure
+- `Slippy.PostJob` wrapper span - was obscuring actual trace structure
+
+*Added:*
+- `Held` span - Created by `waitForPrerequisites()`, represents time waiting for prerequisites to complete
+- Span context serialization for cross-process trace continuity
+
+*New Trace Flow:*
+```
+Pushhookparser (Requested:Build:X with SpanKind=PRODUCER)
+    → Slippy PreJob (Held span while waiting for prerequisites)
+        → Job Execution (container runs)
+            → Slippy PostJob (continues trace via TRACEPARENT env var)
+```
+
+**SpanKind Usage:**
+| Span | SpanKind | Rationale |
+|------|----------|-----------|
+| `Requested:Build:<component>` | PRODUCER | Sending message to trigger build |
+| `Requested:Unit-Tests` | PRODUCER | Sending message to trigger tests |
+| `Requested:Secret-Scan` | PRODUCER | Sending message to trigger scan |
+| `Held` | INTERNAL | Internal wait operation |
+| Job execution spans | INTERNAL | Internal processing |
+
+**Files Modified:**
+- `otel/otel.go` - Added gRPC log exporter support
+- `slippy/tracing.go` - Added SpanKind helpers, SerializedSpanContext, serialization functions
+
+**Current Status:**
+- ✅ `make test PKG=otel` - all pass
+- ✅ `make test PKG=slippy` - all pass
+- ✅ gRPC log export working with `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`
+
+---
 
 ### January 16, 2026 — Comprehensive Error Handling (branch: feature/improved-error-handling)
 
@@ -514,10 +593,11 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ## Current Focus
 
-1. **E2E integration tests complete** - All 7 testcontainers-based tests pass, validating full pipeline flow
-2. **hydrateSlip bug fixed** - Combined `UpdateStepWithHistory` prevents step status overwrites
-3. **VCMT query fix** - `sign = 1` filter ensures correct row selection
-4. **Next: Publish new version** - Tag and publish new goLibMyCarrier version with bug fixes and E2E tests
+1. **OpenTelemetry improvements complete** - gRPC log export, SpanKind support, trace context serialization
+2. **E2E integration tests complete** - All 7 testcontainers-based tests pass, validating full pipeline flow
+3. **hydrateSlip bug fixed** - Combined `UpdateStepWithHistory` prevents step status overwrites
+4. **VCMT query fix** - `sign = 1` filter ensures correct row selection
+5. **Next: Merge test/slippy branch** - PR #31 ready for review and merge to main
 
 ---
 
@@ -614,6 +694,34 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - `FindByCommits`: `WHERE ... AND s.sign = 1 ORDER BY c.priority ASC, s.version DESC`
 **Anti-pattern:** Relying solely on `FINAL` or `LIMIT 1` without `sign = 1` filter.
 
+### Cross-Process Trace Context Propagation
+**Decision:** Use W3C TRACEPARENT format and SerializedSpanContext for cross-process trace continuity.
+**Rationale:** Slippy pre-job and post-job run as separate Argo workflow containers. To maintain trace continuity, the span context must be serialized, passed via workflow artifacts, and deserialized in post-job.
+**Implementation:**
+- Pre-job: `SerializeSpanContext(ctx)` returns `*SerializedSpanContext` with TraceID, SpanID, TraceFlags
+- Workflow: Pass span_context as JSON artifact, set TRACEPARENT env var in post-job container
+- Post-job: Read TRACEPARENT env var, use W3C propagator to inject trace context
+- Format: `TRACEPARENT=00-{trace_id}-{span_id}-{trace_flags}` (W3C standard)
+**Anti-pattern:** Creating independent traces in pre-job and post-job without linkage.
+
+### SpanKind Annotations for Message-Based Operations
+**Decision:** Use explicit SpanKind (PRODUCER, CONSUMER) for message-based operations, INTERNAL for library operations.
+**Rationale:** SpanKind affects how trace visualization tools interpret spans. PRODUCER spans indicate outbound messages; CONSUMER spans indicate inbound message processing. Without proper SpanKind, all spans appear as generic internal operations.
+**Implementation:**
+- `StartProducerSpan(ctx, name, correlationID)` - For sending messages (e.g., `Requested:Build:X`)
+- `StartClientSpan(ctx, name, correlationID)` - For outbound API calls
+- `StartSpan(ctx, name, correlationID)` - Default INTERNAL for library operations
+**Anti-pattern:** Using default INTERNAL SpanKind for all spans regardless of semantic meaning.
+
+### Minimal Wrapper Spans
+**Decision:** Avoid creating wrapper spans that don't represent actual work. Let individual operations create their own spans.
+**Rationale:** Wrapper spans like `Slippy.PreJob` obscure the actual trace hierarchy. The trace should show `Held` → `JobExecution`, not `Slippy.PreJob` → `Held` → `Slippy.PostJob`. Wrapper spans also complicate trace context serialization.
+**Implementation:**
+- Removed `Slippy.PreJob` and `Slippy.PostJob` wrapper spans
+- Individual operations (`waitForPrerequisites`, `UpdateStep`, etc.) create their own meaningful spans
+- `Held` span represents actual prerequisite waiting time
+**Anti-pattern:** Creating `Slippy.PreJob` wrapper span that contains all pre-job operations, obscuring individual operation durations.
+
 ---
 
 ## Technical Debt / Known Issues
@@ -628,12 +736,16 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 ## Next Steps (Not Yet Implemented)
 
 ### Immediate
-- [ ] Publish new goLibMyCarrier version with bug fixes and E2E tests
-- [ ] Update pushhookparser to use new `CreateSlipResult` return type
-- [ ] Run full repo-wide `make lint` and `make test`
+- [ ] Merge PR #31 (test/slippy branch) to main
+- [ ] Publish new goLibMyCarrier version with OTel improvements
+- [ ] Update all downstream consumers (pushhookparser, Slippy) to use new version
+- [ ] Validate trace continuity in production environment
 
 ### Future
 - [x] ~~Integration tests for slippy with real ClickHouse~~ - **Completed January 22, 2026**
+- [x] ~~gRPC log export support~~ - **Completed January 26, 2026**
+- [x] ~~SpanKind annotations~~ - **Completed January 26, 2026**
+- [x] ~~Cross-process trace context propagation~~ - **Completed January 26, 2026**
 - [ ] CLI tooling for slippy operations (manual slip inspection, cleanup)
 - [ ] Additional logger adapters beyond Zap
 - [ ] Implement `normalizeRepository()` for fork handling
