@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 20, 2026  
-> **Status:** Multi-module Go library with comprehensive error handling (branch: feature/impl-event-sourcing)
+> **Last Updated:** January 26, 2026  
+> **Status:** Multi-module Go library with comprehensive E2E integration tests (branch: test/slippy)
 
 ---
 
@@ -30,7 +30,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 | `github` | GitHub API client with App authentication | Updated - structured errors |
 | `vault` | HashiCorp Vault integration | Stable |
 | `auth` | Gin authentication middleware | Stable |
-| `otel` | OpenTelemetry instrumentation | Stable |
+| `otel` | OpenTelemetry instrumentation | Updated - gRPC log export |
 | `argocdclient` | ArgoCD application/manifest client | Stable |
 | `yaml` | YAML utilities | Stable |
 
@@ -145,6 +145,85 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 
 ## Recent Changes
 
+### January 26, 2026 — OpenTelemetry Tracing Improvements (branch: test/slippy)
+
+**Problem:**
+1. OTLP log exporter was using HTTP/protobuf even when `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`, causing 415 errors when connecting to gRPC collectors
+2. Traces lacked proper SpanKind annotations (PRODUCER, CONSUMER, CLIENT, SERVER)
+3. Slippy CLI created wrapper spans (`Slippy.PreJob`, `Slippy.PostJob`) that obscured the actual trace hierarchy
+4. No trace continuity between pre-job and post-job (separate processes via Argo workflows)
+5. No visibility into time spent waiting for prerequisites
+
+**Solution:**
+Comprehensive OpenTelemetry improvements across otel and slippy packages.
+
+**otel Package Changes:**
+
+*New Functions:*
+- `createGRPCLogExporter(ctx, endpoint)` - Creates gRPC-based OTLP log exporter
+- `createHTTPLogExporter(ctx, endpoint)` - Creates HTTP/protobuf-based OTLP log exporter
+
+*Modified Functions:*
+- `createExporters()` - Now checks `OTEL_EXPORTER_OTLP_PROTOCOL` and routes log export to gRPC or HTTP accordingly
+
+*New Import:*
+- `go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc` - gRPC log exporter
+
+**slippy Package Changes:**
+
+*New Types:*
+- `SerializedSpanContext` - JSON-serializable span context for cross-process trace propagation
+  - Fields: `TraceID`, `SpanID`, `TraceFlags` (all strings)
+  - Enables passing trace context via Argo workflow artifacts
+
+*New Constants:*
+- `SpanKindInternal`, `SpanKindClient`, `SpanKindServer`, `SpanKindProducer`, `SpanKindConsumer` - OpenTelemetry span kind values
+
+*New Functions:*
+- `StartSpanWithKind(ctx, name, correlationID, kind)` - Creates span with explicit SpanKind
+- `StartProducerSpan(ctx, name, correlationID)` - Creates PRODUCER span (for sending messages)
+- `StartClientSpan(ctx, name, correlationID)` - Creates CLIENT span (for outbound calls)
+- `SerializeSpanContext(ctx)` - Extracts and serializes current span context to `*SerializedSpanContext`
+- `DeserializeSpanContext(ctx, serialized)` - Reconstructs span context from serialized form
+
+**Trace Architecture Changes:**
+
+*Removed:*
+- `Slippy.PreJob` wrapper span - was obscuring actual trace structure
+- `Slippy.PostJob` wrapper span - was obscuring actual trace structure
+
+*Added:*
+- `Held` span - Created by `waitForPrerequisites()`, represents time waiting for prerequisites to complete
+- Span context serialization for cross-process trace continuity
+
+*New Trace Flow:*
+```
+Pushhookparser (Requested:Build:X with SpanKind=PRODUCER)
+    → Slippy PreJob (Held span while waiting for prerequisites)
+        → Job Execution (container runs)
+            → Slippy PostJob (continues trace via TRACEPARENT env var)
+```
+
+**SpanKind Usage:**
+| Span | SpanKind | Rationale |
+|------|----------|-----------|
+| `Requested:Build:<component>` | PRODUCER | Sending message to trigger build |
+| `Requested:Unit-Tests` | PRODUCER | Sending message to trigger tests |
+| `Requested:Secret-Scan` | PRODUCER | Sending message to trigger scan |
+| `Held` | INTERNAL | Internal wait operation |
+| Job execution spans | INTERNAL | Internal processing |
+
+**Files Modified:**
+- `otel/otel.go` - Added gRPC log exporter support
+- `slippy/tracing.go` - Added SpanKind helpers, SerializedSpanContext, serialization functions
+
+**Current Status:**
+- ✅ `make test PKG=otel` - all pass
+- ✅ `make test PKG=slippy` - all pass
+- ✅ gRPC log export working with `OTEL_EXPORTER_OTLP_PROTOCOL=grpc`
+
+---
+
 ### January 16, 2026 — Comprehensive Error Handling (branch: feature/improved-error-handling)
 
 **Problem:**
@@ -201,6 +280,71 @@ All tests updated to match new signatures. Tests pass with coverage above 75% th
 **Current Status:**
 
 ---
+
+### January 22, 2026 — hydrateSlip Bug Fix & E2E Integration Tests (branch: test/slippy)
+
+**Problem:**
+E2E integration tests revealed that step status updates were being overwritten. After completing a step (e.g., `unit_tests_completed`), reloading the slip showed the step still as `pending`.
+
+**Root Cause:**
+The `AppendHistory` function was calling `Load()` → modify → `Update()` separately from `UpdateStep`. This created a race condition:
+1. `UpdateStep` loads slip, updates step to `completed`, saves (version N)
+2. `AppendHistory` loads slip (gets version N with step=completed), appends history, saves (version N+1)
+3. But with VersionedCollapsingMergeTree, `AppendHistory`'s `Load()` could read stale data, overwriting the step status
+
+**Solution:**
+Created `UpdateStepWithHistory` method that combines step update AND history append in a single atomic Load→modify→Update cycle.
+
+**New Interface Method:**
+- `SlipStore.UpdateStepWithHistory(ctx, correlationID, stepName, componentName, status, entry)` - atomic step + history update
+
+**Files Modified:**
+- `slippy/clickhouse_store.go`: Added `UpdateStepWithHistory` method (~100 lines), `updateAggregateStatusFromComponentStatesWithHistory` method
+- `slippy/interfaces.go`: Added `UpdateStepWithHistory` to `SlipStore` interface
+- `slippy/steps.go`: Changed `UpdateStepWithStatus` to use combined `UpdateStepWithHistory` instead of separate calls
+- `slippy/mock_store_test.go`: Added `UpdateStepWithHistory` implementation
+- `slippy/slippytest/mock_store.go`: Added `UpdateStepWithHistory` implementation
+- `slippy/steps_test.go`: Updated test for new combined operation behavior
+
+**Secondary Fix — VCMT Orphaned Cancel Rows:**
+During testing, discovered that VersionedCollapsingMergeTree `FINAL` modifier can return multiple rows (including orphaned sign=-1 cancel rows) until background merges complete.
+
+**Query Fix:**
+All `Load` queries now filter `sign = 1` and `ORDER BY version DESC` to only select active rows:
+- `clickhouse_store.go`: Modified `Load` and `LoadByCommit` queries
+- `query_builder.go`: Updated `BuildFindByCommitsQuery` and `BuildFindAllByCommitsQuery`
+
+**Additional Fixes:**
+- `SetComponentImageTag` function: Fixed to use `c.pipelineConfig.GetAggregateStep("build")` instead of hardcoded `"builds"` key
+- `steps_test.go`: Updated test data to use `"builds_completed"` aggregate key
+
+**E2E Integration Tests:**
+Comprehensive testcontainers-based E2E tests using real ClickHouse:
+
+| Test | Description | Status |
+|------|-------------|--------|
+| `TestE2E_FullPipelineFlow` | Complete 12-step pipeline with all phases | ✅ PASS |
+| `TestE2E_ConcurrentWriteStressTest` | 20 concurrent component updates | ✅ PASS |
+| `TestE2E_PrerequisiteWaiting` | Hold/wait mechanism for prerequisites | ✅ PASS |
+| `TestE2E_ReplacingMergeTreeCollapse` | 50 sequential updates verify row collapse | ✅ PASS |
+| `TestE2E_ComponentStateEventSourcing` | Component state hydration from event table | ✅ PASS |
+| `TestE2E_SlipStatusHistory` | State history recording verification | ✅ PASS |
+| `TestE2E_JSONSchemaIntegrity` | JSON serialization roundtrip | ✅ PASS |
+
+**Test Execution:**
+```bash
+go test -v -run "TestE2E_" -count=1 -timeout 10m -tags=integration
+```
+
+**Test Coverage:**
+- Unit tests: 278 tests passing
+- E2E integration tests: 7 tests passing
+- All tests execute every step defined in `default.json` (12 steps including optional `package_artifact`)
+
+**Current Status:**
+- ✅ `make test PKG=slippy` - all pass
+- ✅ E2E integration tests - all 7 pass
+- ✅ Bug fix validated through comprehensive testing
 
 ### January 15, 2026 — SOLID/DRY Refactoring (branch: slippy/ancestry-tracking)
 
@@ -449,9 +593,11 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ## Current Focus
 
-1. **Error handling complete** - All errors returned with actionable messages, ready for release
-2. **Validation requirements** - All modules must pass `make fmt`, `make lint`, `make test`
-3. **Next: Publish new version** - Tag and publish new goLibMyCarrier version with error handling changes
+1. **OpenTelemetry improvements complete** - gRPC log export, SpanKind support, trace context serialization
+2. **E2E integration tests complete** - All 7 testcontainers-based tests pass, validating full pipeline flow
+3. **hydrateSlip bug fixed** - Combined `UpdateStepWithHistory` prevents step status overwrites
+4. **VCMT query fix** - `sign = 1` filter ensures correct row selection
+5. **Next: Merge test/slippy branch** - PR #31 ready for review and merge to main
 
 ---
 
@@ -531,6 +677,51 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - Never create `FooWithWarnings`, `FooV2`, `FooNew` variants
 **Anti-pattern:** Creating `resolveAndAbandonAncestorsWithWarnings` instead of updating `resolveAndAbandonAncestors`.
 
+### Atomic Step Updates with History
+**Decision:** Combine step status updates and history appends into a single atomic operation.
+**Rationale:** Separate `UpdateStep` and `AppendHistory` calls create race conditions where `AppendHistory`'s `Load()` can read stale data and overwrite the step status change.
+**Implementation:**
+- `UpdateStepWithHistory` method performs Load→modify step→modify history→Update in one cycle
+- Single version increment ensures both changes are applied atomically
+- Used by `UpdateStepWithStatus` in `steps.go`
+**Anti-pattern:** Calling `UpdateStep` followed by `AppendHistory` separately.
+
+### VCMT Query Pattern with sign=1 Filter
+**Decision:** Always filter `sign = 1` and `ORDER BY version DESC` when querying VersionedCollapsingMergeTree tables.
+**Rationale:** VCMT's `FINAL` modifier can return multiple rows (including orphaned sign=-1 cancel rows) until background merges complete. The `sign = 1` filter reliably selects only active rows.
+**Implementation:**
+- `Load`: `WHERE correlation_id = ? AND sign = 1 ORDER BY version DESC LIMIT 1`
+- `FindByCommits`: `WHERE ... AND s.sign = 1 ORDER BY c.priority ASC, s.version DESC`
+**Anti-pattern:** Relying solely on `FINAL` or `LIMIT 1` without `sign = 1` filter.
+
+### Cross-Process Trace Context Propagation
+**Decision:** Use W3C TRACEPARENT format and SerializedSpanContext for cross-process trace continuity.
+**Rationale:** Slippy pre-job and post-job run as separate Argo workflow containers. To maintain trace continuity, the span context must be serialized, passed via workflow artifacts, and deserialized in post-job.
+**Implementation:**
+- Pre-job: `SerializeSpanContext(ctx)` returns `*SerializedSpanContext` with TraceID, SpanID, TraceFlags
+- Workflow: Pass span_context as JSON artifact, set TRACEPARENT env var in post-job container
+- Post-job: Read TRACEPARENT env var, use W3C propagator to inject trace context
+- Format: `TRACEPARENT=00-{trace_id}-{span_id}-{trace_flags}` (W3C standard)
+**Anti-pattern:** Creating independent traces in pre-job and post-job without linkage.
+
+### SpanKind Annotations for Message-Based Operations
+**Decision:** Use explicit SpanKind (PRODUCER, CONSUMER) for message-based operations, INTERNAL for library operations.
+**Rationale:** SpanKind affects how trace visualization tools interpret spans. PRODUCER spans indicate outbound messages; CONSUMER spans indicate inbound message processing. Without proper SpanKind, all spans appear as generic internal operations.
+**Implementation:**
+- `StartProducerSpan(ctx, name, correlationID)` - For sending messages (e.g., `Requested:Build:X`)
+- `StartClientSpan(ctx, name, correlationID)` - For outbound API calls
+- `StartSpan(ctx, name, correlationID)` - Default INTERNAL for library operations
+**Anti-pattern:** Using default INTERNAL SpanKind for all spans regardless of semantic meaning.
+
+### Minimal Wrapper Spans
+**Decision:** Avoid creating wrapper spans that don't represent actual work. Let individual operations create their own spans.
+**Rationale:** Wrapper spans like `Slippy.PreJob` obscure the actual trace hierarchy. The trace should show `Held` → `JobExecution`, not `Slippy.PreJob` → `Held` → `Slippy.PostJob`. Wrapper spans also complicate trace context serialization.
+**Implementation:**
+- Removed `Slippy.PreJob` and `Slippy.PostJob` wrapper spans
+- Individual operations (`waitForPrerequisites`, `UpdateStep`, etc.) create their own meaningful spans
+- `Held` span represents actual prerequisite waiting time
+**Anti-pattern:** Creating `Slippy.PreJob` wrapper span that contains all pre-job operations, obscuring individual operation durations.
+
 ---
 
 ## Technical Debt / Known Issues
@@ -545,12 +736,16 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 ## Next Steps (Not Yet Implemented)
 
 ### Immediate
-- [ ] Publish new goLibMyCarrier version with error handling changes
-- [ ] Update pushhookparser to use new `CreateSlipResult` return type
-- [ ] Run full repo-wide `make lint` and `make test`
+- [ ] Merge PR #31 (test/slippy branch) to main
+- [ ] Publish new goLibMyCarrier version with OTel improvements
+- [ ] Update all downstream consumers (pushhookparser, Slippy) to use new version
+- [ ] Validate trace continuity in production environment
 
 ### Future
-- [ ] Integration tests for slippy with real ClickHouse (currently unit tests with mocks)
+- [x] ~~Integration tests for slippy with real ClickHouse~~ - **Completed January 22, 2026**
+- [x] ~~gRPC log export support~~ - **Completed January 26, 2026**
+- [x] ~~SpanKind annotations~~ - **Completed January 26, 2026**
+- [x] ~~Cross-process trace context propagation~~ - **Completed January 26, 2026**
 - [ ] CLI tooling for slippy operations (manual slip inspection, cleanup)
 - [ ] Additional logger adapters beyond Zap
 - [ ] Implement `normalizeRepository()` for fork handling

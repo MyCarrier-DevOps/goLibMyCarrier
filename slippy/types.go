@@ -73,8 +73,9 @@ type Slip struct {
 
 	// Version is used by VersionedCollapsingMergeTree to track row versions.
 	// Higher versions take precedence during collapsing.
+	// Uses nanosecond timestamps (time.Now().UnixNano()) to ensure uniqueness across concurrent writers.
 	// This field is managed internally by the store and should not be set manually.
-	Version uint32 `json:"-" ch:"version"`
+	Version uint64 `json:"-" ch:"version"`
 }
 
 // AncestryEntry records metadata about a prior slip in the ancestry chain.

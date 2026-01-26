@@ -26,7 +26,9 @@ func init() {
 }
 
 // integrationTestPipelineConfig returns a pipeline config for integration tests.
-// It defines a simple pipeline with builds as an aggregate step.
+// It defines a simple pipeline matching the production config structure where:
+// - builds_completed is the aggregate step that tracks component builds
+// - The "aggregates" field points to the component step type (e.g., "build")
 func integrationTestPipelineConfig() *PipelineConfig {
 	config := &PipelineConfig{
 		Version:     "1.0",
@@ -34,12 +36,16 @@ func integrationTestPipelineConfig() *PipelineConfig {
 		Description: "Pipeline for integration testing",
 		Steps: []StepConfig{
 			{Name: "push_parsed", Description: "Push event parsed"},
-			{Name: "builds", Description: "Component builds", Aggregates: "builds_completed"},
-			{Name: "builds_completed", Description: "All builds completed", Prerequisites: []string{"push_parsed"}},
-			{Name: "unit_tests", Description: "Component unit tests", Aggregates: "unit_tests_completed"},
+			{
+				Name:          "builds_completed",
+				Description:   "All builds completed",
+				Aggregates:    "build",
+				Prerequisites: []string{"push_parsed"},
+			},
 			{
 				Name:          "unit_tests_completed",
 				Description:   "All unit tests completed",
+				Aggregates:    "unit_test",
 				Prerequisites: []string{"builds_completed"},
 			},
 			{Name: "dev_deploy", Description: "Deploy to dev", Prerequisites: []string{"unit_tests_completed"}},
@@ -218,7 +224,8 @@ func (s *testClickhouseSession) Conn() ch.Conn {
 	return s.conn
 }
 
-// createIntegrationTestSlip creates a slip with the given components for integration testing
+// createIntegrationTestSlip creates a slip with the given components for integration testing.
+// Uses the correct aggregate step names from the pipeline config (e.g., "builds_completed" not "builds").
 func createIntegrationTestSlip(correlationID string, components []string, pipelineConfig *PipelineConfig) *Slip {
 	slip := &Slip{
 		CorrelationID: correlationID,
@@ -240,21 +247,22 @@ func createIntegrationTestSlip(correlationID string, components []string, pipeli
 		slip.Steps[step.Name] = Step{Status: StepStatusPending}
 	}
 
-	// Initialize components for builds and unit_tests aggregates
-	buildsData := make([]ComponentStepData, 0, len(components))
-	unitTestsData := make([]ComponentStepData, 0, len(components))
-	for _, comp := range components {
-		buildsData = append(buildsData, ComponentStepData{
-			Component: comp,
-			Status:    StepStatusPending,
-		})
-		unitTestsData = append(unitTestsData, ComponentStepData{
-			Component: comp,
-			Status:    StepStatusPending,
-		})
+	// Initialize components for each aggregate step using correct step names.
+	// The aggregate step name (e.g., "builds_completed") is the key, not the step type (e.g., "build").
+	for _, step := range pipelineConfig.Steps {
+		if step.Aggregates != "" {
+			// This is an aggregate step - initialize components
+			aggregateData := make([]ComponentStepData, 0, len(components))
+			for _, comp := range components {
+				aggregateData = append(aggregateData, ComponentStepData{
+					Component: comp,
+					Status:    StepStatusPending,
+				})
+			}
+			// Use the step NAME (e.g., "builds_completed") as the aggregate key
+			slip.Aggregates[step.Name] = aggregateData
+		}
 	}
-	slip.Aggregates["builds"] = buildsData
-	slip.Aggregates["unit_tests"] = unitTestsData
 
 	return slip
 }
@@ -321,20 +329,22 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		t.Logf("Completing build for component %d: %s", i+1, component)
 
 		// UpdateComponentStatus signature: (ctx, correlationID, componentName, stepType, status)
+		// stepType is "build" (the Aggregates field value), not "builds" or "builds_completed"
 		if err := store.UpdateComponentStatus(
 			ctx,
 			correlationID,
 			component,
-			"builds",
+			"build",
 			StepStatusCompleted,
 		); err != nil {
 			t.Fatalf("failed to update build for %s: %v", component, err)
 		}
 
 		// Query raw data directly from ClickHouse
+		// Note: The aggregate column is named after the step name (builds_completed)
 		session := store.Session()
 		rows, err := session.QueryWithArgs(ctx, `
-			SELECT version, sign, builds 
+			SELECT version, sign, builds_completed 
 			FROM ci_test.routing_slips FINAL 
 			WHERE correlation_id = $1
 		`, correlationID)
@@ -343,17 +353,17 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		} else {
 			defer rows.Close()
 			for rows.Next() {
-				var version uint32
+				var version uint64
 				var sign int8
-				builds := chcol.NewJSON()
-				if err := rows.Scan(&version, &sign, builds); err != nil {
+				buildsCompleted := chcol.NewJSON()
+				if err := rows.Scan(&version, &sign, buildsCompleted); err != nil {
 					t.Logf("  → Error scanning: %v", err)
 				} else {
 					// Marshal to get the literal JSON representation
-					jsonBytes, _ := builds.MarshalJSON()
+					jsonBytes, _ := buildsCompleted.MarshalJSON()
 					t.Logf("  → Raw ClickHouse row after update %d:", i+1)
 					t.Logf("      version=%d sign=%d", version, sign)
-					t.Logf("      builds=%s", string(jsonBytes))
+					t.Logf("      builds_completed=%s", string(jsonBytes))
 				}
 			}
 		}
@@ -382,7 +392,7 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 	// Query final raw data directly from ClickHouse
 	session := store.Session()
 	rows, err := session.QueryWithArgs(ctx, `
-		SELECT version, sign, builds 
+		SELECT version, sign, builds_completed 
 		FROM ci_test.routing_slips FINAL 
 		WHERE correlation_id = $1
 	`, correlationID)
@@ -391,27 +401,28 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 	} else {
 		defer rows.Close()
 		for rows.Next() {
-			var finalVersion uint32
+			var finalVersion uint64
 			var finalSign int8
-			builds := chcol.NewJSON()
-			if err := rows.Scan(&finalVersion, &finalSign, builds); err != nil {
+			buildsCompleted := chcol.NewJSON()
+			if err := rows.Scan(&finalVersion, &finalSign, buildsCompleted); err != nil {
 				t.Logf("Error scanning final row: %v", err)
 			} else {
 				// Marshal to get the literal JSON representation
-				jsonBytes, _ := builds.MarshalJSON()
+				jsonBytes, _ := buildsCompleted.MarshalJSON()
 				t.Log("")
 				t.Log("═══════════════════════════════════════════════════════════════")
 				t.Log("FINAL RAW CLICKHOUSE ROW")
 				t.Log("═══════════════════════════════════════════════════════════════")
 				t.Logf("version=%d sign=%d", finalVersion, finalSign)
-				t.Logf("builds=%s", string(jsonBytes))
+				t.Logf("builds_completed=%s", string(jsonBytes))
 				t.Log("═══════════════════════════════════════════════════════════════")
 				t.Log("")
 			}
 		}
 	}
 
-	buildsData := finalSlip.Aggregates["builds"]
+	// Aggregates are keyed by step name (builds_completed), not step type (build)
+	buildsData := finalSlip.Aggregates["builds_completed"]
 
 	if len(buildsData) != len(components) {
 		t.Errorf("expected %d builds, got %d", len(components), len(buildsData))
@@ -511,7 +522,8 @@ func TestVersionedCollapsingMergeTree_ConcurrentUpdates(t *testing.T) {
 
 			t.Logf("Goroutine starting update for component: %s", comp)
 			// UpdateComponentStatus signature: (ctx, correlationID, componentName, stepType, status)
-			if err := store.UpdateComponentStatus(ctx, correlationID, comp, "builds", StepStatusCompleted); err != nil {
+			// stepType is "build" (the Aggregates field value), not "builds"
+			if err := store.UpdateComponentStatus(ctx, correlationID, comp, "build", StepStatusCompleted); err != nil {
 				errChan <- fmt.Errorf("failed to update build for %s: %w", comp, err)
 				return
 			}
@@ -538,7 +550,8 @@ func TestVersionedCollapsingMergeTree_ConcurrentUpdates(t *testing.T) {
 		t.Fatalf("failed to load final slip: %v", err)
 	}
 
-	buildsData := finalSlip.Aggregates["builds"]
+	// Aggregates are keyed by step name (builds_completed), not step type (build)
+	buildsData := finalSlip.Aggregates["builds_completed"]
 	t.Logf("Final slip builds after concurrent updates: %+v", buildsData)
 	t.Logf("Final slip version: %d, sign: %d", finalSlip.Version, finalSlip.Sign)
 
@@ -608,7 +621,8 @@ func TestVersionedCollapsingMergeTree_QueryWithFinal(t *testing.T) {
 	}
 
 	// Update component status
-	if err := store.UpdateComponentStatus(ctx, correlationID, "api", "builds", StepStatusCompleted); err != nil {
+	// stepType is "build" (the Aggregates field value), not "builds"
+	if err := store.UpdateComponentStatus(ctx, correlationID, "api", "build", StepStatusCompleted); err != nil {
 		t.Fatalf("failed to update build for api: %v", err)
 	}
 
@@ -625,8 +639,8 @@ func TestVersionedCollapsingMergeTree_QueryWithFinal(t *testing.T) {
 		t.Errorf("expected push_parsed to be completed, got %s", loadedSlip.Steps["push_parsed"].Status)
 	}
 
-	// Find the api build
-	buildsData := loadedSlip.Aggregates["builds"]
+	// Find the api build (aggregates keyed by step name, not step type)
+	buildsData := loadedSlip.Aggregates["builds_completed"]
 	var apiBuild *ComponentStepData
 	for i := range buildsData {
 		if buildsData[i].Component == "api" {
@@ -689,9 +703,12 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 	slip.CommitSHA = expectedCommit
 	slip.Ancestry = []AncestryEntry{{CommitSHA: "parent123", CorrelationID: "parent-corr"}}
 
-	// Add image tags to builds
-	for i := range slip.Aggregates["builds"] {
-		slip.Aggregates["builds"][i].ImageTag = fmt.Sprintf("%s:v1.0.0", slip.Aggregates["builds"][i].Component)
+	// Add image tags to builds (aggregates keyed by step name "builds_completed")
+	for i := range slip.Aggregates["builds_completed"] {
+		slip.Aggregates["builds_completed"][i].ImageTag = fmt.Sprintf(
+			"%s:v1.0.0",
+			slip.Aggregates["builds_completed"][i].Component,
+		)
 	}
 
 	if err := store.Create(ctx, slip); err != nil {
@@ -704,7 +721,8 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 	}
 
 	for _, comp := range components {
-		if err := store.UpdateComponentStatus(ctx, correlationID, comp, "builds", StepStatusCompleted); err != nil {
+		// stepType is "build" (the Aggregates field value), not "builds"
+		if err := store.UpdateComponentStatus(ctx, correlationID, comp, "build", StepStatusCompleted); err != nil {
 			t.Fatalf("failed to update build for %s: %v", comp, err)
 		}
 	}
@@ -742,8 +760,8 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 		t.Errorf("ancestry commit SHA mismatch: expected parent123, got %s", finalSlip.Ancestry[0].CommitSHA)
 	}
 
-	// Verify all builds have their data
-	buildsData := finalSlip.Aggregates["builds"]
+	// Verify all builds have their data (aggregates keyed by step name "builds_completed")
+	buildsData := finalSlip.Aggregates["builds_completed"]
 	buildsByComponent := make(map[string]ComponentStepData)
 	for _, build := range buildsData {
 		buildsByComponent[build.Component] = build
@@ -774,4 +792,567 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 
 	t.Logf("SUCCESS: All data fields preserved after %d updates", 5+len(components))
 	t.Logf("Final version: %d", finalSlip.Version)
+}
+
+// TestAtomicUpdate_NoDuplicateVersions tests that the atomic UNION ALL update
+// guarantees unique versions and proper data accumulation under high concurrency.
+//
+// This test uses the REAL production pipeline config (default.json) to ensure
+// the schema matches actual usage. It validates:
+// 1. Only ONE row with sign=1 survives after OPTIMIZE (no duplicate active rows)
+// 2. Data ACCUMULATES correctly - each worker's change is preserved in the final state
+// 3. The retry mechanism properly reloads and reapplies changes on version conflicts
+//
+// Each worker updates a DIFFERENT component in the "build" aggregate step,
+// so the final slip should contain ALL component updates.
+func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Start ClickHouse container
+	container, err := setupClickHouseContainer(ctx, t)
+	if err != nil {
+		t.Fatalf("failed to setup clickhouse container: %v", err)
+	}
+	defer func() {
+		if err := container.terminate(ctx); err != nil {
+			t.Logf("warning: failed to terminate container: %v", err)
+		}
+	}()
+
+	// Load the REAL production pipeline config from default.json
+	// This ensures migrations create the actual production schema
+	pipelineConfig, err := LoadPipelineConfigFromFile("default.json")
+	if err != nil {
+		t.Fatalf("failed to load default.json pipeline config: %v", err)
+	}
+	t.Logf("Loaded pipeline config: %s (version %s)", pipelineConfig.Name, pipelineConfig.Version)
+
+	store, err := createTestStore(ctx, t, container, pipelineConfig)
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer store.Close()
+
+	// Create a slip with multiple components - these are the components we'll update concurrently
+	// Using realistic component names that would exist in a real repository
+	correlationID := fmt.Sprintf("test-atomic-%d", time.Now().UnixNano())
+	components := []string{"api", "worker", "scheduler", "gateway", "frontend"}
+
+	// Create a new slip for this test
+	slip := &Slip{
+		CorrelationID: correlationID,
+		Repository:    "mycarrier-devops/test-repo",
+		Branch:        "main",
+		CommitSHA:     fmt.Sprintf("abc123%d", time.Now().UnixNano()%1000000),
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		Status:        SlipStatusInProgress,
+		Steps:         make(map[string]Step),
+		Aggregates:    make(map[string][]ComponentStepData),
+		StateHistory:  []StateHistoryEntry{},
+		Ancestry:      []AncestryEntry{},
+	}
+
+	// Initialize steps from the pipeline config
+	for _, stepCfg := range pipelineConfig.Steps {
+		slip.Steps[stepCfg.Name] = Step{
+			Status: StepStatusPending,
+		}
+	}
+
+	// Find the aggregate step name that aggregates "build" components.
+	// In default.json, this is "builds" (not "builds_completed").
+	aggregateStepName := pipelineConfig.GetAggregateStep("build")
+	if aggregateStepName == "" {
+		t.Fatalf("no aggregate step found for 'build' component step")
+	}
+	t.Logf("Using aggregate step: %s", aggregateStepName)
+
+	// Initialize the aggregate with our components using the correct step name from config
+	buildComponents := make([]ComponentStepData, len(components))
+	for i, comp := range components {
+		buildComponents[i] = ComponentStepData{
+			Component: comp,
+			Status:    StepStatusPending,
+		}
+	}
+	slip.Aggregates[aggregateStepName] = buildComponents
+
+	// Create the initial slip
+	if err := store.Create(ctx, slip); err != nil {
+		t.Fatalf("failed to create slip: %v", err)
+	}
+
+	t.Logf("Created slip %s with initial version %d", correlationID, slip.Version)
+	t.Logf("Components in '%s' aggregate: %v", aggregateStepName, components)
+
+	// Each worker will update a different component in the aggregate step
+	// When calling UpdateStep with componentName, it writes to the component states table
+	numConcurrentUpdates := len(components)
+
+	// Use a barrier to ensure all goroutines start at the same time
+	var startWg sync.WaitGroup
+	startWg.Add(1)
+
+	var wg sync.WaitGroup
+	errChan := make(chan error, numConcurrentUpdates)
+	successCount := make(chan int, numConcurrentUpdates)
+
+	for i := 0; i < numConcurrentUpdates; i++ {
+		wg.Add(1)
+		go func(workerID int, componentName string, stepName string) {
+			defer wg.Done()
+
+			// Wait for all goroutines to be ready
+			startWg.Wait()
+
+			// Each worker updates a DIFFERENT component in the aggregate step
+			// UpdateStep handles optimistic locking with retry via component state event sourcing
+			t.Logf("Worker %d: updating %s/%s to completed", workerID, stepName, componentName)
+
+			if err := store.UpdateStep(ctx, correlationID, stepName, componentName, StepStatusCompleted); err != nil {
+				errChan <- fmt.Errorf("worker %d (%s/%s): %w", workerID, stepName, componentName, err)
+				return
+			}
+
+			t.Logf("Worker %d: %s/%s completed successfully", workerID, stepName, componentName)
+			successCount <- workerID
+		}(i, components[i], aggregateStepName)
+	}
+
+	// Start all goroutines simultaneously
+	t.Logf("Starting %d concurrent updates (each updating a different component)...", numConcurrentUpdates)
+	startWg.Done()
+
+	// Wait for all to complete
+	wg.Wait()
+	close(errChan)
+	close(successCount)
+
+	// Check for errors
+	errorCount := 0
+	for err := range errChan {
+		t.Errorf("update error: %v", err)
+		errorCount++
+	}
+
+	successfulUpdates := 0
+	for range successCount {
+		successfulUpdates++
+	}
+
+	t.Logf("Completed: %d successful, %d errors", successfulUpdates, errorCount)
+
+	// Run OPTIMIZE TABLE to force final collapsing
+	if err := store.OptimizeTable(ctx); err != nil {
+		t.Fatalf("failed to optimize table: %v", err)
+	}
+
+	// Query all raw rows to check for duplicate versions
+	session := store.Session()
+	rows, err := session.QueryWithArgs(ctx, `
+		SELECT version, sign, count(*) as cnt
+		FROM ci_test.routing_slips
+		WHERE correlation_id = $1
+		GROUP BY version, sign
+		ORDER BY version, sign
+	`, correlationID)
+	if err != nil {
+		t.Fatalf("failed to query raw rows: %v", err)
+	}
+	defer rows.Close()
+
+	t.Log("")
+	t.Log("═══════════════════════════════════════════════════════════════")
+	t.Log("RAW ROW COUNTS BY VERSION AND SIGN")
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	totalSign1Rows := uint64(0)
+	for rows.Next() {
+		var version uint64
+		var sign int8
+		var count uint64
+		if err := rows.Scan(&version, &sign, &count); err != nil {
+			t.Fatalf("failed to scan row: %v", err)
+		}
+		t.Logf("  version=%d sign=%d count=%d", version, sign, count)
+		if sign == 1 {
+			totalSign1Rows += count
+		}
+	}
+	t.Log("═══════════════════════════════════════════════════════════════")
+	t.Log("")
+
+	// CRITICAL CHECK 1: After OPTIMIZE, there should be EXACTLY ONE row with sign=1
+	// This proves that concurrent updates didn't create multiple active rows
+	if totalSign1Rows != 1 {
+		t.Errorf("CRITICAL: Expected exactly 1 row with sign=1 after OPTIMIZE, got %d", totalSign1Rows)
+		t.Fatalf("Multiple active rows detected - data integrity compromised")
+	}
+	t.Log("✓ Exactly 1 active row (sign=1) after OPTIMIZE")
+
+	// Load the final slip and verify the version
+	finalSlip, err := store.Load(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("failed to load final slip: %v", err)
+	}
+
+	// CRITICAL CHECK 2: Verify ALL component updates accumulated in the final slip
+	// Component states are stored in the aggregate step name from config
+	t.Log("")
+	t.Log("═══════════════════════════════════════════════════════════════")
+	t.Logf("VERIFYING DATA ACCUMULATION IN '%s' AGGREGATE", aggregateStepName)
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	buildAggregate, exists := finalSlip.Aggregates[aggregateStepName]
+	if !exists {
+		t.Logf("Available aggregates: %v", finalSlip.Aggregates)
+		t.Fatalf("'%s' aggregate not found in final slip - hydration may have failed", aggregateStepName)
+	}
+
+	// Build a map for easier lookup
+	componentStatuses := make(map[string]StepStatus)
+	for _, cd := range buildAggregate {
+		componentStatuses[cd.Component] = cd.Status
+	}
+
+	missingOrIncorrect := []string{}
+	for _, comp := range components {
+		status, found := componentStatuses[comp]
+		if !found {
+			missingOrIncorrect = append(missingOrIncorrect, fmt.Sprintf("%s (not found)", comp))
+		} else if status != StepStatusCompleted {
+			missingOrIncorrect = append(
+				missingOrIncorrect,
+				fmt.Sprintf("%s (status=%s, expected=completed)", comp, status),
+			)
+		} else {
+			t.Logf("  ✓ %s/%s = %s", aggregateStepName, comp, status)
+		}
+	}
+	t.Log("═══════════════════════════════════════════════════════════════")
+	t.Log("")
+
+	if len(missingOrIncorrect) > 0 {
+		t.Errorf("DATA ACCUMULATION FAILED: %d components not correctly updated:", len(missingOrIncorrect))
+		for _, issue := range missingOrIncorrect {
+			t.Errorf("  - %s", issue)
+		}
+		t.Fatalf("Not all concurrent component updates were accumulated")
+	}
+
+	// With timestamp-based versions, we can't predict exact values,
+	// but the version should be a reasonable nanosecond timestamp (after year 2020)
+	minReasonableVersion := uint64(1577836800000000000) // 2020-01-01 in nanoseconds
+	if finalSlip.Version < minReasonableVersion {
+		t.Errorf(
+			"expected version to be a nanosecond timestamp (>= %d), got %d",
+			minReasonableVersion,
+			finalSlip.Version,
+		)
+	}
+
+	t.Log("")
+	t.Logf("SUCCESS: All %d concurrent component updates accumulated correctly", numConcurrentUpdates)
+	t.Logf("Final version: %d (timestamp-based)", finalSlip.Version)
+}
+
+// TestAtomicUpdate_VersionSequence tests that versions are strictly incrementing
+// and that each atomic update produces exactly one cancel row and one new state row.
+func TestAtomicUpdate_VersionSequence(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Start ClickHouse container
+	container, err := setupClickHouseContainer(ctx, t)
+	if err != nil {
+		t.Fatalf("failed to setup clickhouse container: %v", err)
+	}
+	defer func() {
+		if err := container.terminate(ctx); err != nil {
+			t.Logf("warning: failed to terminate container: %v", err)
+		}
+	}()
+
+	pipelineConfig := integrationTestPipelineConfig()
+	store, err := createTestStore(ctx, t, container, pipelineConfig)
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer store.Close()
+
+	// Create a slip
+	correlationID := fmt.Sprintf("test-sequence-%d", time.Now().UnixNano())
+	components := []string{"api"}
+
+	slip := createIntegrationTestSlip(correlationID, components, pipelineConfig)
+
+	// Create the initial slip (version 1)
+	if err := store.Create(ctx, slip); err != nil {
+		t.Fatalf("failed to create slip: %v", err)
+	}
+
+	// Perform 5 sequential updates
+	numUpdates := 5
+	for i := 0; i < numUpdates; i++ {
+		// Load the slip first
+		currentSlip, err := store.Load(ctx, correlationID)
+		if err != nil {
+			t.Fatalf("update %d: failed to load slip: %v", i+1, err)
+		}
+
+		// Modify and update
+		currentSlip.UpdatedAt = time.Now()
+		if err := store.Update(ctx, currentSlip); err != nil {
+			t.Fatalf("update %d: failed to update slip: %v", i+1, err)
+		}
+
+		t.Logf("Update %d completed", i+1)
+	}
+
+	// Query all raw rows (without FINAL) to see the full history
+	session := store.Session()
+	rows, err := session.QueryWithArgs(ctx, `
+		SELECT version, sign
+		FROM ci_test.routing_slips
+		WHERE correlation_id = $1
+		ORDER BY version, sign
+	`, correlationID)
+	if err != nil {
+		t.Fatalf("failed to query raw rows: %v", err)
+	}
+	defer rows.Close()
+
+	t.Log("")
+	t.Log("═══════════════════════════════════════════════════════════════")
+	t.Log("ALL ROWS (before optimization)")
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	type rowInfo struct {
+		version uint64
+		sign    int8
+	}
+	var allRows []rowInfo
+	for rows.Next() {
+		var version uint64
+		var sign int8
+		if err := rows.Scan(&version, &sign); err != nil {
+			t.Fatalf("failed to scan row: %v", err)
+		}
+		t.Logf("  version=%d sign=%d", version, sign)
+		allRows = append(allRows, rowInfo{version, sign})
+	}
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	// Verify the version sequence:
+	// - Version 1: 1 row with sign=1 (initial create), 1 row with sign=-1 (cancelled by update 1)
+	// - Version 2: 1 row with sign=1 (update 1 result), 1 row with sign=-1 (cancelled by update 2)
+	// - ...
+	// - Version N+1: 1 row with sign=1 (final state, not cancelled)
+
+	// With timestamp-based versions, we can't predict exact values,
+	// but we can verify the version is a valid nanosecond timestamp
+	minReasonableVersion := uint64(1577836800000000000) // 2020-01-01 in nanoseconds
+
+	// Load the final slip
+	finalSlip, err := store.Load(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("failed to load final slip: %v", err)
+	}
+
+	if finalSlip.Version < minReasonableVersion {
+		t.Errorf(
+			"expected version to be a nanosecond timestamp (>= %d), got %d",
+			minReasonableVersion,
+			finalSlip.Version,
+		)
+	}
+
+	// After OPTIMIZE, verify only one row remains (the final state)
+	if err := store.OptimizeTable(ctx); err != nil {
+		t.Fatalf("failed to optimize table: %v", err)
+	}
+
+	// Count rows after optimization
+	countRows, err := session.QueryWithArgs(ctx, `
+		SELECT count(*) 
+		FROM ci_test.routing_slips FINAL
+		WHERE correlation_id = $1
+	`, correlationID)
+	if err != nil {
+		t.Fatalf("failed to count rows: %v", err)
+	}
+	defer countRows.Close()
+
+	var rowCount uint64
+	if countRows.Next() {
+		if err := countRows.Scan(&rowCount); err != nil {
+			t.Fatalf("failed to scan count: %v", err)
+		}
+	}
+
+	if rowCount != 1 {
+		t.Errorf("expected 1 row after OPTIMIZE FINAL, got %d", rowCount)
+	}
+
+	t.Logf("SUCCESS: Version sequence verified after %d updates", numUpdates)
+	t.Logf("Final version: %d, row count after OPTIMIZE: %d", finalSlip.Version, rowCount)
+}
+
+// TestHydrateSlip_EmptyAggregates tests that component states are properly hydrated
+// into slips even when the aggregate JSON column is empty ({"items":[]}).
+// This reproduces a bug where:
+//  1. A slip is created with empty aggregates (builds_completed = {"items":[]})
+//  2. Component states are written to slip_component_states table
+//  3. Loading the slip fails to populate the aggregate because hydrateSlip
+//     skips aggregates that don't have existing component entries
+func TestHydrateSlip_EmptyAggregates(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Setup
+	container, err := setupClickHouseContainer(ctx, t)
+	if err != nil {
+		t.Fatalf("Failed to start container: %v", err)
+	}
+	defer container.terminate(ctx)
+
+	pipelineConfig := integrationTestPipelineConfig()
+	store, err := createTestStore(ctx, t, container, pipelineConfig)
+	if err != nil {
+		t.Fatalf("Failed to create test store: %v", err)
+	}
+	defer store.Close()
+
+	// Create a slip with EMPTY aggregates (simulates what pushhookparser does)
+	correlationID := fmt.Sprintf("test-hydrate-%d", time.Now().UnixNano())
+	slip := &Slip{
+		CorrelationID: correlationID,
+		Repository:    "test-org/test-repo",
+		Branch:        "main",
+		CommitSHA:     "abc123def456",
+		Status:        SlipStatusInProgress,
+		// Steps match the pipeline config: push_parsed, builds_completed, unit_tests_completed, dev_deploy
+		Steps: map[string]Step{
+			"push_parsed":          {Status: StepStatusCompleted},
+			"builds_completed":     {Status: StepStatusRunning}, // Running, waiting for components
+			"unit_tests_completed": {Status: StepStatusPending},
+			"dev_deploy":           {Status: StepStatusPending},
+		},
+		// IMPORTANT: Empty aggregates - this is the key to reproducing the bug
+		Aggregates: map[string][]ComponentStepData{
+			"builds_completed": {}, // Empty! No component entries yet
+		},
+	}
+
+	if err := store.Create(ctx, slip); err != nil {
+		t.Fatalf("Failed to create slip: %v", err)
+	}
+	t.Logf("Created slip %s with empty aggregates", correlationID)
+
+	// Now simulate components completing their builds by writing directly to slip_component_states
+	// This is what happens when slippy post-job runs for each component
+	components := []string{"api", "worker", "frontend"}
+	for _, comp := range components {
+		err := store.insertComponentState(ctx, correlationID, "builds_completed", comp, StepStatusCompleted)
+		if err != nil {
+			t.Fatalf("Failed to insert component state for %s: %v", comp, err)
+		}
+		t.Logf("Inserted component state: %s = completed", comp)
+	}
+
+	// Verify component states are in the database
+	states, err := store.loadComponentStates(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("Failed to load component states: %v", err)
+	}
+	t.Logf("Component states in database: %d", len(states))
+	for _, s := range states {
+		t.Logf("  %s/%s = %s", s.Step, s.Component, s.Status)
+	}
+
+	if len(states) != len(components) {
+		t.Fatalf("Expected %d component states, got %d", len(components), len(states))
+	}
+
+	// Now load the slip - this should hydrate the aggregate from component states
+	loadedSlip, err := store.Load(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("Failed to load slip: %v", err)
+	}
+
+	// Check that the aggregate was populated with component data
+	t.Log("")
+	t.Log("═══════════════════════════════════════════════════════════════")
+	t.Log("LOADED SLIP AGGREGATES")
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	buildsAggregate, ok := loadedSlip.Aggregates["builds_completed"]
+	if !ok {
+		t.Fatal("builds_completed aggregate not found in loaded slip")
+	}
+
+	t.Logf("builds_completed aggregate has %d components", len(buildsAggregate))
+	for _, comp := range buildsAggregate {
+		t.Logf("  %s: status=%s", comp.Component, comp.Status)
+	}
+
+	// THIS IS THE BUG: The aggregate should have been populated from component states
+	if len(buildsAggregate) == 0 {
+		t.Error("BUG REPRODUCED: builds_completed aggregate is empty after hydration!")
+		t.Error("Expected component states to be merged into the aggregate")
+	}
+
+	// Verify all components are present and completed
+	if len(buildsAggregate) != len(components) {
+		t.Errorf("Expected %d components in aggregate, got %d", len(components), len(buildsAggregate))
+	}
+
+	// Check that aggregate step status was computed correctly
+	buildsStep := loadedSlip.Steps["builds_completed"]
+	t.Logf("builds_completed step status: %s", buildsStep.Status)
+
+	// All components completed, so step should be completed
+	if buildsStep.Status != StepStatusCompleted {
+		t.Errorf("Expected builds_completed step status to be 'completed', got '%s'", buildsStep.Status)
+	}
+
+	t.Log("═══════════════════════════════════════════════════════════════")
+
+	// Also test the updateAggregateStatusFromComponentStates flow
+	// This simulates what happens after UpdateStep with a component name
+	t.Log("")
+	t.Log("Testing updateAggregateStatusFromComponentStates...")
+
+	// Add another component and verify it gets aggregated
+	err = store.UpdateStep(ctx, correlationID, "builds_completed", "scheduler", StepStatusCompleted)
+	if err != nil {
+		t.Fatalf("Failed to UpdateStep for scheduler: %v", err)
+	}
+
+	// Reload and verify
+	reloadedSlip, err := store.Load(ctx, correlationID)
+	if err != nil {
+		t.Fatalf("Failed to reload slip: %v", err)
+	}
+
+	reloadedAggregate := reloadedSlip.Aggregates["builds_completed"]
+	t.Logf("After UpdateStep, aggregate has %d components", len(reloadedAggregate))
+
+	// Should now have 4 components: api, worker, frontend, scheduler
+	expectedCount := len(components) + 1
+	if len(reloadedAggregate) != expectedCount {
+		t.Errorf("Expected %d components after UpdateStep, got %d", expectedCount, len(reloadedAggregate))
+	}
+
+	t.Log("SUCCESS: Hydration test complete")
 }

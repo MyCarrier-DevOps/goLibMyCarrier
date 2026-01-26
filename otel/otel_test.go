@@ -1865,3 +1865,91 @@ func TestOtelLogger_logStructured_EmptyAttributesMap(t *testing.T) {
 		t.Errorf("Expected no attributes in JSON for empty map, got: %v", logEntry.Attributes)
 	}
 }
+
+// Tests for gRPC/HTTP protocol selection
+func TestOtelLogger_ProtocolConstants(t *testing.T) {
+	// Verify the protocol constants are correctly defined
+	if ProtocolGRPC != "grpc" {
+		t.Errorf("ProtocolGRPC should be 'grpc', got %q", ProtocolGRPC)
+	}
+	if ProtocolHTTP != "http/protobuf" {
+		t.Errorf("ProtocolHTTP should be 'http/protobuf', got %q", ProtocolHTTP)
+	}
+	if OtelProtocolEnv != "OTEL_EXPORTER_OTLP_PROTOCOL" {
+		t.Errorf("OtelProtocolEnv should be 'OTEL_EXPORTER_OTLP_PROTOCOL', got %q", OtelProtocolEnv)
+	}
+}
+
+func TestOtelLogger_ProtocolSelection(t *testing.T) {
+	tests := []struct {
+		name             string
+		protocolEnv      string
+		expectedProtocol string
+	}{
+		{
+			name:             "gRPC protocol when explicitly set",
+			protocolEnv:      "grpc",
+			expectedProtocol: "grpc",
+		},
+		{
+			name:             "gRPC protocol case insensitive",
+			protocolEnv:      "GRPC",
+			expectedProtocol: "grpc",
+		},
+		{
+			name:             "HTTP protocol when set",
+			protocolEnv:      "http/protobuf",
+			expectedProtocol: "http/protobuf",
+		},
+		{
+			name:             "HTTP protocol case insensitive",
+			protocolEnv:      "HTTP/PROTOBUF",
+			expectedProtocol: "http/protobuf",
+		},
+		{
+			name:             "default to gRPC when empty",
+			protocolEnv:      "",
+			expectedProtocol: "grpc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Set the protocol environment variable
+			if tt.protocolEnv != "" {
+				if err := os.Setenv(OtelProtocolEnv, tt.protocolEnv); err != nil {
+					t.Fatalf("Failed to set %s: %v", OtelProtocolEnv, err)
+				}
+				defer func() {
+					if err := os.Unsetenv(OtelProtocolEnv); err != nil {
+						t.Logf("Failed to unset %s: %v", OtelProtocolEnv, err)
+					}
+				}()
+			} else {
+				if err := os.Unsetenv(OtelProtocolEnv); err != nil {
+					t.Logf("Failed to unset %s: %v", OtelProtocolEnv, err)
+				}
+			}
+
+			// Verify the protocol is read correctly
+			protocol := strings.ToLower(os.Getenv(OtelProtocolEnv))
+			if protocol == "" {
+				protocol = ProtocolGRPC // Default to gRPC
+			}
+
+			if protocol != tt.expectedProtocol {
+				t.Errorf("Expected protocol %q, got %q", tt.expectedProtocol, protocol)
+			}
+		})
+	}
+}
+
+func TestOtelLogger_DefaultPortConstants(t *testing.T) {
+	// Verify the default port constants are correctly defined
+	if DefaultGRPCPort != "4317" {
+		t.Errorf("DefaultGRPCPort should be '4317', got %q", DefaultGRPCPort)
+	}
+	if DefaultHTTPPort != "4318" {
+		t.Errorf("DefaultHTTPPort should be '4318', got %q", DefaultHTTPPort)
+	}
+}

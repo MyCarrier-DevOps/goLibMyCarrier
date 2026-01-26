@@ -72,15 +72,11 @@ func (c *Client) UpdateStepWithStatus(
 		Message:   message,
 	}
 
-	if err := c.store.UpdateStep(ctx, correlationID, stepName, componentName, status); err != nil {
+	// Use the combined UpdateStepWithHistory to update step AND append history atomically.
+	// This prevents the race condition where a separate AppendHistory call could reload
+	// a stale slip and overwrite the step update.
+	if err := c.store.UpdateStepWithHistory(ctx, correlationID, stepName, componentName, status, entry); err != nil {
 		return NewStepError("update", correlationID, stepName, componentName, err)
-	}
-
-	if err := c.store.AppendHistory(ctx, correlationID, entry); err != nil {
-		// Return the error - callers/shadow mode should decide if this is blocking
-		// The step update succeeded, but the audit trail is incomplete
-		return fmt.Errorf("%w: step %s updated to %s but history append failed: %s",
-			ErrHistoryAppendFailed, stepName, status, err.Error())
 	}
 
 	c.logger.Info(ctx, "Updated step", map[string]interface{}{
@@ -90,7 +86,14 @@ func (c *Client) UpdateStepWithStatus(
 
 	// Check if this is a component step that affects an aggregate
 	if componentName != "" && c.pipelineConfig != nil {
+		// Determine the aggregate step name. The stepName could be either:
+		// 1. The component step name (e.g., "build") - need to look up the aggregate step
+		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
 		aggregateStep := c.pipelineConfig.GetAggregateStep(stepName)
+		if aggregateStep == "" && c.pipelineConfig.IsAggregateStep(stepName) {
+			// stepName is already an aggregate step
+			aggregateStep = stepName
+		}
 		if aggregateStep != "" {
 			if err := c.checkAndUpdateAggregate(ctx, correlationID, stepName, aggregateStep); err != nil {
 				// Return the error - aggregate status is important for pipeline flow
@@ -107,14 +110,15 @@ func (c *Client) UpdateStepWithStatus(
 // and updates the corresponding aggregate step.
 // This is config-driven: the stepName is a component type (e.g., "build")
 // and aggregateStepName is the parent aggregate (e.g., "builds_completed").
-func (c *Client) checkAndUpdateAggregate(ctx context.Context, correlationID, stepName, aggregateStepName string) error {
+func (c *Client) checkAndUpdateAggregate(ctx context.Context, correlationID, _, aggregateStepName string) error {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return fmt.Errorf("failed to load slip for aggregate check: %w", err)
 	}
 
-	// Get component data from the aggregate column
-	columnName := pluralize(stepName)
+	// Get component data from the aggregate column.
+	// The aggregate JSON column is named after the aggregate step (e.g., "builds_completed")
+	columnName := aggregateStepName
 	componentData, ok := slip.Aggregates[columnName]
 	if !ok || len(componentData) == 0 {
 		c.logger.Debug(ctx, "No component data found for aggregate", map[string]interface{}{
@@ -191,12 +195,18 @@ func (c *Client) SetComponentImageTag(ctx context.Context, correlationID, compon
 		return NewSlipError("set image tag", correlationID, err)
 	}
 
-	// Find the builds aggregate column
-	columnName := "builds" // Default pluralized form of "build"
-	componentData, ok := slip.Aggregates[columnName]
+	// Find the step that aggregates "build" component type
+	// In default.json, this is "builds_completed" with aggregates: "build"
+	aggregateStepName := c.pipelineConfig.GetAggregateStep("build")
+	if aggregateStepName == "" {
+		return NewStepError("set image tag", correlationID, "build", componentName,
+			fmt.Errorf("no step configured to aggregate 'build' components"))
+	}
+
+	componentData, ok := slip.Aggregates[aggregateStepName]
 	if !ok {
 		return NewStepError("set image tag", correlationID, "build", componentName,
-			fmt.Errorf("builds aggregate not found"))
+			fmt.Errorf("builds aggregate '%s' not found", aggregateStepName))
 	}
 
 	// Find and update the component
@@ -214,7 +224,7 @@ func (c *Client) SetComponentImageTag(ctx context.Context, correlationID, compon
 			fmt.Errorf("component not found: %s", componentName))
 	}
 
-	slip.Aggregates[columnName] = componentData
+	slip.Aggregates[aggregateStepName] = componentData
 
 	if err := c.store.Update(ctx, slip); err != nil {
 		return NewSlipError("set image tag", correlationID, err)

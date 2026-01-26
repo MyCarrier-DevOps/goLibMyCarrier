@@ -36,11 +36,22 @@ type SlipStore interface {
 	// Each result includes the slip and its matched commit SHA.
 	FindAllByCommits(ctx context.Context, repository string, commits []string) ([]SlipWithCommit, error)
 
-	// Update persists changes to an existing slip
+	// Update persists changes to an existing slip.
+	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
+	// so there are no version conflicts.
 	Update(ctx context.Context, slip *Slip) error
 
 	// UpdateStep updates a specific step's status
 	UpdateStep(ctx context.Context, correlationID, stepName, componentName string, status StepStatus) error
+
+	// UpdateStepWithHistory updates a step's status AND appends a history entry in a single atomic operation.
+	// This prevents race conditions between separate UpdateStep and AppendHistory calls.
+	UpdateStepWithHistory(
+		ctx context.Context,
+		correlationID, stepName, componentName string,
+		status StepStatus,
+		entry StateHistoryEntry,
+	) error
 
 	// UpdateComponentStatus updates a component's build or test status
 	UpdateComponentStatus(ctx context.Context, correlationID, componentName, stepType string, status StepStatus) error

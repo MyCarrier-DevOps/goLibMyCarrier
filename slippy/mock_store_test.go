@@ -14,6 +14,59 @@ func pluralizeMock(name string) string {
 	return name + "s"
 }
 
+// deepCopySlip creates a deep copy of a Slip to prevent shared map/slice references.
+// This is used by MockStore to ensure test isolation.
+func deepCopySlip(slip *Slip) *Slip {
+	if slip == nil {
+		return nil
+	}
+
+	cpy := &Slip{
+		CorrelationID: slip.CorrelationID,
+		Repository:    slip.Repository,
+		Branch:        slip.Branch,
+		CommitSHA:     slip.CommitSHA,
+		CreatedAt:     slip.CreatedAt,
+		UpdatedAt:     slip.UpdatedAt,
+		Status:        slip.Status,
+		PromotedTo:    slip.PromotedTo,
+		Sign:          slip.Sign,
+		Version:       slip.Version,
+	}
+
+	// Deep copy steps map
+	if slip.Steps != nil {
+		cpy.Steps = make(map[string]Step, len(slip.Steps))
+		for k, v := range slip.Steps {
+			cpy.Steps[k] = v
+		}
+	}
+
+	// Deep copy aggregates
+	if slip.Aggregates != nil {
+		cpy.Aggregates = make(map[string][]ComponentStepData)
+		for k, v := range slip.Aggregates {
+			componentData := make([]ComponentStepData, len(v))
+			copy(componentData, v)
+			cpy.Aggregates[k] = componentData
+		}
+	}
+
+	// Deep copy state history
+	if slip.StateHistory != nil {
+		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
+		copy(cpy.StateHistory, slip.StateHistory)
+	}
+
+	// Deep copy ancestry
+	if slip.Ancestry != nil {
+		cpy.Ancestry = make([]AncestryEntry, len(slip.Ancestry))
+		copy(cpy.Ancestry, slip.Ancestry)
+	}
+
+	return cpy
+}
+
 // MockStore is an in-memory implementation of SlipStore for testing.
 // It provides configurable behavior and tracking of method calls.
 type MockStore struct {
@@ -388,6 +441,55 @@ func (m *MockStore) AppendHistory(ctx context.Context, correlationID string, ent
 	}
 
 	slip.StateHistory = append(slip.StateHistory, entry)
+	return nil
+}
+
+// UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
+// This is the combined operation that prevents race conditions.
+func (m *MockStore) UpdateStepWithHistory(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status StepStatus,
+	entry StateHistoryEntry,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Track both calls
+	m.UpdateStepCalls = append(m.UpdateStepCalls, UpdateStepCall{
+		CorrelationID: correlationID,
+		StepName:      stepName,
+		ComponentName: componentName,
+		Status:        status,
+	})
+	m.AppendHistoryCalls = append(m.AppendHistoryCalls, AppendHistoryCall{
+		CorrelationID: correlationID,
+		Entry:         entry,
+	})
+
+	if m.UpdateStepError != nil {
+		return m.UpdateStepError
+	}
+	if err, ok := m.UpdateStepErrorFor[correlationID]; ok {
+		return err
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return ErrSlipNotFound
+	}
+
+	// Update step
+	if slip.Steps == nil {
+		slip.Steps = make(map[string]Step)
+	}
+	step := slip.Steps[stepName]
+	step.Status = status
+	slip.Steps[stepName] = step
+
+	// Append history
+	slip.StateHistory = append(slip.StateHistory, entry)
+
 	return nil
 }
 

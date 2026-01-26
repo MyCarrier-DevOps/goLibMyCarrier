@@ -54,7 +54,8 @@ func (c *Client) getPrereqStatus(ctx context.Context, slip *Slip, prereq, compon
 		// Look up if this prereq is a component type for any aggregate step
 		aggregateStep := c.pipelineConfig.GetAggregateStep(prereq)
 		if aggregateStep != "" {
-			columnName := pluralize(prereq)
+			// Column name is the aggregate step name (e.g., "builds_completed")
+			columnName := aggregateStep
 			if componentData, ok := slip.Aggregates[columnName]; ok {
 				for _, comp := range componentData {
 					if comp.Component == componentName {

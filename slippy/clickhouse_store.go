@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
+	"strings"
 	"time"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
@@ -15,8 +17,71 @@ import (
 const (
 	// DefaultMaxUpdateRetries is the default number of retry attempts for updates
 	// when a version conflict occurs due to concurrent modifications.
-	DefaultMaxUpdateRetries = 10
+	// Version conflicts are transient and will always eventually succeed,
+	// so we set this high to ensure we don't fail unnecessarily.
+	DefaultMaxUpdateRetries = 100
+
+	// retryBaseDelay is the base delay for exponential backoff (version conflicts)
+	retryBaseDelay = 25 * time.Millisecond
+
+	// retryMaxDelay caps the maximum delay between retries (version conflicts)
+	retryMaxDelay = 3 * time.Second
+
+	// slipNotFoundBaseDelay is the multiplier (in minutes) for linear backoff
+	// when waiting for a slip to be created. Uses formula: base * retry * minute
+	// Retry 1: 5min, Retry 2: 10min, Retry 3: 15min (30min total wait)
+	slipNotFoundBaseDelay = 5
+
+	// slipNotFoundMaxRetries is the maximum number of retries when slip doesn't exist.
+	// With linear backoff (5min + 10min + 15min), this gives ~30 minutes total wait time.
+	slipNotFoundMaxRetries = 3
 )
+
+// calculateBackoff returns an exponential backoff duration with jitter for version conflicts.
+// The formula is: min(retryMaxDelay, retryBaseDelay * 2^attempt) + random jitter
+func calculateBackoff(attempt int) time.Duration {
+	return calculateBackoffWithParams(attempt, retryBaseDelay, retryMaxDelay)
+}
+
+// calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
+// Uses linear backoff: 5min for 1st retry, 10min for 2nd, 15min for 3rd.
+// Formula: slipNotFoundBaseDelay * retryNumber * time.Minute
+// where retryNumber is 1-indexed (1, 2, 3).
+func calculateSlipNotFoundBackoff(retryNumber int) time.Duration {
+	if retryNumber < 1 {
+		retryNumber = 1
+	}
+	if retryNumber > slipNotFoundMaxRetries {
+		retryNumber = slipNotFoundMaxRetries
+	}
+	return time.Duration(slipNotFoundBaseDelay*retryNumber) * time.Minute
+}
+
+// calculateBackoffWithParams returns an exponential backoff duration with jitter.
+// The formula is: min(maxDelay, baseDelay * 2^attempt) + random jitter
+func calculateBackoffWithParams(attempt int, baseDelay, maxDelay time.Duration) time.Duration {
+	// Calculate exponential delay: baseDelay * 2^attempt
+	delay := baseDelay * time.Duration(1<<uint(attempt))
+
+	// Cap at maximum delay
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	// Add jitter: ±25% of the delay to prevent thundering herd
+	// Guard against zero delay which would cause rand.Int63n to panic
+	jitterRange := int64(delay) / 2
+	if jitterRange > 0 {
+		jitter := time.Duration(rand.Int63n(jitterRange))
+		if rand.Intn(2) == 0 {
+			delay += jitter
+		} else {
+			delay -= jitter / 2 // Don't go below 75% of calculated delay
+		}
+	}
+
+	return delay
+}
 
 // ClickHouseStore implements SlipStore using ClickHouse as the backend.
 // The store uses correlation_id as the unique identifier for routing slips,
@@ -188,23 +253,27 @@ func (s *ClickHouseStore) PipelineConfig() *PipelineConfig {
 
 // Create persists a new routing slip.
 // The slip's CorrelationID is used as the unique identifier.
-// For VersionedCollapsingMergeTree, this inserts a row with sign=1 and version=1.
+// For VersionedCollapsingMergeTree, this inserts a row with sign=1 and version calculated atomically.
 func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
 
-	// Set default sign and version for new slips
+	// Set default sign for new slips
 	if slip.Sign == 0 {
 		slip.Sign = 1
 	}
-	if slip.Version == 0 {
-		slip.Version = 1
-	}
 
-	if err := s.insertRow(ctx, slip); err != nil {
+	// Generate timestamp-based version (nanoseconds since epoch)
+	// This ensures unique versions even if multiple Create calls happen concurrently
+	version := uint64(time.Now().UnixNano())
+
+	if err := s.insertRow(ctx, slip, version); err != nil {
 		return fmt.Errorf("failed to create slip: %w", err)
 	}
+
+	// Update the slip's version to the generated value
+	slip.Version = version
 
 	// Run OPTIMIZE TABLE if enabled
 	if s.optimizeAfterWrite {
@@ -241,7 +310,9 @@ func (s *ClickHouseStore) Load(ctx context.Context, correlationID string) (*Slip
 		return nil, fmt.Errorf("pipeline config is required for store operations")
 	}
 
-	query := s.queryBuilder.BuildSelectQuery("WHERE correlation_id = ?", "LIMIT 1")
+	// Only select active rows (sign=1) to exclude orphaned cancel rows.
+	// Order by version DESC to get the latest version in case of uncollapsed duplicates.
+	query := s.queryBuilder.BuildSelectQuery("WHERE correlation_id = ? AND sign = 1", "ORDER BY version DESC LIMIT 1")
 	slip, err := s.scanSlip(ctx, query, correlationID)
 	if err != nil {
 		return nil, err
@@ -260,9 +331,11 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 		return nil, fmt.Errorf("pipeline config is required for store operations")
 	}
 
+	// Only select active rows (sign=1) to exclude orphaned cancel rows.
+	// Order by version DESC to get the latest version.
 	query := s.queryBuilder.BuildSelectQuery(
-		"WHERE repository = ? AND commit_sha = ?",
-		"ORDER BY created_at DESC LIMIT 1",
+		"WHERE repository = ? AND commit_sha = ? AND sign = 1",
+		"ORDER BY version DESC LIMIT 1",
 	)
 	slip, err := s.scanSlip(ctx, query, repository, commitSHA)
 	if err != nil {
@@ -359,52 +432,58 @@ func (s *ClickHouseStore) FindAllByCommits(
 }
 
 // Update persists changes to an existing slip using VersionedCollapsingMergeTree semantics.
-// This inserts two rows: a cancel row (sign=-1) with the current max version, and a new row (sign=1) with incremented version.
+// This inserts a cancel row (sign=-1) for the slip's current version and a new row (sign=1)
+// with a new nanosecond timestamp version.
 //
-// Optimistic Locking: If the version in ClickHouse differs from the slip's version (indicating
-// another process modified the slip), this method returns ErrVersionConflict. Callers should
-// reload the slip and retry their operation.
+// Post-Insert Verification: After inserting, we run OPTIMIZE TABLE and verify that our new
+// version is the winning (MAX) version. If another concurrent update's version is higher,
+// our update "lost" and we return ErrVersionConflict. Callers should reload and retry.
 //
-// Atomic Version Increment: The version is fetched atomically from ClickHouse using max(version)
-// to prevent race conditions between concurrent updates.
+// Why post-insert verification works:
+// - Pre-insert checks fail because all concurrent goroutines can pass them simultaneously
+// - VCMT will collapse cancel+insert pairs with the same version
+// - After OPTIMIZE, only ONE sign=1 row can survive (the highest version)
+// - By checking if our version is the MAX, we know if we "won" the race
+//
+// Timestamp-Based Versioning: Each update generates a unique version using time.Now().UnixNano(),
+// guaranteeing unique versions across concurrent writers.
 func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
-	// Get the current max version atomically from ClickHouse
-	currentVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
-	if err != nil {
-		return fmt.Errorf("failed to get current version: %w", err)
-	}
-
-	// Optimistic locking: verify version hasn't changed since the slip was loaded
-	if currentVersion != slip.Version {
-		return fmt.Errorf("%w: expected version %d, but found version %d",
-			ErrVersionConflict, slip.Version, currentVersion)
-	}
-
 	// Update updated_at timestamp
 	slip.UpdatedAt = time.Now()
-
-	// Create a deep copy for the cancel row to prevent shared map/slice references
-	cancelSlip := deepCopySlip(slip)
-	cancelSlip.Sign = -1
-	cancelSlip.Version = currentVersion // Use the atomically fetched version
-
-	if err := s.insertRow(ctx, cancelSlip); err != nil {
-		return fmt.Errorf("failed to insert cancel row: %w", err)
-	}
-
-	// Insert the new state with atomically incremented version (sign=1)
 	slip.Sign = 1
-	slip.Version = currentVersion + 1
 
-	if err := s.insertRow(ctx, slip); err != nil {
-		return fmt.Errorf("failed to insert new row: %w", err)
+	// Store the old version for the cancel row
+	oldVersion := slip.Version
+
+	// Generate new timestamp-based version (nanoseconds since epoch)
+	// This ensures unique versions across concurrent writers
+	newVersion := uint64(time.Now().UnixNano())
+
+	// Insert both cancel row and new row atomically
+	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
+		return fmt.Errorf("failed to insert atomic update: %w", err)
 	}
 
-	// Run OPTIMIZE TABLE if enabled
-	if s.optimizeAfterWrite {
-		if err := s.OptimizeTable(ctx); err != nil {
-			return fmt.Errorf("failed to optimize table after update: %w", err)
-		}
+	// Update the slip's version to the new value
+	slip.Version = newVersion
+
+	// Run OPTIMIZE TABLE to force immediate collapsing
+	// This is required for the post-insert verification to work correctly
+	if err := s.OptimizeTable(ctx); err != nil {
+		return fmt.Errorf("failed to optimize table after update: %w", err)
+	}
+
+	// Post-insert verification: check if our version "won" the race
+	// After OPTIMIZE, the highest version with sign=1 survives
+	// If our version isn't the current MAX, another concurrent update won
+	currentMaxVersion, err := s.getMaxVersion(ctx, slip.CorrelationID)
+	if err != nil {
+		return fmt.Errorf("failed to verify update: %w", err)
+	}
+
+	if currentMaxVersion != newVersion {
+		return fmt.Errorf("%w: our version %d was superseded by version %d",
+			ErrVersionConflict, newVersion, currentMaxVersion)
 	}
 
 	return nil
@@ -412,7 +491,8 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 
 // UpdateStep updates a specific step's status with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
-// If a concurrent modification is detected, the slip is reloaded and the update is retried.
+// If a concurrent modification is detected, the slip is reloaded and the update is retried
+// with exponential backoff and jitter to prevent thundering herd.
 func (s *ClickHouseStore) UpdateStep(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
@@ -421,18 +501,60 @@ func (s *ClickHouseStore) UpdateStep(
 	// Handle component-level updates via event sourcing to avoid write contention.
 	// This writes to slip_component_states using ReplacingMergeTree.
 	if componentName != "" {
-		if _, err := s.Load(ctx, correlationID); err != nil {
+		// First, insert the component state into the event sourcing table
+		if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status); err != nil {
 			return err
 		}
-		return s.insertComponentState(ctx, correlationID, stepName, componentName, status)
+
+		// Now update the aggregate status in the routing_slips table.
+		// This ensures the slip reflects the current state of all components.
+		return s.updateAggregateStatusFromComponentStates(ctx, correlationID, stepName)
 	}
 
-	var lastErr error
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "UpdateStep", correlationID)
+	retrySpan.AddAttribute("slippy.step_name", stepName)
+	// Note: retrySpan is ended explicitly by success/error paths below, not via defer
 
-	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
+
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
 		// Load the current slip (reload on retry to get latest version)
-		slip, err := s.Load(ctx, correlationID)
+		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			// Non-retryable load error
+			retrySpan.EndError(err)
 			return err
 		}
 
@@ -441,23 +563,35 @@ func (s *ClickHouseStore) UpdateStep(
 		// Update pipeline-level steps
 		s.updatePipelineStep(slip, stepName, status, now)
 
-		err = s.Update(ctx, slip)
+		err = s.Update(retrySpan.Context(), slip)
 		if err == nil {
+			retrySpan.EndSuccess()
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
 		if errors.Is(err, ErrVersionConflict) {
-			lastErr = err
-			continue // Retry with fresh data
+			versionConflictRetry++
+
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(versionConflictRetry)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
 		}
 
 		// Non-retryable error
+		retrySpan.EndError(err)
 		return err
 	}
-
-	// All retries exhausted
-	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
 // UpdateComponentStatus updates a component's step status with automatic retry on version conflicts.
@@ -470,36 +604,201 @@ func (s *ClickHouseStore) UpdateComponentStatus(
 	return s.UpdateStep(ctx, correlationID, stepType, componentName, status)
 }
 
+// UpdateStepWithHistory updates a step's status AND appends a history entry in a single atomic operation.
+// This prevents the race condition where a separate AppendHistory call could reload a stale slip
+// and overwrite the step update. Both changes are applied to the same loaded slip and committed
+// together in one Update call.
+func (s *ClickHouseStore) UpdateStepWithHistory(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status StepStatus,
+	entry StateHistoryEntry,
+) error {
+	// Handle component-level updates via event sourcing to avoid write contention.
+	// This writes to slip_component_states using ReplacingMergeTree.
+	if componentName != "" {
+		// First, insert the component state into the event sourcing table
+		if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status); err != nil {
+			return err
+		}
+
+		// Now update the aggregate status in the routing_slips table AND append history.
+		// This ensures the slip reflects the current state of all components.
+		return s.updateAggregateStatusFromComponentStatesWithHistory(ctx, correlationID, stepName, entry)
+	}
+
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "UpdateStepWithHistory", correlationID)
+	retrySpan.AddAttribute("slippy.step_name", stepName)
+	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
+	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
+	// Note: retrySpan is ended explicitly by success/error paths below, not via defer
+
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
+
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
+		// Load the current slip (reload on retry to get latest version)
+		slip, err := s.Load(retrySpan.Context(), correlationID)
+		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			// Non-retryable load error
+			retrySpan.EndError(err)
+			return err
+		}
+
+		now := time.Now()
+
+		// Update pipeline-level steps
+		s.updatePipelineStep(slip, stepName, status, now)
+
+		// Append history entry to the same slip (atomic with step update)
+		slip.StateHistory = append(slip.StateHistory, entry)
+
+		// Single Update call commits both changes atomically
+		err = s.Update(retrySpan.Context(), slip)
+		if err == nil {
+			retrySpan.EndSuccess()
+			return nil // Success
+		}
+
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
+		if errors.Is(err, ErrVersionConflict) {
+			versionConflictRetry++
+
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(versionConflictRetry)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
+		}
+
+		// Non-retryable error
+		retrySpan.EndError(err)
+		return err
+	}
+}
+
 // AppendHistory adds a state history entry to the slip with automatic retry on version conflicts.
 // The correlationID is the unique identifier for the routing slip.
+// Version conflicts are transient and will retry indefinitely.
+// Only context cancellation or permanent errors stop the loop.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
-	var lastErr error
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
+	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
+	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
 
-	for attempt := 0; attempt <= s.maxUpdateRetries; attempt++ {
-		slip, err := s.Load(ctx, correlationID)
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
+
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
+		slip, err := s.Load(retrySpan.Context(), correlationID)
 		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			// Non-retryable load error
+			retrySpan.EndError(err)
 			return err
 		}
 
 		slip.StateHistory = append(slip.StateHistory, entry)
 
-		err = s.Update(ctx, slip)
+		err = s.Update(retrySpan.Context(), slip)
 		if err == nil {
+			retrySpan.EndSuccess()
 			return nil // Success
 		}
 
-		// Check if this is a version conflict error
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
 		if errors.Is(err, ErrVersionConflict) {
-			lastErr = err
-			continue // Retry with fresh data
+			versionConflictRetry++
+
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(versionConflictRetry)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
 		}
 
 		// Non-retryable error
+		retrySpan.EndError(err)
 		return err
 	}
-
-	// All retries exhausted
-	return fmt.Errorf("%w: last error: %w", ErrMaxRetriesExceeded, lastErr)
 }
 
 // Close releases any resources held by the store.
@@ -508,8 +807,8 @@ func (s *ClickHouseStore) Close() error {
 }
 
 // getMaxVersion retrieves the current maximum version for a slip from ClickHouse.
-// This is used for atomic version increment to prevent race conditions.
-func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID string) (uint32, error) {
+// This is used for the optimistic locking check before atomic update.
+func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID string) (uint64, error) {
 	query := fmt.Sprintf(
 		"SELECT max(version) FROM %s.%s WHERE %s = ?",
 		s.database, TableRoutingSlips, ColumnCorrelationID,
@@ -526,19 +825,24 @@ func (s *ClickHouseStore) getMaxVersion(ctx context.Context, correlationID strin
 		return 0, fmt.Errorf("no rows found for correlation_id %s", correlationID)
 	}
 
-	return uint32(maxVersion.Int64), nil
+	return uint64(maxVersion.Int64), nil
 }
 
-// insertRow is an internal method that inserts a single row without OPTIMIZE.
-// Used by both Create (for new slips) and Update (for cancel and new rows).
-func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
+// insertRow inserts a single row into the routing_slips table.
+// If version is 0, the version is calculated atomically as COALESCE(MAX(version), 0) + 1.
+// If version is non-zero, that specific version is used (for cancel rows in VersionedCollapsingMergeTree).
+//
+// VersionedCollapsingMergeTree requires:
+// - Cancel rows (sign=-1) must have the SAME version as the row they cancel
+// - New state rows (sign=1) get the next version
+func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uint64) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
 
 	// Build dynamic column lists using query builder
-	stepColumns, stepPlaceholders, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
-	aggregateColumns, aggregatePlaceholders, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
 		slip.Aggregates,
 	)
 
@@ -562,16 +866,20 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 		return fmt.Errorf("failed to marshal ancestry: %w", err)
 	}
 
-	// Build the INSERT query dynamically
+	// Build column list for INSERT
 	var columns []string
-	var placeholders []string
-	var values []interface{}
-
-	// Core columns (order must match scanner expectations)
 	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
 		ColumnSign, ColumnVersion)
-	placeholders = append(placeholders, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	columns = append(columns, stepColumns...)
+	columns = append(columns, aggregateColumns...)
+
+	// Build SELECT expressions - all literals except version which may use a subquery
+	var selectExprs []string
+	var values []interface{}
+
+	// Core columns as literals (using positional parameters)
+	selectExprs = append(selectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
 	values = append(values,
 		slip.CorrelationID,
 		slip.Repository,
@@ -583,24 +891,194 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip) error {
 		string(stepDetailsJSON),
 		string(stateHistoryJSON),
 		string(ancestryJSON),
-		slip.Sign,
-		slip.Version,
 	)
 
-	// Step status columns
-	columns = append(columns, stepColumns...)
-	placeholders = append(placeholders, stepPlaceholders...)
-	values = append(values, stepValues...)
+	// Sign as literal
+	selectExprs = append(selectExprs, "?")
+	values = append(values, slip.Sign)
 
-	// Aggregate JSON columns
-	columns = append(columns, aggregateColumns...)
-	placeholders = append(placeholders, aggregatePlaceholders...)
-	values = append(values, aggregateValues...)
+	// Version: use provided version or calculate atomically
+	if version > 0 {
+		// Use the specific version provided (for cancel rows)
+		selectExprs = append(selectExprs, "?")
+		values = append(values, version)
+	} else {
+		// Calculate atomically from subquery: COALESCE(MAX(version), 0) + 1
+		// This works for all cases:
+		// - New slip (no existing rows): returns 0 + 1 = 1
+		// - Existing slip: returns current max + 1
+		// Note: This is only used by Create(). Updates use insertAtomicUpdate() which
+		// handles both cancel and new rows in a single UNION ALL statement.
+		selectExprs = append(selectExprs, fmt.Sprintf(
+			"COALESCE((SELECT max(version) FROM %s.%s WHERE %s = ?), 0) + 1",
+			s.database, TableRoutingSlips, ColumnCorrelationID,
+		))
+		values = append(values, slip.CorrelationID)
+	}
 
-	query := s.queryBuilder.BuildInsertQuery(columns, placeholders)
+	// Step status columns as literals
+	for _, stepVal := range stepValues {
+		selectExprs = append(selectExprs, "?")
+		values = append(values, stepVal)
+	}
+
+	// Aggregate JSON columns as literals
+	for _, aggVal := range aggregateValues {
+		selectExprs = append(selectExprs, "?")
+		values = append(values, aggVal)
+	}
+
+	// Build the INSERT...SELECT query
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		SELECT %s
+	`, s.database, TableRoutingSlips, strings.Join(columns, ", "), strings.Join(selectExprs, ", "))
 
 	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
 		return fmt.Errorf("failed to insert slip row: %w", err)
+	}
+
+	return nil
+}
+
+// insertAtomicUpdateWithVersions inserts cancel rows for all existing active rows and a new state row
+// in a single atomic INSERT statement.
+//
+// This uses INSERT...SELECT...UNION ALL to:
+// 1. Select all existing rows with sign=1 and version < newVersion, re-insert them with sign=-1
+// 2. Insert the new row with sign=1 and the new timestamp version
+//
+// The query structure is:
+//
+//	INSERT INTO routing_slips (columns...)
+//	SELECT columns..., -1 as sign, version FROM routing_slips
+//	    WHERE correlation_id = ? AND version < ? AND sign = 1
+//	UNION ALL
+//	SELECT <new_data>, 1 as sign, <new_version>
+//
+// This approach:
+// - Cancels ALL existing active rows (handles any uncollapsed duplicates)
+// - Uses timestamp-based versions to guarantee uniqueness
+// - Is fully atomic - either all rows are inserted or none
+func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
+	ctx context.Context,
+	slip *Slip,
+	_, newVersion uint64,
+) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	// Build dynamic column lists using query builder
+	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+
+	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
+		slip.Aggregates,
+	)
+
+	// Serialize step details (timing, actor, errors)
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	if err != nil {
+		return fmt.Errorf("failed to marshal step details: %w", err)
+	}
+
+	// Serialize state history wrapped in object for ClickHouse JSON compatibility
+	stateHistoryWrapper := map[string]interface{}{"entries": slip.StateHistory}
+	stateHistoryJSON, err := json.Marshal(stateHistoryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal state history: %w", err)
+	}
+
+	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
+	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
+	ancestryJSON, err := json.Marshal(ancestryWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ancestry: %w", err)
+	}
+
+	// Build column list for INSERT (must match SELECT order exactly)
+	var columns []string
+	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnSign, ColumnVersion)
+	columns = append(columns, stepColumns...)
+	columns = append(columns, aggregateColumns...)
+
+	// Build the SELECT for cancel rows - select existing rows with sign=1, re-insert with sign=-1
+	// We keep the original version so VersionedCollapsingMergeTree can collapse them properly
+	cancelSelectColumns := []string{
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		"-1",          // Flip sign to -1
+		ColumnVersion, // Keep original version for proper collapsing
+	}
+	cancelSelectColumns = append(cancelSelectColumns, stepColumns...)
+	cancelSelectColumns = append(cancelSelectColumns, aggregateColumns...)
+
+	cancelQuery := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s < ? AND %s = 1",
+		strings.Join(cancelSelectColumns, ", "),
+		s.database, TableRoutingSlips,
+		ColumnCorrelationID, ColumnVersion, ColumnSign,
+	)
+
+	// Build SELECT expressions for new row (sign=1, new timestamp version)
+	var newSelectExprs []string
+	var newValues []interface{}
+
+	// Core columns (10 columns) - need to cast JSON columns to match existing table schema
+	// ClickHouse requires explicit casting when UNION ALL combines JSON columns from table
+	// with string literals
+	newSelectExprs = append(newSelectExprs, "?", "?", "?", "?", "?", "?", "?",
+		"CAST(? AS JSON)", // step_details - cast to JSON
+		"CAST(? AS JSON)", // state_history - cast to JSON
+		"CAST(? AS JSON)") // ancestry - cast to JSON
+	newValues = append(newValues,
+		slip.CorrelationID,
+		slip.Repository,
+		slip.Branch,
+		slip.CommitSHA,
+		slip.CreatedAt,
+		slip.UpdatedAt,
+		string(slip.Status),
+		string(stepDetailsJSON),
+		string(stateHistoryJSON),
+		string(ancestryJSON),
+	)
+
+	// Sign for new row: 1, Version for new row: new timestamp
+	newSelectExprs = append(newSelectExprs, "1", "?")
+	newValues = append(newValues, newVersion)
+
+	// Step columns (Enum8 - no casting needed)
+	for _, stepVal := range stepValues {
+		newSelectExprs = append(newSelectExprs, "?")
+		newValues = append(newValues, stepVal)
+	}
+
+	// Aggregate columns (JSON type - need casting to match table schema in UNION ALL)
+	for _, aggVal := range aggregateValues {
+		newSelectExprs = append(newSelectExprs, "CAST(? AS JSON)")
+		newValues = append(newValues, aggVal)
+	}
+
+	// Combine: cancel query params (correlation_id, newVersion) + new row values
+	var values []interface{}
+	values = append(values, slip.CorrelationID, newVersion) // For cancel SELECT WHERE clause
+	values = append(values, newValues...)
+
+	// Build the INSERT...SELECT...UNION ALL query
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		%s
+		UNION ALL
+		SELECT %s
+	`, s.database, TableRoutingSlips, strings.Join(columns, ", "),
+		cancelQuery,
+		strings.Join(newSelectExprs, ", "))
+
+	if err := s.session.ExecWithArgs(ctx, query, values...); err != nil {
+		return fmt.Errorf("failed to insert atomic update: %w", err)
 	}
 
 	return nil
@@ -654,71 +1132,25 @@ func (s *ClickHouseStore) updatePipelineStep(slip *Slip, stepName string, status
 	slip.Steps[stepName] = step
 }
 
-// deepCopySlip creates a deep copy of a Slip to prevent shared map/slice references.
-// This is important for VersionedCollapsingMergeTree where we insert cancel rows
-// that must be independent from the new rows.
-func deepCopySlip(slip *Slip) *Slip {
-	if slip == nil {
-		return nil
-	}
-
-	cpy := &Slip{
-		CorrelationID: slip.CorrelationID,
-		Repository:    slip.Repository,
-		Branch:        slip.Branch,
-		CommitSHA:     slip.CommitSHA,
-		CreatedAt:     slip.CreatedAt,
-		UpdatedAt:     slip.UpdatedAt,
-		Status:        slip.Status,
-		PromotedTo:    slip.PromotedTo,
-		Sign:          slip.Sign,
-		Version:       slip.Version,
-	}
-
-	// Deep copy steps map
-	if slip.Steps != nil {
-		cpy.Steps = make(map[string]Step, len(slip.Steps))
-		for k, v := range slip.Steps {
-			cpy.Steps[k] = v
-		}
-	}
-
-	// Deep copy aggregates
-	if slip.Aggregates != nil {
-		cpy.Aggregates = make(map[string][]ComponentStepData)
-		for k, v := range slip.Aggregates {
-			componentData := make([]ComponentStepData, len(v))
-			copy(componentData, v)
-			cpy.Aggregates[k] = componentData
-		}
-	}
-
-	// Deep copy state history
-	if slip.StateHistory != nil {
-		cpy.StateHistory = make([]StateHistoryEntry, len(slip.StateHistory))
-		copy(cpy.StateHistory, slip.StateHistory)
-	}
-
-	// Deep copy ancestry
-	if slip.Ancestry != nil {
-		cpy.Ancestry = make([]AncestryEntry, len(slip.Ancestry))
-		copy(cpy.Ancestry, slip.Ancestry)
-	}
-
-	return cpy
-}
-
 // computeAggregateStatus determines the aggregate status from component statuses.
+// The aggregate is:
+// - "failed" if any component has failed
+// - "completed" if all components are completed
+// - "running" if any component is running OR completed (work is in progress)
+// - "pending" if all components are pending (no work has started)
 func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepData) StepStatus {
 	allCompleted := true
 	anyRunning := false
+	anyCompleted := false
 	anyFailed := false
 
 	for _, comp := range componentData {
 		if comp.Status.IsFailure() {
 			anyFailed = true
 		}
-		if !comp.Status.IsSuccess() {
+		if comp.Status.IsSuccess() {
+			anyCompleted = true
+		} else {
 			allCompleted = false
 		}
 		if comp.Status.IsRunning() {
@@ -732,7 +1164,8 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 	if allCompleted {
 		return StepStatusCompleted
 	}
-	if anyRunning {
+	// If any component is running or completed, the aggregate is "running" (in progress)
+	if anyRunning || anyCompleted {
 		return StepStatusRunning
 	}
 	return StepStatusPending
@@ -751,7 +1184,7 @@ func (s *ClickHouseStore) insertComponentState(
 
 	// Note: We don't have a message passed in UpdateStep/UpdateComponentStatus signature currently.
 	// We pass empty string for message.
-	return s.session.ExecWithArgs(ctx, query,
+	err := s.session.ExecWithArgs(ctx, query,
 		correlationID,
 		stepName,
 		componentName,
@@ -759,6 +1192,243 @@ func (s *ClickHouseStore) insertComponentState(
 		"", // message
 		time.Now(),
 	)
+	if err != nil {
+		return err
+	}
+
+	// Force merge to deduplicate rows in ReplacingMergeTree immediately.
+	// This ensures subsequent reads see the latest state without needing FINAL in SELECT.
+	return s.optimizeComponentStatesTable(ctx)
+}
+
+// optimizeComponentStatesTable forces a merge on the slip_component_states table.
+// This is necessary because ReplacingMergeTree deduplicates asynchronously during background merges.
+// Running OPTIMIZE TABLE FINAL ensures the latest state is immediately visible to subsequent queries.
+func (s *ClickHouseStore) optimizeComponentStatesTable(ctx context.Context) error {
+	query := fmt.Sprintf(`OPTIMIZE TABLE %s.%s FINAL`, s.database, TableSlipComponentStates)
+	return s.session.Exec(ctx, query)
+}
+
+// updateAggregateStatusFromComponentStates loads the slip, hydrates it with component states,
+// and persists the updated aggregate status back to the routing_slips table.
+// This is called after a component state update to ensure the slip reflects the current aggregate status.
+// Uses exponential backoff with jitter to handle concurrent modifications gracefully.
+func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
+	ctx context.Context,
+	correlationID, stepName string,
+) error {
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "updateAggregateStatusFromComponentStates", correlationID)
+	retrySpan.AddAttribute("slippy.step_name", stepName)
+
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
+
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
+		// Load the slip (this will hydrate component states automatically)
+		slip, err := s.Load(retrySpan.Context(), correlationID)
+		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			err = fmt.Errorf("failed to load slip for aggregate update: %w", err)
+			retrySpan.EndError(err)
+			return err
+		}
+
+		// Determine the aggregate step name. The stepName could be either:
+		// 1. The component step name (e.g., "build") - need to look up the aggregate step
+		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
+		aggregateStepName := ""
+		if s.pipelineConfig != nil {
+			// First, try to get aggregate step from component step name
+			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepName)
+			if aggregateStepName == "" {
+				// If not found, check if the step name IS an aggregate step
+				if s.pipelineConfig.IsAggregateStep(stepName) {
+					aggregateStepName = stepName
+				}
+			}
+		}
+		if aggregateStepName == "" {
+			// No aggregate step configured for this step, nothing to update
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		// The slip was already hydrated by Load(), so the step status should reflect
+		// the computed aggregate from all component states.
+		// Now persist this back to the database.
+		err = s.Update(retrySpan.Context(), slip)
+		if err == nil {
+			retrySpan.EndSuccess()
+			return nil // Success
+		}
+
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
+		if errors.Is(err, ErrVersionConflict) {
+			versionConflictRetry++
+
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(versionConflictRetry)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
+		}
+
+		// Non-retryable error
+		retrySpan.EndError(err)
+		return err
+	}
+}
+
+// updateAggregateStatusFromComponentStatesWithHistory updates the aggregate status AND appends a history entry
+// in a single atomic operation. This is the component-level equivalent of UpdateStepWithHistory.
+func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
+	ctx context.Context,
+	correlationID, stepName string,
+	entry StateHistoryEntry,
+) error {
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "updateAggregateStatusFromComponentStatesWithHistory", correlationID)
+	retrySpan.AddAttribute("slippy.step_name", stepName)
+	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
+	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
+
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	versionConflictRetry := 0 // Counter for version conflict retries (for backoff calculation only)
+
+	// Version conflicts are transient and should retry indefinitely.
+	// Only context cancellation or permanent errors should stop the loop.
+	for {
+		// Check for context cancellation first - this is the only way to stop version conflict retries
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
+		// Load the slip (this will hydrate component states automatically)
+		slip, err := s.Load(retrySpan.Context(), correlationID)
+		if err != nil {
+			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				// Use select to respect context cancellation during sleep
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			err = fmt.Errorf("failed to load slip for aggregate update with history: %w", err)
+			retrySpan.EndError(err)
+			return err
+		}
+
+		// Determine the aggregate step name. The stepName could be either:
+		// 1. The component step name (e.g., "build") - need to look up the aggregate step
+		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
+		aggregateStepName := ""
+		if s.pipelineConfig != nil {
+			// First, try to get aggregate step from component step name
+			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepName)
+			if aggregateStepName == "" {
+				// If not found, check if the step name IS an aggregate step
+				if s.pipelineConfig.IsAggregateStep(stepName) {
+					aggregateStepName = stepName
+				}
+			}
+		}
+		if aggregateStepName == "" {
+			// No aggregate step configured for this step, nothing to update
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		// Append history entry to the same slip (atomic with aggregate update)
+		slip.StateHistory = append(slip.StateHistory, entry)
+
+		// The slip was already hydrated by Load(), so the step status should reflect
+		// the computed aggregate from all component states.
+		// Now persist this back to the database with the history entry.
+		err = s.Update(retrySpan.Context(), slip)
+		if err == nil {
+			retrySpan.EndSuccess()
+			return nil // Success
+		}
+
+		// Check if this is a version conflict error (transient, keep retrying indefinitely)
+		if errors.Is(err, ErrVersionConflict) {
+			versionConflictRetry++
+
+			// Apply exponential backoff with jitter before retrying
+			backoff := calculateBackoff(versionConflictRetry)
+			retrySpan.RecordAttempt(backoff.Milliseconds())
+			retrySpan.AddAttribute("slippy.version_conflict", true)
+			retrySpan.AddAttribute("slippy.version_conflict_retry", versionConflictRetry)
+			// Use select to respect context cancellation during sleep
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue // Keep retrying indefinitely for version conflicts
+		}
+
+		// Non-retryable error
+		retrySpan.EndError(err)
+		return err
+	}
 }
 
 // hydrateSlip fetches component states from the event sourcing table and merges them into the slip.
@@ -777,6 +1447,11 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		return nil
 	}
 
+	// Ensure Aggregates map is initialized
+	if slip.Aggregates == nil {
+		slip.Aggregates = make(map[string][]ComponentStepData)
+	}
+
 	// Group states by component step -> component
 	stateMap := make(map[string]map[string]componentStateRow)
 	for _, state := range states {
@@ -787,58 +1462,97 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 	}
 
 	// Update aggregates in the slip
-	for componentStepName, stepStates := range stateMap {
-		aggregateColumn := pluralize(componentStepName)
-		componentDataList, ok := slip.Aggregates[aggregateColumn]
-		if !ok {
+	for stepNameFromDB, stepStates := range stateMap {
+		// Determine the aggregate step name. The step name from the database could be either:
+		// 1. The component step name (e.g., "build") - need to look up the aggregate step
+		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
+		aggregateStepName := ""
+		if s.pipelineConfig != nil {
+			// First, try to get aggregate step from component step name
+			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepNameFromDB)
+			if aggregateStepName == "" {
+				// If not found, check if the step name IS an aggregate step
+				if s.pipelineConfig.IsAggregateStep(stepNameFromDB) {
+					aggregateStepName = stepNameFromDB
+				}
+			}
+		}
+		if aggregateStepName == "" {
+			// No aggregate step configured for this step
 			continue
+		}
+
+		// The aggregate JSON column name is the aggregate step name (e.g., "builds_completed")
+		aggregateColumn := aggregateStepName
+
+		// Get or create the component data list for this aggregate
+		componentDataList := slip.Aggregates[aggregateColumn]
+
+		// Build a map of existing components for quick lookup
+		existingComponents := make(map[string]int) // component name -> index
+		for i, comp := range componentDataList {
+			existingComponents[comp.Component] = i
 		}
 
 		updated := false
 		var maxTime time.Time
 
-		// Update each component's status if we have a newer state
-		for i, comp := range componentDataList {
-			newState, exists := stepStates[comp.Component]
-			if !exists {
-				continue
-			}
+		// Track the components that have actual state from the event sourcing table.
+		// These are the source of truth for aggregate status calculation.
+		// Original placeholder components (from pipeline config) that have no matching
+		// state entries should NOT be considered when computing aggregate status.
+		activeComponents := make([]ComponentStepData, 0, len(stepStates))
 
-			// Update component data
-			slip.Aggregates[aggregateColumn][i].Status = StepStatus(newState.Status)
-			if newState.Message != "" {
-				slip.Aggregates[aggregateColumn][i].Error = newState.Message
-			}
-
-			// Infer timestamps
-			// Since we only have the latest timestamp, we use it for both StartedAt (if running)
-			// and CompletedAt (if terminal), essentially updating the "last transition time".
-			ts := newState.Timestamp
+		// Process each component state
+		for componentName, state := range stepStates {
+			ts := state.Timestamp
 			if ts.After(maxTime) {
 				maxTime = ts
 			}
 
-			if StepStatus(newState.Status).IsRunning() && slip.Aggregates[aggregateColumn][i].StartedAt == nil {
-				slip.Aggregates[aggregateColumn][i].StartedAt = &ts
+			compData := ComponentStepData{
+				Component: componentName,
+				Status:    StepStatus(state.Status),
 			}
-			if StepStatus(newState.Status).IsTerminal() && slip.Aggregates[aggregateColumn][i].CompletedAt == nil {
-				slip.Aggregates[aggregateColumn][i].CompletedAt = &ts
+			if state.Message != "" {
+				compData.Error = state.Message
+			}
+			if StepStatus(state.Status).IsRunning() {
+				compData.StartedAt = &ts
+			}
+			if StepStatus(state.Status).IsTerminal() {
+				compData.CompletedAt = &ts
 			}
 
+			// Track this component for aggregate status calculation
+			activeComponents = append(activeComponents, compData)
+
+			if idx, exists := existingComponents[componentName]; exists {
+				// Update existing component entry
+				slip.Aggregates[aggregateColumn][idx].Status = compData.Status
+				if compData.Error != "" {
+					slip.Aggregates[aggregateColumn][idx].Error = compData.Error
+				}
+				if compData.StartedAt != nil && slip.Aggregates[aggregateColumn][idx].StartedAt == nil {
+					slip.Aggregates[aggregateColumn][idx].StartedAt = compData.StartedAt
+				}
+				if compData.CompletedAt != nil && slip.Aggregates[aggregateColumn][idx].CompletedAt == nil {
+					slip.Aggregates[aggregateColumn][idx].CompletedAt = compData.CompletedAt
+				}
+			} else {
+				// Add new component entry - this handles the case where the aggregate
+				// was empty ({"items":[]}) but component states exist in the event sourcing table
+				slip.Aggregates[aggregateColumn] = append(slip.Aggregates[aggregateColumn], compData)
+			}
 			updated = true
 		}
 
 		if updated {
-			// Recompute the step status based on updated components
-			newStatus := s.computeAggregateStatus(slip.Aggregates[aggregateColumn])
-
-			aggregateStepName := ""
-			if s.pipelineConfig != nil {
-				aggregateStepName = s.pipelineConfig.GetAggregateStep(componentStepName)
-			}
-			if aggregateStepName == "" {
-				continue
-			}
+			// Recompute the step status based on ACTIVE components only.
+			// Active components are those with entries in the component_states table.
+			// This excludes original placeholder components that have different names
+			// from the actual workflow component names.
+			newStatus := s.computeAggregateStatus(activeComponents)
 
 			// Update the step status only if the step exists.
 			step, ok := slip.Steps[aggregateStepName]
@@ -868,14 +1582,16 @@ func (s *ClickHouseStore) loadComponentStates(
 	correlationID string,
 ) (results []componentStateRow, err error) {
 	// We want the latest state for each component.
-	// ReplacingMergeTree eventually duplicates, but we use argMax to be sure given we might read unmerged parts.
+	// ReplacingMergeTree eventually deduplicates, but we use argMax to be sure given we might read unmerged parts.
+	// Note: We alias the max(timestamp) column as 'latest_ts' to avoid conflict with the 'timestamp' column
+	// used inside argMax functions. ClickHouse would otherwise interpret the alias as a nested aggregate.
 	query := fmt.Sprintf(`
 		SELECT
 			step,
 			component,
 			argMax(status, timestamp) as status,
 			argMax(message, timestamp) as message,
-			max(timestamp) as timestamp
+			max(timestamp) as latest_ts
 		FROM %s.%s
 		WHERE correlation_id = ?
 		GROUP BY step, component

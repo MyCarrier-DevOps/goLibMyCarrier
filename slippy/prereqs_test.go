@@ -233,6 +233,12 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 		config := testPipelineConfig()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
+		// Get the aggregate step name from config for "build" component type
+		buildAggregateStep := config.GetAggregateStep("build")
+		if buildAggregateStep == "" {
+			t.Fatal("expected config to have an aggregate step for 'build'")
+		}
+
 		slip := &Slip{
 			CorrelationID: "corr-prereq-comp-1",
 			Repository:    "owner/repo",
@@ -240,7 +246,7 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 			CommitSHA:     "prereqcomp1",
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"builds": {{Component: "my-service", Status: StepStatusCompleted}},
+				buildAggregateStep: {{Component: "my-service", Status: StepStatusCompleted}},
 			},
 			Steps: make(map[string]Step),
 		}
@@ -263,6 +269,12 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 		config := testPipelineConfig()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
+		// Get the aggregate step name from config for "unit_test" component type
+		unitTestAggregateStep := config.GetAggregateStep("unit_test")
+		if unitTestAggregateStep == "" {
+			t.Fatal("expected config to have an aggregate step for 'unit_test'")
+		}
+
 		slip := &Slip{
 			CorrelationID: "corr-prereq-comp-2",
 			Repository:    "owner/repo",
@@ -270,7 +282,7 @@ func TestClient_CheckPrerequisites(t *testing.T) {
 			CommitSHA:     "prereqcomp2",
 			Status:        SlipStatusInProgress,
 			Aggregates: map[string][]ComponentStepData{
-				"unit_tests": {{Component: "my-service", Status: StepStatusFailed}},
+				unitTestAggregateStep: {{Component: "my-service", Status: StepStatusFailed}},
 			},
 			Steps: make(map[string]Step),
 		}

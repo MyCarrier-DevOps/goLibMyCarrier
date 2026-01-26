@@ -21,6 +21,10 @@ type KafkaConfig struct {
 	GroupID            string `mapstructure:"groupid"`
 	Partition          string `mapstructure:"partition"`
 	InsecureSkipVerify string `mapstructure:"insecure_skip_verify"`
+	// StartOffset determines where a new consumer group starts reading.
+	// Valid values: "first" (default, oldest messages) or "last" (newest messages only).
+	// Only applies when GroupID is set and the consumer group has no committed offsets.
+	StartOffset string `mapstructure:"start_offset"`
 }
 
 // LoadConfig loads the configuration from environment variables using Viper.
@@ -49,6 +53,9 @@ func LoadConfig() (*KafkaConfig, error) {
 	}
 	if err := viper.BindEnv("insecure_skip_verify", "KAFKA_INSECURE_SKIP_VERIFY"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_INSECURE_SKIP_VERIFY: %w", err)
+	}
+	if err := viper.BindEnv("start_offset", "KAFKA_START_OFFSET"); err != nil {
+		return nil, fmt.Errorf("error binding KAFKA_START_OFFSET: %w", err)
 	}
 
 	// Read environment variables
@@ -149,13 +156,19 @@ func InitializeKafkaReader(kafkacfg *KafkaConfig, separator string, suffix ...st
 	if err != nil {
 		return nil, fmt.Errorf("error determining topic name: %w", err)
 	}
+	// Determine start offset for new consumer groups (default: FirstOffset)
+	startOffset := kafka.FirstOffset
+	if kafkacfg.StartOffset == "last" || kafkacfg.StartOffset == "latest" {
+		startOffset = kafka.LastOffset
+	}
+
 	readerConfig := kafka.ReaderConfig{
 		Brokers:     []string{kafkacfg.Address},
 		Topic:       topicName,
 		GroupID:     kafkacfg.GroupID,
 		MinBytes:    1,    // 1 Byte
 		MaxBytes:    10e6, // 10MB
-		StartOffset: kafka.FirstOffset,
+		StartOffset: startOffset,
 		Dialer:      dialer,
 		MaxAttempts: 5,
 	}

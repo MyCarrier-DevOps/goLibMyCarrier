@@ -426,6 +426,55 @@ func (m *MockStore) AppendHistory(ctx context.Context, correlationID string, ent
 	return nil
 }
 
+// UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
+// This is the combined operation that prevents race conditions.
+func (m *MockStore) UpdateStepWithHistory(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	status slippy.StepStatus,
+	entry slippy.StateHistoryEntry,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Track both calls
+	m.UpdateStepCalls = append(m.UpdateStepCalls, UpdateStepCall{
+		CorrelationID: correlationID,
+		StepName:      stepName,
+		ComponentName: componentName,
+		Status:        status,
+	})
+	m.AppendHistoryCalls = append(m.AppendHistoryCalls, AppendHistoryCall{
+		CorrelationID: correlationID,
+		Entry:         entry,
+	})
+
+	if m.UpdateStepError != nil {
+		return m.UpdateStepError
+	}
+	if err, ok := m.UpdateStepErrorFor[correlationID]; ok {
+		return err
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return slippy.ErrSlipNotFound
+	}
+
+	// Update step
+	if slip.Steps == nil {
+		slip.Steps = make(map[string]slippy.Step)
+	}
+	step := slip.Steps[stepName]
+	step.Status = status
+	slip.Steps[stepName] = step
+
+	// Append history
+	slip.StateHistory = append(slip.StateHistory, entry)
+
+	return nil
+}
+
 // Close releases any resources held by the store.
 func (m *MockStore) Close() error {
 	m.mu.Lock()

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // Client is the main entry point for slippy operations.
@@ -35,13 +37,17 @@ func NewClient(config Config) (*Client, error) {
 		config.Logger = NopLogger()
 	}
 
-	// Initialize ClickHouse store from config (migrations run based on pipeline config)
+	// Initialize ClickHouse store from config
+	// Migrations are skipped if config.SkipMigrations is true (e.g., Slippy CLI trusts pushhookparser ran them)
 	storeStart := time.Now()
-	config.Logger.Info(ctx, "Creating ClickHouse store...", nil)
+	config.Logger.Info(ctx, "Creating ClickHouse store...", map[string]interface{}{
+		"skip_migrations": config.SkipMigrations,
+	})
 	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{
 		PipelineConfig: config.PipelineConfig,
 		Database:       config.Database,
 		Logger:         config.Logger,
+		SkipMigrations: config.SkipMigrations,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create store: %w", err)
@@ -139,7 +145,13 @@ func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, sta
 // AbandonSlip marks a slip as abandoned, indicating it was superseded by a newer slip.
 // This should only be called on slips that are not already in a terminal state.
 // Returns an error if the slip is already terminal.
+// Uses exponential backoff with jitter to handle concurrent modifications gracefully.
 func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy string) error {
+	// Start tracing span
+	ctx, span := StartSpan(ctx, "AbandonSlip", correlationID)
+	defer span.End()
+	span.SetAttributes(attribute.String("slippy.superseded_by", supersededBy))
+
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return NewSlipError("abandon", correlationID, err)
@@ -150,6 +162,9 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 	}
 
 	slip.Status = SlipStatusAbandoned
+
+	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
+	// so there are no version conflicts and Update always succeeds.
 	if err := c.store.Update(ctx, slip); err != nil {
 		return NewSlipError("abandon", correlationID, err)
 	}
@@ -166,6 +181,11 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 // the slip's work continues in the new slip on the target branch.
 // The promotedTo parameter records the correlation ID of the new slip for bidirectional linking.
 func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo string) error {
+	// Start tracing span
+	ctx, span := StartSpan(ctx, "PromoteSlip", correlationID)
+	defer span.End()
+	span.SetAttributes(attribute.String("slippy.promoted_to", promotedTo))
+
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
 		return NewSlipError("promote", correlationID, err)
@@ -177,6 +197,9 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 
 	slip.Status = SlipStatusPromoted
 	slip.PromotedTo = promotedTo
+
+	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
+	// so there are no version conflicts and Update always succeeds.
 	if err := c.store.Update(ctx, slip); err != nil {
 		return NewSlipError("promote", correlationID, err)
 	}

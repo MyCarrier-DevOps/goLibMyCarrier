@@ -76,8 +76,28 @@ Configure the logger using environment variables:
 | `OTEL_HOST_IP` | OpenTelemetry collector host IP/hostname (takes precedence) | - | `192.168.1.100`, `otel-collector` |
 | `OTEL_HOST_PORT` | OpenTelemetry collector port (used with OTEL_HOST_IP) | - | `4317`, `4318` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Full OpenTelemetry collector endpoint (fallback) | - | `http://localhost:4318` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP transport protocol | `grpc` | `grpc`, `http/protobuf` |
 | `OTEL_EXPORTER_OTLP_HEADERS` | Headers for OTLP requests | - | `api-key=abc123` |
 | `OTEL_SDK_DISABLED` | Disable OpenTelemetry | `false` | `true` |
+
+### Protocol Selection
+
+The logger supports both gRPC and HTTP protocols for OTLP export. Use `OTEL_EXPORTER_OTLP_PROTOCOL` to select:
+
+- **`grpc`** (default): More efficient, uses port 4317 by default
+- **`http/protobuf`**: Uses HTTP/1.1, uses port 4318 by default
+
+```bash
+# Use gRPC protocol (default, more efficient)
+export OTEL_EXPORTER_OTLP_PROTOCOL="grpc"
+export OTEL_HOST_IP="localhost"
+export OTEL_HOST_PORT="4317"
+
+# Use HTTP protocol
+export OTEL_EXPORTER_OTLP_PROTOCOL="http/protobuf"
+export OTEL_HOST_IP="localhost"
+export OTEL_HOST_PORT="4318"
+```
 
 ### Endpoint Configuration Priority
 

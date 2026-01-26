@@ -337,13 +337,14 @@ func computeConfigHash(jsonData []byte) string {
 }
 
 // GetAggregateColumnName returns the JSON column name for an aggregate step.
-// For example, a step with aggregates="build" returns "builds".
+// The column name is the step name itself (e.g., "builds_completed").
+// This must match the column created by dynamic_migrations.go.
 func (c *PipelineConfig) GetAggregateColumnName(stepName string) string {
 	step := c.stepsByName[stepName]
 	if step == nil || step.Aggregates == "" {
 		return ""
 	}
-	return pluralize(step.Aggregates)
+	return step.Name
 }
 
 // initialize builds the internal lookup structures.

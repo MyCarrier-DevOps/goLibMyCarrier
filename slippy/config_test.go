@@ -158,6 +158,45 @@ func TestConfigFromEnv_InvalidValues(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnv_MaxDepthAndDatabase(t *testing.T) {
+	// Save and restore env vars
+	origMaxDepth := os.Getenv("SLIPPY_ANCESTRY_MAX_DEPTH")
+	origDatabase := os.Getenv("SLIPPY_DATABASE")
+	defer func() {
+		_ = os.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", origMaxDepth)
+		_ = os.Setenv("SLIPPY_DATABASE", origDatabase)
+	}()
+
+	// Test valid max depth
+	_ = os.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", "200")
+	_ = os.Setenv("SLIPPY_DATABASE", "custom_db")
+
+	cfg := ConfigFromEnv()
+
+	if cfg.AncestryMaxDepth != 200 {
+		t.Errorf("AncestryMaxDepth = %d, want 200", cfg.AncestryMaxDepth)
+	}
+	if cfg.Database != "custom_db" {
+		t.Errorf("Database = %q, want 'custom_db'", cfg.Database)
+	}
+
+	// Test invalid max depth (negative)
+	_ = os.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", "-10")
+	cfg = ConfigFromEnv()
+
+	if cfg.AncestryMaxDepth != 100 { // default
+		t.Errorf("AncestryMaxDepth should be default (100) for negative value, got %d", cfg.AncestryMaxDepth)
+	}
+
+	// Test invalid max depth (non-numeric)
+	_ = os.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", "not-a-number")
+	cfg = ConfigFromEnv()
+
+	if cfg.AncestryMaxDepth != 100 { // default
+		t.Errorf("AncestryMaxDepth should be default (100) for invalid value, got %d", cfg.AncestryMaxDepth)
+	}
+}
+
 func TestConfig_Validate(t *testing.T) {
 	// Helper to create a valid ClickHouseConfig for tests
 	validCHConfig := &ch.ClickhouseConfig{
@@ -311,6 +350,53 @@ func TestConfig_Validate(t *testing.T) {
 				HoldTimeout:      time.Minute,
 				PollInterval:     time.Second,
 				AncestryDepth:    0,
+				AncestryMaxDepth: 100,
+			},
+			wantError: true,
+			errorIs:   ErrInvalidConfiguration,
+		},
+		{
+			name: "AncestryMaxDepth less than AncestryDepth",
+			config: Config{
+				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   validPipelineConfig,
+				GitHubAppID:      12345,
+				GitHubPrivateKey: "key",
+				HoldTimeout:      time.Minute,
+				PollInterval:     time.Second,
+				AncestryDepth:    50,
+				AncestryMaxDepth: 25, // less than AncestryDepth
+			},
+			wantError: true,
+			errorIs:   ErrInvalidConfiguration,
+		},
+		{
+			name: "ClickHouse load error stored",
+			config: Config{
+				ClickHouseConfig:  nil,
+				clickhouseLoadErr: errors.New("connection failed"),
+				PipelineConfig:    validPipelineConfig,
+				GitHubAppID:       12345,
+				GitHubPrivateKey:  "key",
+				HoldTimeout:       time.Minute,
+				PollInterval:      time.Second,
+				AncestryDepth:     10,
+				AncestryMaxDepth:  100,
+			},
+			wantError: true,
+			errorIs:   ErrInvalidConfiguration,
+		},
+		{
+			name: "Pipeline load error stored",
+			config: Config{
+				ClickHouseConfig: validCHConfig,
+				PipelineConfig:   nil,
+				pipelineLoadErr:  errors.New("invalid config file"),
+				GitHubAppID:      12345,
+				GitHubPrivateKey: "key",
+				HoldTimeout:      time.Minute,
+				PollInterval:     time.Second,
+				AncestryDepth:    10,
 				AncestryMaxDepth: 100,
 			},
 			wantError: true,

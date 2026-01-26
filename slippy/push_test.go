@@ -124,31 +124,42 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			t.Errorf("expected Status 'in_progress', got '%s'", slip.Status)
 		}
 
-		// Verify aggregates have component data
-		if len(slip.Aggregates["builds"]) != 2 {
-			t.Fatalf("expected 2 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
+		// Verify aggregates have component data - use config to get the aggregate step name
+		aggregateSteps := config.GetAggregateSteps()
+		if len(aggregateSteps) == 0 {
+			t.Fatal("expected at least one aggregate step in config")
 		}
-		if slip.Aggregates["builds"][0].Component != "svc-a" {
-			t.Errorf("expected first component 'svc-a', got '%s'", slip.Aggregates["builds"][0].Component)
+		aggregateColumnName := aggregateSteps[0].Name
+		if len(slip.Aggregates[aggregateColumnName]) != 2 {
+			t.Fatalf(
+				"expected 2 components in %s aggregate, got %d",
+				aggregateColumnName,
+				len(slip.Aggregates[aggregateColumnName]),
+			)
 		}
-		if slip.Aggregates["builds"][0].Status != StepStatusPending {
-			t.Errorf("expected build status 'pending', got '%s'", slip.Aggregates["builds"][0].Status)
+		if slip.Aggregates[aggregateColumnName][0].Component != "svc-a" {
+			t.Errorf("expected first component 'svc-a', got '%s'", slip.Aggregates[aggregateColumnName][0].Component)
+		}
+		if slip.Aggregates[aggregateColumnName][0].Status != StepStatusPending {
+			t.Errorf("expected build status 'pending', got '%s'", slip.Aggregates[aggregateColumnName][0].Status)
 		}
 
-		// Verify steps were initialized
-		if slip.Steps["push_parsed"].Status != StepStatusRunning {
-			t.Errorf("expected push_parsed status 'running', got '%s'", slip.Steps["push_parsed"].Status)
+		// Verify steps were initialized - use config step names
+		firstStepName := config.Steps[0].Name
+		if slip.Steps[firstStepName].Status != StepStatusRunning {
+			t.Errorf("expected %s status 'running', got '%s'", firstStepName, slip.Steps[firstStepName].Status)
 		}
-		if slip.Steps["dev_deploy"].Status != StepStatusPending {
-			t.Errorf("expected dev_deploy status 'pending', got '%s'", slip.Steps["dev_deploy"].Status)
+		lastStepName := config.Steps[len(config.Steps)-1].Name
+		if slip.Steps[lastStepName].Status != StepStatusPending {
+			t.Errorf("expected %s status 'pending', got '%s'", lastStepName, slip.Steps[lastStepName].Status)
 		}
 
 		// Verify history was created
 		if len(slip.StateHistory) == 0 {
 			t.Error("expected state history to be initialized")
 		}
-		if slip.StateHistory[0].Step != "push_parsed" {
-			t.Errorf("expected first history entry for 'push_parsed', got '%s'", slip.StateHistory[0].Step)
+		if slip.StateHistory[0].Step != firstStepName {
+			t.Errorf("expected first history entry for '%s', got '%s'", firstStepName, slip.StateHistory[0].Step)
 		}
 
 		// Verify store was called
@@ -368,47 +379,55 @@ func TestClient_InitializeSlipForPush(t *testing.T) {
 		t.Error("expected UpdatedAt to be set")
 	}
 
-	// Verify aggregates have component data (test config has builds_completed with "build" aggregate)
-	if len(slip.Aggregates["builds"]) != 2 {
-		t.Fatalf("expected 2 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
+	// Verify aggregates have component data - use config to get the aggregate step name
+	aggregateSteps := config.GetAggregateSteps()
+	if len(aggregateSteps) == 0 {
+		t.Fatal("expected at least one aggregate step in config")
 	}
-	if slip.Aggregates["builds"][0].Component != "frontend" {
-		t.Errorf("expected first component 'frontend', got '%s'", slip.Aggregates["builds"][0].Component)
+	aggregateColumnName := aggregateSteps[0].Name
+	if len(slip.Aggregates[aggregateColumnName]) != 2 {
+		t.Fatalf(
+			"expected 2 components in %s aggregate, got %d",
+			aggregateColumnName,
+			len(slip.Aggregates[aggregateColumnName]),
+		)
 	}
-	if slip.Aggregates["builds"][1].Component != "backend" {
-		t.Errorf("expected second component 'backend', got '%s'", slip.Aggregates["builds"][1].Component)
+	if slip.Aggregates[aggregateColumnName][0].Component != "frontend" {
+		t.Errorf("expected first component 'frontend', got '%s'", slip.Aggregates[aggregateColumnName][0].Component)
 	}
-	if slip.Aggregates["builds"][0].Status != StepStatusPending {
-		t.Errorf("expected build status 'pending', got '%s'", slip.Aggregates["builds"][0].Status)
+	if slip.Aggregates[aggregateColumnName][1].Component != "backend" {
+		t.Errorf("expected second component 'backend', got '%s'", slip.Aggregates[aggregateColumnName][1].Component)
+	}
+	if slip.Aggregates[aggregateColumnName][0].Status != StepStatusPending {
+		t.Errorf("expected build status 'pending', got '%s'", slip.Aggregates[aggregateColumnName][0].Status)
 	}
 
-	// Verify all pipeline steps from test config are initialized
-	expectedSteps := []string{
-		"push_parsed", "builds_completed", "unit_tests_completed", "dev_deploy",
-	}
-	for _, stepName := range expectedSteps {
-		if _, ok := slip.Steps[stepName]; !ok {
-			t.Errorf("expected step '%s' to be initialized", stepName)
+	// Verify all pipeline steps from config are initialized
+	for _, step := range config.Steps {
+		if _, ok := slip.Steps[step.Name]; !ok {
+			t.Errorf("expected step '%s' to be initialized", step.Name)
 		}
 	}
 
-	// Verify push_parsed is running, others pending
-	if slip.Steps["push_parsed"].Status != StepStatusRunning {
-		t.Errorf("expected push_parsed status 'running', got '%s'", slip.Steps["push_parsed"].Status)
+	// Verify first step is running, others pending
+	firstStepName := config.Steps[0].Name
+	if slip.Steps[firstStepName].Status != StepStatusRunning {
+		t.Errorf("expected %s status 'running', got '%s'", firstStepName, slip.Steps[firstStepName].Status)
 	}
-	if slip.Steps["push_parsed"].StartedAt == nil {
-		t.Error("expected push_parsed StartedAt to be set")
+	if slip.Steps[firstStepName].StartedAt == nil {
+		t.Errorf("expected %s StartedAt to be set", firstStepName)
 	}
-	if slip.Steps["dev_deploy"].Status != StepStatusPending {
-		t.Errorf("expected dev_deploy status 'pending', got '%s'", slip.Steps["dev_deploy"].Status)
+	lastStepName := config.Steps[len(config.Steps)-1].Name
+	if slip.Steps[lastStepName].Status != StepStatusPending {
+		t.Errorf("expected %s status 'pending', got '%s'", lastStepName, slip.Steps[lastStepName].Status)
 	}
 
 	// Verify history
 	if len(slip.StateHistory) != 1 {
 		t.Fatalf("expected 1 history entry, got %d", len(slip.StateHistory))
 	}
-	if slip.StateHistory[0].Step != "push_parsed" {
-		t.Errorf("expected history step 'push_parsed', got '%s'", slip.StateHistory[0].Step)
+	if slip.StateHistory[0].Step != firstStepName {
+		t.Errorf("expected history step '%s', got '%s'", firstStepName, slip.StateHistory[0].Step)
 	}
 	if slip.StateHistory[0].Status != StepStatusRunning {
 		t.Errorf("expected history status 'running', got '%s'", slip.StateHistory[0].Status)
@@ -439,8 +458,11 @@ func TestClient_InitializeSlipForPush_EmptyComponents(t *testing.T) {
 		t.Error("expected Aggregates to be initialized (not nil)")
 	}
 	// With no components, the aggregates should have empty arrays
-	if len(slip.Aggregates["builds"]) != 0 {
-		t.Errorf("expected 0 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
+	aggregateSteps := config.GetAggregateSteps()
+	for _, aggStep := range aggregateSteps {
+		if len(slip.Aggregates[aggStep.Name]) != 0 {
+			t.Errorf("expected 0 components in %s aggregate, got %d", aggStep.Name, len(slip.Aggregates[aggStep.Name]))
+		}
 	}
 }
 
