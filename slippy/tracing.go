@@ -84,6 +84,18 @@ func ContextWithCorrelationTrace(ctx context.Context, correlationID string) cont
 	return trace.ContextWithSpanContext(ctx, spanCtx)
 }
 
+// SpanKind represents the role of a span in a trace.
+type SpanKind = trace.SpanKind
+
+// Span kind constants for external use
+const (
+	SpanKindInternal = trace.SpanKindInternal // Default, for internal operations
+	SpanKindClient   = trace.SpanKindClient   // For outbound calls (API, DB)
+	SpanKindServer   = trace.SpanKindServer   // For handling incoming requests
+	SpanKindProducer = trace.SpanKindProducer // For sending messages to a broker
+	SpanKindConsumer = trace.SpanKindConsumer // For receiving messages from a broker
+)
+
 // StartSpan creates a new span with the given name, using the correlation ID as the trace ID
 // if no existing trace is present. This is the primary entry point for external callers
 // (like pushhookparser) to begin tracing a routing slip operation.
@@ -107,6 +119,42 @@ func StartSpan(ctx context.Context, operationName, correlationID string) (contex
 			attribute.String("slippy.correlation_id", correlationID),
 		),
 	)
+}
+
+// StartSpanWithKind creates a new span with the given name and span kind.
+// Use this when you need to specify the span's role in the trace (CLIENT, SERVER, PRODUCER, CONSUMER).
+//
+//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
+func StartSpanWithKind(
+	ctx context.Context,
+	operationName, correlationID string,
+	kind SpanKind,
+) (context.Context, trace.Span) {
+	// Ensure we have a trace context rooted in the correlation ID
+	ctx = ContextWithCorrelationTrace(ctx, correlationID)
+
+	return tracer().Start(ctx, operationName,
+		trace.WithSpanKind(kind),
+		trace.WithAttributes(
+			attribute.String("slippy.correlation_id", correlationID),
+		),
+	)
+}
+
+// StartProducerSpan creates a span with PRODUCER kind for message sending operations.
+// Use this when sending messages to Kafka or other message brokers.
+//
+//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
+func StartProducerSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
+	return StartSpanWithKind(ctx, operationName, correlationID, SpanKindProducer)
+}
+
+// StartClientSpan creates a span with CLIENT kind for outbound calls.
+// Use this for API calls, database operations, or other external service calls.
+//
+//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
+func StartClientSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
+	return StartSpanWithKind(ctx, operationName, correlationID, SpanKindClient)
 }
 
 // RetrySpan represents a traced retry operation with metrics collection.
@@ -303,4 +351,82 @@ type jobError struct {
 
 func (e *jobError) Error() string {
 	return e.message
+}
+
+// SerializedSpanContext represents a span context that can be serialized to/from JSON
+// for passing between processes (e.g., from pre-job to post-job via Argo artifacts).
+type SerializedSpanContext struct {
+	TraceID    string `json:"trace_id"`
+	SpanID     string `json:"span_id"`
+	TraceFlags string `json:"trace_flags"`
+}
+
+// SerializeSpanContext extracts the current span context from the context and returns
+// a serializable representation. This is used to pass trace context between processes.
+//
+// Usage in pre-job:
+//
+//	ctx, span := slippy.StartSpan(ctx, "Held", correlationID)
+//	serialized := slippy.SerializeSpanContext(ctx)
+//	// Write serialized to artifact file as JSON
+func SerializeSpanContext(ctx context.Context) *SerializedSpanContext {
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if !spanCtx.IsValid() {
+		return nil
+	}
+
+	return &SerializedSpanContext{
+		TraceID:    spanCtx.TraceID().String(),
+		SpanID:     spanCtx.SpanID().String(),
+		TraceFlags: spanCtx.TraceFlags().String(),
+	}
+}
+
+// DeserializeSpanContext creates a context with the span context from a serialized representation.
+// This allows post-job to continue the trace started by pre-job.
+//
+// Usage in post-job:
+//
+//	// Read serialized from artifact file
+//	ctx := slippy.DeserializeSpanContext(context.Background(), serialized)
+//	// Now ctx contains the parent trace context from pre-job
+func DeserializeSpanContext(ctx context.Context, serialized *SerializedSpanContext) context.Context {
+	if serialized == nil || serialized.TraceID == "" || serialized.SpanID == "" {
+		return ctx
+	}
+
+	// Parse trace ID
+	traceIDBytes, err := hex.DecodeString(serialized.TraceID)
+	if err != nil || len(traceIDBytes) != 16 {
+		return ctx
+	}
+	var traceID trace.TraceID
+	copy(traceID[:], traceIDBytes)
+
+	// Parse span ID
+	spanIDBytes, err := hex.DecodeString(serialized.SpanID)
+	if err != nil || len(spanIDBytes) != 8 {
+		return ctx
+	}
+	var spanID trace.SpanID
+	copy(spanID[:], spanIDBytes)
+
+	// Parse trace flags (default to sampled)
+	var traceFlags trace.TraceFlags = trace.FlagsSampled
+	if serialized.TraceFlags != "" {
+		flagByte, err := hex.DecodeString(serialized.TraceFlags)
+		if err == nil && len(flagByte) == 1 {
+			traceFlags = trace.TraceFlags(flagByte[0])
+		}
+	}
+
+	// Create span context
+	spanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: traceFlags,
+		Remote:     true, // Mark as remote since it's from another process
+	})
+
+	return trace.ContextWithSpanContext(ctx, spanCtx)
 }

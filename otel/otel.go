@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
@@ -482,17 +483,12 @@ func (l *OtelLogger) createExporters(ctx context.Context, otlpEndpoint string) (
 		return nil, nil, fmt.Errorf("failed to create OTLP trace exporter: %w", err)
 	}
 
-	// Create OTLP HTTP log exporter (logs always use HTTP for now)
+	// Create OTLP log exporter based on protocol (must match trace exporter protocol)
 	var logExporter sdklog.Exporter
-	if isSecure {
-		logExporter, err = otlploghttp.New(ctx,
-			otlploghttp.WithEndpoint(endpointURL),
-		)
+	if protocol == ProtocolGRPC {
+		logExporter, err = l.createGRPCLogExporter(ctx, endpointURL, isSecure)
 	} else {
-		logExporter, err = otlploghttp.New(ctx,
-			otlploghttp.WithEndpoint(endpointURL),
-			otlploghttp.WithInsecure(),
-		)
+		logExporter, err = l.createHTTPLogExporter(ctx, endpointURL, isSecure)
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create OTLP log exporter: %w", err)
@@ -536,6 +532,41 @@ func (l *OtelLogger) createHTTPTraceExporter(
 	return otlptracehttp.New(ctx,
 		otlptracehttp.WithEndpoint(endpoint),
 		otlptracehttp.WithInsecure(),
+	)
+}
+
+// createGRPCLogExporter creates a gRPC-based OTLP log exporter.
+// gRPC is more efficient and should be used when OTEL_EXPORTER_OTLP_PROTOCOL=grpc.
+func (l *OtelLogger) createGRPCLogExporter(
+	ctx context.Context,
+	endpoint string,
+	isSecure bool,
+) (sdklog.Exporter, error) {
+	opts := []otlploggrpc.Option{
+		otlploggrpc.WithEndpoint(endpoint),
+	}
+
+	if !isSecure {
+		opts = append(opts, otlploggrpc.WithInsecure())
+	}
+
+	return otlploggrpc.New(ctx, opts...)
+}
+
+// createHTTPLogExporter creates an HTTP-based OTLP log exporter.
+func (l *OtelLogger) createHTTPLogExporter(
+	ctx context.Context,
+	endpoint string,
+	isSecure bool,
+) (sdklog.Exporter, error) {
+	if isSecure {
+		return otlploghttp.New(ctx,
+			otlploghttp.WithEndpoint(endpoint),
+		)
+	}
+	return otlploghttp.New(ctx,
+		otlploghttp.WithEndpoint(endpoint),
+		otlploghttp.WithInsecure(),
 	)
 }
 
