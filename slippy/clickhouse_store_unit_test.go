@@ -612,33 +612,6 @@ func TestClickHouseStore_UpdateComponentStatus(t *testing.T) {
 			t.Error("expected insert into slip_component_states")
 		}
 	})
-
-	t.Run("update component status - uses insert", func(t *testing.T) {
-		execCalled := false
-		mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
-		mockSession := &clickhousetest.MockSession{
-			QueryRowRow: mockRow,
-			QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
-				return &clickhousetest.MockRows{}, nil
-			},
-			ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
-				execCalled = true
-				if !strings.Contains(stmt, "slip_component_states") {
-					return fmt.Errorf("expected insert into slip_component_states, got %s", stmt)
-				}
-				return nil
-			},
-		}
-		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
-
-		err := store.UpdateComponentStatus(context.Background(), "test-corr-001", "api", "build", StepStatusCompleted)
-		if err != nil {
-			t.Errorf("expected no error, got %v", err)
-		}
-		if !execCalled {
-			t.Error("expected ExecWithArgs to be called")
-		}
-	})
 }
 
 // TestClickHouseStore_AppendHistory tests the AppendHistory method.

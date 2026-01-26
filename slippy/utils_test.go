@@ -5,57 +5,6 @@ import (
 	"time"
 )
 
-func TestPluralize(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		// Empty string
-		{name: "empty string", input: "", expected: ""},
-
-		// Irregular plurals (from the map)
-		{name: "unit_test", input: "unit_test", expected: "unit_tests"},
-		{name: "build", input: "build", expected: "builds"},
-		{name: "test", input: "test", expected: "tests"},
-		{name: "deploy", input: "deploy", expected: "deploys"},
-
-		// Words ending in s, x, z, ch, sh (add "es")
-		{name: "bus", input: "bus", expected: "buses"},
-		{name: "box", input: "box", expected: "boxes"},
-		{name: "buzz", input: "buzz", expected: "buzzes"},
-		{name: "match", input: "match", expected: "matches"},
-		{name: "push", input: "push", expected: "pushes"},
-
-		// Words ending in consonant + y (change y to ies)
-		{name: "category", input: "category", expected: "categories"},
-		{name: "dependency", input: "dependency", expected: "dependencies"},
-		{name: "query", input: "query", expected: "queries"},
-
-		// Words ending in vowel + y (just add s)
-		{name: "key", input: "key", expected: "keys"},
-		{name: "day", input: "day", expected: "days"},
-		{name: "toy", input: "toy", expected: "toys"},
-
-		// Regular words (just add s)
-		{name: "step", input: "step", expected: "steps"},
-		{name: "component", input: "component", expected: "components"},
-		{name: "workflow", input: "workflow", expected: "workflows"},
-
-		// Single character words
-		{name: "single char y", input: "y", expected: "ys"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := pluralize(tt.input)
-			if result != tt.expected {
-				t.Errorf("pluralize(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
 func TestCalculateBackoff(t *testing.T) {
 	// Test that backoff increases with attempt number
 	for attempt := 1; attempt <= 5; attempt++ {

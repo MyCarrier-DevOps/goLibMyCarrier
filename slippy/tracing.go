@@ -143,16 +143,12 @@ func StartSpanWithKind(
 
 // StartProducerSpan creates a span with PRODUCER kind for message sending operations.
 // Use this when sending messages to Kafka or other message brokers.
-//
-//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
 func StartProducerSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
 	return StartSpanWithKind(ctx, operationName, correlationID, SpanKindProducer)
 }
 
 // StartClientSpan creates a span with CLIENT kind for outbound calls.
 // Use this for API calls, database operations, or other external service calls.
-//
-//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
 func StartClientSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
 	return StartSpanWithKind(ctx, operationName, correlationID, SpanKindClient)
 }
@@ -412,7 +408,7 @@ func DeserializeSpanContext(ctx context.Context, serialized *SerializedSpanConte
 	copy(spanID[:], spanIDBytes)
 
 	// Parse trace flags (default to sampled)
-	var traceFlags trace.TraceFlags = trace.FlagsSampled
+	traceFlags := trace.FlagsSampled
 	if serialized.TraceFlags != "" {
 		flagByte, err := hex.DecodeString(serialized.TraceFlags)
 		if err == nil && len(flagByte) == 1 {

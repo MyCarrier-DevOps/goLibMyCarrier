@@ -23,7 +23,6 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
 	"go.opentelemetry.io/otel/trace"
-	"google.golang.org/grpc"
 )
 
 // Logger constants
@@ -511,9 +510,6 @@ func (l *OtelLogger) createGRPCTraceExporter(
 	if !isSecure {
 		opts = append(opts, otlptracegrpc.WithInsecure())
 	}
-
-	// Add dial options for connection management
-	opts = append(opts, otlptracegrpc.WithDialOption(grpc.WithBlock()))
 
 	return otlptracegrpc.New(ctx, opts...)
 }
