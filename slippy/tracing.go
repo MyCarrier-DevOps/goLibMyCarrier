@@ -153,6 +153,33 @@ func StartClientSpan(ctx context.Context, operationName, correlationID string) (
 	return StartSpanWithKind(ctx, operationName, correlationID, SpanKindClient)
 }
 
+// StartOperationalSpan creates a span that is NOT a child of the pipeline trace.
+// This is used for internal operational spans (database operations, retry loops, etc.)
+// that should not clutter the pipeline content trace.
+//
+// The span is created as a new root span, but includes the correlation_id as a
+// searchable attribute so it can be correlated with the pipeline trace when debugging.
+//
+// Use StartSpan for pipeline content spans (JobExecution, Held, TestExecution).
+// Use StartOperationalSpan for internal implementation spans (UpdateStep, AppendHistory, hydrateSlip).
+//
+//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
+func StartOperationalSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
+	// Create a fresh context that preserves deadline/cancellation but strips the trace parent.
+	// This ensures the operational span is a new root trace, not a child of the pipeline trace.
+	freshCtx := trace.ContextWithSpan(ctx, nil)
+
+	// Start a new root span for this operational trace
+	newCtx, span := tracer().Start(freshCtx, operationName,
+		trace.WithAttributes(
+			attribute.String("slippy.correlation_id", correlationID),
+			attribute.String("slippy.span_type", "operational"),
+		),
+	)
+
+	return newCtx, span
+}
+
 // RetrySpan represents a traced retry operation with metrics collection.
 type RetrySpan struct {
 	ctx           context.Context
@@ -162,32 +189,24 @@ type RetrySpan struct {
 	totalBackoff  int64 // milliseconds
 }
 
-// startRetrySpan begins a new traced retry operation.
-// The correlation ID is used as the trace ID, allowing all operations on the same
-// routing slip to be correlated in the tracing backend.
-// The span will capture retry attempts, backoff durations, and success/failure.
+// startRetrySpan begins a new traced retry operation in an OPERATIONAL trace.
+// This creates spans in a separate trace from the pipeline content, keeping
+// operational details (retries, version conflicts, etc.) out of the main pipeline trace.
+//
+// The correlation ID is stored as a searchable attribute (not as the trace ID),
+// allowing operational traces to be correlated with pipeline traces when debugging.
+//
 // The returned RetrySpan wraps the span and caller must call EndSuccess() or EndError().
 //
-//nolint:spancheck // Span is wrapped in RetrySpan; caller calls EndSuccess/EndError which calls span.End()
+// Span is wrapped in RetrySpan; caller calls EndSuccess/EndError which calls span.End()
 func startRetrySpan(ctx context.Context, operationName, correlationID string) *RetrySpan {
-	// Try to use the correlation ID as the trace ID for better correlation
-	// If the context already has a valid trace, we create a child span instead
-	if !trace.SpanContextFromContext(ctx).IsValid() {
-		if traceID, ok := correlationIDToTraceID(correlationID); ok {
-			// Create a new span context with the correlation ID as trace ID
-			spanCtx := trace.NewSpanContext(trace.SpanContextConfig{
-				TraceID:    traceID,
-				TraceFlags: trace.FlagsSampled, // Ensure the trace is sampled
-			})
-			ctx = trace.ContextWithSpanContext(ctx, spanCtx)
-		}
-	}
+	// Create an operational span that is NOT a child of the pipeline trace.
+	// This keeps operational spans (UpdateStep, AppendHistory, etc.) separate
+	// from pipeline content spans (JobExecution, Held, TestExecution).
+	ctx, span := StartOperationalSpan(ctx, operationName, correlationID)
 
-	ctx, span := tracer().Start(ctx, operationName,
-		trace.WithAttributes(
-			attribute.String("slippy.operation", operationName),
-			attribute.String("slippy.correlation_id", correlationID),
-		),
+	span.SetAttributes(
+		attribute.String("slippy.operation", operationName),
 	)
 
 	return &RetrySpan{

@@ -8,6 +8,41 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+func TestStartOperationalSpan_CreatesIndependentTrace(t *testing.T) {
+	// Create a context with an existing trace (simulating a pipeline content trace)
+	existingTraceID := trace.TraceID{
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	}
+	existingSpanID := trace.SpanID{0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18}
+
+	existingSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    existingTraceID,
+		SpanID:     existingSpanID,
+		TraceFlags: trace.FlagsSampled,
+	})
+	ctx := trace.ContextWithSpanContext(context.Background(), existingSpanCtx)
+
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	// Start an operational span - it should NOT inherit from the existing trace
+	newCtx, span := StartOperationalSpan(ctx, "TestOperation", correlationID)
+	defer span.End()
+
+	// Get the span context from the returned context
+	spanCtx := trace.SpanContextFromContext(newCtx)
+
+	// The operational span should NOT be a child of the existing pipeline trace.
+	// Since we're using a no-op tracer, the trace ID will be zeros,
+	// but critically it should NOT be the existing trace ID.
+	if spanCtx.TraceID() == existingTraceID {
+		t.Errorf(
+			"StartOperationalSpan should create independent trace, but got pipeline trace ID %s",
+			spanCtx.TraceID().String(),
+		)
+	}
+}
+
 func TestCorrelationIDToTraceID(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -77,9 +112,8 @@ func TestCorrelationIDToTraceID(t *testing.T) {
 	}
 }
 
-func TestStartRetrySpan_UsesCorrelationIDAsTraceID(t *testing.T) {
+func TestStartRetrySpan_CreatesOperationalTrace(t *testing.T) {
 	correlationID := "550e8400-e29b-41d4-a716-446655440000"
-	expectedTraceIDHex := "550e8400e29b41d4a716446655440000"
 
 	// Start with a fresh context (no existing trace)
 	ctx := context.Background()
@@ -89,17 +123,22 @@ func TestStartRetrySpan_UsesCorrelationIDAsTraceID(t *testing.T) {
 	// Get the span context from the returned context
 	spanCtx := trace.SpanContextFromContext(retrySpan.Context())
 
-	// Verify the trace ID matches the correlation ID
-	if spanCtx.TraceID().String() != expectedTraceIDHex {
-		t.Errorf("trace ID = %s, want %s", spanCtx.TraceID().String(), expectedTraceIDHex)
+	// The operational span should NOT use the correlation ID as trace ID
+	// (that's only for pipeline content spans, not operational spans).
+	// Instead, it creates a new independent trace.
+	// The trace ID should be all zeros since we're using a no-op tracer in tests
+	// (no exporter configured), but the important thing is that it's NOT the correlation ID.
+	correlationIDAsTraceID := "550e8400e29b41d4a716446655440000"
+	if spanCtx.TraceID().String() == correlationIDAsTraceID {
+		t.Errorf("operational span should NOT use correlation ID as trace ID, got %s", spanCtx.TraceID().String())
 	}
 
 	// Clean up
 	retrySpan.EndSuccess()
 }
 
-func TestStartRetrySpan_PreservesExistingTrace(t *testing.T) {
-	// Create a context with an existing trace
+func TestStartRetrySpan_DoesNotInheritFromPipelineTrace(t *testing.T) {
+	// Create a context with an existing trace (simulating a pipeline content trace)
 	existingTraceID := trace.TraceID{
 		0x01,
 		0x02,
@@ -127,7 +166,7 @@ func TestStartRetrySpan_PreservesExistingTrace(t *testing.T) {
 	})
 	ctx := trace.ContextWithSpanContext(context.Background(), existingSpanCtx)
 
-	// Different correlation ID that would produce a different trace ID
+	// Different correlation ID
 	correlationID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 	retrySpan := startRetrySpan(ctx, "TestOperation", correlationID)
@@ -135,12 +174,14 @@ func TestStartRetrySpan_PreservesExistingTrace(t *testing.T) {
 	// Get the span context from the returned context
 	spanCtx := trace.SpanContextFromContext(retrySpan.Context())
 
-	// The trace ID should still be the existing one (not overwritten by correlation ID)
-	if spanCtx.TraceID() != existingTraceID {
+	// The operational span should NOT inherit from the existing pipeline trace.
+	// This keeps operational spans separate from pipeline content spans.
+	// Since we're using a no-op tracer, the trace ID will be zeros,
+	// but the important thing is it's NOT the existing trace ID.
+	if spanCtx.TraceID() == existingTraceID {
 		t.Errorf(
-			"trace ID = %s, want existing trace ID %s (should not override)",
+			"operational span should NOT inherit from pipeline trace, got trace ID %s",
 			spanCtx.TraceID().String(),
-			existingTraceID.String(),
 		)
 	}
 
