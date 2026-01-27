@@ -97,6 +97,7 @@ func (b *SlipQueryBuilder) AggregateColumn(stepName string) string {
 
 // BuildFindByCommitsQuery builds a query to find a slip by a list of commits.
 // Only selects active rows (sign=1) to exclude orphaned cancel rows.
+// Repository comparison is case-insensitive to handle variations in repository naming.
 func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 	selectColumns := b.BuildSelectColumnsWithPrefix("s.")
 
@@ -111,7 +112,7 @@ func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 			c.commit_sha AS matched_commit
 		FROM %s.routing_slips s FINAL
 		INNER JOIN commits c ON s.commit_sha = c.commit_sha
-		WHERE s.repository = {repository:String}
+		WHERE lower(s.repository) = lower({repository:String})
 		  AND s.sign = 1
 		ORDER BY c.priority ASC, s.version DESC
 		LIMIT 1
@@ -121,6 +122,7 @@ func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 // BuildFindAllByCommitsQuery builds a query to find all slips matching commits in the list.
 // Returns slips ordered by commit priority (most recent commit's slip first).
 // Only selects active rows (sign=1) to exclude orphaned cancel rows.
+// Repository comparison is case-insensitive to handle variations in repository naming.
 func (b *SlipQueryBuilder) BuildFindAllByCommitsQuery() string {
 	selectColumns := b.BuildSelectColumnsWithPrefix("s.")
 
@@ -135,7 +137,7 @@ func (b *SlipQueryBuilder) BuildFindAllByCommitsQuery() string {
 			c.commit_sha AS matched_commit
 		FROM %s.routing_slips s FINAL
 		INNER JOIN commits c ON s.commit_sha = c.commit_sha
-		WHERE s.repository = {repository:String}
+		WHERE lower(s.repository) = lower({repository:String})
 		  AND s.sign = 1
 		ORDER BY c.priority ASC, s.version DESC
 	`, selectColumns, b.database)
