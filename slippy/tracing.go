@@ -198,7 +198,7 @@ type RetrySpan struct {
 //
 // The returned RetrySpan wraps the span and caller must call EndSuccess() or EndError().
 //
-//nolint:spancheck // Span is wrapped in RetrySpan; caller calls EndSuccess/EndError which calls span.End()
+// Span is wrapped in RetrySpan; caller calls EndSuccess/EndError which calls span.End()
 func startRetrySpan(ctx context.Context, operationName, correlationID string) *RetrySpan {
 	// Create an operational span that is NOT a child of the pipeline trace.
 	// This keeps operational spans (UpdateStep, AppendHistory, etc.) separate
