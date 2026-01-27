@@ -231,6 +231,8 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 		m.generateHistoryViewMigration(),
 		m.generateAncestryMigration(),
 		m.generateComponentStatesTableMigration(),
+		m.generateRoutingSlipsTTLMigration(),
+		m.generateComponentStatesTTLMigration(),
 	}
 }
 
@@ -318,6 +320,38 @@ func (m *DynamicMigrationManager) generateComponentStatesTableMigration() clickh
 			ORDER BY (correlation_id, step, component)
 		`, m.database),
 		DownSQL: fmt.Sprintf(`DROP TABLE IF EXISTS %s.slip_component_states`, m.database),
+	}
+}
+
+// generateRoutingSlipsTTLMigration adds 60-day TTL to routing_slips table.
+// ClickHouse TTL expires rows based on the specified datetime column.
+// Note: Materialized views inherit TTL behavior from their source tables.
+func (m *DynamicMigrationManager) generateRoutingSlipsTTLMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     5,
+		Name:        "add_ttl_routing_slips",
+		Description: "Adds 60-day TTL to routing_slips table",
+		UpSQL: fmt.Sprintf(`
+			ALTER TABLE %s.routing_slips MODIFY TTL created_at + INTERVAL 60 DAY
+		`, m.database),
+		DownSQL: fmt.Sprintf(`
+			ALTER TABLE %s.routing_slips REMOVE TTL
+		`, m.database),
+	}
+}
+
+// generateComponentStatesTTLMigration adds 60-day TTL to slip_component_states table.
+func (m *DynamicMigrationManager) generateComponentStatesTTLMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     6,
+		Name:        "add_ttl_component_states",
+		Description: "Adds 60-day TTL to slip_component_states table",
+		UpSQL: fmt.Sprintf(`
+			ALTER TABLE %s.slip_component_states MODIFY TTL timestamp + INTERVAL 60 DAY
+		`, m.database),
+		DownSQL: fmt.Sprintf(`
+			ALTER TABLE %s.slip_component_states REMOVE TTL
+		`, m.database),
 	}
 }
 
