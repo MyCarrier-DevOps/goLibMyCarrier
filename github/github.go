@@ -6,7 +6,7 @@ import (
 	"strconv"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/go-github/v79/github"
+	"github.com/google/go-github/v82/github"
 	"github.com/jferrl/go-githubauth"
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
