@@ -17,6 +17,97 @@ const (
 	tracerName = "github.com/MyCarrier-DevOps/goLibMyCarrier/slippy"
 )
 
+// contextKey is a private type for context keys to avoid collisions.
+type contextKey string
+
+const (
+	// serviceNameKey is the context key for the operational span service name.
+	serviceNameKey contextKey = "slippy.operational.service_name"
+)
+
+// ========================================================================
+// Span Configuration (Functional Options Pattern)
+// ========================================================================
+
+// spanConfig holds configuration for creating spans.
+type spanConfig struct {
+	serviceName string
+	spanKind    trace.SpanKind
+	attributes  []attribute.KeyValue
+}
+
+// SpanOption configures how a span is created.
+type SpanOption func(*spanConfig)
+
+// WithServiceName sets the service name attribute on the span.
+// This helps identify which service generated the span in APM tools.
+// Example: WithServiceName("pushhookparser") or WithServiceName("Slippy")
+func WithServiceName(name string) SpanOption {
+	return func(c *spanConfig) {
+		c.serviceName = name
+	}
+}
+
+// WithSpanKind sets the span kind (CLIENT, SERVER, PRODUCER, CONSUMER, INTERNAL).
+// Use this to specify the span's role in the trace.
+func WithSpanKind(kind trace.SpanKind) SpanOption {
+	return func(c *spanConfig) {
+		c.spanKind = kind
+	}
+}
+
+// WithAttributes adds custom attributes to the span.
+func WithAttributes(attrs ...attribute.KeyValue) SpanOption {
+	return func(c *spanConfig) {
+		c.attributes = append(c.attributes, attrs...)
+	}
+}
+
+// applySpanOptions applies options to a spanConfig, returning a configured instance.
+func applySpanOptions(opts ...SpanOption) *spanConfig {
+	cfg := &spanConfig{
+		spanKind: trace.SpanKindInternal, // default
+	}
+	for _, opt := range opts {
+		opt(cfg)
+	}
+	return cfg
+}
+
+// ========================================================================
+// Context-based Service Name (for automatic propagation)
+// ========================================================================
+
+// ContextWithServiceName returns a context with the service name set for operational spans.
+// When operational spans are created (via StartOperationalSpan or startRetrySpan),
+// they will include this service name as an attribute, making it easier to identify
+// which service generated the span in APM tools.
+//
+// This is useful when you want all spans created with a context to automatically
+// inherit the service name without passing it explicitly to each call.
+//
+// Usage:
+//
+//	ctx := slippy.ContextWithServiceName(ctx, "pushhookparser")
+//	// All operational spans created with this ctx will have service.name = "pushhookparser"
+func ContextWithServiceName(ctx context.Context, serviceName string) context.Context {
+	return context.WithValue(ctx, serviceNameKey, serviceName)
+}
+
+// getServiceNameFromContext retrieves the service name from context, if set.
+func getServiceNameFromContext(ctx context.Context) string {
+	if v := ctx.Value(serviceNameKey); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// ========================================================================
+// Core Tracing Functions
+// ========================================================================
+
 // tracer returns the global OpenTelemetry tracer for the slippy package.
 // If no tracer provider is configured, this returns a no-op tracer.
 func tracer() trace.Tracer {
@@ -97,60 +188,66 @@ const (
 )
 
 // StartSpan creates a new span with the given name, using the correlation ID as the trace ID
-// if no existing trace is present. This is the primary entry point for external callers
-// (like pushhookparser) to begin tracing a routing slip operation.
+// if no existing trace is present. This is the primary entry point for creating pipeline
+// content spans (JobExecution, Held, TestExecution, etc.).
 //
 // The returned span should be ended with span.End() when the operation completes.
 // The returned context should be passed to all subsequent slippy operations.
+//
+// Options can be used to customize the span:
+//   - WithServiceName("myservice"): Set the service.name attribute
+//   - WithSpanKind(SpanKindProducer): Set the span kind
+//   - WithAttributes(...): Add custom attributes
 //
 // Usage:
 //
 //	ctx, span := slippy.StartSpan(ctx, "ProcessPush", correlationID)
 //	defer span.End()
-//	// All slippy operations using ctx will be children of this span
+//
+//	// With options:
+//	ctx, span := slippy.StartSpan(ctx, "ProcessPush", correlationID,
+//	    slippy.WithServiceName("pushhookparser"),
+//	    slippy.WithSpanKind(slippy.SpanKindProducer),
+//	)
+//	defer span.End()
 //
 //nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
-func StartSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
-	// Ensure we have a trace context rooted in the correlation ID
-	ctx = ContextWithCorrelationTrace(ctx, correlationID)
-
-	return tracer().Start(ctx, operationName,
-		trace.WithAttributes(
-			attribute.String("slippy.correlation_id", correlationID),
-		),
-	)
-}
-
-// StartSpanWithKind creates a new span with the given name and span kind.
-// Use this when you need to specify the span's role in the trace (CLIENT, SERVER, PRODUCER, CONSUMER).
-//
-//nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
-func StartSpanWithKind(
+func StartSpan(
 	ctx context.Context,
 	operationName, correlationID string,
-	kind SpanKind,
+	opts ...SpanOption,
 ) (context.Context, trace.Span) {
+	cfg := applySpanOptions(opts...)
+
 	// Ensure we have a trace context rooted in the correlation ID
 	ctx = ContextWithCorrelationTrace(ctx, correlationID)
 
-	return tracer().Start(ctx, operationName,
-		trace.WithSpanKind(kind),
-		trace.WithAttributes(
-			attribute.String("slippy.correlation_id", correlationID),
-		),
-	)
-}
+	// Build base attributes
+	attrs := []attribute.KeyValue{
+		attribute.String("slippy.correlation_id", correlationID),
+	}
 
-// StartProducerSpan creates a span with PRODUCER kind for message sending operations.
-// Use this when sending messages to Kafka or other message brokers.
-func StartProducerSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
-	return StartSpanWithKind(ctx, operationName, correlationID, SpanKindProducer)
-}
+	// Add service name if provided via option or context
+	serviceName := cfg.serviceName
+	if serviceName == "" {
+		serviceName = getServiceNameFromContext(ctx)
+	}
+	if serviceName != "" {
+		attrs = append(attrs, attribute.String("service.name", serviceName))
+	}
 
-// StartClientSpan creates a span with CLIENT kind for outbound calls.
-// Use this for API calls, database operations, or other external service calls.
-func StartClientSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
-	return StartSpanWithKind(ctx, operationName, correlationID, SpanKindClient)
+	// Add any custom attributes from options
+	attrs = append(attrs, cfg.attributes...)
+
+	// Build trace options
+	traceOpts := []trace.SpanStartOption{
+		trace.WithAttributes(attrs...),
+	}
+	if cfg.spanKind != trace.SpanKindInternal {
+		traceOpts = append(traceOpts, trace.WithSpanKind(cfg.spanKind))
+	}
+
+	return tracer().Start(ctx, operationName, traceOpts...)
 }
 
 // StartOperationalSpan creates a span that is NOT a child of the pipeline trace.
@@ -160,21 +257,49 @@ func StartClientSpan(ctx context.Context, operationName, correlationID string) (
 // The span is created as a new root span, but includes the correlation_id as a
 // searchable attribute so it can be correlated with the pipeline trace when debugging.
 //
+// Options can be used to customize the span:
+//   - WithServiceName("Slippy"): Set the service.name attribute (recommended for operational spans)
+//   - WithAttributes(...): Add custom attributes
+//
+// If no service name is provided via option, it will check the context for a service name
+// set via ContextWithServiceName.
+//
 // Use StartSpan for pipeline content spans (JobExecution, Held, TestExecution).
 // Use StartOperationalSpan for internal implementation spans (UpdateStep, AppendHistory, hydrateSlip).
 //
 //nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
-func StartOperationalSpan(ctx context.Context, operationName, correlationID string) (context.Context, trace.Span) {
+func StartOperationalSpan(
+	ctx context.Context,
+	operationName, correlationID string,
+	opts ...SpanOption,
+) (context.Context, trace.Span) {
+	cfg := applySpanOptions(opts...)
+
 	// Create a fresh context that preserves deadline/cancellation but strips the trace parent.
 	// This ensures the operational span is a new root trace, not a child of the pipeline trace.
 	freshCtx := trace.ContextWithSpan(ctx, nil)
 
+	// Build attributes for the span
+	attrs := []attribute.KeyValue{
+		attribute.String("slippy.correlation_id", correlationID),
+		attribute.String("slippy.span_type", "operational"),
+	}
+
+	// Add service name - check option first, then context
+	serviceName := cfg.serviceName
+	if serviceName == "" {
+		serviceName = getServiceNameFromContext(ctx)
+	}
+	if serviceName != "" {
+		attrs = append(attrs, attribute.String("service.name", serviceName))
+	}
+
+	// Add any custom attributes from options
+	attrs = append(attrs, cfg.attributes...)
+
 	// Start a new root span for this operational trace
 	newCtx, span := tracer().Start(freshCtx, operationName,
-		trace.WithAttributes(
-			attribute.String("slippy.correlation_id", correlationID),
-			attribute.String("slippy.span_type", "operational"),
-		),
+		trace.WithAttributes(attrs...),
 	)
 
 	return newCtx, span
