@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/vault
 
-go 1.25.5
+go 1.25.6
 
 require (
 	github.com/hashicorp/vault-client-go v0.4.3
@@ -9,7 +9,7 @@ require (
 
 require (
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
-	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
+	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/go-rootcerts v1.0.2 // indirect
@@ -24,7 +24,7 @@ require (
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/sys v0.40.0 // indirect
-	golang.org/x/text v0.32.0 // indirect
+	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 // indirect
 )
