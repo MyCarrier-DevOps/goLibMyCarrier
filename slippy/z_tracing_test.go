@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -409,5 +410,377 @@ func TestJobError(t *testing.T) {
 	err := &jobError{message: "build failed"}
 	if err.Error() != "build failed" {
 		t.Errorf("Error() = %q, want 'build failed'", err.Error())
+	}
+}
+
+// ============================================================================
+// Context Service Name Tests (Functional Options Pattern)
+// ============================================================================
+
+func TestContextWithServiceName(t *testing.T) {
+	tests := []struct {
+		name        string
+		serviceName string
+		wantStored  string
+	}{
+		{
+			name:        "stores service name in context",
+			serviceName: "pushhookparser",
+			wantStored:  "pushhookparser",
+		},
+		{
+			name:        "stores different service name",
+			serviceName: "Slippy",
+			wantStored:  "Slippy",
+		},
+		{
+			name:        "stores TestEngine.Worker service name",
+			serviceName: "TestEngine.Worker",
+			wantStored:  "TestEngine.Worker",
+		},
+		{
+			name:        "handles empty service name",
+			serviceName: "",
+			wantStored:  "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			ctx = ContextWithServiceName(ctx, tt.serviceName)
+
+			got := getServiceNameFromContext(ctx)
+			if got != tt.wantStored {
+				t.Errorf("getServiceNameFromContext() = %q, want %q", got, tt.wantStored)
+			}
+		})
+	}
+}
+
+func TestGetServiceNameFromContext_EmptyContext(t *testing.T) {
+	ctx := context.Background()
+	got := getServiceNameFromContext(ctx)
+	if got != "" {
+		t.Errorf("getServiceNameFromContext() from empty context = %q, want empty string", got)
+	}
+}
+
+func TestContextWithServiceName_Overwrite(t *testing.T) {
+	ctx := context.Background()
+
+	// Set initial service name
+	ctx = ContextWithServiceName(ctx, "service1")
+	if got := getServiceNameFromContext(ctx); got != "service1" {
+		t.Errorf("First set: got %q, want %q", got, "service1")
+	}
+
+	// Overwrite with new service name
+	ctx = ContextWithServiceName(ctx, "service2")
+	if got := getServiceNameFromContext(ctx); got != "service2" {
+		t.Errorf("Second set: got %q, want %q", got, "service2")
+	}
+}
+
+// ============================================================================
+// Span Option Tests (Functional Options Pattern)
+// ============================================================================
+
+func TestWithServiceName(t *testing.T) {
+	cfg := &spanConfig{}
+	opt := WithServiceName("test-service")
+	opt(cfg)
+
+	if cfg.serviceName != "test-service" {
+		t.Errorf("WithServiceName() set serviceName = %q, want %q", cfg.serviceName, "test-service")
+	}
+}
+
+func TestWithSpanKind(t *testing.T) {
+	tests := []struct {
+		name string
+		kind trace.SpanKind
+	}{
+		{"client", SpanKindClient},
+		{"server", SpanKindServer},
+		{"producer", SpanKindProducer},
+		{"consumer", SpanKindConsumer},
+		{"internal", SpanKindInternal},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &spanConfig{}
+			opt := WithSpanKind(tt.kind)
+			opt(cfg)
+
+			if cfg.spanKind != tt.kind {
+				t.Errorf("WithSpanKind() set spanKind = %v, want %v", cfg.spanKind, tt.kind)
+			}
+		})
+	}
+}
+
+func TestWithAttributes(t *testing.T) {
+	cfg := &spanConfig{}
+	attrs := []attribute.KeyValue{
+		attribute.String("key1", "value1"),
+		attribute.Int("key2", 42),
+		attribute.Bool("key3", true),
+	}
+	opt := WithAttributes(attrs...)
+	opt(cfg)
+
+	if len(cfg.attributes) != 3 {
+		t.Errorf("WithAttributes() set %d attributes, want 3", len(cfg.attributes))
+	}
+
+	// Verify each attribute
+	if cfg.attributes[0].Key != "key1" || cfg.attributes[0].Value.AsString() != "value1" {
+		t.Errorf("First attribute mismatch: got %v", cfg.attributes[0])
+	}
+	if cfg.attributes[1].Key != "key2" || cfg.attributes[1].Value.AsInt64() != 42 {
+		t.Errorf("Second attribute mismatch: got %v", cfg.attributes[1])
+	}
+	if cfg.attributes[2].Key != "key3" || !cfg.attributes[2].Value.AsBool() {
+		t.Errorf("Third attribute mismatch: got %v", cfg.attributes[2])
+	}
+}
+
+func TestWithAttributes_Accumulates(t *testing.T) {
+	cfg := &spanConfig{}
+
+	// Add first batch of attributes
+	opt1 := WithAttributes(attribute.String("key1", "value1"))
+	opt1(cfg)
+
+	// Add second batch of attributes
+	opt2 := WithAttributes(attribute.String("key2", "value2"))
+	opt2(cfg)
+
+	if len(cfg.attributes) != 2 {
+		t.Errorf("WithAttributes() accumulated %d attributes, want 2", len(cfg.attributes))
+	}
+}
+
+func TestApplySpanOptions_Defaults(t *testing.T) {
+	cfg := applySpanOptions()
+
+	if cfg.serviceName != "" {
+		t.Errorf("Default serviceName = %q, want empty", cfg.serviceName)
+	}
+	if cfg.spanKind != trace.SpanKindInternal {
+		t.Errorf("Default spanKind = %v, want Internal", cfg.spanKind)
+	}
+	if len(cfg.attributes) != 0 {
+		t.Errorf("Default attributes length = %d, want 0", len(cfg.attributes))
+	}
+}
+
+func TestApplySpanOptions_MultipleOptions(t *testing.T) {
+	cfg := applySpanOptions(
+		WithServiceName("my-service"),
+		WithSpanKind(SpanKindProducer),
+		WithAttributes(attribute.String("env", "test")),
+	)
+
+	if cfg.serviceName != "my-service" {
+		t.Errorf("serviceName = %q, want %q", cfg.serviceName, "my-service")
+	}
+	if cfg.spanKind != SpanKindProducer {
+		t.Errorf("spanKind = %v, want Producer", cfg.spanKind)
+	}
+	if len(cfg.attributes) != 1 {
+		t.Errorf("attributes length = %d, want 1", len(cfg.attributes))
+	}
+}
+
+// ============================================================================
+// StartSpan with Options Tests
+// ============================================================================
+
+func TestStartSpan_WithServiceNameOption(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	_, span := StartSpan(ctx, "TestOperation", correlationID,
+		WithServiceName("test-service"),
+	)
+	defer span.End()
+
+	// The span should be created (we can't easily inspect attributes without a test tracer)
+	if span == nil {
+		t.Error("StartSpan with options returned nil span")
+	}
+}
+
+func TestStartSpan_WithSpanKindOption(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	_, span := StartSpan(ctx, "TestOperation", correlationID,
+		WithSpanKind(SpanKindProducer),
+	)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartSpan with SpanKind option returned nil span")
+	}
+}
+
+func TestStartSpan_WithAllOptions(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	_, span := StartSpan(ctx, "TestOperation", correlationID,
+		WithServiceName("my-service"),
+		WithSpanKind(SpanKindClient),
+		WithAttributes(
+			attribute.String("custom.key", "custom-value"),
+			attribute.Int("custom.count", 10),
+		),
+	)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartSpan with all options returned nil span")
+	}
+}
+
+func TestStartSpan_InheritsServiceNameFromContext(t *testing.T) {
+	ctx := context.Background()
+	ctx = ContextWithServiceName(ctx, "context-service")
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	// Don't pass WithServiceName - should inherit from context
+	_, span := StartSpan(ctx, "TestOperation", correlationID)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartSpan should work with service name from context")
+	}
+}
+
+func TestStartSpan_OptionOverridesContextServiceName(t *testing.T) {
+	ctx := context.Background()
+	ctx = ContextWithServiceName(ctx, "context-service")
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	// Pass explicit WithServiceName - should override context
+	_, span := StartSpan(ctx, "TestOperation", correlationID,
+		WithServiceName("option-service"),
+	)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartSpan should work with service name from option")
+	}
+}
+
+// ============================================================================
+// StartOperationalSpan with Options Tests
+// ============================================================================
+
+func TestStartOperationalSpan_WithServiceNameOption(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	_, span := StartOperationalSpan(ctx, "AppendHistory", correlationID,
+		WithServiceName("Slippy"),
+	)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartOperationalSpan with service name option returned nil span")
+	}
+}
+
+func TestStartOperationalSpan_WithAttributes(t *testing.T) {
+	ctx := context.Background()
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	_, span := StartOperationalSpan(ctx, "hydrateSlip", correlationID,
+		WithAttributes(
+			attribute.String("step.name", "build"),
+			attribute.Bool("include_history", true),
+		),
+	)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartOperationalSpan with attributes returned nil span")
+	}
+}
+
+func TestStartOperationalSpan_InheritsServiceNameFromContext(t *testing.T) {
+	ctx := context.Background()
+	ctx = ContextWithServiceName(ctx, "TestEngine.Worker")
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	// Don't pass WithServiceName - should inherit from context
+	_, span := StartOperationalSpan(ctx, "LoadSlip", correlationID)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartOperationalSpan should work with service name from context")
+	}
+}
+
+func TestStartOperationalSpan_OptionOverridesContextServiceName(t *testing.T) {
+	ctx := context.Background()
+	ctx = ContextWithServiceName(ctx, "context-service")
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	// Pass explicit WithServiceName - should override context
+	_, span := StartOperationalSpan(ctx, "UpdateStep", correlationID,
+		WithServiceName("Slippy"),
+	)
+	defer span.End()
+
+	if span == nil {
+		t.Error("StartOperationalSpan should work with service name from option")
+	}
+}
+
+// ============================================================================
+// Span Kind Constants Tests
+// ============================================================================
+
+func TestSpanKindConstants(t *testing.T) {
+	// Verify our constants match the underlying trace package constants
+	if SpanKindInternal != trace.SpanKindInternal {
+		t.Error("SpanKindInternal mismatch")
+	}
+	if SpanKindClient != trace.SpanKindClient {
+		t.Error("SpanKindClient mismatch")
+	}
+	if SpanKindServer != trace.SpanKindServer {
+		t.Error("SpanKindServer mismatch")
+	}
+	if SpanKindProducer != trace.SpanKindProducer {
+		t.Error("SpanKindProducer mismatch")
+	}
+	if SpanKindConsumer != trace.SpanKindConsumer {
+		t.Error("SpanKindConsumer mismatch")
+	}
+}
+
+// ============================================================================
+// StartRetrySpan inherits service name from context
+// ============================================================================
+
+func TestStartRetrySpan_InheritsServiceNameFromContext(t *testing.T) {
+	ctx := context.Background()
+	ctx = ContextWithServiceName(ctx, "TestEngine.Worker")
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+
+	retrySpan := startRetrySpan(ctx, "UpdateStepWithRetry", correlationID)
+	defer retrySpan.EndSuccess()
+
+	if retrySpan == nil {
+		t.Fatal("startRetrySpan returned nil")
+	}
+	if retrySpan.span == nil {
+		t.Error("RetrySpan.span is nil")
 	}
 }
