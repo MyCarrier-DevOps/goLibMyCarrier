@@ -595,6 +595,37 @@ func TestApplySpanOptions_MultipleOptions(t *testing.T) {
 	}
 }
 
+func TestApplySpanOptions_NilOptionsSafety(t *testing.T) {
+	// This should not panic even with nil options
+	cfg := applySpanOptions(
+		WithServiceName("my-service"),
+		nil, // nil option should be skipped safely
+		WithSpanKind(SpanKindProducer),
+		nil, // another nil option
+	)
+
+	// Should still apply the non-nil options
+	if cfg.serviceName != "my-service" {
+		t.Errorf("serviceName = %q, want %q", cfg.serviceName, "my-service")
+	}
+	if cfg.spanKind != SpanKindProducer {
+		t.Errorf("spanKind = %v, want Producer", cfg.spanKind)
+	}
+}
+
+func TestApplySpanOptions_AllNilOptions(t *testing.T) {
+	// This should not panic with all nil options
+	cfg := applySpanOptions(nil, nil, nil)
+
+	// Should return defaults
+	if cfg.serviceName != "" {
+		t.Errorf("serviceName = %q, want empty", cfg.serviceName)
+	}
+	if cfg.spanKind != trace.SpanKindInternal {
+		t.Errorf("spanKind = %v, want Internal", cfg.spanKind)
+	}
+}
+
 // ============================================================================
 // StartSpan with Options Tests
 // ============================================================================

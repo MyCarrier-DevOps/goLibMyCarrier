@@ -21,8 +21,8 @@ const (
 type contextKey string
 
 const (
-	// serviceNameKey is the context key for the operational span service name.
-	serviceNameKey contextKey = "slippy.operational.service_name"
+	// serviceNameKey is the context key for the span service name used across Slippy tracing.
+	serviceNameKey contextKey = "slippy.span.service_name"
 )
 
 // ========================================================================
@@ -64,11 +64,15 @@ func WithAttributes(attrs ...attribute.KeyValue) SpanOption {
 }
 
 // applySpanOptions applies options to a spanConfig, returning a configured instance.
+// Nil options are safely skipped to prevent panics.
 func applySpanOptions(opts ...SpanOption) *spanConfig {
 	cfg := &spanConfig{
 		spanKind: trace.SpanKindInternal, // default
 	}
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		opt(cfg)
 	}
 	return cfg
@@ -78,10 +82,13 @@ func applySpanOptions(opts ...SpanOption) *spanConfig {
 // Context-based Service Name (for automatic propagation)
 // ========================================================================
 
-// ContextWithServiceName returns a context with the service name set for operational spans.
-// When operational spans are created (via StartOperationalSpan or startRetrySpan),
-// they will include this service name as an attribute, making it easier to identify
-// which service generated the span in APM tools.
+// ContextWithServiceName returns a context with the service name set for spans
+// started via the slippy tracing helpers.
+//
+// When spans are created (for example via StartSpan, StartOperationalSpan, or
+// internal helpers such as startRetrySpan), they will include this service name
+// as an attribute, making it easier to identify which service generated the span
+// in APM tools.
 //
 // This is useful when you want all spans created with a context to automatically
 // inherit the service name without passing it explicitly to each call.
@@ -89,7 +96,8 @@ func applySpanOptions(opts ...SpanOption) *spanConfig {
 // Usage:
 //
 //	ctx := slippy.ContextWithServiceName(ctx, "pushhookparser")
-//	// All operational spans created with this ctx will have service.name = "pushhookparser"
+//	// All spans created with this ctx via slippy tracing helpers will have
+//	// service.name = "pushhookparser"
 func ContextWithServiceName(ctx context.Context, serviceName string) context.Context {
 	return context.WithValue(ctx, serviceNameKey, serviceName)
 }
@@ -297,10 +305,16 @@ func StartOperationalSpan(
 	// Add any custom attributes from options
 	attrs = append(attrs, cfg.attributes...)
 
-	// Start a new root span for this operational trace
-	newCtx, span := tracer().Start(freshCtx, operationName,
+	// Build trace options
+	traceOpts := []trace.SpanStartOption{
 		trace.WithAttributes(attrs...),
-	)
+	}
+	if cfg.spanKind != trace.SpanKindInternal {
+		traceOpts = append(traceOpts, trace.WithSpanKind(cfg.spanKind))
+	}
+
+	// Start a new root span for this operational trace
+	newCtx, span := tracer().Start(freshCtx, operationName, traceOpts...)
 
 	return newCtx, span
 }
