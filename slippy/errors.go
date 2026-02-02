@@ -55,14 +55,9 @@ var (
 	// The underlying step update may have succeeded but overall status is stale.
 	ErrSlipStatusUpdateFailed = errors.New("failed to update slip status")
 
-	// ErrVersionConflict indicates a concurrent modification was detected.
-	// The slip was modified by another process since it was loaded.
-	// Callers should reload the slip and retry their operation.
-	ErrVersionConflict = errors.New("version conflict: slip was modified by another process")
-
 	// ErrMaxRetriesExceeded indicates the maximum number of retry attempts was reached.
-	// This typically occurs when there is high contention on a slip.
-	ErrMaxRetriesExceeded = errors.New("maximum retry attempts exceeded due to concurrent modifications")
+	// This occurs when a slip is not found after multiple retries.
+	ErrMaxRetriesExceeded = errors.New("maximum retry attempts exceeded")
 )
 
 // SlipError wraps an error with additional context about the slip operation.
