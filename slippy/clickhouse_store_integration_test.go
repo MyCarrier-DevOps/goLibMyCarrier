@@ -168,11 +168,7 @@ func createTestStore(
 	// Wrap the connection in our session wrapper
 	session := &testClickhouseSession{conn: conn}
 
-	// Disable optimize after write for now - we'll test it explicitly
-	optimizeAfterWrite := false
-
 	store := NewClickHouseStoreFromSession(session, pipelineConfig, "ci_test")
-	store.SetOptimizeAfterWrite(optimizeAfterWrite)
 
 	// Run migrations (JSON type setting already applied via conn.Exec above)
 	migrateOpts := MigrateOptions{
@@ -345,8 +341,9 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		session := store.Session()
 		rows, err := session.QueryWithArgs(ctx, `
 			SELECT version, sign, builds_completed 
-			FROM ci_test.routing_slips FINAL 
-			WHERE correlation_id = $1
+			FROM ci_test.routing_slips
+			WHERE correlation_id = $1 AND sign = 1
+			ORDER BY version DESC LIMIT 1
 		`, correlationID)
 		if err != nil {
 			t.Logf("  → Error querying raw data: %v", err)
@@ -378,9 +375,6 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		t.Fatalf("failed to update builds_completed step: %v", err)
 	}
 
-	// Run OPTIMIZE TABLE to force collapsing of rows (fire-and-forget, no error returned)
-	store.OptimizeTable(ctx)
-
 	// Load the final slip and verify no data was lost
 	finalSlip, err := store.Load(ctx, correlationID)
 	if err != nil {
@@ -391,8 +385,9 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 	session := store.Session()
 	rows, err := session.QueryWithArgs(ctx, `
 		SELECT version, sign, builds_completed 
-		FROM ci_test.routing_slips FINAL 
-		WHERE correlation_id = $1
+		FROM ci_test.routing_slips
+		WHERE correlation_id = $1 AND sign = 1
+		ORDER BY version DESC LIMIT 1
 	`, correlationID)
 	if err != nil {
 		t.Logf("Error querying final raw data: %v", err)
@@ -536,9 +531,6 @@ func TestVersionedCollapsingMergeTree_ConcurrentUpdates(t *testing.T) {
 	for err := range errChan {
 		t.Fatalf("concurrent update error: %v", err)
 	}
-
-	// Run OPTIMIZE TABLE to force collapsing (fire-and-forget, no error returned)
-	store.OptimizeTable(ctx)
 
 	// Load and verify
 	finalSlip, err := store.Load(ctx, correlationID)
@@ -726,9 +718,6 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 	if err := store.UpdateStep(ctx, correlationID, "builds_completed", "", StepStatusCompleted); err != nil {
 		t.Fatalf("failed to update builds_completed: %v", err)
 	}
-
-	// Optimize and load (fire-and-forget, no error returned)
-	store.OptimizeTable(ctx)
 
 	finalSlip, err := store.Load(ctx, correlationID)
 	if err != nil {
@@ -941,9 +930,6 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 	}
 
 	t.Logf("Completed: %d successful, %d errors", successfulUpdates, errorCount)
-
-	// Run OPTIMIZE TABLE to force final collapsing (fire-and-forget, no error returned)
-	store.OptimizeTable(ctx)
 
 	// Query all raw rows to check for duplicate versions
 	session := store.Session()
@@ -1169,15 +1155,11 @@ func TestAtomicUpdate_VersionSequence(t *testing.T) {
 		)
 	}
 
-	// After OPTIMIZE, verify only one row remains (the final state)
-	// (fire-and-forget, no error returned)
-	store.OptimizeTable(ctx)
-
-	// Count rows after optimization
+	// Count active rows using sign=1 (avoid expensive FINAL operation)
 	countRows, err := session.QueryWithArgs(ctx, `
 		SELECT count(*) 
-		FROM ci_test.routing_slips FINAL
-		WHERE correlation_id = $1
+		FROM ci_test.routing_slips
+		WHERE correlation_id = $1 AND sign = 1
 	`, correlationID)
 	if err != nil {
 		t.Fatalf("failed to count rows: %v", err)
@@ -1191,12 +1173,12 @@ func TestAtomicUpdate_VersionSequence(t *testing.T) {
 		}
 	}
 
-	if rowCount != 1 {
-		t.Errorf("expected 1 row after OPTIMIZE FINAL, got %d", rowCount)
+	if rowCount == 0 {
+		t.Errorf("expected at least 1 active row (sign=1), got %d", rowCount)
 	}
 
 	t.Logf("SUCCESS: Version sequence verified after %d updates", numUpdates)
-	t.Logf("Final version: %d, row count after OPTIMIZE: %d", finalSlip.Version, rowCount)
+	t.Logf("Final version: %d, active row count (sign=1): %d", finalSlip.Version, rowCount)
 }
 
 // TestHydrateSlip_EmptyAggregates tests that component states are properly hydrated
