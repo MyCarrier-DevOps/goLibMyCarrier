@@ -743,10 +743,8 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	t.Log("PHASE 6: FINAL VERIFICATION")
 	t.Log("═══════════════════════════════════════════════════════════════════════════")
 
-	// Force OPTIMIZE to collapse all rows
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Logf("Warning: OPTIMIZE TABLE failed: %v", err)
-	}
+	// Force OPTIMIZE to collapse all rows (fire-and-forget, errors logged internally)
+	store.OptimizeTable(ctx)
 
 	// Load final slip state
 	finalSlip, err := client.Load(ctx, correlationID)
@@ -1013,10 +1011,8 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 		t.Fatalf("STRESS TEST FAILED: %d errors during concurrent updates", errorCount)
 	}
 
-	// Force OPTIMIZE
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Logf("Warning: OPTIMIZE TABLE failed: %v", err)
-	}
+	// Force OPTIMIZE (fire-and-forget, errors logged internally)
+	store.OptimizeTable(ctx)
 
 	// Verify all data was accumulated
 	finalSlip, err := client.Load(ctx, correlationID)
@@ -1345,11 +1341,9 @@ func TestE2E_ReplacingMergeTreeCollapse(t *testing.T) {
 		t.Errorf("Expected FINAL to return exactly 1 row, got %d", finalRowCount)
 	}
 
-	// Run OPTIMIZE TABLE to physically collapse rows
+	// Run OPTIMIZE TABLE to physically collapse rows (fire-and-forget, errors logged internally)
 	t.Log("Running OPTIMIZE TABLE...")
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Logf("Warning: OPTIMIZE TABLE failed: %v", err)
-	}
+	store.OptimizeTable(ctx)
 
 	// Small delay for OPTIMIZE to complete
 	time.Sleep(2 * time.Second)

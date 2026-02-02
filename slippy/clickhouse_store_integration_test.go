@@ -378,10 +378,8 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		t.Fatalf("failed to update builds_completed step: %v", err)
 	}
 
-	// Run OPTIMIZE TABLE to force collapsing of rows
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Fatalf("failed to optimize table: %v", err)
-	}
+	// Run OPTIMIZE TABLE to force collapsing of rows (fire-and-forget, no error returned)
+	store.OptimizeTable(ctx)
 
 	// Load the final slip and verify no data was lost
 	finalSlip, err := store.Load(ctx, correlationID)
@@ -539,10 +537,8 @@ func TestVersionedCollapsingMergeTree_ConcurrentUpdates(t *testing.T) {
 		t.Fatalf("concurrent update error: %v", err)
 	}
 
-	// Run OPTIMIZE TABLE to force collapsing
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Fatalf("failed to optimize table: %v", err)
-	}
+	// Run OPTIMIZE TABLE to force collapsing (fire-and-forget, no error returned)
+	store.OptimizeTable(ctx)
 
 	// Load and verify
 	finalSlip, err := store.Load(ctx, correlationID)
@@ -731,10 +727,8 @@ func TestVersionedCollapsingMergeTree_DataIntegrity(t *testing.T) {
 		t.Fatalf("failed to update builds_completed: %v", err)
 	}
 
-	// Optimize and load
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Fatalf("failed to optimize table: %v", err)
-	}
+	// Optimize and load (fire-and-forget, no error returned)
+	store.OptimizeTable(ctx)
 
 	finalSlip, err := store.Load(ctx, correlationID)
 	if err != nil {
@@ -948,10 +942,8 @@ func TestAtomicUpdate_NoDuplicateVersions(t *testing.T) {
 
 	t.Logf("Completed: %d successful, %d errors", successfulUpdates, errorCount)
 
-	// Run OPTIMIZE TABLE to force final collapsing
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Fatalf("failed to optimize table: %v", err)
-	}
+	// Run OPTIMIZE TABLE to force final collapsing (fire-and-forget, no error returned)
+	store.OptimizeTable(ctx)
 
 	// Query all raw rows to check for duplicate versions
 	session := store.Session()
@@ -1178,9 +1170,8 @@ func TestAtomicUpdate_VersionSequence(t *testing.T) {
 	}
 
 	// After OPTIMIZE, verify only one row remains (the final state)
-	if err := store.OptimizeTable(ctx); err != nil {
-		t.Fatalf("failed to optimize table: %v", err)
-	}
+	// (fire-and-forget, no error returned)
+	store.OptimizeTable(ctx)
 
 	// Count rows after optimization
 	countRows, err := session.QueryWithArgs(ctx, `

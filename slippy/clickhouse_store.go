@@ -110,7 +110,7 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 	}
 
 	// Default to NopLogger if no logger provided
-	storeLogger := Logger(NopLogger())
+	storeLogger := NopLogger()
 	if opts.Logger != nil {
 		storeLogger = opts.Logger
 	}
@@ -432,10 +432,10 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Update the slip's version to the new value
 	slip.Version = newVersion
 
-	// Run OPTIMIZE TABLE to force immediate collapsing (fire-and-forget)
-	// This improves read consistency but is not required for correctness.
-	// With epoch-based versioning, reads naturally get the latest version.
-	s.OptimizeTable(ctx)
+	// Run OPTIMIZE TABLE if enabled (fire-and-forget, errors are logged not returned)
+	if s.optimizeAfterWrite {
+		s.OptimizeTable(ctx)
+	}
 
 	return nil
 }
