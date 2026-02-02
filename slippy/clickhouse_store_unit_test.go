@@ -455,17 +455,18 @@ func TestClickHouseStore_Update(t *testing.T) {
 		}
 	})
 
-	t.Run("version conflict error", func(t *testing.T) {
-		// With post-insert verification, version conflict is detected AFTER insert
-		// The mock should return a different version than what Update generated
+	t.Run("version conflict no longer detected with epoch versioning", func(t *testing.T) {
+		// With epoch-based versioning, each update has a unique timestamp-based version.
+		// Updates no longer fail with ErrVersionConflict - "last write wins" semantics apply.
+		// This test verifies that Update succeeds even when another "higher version" exists,
+		// because we no longer do post-insert verification.
 		mockSession := &clickhousetest.MockSession{
 			QueryRowFunc: func(ctx context.Context, query string, args ...any) ch.Row {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
 						if len(dest) > 0 {
 							if v, ok := dest[0].(*sql.NullInt64); ok {
-								// Return a much higher version to simulate another update winning
-								// Use max int64 value
+								// Even if we return a higher version, Update should succeed
 								v.Int64 = int64(^uint64(0) >> 1) // Max int64
 								v.Valid = true
 							}
@@ -488,15 +489,15 @@ func TestClickHouseStore_Update(t *testing.T) {
 			Version:       1, // Slip has version 1
 		}
 
+		// With epoch versioning and no verification, Update should succeed
 		err := store.Update(context.Background(), slip)
-		if !errors.Is(err, ErrVersionConflict) {
-			t.Errorf("expected ErrVersionConflict, got %v", err)
+		if err != nil {
+			t.Errorf("expected no error with epoch versioning, got %v", err)
 		}
-		// With post-insert verification, the insert happens BEFORE the conflict is detected
-		// So we expect 1 ExecWithArgs call (the insert)
+		// Verify the insert was made
 		if len(mockSession.ExecWithArgsCalls) != 1 {
 			t.Errorf(
-				"expected 1 ExecWithArgs call (insert before conflict detected), got %d",
+				"expected 1 ExecWithArgs call (atomic cancel + new via UNION ALL), got %d",
 				len(mockSession.ExecWithArgsCalls),
 			)
 		}
@@ -1378,9 +1379,10 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
-	// Should have called QueryRow twice (Load + getMaxVersion) and ExecWithArgs once (atomic cancel + new via UNION ALL)
-	if len(mockSession.QueryRowCalls) != 2 {
-		t.Errorf("expected 2 QueryRow calls (Load + getMaxVersion), got %d", len(mockSession.QueryRowCalls))
+	// Should have called QueryRow once (Load only - no getMaxVersion with epoch versioning)
+	// and ExecWithArgs once (atomic cancel + new via UNION ALL)
+	if len(mockSession.QueryRowCalls) != 1 {
+		t.Errorf("expected 1 QueryRow call (Load only), got %d", len(mockSession.QueryRowCalls))
 	}
 	if len(mockSession.ExecWithArgsCalls) != 1 {
 		t.Errorf(
@@ -2072,10 +2074,8 @@ func TestClickHouseStore_OptimizeTable(t *testing.T) {
 		mockSession := &clickhousetest.MockSession{}
 		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-		err := store.OptimizeTable(context.Background())
-		if err != nil {
-			t.Errorf("expected no error, got %v", err)
-		}
+		store.OptimizeTable(context.Background())
+
 		if len(mockSession.ExecCalls) != 1 {
 			t.Errorf("expected 1 Exec call, got %d", len(mockSession.ExecCalls))
 		}
@@ -2085,19 +2085,20 @@ func TestClickHouseStore_OptimizeTable(t *testing.T) {
 		}
 	})
 
-	t.Run("optimize with error", func(t *testing.T) {
+	t.Run("optimize with error logs but does not fail", func(t *testing.T) {
+		// OptimizeTable is fire-and-forget - errors are logged, not returned
 		expectedErr := errors.New("optimize error")
 		mockSession := &clickhousetest.MockSession{
 			ExecErr: expectedErr,
 		}
 		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-		err := store.OptimizeTable(context.Background())
-		if err == nil {
-			t.Error("expected error, got nil")
-		}
-		if !errors.Is(err, expectedErr) {
-			t.Errorf("expected error to wrap %v, got %v", expectedErr, err)
+		// Should not panic or fail - just logs the error
+		store.OptimizeTable(context.Background())
+
+		// Verify the call was still made
+		if len(mockSession.ExecCalls) != 1 {
+			t.Errorf("expected 1 Exec call, got %d", len(mockSession.ExecCalls))
 		}
 	})
 }
@@ -2183,11 +2184,13 @@ func TestClickHouseStore_SetOptimizeAfterWrite(t *testing.T) {
 			UpdatedAt:     time.Now(),
 		}
 
+		// With fire-and-forget optimization, Create should succeed even when OPTIMIZE fails
+		// (the error is logged but not returned)
 		err := store.Create(context.Background(), slip)
-		if err == nil {
-			t.Error("expected error, got nil")
+		if err != nil {
+			t.Errorf("expected no error (optimize is fire-and-forget), got %v", err)
 		}
-		// INSERT should succeed but OPTIMIZE should fail
+		// INSERT should succeed and OPTIMIZE should be attempted
 		if len(mockSession.ExecWithArgsCalls) != 1 {
 			t.Errorf("expected 1 ExecWithArgs call, got %d", len(mockSession.ExecWithArgsCalls))
 		}
