@@ -145,7 +145,6 @@ func (b *SlipQueryBuilder) BuildFindAllByCommitsQuery() string {
 		ORDER BY c.priority ASC, s.version DESC
 	`, selectColumns, b.database)
 }
-}
 
 // BuildStepColumnsAndValues builds step status column data for INSERT.
 // Returns column names, placeholders, and values in matching order.

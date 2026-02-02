@@ -103,12 +103,6 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		storeLogger = opts.Logger
 	}
 
-	// Default to NopLogger if no logger provided
-	storeLogger := NopLogger()
-	if opts.Logger != nil {
-		storeLogger = opts.Logger
-	}
-
 	store := &ClickHouseStore{
 		session:        session,
 		pipelineConfig: opts.PipelineConfig,
