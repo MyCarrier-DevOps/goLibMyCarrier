@@ -31,11 +31,14 @@ func (b *SlipQueryBuilder) Database() string {
 }
 
 // BuildSelectQuery builds a SELECT query with dynamic columns.
+// Note: We don't use FINAL here as it's expensive. Instead, we rely on:
+// - WHERE sign = 1 to filter out cancelled rows
+// - ORDER BY version DESC LIMIT 1 to get the latest version
 func (b *SlipQueryBuilder) BuildSelectQuery(whereClause, suffix string) string {
 	columns := b.BuildSelectColumns()
 	return fmt.Sprintf(`
 		SELECT %s
-		FROM %s.routing_slips FINAL
+		FROM %s.routing_slips
 		%s
 		%s
 	`, strings.Join(columns, ", "), b.database, whereClause, suffix)
@@ -110,7 +113,7 @@ func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 		SELECT 
 			%s,
 			c.commit_sha AS matched_commit
-		FROM %s.routing_slips s FINAL
+		FROM %s.routing_slips s
 		INNER JOIN commits c ON s.commit_sha = c.commit_sha
 		WHERE lower(s.repository) = lower({repository:String})
 		  AND s.sign = 1
@@ -135,12 +138,13 @@ func (b *SlipQueryBuilder) BuildFindAllByCommitsQuery() string {
 		SELECT 
 			%s,
 			c.commit_sha AS matched_commit
-		FROM %s.routing_slips s FINAL
+		FROM %s.routing_slips s
 		INNER JOIN commits c ON s.commit_sha = c.commit_sha
 		WHERE lower(s.repository) = lower({repository:String})
 		  AND s.sign = 1
 		ORDER BY c.priority ASC, s.version DESC
 	`, selectColumns, b.database)
+}
 }
 
 // BuildStepColumnsAndValues builds step status column data for INSERT.

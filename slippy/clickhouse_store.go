@@ -46,13 +46,12 @@ func calculateSlipNotFoundBackoff(retryNumber int) time.Duration {
 // The store is config-driven: the pipeline configuration determines which
 // step columns exist and how they are queried.
 type ClickHouseStore struct {
-	session            ch.ClickhouseSessionInterface
-	pipelineConfig     *PipelineConfig
-	database           string
-	queryBuilder       *SlipQueryBuilder
-	scanner            *SlipScanner
-	optimizeAfterWrite bool   // If true, runs OPTIMIZE TABLE after each write operation
-	logger             Logger // Logger for operations (defaults to NopLogger)
+	session        ch.ClickhouseSessionInterface
+	pipelineConfig *PipelineConfig
+	database       string
+	queryBuilder   *SlipQueryBuilder
+	scanner        *SlipScanner
+	logger         Logger // Logger for operations (defaults to NopLogger)
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -71,11 +70,6 @@ type ClickHouseStoreOptions struct {
 
 	// Logger for migration output
 	Logger clickhousemigrator.Logger
-
-	// OptimizeAfterWrite if true, runs OPTIMIZE TABLE after each write operation.
-	// This ensures immediate deduplication with ReplacingMergeTree.
-	// Default: true for normal operations, set to false for migrations/bulk operations.
-	OptimizeAfterWrite *bool
 }
 
 // NewClickHouseStoreFromConfig creates a new ClickHouse-backed slip store from config.
@@ -103,10 +97,10 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		opts.Database = "ci"
 	}
 
-	// Default to true for OptimizeAfterWrite (normal operations)
-	optimizeAfterWrite := true
-	if opts.OptimizeAfterWrite != nil {
-		optimizeAfterWrite = *opts.OptimizeAfterWrite
+	// Default to NopLogger if no logger provided
+	storeLogger := NopLogger()
+	if opts.Logger != nil {
+		storeLogger = opts.Logger
 	}
 
 	// Default to NopLogger if no logger provided
@@ -116,13 +110,12 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 	}
 
 	store := &ClickHouseStore{
-		session:            session,
-		pipelineConfig:     opts.PipelineConfig,
-		database:           opts.Database,
-		queryBuilder:       NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
-		scanner:            NewSlipScanner(opts.PipelineConfig),
-		optimizeAfterWrite: optimizeAfterWrite,
-		logger:             storeLogger,
+		session:        session,
+		pipelineConfig: opts.PipelineConfig,
+		database:       opts.Database,
+		queryBuilder:   NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
+		scanner:        NewSlipScanner(opts.PipelineConfig),
+		logger:         storeLogger,
 	}
 
 	// Run migrations unless explicitly skipped
@@ -156,7 +149,6 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 // NewClickHouseStoreFromSession creates a store from an existing session.
 // Migrations are NOT run automatically when using this constructor.
 // Use RunMigrations explicitly if needed.
-// OptimizeAfterWrite defaults to true for normal operations.
 func NewClickHouseStoreFromSession(
 	session ch.ClickhouseSessionInterface,
 	pipelineConfig *PipelineConfig,
@@ -166,32 +158,29 @@ func NewClickHouseStoreFromSession(
 		database = "ci"
 	}
 	return &ClickHouseStore{
-		session:            session,
-		pipelineConfig:     pipelineConfig,
-		database:           database,
-		queryBuilder:       NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:            NewSlipScanner(pipelineConfig),
-		optimizeAfterWrite: true,        // Default to true for normal operations
-		logger:             NopLogger(), // Default to NopLogger
+		session:        session,
+		pipelineConfig: pipelineConfig,
+		database:       database,
+		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:        NewSlipScanner(pipelineConfig),
+		logger:         NopLogger(),
 	}
 }
 
 // NewClickHouseStoreFromConn creates a store from an existing driver connection.
 // Migrations are NOT run automatically when using this constructor.
 // This is provided for backward compatibility with existing code.
-// OptimizeAfterWrite defaults to true for normal operations.
 func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, database string) *ClickHouseStore {
 	if database == "" {
 		database = "ci"
 	}
 	return &ClickHouseStore{
-		session:            ch.NewSessionFromConn(conn),
-		pipelineConfig:     pipelineConfig,
-		database:           database,
-		queryBuilder:       NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:            NewSlipScanner(pipelineConfig),
-		optimizeAfterWrite: true,        // Default to true for normal operations
-		logger:             NopLogger(), // Default to NopLogger
+		session:        ch.NewSessionFromConn(conn),
+		pipelineConfig: pipelineConfig,
+		database:       database,
+		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:        NewSlipScanner(pipelineConfig),
+		logger:         NopLogger(),
 	}
 }
 
@@ -236,38 +225,7 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 	// Update the slip's version to the generated value
 	slip.Version = version
 
-	// Run OPTIMIZE TABLE if enabled (fire-and-forget, errors are logged not returned)
-	if s.optimizeAfterWrite {
-		s.OptimizeTable(ctx)
-	}
-
 	return nil
-}
-
-// OptimizeTable runs OPTIMIZE TABLE to force immediate collapsing.
-// This is necessary with VersionedCollapsingMergeTree to ensure reads don't return
-// uncollapsed rows before background merges complete.
-//
-// This is a fire-and-forget operation: if optimization fails (e.g., due to timeout
-// or ClickHouse load), the error is logged but not returned. The write operation
-// has already succeeded, and optimization is a best-effort operation to improve
-// read consistency. ClickHouse will eventually merge the data in the background.
-func (s *ClickHouseStore) OptimizeTable(ctx context.Context) {
-	query := fmt.Sprintf("OPTIMIZE TABLE %s.routing_slips FINAL", s.database)
-	if err := s.session.Exec(ctx, query); err != nil {
-		// Log the error but don't fail the operation - optimize is best-effort.
-		// The underlying data has been written; ClickHouse will merge it eventually.
-		s.logger.Warn(ctx, "Failed to optimize routing_slips table (non-fatal)", map[string]interface{}{
-			"error":    err.Error(),
-			"database": s.database,
-		})
-	}
-}
-
-// SetOptimizeAfterWrite enables or disables automatic table optimization after writes.
-// This is useful for bulk operations where optimization should be deferred.
-func (s *ClickHouseStore) SetOptimizeAfterWrite(enabled bool) {
-	s.optimizeAfterWrite = enabled
 }
 
 // Load retrieves a slip by its correlation ID.
@@ -431,11 +389,6 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 
 	// Update the slip's version to the new value
 	slip.Version = newVersion
-
-	// Run OPTIMIZE TABLE if enabled (fire-and-forget, errors are logged not returned)
-	if s.optimizeAfterWrite {
-		s.OptimizeTable(ctx)
-	}
 
 	return nil
 }
@@ -1051,7 +1004,7 @@ func (s *ClickHouseStore) insertComponentState(
 
 	// Note: We don't have a message passed in UpdateStep/UpdateComponentStatus signature currently.
 	// We pass empty string for message.
-	err := s.session.ExecWithArgs(ctx, query,
+	return s.session.ExecWithArgs(ctx, query,
 		correlationID,
 		stepName,
 		componentName,
@@ -1059,21 +1012,6 @@ func (s *ClickHouseStore) insertComponentState(
 		"", // message
 		time.Now(),
 	)
-	if err != nil {
-		return err
-	}
-
-	// Force merge to deduplicate rows in ReplacingMergeTree immediately.
-	// This ensures subsequent reads see the latest state without needing FINAL in SELECT.
-	return s.optimizeComponentStatesTable(ctx)
-}
-
-// optimizeComponentStatesTable forces a merge on the slip_component_states table.
-// This is necessary because ReplacingMergeTree deduplicates asynchronously during background merges.
-// Running OPTIMIZE TABLE FINAL ensures the latest state is immediately visible to subsequent queries.
-func (s *ClickHouseStore) optimizeComponentStatesTable(ctx context.Context) error {
-	query := fmt.Sprintf(`OPTIMIZE TABLE %s.%s FINAL`, s.database, TableSlipComponentStates)
-	return s.session.Exec(ctx, query)
 }
 
 // updateAggregateStatusFromComponentStates loads the slip, hydrates it with component states,

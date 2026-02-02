@@ -114,8 +114,12 @@ func TestSlipQueryBuilder_BuildSelectQuery(t *testing.T) {
 	qb := NewSlipQueryBuilder(config, "testdb")
 	query := qb.BuildSelectQuery("WHERE correlation_id = ?", "LIMIT 1")
 
-	if !strings.Contains(query, "testdb.routing_slips FINAL") {
-		t.Error("query should contain 'testdb.routing_slips FINAL'")
+	// Verify table reference without FINAL (expensive operation removed)
+	if !strings.Contains(query, "FROM testdb.routing_slips") {
+		t.Error("query should contain 'FROM testdb.routing_slips'")
+	}
+	if strings.Contains(query, "FINAL") {
+		t.Error("query should NOT contain FINAL (expensive operation)")
 	}
 	if !strings.Contains(query, "WHERE correlation_id = ?") {
 		t.Error("query should contain WHERE clause")
@@ -206,8 +210,11 @@ func TestSlipQueryBuilder_BuildFindByCommitsQuery(t *testing.T) {
 	if !strings.Contains(query, "{commits:Array(String)}") {
 		t.Error("query should contain commits placeholder")
 	}
-	if !strings.Contains(query, "ci.routing_slips s FINAL") {
+	if !strings.Contains(query, "FROM ci.routing_slips s") {
 		t.Error("query should contain table reference")
+	}
+	if strings.Contains(query, "FINAL") {
+		t.Error("query should NOT contain FINAL (expensive operation)")
 	}
 	if !strings.Contains(query, "LIMIT 1") {
 		t.Error("query should have LIMIT 1")

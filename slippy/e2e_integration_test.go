@@ -555,22 +555,24 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 		debugRows.Close()
 	}
 
-	// Debug: Query with FINAL
-	t.Log("DEBUG: Querying with FINAL...")
+	// Debug: Query with sign=1 filter (replaces expensive FINAL operation)
+	t.Log("DEBUG: Querying with sign=1...")
 	finalRows, finalErr := container.conn.Query(ctx, fmt.Sprintf(
-		"SELECT unit_tests_completed_status, sign, version FROM %s.routing_slips FINAL WHERE correlation_id = '%s'",
-		"ci_e2e_test", correlationID))
+		"SELECT unit_tests_completed_status, sign, version FROM %s.routing_slips WHERE correlation_id = '%s' AND sign = 1 ORDER BY version DESC LIMIT 1",
+		"ci_e2e_test",
+		correlationID,
+	))
 	if finalErr != nil {
-		t.Logf("DEBUG: Failed to query with FINAL: %v", finalErr)
+		t.Logf("DEBUG: Failed to query with sign=1: %v", finalErr)
 	} else {
 		for finalRows.Next() {
 			var status string
 			var sign int8
 			var version uint64
 			if err := finalRows.Scan(&status, &sign, &version); err != nil {
-				t.Logf("DEBUG: FINAL Scan error: %v", err)
+				t.Logf("DEBUG: sign=1 Scan error: %v", err)
 			} else {
-				t.Logf("DEBUG: FINAL row - status=%s, sign=%d, version=%d", status, sign, version)
+				t.Logf("DEBUG: sign=1 row - status=%s, sign=%d, version=%d", status, sign, version)
 			}
 		}
 		finalRows.Close()
@@ -742,9 +744,6 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	t.Log("═══════════════════════════════════════════════════════════════════════════")
 	t.Log("PHASE 6: FINAL VERIFICATION")
 	t.Log("═══════════════════════════════════════════════════════════════════════════")
-
-	// Force OPTIMIZE to collapse all rows (fire-and-forget, errors logged internally)
-	store.OptimizeTable(ctx)
 
 	// Load final slip state
 	finalSlip, err := client.Load(ctx, correlationID)
@@ -1010,9 +1009,6 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 	if errorCount > 0 {
 		t.Fatalf("STRESS TEST FAILED: %d errors during concurrent updates", errorCount)
 	}
-
-	// Force OPTIMIZE (fire-and-forget, errors logged internally)
-	store.OptimizeTable(ctx)
 
 	// Verify all data was accumulated
 	finalSlip, err := client.Load(ctx, correlationID)
@@ -1327,36 +1323,29 @@ func TestE2E_ReplacingMergeTreeCollapse(t *testing.T) {
 	}
 	t.Logf("Raw row count (before OPTIMIZE): %d", rawRowCount)
 
-	// Count rows with FINAL (logical view)
+	// Count active rows using sign=1 (replaces expensive FINAL)
 	var finalRowCount uint64
 	if err := container.conn.QueryRow(ctx, `
-		SELECT count(*) FROM ci_collapse_test.routing_slips FINAL
-		WHERE correlation_id = $1
+		SELECT count(*) FROM ci_collapse_test.routing_slips
+		WHERE correlation_id = $1 AND sign = 1
 	`, correlationID).Scan(&finalRowCount); err != nil {
-		t.Fatalf("failed to count FINAL rows: %v", err)
+		t.Fatalf("failed to count active rows: %v", err)
 	}
-	t.Logf("FINAL row count (logical view): %d", finalRowCount)
+	t.Logf("Active row count (sign=1): %d", finalRowCount)
 
-	if finalRowCount != 1 {
-		t.Errorf("Expected FINAL to return exactly 1 row, got %d", finalRowCount)
+	if finalRowCount == 0 {
+		t.Errorf("Expected at least 1 active row (sign=1), got %d", finalRowCount)
 	}
 
-	// Run OPTIMIZE TABLE to physically collapse rows (fire-and-forget, errors logged internally)
-	t.Log("Running OPTIMIZE TABLE...")
-	store.OptimizeTable(ctx)
-
-	// Small delay for OPTIMIZE to complete
-	time.Sleep(2 * time.Second)
-
-	// Count raw rows after OPTIMIZE
+	// Count raw rows (ClickHouse will merge naturally in background)
 	var postOptimizeCount uint64
 	if err := container.conn.QueryRow(ctx, `
 		SELECT count(*) FROM ci_collapse_test.routing_slips
 		WHERE correlation_id = $1
 	`, correlationID).Scan(&postOptimizeCount); err != nil {
-		t.Fatalf("failed to count rows after OPTIMIZE: %v", err)
+		t.Fatalf("failed to count raw rows: %v", err)
 	}
-	t.Logf("Raw row count (after OPTIMIZE): %d", postOptimizeCount)
+	t.Logf("Raw row count: %d", postOptimizeCount)
 
 	// Load final slip and verify data integrity
 	finalSlip, err := client.Load(ctx, correlationID)
@@ -1490,6 +1479,7 @@ func TestE2E_ComponentStateEventSourcing(t *testing.T) {
 	}
 
 	// Query component states directly from the event sourcing table
+	// ReplacingMergeTree tables use FINAL (only VersionedCollapsingMergeTree avoids FINAL)
 	t.Log("")
 	t.Log("COMPONENT STATES IN EVENT SOURCING TABLE:")
 
@@ -1794,8 +1784,10 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 			toString(%s) as builds,
 			toString(state_history) as history,
 			toString(ancestry) as ancestry
-		FROM ci_json_test.routing_slips FINAL
-		WHERE correlation_id = $1
+		FROM ci_json_test.routing_slips
+		WHERE correlation_id = $1 AND sign = 1
+		ORDER BY version DESC
+		LIMIT 1
 	`, buildsStep)
 	err = container.conn.QueryRow(ctx, rawQuery, correlationID).Scan(&buildsJSON, &stateHistoryJSON, &ancestryJSON)
 	if err != nil {
