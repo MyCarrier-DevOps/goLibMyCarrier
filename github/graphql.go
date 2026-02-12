@@ -258,6 +258,11 @@ func (g *GraphQLClient) GetClientForOrg(ctx context.Context, org string) (*githu
 // GetCommitAncestry retrieves the commit ancestry for a given ref.
 // Returns a slice of commit SHAs in order from newest to oldest.
 // This is useful for finding routing slips or tracking commit history.
+//
+// Only the first-parent chain is returned. This prevents merge commits from
+// polluting ancestry with commits from other branches (e.g., merging main
+// into a feature branch would otherwise include main's commits, causing
+// incorrect slip resolution).
 func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref string, depth int) ([]string, error) {
 	// Get authenticated client for this organization
 	client, err := g.GetClientForOrg(ctx, owner)
@@ -265,13 +270,34 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 		return nil, fmt.Errorf("failed to get client for org %s: %w", owner, err)
 	}
 
+	// Over-fetch to ensure we get enough commits for the first-parent chain.
+	// The linearized history includes commits from merged branches; after filtering
+	// to first-parent only, we need at least `depth` first-parent commits remaining.
+	// A branch with frequent merges from main could have 50%+ of its linearized
+	// history be non-first-parent commits, so we use a 5x multiplier.
+	// The caller's configured depth (e.g., 50) reflects the real-world need to
+	// look back many commits to find one that created a routing slip.
+	fetchDepth := depth * 5
+	if fetchDepth < 100 {
+		fetchDepth = 100
+	}
+
+	// Include parent OIDs so we can walk the first-parent chain locally.
+	// GitHub's GraphQL history endpoint returns a linearized view that includes
+	// commits from all parents of merge commits, which pollutes ancestry when
+	// the default branch is merged into a feature branch.
 	var query struct {
 		Repository struct {
 			Object struct {
 				Commit struct {
 					History struct {
 						Nodes []struct {
-							Oid string
+							Oid     string
+							Parents struct {
+								Nodes []struct {
+									Oid string
+								}
+							} `graphql:"parents(first: 1)"`
 						}
 					} `graphql:"history(first: $depth)"`
 				} `graphql:"... on Commit"`
@@ -283,25 +309,88 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 		"owner": githubv4.String(owner),
 		"repo":  githubv4.String(repo),
 		"ref":   githubv4.String(ref),
-		"depth": githubv4.Int(depth),
+		"depth": githubv4.Int(fetchDepth),
 	}
 
 	if err := client.Query(ctx, &query, variables); err != nil {
 		return nil, NewGraphQLError("GetCommitAncestry", owner, repo, ref, err)
 	}
 
-	commits := make([]string, 0, len(query.Repository.Object.Commit.History.Nodes))
-	for _, node := range query.Repository.Object.Commit.History.Nodes {
-		commits = append(commits, node.Oid)
-	}
+	allNodes := query.Repository.Object.Commit.History.Nodes
 
-	g.logger.Debug(ctx, "Retrieved commit ancestry", map[string]interface{}{
-		"count": len(commits),
-		"owner": owner,
-		"repo":  repo,
-		"ref":   ref,
+	// Filter to first-parent chain only.
+	// Starting from HEAD, follow only the first parent of each commit.
+	// This excludes commits brought in via merges from other branches.
+	commits := filterFirstParentChain(allNodes, depth)
+
+	g.logger.Debug(ctx, "Retrieved commit ancestry (first-parent)", map[string]interface{}{
+		"fetched":          len(allNodes),
+		"first_parent_len": len(commits),
+		"owner":            owner,
+		"repo":             repo,
+		"ref":              ref,
 	})
 	return commits, nil
+}
+
+// commitNode is a local type alias for the GraphQL commit node structure
+// used in first-parent filtering.
+type commitNode struct {
+	Oid     string
+	Parents struct {
+		Nodes []struct {
+			Oid string
+		}
+	}
+}
+
+// filterFirstParentChain walks the first-parent chain from the fetched commit history.
+// It starts at the first node (HEAD) and follows only the first parent of each commit,
+// skipping any commits that were brought in via merges from other branches.
+// Returns at most `depth` commit SHAs.
+func filterFirstParentChain(nodes []struct {
+	Oid     string
+	Parents struct {
+		Nodes []struct {
+			Oid string
+		}
+	} `graphql:"parents(first: 1)"`
+}, depth int) []string {
+	if len(nodes) == 0 {
+		return nil
+	}
+
+	// Build a lookup map: OID -> node for O(1) access
+	nodeMap := make(map[string]int, len(nodes))
+	for i, n := range nodes {
+		nodeMap[n.Oid] = i
+	}
+
+	commits := make([]string, 0, depth)
+	currentIdx := 0
+	commits = append(commits, nodes[currentIdx].Oid)
+
+	for len(commits) < depth {
+		current := nodes[currentIdx]
+
+		// No parents means we've reached the root commit
+		if len(current.Parents.Nodes) == 0 {
+			break
+		}
+
+		// Follow the first parent only (index 0 is the first parent in git)
+		firstParentOid := current.Parents.Nodes[0].Oid
+		nextIdx, exists := nodeMap[firstParentOid]
+		if !exists {
+			// First parent not in our fetched set — we've exhausted available data
+			break
+		}
+
+		commits = append(commits, nodes[nextIdx].Oid)
+		currentIdx = nextIdx
+	}
+
+	return commits
 }
 
 // GetPRHeadCommit retrieves the head commit SHA for a pull request.
