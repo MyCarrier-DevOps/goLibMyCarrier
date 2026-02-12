@@ -333,17 +333,6 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 	return commits, nil
 }
 
-// commitNode is a local type alias for the GraphQL commit node structure
-// used in first-parent filtering.
-type commitNode struct {
-	Oid     string
-	Parents struct {
-		Nodes []struct {
-			Oid string
-		}
-	}
-}
-
 // filterFirstParentChain walks the first-parent chain from the fetched commit history.
 // It starts at the first node (HEAD) and follows only the first parent of each commit,
 // skipping any commits that were brought in via merges from other branches.
