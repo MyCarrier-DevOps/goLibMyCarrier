@@ -113,16 +113,30 @@ func TestGetCommitAncestry_Success(t *testing.T) {
 		// Mock GraphQL endpoint
 		if r.URL.Path == "/graphql" || r.URL.Path == "/api/graphql" {
 			queryReceived = true
-			// Mock GraphQL response with commit history
+			// Mock GraphQL response with commit history including parent OIDs
+			// for first-parent chain filtering
 			response := map[string]interface{}{
 				"data": map[string]interface{}{
 					"repository": map[string]interface{}{
 						"object": map[string]interface{}{
 							"history": map[string]interface{}{
 								"nodes": []map[string]interface{}{
-									{"oid": "abc123def456"},
-									{"oid": "def456ghi789"},
-									{"oid": "ghi789jkl012"},
+									{
+										"oid": "abc123def456",
+										"parents": map[string]interface{}{
+											"nodes": []map[string]interface{}{{"oid": "def456ghi789"}},
+										},
+									},
+									{
+										"oid": "def456ghi789",
+										"parents": map[string]interface{}{
+											"nodes": []map[string]interface{}{{"oid": "ghi789jkl012"}},
+										},
+									},
+									{
+										"oid":     "ghi789jkl012",
+										"parents": map[string]interface{}{"nodes": []map[string]interface{}{}},
+									},
 								},
 							},
 						},
@@ -636,7 +650,7 @@ func TestGetCommitAncestry_DebugLogging(t *testing.T) {
 			return
 		}
 
-		// Mock GraphQL endpoint
+		// Mock GraphQL endpoint with parent OIDs for first-parent filtering
 		if r.URL.Path == "/graphql" || r.URL.Path == "/api/graphql" {
 			response := map[string]interface{}{
 				"data": map[string]interface{}{
@@ -644,8 +658,16 @@ func TestGetCommitAncestry_DebugLogging(t *testing.T) {
 						"object": map[string]interface{}{
 							"history": map[string]interface{}{
 								"nodes": []map[string]interface{}{
-									{"oid": "commit1"},
-									{"oid": "commit2"},
+									{
+										"oid": "commit1",
+										"parents": map[string]interface{}{
+											"nodes": []map[string]interface{}{{"oid": "commit2"}},
+										},
+									},
+									{
+										"oid":     "commit2",
+										"parents": map[string]interface{}{"nodes": []map[string]interface{}{}},
+									},
 								},
 							},
 						},
@@ -677,4 +699,135 @@ func TestGetCommitAncestry_DebugLogging(t *testing.T) {
 	mockLog.mu.Lock()
 	defer mockLog.mu.Unlock()
 	assert.NotEmpty(t, mockLog.debugCalls, "Debug should have been called for commit ancestry retrieval")
+}
+
+// TestGetCommitAncestry_FirstParentFiltering tests that merge commits from other branches
+// are excluded from the ancestry chain. This prevents incorrect slip resolution when
+// the default branch (main/integration) is merged into a feature branch.
+func TestGetCommitAncestry_FirstParentFiltering(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Mock JWT endpoint for installation discovery
+		if r.URL.Path == "/api/v3/app/installations" {
+			response := []map[string]interface{}{
+				{
+					"id": json.Number("123456"),
+					"account": map[string]interface{}{
+						"login": "test-owner",
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+
+		// Mock access token endpoint
+		if r.URL.Path == "/api/v3/app/installations/123456/access_tokens" {
+			response := map[string]interface{}{
+				"token":      "ghs_mock_token",
+				"expires_at": "2099-12-31T23:59:59Z",
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+
+		// Mock GraphQL endpoint with a merge scenario:
+		//
+		// feature-3 (HEAD)
+		// |
+		// merge-commit  <-- git merge main
+		// ├── feature-2 (first parent)
+		// │   └── feature-1
+		// └── main-X (second parent, from main)
+		//     └── main-Y
+		//
+		// GitHub's linearized history returns all commits interleaved:
+		//   [feature-3, merge-commit, main-X, feature-2, main-Y, feature-1]
+		//
+		// After first-parent filtering, only the first-parent chain remains:
+		//   [feature-3, merge-commit, feature-2, feature-1]
+		if r.URL.Path == "/graphql" || r.URL.Path == "/api/graphql" {
+			response := map[string]interface{}{
+				"data": map[string]interface{}{
+					"repository": map[string]interface{}{
+						"object": map[string]interface{}{
+							"history": map[string]interface{}{
+								"nodes": []map[string]interface{}{
+									// feature-3: first parent is merge-commit
+									{
+										"oid": "feature3aaa",
+										"parents": map[string]interface{}{
+											"nodes": []map[string]interface{}{{"oid": "mergecommit"}},
+										},
+									},
+									// merge-commit: first parent is feature-2 (branch we were on), second parent is main-X
+									{
+										"oid": "mergecommit",
+										"parents": map[string]interface{}{
+											"nodes": []map[string]interface{}{{"oid": "feature2bbb"}},
+										},
+									},
+									// main-X: from the merged-in main branch (should be filtered out)
+									{
+										"oid": "mainXcccccc",
+										"parents": map[string]interface{}{
+											"nodes": []map[string]interface{}{{"oid": "mainYdddddd"}},
+										},
+									},
+									// feature-2: first parent is feature-1
+									{
+										"oid": "feature2bbb",
+										"parents": map[string]interface{}{
+											"nodes": []map[string]interface{}{{"oid": "feature1eee"}},
+										},
+									},
+									// main-Y: from main branch (should be filtered out)
+									{
+										"oid":     "mainYdddddd",
+										"parents": map[string]interface{}{"nodes": []map[string]interface{}{}},
+									},
+									// feature-1: root of feature branch
+									{
+										"oid":     "feature1eee",
+										"parents": map[string]interface{}{"nodes": []map[string]interface{}{}},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client, err := NewGraphQLClient(
+		GraphQLConfig{AppID: 123, PrivateKey: testPrivateKey(t), EnterpriseURL: server.URL},
+		nil,
+	)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	commits, err := client.GetCommitAncestry(ctx, "test-owner", "test-repo", "HEAD", 25)
+	require.NoError(t, err)
+
+	// Should only contain the first-parent chain: feature-3 -> merge -> feature-2 -> feature-1
+	assert.Len(t, commits, 4)
+	assert.Equal(t, "feature3aaa", commits[0])
+	assert.Equal(t, "mergecommit", commits[1])
+	assert.Equal(t, "feature2bbb", commits[2])
+	assert.Equal(t, "feature1eee", commits[3])
+
+	// main-X and main-Y must NOT be in the result
+	for _, c := range commits {
+		assert.NotEqual(t, "mainXcccccc", c, "main branch commit should be filtered out")
+		assert.NotEqual(t, "mainYdddddd", c, "main branch commit should be filtered out")
+	}
 }
