@@ -3,7 +3,6 @@ package vault
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/hashicorp/vault-client-go"
@@ -50,15 +49,8 @@ type AppRoleAuthenticator struct{}
 // ViperConfigLoader implements configuration loading using Viper
 type ViperConfigLoader struct{}
 
-// viperMutex protects concurrent access to Viper operations
-var viperMutex sync.Mutex
-
 // ViperConfigLoader implements ConfigLoader interface
 func (v *ViperConfigLoader) LoadConfig() (*VaultConfig, error) {
-	// Lock to protect concurrent access when multiple loaders run simultaneously
-	viperMutex.Lock()
-	defer viperMutex.Unlock()
-
 	// Use an isolated viper instance to avoid global state pollution
 	// that could affect other packages using viper with different env prefixes
 	vp := viper.New()
