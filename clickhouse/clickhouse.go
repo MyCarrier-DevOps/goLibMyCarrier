@@ -290,7 +290,13 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 		if err := conn.Ping(ctx); err != nil {
 			var exception *clickhouse.Exception
 			if errors.As(err, &exception) {
-				return fmt.Errorf("exception [%d] %s %s", exception.Code, exception.Message, exception.StackTrace)
+				return fmt.Errorf(
+					"exception [%d] %s %s: %w",
+					exception.Code,
+					exception.Message,
+					exception.StackTrace,
+					exception,
+				)
 			}
 			return err
 		}
