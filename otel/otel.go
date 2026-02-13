@@ -214,13 +214,13 @@ func (l *OtelLogger) Warnf(template string, args ...interface{}) {
 // Fatal logs a fatal level message and then exits the process
 func (l *OtelLogger) Fatal(args ...interface{}) {
 	l.log(LevelFatal, fmt.Sprint(args...))
-	l.exitFunc(1)
+	l.exit(1)
 }
 
 // Fatalf logs a fatal level message with formatting and then exits the process
 func (l *OtelLogger) Fatalf(template string, args ...interface{}) {
 	l.log(LevelFatal, fmt.Sprintf(template, args...))
-	l.exitFunc(1)
+	l.exit(1)
 }
 
 // With adds a key-value pair to the logger context
@@ -265,6 +265,17 @@ func (l *OtelLogger) Shutdown(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// exit calls exitFunc if set, otherwise falls back to os.Exit.
+// This makes OtelLogger safe to use even when constructed as a zero value
+// (e.g., OtelLogger{}) without going through NewAppLogger.
+func (l *OtelLogger) exit(code int) {
+	if l.exitFunc != nil {
+		l.exitFunc(code)
+		return
+	}
+	os.Exit(code)
 }
 
 type loggerKey struct{}

@@ -58,7 +58,7 @@ func (c *Client) doGET(url string) ([]byte, error) {
 	}
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			// Log the error but don't override the main error
+			// Intentionally ignore close error; response body already processed
 			_ = closeErr
 		}
 	}()

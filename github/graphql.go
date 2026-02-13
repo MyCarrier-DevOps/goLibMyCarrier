@@ -292,7 +292,13 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 	// GitHub's GraphQL API enforces a hard limit of 100 records per connection,
 	// so we cap at 100. This means for very deep ancestry searches, the caller
 	// may need multiple resolution strategies (e.g., image tag fallback).
-	fetchDepth := depth * 5
+	var fetchDepth int
+	if depth <= 0 {
+		// GitHub requires history(first: N) with 1 <= N <= 100; clamp to 1 for non-positive depths.
+		fetchDepth = 1
+	} else {
+		fetchDepth = depth * 5
+	}
 	if fetchDepth > 100 {
 		fetchDepth = 100
 	}

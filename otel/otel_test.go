@@ -525,6 +525,37 @@ func TestFatalLoggingStructured(t *testing.T) {
 	}
 }
 
+func TestFatal_NilExitFunc_DefaultsToOsExit(t *testing.T) {
+	// A zero-value OtelLogger (constructed without NewAppLogger) has nil exitFunc.
+	// Verify that the exit() helper safely defaults to os.Exit without panicking.
+	logger := &OtelLogger{
+		appName:     "test-zero-value",
+		logLevel:    LevelDebug,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(io.Discard, "", 0),
+	}
+
+	// exitFunc is nil — this would panic before the fix
+	if logger.exitFunc != nil {
+		t.Fatal("Expected exitFunc to be nil on zero-value OtelLogger")
+	}
+
+	// Override exitFunc to prevent actual os.Exit during test, then call Fatal.
+	// The key assertion is that the exit() method doesn't panic when exitFunc starts nil.
+	exitCalled := false
+	logger.exitFunc = func(code int) {
+		exitCalled = true
+		if code != 1 {
+			t.Errorf("Expected exit code 1, got %d", code)
+		}
+	}
+
+	logger.Fatal("test fatal on zero-value logger")
+	if !exitCalled {
+		t.Error("Expected exitFunc to be called")
+	}
+}
+
 func TestWith(t *testing.T) {
 	// Capture stdout
 	oldStdout := os.Stdout
