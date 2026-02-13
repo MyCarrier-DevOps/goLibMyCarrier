@@ -26,20 +26,25 @@ type ConfigLoaderInterface interface {
 //   - ARGOCD_SERVER -> ServerUrl (required)
 //   - ARGOCD_AUTHTOKEN -> AuthToken (required)
 //
+// Uses an isolated viper instance to avoid global state pollution that could
+// affect other packages using viper with different env prefixes.
+//
 // Returns an error if required environment variables are missing or if
 // there are issues with configuration binding or validation.
 func LoadConfig() (*Config, error) {
-	if err := viper.BindEnv("server_url", "ARGOCD_SERVER"); err != nil {
+	vp := viper.New()
+
+	if err := vp.BindEnv("server_url", "ARGOCD_SERVER"); err != nil {
 		return nil, fmt.Errorf("error binding ARGOCD_SERVER: %w", err)
 	}
-	if err := viper.BindEnv("auth_token", "ARGOCD_AUTHTOKEN"); err != nil {
+	if err := vp.BindEnv("auth_token", "ARGOCD_AUTHTOKEN"); err != nil {
 		return nil, fmt.Errorf("error binding ARGOCD_AUTHTOKEN: %w", err)
 	}
 
-	viper.AutomaticEnv()
+	vp.AutomaticEnv()
 	var config Config
 
-	if err := viper.Unmarshal(&config); err != nil {
+	if err := vp.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("error unmarshalling config: %w", err)
 	}
 

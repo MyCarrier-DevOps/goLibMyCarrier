@@ -4,8 +4,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-
-	"github.com/spf13/viper"
 )
 
 // testConfigEnvVars sets up test environment variables
@@ -40,12 +38,10 @@ func (vars testConfigEnvVars) cleanup(t *testing.T) {
 			t.Errorf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
 		}
 	}
-	viper.Reset()
 }
 
 // testLoadConfigMissing tests missing environment variable scenarios
 func testLoadConfigMissing(t *testing.T, vars testConfigEnvVars, missingVar string) {
-	viper.Reset()
 	vars.setEnvVars(t)
 	defer vars.cleanup(t)
 
@@ -80,9 +76,6 @@ func TestConfig_Struct(t *testing.T) {
 }
 
 func TestLoadConfig_Success(t *testing.T) {
-	// Clean up viper state
-	viper.Reset()
-
 	// Set environment variables
 	if err := os.Setenv("ARGOCD_SERVER", "https://argocd.example.com"); err != nil {
 		t.Fatalf("Failed to set ARGOCD_SERVER: %v", err)
@@ -99,7 +92,6 @@ func TestLoadConfig_Success(t *testing.T) {
 		if err := os.Unsetenv("ARGOCD_AUTHTOKEN"); err != nil {
 			t.Errorf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
 		}
-		viper.Reset()
 	}()
 
 	config, err := LoadConfig()
@@ -135,9 +127,6 @@ func TestLoadConfig_MissingAuthToken(t *testing.T) {
 }
 
 func TestLoadConfig_AllMissing(t *testing.T) {
-	// Clean up viper state
-	viper.Reset()
-
 	// Ensure no environment variables are set
 	if err := os.Unsetenv("ARGOCD_SERVER"); err != nil {
 		t.Errorf("Failed to unset ARGOCD_SERVER: %v", err)
@@ -145,8 +134,6 @@ func TestLoadConfig_AllMissing(t *testing.T) {
 	if err := os.Unsetenv("ARGOCD_AUTHTOKEN"); err != nil {
 		t.Errorf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
 	}
-
-	defer viper.Reset()
 
 	config, err := LoadConfig()
 	if err == nil {
@@ -246,9 +233,6 @@ func TestLoadConfig_PartialEnvironmentVariables(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Clean up viper state
-			viper.Reset()
-
 			// Clean up any existing environment variables
 			_ = os.Unsetenv("ARGOCD_SERVER")
 			_ = os.Unsetenv("ARGOCD_AUTHTOKEN")
@@ -265,7 +249,6 @@ func TestLoadConfig_PartialEnvironmentVariables(t *testing.T) {
 				for key := range tc.envVars {
 					_ = os.Unsetenv(key)
 				}
-				viper.Reset()
 			}()
 
 			config, err := LoadConfig()
@@ -315,7 +298,6 @@ func BenchmarkLoadConfig(b *testing.B) {
 
 	b.ResetTimer()
 	for range b.N {
-		viper.Reset()
 		_, err := LoadConfig()
 		if err != nil {
 			b.Fatalf("Unexpected error: %v", err)
