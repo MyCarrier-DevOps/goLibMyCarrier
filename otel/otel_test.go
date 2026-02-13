@@ -427,6 +427,12 @@ func TestFatalLogging(t *testing.T) {
 		t.Fatal("NewAppLogger() should return *OtelLogger")
 	}
 
+	// Override exitFunc so Fatal doesn't kill the test process
+	exitCodes := []int{}
+	otelLogger.exitFunc = func(code int) {
+		exitCodes = append(exitCodes, code)
+	}
+
 	// Test Fatal method
 	otelLogger.Fatal("fatal error occurred")
 
@@ -457,6 +463,16 @@ func TestFatalLogging(t *testing.T) {
 	// Verify log level is "fatal"
 	if !strings.Contains(output, `"level":"fatal"`) {
 		t.Error("Expected log level to be 'fatal'")
+	}
+
+	// Verify exitFunc was called with code 1 for both Fatal and Fatalf
+	if len(exitCodes) != 2 {
+		t.Errorf("Expected exitFunc to be called 2 times, got %d", len(exitCodes))
+	}
+	for i, code := range exitCodes {
+		if code != 1 {
+			t.Errorf("Expected exit code 1 for call %d, got %d", i, code)
+		}
 	}
 }
 

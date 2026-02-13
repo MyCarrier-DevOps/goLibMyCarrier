@@ -3,6 +3,7 @@ package otel
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	stdlog "log"
 	"os"
@@ -107,6 +108,9 @@ type OtelLogger struct {
 	traceProvider *sdktrace.TracerProvider
 	logger        otellog.Logger
 	logProvider   *sdklog.LoggerProvider
+	// exitFunc is called by Fatal/Fatalf after logging. Defaults to os.Exit.
+	// Override in tests to prevent process termination.
+	exitFunc func(int)
 }
 
 // LogEntry represents a structured log entry
@@ -150,6 +154,7 @@ func NewAppLogger() AppLogger {
 		attributes:  make(map[string]interface{}),
 		fallbackLog: fallbackLog,
 		useOtel:     useOtel,
+		exitFunc:    os.Exit,
 	}
 
 	// Initialize OpenTelemetry if enabled
@@ -206,14 +211,16 @@ func (l *OtelLogger) Warnf(template string, args ...interface{}) {
 	l.log(LevelWarn, fmt.Sprintf(template, args...))
 }
 
-// Fatal logs a fatal level message
+// Fatal logs a fatal level message and then exits the process
 func (l *OtelLogger) Fatal(args ...interface{}) {
 	l.log(LevelFatal, fmt.Sprint(args...))
+	l.exitFunc(1)
 }
 
-// Fatalf logs a fatal level message with formatting
+// Fatalf logs a fatal level message with formatting and then exits the process
 func (l *OtelLogger) Fatalf(template string, args ...interface{}) {
 	l.log(LevelFatal, fmt.Sprintf(template, args...))
+	l.exitFunc(1)
 }
 
 // With adds a key-value pair to the logger context
@@ -229,6 +236,7 @@ func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 		traceProvider: l.traceProvider,
 		logger:        l.logger,
 		logProvider:   l.logProvider,
+		exitFunc:      l.exitFunc,
 	}
 
 	// Copy existing attributes
@@ -242,20 +250,21 @@ func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 	return newLogger
 }
 
-// Shutdown gracefully shuts down the OpenTelemetry providers
+// Shutdown gracefully shuts down the OpenTelemetry providers.
+// All provider errors are collected and returned as a joined error.
 func (l *OtelLogger) Shutdown(ctx context.Context) error {
-	var err error
+	var errs []error
 	if l.traceProvider != nil {
 		if shutdownErr := l.traceProvider.Shutdown(ctx); shutdownErr != nil {
-			err = shutdownErr
+			errs = append(errs, fmt.Errorf("trace provider shutdown: %w", shutdownErr))
 		}
 	}
 	if l.logProvider != nil {
 		if shutdownErr := l.logProvider.Shutdown(ctx); shutdownErr != nil {
-			err = shutdownErr
+			errs = append(errs, fmt.Errorf("log provider shutdown: %w", shutdownErr))
 		}
 	}
-	return err
+	return errors.Join(errs...)
 }
 
 type loggerKey struct{}
@@ -267,11 +276,36 @@ func WithLogger(ctx context.Context, logger AppLogger) context.Context {
 }
 
 // FromContext returns the logger in the context.
+// If no logger is found, returns a lightweight fallback logger that does not
+// initialize OpenTelemetry providers (to avoid expensive provider creation
+// on every call).
 func FromContext(ctx context.Context) AppLogger {
 	if logger, ok := ctx.Value(loggerKey{}).(AppLogger); ok {
 		return logger
 	}
-	return NewAppLogger()
+	// Return a lightweight logger without OTel initialization to avoid
+	// creating expensive providers on every missing-context call.
+	logLevelStr, _ := os.LookupEnv("LOG_LEVEL")
+	if logLevelStr == "" {
+		logLevelStr = InfoLevel
+	}
+	appName, _ := os.LookupEnv("LOG_APP_NAME")
+	if appName == "" {
+		appName = "default_app"
+	}
+	appVersion, _ := os.LookupEnv("LOG_APP_VERSION")
+	if appVersion == "" {
+		appVersion = "1.0.0"
+	}
+	return &OtelLogger{
+		appName:     appName,
+		appVersion:  appVersion,
+		logLevel:    parseLogLevel(logLevelStr),
+		attributes:  make(map[string]interface{}),
+		fallbackLog: stdlog.New(os.Stdout, fmt.Sprintf("[%s] ", appName), stdlog.LstdFlags),
+		useOtel:     false,
+		exitFunc:    os.Exit,
+	}
 }
 
 // GinLoggerMiddleware creates a Gin middleware that uses otel logger
