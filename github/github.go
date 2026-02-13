@@ -169,7 +169,7 @@ func (s *GithubSession) Client() *github.Client {
 func (s *GithubSession) authenticate() error {
 	privateKey := []byte(s.pem)
 	if _, err := jwt.ParseRSAPrivateKeyFromPEM(privateKey); err != nil {
-		return fmt.Errorf("error creating application token source: invalid private key: %s", err.Error())
+		return fmt.Errorf("error creating application token source: invalid private key: %w", err)
 	}
 	appID, err := strconv.ParseInt(s.appID, 10, 64)
 	if err != nil {
@@ -177,17 +177,17 @@ func (s *GithubSession) authenticate() error {
 	}
 	installationID, err := strconv.ParseInt(s.installID, 10, 64)
 	if err != nil {
-		return fmt.Errorf("error parsing installationID: %s", err.Error())
+		return fmt.Errorf("error parsing installationID: %w", err)
 	}
 	appTokenSource, err := githubauth.NewApplicationTokenSource(appID, privateKey)
 	if err != nil {
-		return fmt.Errorf("error creating application token source: %s", err.Error())
+		return fmt.Errorf("error creating application token source: %w", err)
 	}
 	installationTokenSource := githubauth.NewInstallationTokenSource(installationID, appTokenSource)
 	httpClient := oauth2.NewClient(context.Background(), installationTokenSource)
 	token, err := installationTokenSource.Token()
 	if err != nil {
-		return fmt.Errorf("error generating token: %s", err.Error())
+		return fmt.Errorf("error generating token: %w", err)
 	}
 	s.client = github.NewClient(httpClient)
 	s.auth = token

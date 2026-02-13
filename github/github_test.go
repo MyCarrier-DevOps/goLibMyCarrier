@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"testing"
 
 	"github.com/google/go-github/v82/github"
@@ -482,6 +483,34 @@ func TestGithubSession_Authenticate_Errors(t *testing.T) {
 		err := session.authenticate()
 		assert.Error(t, err)
 		// Will fail on invalid private key first since empty PEM
+	})
+}
+
+// TestGithubSession_Authenticate_ErrorWrapping verifies that authenticate()
+// consistently wraps errors with %w so callers can use errors.Is / errors.As.
+func TestGithubSession_Authenticate_ErrorWrapping(t *testing.T) {
+	validPEM := testPrivateKey(t)
+
+	t.Run("invalid appID wraps with strconv.ErrSyntax", func(t *testing.T) {
+		session := &GithubSession{
+			pem:       validPEM,
+			appID:     "not-a-number",
+			installID: "67890",
+		}
+		err := session.authenticate()
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, strconv.ErrSyntax, "appID parse error should wrap the original strconv error")
+	})
+
+	t.Run("invalid installID wraps with strconv.ErrSyntax", func(t *testing.T) {
+		session := &GithubSession{
+			pem:       validPEM,
+			appID:     "12345",
+			installID: "not-a-number",
+		}
+		err := session.authenticate()
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, strconv.ErrSyntax, "installID parse error should wrap the original strconv error")
 	})
 }
 
