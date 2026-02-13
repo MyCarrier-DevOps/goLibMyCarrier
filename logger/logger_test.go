@@ -39,6 +39,18 @@ func TestFromContext(t *testing.T) {
 	})
 }
 
+// TestFromContext_DefaultLoggerReuse verifies that FromContext returns the same
+// cached default logger instance on repeated calls without a logger in context,
+// avoiding expensive allocation on every miss.
+func TestFromContext_DefaultLoggerReuse(t *testing.T) {
+	ctx := context.Background()
+	logger1 := FromContext(ctx)
+	logger2 := FromContext(ctx)
+	if logger1 != logger2 {
+		t.Errorf("expected FromContext to return the same default logger instance, got two different pointers")
+	}
+}
+
 func TestConfigureLogLevelLogger(t *testing.T) {
 	convey.Convey("Configure logger with different log levels", t, func() {
 		convey.Convey("Configure with info level", func() {

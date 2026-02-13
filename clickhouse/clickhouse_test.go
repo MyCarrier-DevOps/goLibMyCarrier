@@ -3,10 +3,12 @@ package clickhouse
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	chdriver "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -1960,4 +1962,75 @@ func TestClickhouseSession_Exec_RetryExhaustion(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "operation failed after 3 retries")
 	mockConn.AssertExpectations(t)
+}
+
+// Test retryOperation does NOT retry non-transient errors (ClickHouse exceptions)
+func TestRetryOperation_NonTransientError_NoRetry(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx := context.Background()
+	callCount := 0
+
+	// ClickHouse server exceptions are non-transient and should fail immediately
+	serverErr := &chdriver.Exception{
+		Code:    62, // SYNTAX_ERROR
+		Message: "Syntax error in query",
+	}
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return serverErr
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, 1, callCount, "non-transient errors should NOT be retried")
+	assert.ErrorIs(t, err, serverErr)
+}
+
+// Test isTransientError classification
+func TestIsTransientError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "generic error is transient",
+			err:      errors.New("connection refused"),
+			expected: true,
+		},
+		{
+			name: "clickhouse exception is NOT transient",
+			err: &chdriver.Exception{
+				Code:    62,
+				Message: "Syntax error",
+			},
+			expected: false,
+		},
+		{
+			name:     "wrapped generic error is transient",
+			err:      fmt.Errorf("failed: %w", errors.New("timeout")),
+			expected: true,
+		},
+		{
+			name: "wrapped clickhouse exception is NOT transient",
+			err: fmt.Errorf("query failed: %w", &chdriver.Exception{
+				Code:    60,
+				Message: "Table does not exist",
+			}),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isTransientError(tt.err)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
 }

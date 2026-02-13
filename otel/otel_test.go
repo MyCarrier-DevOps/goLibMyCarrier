@@ -427,6 +427,12 @@ func TestFatalLogging(t *testing.T) {
 		t.Fatal("NewAppLogger() should return *OtelLogger")
 	}
 
+	// Override exitFunc so Fatal doesn't kill the test process
+	exitCodes := []int{}
+	otelLogger.exitFunc = func(code int) {
+		exitCodes = append(exitCodes, code)
+	}
+
 	// Test Fatal method
 	otelLogger.Fatal("fatal error occurred")
 
@@ -457,6 +463,16 @@ func TestFatalLogging(t *testing.T) {
 	// Verify log level is "fatal"
 	if !strings.Contains(output, `"level":"fatal"`) {
 		t.Error("Expected log level to be 'fatal'")
+	}
+
+	// Verify exitFunc was called with code 1 for both Fatal and Fatalf
+	if len(exitCodes) != 2 {
+		t.Errorf("Expected exitFunc to be called 2 times, got %d", len(exitCodes))
+	}
+	for i, code := range exitCodes {
+		if code != 1 {
+			t.Errorf("Expected exit code 1 for call %d, got %d", i, code)
+		}
 	}
 }
 
@@ -506,6 +522,37 @@ func TestFatalLoggingStructured(t *testing.T) {
 	}
 	if logEntry.Attributes["severity"] != "critical" {
 		t.Errorf("Expected attribute severity='critical', got %v", logEntry.Attributes["severity"])
+	}
+}
+
+func TestFatal_NilExitFunc_DefaultsToOsExit(t *testing.T) {
+	// A zero-value OtelLogger (constructed without NewAppLogger) has nil exitFunc.
+	// Verify that the exit() helper safely defaults to os.Exit without panicking.
+	logger := &OtelLogger{
+		appName:     "test-zero-value",
+		logLevel:    LevelDebug,
+		attributes:  make(map[string]interface{}),
+		fallbackLog: log.New(io.Discard, "", 0),
+	}
+
+	// exitFunc is nil — this would panic before the fix
+	if logger.exitFunc != nil {
+		t.Fatal("Expected exitFunc to be nil on zero-value OtelLogger")
+	}
+
+	// Override exitFunc to prevent actual os.Exit during test, then call Fatal.
+	// The key assertion is that the exit() method doesn't panic when exitFunc starts nil.
+	exitCalled := false
+	logger.exitFunc = func(code int) {
+		exitCalled = true
+		if code != 1 {
+			t.Errorf("Expected exit code 1, got %d", code)
+		}
+	}
+
+	logger.Fatal("test fatal on zero-value logger")
+	if !exitCalled {
+		t.Error("Expected exitFunc to be called")
 	}
 }
 

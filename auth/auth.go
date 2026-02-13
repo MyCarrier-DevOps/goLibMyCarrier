@@ -1,8 +1,9 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -26,7 +27,7 @@ func (am *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Check if AuthMiddleware instance is nil
 		if am == nil {
-			log.Println("AuthMiddleware instance is nil")
+			slog.Error("AuthMiddleware instance is nil")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 			c.Abort()
 			return
@@ -34,7 +35,7 @@ func (am *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 
 		// Check if validApiKey is set
 		if am.validApiKey == "" {
-			log.Println("validApiKey is not set")
+			slog.Error("validApiKey is not set")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Internal server error"})
 			c.Abort()
 			return
@@ -56,7 +57,7 @@ func (am *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 		// Decode the Base64 ApiKey
 		decodedApiKey, err := base64.StdEncoding.DecodeString(apiKey)
 		if err != nil {
-			log.Printf("Failed to decode Base64 string: %v", err.Error())
+			slog.Error("failed to decode Base64 API key", "error", err)
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
 			return
@@ -65,8 +66,8 @@ func (am *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 		// Convert decoded API key to string
 		decodedApiKeyStr := string(decodedApiKey)
 
-		// Validate the API key
-		if decodedApiKeyStr != am.validApiKey {
+		// Validate the API key using constant-time comparison to prevent timing attacks
+		if subtle.ConstantTimeCompare([]byte(decodedApiKeyStr), []byte(am.validApiKey)) != 1 {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
 			return

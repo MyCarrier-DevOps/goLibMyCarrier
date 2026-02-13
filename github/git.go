@@ -352,7 +352,7 @@ func createCommit(worktree *git.Worktree, options CommitOptions) (plumbing.Hash,
 // pushChanges pushes the committed changes to the remote repository
 func pushChanges(repo *git.Repository, options CommitOptions) error {
 	if options.Auth == nil {
-		return nil // No push if no auth provided
+		return fmt.Errorf("push authentication is required: Auth must be provided in CommitOptions")
 	}
 
 	pushOptions := &git.PushOptions{
@@ -397,8 +397,12 @@ func CommitChanges(repo *git.Repository, options CommitOptions) (string, error) 
 		return "", err
 	}
 
-	if err := pushChanges(repo, options); err != nil {
-		return commit.String(), err
+	// Only push if authentication is provided.
+	// This allows "commit only" usage when Auth is nil.
+	if options.Auth != nil {
+		if err := pushChanges(repo, options); err != nil {
+			return commit.String(), err
+		}
 	}
 
 	return commit.String(), nil

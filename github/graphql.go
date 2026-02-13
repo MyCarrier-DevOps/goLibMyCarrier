@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,6 +41,11 @@ type GraphQLClient struct {
 	privateKey    []byte
 	enterpriseURL string
 	logger        logger.Logger
+
+	// httpClient is used for REST API calls (e.g. installation discovery).
+	// Defaults to a client with a 30-second timeout to prevent hung goroutines
+	// if the GitHub API becomes unresponsive.
+	httpClient *http.Client
 
 	// Cache of org -> installation ID mappings
 	installationCache map[string]int64
@@ -92,6 +98,7 @@ func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, err
 		privateKey:        privateKey,
 		enterpriseURL:     cfg.EnterpriseURL,
 		logger:            log,
+		httpClient:        &http.Client{Timeout: 30 * time.Second},
 		installationCache: make(map[string]int64),
 		clientCache:       make(map[string]*githubv4.Client),
 	}, nil
@@ -115,6 +122,7 @@ func (g *GraphQLClient) GetGraphQLURL() string {
 
 // DiscoverInstallationID finds the installation ID for a given organization.
 // Results are cached to avoid repeated API calls.
+// Handles paginated results from the GitHub API via Link headers.
 func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) (int64, error) {
 	// Check cache first
 	g.cacheMutex.RLock()
@@ -134,70 +142,78 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 		return 0, fmt.Errorf("failed to generate app JWT: %w", err)
 	}
 
-	// Query all installations for this app
-	req, err := http.NewRequestWithContext(ctx, "GET",
-		g.GetAPIBaseURL()+"/app/installations", http.NoBody)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create request: %w", err)
-	}
+	// Paginate through all installations for this app
+	availableOrgs := make([]string, 0)
+	nextURL := g.GetAPIBaseURL() + "/app/installations?per_page=100"
 
-	req.Header.Set("Authorization", "Bearer "+jwtToken)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-Github-Api-Version", "2022-11-28")
+	for nextURL != "" {
+		req, err := http.NewRequestWithContext(ctx, "GET", nextURL, http.NoBody)
+		if err != nil {
+			return 0, fmt.Errorf("failed to create request: %w", err)
+		}
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, fmt.Errorf("failed to query installations: %w", err)
-	}
-	defer func() {
+		req.Header.Set("Authorization", "Bearer "+jwtToken)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-Github-Api-Version", "2022-11-28")
+
+		resp, err := g.httpClient.Do(req)
+		if err != nil {
+			return 0, fmt.Errorf("failed to query installations: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			body, readErr := io.ReadAll(resp.Body)
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				g.logger.Debug(ctx, "failed to close response body", map[string]interface{}{"error": closeErr.Error()})
+			}
+			var bodyStr string
+			if readErr != nil {
+				bodyStr = fmt.Sprintf("(could not read body: %v)", readErr)
+			} else {
+				bodyStr = string(body)
+			}
+			// Detect authentication vs other errors
+			isAuthErr := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
+			return 0, NewInstallationLookupError(org, fmt.Errorf("%s - %s", resp.Status, bodyStr), isAuthErr)
+		}
+
+		var installations []Installation
+		if err := json.NewDecoder(resp.Body).Decode(&installations); err != nil {
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				g.logger.Debug(ctx, "failed to close response body", map[string]interface{}{"error": closeErr.Error()})
+			}
+			return 0, fmt.Errorf("failed to decode installations: %w", err)
+		}
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			g.logger.Debug(ctx, "Failed to close response body", map[string]interface{}{"error": closeErr.Error()})
+			g.logger.Debug(ctx, "failed to close response body", map[string]interface{}{"error": closeErr.Error()})
 		}
-	}()
 
-	if resp.StatusCode != http.StatusOK {
-		body, readErr := io.ReadAll(resp.Body)
-		var bodyStr string
-		if readErr != nil {
-			bodyStr = fmt.Sprintf("(could not read body: %v)", readErr)
-		} else {
-			bodyStr = string(body)
-		}
-		// Detect authentication vs other errors
-		isAuthErr := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
-		return 0, NewInstallationLookupError(org, fmt.Errorf("%s - %s", resp.Status, bodyStr), isAuthErr)
-	}
-
-	var installations []Installation
-	if err := json.NewDecoder(resp.Body).Decode(&installations); err != nil {
-		return 0, fmt.Errorf("failed to decode installations: %w", err)
-	}
-
-	// Collect all available organizations for error reporting
-	availableOrgs := make([]string, 0, len(installations))
-
-	// Find installation for the target organization
-	for _, inst := range installations {
-		g.logger.Debug(ctx, "Found installation", map[string]interface{}{
-			"installation_id": inst.ID,
-			"account":         inst.Account.Login,
-			"type":            inst.Account.Type,
-		})
-
-		availableOrgs = append(availableOrgs, inst.Account.Login)
-
-		// Cache all discovered installations
-		g.cacheMutex.Lock()
-		g.installationCache[inst.Account.Login] = inst.ID
-		g.cacheMutex.Unlock()
-
-		if inst.Account.Login == org {
-			g.logger.Info(ctx, "Resolved installation ID", map[string]interface{}{
+		// Process installations from this page
+		for _, inst := range installations {
+			g.logger.Debug(ctx, "Found installation", map[string]interface{}{
 				"installation_id": inst.ID,
-				"organization":    org,
+				"account":         inst.Account.Login,
+				"type":            inst.Account.Type,
 			})
-			return inst.ID, nil
+
+			availableOrgs = append(availableOrgs, inst.Account.Login)
+
+			// Cache all discovered installations
+			g.cacheMutex.Lock()
+			g.installationCache[inst.Account.Login] = inst.ID
+			g.cacheMutex.Unlock()
+
+			if inst.Account.Login == org {
+				g.logger.Info(ctx, "Resolved installation ID", map[string]interface{}{
+					"installation_id": inst.ID,
+					"organization":    org,
+				})
+				return inst.ID, nil
+			}
 		}
+
+		// Follow pagination via Link header
+		nextURL = parseNextPageURL(resp.Header.Get("Link"))
 	}
 
 	// Return error with available orgs - let caller decide how to log based on shadow mode
@@ -273,12 +289,17 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 	// Over-fetch to ensure we get enough commits for the first-parent chain.
 	// The linearized history includes commits from merged branches; after filtering
 	// to first-parent only, we need at least `depth` first-parent commits remaining.
-	// A branch with frequent merges from main could have 50%+ of its linearized
-	// history be non-first-parent commits, so we use a 5x multiplier.
-	// The caller's configured depth (e.g., 50) reflects the real-world need to
-	// look back many commits to find one that created a routing slip.
-	fetchDepth := depth * 5
-	if fetchDepth < 100 {
+	// GitHub's GraphQL API enforces a hard limit of 100 records per connection,
+	// so we cap at 100. This means for very deep ancestry searches, the caller
+	// may need multiple resolution strategies (e.g., image tag fallback).
+	var fetchDepth int
+	if depth <= 0 {
+		// GitHub requires history(first: N) with 1 <= N <= 100; clamp to 1 for non-positive depths.
+		fetchDepth = 1
+	} else {
+		fetchDepth = depth * 5
+	}
+	if fetchDepth > 100 {
 		fetchDepth = 100
 	}
 
@@ -447,6 +468,31 @@ func (g *GraphQLClient) GetCachedInstallationIDs() map[string]int64 {
 		result[k] = v
 	}
 	return result
+}
+
+// parseNextPageURL extracts the "next" page URL from a GitHub Link header.
+// The Link header format is: <url>; rel="next", <url>; rel="last"
+// Returns an empty string if there is no next page.
+func parseNextPageURL(linkHeader string) string {
+	if linkHeader == "" {
+		return ""
+	}
+
+	// Split by comma to get individual link entries
+	for _, part := range strings.Split(linkHeader, ",") {
+		part = strings.TrimSpace(part)
+		// Look for rel="next"
+		if !strings.Contains(part, `rel="next"`) {
+			continue
+		}
+		// Extract URL between < and >
+		start := strings.Index(part, "<")
+		end := strings.Index(part, ">")
+		if start >= 0 && end > start {
+			return part[start+1 : end]
+		}
+	}
+	return ""
 }
 
 // generateAppJWT creates a JWT for authenticating as the GitHub App.

@@ -1034,4 +1034,50 @@ func TestProcessNodeEdgeCases(t *testing.T) {
 			t.Errorf("Unexpected error: %v", err)
 		}
 	})
+
+	// Test that sequences of complex objects (maps) stay in block style
+	t.Run("sequence_of_maps_uses_block_style", func(t *testing.T) {
+		tmpDir, err := os.MkdirTemp("", "yaml-test")
+		if err != nil {
+			t.Fatalf("Failed to create temp directory: %v", err)
+		}
+		defer os.RemoveAll(tmpDir)
+
+		data := map[string]interface{}{
+			"testdefinitions": []interface{}{
+				map[string]interface{}{
+					"name":    "suite1",
+					"filters": []string{"TestCategory=coreapitest"},
+				},
+				map[string]interface{}{
+					"name":    "suite2",
+					"filters": []string{"TestCategory=integration"},
+				},
+			},
+		}
+
+		filePath := filepath.Join(tmpDir, "test.yaml")
+		err = WriteYamlFileWithStyle(filePath, data)
+		if err != nil {
+			t.Fatalf("Failed to write YAML file: %v", err)
+		}
+
+		content, err := os.ReadFile(filePath)
+		if err != nil {
+			t.Fatalf("Failed to read YAML file: %v", err)
+		}
+
+		contentStr := string(content)
+
+		// Sequences of maps should remain in block style (multiline)
+		// NOT flow style like [{name: suite1, ...}, {name: suite2, ...}]
+		if strings.Contains(contentStr, "testdefinitions: [{") || strings.Contains(contentStr, "testdefinitions: [{}") {
+			t.Errorf("Expected block style for sequence of maps, but got flow style:\n%s", contentStr)
+		}
+
+		// The inner "filters" arrays (scalars only) should still be flow style
+		if !strings.Contains(contentStr, `filters: ["TestCategory=coreapitest"]`) {
+			t.Errorf("Expected filters to use flow style, but got:\n%s", contentStr)
+		}
+	})
 }

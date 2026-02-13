@@ -27,25 +27,27 @@ type GithubConfig struct {
 }
 
 func GithubLoadConfig() (*GithubConfig, error) {
-	// Load the configuration from environment variables or a config file
-	viper.SetEnvPrefix("GITHUB")
-	if err := viper.BindEnv("pem", "GITHUB_APP_PRIVATE_KEY"); err != nil {
+	// Load the configuration from environment variables using an isolated viper instance
+	// to prevent cross-package state pollution.
+	vp := viper.New()
+	vp.SetEnvPrefix("GITHUB")
+	if err := vp.BindEnv("pem", "GITHUB_APP_PRIVATE_KEY"); err != nil {
 		return nil, fmt.Errorf("error binding env GITHUB_APP_PRIVATE_KEY: %w", err)
 	}
-	if err := viper.BindEnv("app_id", "GITHUB_APP_ID"); err != nil {
+	if err := vp.BindEnv("app_id", "GITHUB_APP_ID"); err != nil {
 		return nil, fmt.Errorf("error binding env GITHUB_APP_ID: %w", err)
 	}
-	if err := viper.BindEnv("install_id", "GITHUB_APP_INSTALLATION_ID"); err != nil {
+	if err := vp.BindEnv("install_id", "GITHUB_APP_INSTALLATION_ID"); err != nil {
 		return nil, fmt.Errorf("error binding env GITHUB_APP_INSTALLATION_ID: %w", err)
 	}
 
 	// Read environment variables
-	viper.AutomaticEnv()
+	vp.AutomaticEnv()
 
 	var GithubConfig GithubConfig
 
 	// Unmarshal environment variables into the Config struct
-	if err := viper.Unmarshal(&GithubConfig); err != nil {
+	if err := vp.Unmarshal(&GithubConfig); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
@@ -167,25 +169,25 @@ func (s *GithubSession) Client() *github.Client {
 func (s *GithubSession) authenticate() error {
 	privateKey := []byte(s.pem)
 	if _, err := jwt.ParseRSAPrivateKeyFromPEM(privateKey); err != nil {
-		return fmt.Errorf("error creating application token source: invalid private key: %s", err.Error())
+		return fmt.Errorf("error creating application token source: invalid private key: %w", err)
 	}
 	appID, err := strconv.ParseInt(s.appID, 10, 64)
 	if err != nil {
-		return fmt.Errorf("error parsing appId ")
+		return fmt.Errorf("error parsing appId: %w", err)
 	}
 	installationID, err := strconv.ParseInt(s.installID, 10, 64)
 	if err != nil {
-		return fmt.Errorf("error parsing installationID: %s", err.Error())
+		return fmt.Errorf("error parsing installationID: %w", err)
 	}
 	appTokenSource, err := githubauth.NewApplicationTokenSource(appID, privateKey)
 	if err != nil {
-		return fmt.Errorf("error creating application token source: %s", err.Error())
+		return fmt.Errorf("error creating application token source: %w", err)
 	}
 	installationTokenSource := githubauth.NewInstallationTokenSource(installationID, appTokenSource)
 	httpClient := oauth2.NewClient(context.Background(), installationTokenSource)
 	token, err := installationTokenSource.Token()
 	if err != nil {
-		return fmt.Errorf("error generating token: %s", err.Error())
+		return fmt.Errorf("error generating token: %w", err)
 	}
 	s.client = github.NewClient(httpClient)
 	s.auth = token

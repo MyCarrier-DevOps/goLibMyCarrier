@@ -828,3 +828,70 @@ func TestSetExpectedTables(t *testing.T) {
 		t.Errorf("expected 2 tables, got %d", len(migrator.expectedTables))
 	}
 }
+
+// ============================================================================
+// Empty DownSQL / UpSQL Validation Tests
+// ============================================================================
+
+func TestMigrateDown_EmptyDownSQL_Skips(t *testing.T) {
+	callCount := 0
+	mockConn := &MockConn{
+		QueryRowFunc: func(ctx context.Context, query string, args ...interface{}) driver.Row {
+			callCount++
+			if callCount == 1 {
+				// Table exists
+				return &MockRow{values: []interface{}{uint64(1)}}
+			}
+			// Current version is 2
+			return &MockRow{values: []interface{}{uint32(2)}}
+		},
+	}
+
+	migrations := []Migration{
+		{Version: 1, Name: "v1", UpSQL: "CREATE TABLE t1", DownSQL: "DROP TABLE t1"},
+		{Version: 2, Name: "v2_irreversible", UpSQL: "ALTER TABLE t1 ADD COLUMN x", DownSQL: ""},
+	}
+	migrator, _ := NewMigrator(mockConn, nil, WithMigrations(migrations))
+
+	// Migrating down should skip v2 (no DownSQL) and revert v1 normally
+	err := migrator.MigrateToVersion(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// v2 DownSQL is empty so its ALTER should NOT have been executed
+	for _, call := range mockConn.ExecCalls {
+		if strings.Contains(call.Query, "ALTER TABLE") {
+			t.Error("should not have executed empty DownSQL for v2")
+		}
+	}
+}
+
+func TestCreateTables_EmptyUpSQL(t *testing.T) {
+	callCount := 0
+	mockConn := &MockConn{
+		QueryRowFunc: func(ctx context.Context, query string, args ...interface{}) driver.Row {
+			callCount++
+			if callCount == 1 {
+				// Table exists
+				return &MockRow{values: []interface{}{uint64(1)}}
+			}
+			// Current version is 0
+			return &MockRow{values: []interface{}{uint32(0)}}
+		},
+	}
+
+	migrations := []Migration{
+		{Version: 1, Name: "v1_empty", UpSQL: "", DownSQL: "DROP TABLE t1"},
+	}
+	migrator, _ := NewMigrator(mockConn, nil, WithMigrations(migrations))
+
+	err := migrator.CreateTables(context.Background())
+	if err == nil {
+		t.Fatal("expected error for empty UpSQL, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "UpSQL is empty") {
+		t.Errorf("expected error about empty UpSQL, got: %v", err)
+	}
+}
