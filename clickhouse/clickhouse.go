@@ -36,8 +36,26 @@ func Named(name string, value interface{}) driver.NamedValue {
 // This can be overridden in tests for faster execution.
 var DefaultRetryIntervals = []time.Duration{2 * time.Second, 3 * time.Second, 5 * time.Second}
 
+// isTransientError determines whether a ClickHouse error is transient (and thus
+// worth retrying) or permanent (e.g. syntax error, authentication failure).
+// Server-side exceptions (clickhouse.Exception) are treated as non-transient
+// since they indicate query or configuration problems that won't resolve on retry.
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var exception *clickhouse.Exception
+	if errors.As(err, &exception) {
+		// Server-side exceptions are deterministic and won't resolve on retry
+		return false
+	}
+	// Everything else (network errors, timeouts, EOF) is transient
+	return true
+}
+
 // retryOperation retries a clickhouse operation with exponential backoff.
-// It will retry on failure using DefaultRetryIntervals (2s, 3s, and 5s by default).
+// Only transient errors (network issues, timeouts) are retried.
+// Non-transient errors (server exceptions like syntax/auth errors) fail immediately.
 // Tests can override DefaultRetryIntervals for faster execution.
 func retryOperation(ctx context.Context, operation func() error) error {
 	backoffIntervals := DefaultRetryIntervals
@@ -47,8 +65,12 @@ func retryOperation(ctx context.Context, operation func() error) error {
 	if err == nil {
 		return nil
 	}
+	// Don't retry non-transient errors (e.g. SQL syntax errors, auth failures)
+	if !isTransientError(err) {
+		return err
+	}
 
-	// Retry with backoff
+	// Retry with backoff for transient errors only
 	for i, interval := range backoffIntervals {
 		select {
 		case <-ctx.Done():
@@ -57,6 +79,9 @@ func retryOperation(ctx context.Context, operation func() error) error {
 			err = operation()
 			if err == nil {
 				return nil
+			}
+			if !isTransientError(err) {
+				return err
 			}
 		}
 	}
