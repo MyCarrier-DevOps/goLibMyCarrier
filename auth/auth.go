@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"crypto/subtle"
 	"encoding/base64"
 	"log"
 	"net/http"
@@ -65,8 +66,8 @@ func (am *AuthMiddleware) MiddlewareFunc() gin.HandlerFunc {
 		// Convert decoded API key to string
 		decodedApiKeyStr := string(decodedApiKey)
 
-		// Validate the API key
-		if decodedApiKeyStr != am.validApiKey {
+		// Validate the API key using constant-time comparison to prevent timing attacks
+		if subtle.ConstantTimeCompare([]byte(decodedApiKeyStr), []byte(am.validApiKey)) != 1 {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			c.Abort()
 			return
