@@ -4,87 +4,64 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
-	"time"
+
+	"github.com/hashicorp/go-retryablehttp"
 )
 
-// GetArgoApplicationResourceTree gets the resource tree from ArgoCD (for health status in v3.0+)
+// GetArgoApplicationResourceTree gets the resource tree from ArgoCD (for health status in v3.0+).
+// It uses the retryable HTTP client with exponential backoff to handle transient failures,
+// consistent with GetApplication and GetManifests.
 func (c *Client) GetArgoApplicationResourceTree(argoAppName string) (map[string]interface{}, error) {
-	const maxRetries = 3
-	const baseDelay = time.Second
+	apiUrl := fmt.Sprintf("%v/api/v1/applications/%v/resource-tree", c.baseUrl, argoAppName)
 
-	var lastErr error
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+	req, err := retryablehttp.NewRequest("GET", apiUrl, nil)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
 	}
 
-	for attempt := range maxRetries {
-		if attempt > 0 {
-			// Exponential backoff: wait 1s, 2s, 4s
-			delay := baseDelay * time.Duration(1<<uint(attempt-1))
-			time.Sleep(delay)
-		}
+	// Set headers
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.authToken))
+	req.Header.Set("Content-Type", "application/json")
 
-		apiUrl := fmt.Sprintf("%v/api/v1/applications/%v/resource-tree", c.baseUrl, argoAppName)
-		req, err := http.NewRequest("GET", apiUrl, http.NoBody)
-		if err != nil {
-			lastErr = fmt.Errorf("error creating request: %w", err)
-			continue
-		}
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.authToken))
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			lastErr = fmt.Errorf("error making request (attempt %d/%d): %w", attempt+1, maxRetries, err)
-			continue
-		}
-
-		// Check for HTTP error status codes
-		if resp.StatusCode >= 500 {
-			_, readErr := io.ReadAll(resp.Body)
-			closeErr := resp.Body.Close()
-			lastErr = fmt.Errorf("server error %d (attempt %d/%d)", resp.StatusCode, attempt+1, maxRetries)
-			if readErr != nil {
-				lastErr = fmt.Errorf("server error %d (attempt %d/%d), failed to read body: %w",
-					resp.StatusCode, attempt+1, maxRetries, readErr)
-			}
-			if closeErr != nil {
-				lastErr = fmt.Errorf("server error %d (attempt %d/%d), failed to close body: %w",
-					resp.StatusCode, attempt+1, maxRetries, closeErr)
-			}
-			continue
-		} else if resp.StatusCode >= 400 {
-			// Client errors (4xx) shouldn't be retried
-			body, err := io.ReadAll(resp.Body)
-			if closeErr := resp.Body.Close(); closeErr != nil {
-				return nil, fmt.Errorf("error closing response body: %w", closeErr)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("error reading body: %w", err)
-			}
-			return nil, fmt.Errorf("client error %d: %s", resp.StatusCode, string(body))
-		}
-
-		body, err := io.ReadAll(resp.Body)
+	resp, err := c.retryableClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %w", err)
+	}
+	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
-			lastErr = fmt.Errorf("error closing response body: %w", closeErr)
-			continue
+			// Log the error but don't override the main error
+			_ = closeErr
 		}
-		if err != nil {
-			lastErr = fmt.Errorf("error reading response body: %w", err)
-			continue
-		}
+	}()
 
-		var resourceTree map[string]interface{}
-		err = json.Unmarshal(body, &resourceTree)
+	// Handle 4xx client errors (these weren't retried)
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			lastErr = fmt.Errorf("error unmarshalling ArgoCD resource tree data: %w", err)
-			continue
+			return nil, fmt.Errorf("error reading body: %w", err)
 		}
-
-		return resourceTree, nil
+		return nil, fmt.Errorf("client error %d: %s", resp.StatusCode, string(body))
 	}
 
-	return nil, fmt.Errorf("failed after %d attempts, last error: %w", maxRetries, lastErr)
+	// Handle any remaining 5xx errors that exhausted retries
+	if resp.StatusCode >= 500 {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("error reading body: %w", err)
+		}
+		return nil, fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	var resourceTree map[string]interface{}
+	err = json.Unmarshal(body, &resourceTree)
+	if err != nil {
+		return nil, fmt.Errorf("error unmarshalling ArgoCD resource tree data: %w", err)
+	}
+
+	return resourceTree, nil
 }

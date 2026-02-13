@@ -124,12 +124,9 @@ func TestGetArgoApplicationResourceTree_MaxRetriesExceeded(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error after max retries, got nil")
 	}
-	if callCount != 3 {
-		t.Errorf("expected 3 calls (max retries), got %d", callCount)
-	}
-	expectedErrMsg := "failed after 3 attempts"
-	if err.Error()[:len(expectedErrMsg)] != expectedErrMsg {
-		t.Errorf("expected error to start with '%s', got: %v", expectedErrMsg, err)
+	// retryablehttp: initial attempt + RetryMax(3) retries = 4 total calls
+	if callCount != 4 {
+		t.Errorf("expected 4 calls (initial + 3 retries), got %d", callCount)
 	}
 }
 
@@ -147,7 +144,9 @@ func TestGetArgoApplicationResourceTree_InvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected JSON unmarshal error, got nil")
 	}
-	expectedErrMsg := "failed after 3 attempts, last error: error unmarshalling ArgoCD resource tree data"
+	// With retryablehttp, 200 responses are not retried,
+	// so we get a direct unmarshal error without the retry wrapper.
+	expectedErrMsg := "error unmarshalling ArgoCD resource tree data"
 	if len(err.Error()) < len(expectedErrMsg) || err.Error()[:len(expectedErrMsg)] != expectedErrMsg {
 		t.Errorf("expected error to start with '%s', got: %v", expectedErrMsg, err)
 	}
