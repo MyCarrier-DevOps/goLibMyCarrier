@@ -63,14 +63,23 @@ func processNode(node *yaml.Node) {
 		processNode(node.Content[i])
 	}
 
-	// Apply flow style to all sequence nodes (arrays)
+	// Apply flow style only to sequences where ALL items are scalars.
+	// Sequences containing maps or nested sequences stay in block style for readability.
 	if node.Kind == yaml.SequenceNode && len(node.Content) > 0 {
-		// Set the sequence to use flow style (inline array format)
-		node.Style = yaml.FlowStyle
+		allScalar := true
+		for _, child := range node.Content {
+			if child.Kind != yaml.ScalarNode {
+				allScalar = false
+				break
+			}
+		}
 
-		// Ensure all sequence items are set as scalar nodes with double quotes
-		for j := range node.Content {
-			if node.Content[j].Kind == yaml.ScalarNode {
+		if allScalar {
+			// Set the sequence to use flow style (inline array format)
+			node.Style = yaml.FlowStyle
+
+			// Ensure all sequence items are set as scalar nodes with double quotes
+			for j := range node.Content {
 				node.Content[j].Style = yaml.DoubleQuotedStyle
 			}
 		}
