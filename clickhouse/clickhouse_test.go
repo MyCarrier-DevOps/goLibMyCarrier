@@ -272,22 +272,22 @@ func TestClickhouseLoadConfig_Success(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, config)
-	assert.Equal(t, "localhost", config.ChHostname)
-	assert.Equal(t, "default", config.ChUsername)
-	assert.Equal(t, "password", config.ChPassword)
-	assert.Equal(t, "testdb", config.ChDatabase)
-	assert.Equal(t, "9000", config.ChPort)
-	assert.Equal(t, "true", config.ChSkipVerify)
+	assert.Equal(t, "localhost", config.Hostname)
+	assert.Equal(t, "default", config.Username)
+	assert.Equal(t, "password", config.Password)
+	assert.Equal(t, "testdb", config.Database)
+	assert.Equal(t, "9000", config.Port)
+	assert.Equal(t, "true", config.SkipVerify)
 }
 
 // Test configuration validation - missing hostname
 func TestClickhouseValidateConfig_MissingHostname(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -298,11 +298,11 @@ func TestClickhouseValidateConfig_MissingHostname(t *testing.T) {
 // Test configuration validation - missing username
 func TestClickhouseValidateConfig_MissingUsername(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -313,11 +313,11 @@ func TestClickhouseValidateConfig_MissingUsername(t *testing.T) {
 // Test configuration validation - missing password
 func TestClickhouseValidateConfig_MissingPassword(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -328,11 +328,11 @@ func TestClickhouseValidateConfig_MissingPassword(t *testing.T) {
 // Test configuration validation - missing database
 func TestClickhouseValidateConfig_MissingDatabase(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -343,11 +343,11 @@ func TestClickhouseValidateConfig_MissingDatabase(t *testing.T) {
 // Test configuration validation - missing port
 func TestClickhouseValidateConfig_MissingPort(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		SkipVerify: "true",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -358,11 +358,11 @@ func TestClickhouseValidateConfig_MissingPort(t *testing.T) {
 // Test configuration validation - missing skip verify
 func TestClickhouseValidateConfig_MissingSkipVerify(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname: "localhost",
-		ChUsername: "default",
-		ChPassword: "password",
-		ChDatabase: "testdb",
-		ChPort:     "9000",
+		Hostname: "localhost",
+		Username: "default",
+		Password: "password",
+		Database: "testdb",
+		Port:     "9000",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -373,12 +373,12 @@ func TestClickhouseValidateConfig_MissingSkipVerify(t *testing.T) {
 // Test configuration validation - invalid skip verify value
 func TestClickhouseValidateConfig_InvalidSkipVerify(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "invalid",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "invalid",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -389,12 +389,12 @@ func TestClickhouseValidateConfig_InvalidSkipVerify(t *testing.T) {
 // Test configuration validation - valid config
 func TestClickhouseValidateConfig_Valid(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -404,12 +404,12 @@ func TestClickhouseValidateConfig_Valid(t *testing.T) {
 // Test configuration validation - skip verify false
 func TestClickhouseValidateConfig_SkipVerifyFalse(t *testing.T) {
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "false",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "false",
 	}
 
 	err := ClickhouseValidateConfig(config)
@@ -431,7 +431,7 @@ func TestDefaultConfigLoader_LoadConfig(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, config)
-	assert.Equal(t, "localhost", config.ChHostname)
+	assert.Equal(t, "localhost", config.Hostname)
 }
 
 // Test DefaultConfigValidator
@@ -440,12 +440,12 @@ func TestDefaultConfigValidator_ValidateConfig(t *testing.T) {
 
 	// Test valid config
 	validConfig := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	err := validator.ValidateConfig(validConfig)
@@ -466,12 +466,12 @@ func TestDefaultSessionFactory_NewSession(t *testing.T) {
 	factory := &DefaultSessionFactory{}
 
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	ctx := context.Background()
@@ -497,8 +497,8 @@ func TestDefaultSessionFactory_NewSession(t *testing.T) {
 func TestMockConfigLoader(t *testing.T) {
 	mockLoader := &MockConfigLoader{}
 	expectedConfig := &ClickhouseConfig{
-		ChHostname: "mock-host",
-		ChUsername: "mock-user",
+		Hostname: "mock-host",
+		Username: "mock-user",
 	}
 
 	mockLoader.On("LoadConfig").Return(expectedConfig, nil)
@@ -543,7 +543,7 @@ func TestMockConfigValidator(t *testing.T) {
 func TestMockConfigValidator_Success(t *testing.T) {
 	mockValidator := &MockConfigValidator{}
 	testConfig := &ClickhouseConfig{
-		ChHostname: "localhost",
+		Hostname: "localhost",
 	}
 
 	mockValidator.On("ValidateConfig", testConfig).Return(nil)
@@ -751,12 +751,12 @@ func TestNewClickhouseSession_Success(t *testing.T) {
 	defer setTestRetryIntervals()()
 
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	ctx := context.Background()
@@ -794,12 +794,12 @@ func TestClickhouseSession_Connect(t *testing.T) {
 
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	ctx := context.Background()
@@ -821,12 +821,12 @@ func TestClickhouseSession_Connect_InvalidConfig(t *testing.T) {
 
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
-		ChHostname:   "invalid-host-that-does-not-exist",
-		ChUsername:   "invalid",
-		ChPassword:   "invalid",
-		ChDatabase:   "invalid",
-		ChPort:       "99999",
-		ChSkipVerify: "true",
+		Hostname:   "invalid-host-that-does-not-exist",
+		Username:   "invalid",
+		Password:   "invalid",
+		Database:   "invalid",
+		Port:       "99999",
+		SkipVerify: "true",
 	}
 
 	ctx := context.Background()
@@ -947,12 +947,12 @@ func TestClickhouseSession_Connect_NilContext(t *testing.T) {
 
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	err := session.Connect(config, nil)
@@ -968,12 +968,12 @@ func TestClickhouseSession_Connect_MalformedHostname(t *testing.T) {
 
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
-		ChHostname:   "invalid-host-with-special-chars@#$%",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "invalid-host-with-special-chars@#$%",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	ctx := context.Background()
@@ -995,12 +995,12 @@ func TestClickhouseSession_Connect_InvalidPort(t *testing.T) {
 
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "99999", // Invalid port
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "99999", // Invalid port
+		SkipVerify: "true",
 	}
 
 	ctx := context.Background()
@@ -1090,7 +1090,7 @@ func TestClickhouseLoadConfig_SkipVerifyFalse(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.NotNil(t, config)
-	assert.Equal(t, "false", config.ChSkipVerify)
+	assert.Equal(t, "false", config.SkipVerify)
 }
 
 // Test NewClickhouseSession with skip verify false
@@ -1098,12 +1098,12 @@ func TestNewClickhouseSession_SkipVerifyFalse(t *testing.T) {
 	defer setTestRetryIntervals()()
 
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9000",
-		ChSkipVerify: "false",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9000",
+		SkipVerify: "false",
 	}
 
 	ctx := context.Background()
@@ -1128,12 +1128,12 @@ func TestClickhouseSession_Connect_DifferentPorts(t *testing.T) {
 
 	session := &ClickhouseSession{}
 	config := &ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChUsername:   "default",
-		ChPassword:   "password",
-		ChDatabase:   "testdb",
-		ChPort:       "9440", // Different port
-		ChSkipVerify: "true",
+		Hostname:   "localhost",
+		Username:   "default",
+		Password:   "password",
+		Database:   "testdb",
+		Port:       "9440", // Different port
+		SkipVerify: "true",
 	}
 
 	ctx := context.Background()
@@ -1148,20 +1148,20 @@ func TestClickhouseSession_Initialization(t *testing.T) {
 	defer setTestRetryIntervals()()
 
 	config := &ClickhouseConfig{
-		ChHostname:   "test-host",
-		ChUsername:   "test-user",
-		ChPassword:   "test-pass",
-		ChDatabase:   "test-db",
-		ChPort:       "9000",
-		ChSkipVerify: "true",
+		Hostname:   "test-host",
+		Username:   "test-user",
+		Password:   "test-pass",
+		Database:   "test-db",
+		Port:       "9000",
+		SkipVerify: "true",
 	}
 
 	session := &ClickhouseSession{
-		db:         config.ChDatabase,
-		addr:       []string{config.ChHostname + ":" + config.ChPort},
-		username:   config.ChUsername,
-		password:   config.ChPassword,
-		skipVerify: config.ChSkipVerify == "true",
+		db:         config.Database,
+		addr:       []string{config.Hostname + ":" + config.Port},
+		username:   config.Username,
+		password:   config.Password,
+		skipVerify: config.SkipVerify == "true",
 	}
 
 	assert.Equal(t, "test-db", session.db)
@@ -2033,4 +2033,24 @@ func TestIsTransientError(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+// TestClickhouseConfig_FieldNames verifies the renamed config fields
+// (without redundant Ch prefix) map correctly from environment variables.
+func TestClickhouseConfig_FieldNames(t *testing.T) {
+	t.Setenv("CLICKHOUSE_HOSTNAME", "renamed-host")
+	t.Setenv("CLICKHOUSE_USERNAME", "renamed-user")
+	t.Setenv("CLICKHOUSE_PASSWORD", "renamed-pass")
+	t.Setenv("CLICKHOUSE_DATABASE", "renamed-db")
+	t.Setenv("CLICKHOUSE_PORT", "9001")
+	t.Setenv("CLICKHOUSE_SKIP_VERIFY", "true")
+
+	config, err := ClickhouseLoadConfig()
+	assert.NoError(t, err)
+	assert.Equal(t, "renamed-host", config.Hostname)
+	assert.Equal(t, "renamed-user", config.Username)
+	assert.Equal(t, "renamed-pass", config.Password)
+	assert.Equal(t, "renamed-db", config.Database)
+	assert.Equal(t, "9001", config.Port)
+	assert.Equal(t, "true", config.SkipVerify)
 }

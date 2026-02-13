@@ -127,12 +127,12 @@ type ClickhouseSession struct {
 }
 
 type ClickhouseConfig struct {
-	ChHostname   string `mapstructure:"chhostname"`
-	ChUsername   string `mapstructure:"chusername"`
-	ChPassword   string `mapstructure:"chpassword"`
-	ChDatabase   string `mapstructure:"chdatabase"`
-	ChSkipVerify string `mapstructure:"chskipverify"`
-	ChPort       string `mapstructure:"chport"`
+	Hostname   string `mapstructure:"chhostname"`
+	Username   string `mapstructure:"chusername"`
+	Password   string `mapstructure:"chpassword"`
+	Database   string `mapstructure:"chdatabase"`
+	SkipVerify string `mapstructure:"chskipverify"`
+	Port       string `mapstructure:"chport"`
 }
 
 // LoadConfig loads the configuration from environment variables using Viper.
@@ -186,27 +186,27 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 
 // validateConfig validates the loaded configuration.
 func ClickhouseValidateConfig(clickhouseConfig *ClickhouseConfig) error {
-	if clickhouseConfig.ChHostname == "" {
+	if clickhouseConfig.Hostname == "" {
 		return fmt.Errorf("clickhouse hostname is required")
 	}
-	if clickhouseConfig.ChUsername == "" {
+	if clickhouseConfig.Username == "" {
 		return fmt.Errorf("clickhouse username is required")
 	}
-	if clickhouseConfig.ChPassword == "" {
+	if clickhouseConfig.Password == "" {
 		return fmt.Errorf("clickhouse password is required")
 	}
-	if clickhouseConfig.ChDatabase == "" {
+	if clickhouseConfig.Database == "" {
 		return fmt.Errorf("clickhouse database is required")
 	}
 	// Port and SkipVerify have defaults, so they should always be set
 	// But validate they have reasonable values if present
-	if clickhouseConfig.ChPort == "" {
+	if clickhouseConfig.Port == "" {
 		return fmt.Errorf("clickhouse port is required (should default to 9440)")
 	}
-	if clickhouseConfig.ChSkipVerify == "" {
+	if clickhouseConfig.SkipVerify == "" {
 		return fmt.Errorf("clickhouse skip verify is required (should default to false)")
 	}
-	if clickhouseConfig.ChSkipVerify != "true" && clickhouseConfig.ChSkipVerify != "false" {
+	if clickhouseConfig.SkipVerify != "true" && clickhouseConfig.SkipVerify != "false" {
 		return fmt.Errorf("clickhouse skip verify must be true or false")
 	}
 	return nil
@@ -246,11 +246,11 @@ func NewClickhouseSession(ch *ClickhouseConfig, ctx context.Context) (*Clickhous
 	}
 
 	conn := &ClickhouseSession{
-		db:         ch.ChDatabase,
-		addr:       []string{ch.ChHostname + ":" + ch.ChPort},
-		username:   ch.ChUsername,
-		password:   ch.ChPassword,
-		skipVerify: ch.ChSkipVerify == "true",
+		db:         ch.Database,
+		addr:       []string{ch.Hostname + ":" + ch.Port},
+		username:   ch.Username,
+		password:   ch.Password,
+		skipVerify: ch.SkipVerify == "true",
 	}
 
 	err := conn.Connect(ch, ctx)
@@ -272,11 +272,11 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 
 	return retryOperation(ctx, func() error {
 		conn, err := clickhouse.Open(&clickhouse.Options{
-			Addr: []string{ch.ChHostname + ":" + ch.ChPort},
+			Addr: []string{ch.Hostname + ":" + ch.Port},
 			Auth: clickhouse.Auth{
-				Database: ch.ChDatabase,
-				Username: ch.ChUsername,
-				Password: ch.ChPassword,
+				Database: ch.Database,
+				Username: ch.Username,
+				Password: ch.Password,
 			},
 
 			TLS: &tls.Config{
