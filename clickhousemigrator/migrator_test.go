@@ -833,7 +833,7 @@ func TestSetExpectedTables(t *testing.T) {
 // Empty DownSQL / UpSQL Validation Tests
 // ============================================================================
 
-func TestMigrateDown_EmptyDownSQL(t *testing.T) {
+func TestMigrateDown_EmptyDownSQL_Skips(t *testing.T) {
 	callCount := 0
 	mockConn := &MockConn{
 		QueryRowFunc: func(ctx context.Context, query string, args ...interface{}) driver.Row {
@@ -853,21 +853,16 @@ func TestMigrateDown_EmptyDownSQL(t *testing.T) {
 	}
 	migrator, _ := NewMigrator(mockConn, nil, WithMigrations(migrations))
 
-	// Trying to migrate down from version 2 should fail because v2 has no DownSQL
+	// Migrating down should skip v2 (no DownSQL) and revert v1 normally
 	err := migrator.MigrateToVersion(context.Background(), 0)
-	if err == nil {
-		t.Fatal("expected error for empty DownSQL, got nil")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
 	}
 
-	// Should indicate the migration is not reversible
-	if !strings.Contains(err.Error(), "DownSQL is empty") {
-		t.Errorf("expected error about empty DownSQL, got: %v", err)
-	}
-
-	// Should NOT have executed any Exec calls for down migrations
+	// v2 DownSQL is empty so its ALTER should NOT have been executed
 	for _, call := range mockConn.ExecCalls {
-		if strings.HasPrefix(call.Query, "DROP TABLE") {
-			t.Error("should not have executed any down migration SQL")
+		if strings.Contains(call.Query, "ALTER TABLE") {
+			t.Error("should not have executed empty DownSQL for v2")
 		}
 	}
 }

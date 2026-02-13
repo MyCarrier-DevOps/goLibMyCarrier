@@ -446,19 +446,13 @@ func (m *Migrator) migrateDown(ctx context.Context, currentVersion, targetVersio
 			continue
 		}
 
-		// Reject empty DownSQL to prevent silent schema inconsistency
+		// Skip migrations with no DownSQL — these are intentionally irreversible
 		if strings.TrimSpace(migration.DownSQL) == "" {
-			return &MigrationError{
-				Version:     migration.Version,
-				Name:        migration.Name,
-				Description: migration.Description,
-				Operation:   "down",
-				Err: fmt.Errorf(
-					"DownSQL is empty — migration %d (%s) is not reversible",
-					migration.Version,
-					migration.Name,
-				),
-			}
+			m.logger.Info(ctx, "Skipping migration with no DownSQL (not reversible)", map[string]interface{}{
+				"version": migration.Version,
+				"name":    migration.Name,
+			})
+			continue
 		}
 
 		m.logger.Info(ctx, "Reverting migration", map[string]interface{}{
