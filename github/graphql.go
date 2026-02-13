@@ -163,7 +163,9 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 
 		if resp.StatusCode != http.StatusOK {
 			body, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				g.logger.Debug(ctx, "failed to close response body", map[string]interface{}{"error": closeErr.Error()})
+			}
 			var bodyStr string
 			if readErr != nil {
 				bodyStr = fmt.Sprintf("(could not read body: %v)", readErr)
@@ -177,10 +179,14 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 
 		var installations []Installation
 		if err := json.NewDecoder(resp.Body).Decode(&installations); err != nil {
-			_ = resp.Body.Close()
+			if closeErr := resp.Body.Close(); closeErr != nil {
+				g.logger.Debug(ctx, "failed to close response body", map[string]interface{}{"error": closeErr.Error()})
+			}
 			return 0, fmt.Errorf("failed to decode installations: %w", err)
 		}
-		_ = resp.Body.Close()
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			g.logger.Debug(ctx, "failed to close response body", map[string]interface{}{"error": closeErr.Error()})
+		}
 
 		// Process installations from this page
 		for _, inst := range installations {
