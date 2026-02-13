@@ -42,6 +42,11 @@ type GraphQLClient struct {
 	enterpriseURL string
 	logger        logger.Logger
 
+	// httpClient is used for REST API calls (e.g. installation discovery).
+	// Defaults to a client with a 30-second timeout to prevent hung goroutines
+	// if the GitHub API becomes unresponsive.
+	httpClient *http.Client
+
 	// Cache of org -> installation ID mappings
 	installationCache map[string]int64
 	cacheMutex        sync.RWMutex
@@ -93,6 +98,7 @@ func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, err
 		privateKey:        privateKey,
 		enterpriseURL:     cfg.EnterpriseURL,
 		logger:            log,
+		httpClient:        &http.Client{Timeout: 30 * time.Second},
 		installationCache: make(map[string]int64),
 		clientCache:       make(map[string]*githubv4.Client),
 	}, nil
@@ -150,7 +156,7 @@ func (g *GraphQLClient) DiscoverInstallationID(ctx context.Context, org string) 
 		req.Header.Set("Accept", "application/vnd.github+json")
 		req.Header.Set("X-Github-Api-Version", "2022-11-28")
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := g.httpClient.Do(req)
 		if err != nil {
 			return 0, fmt.Errorf("failed to query installations: %w", err)
 		}
