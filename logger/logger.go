@@ -3,6 +3,7 @@ package logger
 import (
 	"context"
 	"os"
+	"sync"
 
 	zap "go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -42,6 +43,13 @@ func NewAppLogger() *zap.SugaredLogger {
 
 type loggerKey struct{}
 
+// defaultLogger is a lazily-initialized fallback logger used by FromContext
+// when no logger is present in the context, avoiding repeated allocations.
+var (
+	defaultLogger     *zap.SugaredLogger
+	defaultLoggerOnce sync.Once
+)
+
 // WithLogger returns a copy of parent context in which the
 // value associated with logger key is the supplied logger.
 func WithLogger(ctx context.Context, logger *zap.SugaredLogger) context.Context {
@@ -49,11 +57,15 @@ func WithLogger(ctx context.Context, logger *zap.SugaredLogger) context.Context 
 }
 
 // FromContext returns the logger in the context.
+// If no logger is found, it returns a cached default logger (initialized once).
 func FromContext(ctx context.Context) *zap.SugaredLogger {
 	if logger, ok := ctx.Value(loggerKey{}).(*zap.SugaredLogger); ok {
 		return logger
 	}
-	return NewAppLogger()
+	defaultLoggerOnce.Do(func() {
+		defaultLogger = NewAppLogger()
+	})
+	return defaultLogger
 }
 
 // Returns logger conifg depending on the log level
