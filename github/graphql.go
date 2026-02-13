@@ -273,12 +273,11 @@ func (g *GraphQLClient) GetCommitAncestry(ctx context.Context, owner, repo, ref 
 	// Over-fetch to ensure we get enough commits for the first-parent chain.
 	// The linearized history includes commits from merged branches; after filtering
 	// to first-parent only, we need at least `depth` first-parent commits remaining.
-	// A branch with frequent merges from main could have 50%+ of its linearized
-	// history be non-first-parent commits, so we use a 5x multiplier.
-	// The caller's configured depth (e.g., 50) reflects the real-world need to
-	// look back many commits to find one that created a routing slip.
+	// GitHub's GraphQL API enforces a hard limit of 100 records per connection,
+	// so we cap at 100. This means for very deep ancestry searches, the caller
+	// may need multiple resolution strategies (e.g., image tag fallback).
 	fetchDepth := depth * 5
-	if fetchDepth < 100 {
+	if fetchDepth > 100 {
 		fetchDepth = 100
 	}
 
