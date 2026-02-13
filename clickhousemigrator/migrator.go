@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -445,6 +446,21 @@ func (m *Migrator) migrateDown(ctx context.Context, currentVersion, targetVersio
 			continue
 		}
 
+		// Reject empty DownSQL to prevent silent schema inconsistency
+		if strings.TrimSpace(migration.DownSQL) == "" {
+			return &MigrationError{
+				Version:     migration.Version,
+				Name:        migration.Name,
+				Description: migration.Description,
+				Operation:   "down",
+				Err: fmt.Errorf(
+					"DownSQL is empty — migration %d (%s) is not reversible",
+					migration.Version,
+					migration.Name,
+				),
+			}
+		}
+
 		m.logger.Info(ctx, "Reverting migration", map[string]interface{}{
 			"version":     migration.Version,
 			"name":        migration.Name,
@@ -504,6 +520,21 @@ func (m *Migrator) createSchemaVersionTable(ctx context.Context) error {
 
 // applyMigrationWithTimeout applies a single migration with extended timeout.
 func (m *Migrator) applyMigrationWithTimeout(ctx context.Context, migration Migration) error {
+	// Reject empty UpSQL to prevent silent no-op migrations
+	if strings.TrimSpace(migration.UpSQL) == "" {
+		return &MigrationError{
+			Version:     migration.Version,
+			Name:        migration.Name,
+			Description: migration.Description,
+			Operation:   "up",
+			Err: fmt.Errorf(
+				"UpSQL is empty — migration %d (%s) has no SQL to apply",
+				migration.Version,
+				migration.Name,
+			),
+		}
+	}
+
 	// Create a child context with extended timeout for complex table creation operations
 	migrationCtx, cancel := context.WithTimeout(ctx, m.migrationTimeout)
 	defer cancel()

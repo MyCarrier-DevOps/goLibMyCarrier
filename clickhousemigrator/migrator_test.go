@@ -828,3 +828,75 @@ func TestSetExpectedTables(t *testing.T) {
 		t.Errorf("expected 2 tables, got %d", len(migrator.expectedTables))
 	}
 }
+
+// ============================================================================
+// Empty DownSQL / UpSQL Validation Tests
+// ============================================================================
+
+func TestMigrateDown_EmptyDownSQL(t *testing.T) {
+	callCount := 0
+	mockConn := &MockConn{
+		QueryRowFunc: func(ctx context.Context, query string, args ...interface{}) driver.Row {
+			callCount++
+			if callCount == 1 {
+				// Table exists
+				return &MockRow{values: []interface{}{uint64(1)}}
+			}
+			// Current version is 2
+			return &MockRow{values: []interface{}{uint32(2)}}
+		},
+	}
+
+	migrations := []Migration{
+		{Version: 1, Name: "v1", UpSQL: "CREATE TABLE t1", DownSQL: "DROP TABLE t1"},
+		{Version: 2, Name: "v2_irreversible", UpSQL: "ALTER TABLE t1 ADD COLUMN x", DownSQL: ""},
+	}
+	migrator, _ := NewMigrator(mockConn, nil, WithMigrations(migrations))
+
+	// Trying to migrate down from version 2 should fail because v2 has no DownSQL
+	err := migrator.MigrateToVersion(context.Background(), 0)
+	if err == nil {
+		t.Fatal("expected error for empty DownSQL, got nil")
+	}
+
+	// Should indicate the migration is not reversible
+	if !strings.Contains(err.Error(), "DownSQL is empty") {
+		t.Errorf("expected error about empty DownSQL, got: %v", err)
+	}
+
+	// Should NOT have executed any Exec calls for down migrations
+	for _, call := range mockConn.ExecCalls {
+		if strings.HasPrefix(call.Query, "DROP TABLE") {
+			t.Error("should not have executed any down migration SQL")
+		}
+	}
+}
+
+func TestCreateTables_EmptyUpSQL(t *testing.T) {
+	callCount := 0
+	mockConn := &MockConn{
+		QueryRowFunc: func(ctx context.Context, query string, args ...interface{}) driver.Row {
+			callCount++
+			if callCount == 1 {
+				// Table exists
+				return &MockRow{values: []interface{}{uint64(1)}}
+			}
+			// Current version is 0
+			return &MockRow{values: []interface{}{uint32(0)}}
+		},
+	}
+
+	migrations := []Migration{
+		{Version: 1, Name: "v1_empty", UpSQL: "", DownSQL: "DROP TABLE t1"},
+	}
+	migrator, _ := NewMigrator(mockConn, nil, WithMigrations(migrations))
+
+	err := migrator.CreateTables(context.Background())
+	if err == nil {
+		t.Fatal("expected error for empty UpSQL, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "UpSQL is empty") {
+		t.Errorf("expected error about empty UpSQL, got: %v", err)
+	}
+}
