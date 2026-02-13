@@ -87,20 +87,20 @@ func TestConfigFromEnv(t *testing.T) {
 	if cfg.ClickHouseConfig == nil {
 		t.Error("ClickHouseConfig should not be nil")
 	} else {
-		if cfg.ClickHouseConfig.Hostname != "localhost" {
-			t.Errorf("Hostname = %q, want 'localhost'", cfg.ClickHouseConfig.Hostname)
+		if cfg.ClickHouseConfig.ChHostname != "localhost" {
+			t.Errorf("ChHostname = %q, want 'localhost'", cfg.ClickHouseConfig.ChHostname)
 		}
-		if cfg.ClickHouseConfig.Port != "9000" {
-			t.Errorf("Port = %q, want '9000'", cfg.ClickHouseConfig.Port)
+		if cfg.ClickHouseConfig.ChPort != "9000" {
+			t.Errorf("ChPort = %q, want '9000'", cfg.ClickHouseConfig.ChPort)
 		}
-		if cfg.ClickHouseConfig.Username != "testuser" {
-			t.Errorf("Username = %q, want 'testuser'", cfg.ClickHouseConfig.Username)
+		if cfg.ClickHouseConfig.ChUsername != "testuser" {
+			t.Errorf("ChUsername = %q, want 'testuser'", cfg.ClickHouseConfig.ChUsername)
 		}
-		if cfg.ClickHouseConfig.Password != "testpass" {
-			t.Errorf("Password = %q, want 'testpass'", cfg.ClickHouseConfig.Password)
+		if cfg.ClickHouseConfig.ChPassword != "testpass" {
+			t.Errorf("ChPassword = %q, want 'testpass'", cfg.ClickHouseConfig.ChPassword)
 		}
-		if cfg.ClickHouseConfig.Database != "testdb" {
-			t.Errorf("Database = %q, want 'testdb'", cfg.ClickHouseConfig.Database)
+		if cfg.ClickHouseConfig.ChDatabase != "testdb" {
+			t.Errorf("ChDatabase = %q, want 'testdb'", cfg.ClickHouseConfig.ChDatabase)
 		}
 	}
 
@@ -200,12 +200,12 @@ func TestConfigFromEnv_MaxDepthAndDatabase(t *testing.T) {
 func TestConfig_Validate(t *testing.T) {
 	// Helper to create a valid ClickHouseConfig for tests
 	validCHConfig := &ch.ClickhouseConfig{
-		Hostname:   "localhost",
-		Port:       "9000",
-		Database:   "testdb",
-		Username:   "user",
-		Password:   "pass",
-		SkipVerify: "true",
+		ChHostname:   "localhost",
+		ChPort:       "9000",
+		ChDatabase:   "testdb",
+		ChUsername:   "user",
+		ChPassword:   "pass",
+		ChSkipVerify: "true",
 	}
 
 	// Helper to create a valid PipelineConfig for tests
@@ -480,12 +480,12 @@ func TestConfig_GitHubConfig(t *testing.T) {
 
 func TestConfig_ValidateMinimal(t *testing.T) {
 	validCHConfig := &ch.ClickhouseConfig{
-		Hostname:   "localhost",
-		Port:       "9000",
-		Database:   "testdb",
-		Username:   "user",
-		Password:   "pass",
-		SkipVerify: "true",
+		ChHostname:   "localhost",
+		ChPort:       "9000",
+		ChDatabase:   "testdb",
+		ChUsername:   "user",
+		ChPassword:   "pass",
+		ChSkipVerify: "true",
 	}
 
 	validPipelineConfig := &PipelineConfig{

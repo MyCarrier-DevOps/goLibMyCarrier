@@ -482,12 +482,12 @@ func TestClient_AbandonSlip(t *testing.T) {
 func TestNewClient_ValidationErrors(t *testing.T) {
 	// Helper to create a valid ClickHouseConfig for tests
 	validCHConfig := &ch.ClickhouseConfig{
-		Hostname:   "localhost",
-		Port:       "9000",
-		Database:   "testdb",
-		Username:   "user",
-		Password:   "pass",
-		SkipVerify: "true",
+		ChHostname:   "localhost",
+		ChPort:       "9000",
+		ChDatabase:   "testdb",
+		ChUsername:   "user",
+		ChPassword:   "pass",
+		ChSkipVerify: "true",
 	}
 
 	tests := []struct {
