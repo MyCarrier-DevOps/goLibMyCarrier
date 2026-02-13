@@ -175,6 +175,7 @@ func TestValidateConfig_DefaultInsecureSkipVerify(t *testing.T) {
 		Partition: "1",
 	}
 
+	applyDefaults(config)
 	err := validateConfig(config)
 	assert.NoError(t, err)
 	assert.Equal(t, "false", config.InsecureSkipVerify)
@@ -309,6 +310,7 @@ func TestValidateConfig_WithTopicPrefix(t *testing.T) {
 		Partition:   "1",
 	}
 
+	applyDefaults(config)
 	err := validateConfig(config)
 	assert.NoError(t, err)
 }
@@ -522,7 +524,7 @@ func TestLoadConfig_BothTopicAndPrefix(t *testing.T) {
 	assert.Equal(t, "dev.mycarrier.ci", config.TopicPrefix)
 }
 
-// Test validateConfig with default values
+// Test applyDefaults + validateConfig with default values
 func TestValidateConfig_DefaultValues(t *testing.T) {
 	config := &KafkaConfig{
 		Address:  "localhost:9092",
@@ -532,6 +534,7 @@ func TestValidateConfig_DefaultValues(t *testing.T) {
 		// GroupID, Partition, and InsecureSkipVerify are not set
 	}
 
+	applyDefaults(config)
 	err := validateConfig(config)
 	assert.NoError(t, err)
 	assert.Equal(t, "default-group", config.GroupID)
@@ -564,6 +567,7 @@ func TestValidateConfig_PartitionEdgeCases(t *testing.T) {
 				Partition: tt.partition,
 			}
 
+			applyDefaults(config)
 			err := validateConfig(config)
 			if tt.expectErr {
 				assert.Error(t, err)

@@ -28,47 +28,51 @@ type KafkaConfig struct {
 }
 
 // LoadConfig loads the configuration from environment variables using Viper.
+// An isolated viper instance is used to prevent cross-package state pollution.
 func LoadConfig() (*KafkaConfig, error) {
+	vp := viper.New()
+
 	// Bind environment variables
-	if err := viper.BindEnv("address", "KAFKA_ADDRESS"); err != nil {
+	if err := vp.BindEnv("address", "KAFKA_ADDRESS"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_ADDRESS: %w", err)
 	}
-	prefixerr := viper.BindEnv("topic_prefix", "KAFKA_TOPIC_PREFIX")
-	topicerr := viper.BindEnv("topic", "KAFKA_TOPIC")
+	prefixerr := vp.BindEnv("topic_prefix", "KAFKA_TOPIC_PREFIX")
+	topicerr := vp.BindEnv("topic", "KAFKA_TOPIC")
 	if prefixerr != nil && topicerr != nil {
 		return nil, fmt.Errorf(`error binding KAFKA_TOPIC or KAFKA_TOPIC_PREFIX. 
 			Prefix error: %w, Topic error: %w`, prefixerr, topicerr)
 	}
-	if err := viper.BindEnv("username", "KAFKA_USERNAME"); err != nil {
+	if err := vp.BindEnv("username", "KAFKA_USERNAME"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_USERNAME: %w", err)
 	}
-	if err := viper.BindEnv("password", "KAFKA_PASSWORD"); err != nil {
+	if err := vp.BindEnv("password", "KAFKA_PASSWORD"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_PASSWORD: %w", err)
 	}
-	if err := viper.BindEnv("groupid", "KAFKA_GROUPID"); err != nil {
+	if err := vp.BindEnv("groupid", "KAFKA_GROUPID"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_GROUPID: %w", err)
 	}
-	if err := viper.BindEnv("partition", "KAFKA_PARTITION"); err != nil {
+	if err := vp.BindEnv("partition", "KAFKA_PARTITION"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_PARTITION: %w", err)
 	}
-	if err := viper.BindEnv("insecure_skip_verify", "KAFKA_INSECURE_SKIP_VERIFY"); err != nil {
+	if err := vp.BindEnv("insecure_skip_verify", "KAFKA_INSECURE_SKIP_VERIFY"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_INSECURE_SKIP_VERIFY: %w", err)
 	}
-	if err := viper.BindEnv("start_offset", "KAFKA_START_OFFSET"); err != nil {
+	if err := vp.BindEnv("start_offset", "KAFKA_START_OFFSET"); err != nil {
 		return nil, fmt.Errorf("error binding KAFKA_START_OFFSET: %w", err)
 	}
 
 	// Read environment variables
-	viper.AutomaticEnv()
+	vp.AutomaticEnv()
 
 	var kafkaConfig KafkaConfig
 
 	// Unmarshal environment variables into the Config struct
-	if err := viper.Unmarshal(&kafkaConfig); err != nil {
+	if err := vp.Unmarshal(&kafkaConfig); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
-	// Validate the configuration
+	// Apply sensible defaults, then validate
+	applyDefaults(&kafkaConfig)
 	if err := validateConfig(&kafkaConfig); err != nil {
 		return nil, err
 	}
@@ -76,7 +80,22 @@ func LoadConfig() (*KafkaConfig, error) {
 	return &kafkaConfig, nil
 }
 
+// applyDefaults fills in sensible default values for optional configuration fields.
+// This is separated from validateConfig so that validation is a pure check with no side effects.
+func applyDefaults(kafkaConfig *KafkaConfig) {
+	if kafkaConfig.GroupID == "" {
+		kafkaConfig.GroupID = "default-group"
+	}
+	if kafkaConfig.Partition == "" {
+		kafkaConfig.Partition = "0"
+	}
+	if kafkaConfig.InsecureSkipVerify == "" {
+		kafkaConfig.InsecureSkipVerify = "false"
+	}
+}
+
 // validateConfig validates the loaded configuration.
+// This is a pure validation function with no side effects — call applyDefaults first.
 func validateConfig(kafkaConfig *KafkaConfig) error {
 	if kafkaConfig.Address == "" {
 		return fmt.Errorf("kafka address is required")
@@ -90,19 +109,10 @@ func validateConfig(kafkaConfig *KafkaConfig) error {
 	if kafkaConfig.Password == "" {
 		return fmt.Errorf("kafka password is required")
 	}
-	if kafkaConfig.GroupID == "" {
-		kafkaConfig.GroupID = "default-group"
+	if _, err := strconv.Atoi(kafkaConfig.Partition); err != nil {
+		return fmt.Errorf("kafka partition must be a valid numeric value")
 	}
-	if kafkaConfig.Partition == "" {
-		kafkaConfig.Partition = "0"
-	} else {
-		if _, err := strconv.Atoi(kafkaConfig.Partition); err != nil {
-			return fmt.Errorf("kafka partition must be a valid numeric value")
-		}
-	}
-	if kafkaConfig.InsecureSkipVerify == "" {
-		kafkaConfig.InsecureSkipVerify = "false"
-	} else if kafkaConfig.InsecureSkipVerify != "true" && kafkaConfig.InsecureSkipVerify != "false" {
+	if kafkaConfig.InsecureSkipVerify != "true" && kafkaConfig.InsecureSkipVerify != "false" {
 		return fmt.Errorf("kafka insecure_skip_verify must be true or false")
 	}
 	return nil
@@ -216,12 +226,14 @@ func InitializeKafkaWriter(kafkacfg *KafkaConfig, separator string, suffix ...st
 		},
 	}
 
+	// Async is explicitly set to false so that write errors are surfaced to the
+	// caller instead of being silently dropped.
 	writer := kafka.NewWriter(kafka.WriterConfig{
 		Brokers:     []string{kafkacfg.Address},
 		Topic:       topicName,
 		Dialer:      dialer,
 		Balancer:    &kafka.LeastBytes{},
-		Async:       true,
+		Async:       false,
 		MaxAttempts: 5,
 	})
 
