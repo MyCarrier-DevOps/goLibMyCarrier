@@ -224,25 +224,15 @@ func TestAppRoleAuthenticator_Authenticate_NoCredentials_ValidClient(t *testing.
 
 	ctx := context.Background()
 
-	// Create a minimal mock client struct (we can't easily create a real one without vault)
-	// But we can test the logic path where client is not nil but credentials are empty
-	// We'll use a mock here since we can't easily create a real vault.Client
-
-	// For this test, we'll call it with a mock that's designed to test the no-credentials path
-	// Since the function checks credentials before making any client calls, this should work
-
-	// Actually, let's test this differently - we can't easily create a vault.Client without vault
-	// So let's modify the approach to test the authentication logic through NewVaultClient
-
-	// Test that when no credentials are provided, authentication should be skipped
+	// Empty credentials should now be rejected by the authenticator
 	client, err := NewVaultClient(ctx, config, authenticator)
 
-	// This should succeed even without credentials (auth is skipped)
-	if err != nil {
-		t.Errorf("NewVaultClient() with no credentials should succeed, got error: %v", err)
+	// This should fail because empty credentials are no longer allowed
+	if err == nil {
+		t.Errorf("NewVaultClient() with empty credentials should fail, got nil error")
 	}
-	if client == nil {
-		t.Errorf("NewVaultClient() client should not be nil when config is valid")
+	if client != nil {
+		t.Errorf("NewVaultClient() client should be nil when credentials are empty")
 	}
 }
 
@@ -433,7 +423,7 @@ func TestNewVaultClient_WithSuccessfulAuth(t *testing.T) {
 }
 
 // Test CreateVaultClient function
-func TestCreateVaultClient_Success(t *testing.T) {
+func TestCreateVaultClient_RejectsEmptyCredentials(t *testing.T) {
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
 		Credentials: Credentials{
@@ -445,12 +435,12 @@ func TestCreateVaultClient_Success(t *testing.T) {
 	ctx := context.Background()
 	client, err := CreateVaultClient(ctx, config)
 
-	// Should succeed with valid config (no credentials means no auth)
-	if err != nil {
-		t.Errorf("CreateVaultClient() error = %v, want nil", err)
+	// Should fail because empty credentials are not allowed
+	if err == nil {
+		t.Errorf("CreateVaultClient() with empty credentials should fail, got nil error")
 	}
-	if client == nil {
-		t.Errorf("CreateVaultClient() client = nil, want non-nil")
+	if client != nil {
+		t.Errorf("CreateVaultClient() client should be nil when credentials are empty")
 	}
 }
 
@@ -544,7 +534,7 @@ func TestVaultClient_ErrorScenarios(t *testing.T) {
 }
 
 // Test legacy functions
-func TestLegacyVaultClient(t *testing.T) {
+func TestLegacyVaultClient_RejectsEmptyCredentials(t *testing.T) {
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
 		Credentials: Credentials{
@@ -556,11 +546,12 @@ func TestLegacyVaultClient(t *testing.T) {
 	ctx := context.Background()
 	client, err := LegacyVaultClient(ctx, config)
 
-	if err != nil {
-		t.Errorf("LegacyVaultClient() error = %v, want nil", err)
+	// Should fail because empty credentials are not allowed
+	if err == nil {
+		t.Errorf("LegacyVaultClient() with empty credentials should fail, got nil error")
 	}
-	if client == nil {
-		t.Errorf("LegacyVaultClient() client = nil, want non-nil")
+	if client != nil {
+		t.Errorf("LegacyVaultClient() client should be nil when credentials are empty")
 	}
 }
 
@@ -620,6 +611,57 @@ func TestAppRoleAuthenticator_Authenticate_WithCredentials(t *testing.T) {
 	}
 }
 
+// Test that partial credentials (only RoleID or only SecretID) are rejected
+func TestAppRoleAuthenticator_Authenticate_PartialCredentials(t *testing.T) {
+	authenticator := &AppRoleAuthenticator{}
+	ctx := context.Background()
+
+	// Create a real client for testing credential validation
+	client, err := vault.New(vault.WithAddress("http://localhost:8200"))
+	if err != nil {
+		t.Fatalf("Failed to create vault client: %v", err)
+	}
+
+	tests := []struct {
+		name        string
+		credentials Credentials
+		wantErr     string
+	}{
+		{
+			name:        "both empty",
+			credentials: Credentials{RoleID: "", SecretID: ""},
+			wantErr:     "vault AppRole credentials are required: both role_id and secret_id must be provided",
+		},
+		{
+			name:        "only RoleID",
+			credentials: Credentials{RoleID: "test-role", SecretID: ""},
+			wantErr:     "vault AppRole secret_id is required",
+		},
+		{
+			name:        "only SecretID",
+			credentials: Credentials{RoleID: "", SecretID: "test-secret"},
+			wantErr:     "vault AppRole role_id is required",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &VaultConfig{
+				VaultAddress: "http://localhost:8200",
+				Credentials:  tt.credentials,
+			}
+			err := authenticator.Authenticate(ctx, client, config)
+			if err == nil {
+				t.Errorf("expected error for %s, got nil", tt.name)
+				return
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestAppRoleAuthenticator_Authenticate_NilConfig(t *testing.T) {
 	authenticator := &AppRoleAuthenticator{}
 	ctx := context.Background()
@@ -639,26 +681,17 @@ func TestAppRoleAuthenticator_Authenticate_NilConfig(t *testing.T) {
 
 // Test legacy GetKVSecret function
 func TestGetKVSecret_Legacy(t *testing.T) {
-	// Since we can't create a real vault.Client without a Vault instance,
-	// we test that the function exists and accepts the right types
-	// In a real scenario, you'd use a test Vault instance or more sophisticated mocking
-
-	// Create a vault config
+	// Create a client with nil authenticator (bypasses credential check)
+	// to test the legacy wrapper function's code path
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
-		Credentials: Credentials{
-			RoleID:   "",
-			SecretID: "",
-		},
 	}
 
 	ctx := context.Background()
-	vaultClient, err := CreateVaultClient(ctx, config)
+	vaultClient, err := NewVaultClient(ctx, config, nil)
 
-	// We expect this to succeed (client creation without auth)
 	if err != nil {
-		t.Logf("CreateVaultClient failed (expected in test env): %v", err)
-		return
+		t.Fatalf("NewVaultClient failed: %v", err)
 	}
 
 	// Now test the legacy GetKVSecret function
@@ -677,18 +710,13 @@ func TestGetKVSecret_Legacy(t *testing.T) {
 func TestGetAzureDynamicCredentials_Legacy(t *testing.T) {
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
-		Credentials: Credentials{
-			RoleID:   "",
-			SecretID: "",
-		},
 	}
 
 	ctx := context.Background()
-	vaultClient, err := CreateVaultClient(ctx, config)
+	vaultClient, err := NewVaultClient(ctx, config, nil)
 
 	if err != nil {
-		t.Logf("CreateVaultClient failed (expected in test env): %v", err)
-		return
+		t.Fatalf("NewVaultClient failed: %v", err)
 	}
 
 	// Test the legacy GetAzureDynamicCredentials function
@@ -706,18 +734,13 @@ func TestGetAzureDynamicCredentials_Legacy(t *testing.T) {
 func TestVaultClient_SetToken(t *testing.T) {
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
-		Credentials: Credentials{
-			RoleID:   "",
-			SecretID: "",
-		},
 	}
 
 	ctx := context.Background()
-	vaultClient, err := CreateVaultClient(ctx, config)
+	vaultClient, err := NewVaultClient(ctx, config, nil)
 
 	if err != nil {
-		t.Logf("CreateVaultClient failed (expected in test env): %v", err)
-		return
+		t.Fatalf("NewVaultClient failed: %v", err)
 	}
 
 	// Test SetToken - this should succeed even without a real Vault
@@ -731,18 +754,13 @@ func TestVaultClient_SetToken(t *testing.T) {
 func TestVaultClient_GetKVSecret_Method(t *testing.T) {
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
-		Credentials: Credentials{
-			RoleID:   "",
-			SecretID: "",
-		},
 	}
 
 	ctx := context.Background()
-	vaultClient, err := CreateVaultClient(ctx, config)
+	vaultClient, err := NewVaultClient(ctx, config, nil)
 
 	if err != nil {
-		t.Logf("CreateVaultClient failed (expected in test env): %v", err)
-		return
+		t.Fatalf("NewVaultClient failed: %v", err)
 	}
 
 	// Test GetKVSecret method
@@ -760,18 +778,13 @@ func TestVaultClient_GetKVSecret_Method(t *testing.T) {
 func TestVaultClient_GetKVSecretList_Method(t *testing.T) {
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
-		Credentials: Credentials{
-			RoleID:   "",
-			SecretID: "",
-		},
 	}
 
 	ctx := context.Background()
-	vaultClient, err := CreateVaultClient(ctx, config)
+	vaultClient, err := NewVaultClient(ctx, config, nil)
 
 	if err != nil {
-		t.Logf("CreateVaultClient failed (expected in test env): %v", err)
-		return
+		t.Fatalf("NewVaultClient failed: %v", err)
 	}
 
 	// Test GetKVSecretList method
@@ -789,18 +802,13 @@ func TestVaultClient_GetKVSecretList_Method(t *testing.T) {
 func TestVaultClient_GetAzureDynamicCredentials_Method(t *testing.T) {
 	config := &VaultConfig{
 		VaultAddress: "http://localhost:8200",
-		Credentials: Credentials{
-			RoleID:   "",
-			SecretID: "",
-		},
 	}
 
 	ctx := context.Background()
-	vaultClient, err := CreateVaultClient(ctx, config)
+	vaultClient, err := NewVaultClient(ctx, config, nil)
 
 	if err != nil {
-		t.Logf("CreateVaultClient failed (expected in test env): %v", err)
-		return
+		t.Fatalf("NewVaultClient failed: %v", err)
 	}
 
 	// Test GetAzureDynamicCredentials method

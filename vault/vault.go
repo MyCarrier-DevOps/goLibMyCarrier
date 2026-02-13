@@ -55,28 +55,32 @@ var viperMutex sync.Mutex
 
 // ViperConfigLoader implements ConfigLoader interface
 func (v *ViperConfigLoader) LoadConfig() (*VaultConfig, error) {
-	// Lock to protect concurrent access to Viper
+	// Lock to protect concurrent access when multiple loaders run simultaneously
 	viperMutex.Lock()
 	defer viperMutex.Unlock()
 
+	// Use an isolated viper instance to avoid global state pollution
+	// that could affect other packages using viper with different env prefixes
+	vp := viper.New()
+
 	// Bind environment variables
-	if err := viper.BindEnv("vaultaddress", "VAULT_ADDRESS"); err != nil {
+	if err := vp.BindEnv("vaultaddress", "VAULT_ADDRESS"); err != nil {
 		return nil, fmt.Errorf("error binding environment variable VAULT_ADDRESS: %w", err)
 	}
-	if err := viper.BindEnv("credentials.role_id", "VAULT_ROLE_ID"); err != nil {
+	if err := vp.BindEnv("credentials.role_id", "VAULT_ROLE_ID"); err != nil {
 		return nil, fmt.Errorf("error binding environment variable VAULT_ROLE_ID: %w", err)
 	}
-	if err := viper.BindEnv("credentials.secret_id", "VAULT_SECRET_ID"); err != nil {
+	if err := vp.BindEnv("credentials.secret_id", "VAULT_SECRET_ID"); err != nil {
 		return nil, fmt.Errorf("error binding environment variable VAULT_SECRET_ID: %w", err)
 	}
 
 	// Read environment variables
-	viper.AutomaticEnv()
+	vp.AutomaticEnv()
 
 	var config VaultConfig
 
 	// Unmarshal environment variables into the Config struct
-	if err := viper.Unmarshal(&config); err != nil {
+	if err := vp.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
@@ -110,8 +114,14 @@ func (a *AppRoleAuthenticator) Authenticate(ctx context.Context, client *vault.C
 	if config == nil {
 		return fmt.Errorf("vault config cannot be nil")
 	}
-	if config.Credentials.RoleID == "" || config.Credentials.SecretID == "" {
-		return nil // No credentials provided, skip authentication
+	if config.Credentials.RoleID == "" && config.Credentials.SecretID == "" {
+		return fmt.Errorf("vault AppRole credentials are required: both role_id and secret_id must be provided")
+	}
+	if config.Credentials.RoleID == "" {
+		return fmt.Errorf("vault AppRole role_id is required")
+	}
+	if config.Credentials.SecretID == "" {
+		return fmt.Errorf("vault AppRole secret_id is required")
 	}
 
 	// Authenticate with Vault using AppRole
