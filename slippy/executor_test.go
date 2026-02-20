@@ -542,6 +542,8 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
 
+		// Scenario: slip was failed, but the failing step has been retried and
+		// now all steps are completed or pending — no primary failures remain.
 		slip := &Slip{
 			CorrelationID: "corr-completion-resolved",
 			Repository:    "owner/repo",
@@ -576,6 +578,101 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 	})
 
+	t.Run("resolved failure resets cascade-aborted steps to pending", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		// Scenario: unit_tests was failed (upstream), deploy_dev was aborted (cascade).
+		// unit_tests is now retried and completed. The aborted step should be
+		// reset to pending so it can re-run, and the slip reconciled to in_progress.
+		slip := &Slip{
+			CorrelationID: "corr-completion-cascade",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"push_parsed":       {Status: StepStatusCompleted},
+				"unit_tests":        {Status: StepStatusCompleted},
+				"deploy_dev":        {Status: StepStatusAborted},
+				"prod_steady_state": {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(slip)
+
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-cascade")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if completed {
+			t.Error("expected pipeline to not be complete")
+		}
+		if status != SlipStatusInProgress {
+			t.Errorf("expected status 'in_progress', got '%s'", status)
+		}
+
+		// Verify the cascade-aborted step was reset to pending
+		updated, loadErr := store.Load(ctx, "corr-completion-cascade")
+		if loadErr != nil {
+			t.Fatalf("failed to load updated slip: %v", loadErr)
+		}
+		if updated.Status != SlipStatusInProgress {
+			t.Errorf("expected persisted status 'in_progress', got '%s'", updated.Status)
+		}
+		deployStep, ok := updated.Steps["deploy_dev"]
+		if !ok {
+			t.Fatal("deploy_dev step not found after reconciliation")
+		}
+		if deployStep.Status != StepStatusPending {
+			t.Errorf("expected deploy_dev reset to 'pending', got '%s'", deployStep.Status)
+		}
+	})
+
+	t.Run("primary failure with cascade aborted stays failed", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		// Scenario: unit_tests is still failed (primary), deploy_dev is aborted (cascade).
+		// No reconciliation should happen because the primary failure persists.
+		slip := &Slip{
+			CorrelationID: "corr-completion-mixed",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"push_parsed":       {Status: StepStatusCompleted},
+				"unit_tests":        {Status: StepStatusFailed},
+				"deploy_dev":        {Status: StepStatusAborted},
+				"prod_steady_state": {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(slip)
+
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-mixed")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if !completed {
+			t.Error("expected pipeline to be marked complete (failed)")
+		}
+		if status != SlipStatusFailed {
+			t.Errorf("expected status 'failed', got '%s'", status)
+		}
+
+		// Verify the aborted step was NOT reset (primary failure still exists)
+		updated, loadErr := store.Load(ctx, "corr-completion-mixed")
+		if loadErr != nil {
+			t.Fatalf("failed to load updated slip: %v", loadErr)
+		}
+		deployStep := updated.Steps["deploy_dev"]
+		if deployStep.Status != StepStatusAborted {
+			t.Errorf("expected deploy_dev to remain 'aborted', got '%s'", deployStep.Status)
+		}
+	})
+
 	t.Run("slip not found returns error", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
@@ -593,11 +690,14 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 	})
 
-	t.Run("aborted step marks pipeline failed", func(t *testing.T) {
+	t.Run("aborted-only step on in_progress slip does not mark failed", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
 
+		// Scenario: a step was externally aborted but no primary failure exists.
+		// The slip is in_progress and should remain so — cascade aborts alone
+		// do not constitute a pipeline failure without an originating primary failure.
 		slip := &Slip{
 			CorrelationID: "corr-completion-4",
 			Repository:    "owner/repo",
@@ -615,11 +715,11 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if !completed {
-			t.Error("expected pipeline to be marked complete (aborted)")
+		if completed {
+			t.Error("expected pipeline to not be marked complete")
 		}
-		if status != SlipStatusFailed {
-			t.Errorf("expected status 'failed', got '%s'", status)
+		if status != SlipStatusInProgress {
+			t.Errorf("expected status 'in_progress', got '%s'", status)
 		}
 	})
 

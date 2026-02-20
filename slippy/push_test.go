@@ -651,15 +651,17 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
-		// Verify failed step is recorded
+		// Verify failed step is recorded even though the slip was abandoned.
+		// Failed slips are non-terminal and get abandoned when superseded by a new push,
+		// but the failure context (which step failed) is captured before abandonment.
 		if len(ancestry) != 1 {
 			t.Fatalf("expected 1 ancestry entry, got %d", len(ancestry))
 		}
 		if ancestry[0].FailedStep != "unit_tests" {
 			t.Errorf("expected FailedStep 'unit_tests', got '%s'", ancestry[0].FailedStep)
 		}
-		if ancestry[0].Status != SlipStatusFailed {
-			t.Errorf("expected Status 'failed', got '%s'", ancestry[0].Status)
+		if ancestry[0].Status != SlipStatusAbandoned {
+			t.Errorf("expected Status 'abandoned' (failed slip superseded by new push), got '%s'", ancestry[0].Status)
 		}
 	})
 

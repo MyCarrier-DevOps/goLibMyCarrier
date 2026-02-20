@@ -291,10 +291,25 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	for i, ancestorSlip := range ancestorSlips {
 		slip := ancestorSlip.Slip
 
-		// Only the first (most recent) non-terminal, non-failed slip needs status update.
-		// Failed slips are preserved for ancestry failure context and may still be
-		// retried independently, so they are not auto-abandoned/promoted here.
-		if i == 0 && !slip.Status.IsTerminal() && slip.Status != SlipStatusFailed {
+		// Capture failure context BEFORE any status modification (abandon/promote).
+		// This preserves which step failed so it can be recorded in ancestry even
+		// if the slip is subsequently abandoned by a newer push.
+		var failedStep string
+		if slip.Status == SlipStatusFailed {
+			for stepName, step := range slip.Steps {
+				if step.Status == StepStatusFailed {
+					failedStep = stepName
+					break
+				}
+			}
+		}
+
+		// Only the first (most recent) non-terminal slip needs status update.
+		// Failed slips are non-terminal and eligible for abandonment here because
+		// a new push indicates the developer has moved on. If they wanted to retry
+		// the same commit, they would re-run without pushing and the non-terminal
+		// slip would be found by ancestry resolution.
+		if i == 0 && !slip.Status.IsTerminal() {
 			if isSquashMerge {
 				// Squash merge: promote the feature branch slip (successful outcome)
 				c.logger.Info(ctx, "Promoting feature branch slip via squash merge", map[string]interface{}{
@@ -339,17 +354,6 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 				} else {
 					// Update the local copy to reflect the abandonment
 					slip.Status = SlipStatusAbandoned
-				}
-			}
-		}
-
-		// Find the failed step if status is failed
-		var failedStep string
-		if slip.Status == SlipStatusFailed {
-			for stepName, step := range slip.Steps {
-				if step.Status == StepStatusFailed {
-					failedStep = stepName
-					break
 				}
 			}
 		}

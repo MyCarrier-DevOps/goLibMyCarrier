@@ -239,6 +239,13 @@ func (c *Client) RunPostExecution(ctx context.Context, opts PostExecutionOptions
 // checkPipelineCompletion checks if the entire pipeline is complete and updates slip status.
 // Returns (completed, status, error). The error is returned rather than swallowed to allow
 // callers (and shadow mode settings) to decide how to handle failures.
+//
+// Step failures are classified as:
+//   - Primary failures (failed, error, timeout): the step itself encountered an issue.
+//   - Cascade failures (aborted): the step was killed because an upstream step failed.
+//
+// When a previously-failed slip has no remaining primary failures, cascade-aborted steps
+// are reset to pending so they can re-run, and the slip status is reconciled to in_progress.
 func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID string) (bool, SlipStatus, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
@@ -256,25 +263,57 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		return true, SlipStatusCompleted, nil
 	}
 
-	// Check if any terminal step failed (pipeline failed)
+	// Categorize step failures into primary (step itself failed) vs cascade (aborted by upstream).
+	// Primary failures indicate real problems that need resolution.
+	// Cascade failures are collateral damage from an upstream primary failure.
+	var primaryFailures []string
+	var cascadeFailures []string
 	for stepName, step := range slip.Steps {
-		if step.Status == StepStatusFailed || step.Status == StepStatusError ||
-			step.Status == StepStatusAborted || step.Status == StepStatusTimeout {
-			c.logger.Info(ctx, "Pipeline failed at step, updating slip status", map[string]interface{}{
-				"correlation_id": correlationID,
-				"step_name":      stepName,
-			})
-			if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed); err != nil {
-				return true, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
-			}
-			return true, SlipStatusFailed, nil
+		switch step.Status {
+		case StepStatusFailed, StepStatusError, StepStatusTimeout:
+			primaryFailures = append(primaryFailures, stepName)
+		case StepStatusAborted:
+			cascadeFailures = append(cascadeFailures, stepName)
 		}
 	}
 
-	if slip.Status == SlipStatusFailed {
-		c.logger.Info(ctx, "No failing steps remain, reconciling slip status to in_progress", map[string]interface{}{
-			"correlation_id": correlationID,
+	// If any step has a primary failure, the pipeline is failed
+	if len(primaryFailures) > 0 {
+		c.logger.Info(ctx, "Pipeline has primary step failure(s), updating slip status", map[string]interface{}{
+			"correlation_id":   correlationID,
+			"primary_failures": primaryFailures,
+			"cascade_failures": cascadeFailures,
 		})
+		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed); err != nil {
+			return true, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
+		}
+		return true, SlipStatusFailed, nil
+	}
+
+	// No primary failures remain. If the slip was previously failed, reconcile:
+	// reset cascade-aborted steps to pending so they can re-run, then
+	// move the slip back to in_progress.
+	if slip.Status == SlipStatusFailed {
+		c.logger.Info(ctx, "No primary failures remain, reconciling slip status to in_progress", map[string]interface{}{
+			"correlation_id": correlationID,
+			"cascade_resets": cascadeFailures,
+		})
+
+		// Reset cascade-aborted steps to pending so downstream steps can be
+		// re-evaluated by the prerequisite system on their next pre-execution.
+		for _, stepName := range cascadeFailures {
+			if resetErr := c.UpdateStepWithStatus(
+				ctx, correlationID, stepName, "",
+				StepStatusPending, "reset: upstream failure resolved",
+			); resetErr != nil {
+				c.logger.Warn(ctx, "Failed to reset aborted step to pending", map[string]interface{}{
+					"correlation_id": correlationID,
+					"step_name":      stepName,
+					"error":          resetErr.Error(),
+				})
+			}
+		}
+
 		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusInProgress); err != nil {
 			return false, SlipStatusInProgress, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
