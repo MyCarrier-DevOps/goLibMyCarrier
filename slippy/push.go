@@ -291,9 +291,10 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	for i, ancestorSlip := range ancestorSlips {
 		slip := ancestorSlip.Slip
 
-		// Only the first (most recent) non-terminal slip needs status update
-		// Earlier slips should already be in terminal states
-		if i == 0 && !slip.Status.IsTerminal() {
+		// Only the first (most recent) non-terminal, non-failed slip needs status update.
+		// Failed slips are preserved for ancestry failure context and may still be
+		// retried independently, so they are not auto-abandoned/promoted here.
+		if i == 0 && !slip.Status.IsTerminal() && slip.Status != SlipStatusFailed {
 			if isSquashMerge {
 				// Squash merge: promote the feature branch slip (successful outcome)
 				c.logger.Info(ctx, "Promoting feature branch slip via squash merge", map[string]interface{}{

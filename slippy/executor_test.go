@@ -652,6 +652,44 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 			t.Errorf("expected status 'failed', got '%s'", status)
 		}
 	})
+
+	t.Run("error step marks pipeline failed and prevents reconciliation", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-completion-6",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"dev_tests":         {Status: StepStatusError},
+				"prod_steady_state": {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(slip)
+
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-6")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if !completed {
+			t.Error("expected pipeline to be marked complete (error)")
+		}
+		if status != SlipStatusFailed {
+			t.Errorf("expected status 'failed', got '%s'", status)
+		}
+
+		updated, loadErr := store.Load(ctx, "corr-completion-6")
+		if loadErr != nil {
+			t.Fatalf("failed to load updated slip: %v", loadErr)
+		}
+		if updated.Status != SlipStatusFailed {
+			t.Errorf("expected persisted status 'failed', got '%s'", updated.Status)
+		}
+	})
 }
 
 func TestParsePrerequisites(t *testing.T) {

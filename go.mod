@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier
 
-go 1.25
+go 1.26
 
 // This is a meta-module that provides version tracking for all submodules.
 // Individual packages should be imported directly:

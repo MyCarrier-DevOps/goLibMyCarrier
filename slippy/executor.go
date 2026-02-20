@@ -258,7 +258,8 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 
 	// Check if any terminal step failed (pipeline failed)
 	for stepName, step := range slip.Steps {
-		if step.Status == StepStatusFailed || step.Status == StepStatusAborted || step.Status == StepStatusTimeout {
+		if step.Status == StepStatusFailed || step.Status == StepStatusError ||
+			step.Status == StepStatusAborted || step.Status == StepStatusTimeout {
 			c.logger.Info(ctx, "Pipeline failed at step, updating slip status", map[string]interface{}{
 				"correlation_id": correlationID,
 				"step_name":      stepName,
