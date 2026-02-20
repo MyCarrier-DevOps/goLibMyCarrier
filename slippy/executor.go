@@ -252,6 +252,12 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		return false, "", fmt.Errorf("%w: failed to load slip for completion check: %s", ErrSlipNotFound, err.Error())
 	}
 
+	// A successfully completed slip is immutable — it is the only status that
+	// should never be modified. Short-circuit to avoid any re-evaluation.
+	if slip.Status == SlipStatusCompleted {
+		return true, SlipStatusCompleted, nil
+	}
+
 	// Check if prod_steady_state is completed
 	if step, ok := slip.Steps["prod_steady_state"]; ok && step.Status == StepStatusCompleted {
 		c.logger.Info(ctx, "Pipeline complete! Updating slip status to completed", map[string]interface{}{
@@ -277,7 +283,9 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		}
 	}
 
-	// If any step has a primary failure, the pipeline is failed
+	// If any step has a primary failure, the pipeline is in a failed state.
+	// Return completed=false because Failed is non-terminal — the pipeline can
+	// recover if the failed steps are retried and succeed.
 	if len(primaryFailures) > 0 {
 		c.logger.Info(ctx, "Pipeline has primary step failure(s), updating slip status", map[string]interface{}{
 			"correlation_id":   correlationID,
@@ -285,9 +293,9 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 			"cascade_failures": cascadeFailures,
 		})
 		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed); err != nil {
-			return true, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
+			return false, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
-		return true, SlipStatusFailed, nil
+		return false, SlipStatusFailed, nil
 	}
 
 	// No primary failures remain. If the slip was previously failed, reconcile:
@@ -301,17 +309,32 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 
 		// Reset cascade-aborted steps to pending so downstream steps can be
 		// re-evaluated by the prerequisite system on their next pre-execution.
+		// If any reset fails, keep the slip as Failed so the next call retries
+		// rather than leaving orphaned aborted steps on an in_progress slip.
+		var resetFailures []string
 		for _, stepName := range cascadeFailures {
 			if resetErr := c.UpdateStepWithStatus(
 				ctx, correlationID, stepName, "",
 				StepStatusPending, "reset: upstream failure resolved",
 			); resetErr != nil {
+				resetFailures = append(resetFailures, stepName)
 				c.logger.Warn(ctx, "Failed to reset aborted step to pending", map[string]interface{}{
 					"correlation_id": correlationID,
 					"step_name":      stepName,
 					"error":          resetErr.Error(),
 				})
 			}
+		}
+
+		// If any cascade resets failed, keep the slip as Failed so the next
+		// checkPipelineCompletion call retries the resets. Moving to InProgress
+		// with orphaned aborted steps would leave them permanently stuck.
+		if len(resetFailures) > 0 {
+			c.logger.Warn(ctx, "Keeping slip as failed due to cascade reset failures", map[string]interface{}{
+				"correlation_id": correlationID,
+				"reset_failures": resetFailures,
+			})
+			return false, SlipStatusFailed, nil
 		}
 
 		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusInProgress); err != nil {

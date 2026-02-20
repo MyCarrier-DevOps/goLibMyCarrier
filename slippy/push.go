@@ -294,11 +294,16 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 		// Capture failure context BEFORE any status modification (abandon/promote).
 		// This preserves which step failed so it can be recorded in ancestry even
 		// if the slip is subsequently abandoned by a newer push.
+		// Check all primary failure statuses — a slip can be marked Failed due to
+		// a step with Error or Timeout status, not just Failed.
 		var failedStep string
 		if slip.Status == SlipStatusFailed {
 			for stepName, step := range slip.Steps {
-				if step.Status == StepStatusFailed {
+				switch step.Status {
+				case StepStatusFailed, StepStatusError, StepStatusTimeout:
 					failedStep = stepName
+				}
+				if failedStep != "" {
 					break
 				}
 			}

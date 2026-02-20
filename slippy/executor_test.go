@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -529,8 +530,8 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if !completed {
-			t.Error("expected pipeline to be marked complete (failed)")
+		if completed {
+			t.Error("expected pipeline to not be marked complete (failed is non-terminal)")
 		}
 		if status != SlipStatusFailed {
 			t.Errorf("expected status 'failed', got '%s'", status)
@@ -629,6 +630,60 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 	})
 
+	t.Run("partial cascade reset failure keeps slip as failed", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		// Scenario: primary failure resolved, cascade-aborted steps need resetting.
+		// But the step update fails (e.g., DB error). The slip must stay Failed
+		// so the next checkPipelineCompletion call retries the resets. Moving to
+		// InProgress with orphaned aborted steps would leave them permanently stuck.
+		slip := &Slip{
+			CorrelationID: "corr-completion-partial-reset",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"push_parsed":       {Status: StepStatusCompleted},
+				"unit_tests":        {Status: StepStatusCompleted},
+				"deploy_dev":        {Status: StepStatusAborted},
+				"prod_steady_state": {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(slip)
+
+		// Inject step update error — this will cause the cascade reset to fail
+		store.UpdateStepErrorFor["corr-completion-partial-reset"] = fmt.Errorf("database connection lost")
+
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-partial-reset")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if completed {
+			t.Error("expected pipeline to not be marked complete")
+		}
+		if status != SlipStatusFailed {
+			t.Errorf("expected status 'failed' (kept due to reset failure), got '%s'", status)
+		}
+
+		// Verify the slip was NOT moved to InProgress
+		updated, loadErr := store.Load(ctx, "corr-completion-partial-reset")
+		if loadErr != nil {
+			t.Fatalf("failed to load updated slip: %v", loadErr)
+		}
+		if updated.Status != SlipStatusFailed {
+			t.Errorf("expected persisted status 'failed', got '%s'", updated.Status)
+		}
+
+		// Verify the aborted step was NOT reset (the update was rejected)
+		deployStep := updated.Steps["deploy_dev"]
+		if deployStep.Status != StepStatusAborted {
+			t.Errorf("expected deploy_dev to remain 'aborted', got '%s'", deployStep.Status)
+		}
+	})
+
 	t.Run("primary failure with cascade aborted stays failed", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
@@ -655,8 +710,8 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if !completed {
-			t.Error("expected pipeline to be marked complete (failed)")
+		if completed {
+			t.Error("expected pipeline to not be marked complete (failed is non-terminal)")
 		}
 		if status != SlipStatusFailed {
 			t.Errorf("expected status 'failed', got '%s'", status)
@@ -745,8 +800,8 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if !completed {
-			t.Error("expected pipeline to be marked complete (timeout)")
+		if completed {
+			t.Error("expected pipeline to not be marked complete (failed is non-terminal)")
 		}
 		if status != SlipStatusFailed {
 			t.Errorf("expected status 'failed', got '%s'", status)
@@ -775,8 +830,8 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
-		if !completed {
-			t.Error("expected pipeline to be marked complete (error)")
+		if completed {
+			t.Error("expected pipeline to not be marked complete (failed is non-terminal)")
 		}
 		if status != SlipStatusFailed {
 			t.Errorf("expected status 'failed', got '%s'", status)
