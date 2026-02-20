@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient
 
-go 1.25.6
+go 1.26
 
 require (
 	github.com/hashicorp/go-retryablehttp v0.7.8
