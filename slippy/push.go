@@ -291,8 +291,32 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	for i, ancestorSlip := range ancestorSlips {
 		slip := ancestorSlip.Slip
 
-		// Only the first (most recent) non-terminal slip needs status update
-		// Earlier slips should already be in terminal states
+		// Capture failure context BEFORE any status modification (abandon/promote).
+		// This preserves which step failed so it can be recorded in ancestry even
+		// if the slip is subsequently abandoned by a newer push.
+		// Check all primary failure statuses — a slip can be marked Failed due to
+		// a step with Error or Timeout status, not just Failed.
+		var failedStep string
+		if slip.Status == SlipStatusFailed {
+			for stepName, step := range slip.Steps {
+				switch step.Status {
+				case StepStatusFailed, StepStatusError, StepStatusTimeout:
+					failedStep = stepName
+				case StepStatusPending, StepStatusHeld, StepStatusRunning,
+					StepStatusCompleted, StepStatusAborted, StepStatusSkipped:
+					// Non-primary-failure statuses — not relevant for failedStep capture
+				}
+				if failedStep != "" {
+					break
+				}
+			}
+		}
+
+		// Only the first (most recent) non-terminal slip needs status update.
+		// Failed slips are non-terminal and eligible for abandonment here because
+		// a new push indicates the developer has moved on. If they wanted to retry
+		// the same commit, they would re-run without pushing and the non-terminal
+		// slip would be found by ancestry resolution.
 		if i == 0 && !slip.Status.IsTerminal() {
 			if isSquashMerge {
 				// Squash merge: promote the feature branch slip (successful outcome)
@@ -338,17 +362,6 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 				} else {
 					// Update the local copy to reflect the abandonment
 					slip.Status = SlipStatusAbandoned
-				}
-			}
-		}
-
-		// Find the failed step if status is failed
-		var failedStep string
-		if slip.Status == SlipStatusFailed {
-			for stepName, step := range slip.Steps {
-				if step.Status == StepStatusFailed {
-					failedStep = stepName
-					break
 				}
 			}
 		}

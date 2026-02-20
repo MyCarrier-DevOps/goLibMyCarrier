@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator
 
-go 1.25.6
+go 1.26
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.42.0

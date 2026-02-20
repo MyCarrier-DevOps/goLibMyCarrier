@@ -1,6 +1,6 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/vault
 
-go 1.25.6
+go 1.26
 
 require (
 	github.com/hashicorp/vault-client-go v0.4.3

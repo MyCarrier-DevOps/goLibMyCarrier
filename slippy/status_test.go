@@ -44,7 +44,7 @@ func TestSlipStatus_IsTerminal(t *testing.T) {
 		{SlipStatusPending, false},
 		{SlipStatusInProgress, false},
 		{SlipStatusCompleted, true},
-		{SlipStatusFailed, true},
+		{SlipStatusFailed, false},
 		{SlipStatusCompensating, false},
 		{SlipStatusCompensated, true},
 		{SlipStatusAbandoned, true},
