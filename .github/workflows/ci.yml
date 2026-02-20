@@ -51,7 +51,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
         with:
-          go-version: ^1.25
+          go-version: ^1.26
       - name: Test ${{ matrix.module }} module
         working-directory: ${{ matrix.module }}
         run: |
@@ -79,7 +79,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
         with:
-          go-version: ^1.25
+          go-version: ^1.26
       - name: Install tools
         run: make install-tools
       - name: Lint ${{ matrix.module }} module
@@ -100,7 +100,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v4
         with:
-          go-version: ^1.25
+          go-version: ^1.26
       - name: Run vulnerability scan on ${{ matrix.module }} module
         run: make check-sec PKG=${{ matrix.module }}
 
