@@ -537,6 +537,45 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 	})
 
+	t.Run("resolved failure reverts slip status to in_progress", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-completion-resolved",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"push_parsed":       {Status: StepStatusCompleted},
+				"builds_completed":  {Status: StepStatusCompleted},
+				"prod_steady_state": {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(slip)
+
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-resolved")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if completed {
+			t.Error("expected pipeline to not be complete")
+		}
+		if status != SlipStatusInProgress {
+			t.Errorf("expected status 'in_progress', got '%s'", status)
+		}
+
+		updated, loadErr := store.Load(ctx, "corr-completion-resolved")
+		if loadErr != nil {
+			t.Fatalf("failed to load updated slip: %v", loadErr)
+		}
+		if updated.Status != SlipStatusInProgress {
+			t.Errorf("expected persisted status 'in_progress', got '%s'", updated.Status)
+		}
+	})
+
 	t.Run("slip not found returns error", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()

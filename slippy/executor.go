@@ -270,6 +270,16 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		}
 	}
 
+	if slip.Status == SlipStatusFailed {
+		c.logger.Info(ctx, "No failing steps remain, reconciling slip status to in_progress", map[string]interface{}{
+			"correlation_id": correlationID,
+		})
+		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusInProgress); err != nil {
+			return false, SlipStatusInProgress, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
+		}
+		return false, SlipStatusInProgress, nil
+	}
+
 	return false, slip.Status, nil
 }
 

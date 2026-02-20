@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 26, 2026  
-> **Status:** Multi-module Go library with comprehensive E2E integration tests (branch: test/slippy)
+> **Last Updated:** February 20, 2026
+> **Status:** Multi-module Go library with active slippy status-reconciliation fix validated in module tests
 
 ---
 
@@ -51,7 +51,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Status:** Complete & Validated
 - **Architecture:** Moved component status updates (highly concurrent) to `slip_component_states` table (`ReplacingMergeTree`)
 - **Reasoning:** Eliminates lock contention/version conflicts on main `routing_slips` table during parallel build/test execution
-- **Pattern:** 
+- **Pattern:**
   - Writes: Direct INSERTs (blind writes) - high throughput, no locking
   - Reads: `Load()` performs hydration by querying latest state for each component and overlaying on `Slip` object
 - **Migration:** Version 4 `create_slip_component_states`
@@ -144,6 +144,22 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### February 20, 2026 — Slippy Failed Status Reconciliation Fix
+
+**Problem:**
+- Slip-level status in `routing_slips.status` could remain `failed` after a stage/component was retried and resolved to a non-failing status.
+- `checkPipelineCompletion()` set slip status to `failed` when any step failed, but had no reconciliation path back to `in_progress` unless final completion step (`prod_steady_state`) was reached.
+
+**Solution:**
+- Updated `slippy/checkPipelineCompletion()` in `slippy/executor.go` to reconcile stale `SlipStatusFailed` back to `SlipStatusInProgress` when no current steps are in failing terminal states (`failed`, `aborted`, `timeout`).
+- Added regression coverage in `slippy/executor_test.go`:
+  - `resolved failure reverts slip status to in_progress`
+  - Verifies both returned status and persisted slip status in store.
+
+**Validation:**
+- `cd slippy && go test -run TestClient_CheckPipelineCompletion ./...`
+- `cd slippy && go test ./...`
 
 ### January 26, 2026 — OpenTelemetry Tracing Improvements (branch: test/slippy)
 
@@ -423,10 +439,10 @@ Added comprehensive "Edge Cases & Mitigations" table to PROJECT_STATE.md documen
 
 ### January 15, 2026 — Squash Merge Promotion (branch: slippy/ancestry-tracking)
 
-**Problem:** 
+**Problem:**
 Squash merges break git ancestry - the merge commit has no parent link to the feature branch head commit. This meant feature branch slips couldn't be linked to the integration branch slip created after merge.
 
-**Solution:** 
+**Solution:**
 Parse PR number from commit message, query GitHub for PR head commit, find associated slip, and mark it as "promoted" rather than abandoned.
 
 **New Status:**
@@ -462,11 +478,11 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ### January 15, 2026 — Ancestry Tracking & Progressive Depth Search (branch: slippy/ancestry-tracking)
 
-**Problem:** 
+**Problem:**
 1. No way to track full commit lineage across slip generations
 2. Large pushes with many commits between slips (>25) caused ancestor resolution to fail
 
-**Solution:** 
+**Solution:**
 1. Added `Ancestry` JSON field to store complete commit chain; child slips inherit parent's ancestry
 2. Implemented progressive depth search - starts at `AncestryDepth` (default 25), expands to `AncestryMaxDepth` (default 100) if no ancestor found
 
@@ -530,7 +546,7 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - Uses `chcol.ExtractJSONPathAs[T]()` for state history and aggregates
 
 **Test Fixes:**
-- `slippy/clickhouse_store_unit_test.go`: Updated mocks to use `chcol.JSON.Scan()` 
+- `slippy/clickhouse_store_unit_test.go`: Updated mocks to use `chcol.JSON.Scan()`
 - Added `chcol` import and proper data wrapper structures
 - Fixed test expectations for graceful JSON error handling
 - `slippy/config_test.go`: Fixed errcheck violations (added `_ =` to `os.Setenv` calls)
@@ -541,7 +557,7 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 **Current Status:**
 - ✅ `go fmt` passes
-- ✅ `golangci-lint` reports 0 issues  
+- ✅ `golangci-lint` reports 0 issues
 - ✅ All tests pass
 - ✅ 75.7% statement coverage
 
