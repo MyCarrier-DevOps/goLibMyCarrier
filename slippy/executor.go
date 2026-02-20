@@ -280,6 +280,8 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 			primaryFailures = append(primaryFailures, stepName)
 		case StepStatusAborted:
 			cascadeFailures = append(cascadeFailures, stepName)
+		case StepStatusPending, StepStatusHeld, StepStatusRunning, StepStatusCompleted, StepStatusSkipped:
+			// Non-failure statuses — no action needed
 		}
 	}
 

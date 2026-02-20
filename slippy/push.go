@@ -302,6 +302,9 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 				switch step.Status {
 				case StepStatusFailed, StepStatusError, StepStatusTimeout:
 					failedStep = stepName
+				case StepStatusPending, StepStatusHeld, StepStatusRunning,
+					StepStatusCompleted, StepStatusAborted, StepStatusSkipped:
+					// Non-primary-failure statuses — not relevant for failedStep capture
 				}
 				if failedStep != "" {
 					break

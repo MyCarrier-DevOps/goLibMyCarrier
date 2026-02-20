@@ -391,20 +391,20 @@ func (m *DynamicMigrationManager) generateStepColumnEnsurer(step StepConfig) cli
 	statusColumn := fmt.Sprintf("%s_status", step.Name)
 
 	var sql strings.Builder
-	sql.WriteString(fmt.Sprintf(`
+	fmt.Fprintf(&sql, `
 		ALTER TABLE %s.routing_slips
 		ADD COLUMN IF NOT EXISTS %s Enum8(
 			'pending'=1, 'held'=2, 'running'=3, 'completed'=4,
 			'failed'=5, 'error'=6, 'aborted'=7, 'timeout'=8, 'skipped'=9
-		) DEFAULT 'pending'`, m.database, statusColumn))
+		) DEFAULT 'pending'`, m.database, statusColumn)
 
 	// If this is an aggregate step, add a JSON column for component data
 	// Array wrapped in object for ClickHouse JSON compatibility
 	if step.Aggregates != "" {
 		// Column name is the step name (e.g., "builds")
 		aggregateColumn := step.Name
-		sql.WriteString(fmt.Sprintf(`,
-		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '{"items":[]}'`, aggregateColumn))
+		fmt.Fprintf(&sql, `,
+		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '{"items":[]}'`, aggregateColumn)
 	}
 
 	description := fmt.Sprintf("Ensures %s column exists for step '%s'", statusColumn, step.Name)
@@ -459,10 +459,10 @@ func (m *DynamicMigrationManager) generateAncestryMigration() clickhousemigrator
 func (m *DynamicMigrationManager) generateIndexEnsurer() clickhousemigrator.SchemaEnsurer {
 	var sql strings.Builder
 
-	sql.WriteString(fmt.Sprintf(`
+	fmt.Fprintf(&sql, `
 		ALTER TABLE %s.routing_slips
 		ADD INDEX IF NOT EXISTS idx_status status TYPE set(10) GRANULARITY 1
-	`, m.database))
+	`, m.database)
 
 	// Add indexes for deploy steps (commonly queried for held status)
 	deploySteps := []string{"dev_deploy", "preprod_deploy", "prod_deploy"}
@@ -471,9 +471,9 @@ func (m *DynamicMigrationManager) generateIndexEnsurer() clickhousemigrator.Sche
 			statusColumn := fmt.Sprintf("%s_status", stepName)
 			indexName := fmt.Sprintf("idx_%s_held", stepName)
 
-			sql.WriteString(fmt.Sprintf(`,
+			fmt.Fprintf(&sql, `,
 		ADD INDEX IF NOT EXISTS %s %s TYPE set(10) GRANULARITY 1
-			`, indexName, statusColumn))
+			`, indexName, statusColumn)
 		}
 	}
 
