@@ -2,7 +2,7 @@ version: "2"
 
 run:
   timeout: 5m
-  go: "1.25.2"
+  go: "1.26"
   tests: false
 
 formatters:
@@ -73,7 +73,7 @@ linters:
     - unused # checks for unused constants, variables, functions and types
     - wastedassign # finds wasted assignment statements
     - whitespace # detects leading and trailing whitespace
-  
+
   settings:
     gocritic:
       enabled-tags:

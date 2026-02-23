@@ -1,6 +1,6 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** February 20, 2026
+> **Last Updated:** February 23, 2026
 > **Status:** Multi-module Go library on Go 1.26; all CVEs remediated; slippy status reconciliation and terminal-semantics validated
 
 ---
@@ -144,6 +144,26 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### February 23, 2026 — Lint Go-Version Alignment + Full Repo Validation
+
+**Problem:**
+- Shared lint config in `.github/.golangci.yml` still had `run.go: "1.25.2"` while repo modules/toolchain are on Go 1.26.
+- This could create analysis-version drift between lint and build/test environments.
+
+**Solution:**
+- Updated `.github/.golangci.yml` to `run.go: "1.26"`.
+- Executed full repo validation suite from root:
+  - `make fmt`
+  - `make tidy`
+  - `make lint`
+  - `make test`
+  - `make check-sec`
+
+**Validation:**
+- ✅ Lint passed in all modules using shared config.
+- ✅ Tests passed across all modules.
+- ✅ `govulncheck` reported no vulnerabilities in all modules.
 
 ### February 20, 2026 — Vulnerability Remediation (GO-2026-4337, GO-2026-4473, GO-2026-4394)
 
