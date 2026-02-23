@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** January 26, 2026  
-> **Status:** Multi-module Go library with comprehensive E2E integration tests (branch: test/slippy)
+> **Last Updated:** February 23, 2026
+> **Status:** Multi-module Go library on Go 1.26; all CVEs remediated; slippy status reconciliation and terminal-semantics validated
 
 ---
 
@@ -51,7 +51,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Status:** Complete & Validated
 - **Architecture:** Moved component status updates (highly concurrent) to `slip_component_states` table (`ReplacingMergeTree`)
 - **Reasoning:** Eliminates lock contention/version conflicts on main `routing_slips` table during parallel build/test execution
-- **Pattern:** 
+- **Pattern:**
   - Writes: Direct INSERTs (blind writes) - high throughput, no locking
   - Reads: `Load()` performs hydration by querying latest state for each component and overlaying on `Slip` object
 - **Migration:** Version 4 `create_slip_component_states`
@@ -144,6 +144,90 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### February 23, 2026 — Lint Go-Version Alignment + Full Repo Validation
+
+**Problem:**
+- Shared lint config in `.github/.golangci.yml` still had `run.go: "1.25.2"` while repo modules/toolchain are on Go 1.26.
+- This could create analysis-version drift between lint and build/test environments.
+
+**Solution:**
+- Updated `.github/.golangci.yml` to `run.go: "1.26"`.
+- Executed full repo validation suite from root:
+  - `make fmt`
+  - `make tidy`
+  - `make lint`
+  - `make test`
+  - `make check-sec`
+
+**Validation:**
+- ✅ Lint passed in all modules using shared config.
+- ✅ Tests passed across all modules.
+- ✅ `govulncheck` reported no vulnerabilities in all modules.
+
+### February 20, 2026 — Vulnerability Remediation (GO-2026-4337, GO-2026-4473, GO-2026-4394)
+
+**Problem:**
+- `crypto/tls` stdlib vulnerability `GO-2026-4337` was reported for Go `1.25.6` (fixed in `1.25.7`).
+- `github.com/go-git/go-git/v5` vulnerability `GO-2026-4473` affected `v5.16.4` (fixed in `v5.16.5`).
+- `go.opentelemetry.io/otel/sdk` vulnerability `GO-2026-4394` affected `v1.39.0` (fixed in `v1.40.0`).
+
+**Solution:**
+- Go toolchain already migrated to `go1.26.0` and all module `go` directives set to `1.26`, which supersedes affected stdlib `crypto/tls@go1.25.6`.
+- Upgraded `go-git` in `github/go.mod` to `github.com/go-git/go-git/v5 v5.16.5`.
+- Upgraded OpenTelemetry in `otel/go.mod` to `go.opentelemetry.io/otel v1.40.0`, `go.opentelemetry.io/otel/sdk v1.40.0`, and aligned trace exporters/trace packages to `v1.40.0`.
+- Ran `go mod tidy` in upgraded modules and repo-wide `make tidy`.
+
+**Validation:**
+- ✅ `make test`
+- ✅ `make check-sec` (no vulnerabilities found)
+
+### February 20, 2026 — Go 1.26 Migration Across All Modules
+
+**Problem:**
+- Repo modules were mixed on `go 1.25`/`1.25.6` and needed upgrade to Go 1.26.
+- Security requirement referenced `crypto/tls` fixed in Go patch stream; this is part of Go stdlib and addressed by runtime/toolchain upgrade.
+
+**Solution:**
+- Updated `go.mod` `go` directive to `1.26` for root meta-module and all submodules:
+  - `go.mod`
+  - `argocdclient/go.mod`, `auth/go.mod`, `clickhouse/go.mod`, `clickhousemigrator/go.mod`
+  - `github/go.mod`, `kafka/go.mod`, `logger/go.mod`, `otel/go.mod`, `slippy/go.mod`
+  - `vault/go.mod`, `yaml/go.mod`
+- Ran repo-wide `make tidy` on Go `1.26.0`.
+
+**Validation:**
+- ✅ `go version` -> `go1.26.0 darwin/arm64`
+- ✅ `make tidy`
+- ✅ `make test`
+
+### February 20, 2026 — SlipStatusFailed Terminal Semantics & Reconciliation Fix
+
+**Problem:**
+1. `SlipStatus.IsTerminal()` treated `failed` as terminal, but `checkPipelineCompletion()` reconciled stale slip status from `failed` back to `in_progress` after step recovery, creating inconsistent behavior for consumers using terminal checks.
+2. Slip-level status in `routing_slips.status` could remain `failed` after a stage/component was retried and resolved to a non-failing status.
+3. `StepStatusError` was not included in failure detection logic, allowing incorrect reconciliation to `in_progress` while steps remained in error state.
+
+**Solution:**
+- Updated `slippy/status.go`:
+  - `SlipStatusFailed` is now explicitly non-terminal (recoverable) in documentation.
+  - `IsTerminal()` no longer treats `failed` as terminal.
+- Updated `slippy/status_test.go` terminal expectations for `SlipStatusFailed`.
+- Updated `slippy/push.go` ancestor transition guard to avoid auto-abandon/promote for failed ancestors, preserving failed-step ancestry context while keeping failed recoverable.
+- Updated `slippy/executor.go`:
+  - `checkPipelineCompletion()` reconciles stale `SlipStatusFailed` back to `SlipStatusInProgress` when no current steps are in failing terminal states.
+  - Pipeline failure detection now treats `StepStatusError` as a failing terminal step (alongside failed/aborted/timeout), preventing incorrect reconciliation.
+- Added regression coverage in `slippy/executor_test.go`:
+  - `resolved failure reverts slip status to in_progress`
+  - `error step marks pipeline failed and prevents reconciliation`
+  - Verifies both returned status and persisted slip status in store.
+
+**Validation:**
+- ✅ `make test PKG=slippy`
+- ✅ `TestSlipStatus_IsTerminal/failed` - passes with `failed` as non-terminal
+- ✅ `TestExecutor_ExecutePostPipeline` - all error handling scenarios pass
+- ✅ `make test` - all modules pass
+- ✅ `make check-sec` - no vulnerabilities found
 
 ### January 26, 2026 — OpenTelemetry Tracing Improvements (branch: test/slippy)
 
@@ -423,10 +507,10 @@ Added comprehensive "Edge Cases & Mitigations" table to PROJECT_STATE.md documen
 
 ### January 15, 2026 — Squash Merge Promotion (branch: slippy/ancestry-tracking)
 
-**Problem:** 
+**Problem:**
 Squash merges break git ancestry - the merge commit has no parent link to the feature branch head commit. This meant feature branch slips couldn't be linked to the integration branch slip created after merge.
 
-**Solution:** 
+**Solution:**
 Parse PR number from commit message, query GitHub for PR head commit, find associated slip, and mark it as "promoted" rather than abandoned.
 
 **New Status:**
@@ -462,11 +546,11 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ### January 15, 2026 — Ancestry Tracking & Progressive Depth Search (branch: slippy/ancestry-tracking)
 
-**Problem:** 
+**Problem:**
 1. No way to track full commit lineage across slip generations
 2. Large pushes with many commits between slips (>25) caused ancestor resolution to fail
 
-**Solution:** 
+**Solution:**
 1. Added `Ancestry` JSON field to store complete commit chain; child slips inherit parent's ancestry
 2. Implemented progressive depth search - starts at `AncestryDepth` (default 25), expands to `AncestryMaxDepth` (default 100) if no ancestor found
 
@@ -530,7 +614,7 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - Uses `chcol.ExtractJSONPathAs[T]()` for state history and aggregates
 
 **Test Fixes:**
-- `slippy/clickhouse_store_unit_test.go`: Updated mocks to use `chcol.JSON.Scan()` 
+- `slippy/clickhouse_store_unit_test.go`: Updated mocks to use `chcol.JSON.Scan()`
 - Added `chcol` import and proper data wrapper structures
 - Fixed test expectations for graceful JSON error handling
 - `slippy/config_test.go`: Fixed errcheck violations (added `_ =` to `os.Setenv` calls)
@@ -541,7 +625,7 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 **Current Status:**
 - ✅ `go fmt` passes
-- ✅ `golangci-lint` reports 0 issues  
+- ✅ `golangci-lint` reports 0 issues
 - ✅ All tests pass
 - ✅ 75.7% statement coverage
 

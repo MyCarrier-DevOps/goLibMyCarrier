@@ -14,7 +14,8 @@ const (
 	// SlipStatusCompleted indicates all pipeline steps completed successfully
 	SlipStatusCompleted SlipStatus = "completed"
 
-	// SlipStatusFailed indicates one or more pipeline steps failed
+	// SlipStatusFailed indicates one or more pipeline steps failed.
+	// This status is recoverable if failed steps are retried and resolved.
 	SlipStatusFailed SlipStatus = "failed"
 
 	// SlipStatusCompensating indicates compensation/rollback is in progress
@@ -39,12 +40,14 @@ func (s SlipStatus) String() string {
 }
 
 // IsTerminal returns true if the slip status is a terminal state
-// (completed, failed, compensated, abandoned, or promoted).
+// (completed, compensated, abandoned, or promoted).
+// Failed is intentionally non-terminal because pipelines may recover
+// through retries and continue execution.
 func (s SlipStatus) IsTerminal() bool {
 	switch s {
-	case SlipStatusCompleted, SlipStatusFailed, SlipStatusCompensated, SlipStatusAbandoned, SlipStatusPromoted:
+	case SlipStatusCompleted, SlipStatusCompensated, SlipStatusAbandoned, SlipStatusPromoted:
 		return true
-	case SlipStatusPending, SlipStatusInProgress, SlipStatusCompensating:
+	case SlipStatusPending, SlipStatusInProgress, SlipStatusFailed, SlipStatusCompensating:
 		return false
 	default:
 		return false

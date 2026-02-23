@@ -651,15 +651,113 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
-		// Verify failed step is recorded
+		// Verify failed step is recorded even though the slip was abandoned.
+		// Failed slips are non-terminal and get abandoned when superseded by a new push,
+		// but the failure context (which step failed) is captured before abandonment.
 		if len(ancestry) != 1 {
 			t.Fatalf("expected 1 ancestry entry, got %d", len(ancestry))
 		}
 		if ancestry[0].FailedStep != "unit_tests" {
 			t.Errorf("expected FailedStep 'unit_tests', got '%s'", ancestry[0].FailedStep)
 		}
-		if ancestry[0].Status != SlipStatusFailed {
-			t.Errorf("expected Status 'failed', got '%s'", ancestry[0].Status)
+		if ancestry[0].Status != SlipStatusAbandoned {
+			t.Errorf("expected Status 'abandoned' (failed slip superseded by new push), got '%s'", ancestry[0].Status)
+		}
+	})
+
+	t.Run("records error step in ancestry failedStep", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		// A slip can be marked Failed due to a step with Error status (not just Failed).
+		// The failedStep extraction must capture Error and Timeout statuses too.
+		now := time.Now()
+		ancestorSlip := &Slip{
+			CorrelationID: "corr-error-step-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "error123",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"push_parsed": {Status: StepStatusCompleted},
+				"unit_tests":  {Status: StepStatusError}, // Error, not Failed
+				"dev_deploy":  {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(ancestorSlip)
+
+		github.SetAncestry("owner", "repo", "abc456", []string{"abc456", "error123"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-err",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc456",
+		}
+
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
+		}
+
+		if len(ancestry) != 1 {
+			t.Fatalf("expected 1 ancestry entry, got %d", len(ancestry))
+		}
+		if ancestry[0].FailedStep != "unit_tests" {
+			t.Errorf("expected FailedStep 'unit_tests' (error status), got '%s'", ancestry[0].FailedStep)
+		}
+	})
+
+	t.Run("records timeout step in ancestry failedStep", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		now := time.Now()
+		ancestorSlip := &Slip{
+			CorrelationID: "corr-timeout-step-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "timeout123",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"push_parsed": {Status: StepStatusCompleted},
+				"unit_tests":  {Status: StepStatusTimeout}, // Timeout, not Failed
+				"dev_deploy":  {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(ancestorSlip)
+
+		github.SetAncestry("owner", "repo", "abc789", []string{"abc789", "timeout123"})
+
+		opts := PushOptions{
+			CorrelationID: "corr-new-timeout",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc789",
+		}
+
+		ancestry, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
+		}
+
+		if len(ancestry) != 1 {
+			t.Fatalf("expected 1 ancestry entry, got %d", len(ancestry))
+		}
+		if ancestry[0].FailedStep != "unit_tests" {
+			t.Errorf("expected FailedStep 'unit_tests' (timeout status), got '%s'", ancestry[0].FailedStep)
 		}
 	})
 
