@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** February 23, 2026
-> **Status:** Multi-module Go library on Go 1.26; all CVEs remediated; slippy status reconciliation and terminal-semantics validated
+> **Last Updated:** March 4, 2026
+> **Status:** Multi-module Go library on Go 1.26; all CVEs remediated; pipeline-level step event sourcing complete — concurrent lost-update bug eliminated
 
 ---
 
@@ -45,6 +45,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Progressive depth ancestry search** - starts at 25 commits, expands to 100 if no ancestor found
 - **Ancestry inheritance** - child slips inherit parent's ancestry chain for complete lineage
 - **Event Sourcing for Component Updates** - uses high-throughput `ReplacingMergeTree` for component states
+- **Event Sourcing extended to pipeline-level steps** (July 2025) - eliminates concurrent lost-update bug; see "Recent Changes"
 - See `slippy/CLAUDE.md` for detailed patterns
 
 ### Component State Event Sourcing (January 20, 2026)
@@ -144,6 +145,30 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### March 4, 2026 — Pipeline-Level Step Event Sourcing (Concurrent Lost-Update Fix)
+
+**Root Cause:**
+`UpdateStep` and `UpdateStepWithHistory` used a Read-Modify-Write (RMW) pattern against the `routing_slips` table (`VersionedCollapsingMergeTree`, full-row last-write-wins semantics). Under concurrent execution (e.g., `push_parsed` and `dev_deploy` writers racing), Writer B would load a snapshot that did not yet include Writer A's change, perform its update in memory, then write a full row that silently overwrote A's step status — leaving the step stuck as `pending` even though the reporting job had already called `slippy post-job --success`.
+
+**Solution:**
+Extended the existing `slip_component_states` event-sourcing pattern (already used for component-level steps) to all pipeline-level step updates:
+
+- `insertComponentState` — added `message string` parameter so pipeline-step events carry history messages.
+- `UpdateStep` — replaced 80-line RMW retry loop with a single `insertComponentState` call (`component=""`).  Aggregate steps (`IsAggregateStep=true`) also trigger `updateAggregateStatusFromComponentStates` write-back. Pure pipeline steps return immediately—the event log is the authoritative source of truth.
+- `UpdateStepWithHistory` — same replacement; pure pipeline steps call `AppendHistory` instead of the write-back.
+- `updateAggregateStatusFromComponentStatesWithHistory` — no-aggregate early-exit now calls `AppendHistory` instead of silently dropping the history entry.
+- `hydrateSlip` — added a first-pass loop for `component=""` rows that applies them directly to `slip.Steps[step]`. These rows are excluded from the aggregate-computation `stateMap` to avoid being treated as real component entries (which would contaminate aggregate rollup).
+- `updatePipelineStep` — deleted (dead code; all callers removed).
+
+**Files changed:** `slippy/clickhouse_store.go`
+
+**Tests added:**
+- `TestClickHouseStore_UpdateStep/pure pipeline step succeeds without loading slip` — verifies non-aggregate pipeline step writes exactly 1 row to `slip_component_states` with 0 `QueryRow` calls.
+- `TestClickHouseStore_UpdateStep/insert error propagates for pure pipeline step` — verifies error propagation from the event insert.
+- `TestClickHouseStore_UpdateStep_Success` — updated to reflect 0 `QueryRow` + 1 `ExecWithArgs` for `push_parsed`.
+- `TestClickHouseStore_HydrateSlip_PipelineLevelEvent_EmptyComponent` — regression: `component=""` row applied to `slip.Steps`, not leaked into `Aggregates`.
+- `TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost` — regression: two independent `UpdateStep` calls each produce their own `slip_component_states` insert with zero shared `routing_slips` read (eliminates the RMW race entirely).
 
 ### February 23, 2026 — Lint Go-Version Alignment + Full Repo Validation
 

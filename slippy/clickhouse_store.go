@@ -387,88 +387,37 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	return nil
 }
 
-// UpdateStep updates a specific step's status with automatic retry on version conflicts.
+// UpdateStep updates a specific step's status.
 // The correlationID is the unique identifier for the routing slip.
-// If a concurrent modification is detected, the slip is reloaded and the update is retried
-// with exponential backoff and jitter to prevent thundering herd.
+//
+// All updates — both component-level (componentName != "") and pipeline-level
+// (componentName == "") — are written to slip_component_states via event sourcing.
+// This eliminates the Read-Modify-Write race on routing_slips under concurrent writers:
+// each insert into the append-only event log is conflict-free, and hydrateSlip derives
+// the authoritative step status on every Load.
 func (s *ClickHouseStore) UpdateStep(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
-	// Handle component-level updates via event sourcing to avoid write contention.
-	// This writes to slip_component_states using ReplacingMergeTree.
-	if componentName != "" {
-		// First, insert the component state into the event sourcing table
-		if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status); err != nil {
-			return err
-		}
+	// Write the step event to the conflict-free event-sourcing table.
+	// Pipeline-level steps use componentName="" as a sentinel value.
+	if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status, ""); err != nil {
+		return err
+	}
 
-		// Now update the aggregate status in the routing_slips table.
-		// This ensures the slip reflects the current state of all components.
+	// Trigger aggregate write-back to routing_slips when there is an aggregate to update:
+	//   - componentName != "":  a component step that rolls up into an aggregate step.
+	//   - IsAggregateStep:      this step IS the aggregate (e.g. called by checkAndUpdateAggregate
+	//                           with componentName="").
+	// For pure pipeline steps (non-aggregate, no component), the event log is the sole
+	// source of truth; hydrateSlip derives the step status on every Load, so no
+	// write-back to routing_slips is needed.
+	if componentName != "" || (s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName)) {
 		return s.updateAggregateStatusFromComponentStates(ctx, correlationID, stepName)
 	}
 
-	// Start tracing span for the retry operation
-	retrySpan := startRetrySpan(ctx, "UpdateStep", correlationID)
-	retrySpan.AddAttribute("slippy.step_name", stepName)
-	// Note: retrySpan is ended explicitly by success/error paths below, not via defer
-
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
-
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
-	for {
-		// Check for context cancellation first
-		if ctx.Err() != nil {
-			retrySpan.EndError(ctx.Err())
-			return ctx.Err()
-		}
-
-		// Load the current slip
-		slip, err := s.Load(retrySpan.Context(), correlationID)
-		if err != nil {
-			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
-			if errors.Is(err, ErrSlipNotFound) {
-				slipNotFoundRetry++
-				if slipNotFoundRetry > slipNotFoundMaxRetries {
-					err := fmt.Errorf("%w: slip not found after %d retries: %w",
-						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
-					retrySpan.EndError(err)
-					return err
-				}
-				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
-				retrySpan.RecordAttempt(backoff.Milliseconds())
-				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
-				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				// Use select to respect context cancellation during sleep
-				select {
-				case <-ctx.Done():
-					retrySpan.EndError(ctx.Err())
-					return ctx.Err()
-				case <-time.After(backoff):
-				}
-				continue
-			}
-			// Non-retryable load error
-			retrySpan.EndError(err)
-			return err
-		}
-
-		now := time.Now()
-
-		// Update pipeline-level steps
-		s.updatePipelineStep(slip, stepName, status, now)
-
-		err = s.Update(retrySpan.Context(), slip)
-		if err != nil {
-			retrySpan.EndError(err)
-			return err
-		}
-
-		retrySpan.EndSuccess()
-		return nil
-	}
+	return nil
 }
 
 // UpdateComponentStatus updates a component's step status with automatic retry on version conflicts.
@@ -481,97 +430,35 @@ func (s *ClickHouseStore) UpdateComponentStatus(
 	return s.UpdateStep(ctx, correlationID, stepType, componentName, status)
 }
 
-// UpdateStepWithHistory updates a step's status AND appends a history entry in a single atomic operation.
-// This prevents the race condition where a separate AppendHistory call could reload a stale slip
-// and overwrite the step update. Both changes are applied to the same loaded slip and committed
-// together in one Update call.
+// UpdateStepWithHistory updates a step's status AND appends a history entry.
+//
+// The step status is written to slip_component_states via the same conflict-free
+// event-sourcing path used by UpdateStep (both component-level and pipeline-level).
+// The history entry is persisted:
+//   - atomically alongside the aggregate write-back for component steps and aggregate steps;
+//   - via AppendHistory for pure pipeline steps with no aggregate.
 func (s *ClickHouseStore) UpdateStepWithHistory(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
 	status StepStatus,
 	entry StateHistoryEntry,
 ) error {
-	// Handle component-level updates via event sourcing to avoid write contention.
-	// This writes to slip_component_states using ReplacingMergeTree.
-	if componentName != "" {
-		// First, insert the component state into the event sourcing table
-		if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status); err != nil {
-			return err
-		}
+	// Store the step event in the conflict-free event-sourcing table.
+	// The message from the history entry is co-located in the event record.
+	if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status, entry.Message); err != nil {
+		return err
+	}
 
-		// Now update the aggregate status in the routing_slips table AND append history.
-		// This ensures the slip reflects the current state of all components.
+	// Persist history and (where applicable) the aggregate status to routing_slips.
+	//   - componentName != "":  component step → aggregate write-back carries the history.
+	//   - IsAggregateStep:      aggregate step itself → aggregate write-back carries the history.
+	//   - otherwise:            pure pipeline step → call AppendHistory directly.
+	if componentName != "" || (s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName)) {
 		return s.updateAggregateStatusFromComponentStatesWithHistory(ctx, correlationID, stepName, entry)
 	}
 
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
-
-	// Start operational tracing span for the retry operation.
-	// This creates a span in a separate trace from the pipeline content,
-	// keeping internal database operations out of the main pipeline trace.
-	retrySpan := startRetrySpan(ctx, "UpdateStepWithHistory", correlationID)
-	retrySpan.AddAttribute("slippy.step_name", stepName)
-	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
-	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
-	// Note: retrySpan is ended explicitly by success/error paths below, not via defer
-
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
-	for {
-		// Check for context cancellation first
-		if ctx.Err() != nil {
-			retrySpan.EndError(ctx.Err())
-			return ctx.Err()
-		}
-
-		// Load the current slip
-		slip, err := s.Load(retrySpan.Context(), correlationID)
-		if err != nil {
-			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
-			if errors.Is(err, ErrSlipNotFound) {
-				slipNotFoundRetry++
-				if slipNotFoundRetry > slipNotFoundMaxRetries {
-					err := fmt.Errorf("%w: slip not found after %d retries: %w",
-						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
-					retrySpan.EndError(err)
-					return err
-				}
-				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
-				retrySpan.RecordAttempt(backoff.Milliseconds())
-				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
-				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				// Use select to respect context cancellation during sleep
-				select {
-				case <-ctx.Done():
-					retrySpan.EndError(ctx.Err())
-					return ctx.Err()
-				case <-time.After(backoff):
-				}
-				continue
-			}
-			// Non-retryable load error
-			retrySpan.EndError(err)
-			return err
-		}
-
-		now := time.Now()
-
-		// Update pipeline-level steps
-		s.updatePipelineStep(slip, stepName, status, now)
-
-		// Append history entry to the same slip (atomic with step update)
-		slip.StateHistory = append(slip.StateHistory, entry)
-
-		// Single Update call commits both changes atomically
-		err = s.Update(retrySpan.Context(), slip)
-		if err != nil {
-			retrySpan.EndError(err)
-			return err
-		}
-
-		retrySpan.EndSuccess()
-		return nil
-	}
+	// Pure pipeline step: persist only the history entry to routing_slips.
+	return s.AppendHistory(ctx, correlationID, entry)
 }
 
 // AppendHistory adds a state history entry to the slip.
@@ -935,17 +822,6 @@ func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
 	return details
 }
 
-// updatePipelineStep updates a pipeline step's status if it exists.
-func (s *ClickHouseStore) updatePipelineStep(slip *Slip, stepName string, status StepStatus, now time.Time) {
-	if s.pipelineConfig.GetStep(stepName) == nil {
-		return
-	}
-
-	step := slip.Steps[stepName]
-	step.ApplyStatusTransition(status, now)
-	slip.Steps[stepName] = step
-}
-
 // computeAggregateStatus determines the aggregate status from component statuses.
 // The aggregate is:
 // - "failed" if any component has failed
@@ -985,25 +861,27 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 	return StepStatusPending
 }
 
-// insertComponentState inserts a new state for a component into the event sourcing table.
+// insertComponentState inserts a new state into the event sourcing table.
+// Both component-level steps (componentName != "") and pipeline-level steps
+// (componentName == "") are stored here, making all step updates conflict-free
+// under concurrent writers. The message is preserved for history reconstruction.
 func (s *ClickHouseStore) insertComponentState(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
 	status StepStatus,
+	message string,
 ) error {
 	query := fmt.Sprintf(`
 		INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`, s.database, TableSlipComponentStates)
 
-	// Note: We don't have a message passed in UpdateStep/UpdateComponentStatus signature currently.
-	// We pass empty string for message.
 	return s.session.ExecWithArgs(ctx, query,
 		correlationID,
 		stepName,
 		componentName,
 		string(status),
-		"", // message
+		message,
 		time.Now(),
 	)
 }
@@ -1165,9 +1043,13 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 			}
 		}
 		if aggregateStepName == "" {
-			// No aggregate step configured for this step, nothing to update
+			// No aggregate step configured for this step. The step event is already
+			// persisted in slip_component_states. Append the history entry to routing_slips
+			// so the audit trail is preserved. AppendHistory does a Load + Update RMW;
+			// hydrateSlip ensures the written row reflects the correct step status from
+			// the event log, so this write cannot lose another step's status.
 			retrySpan.EndSuccess()
-			return nil
+			return s.AppendHistory(ctx, correlationID, entry)
 		}
 
 		// Append history entry to the same slip (atomic with aggregate update)
@@ -1208,9 +1090,30 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		slip.Aggregates = make(map[string][]ComponentStepData)
 	}
 
-	// Group states by component step -> component
+	// First pass: apply pipeline-level step events (component="" sentinel).
+	// These come from UpdateStep/UpdateStepWithHistory calls for non-component steps
+	// and represent the authoritative step status stored in the event log.
+	// Applying them before the aggregate loop prevents the aggregate loop from
+	// treating component="" as an actual component name.
+	for _, state := range states {
+		if state.Component != "" {
+			continue
+		}
+		step, ok := slip.Steps[state.Step]
+		if !ok {
+			continue
+		}
+		step.ApplyStatusTransition(StepStatus(state.Status), state.Timestamp)
+		slip.Steps[state.Step] = step
+	}
+
+	// Second pass: group component-level states (component != "") by step -> component.
+	// Pipeline-level events (component="") are excluded here; they were handled above.
 	stateMap := make(map[string]map[string]componentStateRow)
 	for _, state := range states {
+		if state.Component == "" {
+			continue // already applied in first pass
+		}
 		if _, ok := stateMap[state.Step]; !ok {
 			stateMap[state.Step] = make(map[string]componentStateRow)
 		}

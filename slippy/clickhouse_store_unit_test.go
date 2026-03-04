@@ -506,24 +506,42 @@ func TestClickHouseStore_Update(t *testing.T) {
 
 // TestClickHouseStore_UpdateStep tests the UpdateStep method.
 func TestClickHouseStore_UpdateStep(t *testing.T) {
-	t.Run("update step - load fails", func(t *testing.T) {
-		mockRow := &clickhousetest.MockRow{
-			ScanErr: ErrSlipNotFound,
+	t.Run("pure pipeline step succeeds without loading slip", func(t *testing.T) {
+		// Under the event-sourcing design, pure pipeline steps (non-aggregate, no component)
+		// only write to slip_component_states. No slip load is required; hydrateSlip derives
+		// the status on every Load. UpdateStep must succeed even when the routing_slips row is
+		// unavailable (e.g. before the slip exists or when the load would have failed).
+		mockSession := &clickhousetest.MockSession{}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
+		if err != nil {
+			t.Errorf("expected no error for pure pipeline step, got %v", err)
 		}
+		// One ExecWithArgs call: the slip_component_states insert.
+		// Zero QueryRow calls: no slip load needed for non-aggregate pipeline steps.
+		if len(mockSession.ExecWithArgsCalls) != 1 {
+			t.Errorf("expected 1 ExecWithArgs call (component_states insert), got %d", len(mockSession.ExecWithArgsCalls))
+		}
+		if len(mockSession.QueryRowCalls) != 0 {
+			t.Errorf("expected 0 QueryRow calls (no load for pure pipeline step), got %d", len(mockSession.QueryRowCalls))
+		}
+		// The single insert must target slip_component_states.
+		if !strings.Contains(mockSession.ExecWithArgsCalls[0].Stmt, TableSlipComponentStates) {
+			t.Errorf("expected insert into %s, got query: %s", TableSlipComponentStates, mockSession.ExecWithArgsCalls[0].Stmt)
+		}
+	})
+
+	t.Run("insert error propagates for pure pipeline step", func(t *testing.T) {
+		expectedErr := errors.New("insert failed")
 		mockSession := &clickhousetest.MockSession{
-			QueryRowRow: mockRow,
+			ExecWithArgsErr: expectedErr,
 		}
 		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-		// Use a short timeout since slip-not-found retry logic waits 5+10+15 minutes
-		// with production timeouts. The context timeout ensures the test completes quickly.
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-
-		err := store.UpdateStep(ctx, "test-corr-001", "push_parsed", "", StepStatusCompleted)
-		// With short timeout, we expect context deadline exceeded OR slip not found error
-		if !errors.Is(err, ErrSlipNotFound) && !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("expected ErrSlipNotFound or context.DeadlineExceeded, got %v", err)
+		err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
+		if !errors.Is(err, expectedErr) {
+			t.Errorf("expected insert error %v, got %v", expectedErr, err)
 		}
 	})
 }
@@ -1371,24 +1389,165 @@ func TestClickHouseStore_Load_InvalidStateHistoryJSON(t *testing.T) {
 
 // TestClickHouseStore_UpdateStep_Success tests successful step update.
 func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
-	// Use the helper that handles both Load and getMaxVersion queries
-	mockSession := createMockSessionForUpdates("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending, 1)
+	// Under the event-sourcing design, a pure pipeline step (non-aggregate, no component)
+	// only writes to slip_component_states. No Load + routing_slips Update is needed.
+	mockSession := &clickhousetest.MockSession{}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
-	// Should have called QueryRow once (Load only - no getMaxVersion with epoch versioning)
-	// and ExecWithArgs once (atomic cancel + new via UNION ALL)
-	if len(mockSession.QueryRowCalls) != 1 {
-		t.Errorf("expected 1 QueryRow call (Load only), got %d", len(mockSession.QueryRowCalls))
+	// Pure pipeline step: 0 QueryRow calls (no Load), 1 ExecWithArgs (slip_component_states insert).
+	if len(mockSession.QueryRowCalls) != 0 {
+		t.Errorf("expected 0 QueryRow calls (no load for pure pipeline step), got %d",
+			len(mockSession.QueryRowCalls))
 	}
 	if len(mockSession.ExecWithArgsCalls) != 1 {
 		t.Errorf(
-			"expected 1 ExecWithArgs call (atomic cancel + new via UNION ALL), got %d",
+			"expected 1 ExecWithArgs call (slip_component_states insert), got %d",
 			len(mockSession.ExecWithArgsCalls),
 		)
+	}
+}
+
+// TestClickHouseStore_HydrateSlip_PipelineLevelEvent_EmptyComponent is a regression test
+// for the concurrent lost-update fix. It verifies that pipeline-level step events stored
+// with component="" in slip_component_states are applied to the slip's Steps map during
+// hydrateSlip, and that these sentinel rows are NOT treated as real component entries
+// in the aggregate computation loop.
+func TestClickHouseStore_HydrateSlip_PipelineLevelEvent_EmptyComponent(t *testing.T) {
+	eventTimestamp := time.Now()
+	config := testPipelineConfig()
+
+	// Simulate one pipeline-level event (component="") for "push_parsed"
+	// and one real component event for "builds" / "api".
+	callCount := 0
+	mockRows := &clickhousetest.MockRows{
+		NextData: []bool{true, true, false},
+		ScanFunc: func(dest ...any) error {
+			callCount++
+			step := "push_parsed"
+			component := ""
+			status := string(StepStatusCompleted)
+			if callCount == 2 {
+				step = "builds"
+				component = "api"
+				status = string(StepStatusRunning)
+			}
+			if ptr, ok := dest[0].(*string); ok {
+				*ptr = step
+			}
+			if ptr, ok := dest[1].(*string); ok {
+				*ptr = component
+			}
+			if ptr, ok := dest[2].(*string); ok {
+				*ptr = status
+			}
+			if ptr, ok := dest[3].(*string); ok {
+				*ptr = ""
+			}
+			if ptr, ok := dest[4].(*time.Time); ok {
+				*ptr = eventTimestamp
+			}
+			return nil
+		},
+	}
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return mockRows, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, config, "ci")
+	slip := &Slip{
+		CorrelationID: "test-corr-001",
+		Steps: map[string]Step{
+			"push_parsed": {Status: StepStatusPending},
+			"builds":      {Status: StepStatusPending},
+		},
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {{Component: "api", Status: StepStatusPending}},
+		},
+	}
+
+	err := store.hydrateSlip(context.Background(), slip)
+	if err != nil {
+		t.Fatalf("hydrateSlip returned unexpected error: %v", err)
+	}
+
+	// Pipeline-level event (component="") must update the step status directly.
+	if slip.Steps["push_parsed"].Status != StepStatusCompleted {
+		t.Errorf("expected push_parsed step status completed, got %s", slip.Steps["push_parsed"].Status)
+	}
+
+	// The component="" row must NOT appear as a component entry in the aggregate loop.
+	// Only the real "api" component should be in Aggregates["builds"].
+	comps := slip.Aggregates["builds"]
+	for _, c := range comps {
+		if c.Component == "" {
+			t.Error("component= sentinel row must not appear in Aggregates after hydrateSlip")
+		}
+	}
+
+	// The real component event (builds / api) must still be applied.
+	found := false
+	for _, c := range comps {
+		if c.Component == "api" && c.Status == StepStatusRunning {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected Aggregates[builds] to contain api=running; got %+v", comps)
+	}
+}
+
+// TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost is a regression test for the
+// concurrent lost-update bug. It verifies that two independent UpdateStep calls for
+// different pipeline steps each produce exactly one slip_component_states insert, with no
+// shared routing_slips load/write-back that could allow one writer to silently overwrite
+// the other writer's update.
+func TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	// Simulate two concurrent writers for different pipeline steps.
+	err1 := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
+	err2 := store.UpdateStep(context.Background(), "test-corr-001", "dev_deploy", "", StepStatusFailed)
+
+	if err1 != nil {
+		t.Errorf("first UpdateStep (push_parsed) failed: %v", err1)
+	}
+	if err2 != nil {
+		t.Errorf("second UpdateStep (dev_deploy) failed: %v", err2)
+	}
+
+	// Each call must have produced exactly one slip_component_states insert.
+	// Under the old RMW design both writers would race on routing_slips and one
+	// would silently overwrite the other's column.
+	if len(mockSession.ExecWithArgsCalls) != 2 {
+		t.Errorf("expected 2 ExecWithArgs calls (one per step), got %d", len(mockSession.ExecWithArgsCalls))
+	}
+	if len(mockSession.QueryRowCalls) != 0 {
+		t.Errorf("expected 0 QueryRow calls (no shared routing_slips load), got %d", len(mockSession.QueryRowCalls))
+	}
+
+	// Verify the two inserts target slip_component_states and carry the correct step names.
+	steps := make(map[string]bool)
+	for _, call := range mockSession.ExecWithArgsCalls {
+		if !strings.Contains(call.Stmt, TableSlipComponentStates) {
+			t.Errorf("expected insert into %s, got: %s", TableSlipComponentStates, call.Stmt)
+		}
+		for _, arg := range call.Args {
+			if s, ok := arg.(string); ok && (s == "push_parsed" || s == "dev_deploy") {
+				steps[s] = true
+			}
+		}
+	}
+	if !steps["push_parsed"] {
+		t.Error("expected push_parsed step in slip_component_states inserts")
+	}
+	if !steps["dev_deploy"] {
+		t.Error("expected dev_deploy step in slip_component_states inserts")
 	}
 }
 
