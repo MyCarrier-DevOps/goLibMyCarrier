@@ -340,7 +340,7 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 		// Note: The aggregate column is named after the step name (builds_completed)
 		session := store.Session()
 		rows, err := session.QueryWithArgs(ctx, `
-			SELECT version, sign, builds_completed 
+			SELECT version, sign, builds_completed
 			FROM ci_test.routing_slips
 			WHERE correlation_id = $1 AND sign = 1
 			ORDER BY version DESC LIMIT 1
@@ -384,7 +384,7 @@ func TestVersionedCollapsingMergeTree_ConcurrentBuildUpdates(t *testing.T) {
 	// Query final raw data directly from ClickHouse
 	session := store.Session()
 	rows, err := session.QueryWithArgs(ctx, `
-		SELECT version, sign, builds_completed 
+		SELECT version, sign, builds_completed
 		FROM ci_test.routing_slips
 		WHERE correlation_id = $1 AND sign = 1
 		ORDER BY version DESC LIMIT 1
@@ -1157,7 +1157,7 @@ func TestAtomicUpdate_VersionSequence(t *testing.T) {
 
 	// Count active rows using sign=1 (avoid expensive FINAL operation)
 	countRows, err := session.QueryWithArgs(ctx, `
-		SELECT count(*) 
+		SELECT count(*)
 		FROM ci_test.routing_slips
 		WHERE correlation_id = $1 AND sign = 1
 	`, correlationID)
@@ -1236,7 +1236,7 @@ func TestHydrateSlip_EmptyAggregates(t *testing.T) {
 	// This is what happens when slippy post-job runs for each component
 	components := []string{"api", "worker", "frontend"}
 	for _, comp := range components {
-		err := store.insertComponentState(ctx, correlationID, "builds_completed", comp, StepStatusCompleted)
+		err := store.insertComponentState(ctx, correlationID, "builds_completed", comp, StepStatusCompleted, "")
 		if err != nil {
 			t.Fatalf("Failed to insert component state for %s: %v", comp, err)
 		}
