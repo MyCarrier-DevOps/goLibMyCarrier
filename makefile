@@ -28,14 +28,14 @@ test:
 		for dir in $(LIB_DIRS); do \
 			if [ -d "$$dir" ]; then \
 				echo "Testing $$dir module..."; \
-				(cd $$dir && go mod download && go test -cover -coverprofile=../coverage-$$dir.out ./... && go tool cover -func=../coverage-$$dir.out); \
+				(cd $$dir && go mod download && go test -race -count=1 -timeout 120s -cover -coverprofile=../coverage-$$dir.out ./... && go tool cover -func=../coverage-$$dir.out); \
 			else \
 				echo "Directory $$dir not found, skipping..."; \
 			fi; \
 		done; \
 	else \
 		echo "Testing $(PKG) module..."; \
-		(cd $(PKG) && go mod download && go test -cover -coverprofile=../coverage-$(PKG).out ./... && go tool cover -func=../coverage-$(PKG).out); \
+		(cd $(PKG) && go mod download && go test -race -count=1 -timeout 120s -cover -coverprofile=../coverage-$(PKG).out ./... && go tool cover -func=../coverage-$(PKG).out); \
 	fi
 
 .PHONY: fmt

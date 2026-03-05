@@ -45,6 +45,41 @@ go get -u github.com/MyCarrier-DevOps/goLibMyCarrier/kafka@v1.3.6
 | `vault` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/vault.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/vault) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/vault)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/vault) |
 | `yaml` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/yaml) |
 
+## Development
+
+### Running Tests
+
+Run the full test suite (all modules) with the race detector enabled:
+
+```bash
+make test
+```
+
+Run tests for a single module:
+
+```bash
+make test PKG=slippy
+```
+
+Run tests manually with the race detector for a single module:
+
+```bash
+cd slippy && go test -race -count=1 -timeout 120s ./...
+```
+
+The `-race` flag instruments the binary to detect concurrent memory access violations at runtime. It adds ~2–10× CPU overhead but catches data races that would otherwise produce non-deterministic bugs. **Always run with `-race` locally before opening a PR.**
+
+### Other Make Targets
+
+| Target | Description |
+|--------|-------------|
+| `make lint` | Run `golangci-lint` across all modules |
+| `make fmt` | Format all modules |
+| `make tidy` | Run `go mod tidy` across all modules |
+| `make check-sec` | Scan for known vulnerabilities |
+| `make test PKG=<module>` | Test a single module |
+| `make lint PKG=<module>` | Lint a single module |
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
