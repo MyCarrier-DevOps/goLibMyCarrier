@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** March 4, 2026
-> **Status:** Multi-module Go library on Go 1.26; all CVEs remediated; pipeline-level step event sourcing complete — concurrent lost-update bug eliminated
+> **Last Updated:** March 5, 2026
+> **Status:** Multi-module Go library on Go 1.26; all CVEs remediated; 4-phase residual post-fix issues resolved + aggregate write-back OCC conflict retry implemented — last remaining concurrency gap plugged
 
 ---
 
@@ -45,7 +45,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Progressive depth ancestry search** - starts at 25 commits, expands to 100 if no ancestor found
 - **Ancestry inheritance** - child slips inherit parent's ancestry chain for complete lineage
 - **Event Sourcing for Component Updates** - uses high-throughput `ReplacingMergeTree` for component states
-- **Event Sourcing extended to pipeline-level steps** (July 2025) - eliminates concurrent lost-update bug; see "Recent Changes"
+- **Event Sourcing extended to pipeline-level steps** (March 4, 2026) - eliminates concurrent lost-update bug; see "Recent Changes"
 - See `slippy/CLAUDE.md` for detailed patterns
 
 ### Component State Event Sourcing (January 20, 2026)
@@ -145,6 +145,108 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### March 5, 2026 — Aggregate Write-Back OCC Conflict Retry
+
+**Background:**
+After the pipeline-level step event-sourcing fix, individual step writes became conflict-free (append-only to `slip_component_states`). However, the two aggregate write-back functions (`updateAggregateStatusFromComponentStates` and `updateAggregateStatusFromComponentStatesWithHistory`) still used a Load→compute→Update (RMW) pattern against `routing_slips`. When two components complete within the same nanosecond window, concurrent write-backs could still overwrite each other's aggregate row.
+
+**Solution:**
+Post-write conflict detection + exponential-backoff retry, without any schema changes.
+
+**New Constants:**
+- `aggregateConflictMaxRetries = 5` — maximum retry attempts
+- `aggregateConflictBaseDelayMs = 10` — base delay in ms (doubles each retry: 10→20→40→80→160ms)
+
+**New Function `calculateAggregateConflictBackoff(retryNumber int) time.Duration`:**
+Returns exponential delay clamped to [1, aggregateConflictMaxRetries]. Sequence: 10ms, 20ms, 40ms, 80ms, 160ms.
+
+**New Method `loadVersionFromDB(ctx, correlationID) (uint64, error)`:**
+Single-column `SELECT version FROM routing_slips FINAL WHERE sign=1 ORDER BY version DESC LIMIT 1` — reads only the version, no full row hydration. Returns `ErrSlipNotFound` on `sql.ErrNoRows`.
+
+**Updated `updateAggregateStatusFromComponentStates`:**
+After `s.Update()`: calls `loadVersionFromDB`, compares `latestVersion == slip.Version`. On mismatch (concurrent write), increments `conflictRetry`, backs off exponentially, and re-Loads + re-writes. On retries exhausted: returns `nil` (best-effort — the concurrent row already reflects an up-to-date aggregate from the event log). Failure of the version check itself is also non-fatal (`slippy.version_check_error` span attribute + nil return).
+
+**Updated `updateAggregateStatusFromComponentStatesWithHistory`:** Same conflict retry block added.
+
+**Files:** `slippy/clickhouse_store.go`
+
+**Tests Added (`slippy/clickhouse_store_unit_test.go`):**
+- `TestCalculateAggregateConflictBackoff` — table-driven backoff sequence + clamp checks
+- `TestClickHouseStore_LoadVersionFromDB` — success, `ErrSlipNotFound`, scan error propagation
+- `TestClickHouseStore_UpdateAggregateStatus_ConflictRetry` — regression: first loadVersionFromDB returns 999 (concurrent write); function re-Loads + re-writes; second loadVersionFromDB returns matching version; 2 Update calls asserted
+- `TestClickHouseStore_UpdateAggregateStatus_ConflictRetryExhausted` — regression: all 5 retries exhausted, function returns nil; 6 Update calls (1 initial + 5 retries) asserted
+
+**Mock discriminator:** `"SELECT version FROM"` substring identifies `loadVersionFromDB` queries in all `QueryRowFunc` branches (vs `Load` which selects all 18 columns).
+
+**Validation:**
+- ✅ `go test -count=1 ./...` — all pass, 80.5% coverage
+- ✅ `golangci-lint run` — 0 issues
+
+---
+
+### March 5, 2026 — 4-Phase Residual Post-Fix Issues Resolution
+
+**Background:**
+The March 4 pipeline-level step event-sourcing fix introduced or exposed four residual issues. This session implements a 4-phase plan to eliminate them.
+
+#### Phase 1: Delete `checkAndUpdateAggregate` (Issues 2 & 3)
+
+**Problem:** `UpdateStepWithStatus` in `steps.go` called `checkAndUpdateAggregate` which performed a second `Load → computeAggregateStatus → UpdateStepWithHistory` cycle for a component step. This:
+- Doubled the routing_slips write-back (aggregate already computed inside `ClickHouseStore.updateAggregateStatusFromComponentStatesWithHistory`).
+- Wrote synthetic aggregate-level events with `component=""` to `slip_component_states`, contaminating the event log.
+
+**Fix:** Deleted `checkAndUpdateAggregate` and the surrounding `if componentName != "" && c.pipelineConfig != nil { ... }` block from `steps.go:UpdateStepWithStatus`. Aggregate computation is now exclusively within the store.
+
+**Files:** `slippy/steps.go`
+
+#### Phase 2: `AppendHistory` Atomic DB Pass-Through (Issue 1)
+
+**Problem:** `AppendHistory` called `Load` (full `hydrateSlip`) to read existing history, appended the entry in-memory, then called `Update`. Any step/aggregate column written between the `Load` and the `Update` was silently overwritten.
+
+**Fix:**
+- Added `loadStateHistoryFromDB(ctx, correlationID) (string, error)` — reads only `state_history` from the latest active routing_slips row (single-column QueryRow, no hydration).
+- Added `insertAtomicHistoryUpdate(ctx, correlationID, newVersion, newStateHistoryJSON)` — UNION ALL query:
+  - Cancel arm: re-SELECT all columns from existing active rows, flip sign to -1.
+  - New-row arm: re-SELECT all columns from latest active row verbatim **from the DB**, replacing only `state_history`, `updated_at`, `sign`, `version`.
+  - Step/aggregate columns are read from DB verbatim — stale in-memory values can never overwrite them.
+- `AppendHistory` now calls `loadStateHistoryFromDB` + `insertAtomicHistoryUpdate` instead of `Load` + `Update`.
+
+**Files:** `slippy/clickhouse_store.go`
+
+#### Phase 3: `SetComponentImageTag` Event-Sourced via `image_tag` Column (Issue 4)
+
+**Problem:** `Client.SetComponentImageTag` previously called `Load → find component → set ImageTag → Update`, an RMW that could race with concurrent step updates and lose either the new image tag or a concurrent status update.
+
+**Fix:**
+- Migration version 7: `ALTER TABLE slip_component_states ADD COLUMN IF NOT EXISTS image_tag String DEFAULT ''`.
+- `insertComponentState` signature extended to accept `imageTag string` as 7th parameter; INSERT includes `image_tag` column.
+- `componentStateRow` struct: added `ImageTag string \`ch:"image_tag"\`` field.
+- `loadComponentStates` SELECT: added `argMax(image_tag, timestamp) as image_tag`; Scan now reads 6 columns.
+- `hydrateSlip` → `applyComponentStatesToAggregate` (extracted): propagates `state.ImageTag` to `compData.ImageTag` for both new and existing component paths.
+- `ClickHouseStore.SetComponentImageTag`: queries `argMax(status, timestamp)` for the component, then calls `insertComponentState(..., currentStatus, "", imageTag)`. Conflict-free append — no RMW on routing_slips.
+- `Client.SetComponentImageTag`: simplified to delegate to `store.SetComponentImageTag`; no Load/Update.
+- `SlipStore` interface: added `SetComponentImageTag` method.
+- Mocks updated: `mock_store_test.go` and `slippytest/mock_store.go` — `SetImageTagCall` struct, `SetImageTagCalls []SetImageTagCall`, `SetComponentImageTag` method.
+
+**Files:** `slippy/clickhouse_store.go`, `slippy/steps.go`, `slippy/interfaces.go`, `slippy/dynamic_migrations.go`, `slippy/mock_store_test.go`, `slippy/slippytest/mock_store.go`
+
+#### hydrateSlip Refactor (Bonus — Cyclomatic Complexity fix)
+
+**Problem:** After the ImageTag changes pushed `hydrateSlip` cyclomatic complexity to 31 (>30 limit).
+
+**Fix:** Extracted two helpers and two package-level functions:
+- `resolveAggregateStepName(stepNameFromDB string) string` — resolves DB step name to aggregate column name, with nil-config safety.
+- `applyComponentStatesToAggregate(slip, aggregateColumn, aggregateStepName, stepStates)` — entire per-aggregate inner loop including component update/create and status recomputation.
+- `buildComponentData(componentName string, state componentStateRow) ComponentStepData` — pure constructor.
+- `updateExistingComponent(dest *ComponentStepData, src ComponentStepData)` — merge helper.
+
+**Tests Added:**
+- `TestClient_UpdateStepWithStatus_SingleStoreCallPerUpdate` — regression: verifies exactly 1 store call per `UpdateStepWithStatus` invocation (no double aggregate call).
+- `TestClickHouseStore_AppendHistory_DoesNotCallFullLoad` — regression: verifies `AppendHistory` uses 1 `QueryRow` + 1 `ExecWithArgs` and zero `QueryWithArgs` (no full Load).
+- `TestClickHouseStore_SetComponentImageTag_PreservesCurrentStatus` — regression: verifies `SetComponentImageTag` reads current status then inserts event with preserved status and provided image tag.
+- `TestColumnNameConsistency/AggregateUpdate` and `SetImageTag` — updated to reflect new behaviour (1 store call, `SetImageTagCalls` tracking).
+- 4 `loadComponentStates` ScanFunc mocks in `clickhouse_store_unit_test.go` — extended to 6 columns (added `image_tag`).
 
 ### March 4, 2026 — Pipeline-Level Step Event Sourcing (Concurrent Lost-Update Fix)
 
@@ -702,11 +804,9 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ## Current Focus
 
-1. **OpenTelemetry improvements complete** - gRPC log export, SpanKind support, trace context serialization
-2. **E2E integration tests complete** - All 7 testcontainers-based tests pass, validating full pipeline flow
-3. **hydrateSlip bug fixed** - Combined `UpdateStepWithHistory` prevents step status overwrites
-4. **VCMT query fix** - `sign = 1` filter ensures correct row selection
-5. **Next: Merge test/slippy branch** - PR #31 ready for review and merge to main
+1. **Aggregate write-back OCC conflict retry implemented** (March 5, 2026) — post-write conflict detection + exponential-backoff retry in both aggregate write-back functions; lint clean, 80.5% coverage.
+2. **Ready for PR merge** — covers event-sourcing fix, 4-phase residual fix, and write-back conflict retry.
+3. **Next: Publish & propagate** — release new goLibMyCarrier version; update downstream consumers.
 
 ---
 
@@ -845,8 +945,8 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 ## Next Steps (Not Yet Implemented)
 
 ### Immediate
-- [ ] Merge PR #31 (test/slippy branch) to main
-- [ ] Publish new goLibMyCarrier version with OTel improvements
+- [ ] Merge updated PR (event sourcing + 4-phase residual fix) to main
+- [ ] Publish new goLibMyCarrier version
 - [ ] Update all downstream consumers (pushhookparser, Slippy) to use new version
 - [ ] Validate trace continuity in production environment
 

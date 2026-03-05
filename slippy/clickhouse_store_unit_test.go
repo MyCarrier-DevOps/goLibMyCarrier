@@ -817,7 +817,8 @@ func createMockScanRow(correlationID, repository, branch, commitSHA string, stat
 // createMockSessionForUpdates creates a mock session that can handle both Load queries (returning a full slip)
 // and getMaxVersion queries (returning a version number). This is needed because Update methods
 // now call getMaxVersion to implement optimistic locking (post-insert verification).
-// The mock tracks the version being inserted and returns it from subsequent max(version) queries.
+// The mock tracks the version being inserted and returns it from subsequent max(version) and
+// loadVersionFromDB queries, ensuring the post-write conflict checks succeed without retrying.
 func createMockSessionForUpdates(
 	correlationID, repository, branch, commitSHA string,
 	status SlipStatus,
@@ -825,8 +826,7 @@ func createMockSessionForUpdates(
 ) *clickhousetest.MockSession {
 	slipRow := createMockScanRow(correlationID, repository, branch, commitSHA, status)
 
-	// Track the last inserted version to return from max(version) queries
-	// This is essential for the post-insert verification to succeed
+	// Track the last inserted version to return from max(version) and loadVersionFromDB queries.
 	var lastInsertedVersion uint64 = version
 
 	return &clickhousetest.MockSession{
@@ -838,9 +838,35 @@ func createMockSessionForUpdates(
 					ScanFunc: func(dest ...any) error {
 						if len(dest) > 0 {
 							if v, ok := dest[0].(*sql.NullInt64); ok {
-								// Return the last inserted version (or initial version if no insert yet)
 								v.Int64 = int64(lastInsertedVersion)
 								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			// loadStateHistoryFromDB reads only state_history (1 column)
+			if strings.Contains(query, "state_history") && !strings.Contains(query, "*") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if ptr, ok := dest[0].(*string); ok {
+								*ptr = `{"entries":[]}`
+							}
+						}
+						return nil
+					},
+				}
+			}
+			// loadVersionFromDB: SELECT version FROM ... FINAL ... ORDER BY version DESC LIMIT 1
+			if strings.Contains(query, "SELECT version FROM") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								// Return the same version just written — no conflict.
+								*v = lastInsertedVersion
 							}
 						}
 						return nil
@@ -851,9 +877,8 @@ func createMockSessionForUpdates(
 			return slipRow
 		},
 		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
-			// Track the newVersion from INSERT statements for routing_slips
-			// In insertAtomicUpdateWithVersions, the args are:
-			// [0] = correlation_id, [1] = newVersion, [2...] = new row values
+			// Track the newVersion from INSERT statements for routing_slips.
+			// In insertAtomicUpdateWithVersions, args[1] is the new timestamp version.
 			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
 				if len(args) >= 2 {
 					if v, ok := args[1].(uint64); ok {
@@ -928,7 +953,10 @@ func TestClickHouseStore_Load_HydratesComponentStates(t *testing.T) {
 			if ptr, ok := dest[3].(*string); ok {
 				*ptr = "ok"
 			}
-			if ptr, ok := dest[4].(*time.Time); ok {
+			if ptr, ok := dest[4].(*string); ok {
+				*ptr = "" // image_tag
+			}
+			if ptr, ok := dest[5].(*time.Time); ok {
 				*ptr = stateTimestamp
 			}
 			return nil
@@ -1001,7 +1029,10 @@ func TestClickHouseStore_Load_HydratesComponentStates_AggregateStepName(t *testi
 			if ptr, ok := dest[3].(*string); ok {
 				*ptr = "ok"
 			}
-			if ptr, ok := dest[4].(*time.Time); ok {
+			if ptr, ok := dest[4].(*string); ok {
+				*ptr = "" // image_tag
+			}
+			if ptr, ok := dest[5].(*time.Time); ok {
 				*ptr = stateTimestamp
 			}
 			return nil
@@ -1120,7 +1151,10 @@ func TestClickHouseStore_HydrateSlip_AllComponentStatesCompleted_AggregateComple
 			if ptr, ok := dest[3].(*string); ok {
 				*ptr = "build succeeded"
 			}
-			if ptr, ok := dest[4].(*time.Time); ok {
+			if ptr, ok := dest[4].(*string); ok {
+				*ptr = "" // image_tag
+			}
+			if ptr, ok := dest[5].(*time.Time); ok {
 				*ptr = stateTimestamp
 			}
 			currentIdx++
@@ -1447,7 +1481,10 @@ func TestClickHouseStore_HydrateSlip_PipelineLevelEvent_EmptyComponent(t *testin
 			if ptr, ok := dest[3].(*string); ok {
 				*ptr = ""
 			}
-			if ptr, ok := dest[4].(*time.Time); ok {
+			if ptr, ok := dest[4].(*string); ok {
+				*ptr = "" // image_tag
+			}
+			if ptr, ok := dest[5].(*time.Time); ok {
 				*ptr = eventTimestamp
 			}
 			return nil
@@ -1557,10 +1594,10 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 	insertToComponentStatesCalled := false
 	slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 
-	// Track the version being inserted so we can return it from max(version)
+	// Track the version being inserted so we can return it from max(version) and loadVersionFromDB.
 	var lastInsertedVersion uint64
 	mockSession := &clickhousetest.MockSession{
-		// Handle both Load and getMaxVersion queries
+		// Handle Load, getMaxVersion, and loadVersionFromDB queries.
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
 			if strings.Contains(query, "max(version)") {
 				return &clickhousetest.MockRow{
@@ -1569,6 +1606,19 @@ func TestClickHouseStore_UpdateStep_WithComponent(t *testing.T) {
 							if v, ok := dest[0].(*sql.NullInt64); ok {
 								v.Int64 = int64(lastInsertedVersion)
 								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			// loadVersionFromDB: SELECT version ... ORDER BY version DESC LIMIT 1
+			if strings.Contains(query, "SELECT version FROM") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = lastInsertedVersion
 							}
 						}
 						return nil
@@ -1633,11 +1683,10 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 	insertToComponentStatesCalled := false
 	slipRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)
 
-	// Track the version being inserted so we can return it from max(version)
-	// This prevents infinite retry loops in the post-insert verification
+	// Track the version being inserted so we can return it from max(version) and loadVersionFromDB.
 	var lastInsertedVersion uint64
 	mockSession := &clickhousetest.MockSession{
-		// Handle both Load and getMaxVersion queries
+		// Handle Load, getMaxVersion, and loadVersionFromDB queries.
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
 			if strings.Contains(query, "max(version)") {
 				return &clickhousetest.MockRow{
@@ -1646,6 +1695,19 @@ func TestClickHouseStore_UpdateComponentStatus_Success(t *testing.T) {
 							if v, ok := dest[0].(*sql.NullInt64); ok {
 								v.Int64 = int64(lastInsertedVersion)
 								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			// loadVersionFromDB: SELECT version ... ORDER BY version DESC LIMIT 1
+			if strings.Contains(query, "SELECT version FROM") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = lastInsertedVersion
 							}
 						}
 						return nil
@@ -2224,5 +2286,357 @@ func TestClickHouseStore_FindByCommits_QueryError(t *testing.T) {
 	_, _, err := store.FindByCommits(context.Background(), "myorg/myrepo", []string{"abc123"})
 	if err == nil {
 		t.Error("expected error, got nil")
+	}
+}
+
+// TestClickHouseStore_AppendHistory_DoesNotCallFullLoad is a regression test verifying that
+// AppendHistory no longer performs a full Load (QueryWithArgs) to read the entire routing_slips
+// row. After the Phase 2 fix it should use exactly one QueryRow (loadStateHistoryFromDB) and
+// one ExecWithArgs (insertAtomicHistoryUpdate), keeping all step/aggregate columns in sync with
+// the DB row rather than an in-memory snapshot.
+func TestClickHouseStore_AppendHistory_DoesNotCallFullLoad(t *testing.T) {
+	stateHistoryJSON := `{"entries":[]}`
+	mockSession := &clickhousetest.MockSession{
+		QueryRowRow: &clickhousetest.MockRow{
+			ScanFunc: func(dest ...any) error {
+				if len(dest) < 1 {
+					return fmt.Errorf("expected at least 1 scan destination, got 0")
+				}
+				if ptr, ok := dest[0].(*string); ok {
+					*ptr = stateHistoryJSON
+				}
+				return nil
+			},
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	entry := StateHistoryEntry{
+		Timestamp: time.Now(),
+		Step:      "push_parsed",
+		Status:    StepStatusCompleted,
+		Actor:     "test-actor",
+	}
+
+	err := store.AppendHistory(context.Background(), "corr-append-regression", entry)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Exactly one QueryRow call (loadStateHistoryFromDB), no full QueryWithArgs (Load).
+	if len(mockSession.QueryRowCalls) != 1 {
+		t.Errorf("expected 1 QueryRow call (loadStateHistoryFromDB), got %d", len(mockSession.QueryRowCalls))
+	}
+	if len(mockSession.QueryWithArgsCalls) != 0 {
+		t.Errorf("expected 0 QueryWithArgs calls (no full Load), got %d", len(mockSession.QueryWithArgsCalls))
+	}
+	// Exactly one ExecWithArgs call (insertAtomicHistoryUpdate).
+	if len(mockSession.ExecWithArgsCalls) != 1 {
+		t.Errorf("expected 1 ExecWithArgs call (insertAtomicHistoryUpdate), got %d", len(mockSession.ExecWithArgsCalls))
+	}
+}
+
+// TestClickHouseStore_SetComponentImageTag_PreservesCurrentStatus is a regression test verifying
+// that SetComponentImageTag reads the current component status from the event log and preserves
+// it when inserting the new image-tag event, preventing the "unknown status" data loss that the
+// Phase 3 RMW approach could have caused if the component state was missing from an in-memory load.
+func TestClickHouseStore_SetComponentImageTag_PreservesCurrentStatus(t *testing.T) {
+	const wantStatus = "completed"
+	const wantImageTag = "sha256:abc123deadbeef"
+
+	mockSession := &clickhousetest.MockSession{
+		// QueryRow returns the current status for argMax(status, timestamp) query.
+		QueryRowRow: &clickhousetest.MockRow{
+			ScanFunc: func(dest ...any) error {
+				if len(dest) < 1 {
+					return fmt.Errorf("expected at least 1 scan destination, got 0")
+				}
+				if ptr, ok := dest[0].(*string); ok {
+					*ptr = wantStatus
+				}
+				return nil
+			},
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	err := store.SetComponentImageTag(context.Background(), "corr-imagetag-regression", "build", "svc-a", wantImageTag)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Exactly one QueryRow call (argMax status read) and one ExecWithArgs (insertComponentState).
+	if len(mockSession.QueryRowCalls) != 1 {
+		t.Errorf("expected 1 QueryRow call, got %d", len(mockSession.QueryRowCalls))
+	}
+	if len(mockSession.ExecWithArgsCalls) != 1 {
+		t.Errorf("expected 1 ExecWithArgs call (insertComponentState), got %d", len(mockSession.ExecWithArgsCalls))
+	}
+
+	// The insert must carry the preserved status and the new image tag.
+	execArgs := mockSession.ExecWithArgsCalls[0].Args
+	foundStatus := false
+	foundImageTag := false
+	for _, arg := range execArgs {
+		if s, ok := arg.(string); ok {
+			if s == wantStatus {
+				foundStatus = true
+			}
+			if s == wantImageTag {
+				foundImageTag = true
+			}
+		}
+	}
+	if !foundStatus {
+		t.Errorf("expected ExecWithArgs to include preserved status %q in args %v", wantStatus, execArgs)
+	}
+	if !foundImageTag {
+		t.Errorf("expected ExecWithArgs to include image tag %q in args %v", wantImageTag, execArgs)
+	}
+}
+
+// TestCalculateAggregateConflictBackoff verifies the exponential backoff sequence for
+// aggregate write-back conflict retries.
+func TestCalculateAggregateConflictBackoff(t *testing.T) {
+	cases := []struct {
+		retryNumber int
+		wantMs      int64
+	}{
+		{1, 10},
+		{2, 20},
+		{3, 40},
+		{4, 80},
+		{5, 160},
+	}
+	for _, tc := range cases {
+		got := calculateAggregateConflictBackoff(tc.retryNumber)
+		if got.Milliseconds() != tc.wantMs {
+			t.Errorf("retryNumber=%d: expected %dms, got %dms", tc.retryNumber, tc.wantMs, got.Milliseconds())
+		}
+	}
+
+	// Below-minimum clamps to 1 → 10ms
+	if got := calculateAggregateConflictBackoff(0); got.Milliseconds() != 10 {
+		t.Errorf("retryNumber=0: expected 10ms, got %dms", got.Milliseconds())
+	}
+	if got := calculateAggregateConflictBackoff(-1); got.Milliseconds() != 10 {
+		t.Errorf("retryNumber=-1: expected 10ms, got %dms", got.Milliseconds())
+	}
+	// Above-maximum clamps to 5 → 160ms
+	if got := calculateAggregateConflictBackoff(6); got.Milliseconds() != 160 {
+		t.Errorf("retryNumber=6: expected 160ms, got %dms", got.Milliseconds())
+	}
+}
+
+// TestClickHouseStore_LoadVersionFromDB verifies the single-column version query helper.
+func TestClickHouseStore_LoadVersionFromDB(t *testing.T) {
+	t.Run("returns version on success", func(t *testing.T) {
+		const wantVersion uint64 = 1234567890
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: &clickhousetest.MockRow{
+				ScanFunc: func(dest ...any) error {
+					if len(dest) < 1 {
+						return fmt.Errorf("expected 1 dest, got 0")
+					}
+					if v, ok := dest[0].(*uint64); ok {
+						*v = wantVersion
+					}
+					return nil
+				},
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		got, err := store.loadVersionFromDB(context.Background(), "corr-version-test")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if got != wantVersion {
+			t.Errorf("expected version %d, got %d", wantVersion, got)
+		}
+	})
+
+	t.Run("returns ErrSlipNotFound on sql.ErrNoRows", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: &clickhousetest.MockRow{ScanErr: sql.ErrNoRows},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		_, err := store.loadVersionFromDB(context.Background(), "corr-missing")
+		if !errors.Is(err, ErrSlipNotFound) {
+			t.Errorf("expected ErrSlipNotFound, got %v", err)
+		}
+	})
+
+	t.Run("propagates scan errors", func(t *testing.T) {
+		scanErr := errors.New("scan failure")
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: &clickhousetest.MockRow{ScanErr: scanErr},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		_, err := store.loadVersionFromDB(context.Background(), "corr-scan-err")
+		if !errors.Is(err, scanErr) {
+			t.Errorf("expected wrapped scan error, got %v", err)
+		}
+	})
+}
+
+// TestClickHouseStore_UpdateAggregateStatus_ConflictRetry is a regression test verifying that
+// when loadVersionFromDB returns a version that does not match slip.Version (simulating a
+// concurrent write-back), updateAggregateStatusFromComponentStates re-Loads and re-writes
+// until the version matches.
+func TestClickHouseStore_UpdateAggregateStatus_ConflictRetry(t *testing.T) {
+	slipRow := createMockScanRow("corr-conflict", "myorg/myrepo", "main", "abc123", SlipStatusInProgress)
+
+	// queryRow call sequence:
+	// 1st  → Load (returns slipRow, version field = 1 from createMockScanRow)
+	// 2nd  → loadVersionFromDB (returns 999 — simulates concurrent write)
+	// 3rd  → Load retry (returns slipRow again)
+	// 4th  → loadVersionFromDB (returns lastInsertedVersion — our write won)
+	var lastInsertedVersion uint64
+	queryRowCall := 0
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			if strings.Contains(query, "max(version)") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*sql.NullInt64); ok {
+								v.Int64 = int64(lastInsertedVersion)
+								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			if strings.Contains(query, "SELECT version FROM") {
+				queryRowCall++
+				call := queryRowCall
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								if call == 1 {
+									// First check: concurrent writer at version 999
+									*v = 999
+								} else {
+									// Second check: our write won
+									*v = lastInsertedVersion
+								}
+							}
+						}
+						return nil
+					},
+				}
+			}
+			return slipRow
+		},
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return &clickhousetest.MockRows{}, nil
+		},
+		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				if len(args) >= 2 {
+					if v, ok := args[1].(uint64); ok {
+						lastInsertedVersion = v
+					}
+				}
+			}
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	// "build" has an aggregate step "builds" in testPipelineConfig.
+	err := store.updateAggregateStatusFromComponentStates(context.Background(), "corr-conflict", "build")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Two Exec calls: one per Load+Update cycle (initial attempt + one retry).
+	routingSlipsExecs := 0
+	for _, call := range mockSession.ExecWithArgsCalls {
+		if strings.Contains(call.Stmt, "routing_slips") {
+			routingSlipsExecs++
+		}
+	}
+	if routingSlipsExecs != 2 {
+		t.Errorf("expected 2 routing_slips Update calls (initial + conflict retry), got %d", routingSlipsExecs)
+	}
+
+	// Two loadVersionFromDB calls (one per attempt).
+	if queryRowCall != 2 {
+		t.Errorf("expected 2 loadVersionFromDB calls, got %d", queryRowCall)
+	}
+}
+
+// TestClickHouseStore_UpdateAggregateStatus_ConflictRetryExhausted verifies that when all
+// aggregateConflictMaxRetries are exhausted, the function returns nil (not an error).
+func TestClickHouseStore_UpdateAggregateStatus_ConflictRetryExhausted(t *testing.T) {
+	slipRow := createMockScanRow("corr-exhausted", "myorg/myrepo", "main", "abc123", SlipStatusInProgress)
+
+	var lastInsertedVersion uint64
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			if strings.Contains(query, "max(version)") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*sql.NullInt64); ok {
+								v.Int64 = int64(lastInsertedVersion)
+								v.Valid = true
+							}
+						}
+						return nil
+					},
+				}
+			}
+			// loadVersionFromDB always returns a higher version than what we wrote.
+			if strings.Contains(query, "SELECT version FROM") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								// Always one higher than our last write.
+								*v = lastInsertedVersion + 1
+							}
+						}
+						return nil
+					},
+				}
+			}
+			return slipRow
+		},
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return &clickhousetest.MockRows{}, nil
+		},
+		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				if len(args) >= 2 {
+					if v, ok := args[1].(uint64); ok {
+						lastInsertedVersion = v
+					}
+				}
+			}
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	// Should return nil even when all retries are exhausted.
+	err := store.updateAggregateStatusFromComponentStates(context.Background(), "corr-exhausted", "build")
+	if err != nil {
+		t.Errorf("expected nil (best-effort outcome), got %v", err)
+	}
+
+	// Should have attempted (1 initial + aggregateConflictMaxRetries) Updates total.
+	routingSlipsExecs := 0
+	for _, call := range mockSession.ExecWithArgsCalls {
+		if strings.Contains(call.Stmt, "routing_slips") {
+			routingSlipsExecs++
+		}
+	}
+	wantExecs := 1 + aggregateConflictMaxRetries
+	if routingSlipsExecs != wantExecs {
+		t.Errorf("expected %d routing_slips Update calls, got %d", wantExecs, routingSlipsExecs)
 	}
 }

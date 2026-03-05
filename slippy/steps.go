@@ -84,84 +84,7 @@ func (c *Client) UpdateStepWithStatus(
 		"status":    string(status),
 	})
 
-	// Check if this is a component step that affects an aggregate
-	if componentName != "" && c.pipelineConfig != nil {
-		// Determine the aggregate step name. The stepName could be either:
-		// 1. The component step name (e.g., "build") - need to look up the aggregate step
-		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
-		aggregateStep := c.pipelineConfig.GetAggregateStep(stepName)
-		if aggregateStep == "" && c.pipelineConfig.IsAggregateStep(stepName) {
-			// stepName is already an aggregate step
-			aggregateStep = stepName
-		}
-		if aggregateStep != "" {
-			if err := c.checkAndUpdateAggregate(ctx, correlationID, stepName, aggregateStep); err != nil {
-				// Return the error - aggregate status is important for pipeline flow
-				return fmt.Errorf("step %s updated but aggregate %s update failed: %w",
-					stepName, aggregateStep, err)
-			}
-		}
-	}
-
 	return nil
-}
-
-// checkAndUpdateAggregate checks if all components have completed a step type
-// and updates the corresponding aggregate step.
-// This is config-driven: the stepName is a component type (e.g., "build")
-// and aggregateStepName is the parent aggregate (e.g., "builds_completed").
-func (c *Client) checkAndUpdateAggregate(ctx context.Context, correlationID, _, aggregateStepName string) error {
-	slip, err := c.store.Load(ctx, correlationID)
-	if err != nil {
-		return fmt.Errorf("failed to load slip for aggregate check: %w", err)
-	}
-
-	// Get component data from the aggregate column.
-	// The aggregate JSON column is named after the aggregate step (e.g., "builds_completed")
-	columnName := aggregateStepName
-	componentData, ok := slip.Aggregates[columnName]
-	if !ok || len(componentData) == 0 {
-		c.logger.Debug(ctx, "No component data found for aggregate", map[string]interface{}{
-			"aggregate_step": aggregateStepName,
-			"column_name":    columnName,
-		})
-		return nil
-	}
-
-	allCompleted := true
-	anyFailed := false
-
-	for _, comp := range componentData {
-		if !comp.Status.IsTerminal() {
-			allCompleted = false
-		}
-		if comp.Status.IsFailure() {
-			anyFailed = true
-		}
-	}
-
-	if !allCompleted {
-		c.logger.Debug(ctx, "Aggregate not yet complete, some components still running", map[string]interface{}{
-			"aggregate_step": aggregateStepName,
-		})
-		return nil
-	}
-
-	var aggregateStatus StepStatus
-	var message string
-	if anyFailed {
-		aggregateStatus = StepStatusFailed
-		message = "one or more components failed"
-	} else {
-		aggregateStatus = StepStatusCompleted
-		message = "all components completed successfully"
-	}
-
-	c.logger.Info(ctx, "Updating aggregate", map[string]interface{}{
-		"aggregate_step": aggregateStepName,
-		"status":         string(aggregateStatus),
-	})
-	return c.UpdateStepWithStatus(ctx, slip.CorrelationID, aggregateStepName, "", aggregateStatus, message)
 }
 
 // UpdateComponentBuildStatus updates a component's build status.
@@ -186,48 +109,24 @@ func (c *Client) UpdateComponentTestStatus(
 	return c.UpdateStepWithStatus(ctx, correlationID, "unit_test", componentName, status, message)
 }
 
-// SetComponentImageTag sets the image tag for a component after successful build.
+// SetComponentImageTag records the container image tag for a component after a successful build.
+// The image tag is stored in the component event log (slip_component_states), replacing the
+// previous Read-Modify-Write pattern that was susceptible to concurrent lost updates.
 // The correlationID is the unique identifier for the routing slip.
-// The image tag is stored in the component's metadata within the builds aggregate column.
 func (c *Client) SetComponentImageTag(ctx context.Context, correlationID, componentName, imageTag string) error {
-	slip, err := c.store.Load(ctx, correlationID)
-	if err != nil {
-		return NewSlipError("set image tag", correlationID, err)
+	if c.pipelineConfig == nil {
+		return NewStepError("set image tag", correlationID, "build", componentName,
+			fmt.Errorf("no pipeline config set"))
 	}
 
-	// Find the step that aggregates "build" component type
-	// In default.json, this is "builds_completed" with aggregates: "build"
 	aggregateStepName := c.pipelineConfig.GetAggregateStep("build")
 	if aggregateStepName == "" {
 		return NewStepError("set image tag", correlationID, "build", componentName,
 			fmt.Errorf("no step configured to aggregate 'build' components"))
 	}
 
-	componentData, ok := slip.Aggregates[aggregateStepName]
-	if !ok {
-		return NewStepError("set image tag", correlationID, "build", componentName,
-			fmt.Errorf("builds aggregate '%s' not found", aggregateStepName))
-	}
-
-	// Find and update the component
-	found := false
-	for i := range componentData {
-		if componentData[i].Component == componentName {
-			componentData[i].ImageTag = imageTag
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		return NewStepError("set image tag", correlationID, "build", componentName,
-			fmt.Errorf("component not found: %s", componentName))
-	}
-
-	slip.Aggregates[aggregateStepName] = componentData
-
-	if err := c.store.Update(ctx, slip); err != nil {
-		return NewSlipError("set image tag", correlationID, err)
+	if err := c.store.SetComponentImageTag(ctx, correlationID, "build", componentName, imageTag); err != nil {
+		return NewStepError("set image tag", correlationID, "build", componentName, err)
 	}
 
 	c.logger.Info(ctx, "Set image tag for component", map[string]interface{}{

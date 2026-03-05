@@ -233,6 +233,7 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 		m.generateComponentStatesTableMigration(),
 		m.generateRoutingSlipsTTLMigration(),
 		m.generateComponentStatesTTLMigration(),
+		m.generateComponentStatesImageTagMigration(),
 	}
 }
 
@@ -351,6 +352,26 @@ func (m *DynamicMigrationManager) generateComponentStatesTTLMigration() clickhou
 		`, m.database),
 		DownSQL: fmt.Sprintf(`
 			ALTER TABLE %s.slip_component_states REMOVE TTL
+		`, m.database),
+	}
+}
+
+// generateComponentStatesImageTagMigration adds the image_tag column to slip_component_states.
+// This allows SetComponentImageTag to be event-sourced alongside status updates,
+// eliminating the full Read-Modify-Write race that existed when image tags were stored
+// exclusively in the routing_slips aggregate JSON column.
+func (m *DynamicMigrationManager) generateComponentStatesImageTagMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     7,
+		Name:        "add_image_tag_to_component_states",
+		Description: "Adds image_tag column to slip_component_states for event-sourced image tag tracking",
+		UpSQL: fmt.Sprintf(`
+			ALTER TABLE %s.slip_component_states
+			ADD COLUMN IF NOT EXISTS image_tag String DEFAULT ''
+		`, m.database),
+		DownSQL: fmt.Sprintf(`
+			ALTER TABLE %s.slip_component_states
+			DROP COLUMN IF EXISTS image_tag
 		`, m.database),
 	}
 }

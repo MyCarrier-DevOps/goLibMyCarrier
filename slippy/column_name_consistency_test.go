@@ -235,14 +235,16 @@ func testPrerequisiteResolutionConsistency(t *testing.T, config *PipelineConfig,
 	}
 }
 
-// testAggregateUpdateConsistency verifies aggregate status updates use config step names.
+// testAggregateUpdateConsistency verifies that UpdateStepWithStatus uses the correct config
+// step names and issues exactly one store call per invocation. After the Phase 1 fix the client
+// no longer fires a second store call via the removed checkAndUpdateAggregate; aggregate status
+// computation is handled entirely within the store.
 func testAggregateUpdateConsistency(t *testing.T, config *PipelineConfig, buildStepName, buildAggregate string) {
 	ctx := context.Background()
 	store := NewMockStore()
 	github := NewMockGitHubAPI()
 	client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
-	// Create a slip with all components completed
 	slip := &Slip{
 		CorrelationID: "test-agg-update-consistency",
 		Repository:    "owner/repo",
@@ -261,7 +263,6 @@ func testAggregateUpdateConsistency(t *testing.T, config *PipelineConfig, buildS
 	}
 	store.AddSlip(slip)
 
-	// Update a component step - should trigger aggregate update
 	err := client.UpdateStepWithStatus(
 		ctx,
 		slip.CorrelationID,
@@ -274,31 +275,29 @@ func testAggregateUpdateConsistency(t *testing.T, config *PipelineConfig, buildS
 		t.Fatalf("UpdateStepWithStatus failed: %v", err)
 	}
 
-	// Verify the aggregate step (with config name) was updated
-	var foundAggregateUpdate bool
-	for _, call := range store.UpdateStepCalls {
-		if call.StepName == buildStepName {
-			foundAggregateUpdate = true
-			if call.Status != StepStatusCompleted {
-				t.Errorf("Aggregate step %q updated with status %q, want completed", buildStepName, call.Status)
-			}
-			break
-		}
-	}
-	if !foundAggregateUpdate {
-		t.Errorf("Expected aggregate step %q to be updated, but it wasn't", buildStepName)
+	// Exactly one UpdateStepWithHistory call must be made. The client no longer issues
+	// a second call for the aggregate; that is now the store's responsibility.
+	if len(store.UpdateStepCalls) != 1 {
+		t.Errorf("expected exactly 1 UpdateStepWithHistory call, got %d", len(store.UpdateStepCalls))
 		t.Logf("UpdateStepCalls: %+v", store.UpdateStepCalls)
+	}
+	if len(store.UpdateStepCalls) > 0 && store.UpdateStepCalls[0].StepName != buildAggregate {
+		t.Errorf("expected store call for step %q, got %q", buildAggregate, store.UpdateStepCalls[0].StepName)
 	}
 }
 
-// testSetImageTagConsistency verifies SetComponentImageTag uses config step names.
+// testSetImageTagConsistency verifies SetComponentImageTag uses config step names and delegates
+// to the store via SetComponentImageTag rather than performing an in-memory RMW via Update.
+// buildStepName is the aggregate column name (e.g. "builds"); the component-level step type
+// stored in slip_component_states (the event log) is "build" regardless of the aggregate name.
 func testSetImageTagConsistency(t *testing.T, config *PipelineConfig, buildStepName string) {
 	ctx := context.Background()
 	store := NewMockStore()
 	github := NewMockGitHubAPI()
 	client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
-	// Create a slip with component data using the config step name
+	const wantImageTag = "myregistry/service-a:v1.0.0"
+
 	slip := &Slip{
 		CorrelationID: "test-image-tag-consistency",
 		Repository:    "owner/repo",
@@ -316,24 +315,30 @@ func testSetImageTagConsistency(t *testing.T, config *PipelineConfig, buildStepN
 	}
 	store.AddSlip(slip)
 
-	// Set image tag
-	err := client.SetComponentImageTag(ctx, slip.CorrelationID, "service-a", "myregistry/service-a:v1.0.0")
+	err := client.SetComponentImageTag(ctx, slip.CorrelationID, "service-a", wantImageTag)
 	if err != nil {
 		t.Fatalf("SetComponentImageTag failed: %v", err)
 	}
 
-	// Verify the update was made to the correct aggregate column
-	if len(store.UpdateCalls) != 1 {
-		t.Fatalf("Expected 1 Update call, got %d", len(store.UpdateCalls))
+	// SetComponentImageTag must delegate to store.SetComponentImageTag — no full-slip Update call.
+	if len(store.UpdateCalls) != 0 {
+		t.Errorf("expected 0 Update calls (event-sourced via store), got %d", len(store.UpdateCalls))
 	}
-
-	updatedSlip := store.UpdateCalls[0].Slip
-	components, ok := updatedSlip.Aggregates[buildStepName]
-	if !ok {
-		t.Fatalf("Updated slip missing aggregate column %q", buildStepName)
+	if len(store.SetImageTagCalls) != 1 {
+		t.Fatalf("expected 1 SetComponentImageTag call, got %d", len(store.SetImageTagCalls))
 	}
-	if len(components) != 1 || components[0].ImageTag != "myregistry/service-a:v1.0.0" {
-		t.Errorf("Image tag not set correctly in aggregate %q", buildStepName)
+	call := store.SetImageTagCalls[0]
+	// The event log step name is the component-level step TYPE from the config, which must
+	// resolve back to the aggregate via GetAggregateStep.
+	if config.GetAggregateStep(call.StepName) == "" {
+		t.Errorf("SetComponentImageTag called with step %q that does not resolve to any aggregate in config; "+
+			"expected a component step type whose aggregate column is %q", call.StepName, buildStepName)
+	}
+	if call.ComponentName != "service-a" {
+		t.Errorf("SetComponentImageTag called with component %q, want %q", call.ComponentName, "service-a")
+	}
+	if call.ImageTag != wantImageTag {
+		t.Errorf("SetComponentImageTag called with imageTag %q, want %q", call.ImageTag, wantImageTag)
 	}
 }
 

@@ -1236,7 +1236,7 @@ func TestHydrateSlip_EmptyAggregates(t *testing.T) {
 	// This is what happens when slippy post-job runs for each component
 	components := []string{"api", "worker", "frontend"}
 	for _, comp := range components {
-		err := store.insertComponentState(ctx, correlationID, "builds_completed", comp, StepStatusCompleted, "")
+		err := store.insertComponentState(ctx, correlationID, "builds_completed", comp, StepStatusCompleted, "", "")
 		if err != nil {
 			t.Fatalf("Failed to insert component state for %s: %v", comp, err)
 		}

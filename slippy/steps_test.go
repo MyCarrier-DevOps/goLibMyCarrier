@@ -259,205 +259,69 @@ func TestClient_UpdateStepWithStatus(t *testing.T) {
 	})
 }
 
-func TestClient_CheckAndUpdateAggregates(t *testing.T) {
+// TestClient_UpdateStepWithStatus_SingleStoreCallPerUpdate is a regression test verifying that
+// the client no longer performs a second store load+update via checkAndUpdateAggregate after
+// each component step update. The aggregate status is now computed entirely within the store
+// (via updateAggregateStatusFromComponentStatesWithHistory), so the client should issue exactly
+// one UpdateStepWithHistory call per UpdateStepWithStatus invocation.
+func TestClient_UpdateStepWithStatus_SingleStoreCallPerUpdate(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("build aggregate - all success", func(t *testing.T) {
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		config := testPipelineConfig()
-		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+	tests := []struct {
+		name          string
+		stepName      string
+		componentName string
+		status        StepStatus
+	}{
+		{
+			name:          "component build step - only one store call",
+			stepName:      "build",
+			componentName: "svc-a",
+			status:        StepStatusCompleted,
+		},
+		{
+			name:          "pure pipeline step - only one store call",
+			stepName:      "push_parsed",
+			componentName: "",
+			status:        StepStatusCompleted,
+		},
+		{
+			name:          "aggregate step - only one store call",
+			stepName:      "builds_completed",
+			componentName: "",
+			status:        StepStatusCompleted,
+		},
+	}
 
-		// Get the aggregate step name from config for "build" component type
-		buildAggregateStep := config.GetAggregateStep("build")
-		if buildAggregateStep == "" {
-			t.Fatal("expected config to have an aggregate step for 'build'")
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			config := testPipelineConfig()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
 
-		slip := &Slip{
-			CorrelationID: "corr-agg-1",
-			Repository:    "owner/repo",
-			Branch:        "main",
-			CommitSHA:     "abc123",
-			CreatedAt:     time.Now(),
-			UpdatedAt:     time.Now(),
-			Status:        SlipStatusInProgress,
-			Aggregates: map[string][]ComponentStepData{
-				// The aggregate column name is the step name from config
-				buildAggregateStep: {
-					{Component: "svc-a", Status: StepStatusCompleted},
-					{Component: "svc-b", Status: StepStatusCompleted},
-				},
-			},
-			Steps: make(map[string]Step),
-		}
-		store.AddSlip(slip)
+			slip := createTestSlip("corr-single-call")
+			store.AddSlip(slip)
 
-		// Trigger aggregate check via UpdateStepWithStatus with "build" step
-		err := client.UpdateStepWithStatus(ctx, "corr-agg-1", "build", "svc-a", StepStatusCompleted, "build done")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		// Should have two UpdateStep calls: one for "build" and one for the aggregate step
-		var foundAggregateCompleted bool
-		for _, call := range store.UpdateStepCalls {
-			if call.StepName == buildAggregateStep && call.Status == StepStatusCompleted {
-				foundAggregateCompleted = true
-				break
+			err := client.UpdateStepWithStatus(ctx, "corr-single-call", tt.stepName, tt.componentName, tt.status, "test msg")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
-		}
-		if !foundAggregateCompleted {
-			t.Errorf("expected %s to be updated to completed", buildAggregateStep)
-		}
-	})
 
-	t.Run("build aggregate - one failed", func(t *testing.T) {
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		config := testPipelineConfig()
-		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
-
-		// Get the aggregate step name from config for "build" component type
-		buildAggregateStep := config.GetAggregateStep("build")
-		if buildAggregateStep == "" {
-			t.Fatal("expected config to have an aggregate step for 'build'")
-		}
-
-		slip := &Slip{
-			CorrelationID: "corr-agg-2",
-			Repository:    "owner/repo",
-			Branch:        "main",
-			CommitSHA:     "abc124",
-			CreatedAt:     time.Now(),
-			UpdatedAt:     time.Now(),
-			Status:        SlipStatusInProgress,
-			Aggregates: map[string][]ComponentStepData{
-				// The aggregate column name is the step name from config
-				buildAggregateStep: {
-					{Component: "svc-a", Status: StepStatusCompleted},
-					{Component: "svc-b", Status: StepStatusFailed},
-				},
-			},
-			Steps: make(map[string]Step),
-		}
-		store.AddSlip(slip)
-
-		err := client.UpdateStepWithStatus(ctx, "corr-agg-2", "build", "svc-a", StepStatusCompleted, "build done")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		// aggregate should be failed
-		var foundAggregateFailed bool
-		for _, call := range store.UpdateStepCalls {
-			if call.StepName == buildAggregateStep && call.Status == StepStatusFailed {
-				foundAggregateFailed = true
-				break
+			// Exactly one UpdateStepWithHistory call must be made: no client-side
+			// aggregate re-check or second load+update cycle.
+			if len(store.UpdateStepCalls) != 1 {
+				t.Errorf("expected exactly 1 UpdateStepWithHistory call, got %d\n"+
+					"calls: %+v", len(store.UpdateStepCalls), store.UpdateStepCalls)
 			}
-		}
-		if !foundAggregateFailed {
-			t.Errorf("expected %s to be updated to failed", buildAggregateStep)
-		}
-	})
-
-	t.Run("build aggregate - still running", func(t *testing.T) {
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		config := testPipelineConfig()
-		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
-
-		// Get the aggregate step name from config for "build" component type
-		buildAggregateStep := config.GetAggregateStep("build")
-		if buildAggregateStep == "" {
-			t.Fatal("expected config to have an aggregate step for 'build'")
-		}
-
-		slip := &Slip{
-			CorrelationID: "corr-agg-3",
-			Repository:    "owner/repo",
-			Branch:        "main",
-			CommitSHA:     "abc125",
-			CreatedAt:     time.Now(),
-			UpdatedAt:     time.Now(),
-			Status:        SlipStatusInProgress,
-			Aggregates: map[string][]ComponentStepData{
-				// The aggregate column name is the step name from config
-				buildAggregateStep: {
-					{Component: "svc-a", Status: StepStatusCompleted},
-					{Component: "svc-b", Status: StepStatusRunning}, // Still running
-				},
-			},
-			Steps: make(map[string]Step),
-		}
-		store.AddSlip(slip)
-
-		err := client.UpdateStepWithStatus(ctx, "corr-agg-3", "build", "svc-a", StepStatusCompleted, "build done")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		// aggregate should NOT be updated (only 1 call for "build" step)
-		var aggregateUpdated bool
-		for _, call := range store.UpdateStepCalls {
-			if call.StepName == buildAggregateStep {
-				aggregateUpdated = true
-				break
+			if store.UpdateStepCalls[0].StepName != tt.stepName {
+				t.Errorf("expected step %q, got %q", tt.stepName, store.UpdateStepCalls[0].StepName)
 			}
-		}
-		if aggregateUpdated {
-			t.Errorf("expected %s to NOT be updated while builds still running", buildAggregateStep)
-		}
-	})
-
-	t.Run("unit_test aggregate", func(t *testing.T) {
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		config := testPipelineConfig()
-		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
-
-		// Get the aggregate step name from config for "unit_test" component type
-		unitTestAggregateStep := config.GetAggregateStep("unit_test")
-		if unitTestAggregateStep == "" {
-			t.Fatal("expected config to have an aggregate step for 'unit_test'")
-		}
-
-		slip := &Slip{
-			CorrelationID: "corr-agg-4",
-			Repository:    "owner/repo",
-			Branch:        "main",
-			CommitSHA:     "abc126",
-			CreatedAt:     time.Now(),
-			UpdatedAt:     time.Now(),
-			Status:        SlipStatusInProgress,
-			Aggregates: map[string][]ComponentStepData{
-				// The aggregate column name is the step name from config
-				unitTestAggregateStep: {
-					{Component: "svc-a", Status: StepStatusCompleted},
-					{Component: "svc-b", Status: StepStatusCompleted},
-				},
-			},
-			Steps: make(map[string]Step),
-		}
-		store.AddSlip(slip)
-
-		err := client.UpdateStepWithStatus(ctx, "corr-agg-4", "unit_test", "svc-a", StepStatusCompleted, "tests done")
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
-		// Should update the aggregate step
-		var foundAggregateCompleted bool
-		for _, call := range store.UpdateStepCalls {
-			if call.StepName == unitTestAggregateStep && call.Status == StepStatusCompleted {
-				foundAggregateCompleted = true
-				break
+			if store.UpdateStepCalls[0].Status != tt.status {
+				t.Errorf("expected status %q, got %q", tt.status, store.UpdateStepCalls[0].Status)
 			}
-		}
-		if !foundAggregateCompleted {
-			t.Errorf("expected %s to be updated to completed", unitTestAggregateStep)
-		}
-	})
+		})
+	}
 }
 
 func TestClient_UpdateComponentBuildStatus(t *testing.T) {
@@ -555,13 +419,24 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		// Verify the update
-		if len(store.UpdateCalls) != 1 {
-			t.Fatal("expected Update to be called")
+		// Verify the event was recorded via SetComponentImageTag on the store.
+		if len(store.SetImageTagCalls) != 1 {
+			t.Fatalf("expected SetComponentImageTag to be called once, got %d", len(store.SetImageTagCalls))
 		}
-		updatedSlip := store.UpdateCalls[0].Slip
+		call := store.SetImageTagCalls[0]
+		if call.CorrelationID != "corr-img-1" {
+			t.Errorf("expected correlationID 'corr-img-1', got %q", call.CorrelationID)
+		}
+		if call.ComponentName != "my-service" {
+			t.Errorf("expected componentName 'my-service', got %q", call.ComponentName)
+		}
+		if call.ImageTag != "mycarrier/my-service:abc123-1234567890" {
+			t.Errorf("expected imageTag 'mycarrier/my-service:abc123-1234567890', got %q", call.ImageTag)
+		}
+		// Verify the in-memory slip was updated by the mock.
+		updatedSlip, _ := store.Load(ctx, "corr-img-1")
 		if updatedSlip.Aggregates[buildAggregateStep][0].ImageTag != "mycarrier/my-service:abc123-1234567890" {
-			t.Errorf("expected image tag to be set, got '%s'", updatedSlip.Aggregates[buildAggregateStep][0].ImageTag)
+			t.Errorf("expected image tag in slip aggregates, got %q", updatedSlip.Aggregates[buildAggregateStep][0].ImageTag)
 		}
 	})
 
@@ -616,9 +491,9 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			t.Fatal("expected error for nonexistent slip")
 		}
 
-		var slipErr *SlipError
-		if !errors.As(err, &slipErr) {
-			t.Fatalf("expected SlipError, got %T", err)
+		var stepErr *StepError
+		if !errors.As(err, &stepErr) {
+			t.Fatalf("expected StepError, got %T", err)
 		}
 	})
 }
