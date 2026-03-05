@@ -65,6 +65,7 @@ type MockStore struct {
 	UpdateStepCalls       []UpdateStepCall
 	UpdateComponentCalls  []UpdateComponentCall
 	AppendHistoryCalls    []AppendHistoryCall
+	SetImageTagCalls      []SetImageTagCall
 	CloseCalls            int
 
 	// Error injection for testing error paths
@@ -77,6 +78,7 @@ type MockStore struct {
 	UpdateStepError       error
 	UpdateComponentError  error
 	AppendHistoryError    error
+	SetImageTagError      error
 	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
@@ -135,6 +137,14 @@ type UpdateComponentCall struct {
 type AppendHistoryCall struct {
 	CorrelationID string
 	Entry         slippy.StateHistoryEntry
+}
+
+// SetImageTagCall records a SetComponentImageTag call.
+type SetImageTagCall struct {
+	CorrelationID string
+	StepName      string
+	ComponentName string
+	ImageTag      string
 }
 
 // NewMockStore creates a new MockStore with initialized maps.
@@ -489,6 +499,43 @@ func (m *MockStore) Close() error {
 	return nil
 }
 
+// SetComponentImageTag records the container image tag for a component in the in-memory slip.
+func (m *MockStore) SetComponentImageTag(
+	_ context.Context,
+	correlationID, stepName, componentName, imageTag string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.SetImageTagCalls = append(m.SetImageTagCalls, SetImageTagCall{
+		CorrelationID: correlationID,
+		StepName:      stepName,
+		ComponentName: componentName,
+		ImageTag:      imageTag,
+	})
+
+	if m.SetImageTagError != nil {
+		return m.SetImageTagError
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return slippy.ErrSlipNotFound
+	}
+
+	// Search all aggregate columns for the component.
+	for colName, componentData := range slip.Aggregates {
+		for i := range componentData {
+			if componentData[i].Component == componentName {
+				slip.Aggregates[colName][i].ImageTag = imageTag
+				return nil
+			}
+		}
+	}
+
+	return slippy.ErrSlipNotFound
+}
+
 // Reset clears all stored data and call tracking.
 func (m *MockStore) Reset() {
 	m.mu.Lock()
@@ -505,6 +552,7 @@ func (m *MockStore) Reset() {
 	m.UpdateStepCalls = nil
 	m.UpdateComponentCalls = nil
 	m.AppendHistoryCalls = nil
+	m.SetImageTagCalls = nil
 	m.CloseCalls = 0
 }
 
