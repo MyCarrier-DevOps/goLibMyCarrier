@@ -381,6 +381,8 @@ func (m *DynamicMigrationManager) generateSlipAncestryTableMigration() clickhous
 					'promoted' = 8
 				),
 				parent_failed_step String DEFAULT '',
+				parent_repository String DEFAULT '',
+				parent_branch String DEFAULT '',
 				created_at DateTime64(3) DEFAULT now64(3)
 			)
 			ENGINE = ReplacingMergeTree(created_at)
@@ -395,6 +397,8 @@ func (m *DynamicMigrationManager) generateSlipAncestryTableMigration() clickhous
 // generateAncestryDataMigration migrates existing ancestry data from the inline JSON
 // column on routing_slips to the new slip_ancestry table. For each slip that has ancestry,
 // only the first entry (direct parent) is extracted and inserted.
+// Uses row_number instead of FINAL for efficiency, and joins to get the parent's
+// created_at rather than the child's for consistent AncestryEntry.CreatedAt semantics.
 func (m *DynamicMigrationManager) generateAncestryDataMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
 		Version:     8,
@@ -404,7 +408,8 @@ func (m *DynamicMigrationManager) generateAncestryDataMigration() clickhousemigr
 			INSERT INTO %s.%s (
 				repository, branch, correlation_id,
 				parent_correlation_id, parent_commit_sha, parent_status,
-				parent_failed_step, created_at
+				parent_failed_step, parent_repository, parent_branch,
+				created_at
 			)
 			SELECT
 				rs.repository,
@@ -414,11 +419,34 @@ func (m *DynamicMigrationManager) generateAncestryDataMigration() clickhousemigr
 				rs.ancestry.chain.commit_sha[1],
 				rs.ancestry.chain.status[1],
 				COALESCE(rs.ancestry.chain.failed_step[1], ''),
-				rs.created_at
-			FROM %s.routing_slips rs FINAL
-			WHERE rs.sign = 1
+				COALESCE(parent_rs.repository, rs.repository),
+				COALESCE(parent_rs.branch, rs.branch),
+				COALESCE(parent_rs.created_at, rs.created_at)
+			FROM (
+				SELECT
+					repository, branch, correlation_id, ancestry, created_at,
+					row_number() OVER (
+						PARTITION BY correlation_id
+						ORDER BY version DESC, created_at DESC
+					) AS row_num
+				FROM %s.routing_slips
+				WHERE sign = 1
+			) AS rs
+			LEFT JOIN (
+				SELECT
+					correlation_id, repository, branch, created_at,
+					row_number() OVER (
+						PARTITION BY correlation_id
+						ORDER BY version DESC, created_at DESC
+					) AS row_num
+				FROM %s.routing_slips
+				WHERE sign = 1
+			) AS parent_rs
+				ON parent_rs.correlation_id = rs.ancestry.chain.correlation_id[1]
+				AND parent_rs.row_num = 1
+			WHERE rs.row_num = 1
 			  AND length(rs.ancestry.chain.correlation_id) > 0
-		`, m.database, TableSlipAncestry, m.database),
+		`, m.database, TableSlipAncestry, m.database, m.database),
 		DownSQL: fmt.Sprintf(`TRUNCATE TABLE IF EXISTS %s.%s`, m.database, TableSlipAncestry),
 	}
 }

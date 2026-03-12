@@ -649,12 +649,14 @@ func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, pa
 		INSERT INTO %s.%s (
 			%s, %s, %s,
 			%s, %s, %s,
-			%s, %s
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			%s, %s, %s,
+			%s
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		s.database, TableSlipAncestry,
 		ColumnRepository, ColumnBranch, ColumnCorrelationID,
 		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
-		ColumnParentFailedStep, ColumnCreatedAt,
+		ColumnParentFailedStep, ColumnParentRepository, ColumnParentBranch,
+		ColumnCreatedAt,
 	)
 
 	return s.session.ExecWithArgs(ctx, query,
@@ -665,6 +667,8 @@ func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, pa
 		parent.CommitSHA,
 		string(parent.Status),
 		parent.FailedStep,
+		parent.Repository,
+		parent.Branch,
 		parent.CreatedAt,
 	)
 }
@@ -673,27 +677,35 @@ func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, pa
 // the full ancestry chain for a given slip. Returns entries ordered from
 // direct parent to oldest ancestor. Stops when no more parent links are found
 // or maxDepth is reached.
+// Supports cross-branch ancestry: each link stores the parent's repository and
+// branch, which are used for the next hop rather than the original child's values.
 func (s *ClickHouseStore) ResolveAncestry(
 	ctx context.Context,
 	repository, branch, correlationID string,
 	maxDepth int,
 ) ([]AncestryEntry, error) {
 	query := fmt.Sprintf(`
-		SELECT %s, %s, %s, %s, %s
-		FROM %s.%s FINAL
+		SELECT %s, %s, %s, %s, %s, %s, %s
+		FROM %s.%s
 		WHERE %s = ? AND %s = ? AND %s = ?
+		ORDER BY %s DESC
+		LIMIT 1
 	`,
 		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
-		ColumnParentFailedStep, ColumnCreatedAt,
+		ColumnParentFailedStep, ColumnParentRepository, ColumnParentBranch,
+		ColumnCreatedAt,
 		s.database, TableSlipAncestry,
 		ColumnRepository, ColumnBranch, ColumnCorrelationID,
+		ColumnCreatedAt,
 	)
 
 	var chain []AncestryEntry
 	currentID := correlationID
+	currentRepo := repository
+	currentBranch := branch
 
 	for range maxDepth {
-		row := s.session.QueryRow(ctx, query, repository, branch, currentID)
+		row := s.session.QueryRow(ctx, query, currentRepo, currentBranch, currentID)
 
 		var entry AncestryEntry
 		var statusStr string
@@ -702,6 +714,8 @@ func (s *ClickHouseStore) ResolveAncestry(
 			&entry.CommitSHA,
 			&statusStr,
 			&entry.FailedStep,
+			&entry.Repository,
+			&entry.Branch,
 			&entry.CreatedAt,
 		); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
@@ -713,6 +727,8 @@ func (s *ClickHouseStore) ResolveAncestry(
 
 		chain = append(chain, entry)
 		currentID = entry.CorrelationID
+		currentRepo = entry.Repository
+		currentBranch = entry.Branch
 	}
 
 	return chain, nil

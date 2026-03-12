@@ -384,6 +384,8 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 			Status:        slip.Status,
 			FailedStep:    failedStep,
 			CreatedAt:     slip.CreatedAt,
+			Repository:    slip.Repository,
+			Branch:        slip.Branch,
 		})
 	}
 
