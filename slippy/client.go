@@ -142,6 +142,15 @@ func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, sta
 	return nil
 }
 
+// ResolveAncestry walks the slip_ancestry table to reconstruct a slip's full
+// ancestry chain on demand. Uses config.AncestryMaxDepth as the depth limit.
+func (c *Client) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+) ([]AncestryEntry, error) {
+	return c.store.ResolveAncestry(ctx, repository, branch, correlationID, c.config.AncestryMaxDepth)
+}
+
 // AbandonSlip marks a slip as abandoned, indicating it was superseded by a newer slip.
 // This should only be called on slips that are not already in a terminal state.
 // Returns an error if the slip is already terminal.

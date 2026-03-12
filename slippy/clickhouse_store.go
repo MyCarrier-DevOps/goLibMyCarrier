@@ -673,17 +673,10 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 		return fmt.Errorf("failed to marshal state history: %w", err)
 	}
 
-	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
-	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
-	ancestryJSON, err := json.Marshal(ancestryWrapper)
-	if err != nil {
-		return fmt.Errorf("failed to marshal ancestry: %w", err)
-	}
-
 	// Build column list for INSERT
 	var columns []string
 	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
-		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory,
 		ColumnSign, ColumnVersion)
 	columns = append(columns, stepColumns...)
 	columns = append(columns, aggregateColumns...)
@@ -693,7 +686,7 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 	var values []interface{}
 
 	// Core columns as literals (using positional parameters)
-	selectExprs = append(selectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?", "?")
+	selectExprs = append(selectExprs, "?", "?", "?", "?", "?", "?", "?", "?", "?")
 	values = append(values,
 		slip.CorrelationID,
 		slip.Repository,
@@ -704,7 +697,6 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 		string(slip.Status),
 		string(stepDetailsJSON),
 		string(stateHistoryJSON),
-		string(ancestryJSON),
 	)
 
 	// Sign as literal
@@ -803,17 +795,10 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 		return fmt.Errorf("failed to marshal state history: %w", err)
 	}
 
-	// Serialize ancestry wrapped in object for ClickHouse JSON compatibility
-	ancestryWrapper := map[string]interface{}{"chain": slip.Ancestry}
-	ancestryJSON, err := json.Marshal(ancestryWrapper)
-	if err != nil {
-		return fmt.Errorf("failed to marshal ancestry: %w", err)
-	}
-
 	// Build column list for INSERT (must match SELECT order exactly)
 	var columns []string
 	columns = append(columns, ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
-		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory,
 		ColumnSign, ColumnVersion)
 	columns = append(columns, stepColumns...)
 	columns = append(columns, aggregateColumns...)
@@ -822,7 +807,7 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 	// We keep the original version so VersionedCollapsingMergeTree can collapse them properly
 	cancelSelectColumns := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
-		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory,
 		"-1",          // Flip sign to -1
 		ColumnVersion, // Keep original version for proper collapsing
 	}
@@ -840,13 +825,12 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 	var newSelectExprs []string
 	var newValues []interface{}
 
-	// Core columns (10 columns) - need to cast JSON columns to match existing table schema
+	// Core columns (9 columns) - need to cast JSON columns to match existing table schema
 	// ClickHouse requires explicit casting when UNION ALL combines JSON columns from table
 	// with string literals
 	newSelectExprs = append(newSelectExprs, "?", "?", "?", "?", "?", "?", "?",
 		"CAST(? AS JSON)", // step_details - cast to JSON
-		"CAST(? AS JSON)", // state_history - cast to JSON
-		"CAST(? AS JSON)") // ancestry - cast to JSON
+		"CAST(? AS JSON)") // state_history - cast to JSON
 	newValues = append(newValues,
 		slip.CorrelationID,
 		slip.Repository,
@@ -857,7 +841,6 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 		string(slip.Status),
 		string(stepDetailsJSON),
 		string(stateHistoryJSON),
-		string(ancestryJSON),
 	)
 
 	// Sign for new row: 1, Version for new row: new timestamp
@@ -1185,6 +1168,80 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		retrySpan.EndSuccess()
 		return nil
 	}
+}
+
+// InsertAncestryLink writes a single direct-parent link to the slip_ancestry table.
+// Each slip has at most one parent entry, keeping storage O(1) per slip.
+func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (
+			%s, %s, %s,
+			%s, %s, %s,
+			%s, %s
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.database, TableSlipAncestry,
+		ColumnRepository, ColumnBranch, ColumnCorrelationID,
+		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
+		ColumnParentFailedStep, ColumnCreatedAt,
+	)
+
+	return s.session.ExecWithArgs(ctx, query,
+		slip.Repository,
+		slip.Branch,
+		slip.CorrelationID,
+		parent.CorrelationID,
+		parent.CommitSHA,
+		string(parent.Status),
+		parent.FailedStep,
+		parent.CreatedAt,
+	)
+}
+
+// ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
+// the full ancestry chain for a given slip. Returns entries ordered from
+// direct parent to oldest ancestor. Stops when no more parent links are found
+// or maxDepth is reached.
+func (s *ClickHouseStore) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+	maxDepth int,
+) ([]AncestryEntry, error) {
+	query := fmt.Sprintf(`
+		SELECT %s, %s, %s, %s, %s
+		FROM %s.%s FINAL
+		WHERE %s = ? AND %s = ? AND %s = ?
+	`,
+		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
+		ColumnParentFailedStep, ColumnCreatedAt,
+		s.database, TableSlipAncestry,
+		ColumnRepository, ColumnBranch, ColumnCorrelationID,
+	)
+
+	var chain []AncestryEntry
+	currentID := correlationID
+
+	for i := 0; i < maxDepth; i++ {
+		row := s.session.QueryRow(ctx, query, repository, branch, currentID)
+
+		var entry AncestryEntry
+		var statusStr string
+		if err := row.Scan(
+			&entry.CorrelationID,
+			&entry.CommitSHA,
+			&statusStr,
+			&entry.FailedStep,
+			&entry.CreatedAt,
+		); err != nil {
+			// No more parents found — end of chain
+			break
+		}
+		entry.Status = SlipStatus(statusStr)
+
+		chain = append(chain, entry)
+		currentID = entry.CorrelationID
+	}
+
+	return chain, nil
 }
 
 // hydrateSlip fetches component states from the event sourcing table and merges them into the slip.

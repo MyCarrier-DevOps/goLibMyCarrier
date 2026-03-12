@@ -184,6 +184,18 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		return nil, fmt.Errorf("failed to create slip: %w", err)
 	}
 
+	// Write direct parent link to slip_ancestry table (O(1) per slip)
+	if len(ancestry) > 0 {
+		if err := c.store.InsertAncestryLink(ctx, slip, ancestry[0]); err != nil {
+			c.logger.Warn(ctx, "Failed to write ancestry link", map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"parent_id":      ancestry[0].CorrelationID,
+				"error":          err.Error(),
+			})
+			result.Warnings = append(result.Warnings, fmt.Errorf("failed to write ancestry link: %w", err))
+		}
+	}
+
 	result.Slip = slip
 
 	c.logger.Info(ctx, "Created routing slip", map[string]interface{}{
@@ -373,16 +385,6 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 			FailedStep:    failedStep,
 			CreatedAt:     slip.CreatedAt,
 		})
-
-		// Inherit ancestor's ancestry chain (only from the first/most recent ancestor)
-		// This ensures we maintain full lineage even when commits exceed AncestryDepth
-		if i == 0 && len(slip.Ancestry) > 0 {
-			c.logger.Debug(ctx, "Inheriting ancestry from parent slip", map[string]interface{}{
-				"parent_id":         slip.CorrelationID,
-				"inherited_entries": len(slip.Ancestry),
-			})
-			ancestry = append(ancestry, slip.Ancestry...)
-		}
 	}
 
 	c.logger.Info(ctx, "Resolved ancestry chain", map[string]interface{}{

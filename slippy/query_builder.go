@@ -50,7 +50,7 @@ func (b *SlipQueryBuilder) BuildSelectColumns() []string {
 	columns := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus,
-		ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnStepDetails, ColumnStateHistory,
 		ColumnSign, ColumnVersion,
 	}
 
