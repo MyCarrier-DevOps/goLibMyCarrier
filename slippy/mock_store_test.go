@@ -504,7 +504,7 @@ func (m *MockStore) ResolveAncestry(
 	repository, branch, correlationID string,
 	maxDepth int,
 ) ([]AncestryEntry, error) {
-	return nil, nil
+	return []AncestryEntry{}, nil
 }
 
 // Close releases any resources held by the store.

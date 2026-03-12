@@ -575,7 +575,7 @@ func (m *MockStore) ResolveAncestry(
 	repository, branch, correlationID string,
 	maxDepth int,
 ) ([]slippy.AncestryEntry, error) {
-	return nil, nil
+	return []slippy.AncestryEntry{}, nil
 }
 
 // Ensure MockStore implements slippy.SlipStore at compile time.
