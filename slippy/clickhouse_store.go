@@ -642,6 +642,82 @@ func (s *ClickHouseStore) Close() error {
 	return s.session.Close()
 }
 
+// InsertAncestryLink writes a single direct-parent link to the slip_ancestry table.
+// Each slip has at most one parent entry, keeping storage O(1) per slip.
+func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (
+			%s, %s, %s,
+			%s, %s, %s,
+			%s, %s
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		s.database, TableSlipAncestry,
+		ColumnRepository, ColumnBranch, ColumnCorrelationID,
+		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
+		ColumnParentFailedStep, ColumnCreatedAt,
+	)
+
+	return s.session.ExecWithArgs(ctx, query,
+		slip.Repository,
+		slip.Branch,
+		slip.CorrelationID,
+		parent.CorrelationID,
+		parent.CommitSHA,
+		string(parent.Status),
+		parent.FailedStep,
+		parent.CreatedAt,
+	)
+}
+
+// ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
+// the full ancestry chain for a given slip. Returns entries ordered from
+// direct parent to oldest ancestor. Stops when no more parent links are found
+// or maxDepth is reached.
+func (s *ClickHouseStore) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+	maxDepth int,
+) ([]AncestryEntry, error) {
+	query := fmt.Sprintf(`
+		SELECT %s, %s, %s, %s, %s
+		FROM %s.%s FINAL
+		WHERE %s = ? AND %s = ? AND %s = ?
+	`,
+		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
+		ColumnParentFailedStep, ColumnCreatedAt,
+		s.database, TableSlipAncestry,
+		ColumnRepository, ColumnBranch, ColumnCorrelationID,
+	)
+
+	var chain []AncestryEntry
+	currentID := correlationID
+
+	for range maxDepth {
+		row := s.session.QueryRow(ctx, query, repository, branch, currentID)
+
+		var entry AncestryEntry
+		var statusStr string
+		if err := row.Scan(
+			&entry.CorrelationID,
+			&entry.CommitSHA,
+			&statusStr,
+			&entry.FailedStep,
+			&entry.CreatedAt,
+		); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				break
+			}
+			return nil, fmt.Errorf("scanning ancestry row: %w", err)
+		}
+		entry.Status = SlipStatus(statusStr)
+
+		chain = append(chain, entry)
+		currentID = entry.CorrelationID
+	}
+
+	return chain, nil
+}
+
 // insertRow inserts a single row into the routing_slips table.
 // If version is 0, the version is calculated atomically as COALESCE(MAX(version), 0) + 1.
 // If version is non-zero, that specific version is used (for cancel rows in VersionedCollapsingMergeTree).
@@ -1168,80 +1244,6 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		retrySpan.EndSuccess()
 		return nil
 	}
-}
-
-// InsertAncestryLink writes a single direct-parent link to the slip_ancestry table.
-// Each slip has at most one parent entry, keeping storage O(1) per slip.
-func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
-	query := fmt.Sprintf(`
-		INSERT INTO %s.%s (
-			%s, %s, %s,
-			%s, %s, %s,
-			%s, %s
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		s.database, TableSlipAncestry,
-		ColumnRepository, ColumnBranch, ColumnCorrelationID,
-		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
-		ColumnParentFailedStep, ColumnCreatedAt,
-	)
-
-	return s.session.ExecWithArgs(ctx, query,
-		slip.Repository,
-		slip.Branch,
-		slip.CorrelationID,
-		parent.CorrelationID,
-		parent.CommitSHA,
-		string(parent.Status),
-		parent.FailedStep,
-		parent.CreatedAt,
-	)
-}
-
-// ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
-// the full ancestry chain for a given slip. Returns entries ordered from
-// direct parent to oldest ancestor. Stops when no more parent links are found
-// or maxDepth is reached.
-func (s *ClickHouseStore) ResolveAncestry(
-	ctx context.Context,
-	repository, branch, correlationID string,
-	maxDepth int,
-) ([]AncestryEntry, error) {
-	query := fmt.Sprintf(`
-		SELECT %s, %s, %s, %s, %s
-		FROM %s.%s FINAL
-		WHERE %s = ? AND %s = ? AND %s = ?
-	`,
-		ColumnParentCorrelationID, ColumnParentCommitSHA, ColumnParentStatus,
-		ColumnParentFailedStep, ColumnCreatedAt,
-		s.database, TableSlipAncestry,
-		ColumnRepository, ColumnBranch, ColumnCorrelationID,
-	)
-
-	var chain []AncestryEntry
-	currentID := correlationID
-
-	for i := 0; i < maxDepth; i++ {
-		row := s.session.QueryRow(ctx, query, repository, branch, currentID)
-
-		var entry AncestryEntry
-		var statusStr string
-		if err := row.Scan(
-			&entry.CorrelationID,
-			&entry.CommitSHA,
-			&statusStr,
-			&entry.FailedStep,
-			&entry.CreatedAt,
-		); err != nil {
-			// No more parents found — end of chain
-			break
-		}
-		entry.Status = SlipStatus(statusStr)
-
-		chain = append(chain, entry)
-		currentID = entry.CorrelationID
-	}
-
-	return chain, nil
 }
 
 // hydrateSlip fetches component states from the event sourcing table and merges them into the slip.
