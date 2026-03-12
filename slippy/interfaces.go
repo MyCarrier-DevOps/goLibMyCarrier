@@ -59,6 +59,17 @@ type SlipStore interface {
 	// AppendHistory adds a state history entry to the slip
 	AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error
 
+	// InsertAncestryLink writes a single direct-parent link to the ancestry table.
+	InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error
+
+	// ResolveAncestry walks parent links to reconstruct the full ancestry chain.
+	// Returns entries ordered from direct parent to oldest ancestor, capped at maxDepth.
+	ResolveAncestry(
+		ctx context.Context,
+		repository, branch, correlationID string,
+		maxDepth int,
+	) ([]AncestryEntry, error)
+
 	// Close releases any resources held by the store
 	Close() error
 }

@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -36,6 +37,17 @@ func NewClient(config Config) (*Client, error) {
 	if config.Logger == nil {
 		config.Logger = NopLogger()
 	}
+
+	// Log database selection with reason
+	dbSource := "K8S_NAMESPACE"
+	if slippyDB := os.Getenv("SLIPPY_DATABASE"); slippyDB != "" {
+		dbSource = "SLIPPY_DATABASE override"
+	}
+	config.Logger.Info(ctx, "Database selected", map[string]interface{}{
+		"database":      config.Database,
+		"source":        dbSource,
+		"k8s_namespace": os.Getenv("K8S_NAMESPACE"),
+	})
 
 	// Initialize ClickHouse store from config
 	// Migrations are skipped if config.SkipMigrations is true (e.g., Slippy CLI trusts pushhookparser ran them)
@@ -140,6 +152,15 @@ func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, sta
 		"status":         string(status),
 	})
 	return nil
+}
+
+// ResolveAncestry walks the slip_ancestry table to reconstruct a slip's full
+// ancestry chain on demand. Uses config.AncestryMaxDepth as the depth limit.
+func (c *Client) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+) ([]AncestryEntry, error) {
+	return c.store.ResolveAncestry(ctx, repository, branch, correlationID, c.config.AncestryMaxDepth)
 }
 
 // AbandonSlip marks a slip as abandoned, indicating it was superseded by a newer slip.

@@ -564,5 +564,19 @@ func DeepCopySlip(slip *slippy.Slip) *slippy.Slip {
 	return cpy
 }
 
+// InsertAncestryLink writes a direct-parent link (no-op in mock).
+func (m *MockStore) InsertAncestryLink(ctx context.Context, slip *slippy.Slip, parent slippy.AncestryEntry) error {
+	return nil
+}
+
+// ResolveAncestry walks parent links to reconstruct ancestry (returns empty in mock).
+func (m *MockStore) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+	maxDepth int,
+) ([]slippy.AncestryEntry, error) {
+	return []slippy.AncestryEntry{}, nil
+}
+
 // Ensure MockStore implements slippy.SlipStore at compile time.
 var _ slippy.SlipStore = (*MockStore)(nil)

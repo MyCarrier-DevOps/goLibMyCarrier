@@ -569,14 +569,45 @@ func TestConfig_WithPipelineConfig(t *testing.T) {
 
 func TestConfig_WithDatabase(t *testing.T) {
 	cfg := DefaultConfig()
+	original := cfg.Database
 
 	newCfg := cfg.WithDatabase("custom_db")
 
 	if newCfg.Database != "custom_db" {
 		t.Errorf("WithDatabase should set database to 'custom_db', got '%s'", newCfg.Database)
 	}
-	// Original should be unchanged (default is "ci")
-	if cfg.Database != "ci" {
-		t.Errorf("original config should have default database 'ci', got '%s'", cfg.Database)
+	// Original should be unchanged
+	if cfg.Database != original {
+		t.Errorf("original config should not be modified, got '%s'", cfg.Database)
+	}
+}
+
+func TestDefaultDatabase_K8SNamespace(t *testing.T) {
+	orig := os.Getenv("K8S_NAMESPACE")
+	defer func() { _ = os.Setenv("K8S_NAMESPACE", orig) }()
+
+	tests := []struct {
+		namespace string
+		want      string
+	}{
+		{"", "ci"},
+		{"production", "ci"},
+		{"dev", "ci"},
+		{"argo-events", "ci"},
+		{"test", "ci_test"},
+		{"slippy-test", "ci_test"},
+		{"integration-test-ns", "ci_test"},
+		{"testing", "ci_test"},
+		{"argo-events-test", "ci_test"},
+	}
+
+	for _, tt := range tests {
+		t.Run("namespace_"+tt.namespace, func(t *testing.T) {
+			_ = os.Setenv("K8S_NAMESPACE", tt.namespace)
+			got := defaultDatabase()
+			if got != tt.want {
+				t.Errorf("defaultDatabase() with K8S_NAMESPACE=%q = %q, want %q", tt.namespace, got, tt.want)
+			}
+		})
 	}
 }
