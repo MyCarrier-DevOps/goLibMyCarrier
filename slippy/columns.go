@@ -33,4 +33,6 @@ const (
 	ColumnParentCommitSHA     = "parent_commit_sha"
 	ColumnParentStatus        = "parent_status"
 	ColumnParentFailedStep    = "parent_failed_step"
+	ColumnParentRepository    = "parent_repository"
+	ColumnParentBranch        = "parent_branch"
 )
