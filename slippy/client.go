@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -36,6 +37,17 @@ func NewClient(config Config) (*Client, error) {
 	if config.Logger == nil {
 		config.Logger = NopLogger()
 	}
+
+	// Log database selection with reason
+	dbSource := "K8S_NAMESPACE"
+	if slippyDB := os.Getenv("SLIPPY_DATABASE"); slippyDB != "" {
+		dbSource = "SLIPPY_DATABASE override"
+	}
+	config.Logger.Info(ctx, "Database selected", map[string]interface{}{
+		"database":      config.Database,
+		"source":        dbSource,
+		"k8s_namespace": os.Getenv("K8S_NAMESPACE"),
+	})
 
 	// Initialize ClickHouse store from config
 	// Migrations are skipped if config.SkipMigrations is true (e.g., Slippy CLI trusts pushhookparser ran them)
