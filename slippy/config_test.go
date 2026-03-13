@@ -594,11 +594,13 @@ func TestDefaultDatabase_K8SNamespace(t *testing.T) {
 		{"production", "ci"},
 		{"dev", "ci"},
 		{"argo-events", "ci"},
-		{"test", "ci_test"},
+		{"test", "ci"},
+		{"testing", "ci"},
+		{"testengine", "ci"},
 		{"slippy-test", "ci_test"},
-		{"integration-test-ns", "ci_test"},
-		{"testing", "ci_test"},
 		{"argo-events-test", "ci_test"},
+		{"slippy-dev", "ci_test"},
+		{"argo-events-dev", "ci_test"},
 	}
 
 	for _, tt := range tests {
