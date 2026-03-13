@@ -4,7 +4,7 @@ go 1.26
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.42.0
-	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.57
+	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.63
 )
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger
