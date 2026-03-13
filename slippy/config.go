@@ -68,9 +68,10 @@ type Config struct {
 }
 
 // defaultDatabase returns the database name based on the K8S_NAMESPACE environment variable.
-// If K8S_NAMESPACE contains "test", it returns "ci_test"; otherwise "ci".
+// If K8S_NAMESPACE ends with "-test" or "-dev", it returns "ci_test"; otherwise "ci".
 func defaultDatabase() string {
-	if strings.Contains(os.Getenv("K8S_NAMESPACE"), "test") {
+	ns := os.Getenv("K8S_NAMESPACE")
+	if strings.HasSuffix(ns, "-test") || strings.HasSuffix(ns, "-dev") {
 		return "ci_test"
 	}
 	return "ci"
