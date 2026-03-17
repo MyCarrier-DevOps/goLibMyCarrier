@@ -235,6 +235,7 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 		m.generateComponentStatesTTLMigration(),
 		m.generateSlipAncestryTableMigration(),
 		m.generateAncestryDataMigration(),
+		m.generateDropHistoryViewMigration(),
 		m.generateDropAncestryColumnMigration(),
 	}
 }
@@ -451,11 +452,25 @@ func (m *DynamicMigrationManager) generateAncestryDataMigration() clickhousemigr
 	}
 }
 
+// generateDropHistoryViewMigration drops the routing_slip_history_mv materialized view.
+// This must run before dropping the ancestry column, because the view reads from
+// routing_slips and ClickHouse blocks column drops while dependent views exist.
+func (m *DynamicMigrationManager) generateDropHistoryViewMigration() clickhousemigrator.Migration {
+	historyMigration := m.generateHistoryViewMigration()
+	return clickhousemigrator.Migration{
+		Version:     9,
+		Name:        "drop_history_view",
+		Description: "Drops routing_slip_history_mv so the ancestry column can be removed",
+		UpSQL:       historyMigration.DownSQL,
+		DownSQL:     historyMigration.UpSQL,
+	}
+}
+
 // generateDropAncestryColumnMigration removes the ancestry JSON column from routing_slips
 // after data has been migrated to the slip_ancestry table.
 func (m *DynamicMigrationManager) generateDropAncestryColumnMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
-		Version:     9,
+		Version:     10,
 		Name:        "drop_ancestry_column",
 		Description: "Drops the ancestry JSON column from routing_slips (data now in slip_ancestry)",
 		UpSQL: fmt.Sprintf(`
