@@ -94,7 +94,7 @@ type AppLogger interface {
 	Fatalf(template string, args ...interface{})
 	With(key string, value interface{}) AppLogger
 	// WithContext returns a logger that, for the OpenTelemetry Emit path only,
-	// attaches the TraceId/SpanId of the active span from ctx to every OTel log
+	// attaches the TraceID/SpanID of the active span from ctx to every OTel log
 	// record it emits. Structured JSON/stdout logs (when useOtel is false or no
 	// OTLP endpoint is configured) are not affected.
 	WithContext(ctx context.Context) AppLogger

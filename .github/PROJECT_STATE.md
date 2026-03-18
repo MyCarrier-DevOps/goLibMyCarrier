@@ -182,7 +182,6 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 **Files changed:**
 - `otel/otel.go`
 - `otel/otel_test.go`
-- `PR-description-otel-withcontext.md` (PR description artifact)
 
 **Validation:**
 - ✅ `make lint PKG=otel` — 0 issues

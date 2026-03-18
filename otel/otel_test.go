@@ -2031,7 +2031,11 @@ func (c *captureOtelLogger) Enabled(_ context.Context, _ otellog.EnabledParamete
 // other context value — so that only the minimal necessary state is retained.
 func TestWithContext_ExtractsSpanContextFromContext(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
-	defer func() { _ = tp.Shutdown(context.Background()) }()
+ 	defer func() {
+ 		if err := tp.Shutdown(context.Background()); err != nil {
+ 			t.Errorf("failed to shutdown tracer provider: %v", err)
+ 		}
+ 	}()
 
 	ctx, span := tp.Tracer("test").Start(context.Background(), "test-span")
 	defer span.End()
