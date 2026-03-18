@@ -2089,7 +2089,11 @@ func TestWithContext_NoSpan_ClearsSpanCtx(t *testing.T) {
 // that has no active span.
 func TestWithContext_StaleSpanCtx_ClearedWhenNoSpanInNewContext(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
-	defer func() { _ = tp.Shutdown(context.Background()) }()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			t.Errorf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
 
 	_, originalSpan := tp.Tracer("test").Start(context.Background(), "original-span")
 	defer originalSpan.End()
@@ -2123,7 +2127,11 @@ func TestWithContext_StaleSpanCtx_ClearedWhenNoSpanInNewContext(t *testing.T) {
 // extract TraceID and SpanID for log-trace correlation.
 func TestSendOtelLog_PassesSpanCtxToEmit(t *testing.T) {
 	tp := sdktrace.NewTracerProvider()
-	defer func() { _ = tp.Shutdown(context.Background()) }()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			t.Errorf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
 
 	_, span := tp.Tracer("test").Start(context.Background(), "test-span")
 	defer span.End()

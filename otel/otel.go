@@ -2,6 +2,7 @@ package otel
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -351,6 +352,44 @@ func FromContext(ctx context.Context) AppLogger {
 		useOtel:     false,
 		exitFunc:    os.Exit,
 	}
+}
+
+// BuildCorrelationContext creates an OTel context whose active remote span uses
+// correlationId (dashes stripped, 32 hex chars) as its TraceId. All spans and
+// log records emitted from the returned context share that TraceId, forming a
+// single traceable chain across service boundaries (e.g. API → Kafka → Worker).
+// If correlationId is not a valid 32-hex string or does not yield a valid TraceID,
+// the original ctx is returned unchanged.
+func BuildCorrelationContext(ctx context.Context, correlationId string) context.Context {
+	cleaned := strings.ReplaceAll(correlationId, "-", "")
+	if len(cleaned) != 32 {
+		return ctx
+	}
+	b, err := hex.DecodeString(cleaned)
+	if err != nil {
+		return ctx
+	}
+	var traceID trace.TraceID
+	copy(traceID[:], b)
+	if !traceID.IsValid() {
+		return ctx
+	}
+	// Preserve existing trace flags if there is a valid parent span; otherwise
+	// leave them unset so the sampler can decide.
+	var traceFlags trace.TraceFlags
+	if parentSpanCtx := trace.SpanContextFromContext(ctx); parentSpanCtx.IsValid() {
+		traceFlags = parentSpanCtx.TraceFlags()
+	}
+	remoteSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     trace.SpanID{0x01}, // non-zero required for IsValid()
+		TraceFlags: traceFlags,
+		Remote:     true,
+	})
+	if !remoteSpanCtx.IsValid() {
+		return ctx
+	}
+	return trace.ContextWithRemoteSpanContext(ctx, remoteSpanCtx)
 }
 
 // GinLoggerMiddleware creates a Gin middleware that uses otel logger
