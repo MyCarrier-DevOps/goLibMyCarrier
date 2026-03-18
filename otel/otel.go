@@ -276,9 +276,10 @@ func (l *OtelLogger) Shutdown(ctx context.Context) error {
 }
 
 // clone returns a shallow copy of the logger with a fresh attributes map
-// containing all existing key-value pairs. All other fields are copied by
-// value, so callers can safely modify the returned logger's attributes or
-// spanCtx without affecting the original.
+// containing all existing key-value pairs. The attributes map itself is
+// deep-copied (a new map is allocated), spanCtx is copied by value, and
+// pointer fields (such as fallbackLog, tracer, traceProvider, logger, and
+// logProvider) are intentionally shared between the original and the clone.
 func (l *OtelLogger) clone() *OtelLogger {
 	newLogger := &OtelLogger{
 		appName:       l.appName,
@@ -752,8 +753,9 @@ func (l *OtelLogger) sendOtelLog(level LogLevel, message string) {
 	// Build a minimal context for Emit. The SDK log bridge calls
 	// trace.SpanContextFromContext to extract TraceID/SpanID; we satisfy that by
 	// using trace.ContextWithSpanContext, which wraps the stored SpanContext in an
-	// internal non-recording span — zero GC overhead, no retained heap objects.
-	// Falls back to context.Background() when no span was set via WithContext.
+	// internal non-recording span. This keeps the context minimal and avoids
+	// retaining any request-scoped values from a larger parent context. Falls back
+	// to context.Background() when no span was set via WithContext.
 	ctx := context.Background()
 	if sc := l.spanCtx; sc.IsValid() {
 		ctx = trace.ContextWithSpanContext(context.Background(), sc)
