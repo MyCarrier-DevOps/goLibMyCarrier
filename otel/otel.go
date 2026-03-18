@@ -243,7 +243,7 @@ func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 }
 
 // WithContext returns a copy of the logger whose OTel log records will carry
-// the TraceId/SpanId of the active span from ctx. Only the SpanContext value
+// the TraceID/SpanID of the active span from ctx. Only the SpanContext value
 // (TraceID, SpanID, flags — 24 bytes) is stored; the Span object, request body,
 // deadlines, and all other context values are intentionally discarded to prevent
 // retaining large request-scoped objects beyond the request lifetime.

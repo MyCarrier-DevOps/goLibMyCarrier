@@ -2184,3 +2184,112 @@ func TestSendOtelLog_FallsBackToBackgroundWhenNoSpanCtx(t *testing.T) {
 		t.Errorf("expected no span context in emitted ctx, got %v", sc)
 	}
 }
+
+// --- BuildCorrelationContext tests ---
+
+func TestBuildCorrelationContext_ValidUUID_SetsTraceID(t *testing.T) {
+	// Standard UUID-formatted correlation ID (dashes must be stripped).
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := BuildCorrelationContext(context.Background(), correlationID)
+
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context in the returned context")
+	}
+	if !sc.IsRemote() {
+		t.Error("expected span context to be marked as remote")
+	}
+	want := "550e8400e29b41d4a716446655440000"
+	if got := sc.TraceID().String(); got != want {
+		t.Errorf("TraceID: got %q, want %q", got, want)
+	}
+}
+
+func TestBuildCorrelationContext_ValidHexNoDashes_SetsTraceID(t *testing.T) {
+	// 32-char hex string with no dashes.
+	correlationID := "abcdef1234567890abcdef1234567890"
+	ctx := BuildCorrelationContext(context.Background(), correlationID)
+
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context")
+	}
+	if got := sc.TraceID().String(); got != correlationID {
+		t.Errorf("TraceID: got %q, want %q", got, correlationID)
+	}
+}
+
+func TestBuildCorrelationContext_InvalidShortString_ReturnsOriginalCtx(t *testing.T) {
+	// Too short — should be a no-op.
+	type key struct{}
+	origCtx := context.WithValue(context.Background(), key{}, "sentinel")
+	result := BuildCorrelationContext(origCtx, "tooshort")
+
+	if result != origCtx {
+		t.Error("expected the original context to be returned unchanged")
+	}
+}
+
+func TestBuildCorrelationContext_InvalidNonHex_ReturnsOriginalCtx(t *testing.T) {
+	// 32 chars but contains non-hex characters.
+	type key struct{}
+	origCtx := context.WithValue(context.Background(), key{}, "sentinel")
+	result := BuildCorrelationContext(origCtx, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+
+	if result != origCtx {
+		t.Error("expected the original context to be returned unchanged")
+	}
+}
+
+func TestBuildCorrelationContext_AllZeros_ReturnsOriginalCtx(t *testing.T) {
+	// All-zero TraceID is not valid per the OTel spec.
+	type key struct{}
+	origCtx := context.WithValue(context.Background(), key{}, "sentinel")
+	result := BuildCorrelationContext(origCtx, "00000000000000000000000000000000")
+
+	if result != origCtx {
+		t.Error("expected the original context to be returned unchanged for all-zero TraceID")
+	}
+}
+
+func TestBuildCorrelationContext_PreservesParentTraceFlags(t *testing.T) {
+	// When a valid parent span is already active the returned context must
+	// carry the same trace flags (e.g. sampled bit) so downstream decisions
+	// are consistent with the upstream sampling choice.
+	tp := sdktrace.NewTracerProvider()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			t.Errorf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
+
+	_, span := tp.Tracer("test").Start(context.Background(), "parent")
+	defer span.End()
+	parentCtx := trace.ContextWithSpan(context.Background(), span)
+	parentFlags := span.SpanContext().TraceFlags()
+
+	correlationID := "abcdef1234567890abcdef1234567890"
+	resultCtx := BuildCorrelationContext(parentCtx, correlationID)
+
+	sc := trace.SpanContextFromContext(resultCtx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context")
+	}
+	if sc.TraceFlags() != parentFlags {
+		t.Errorf("TraceFlags: got %v, want %v (parent flags not preserved)", sc.TraceFlags(), parentFlags)
+	}
+}
+
+func TestBuildCorrelationContext_NoParentSpan_TraceFlagsUnset(t *testing.T) {
+	// No active span in parent context → TraceFlags should be zero.
+	correlationID := "abcdef1234567890abcdef1234567890"
+	ctx := BuildCorrelationContext(context.Background(), correlationID)
+
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context")
+	}
+	if sc.TraceFlags() != 0 {
+		t.Errorf("expected zero TraceFlags with no parent, got %v", sc.TraceFlags())
+	}
+}
