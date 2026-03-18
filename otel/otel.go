@@ -2,6 +2,7 @@ package otel
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -93,6 +94,11 @@ type AppLogger interface {
 	Fatal(args ...interface{})
 	Fatalf(template string, args ...interface{})
 	With(key string, value interface{}) AppLogger
+	// WithContext returns a logger that, for the OpenTelemetry Emit path only,
+	// attaches the TraceID/SpanID of the active span from ctx to every OTel log
+	// record it emits. Structured JSON/stdout logs (when useOtel is false or no
+	// OTLP endpoint is configured) are not affected.
+	WithContext(ctx context.Context) AppLogger
 	Shutdown(ctx context.Context) error
 }
 
@@ -108,6 +114,12 @@ type OtelLogger struct {
 	traceProvider *sdktrace.TracerProvider
 	logger        otellog.Logger
 	logProvider   *sdklog.LoggerProvider
+	// spanCtx holds only the SpanContext (TraceID + SpanID + flags) for OTel
+	// log-trace correlation. Storing the 24-byte value type rather than a full
+	// context.Context or trace.Span avoids retaining request-scoped heap objects
+	// (HTTP request body, gin context, deadlines, etc.) beyond the request lifetime.
+	// Zero value (IsValid() == false) means no trace correlation.
+	spanCtx trace.SpanContext
 	// exitFunc is called by Fatal/Fatalf after logging. Defaults to os.Exit.
 	// Override in tests to prevent process termination.
 	exitFunc func(int)
@@ -225,28 +237,25 @@ func (l *OtelLogger) Fatalf(template string, args ...interface{}) {
 
 // With adds a key-value pair to the logger context
 func (l *OtelLogger) With(key string, value interface{}) AppLogger {
-	newLogger := &OtelLogger{
-		appName:       l.appName,
-		appVersion:    l.appVersion,
-		logLevel:      l.logLevel,
-		attributes:    make(map[string]interface{}),
-		fallbackLog:   l.fallbackLog,
-		useOtel:       l.useOtel,
-		tracer:        l.tracer,
-		traceProvider: l.traceProvider,
-		logger:        l.logger,
-		logProvider:   l.logProvider,
-		exitFunc:      l.exitFunc,
-	}
-
-	// Copy existing attributes
-	for k, v := range l.attributes {
-		newLogger.attributes[k] = v
-	}
-
-	// Add new attribute
+	newLogger := l.clone()
 	newLogger.attributes[key] = value
+	return newLogger
+}
 
+// WithContext returns a copy of the logger whose OTel log records will carry
+// the TraceID/SpanID of the active span from ctx. Only the SpanContext value
+// (TraceID, SpanID, flags — 24 bytes) is stored; the Span object, request body,
+// deadlines, and all other context values are intentionally discarded to prevent
+// retaining large request-scoped objects beyond the request lifetime.
+//
+// The SpanContext is always overwritten — even when ctx has no active span. This
+// ensures a derived logger cannot accidentally inherit a stale trace correlation
+// from its parent logger.
+func (l *OtelLogger) WithContext(ctx context.Context) AppLogger {
+	newLogger := l.clone()
+	// SpanFromContext returns a noop span (IsValid() == false) when no span is
+	// active, so the zero SpanContext naturally clears any inherited trace.
+	newLogger.spanCtx = trace.SpanFromContext(ctx).SpanContext()
 	return newLogger
 }
 
@@ -265,6 +274,32 @@ func (l *OtelLogger) Shutdown(ctx context.Context) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// clone returns a shallow copy of the logger with a fresh attributes map
+// containing all existing key-value pairs. The attributes map itself is
+// deep-copied (a new map is allocated), spanCtx is copied by value, and
+// pointer fields (such as fallbackLog, tracer, traceProvider, logger, and
+// logProvider) are intentionally shared between the original and the clone.
+func (l *OtelLogger) clone() *OtelLogger {
+	newLogger := &OtelLogger{
+		appName:       l.appName,
+		appVersion:    l.appVersion,
+		logLevel:      l.logLevel,
+		attributes:    make(map[string]interface{}, len(l.attributes)),
+		fallbackLog:   l.fallbackLog,
+		useOtel:       l.useOtel,
+		tracer:        l.tracer,
+		traceProvider: l.traceProvider,
+		logger:        l.logger,
+		logProvider:   l.logProvider,
+		spanCtx:       l.spanCtx,
+		exitFunc:      l.exitFunc,
+	}
+	for k, v := range l.attributes {
+		newLogger.attributes[k] = v
+	}
+	return newLogger
 }
 
 // exit calls exitFunc if set, otherwise falls back to os.Exit.
@@ -317,6 +352,44 @@ func FromContext(ctx context.Context) AppLogger {
 		useOtel:     false,
 		exitFunc:    os.Exit,
 	}
+}
+
+// BuildCorrelationContext creates an OTel context whose active remote span uses
+// correlationId (dashes stripped, 32 hex chars) as its TraceId. All spans and
+// log records emitted from the returned context share that TraceId, forming a
+// single traceable chain across service boundaries (e.g. API → Kafka → Worker).
+// If correlationId is not a valid 32-hex string or does not yield a valid TraceID,
+// the original ctx is returned unchanged.
+func BuildCorrelationContext(ctx context.Context, correlationId string) context.Context {
+	cleaned := strings.ReplaceAll(correlationId, "-", "")
+	if len(cleaned) != 32 {
+		return ctx
+	}
+	b, err := hex.DecodeString(cleaned)
+	if err != nil {
+		return ctx
+	}
+	var traceID trace.TraceID
+	copy(traceID[:], b)
+	if !traceID.IsValid() {
+		return ctx
+	}
+	// Preserve existing trace flags if there is a valid parent span; otherwise
+	// leave them unset so the sampler can decide.
+	var traceFlags trace.TraceFlags
+	if parentSpanCtx := trace.SpanContextFromContext(ctx); parentSpanCtx.IsValid() {
+		traceFlags = parentSpanCtx.TraceFlags()
+	}
+	remoteSpanCtx := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     trace.SpanID{0x01}, // non-zero required for IsValid()
+		TraceFlags: traceFlags,
+		Remote:     true,
+	})
+	if !remoteSpanCtx.IsValid() {
+		return ctx
+	}
+	return trace.ContextWithRemoteSpanContext(ctx, remoteSpanCtx)
 }
 
 // GinLoggerMiddleware creates a Gin middleware that uses otel logger
@@ -716,8 +789,19 @@ func (l *OtelLogger) sendOtelLog(level LogLevel, message string) {
 		logRecord.AddAttributes(otellog.String(k, fmt.Sprintf("%v", v)))
 	}
 
+	// Build a minimal context for Emit. The SDK log bridge calls
+	// trace.SpanContextFromContext to extract TraceID/SpanID; we satisfy that by
+	// using trace.ContextWithSpanContext, which wraps the stored SpanContext in an
+	// internal non-recording span. This keeps the context minimal and avoids
+	// retaining any request-scoped values from a larger parent context. Falls back
+	// to context.Background() when no span was set via WithContext.
+	ctx := context.Background()
+	if sc := l.spanCtx; sc.IsValid() {
+		ctx = trace.ContextWithSpanContext(context.Background(), sc)
+	}
+
 	// Emit the log record
-	l.logger.Emit(context.Background(), logRecord)
+	l.logger.Emit(ctx, logRecord)
 }
 
 // logFallback uses standard library logging as fallback
