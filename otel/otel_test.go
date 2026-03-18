@@ -14,6 +14,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/attribute"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/embedded"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestLogLevel_String(t *testing.T) {
@@ -1998,5 +2002,139 @@ func TestOtelLogger_DefaultPortConstants(t *testing.T) {
 	}
 	if DefaultHTTPPort != "4318" {
 		t.Errorf("DefaultHTTPPort should be '4318', got %q", DefaultHTTPPort)
+	}
+}
+
+// captureOtelLogger is a test double for otellog.Logger that records the context
+// and record passed to every Emit call, allowing tests to assert on trace
+// correlation fields (TraceID, SpanID) that the SDK log bridge extracts from ctx.
+type captureOtelLogger struct {
+	embedded.Logger // required by the otellog.Logger interface
+	calls []captureEmitCall
+}
+
+type captureEmitCall struct {
+	ctx    context.Context
+	record otellog.Record
+}
+
+func (c *captureOtelLogger) Emit(ctx context.Context, r otellog.Record) {
+	c.calls = append(c.calls, captureEmitCall{ctx: ctx, record: r})
+}
+
+func (c *captureOtelLogger) Enabled(_ context.Context, _ otellog.EnabledParameters) bool {
+	return true
+}
+
+// TestWithContext_ExtractsSpanContextFromContext verifies that WithContext stores
+// a trimmed context containing only the active span, so the OTel log bridge can
+// extract TraceID/SpanID without retaining request-scoped values.
+func TestWithContext_ExtractsSpanContextFromContext(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	ctx, span := tp.Tracer("test").Start(context.Background(), "test-span")
+	defer span.End()
+
+	wantSC := span.SpanContext()
+	if !wantSC.IsValid() {
+		t.Fatal("test span must have a valid SpanContext")
+	}
+
+	base := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+	}
+
+	derived, ok := base.WithContext(ctx).(*OtelLogger)
+	if !ok {
+		t.Fatal("WithContext must return *OtelLogger")
+	}
+
+	if derived.traceCtx == nil {
+		t.Fatal("WithContext must set traceCtx when context has a valid span")
+	}
+	gotSC := trace.SpanContextFromContext(derived.traceCtx)
+	if gotSC.TraceID() != wantSC.TraceID() || gotSC.SpanID() != wantSC.SpanID() {
+		t.Errorf("traceCtx carries wrong SpanContext:\ngot  TraceID=%v SpanID=%v\nwant TraceID=%v SpanID=%v",
+			gotSC.TraceID(), gotSC.SpanID(), wantSC.TraceID(), wantSC.SpanID())
+	}
+}
+
+// TestWithContext_NoSpan_TraceCtxIsNil verifies that passing a context with no
+// active span leaves traceCtx nil, so sendOtelLog falls back to context.Background().
+func TestWithContext_NoSpan_TraceCtxIsNil(t *testing.T) {
+	base := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+	}
+	derived, ok := base.WithContext(context.Background()).(*OtelLogger)
+	if !ok {
+		t.Fatal("WithContext must return *OtelLogger")
+	}
+	if derived.traceCtx != nil {
+		t.Error("expected traceCtx to be nil when the context carries no active span")
+	}
+}
+
+// TestSendOtelLog_PassesTraceCtxToEmit verifies that sendOtelLog forwards the
+// trimmed traceCtx (carrying the active span) to Emit so the SDK log bridge can
+// extract TraceID and SpanID for log-trace correlation.
+func TestSendOtelLog_PassesTraceCtxToEmit(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+
+	_, span := tp.Tracer("test").Start(context.Background(), "test-span")
+	defer span.End()
+
+	wantSC := span.SpanContext()
+	trimmedCtx := trace.ContextWithSpan(context.Background(), span)
+
+	cap := &captureOtelLogger{}
+	logger := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+		logger:     cap,
+		traceCtx:   trimmedCtx,
+	}
+
+	logger.sendOtelLog(LevelInfo, "hello")
+
+	if len(cap.calls) != 1 {
+		t.Fatalf("expected 1 Emit call, got %d", len(cap.calls))
+	}
+	gotSC := trace.SpanContextFromContext(cap.calls[0].ctx)
+	if gotSC.TraceID() != wantSC.TraceID() {
+		t.Errorf("TraceID: got %v, want %v", gotSC.TraceID(), wantSC.TraceID())
+	}
+	if gotSC.SpanID() != wantSC.SpanID() {
+		t.Errorf("SpanID: got %v, want %v", gotSC.SpanID(), wantSC.SpanID())
+	}
+}
+
+// TestSendOtelLog_FallsBackToBackgroundWhenNoTraceCtx verifies that when no
+// traceCtx is set, sendOtelLog emits with context.Background() (no span context),
+// and the SDK bridge records zero TraceID/SpanID.
+func TestSendOtelLog_FallsBackToBackgroundWhenNoTraceCtx(t *testing.T) {
+	cap := &captureOtelLogger{}
+	logger := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+		logger:     cap,
+		// traceCtx is nil
+	}
+
+	logger.sendOtelLog(LevelInfo, "hello")
+
+	if len(cap.calls) != 1 {
+		t.Fatalf("expected 1 Emit call, got %d", len(cap.calls))
+	}
+	sc := trace.SpanContextFromContext(cap.calls[0].ctx)
+	if sc.IsValid() {
+		t.Errorf("expected no span context in emitted ctx, got %v", sc)
 	}
 }
