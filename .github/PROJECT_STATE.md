@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** February 23, 2026
-> **Status:** Multi-module Go library on Go 1.26; all CVEs remediated; slippy status reconciliation and terminal-semantics validated
+> **Last Updated:** March 18, 2026
+> **Status:** Multi-module Go library on Go 1.26; otel `WithContext` PR review complete; all CVEs remediated
 
 ---
 
@@ -30,7 +30,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 | `github` | GitHub API client with App authentication | Updated - structured errors |
 | `vault` | HashiCorp Vault integration | Stable |
 | `auth` | Gin authentication middleware | Stable |
-| `otel` | OpenTelemetry instrumentation | Updated - gRPC log export |
+| `otel` | OpenTelemetry instrumentation | Updated — `WithContext` + `clone()` + stale-trace fix |
 | `argocdclient` | ArgoCD application/manifest client | Stable |
 | `yaml` | YAML utilities | Stable |
 
@@ -144,6 +144,53 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### March 18, 2026 — otel `WithContext` PR Review Iterations
+
+**Problem (original PR):**
+`OtelLogger.sendOtelLog` always called `l.logger.Emit(context.Background(), logRecord)`. The hard-coded `context.Background()` had no span, so the OTel SDK bridge extracted zero TraceID/SpanID — ClickHouse `mgmt_otel_logs` showed empty trace correlation fields for all services.
+
+**Initial implementation:**
+- Added `WithContext(ctx context.Context) AppLogger` to the `AppLogger` interface and `OtelLogger`
+- Added `traceCtx context.Context` field; `sendOtelLog` passed it to `Emit`
+
+**PR review — round 1 (addressed):**
+
+| Comment | Resolution |
+|---|---|
+| Storing full `context.Context` retains large request-scoped values (deadlines, body, etc.) beyond request lifetime | Replaced `traceCtx context.Context` with `spanCtx trace.SpanContext` (24-byte value type — no heap references) |
+| `With` and `WithContext` duplicate the struct-copy + attributes-copy logic | Extracted `clone()` unexported helper; both methods delegate to it |
+| No tests for `WithContext` → `sendOtelLog` correlation path | Added 4 tests using `captureOtelLogger` test double |
+| Docstring implies stdout/JSON logs gain TraceId/SpanId | Narrowed docstring to "OTel Emit path only" |
+
+**PR review — round 2 (addressed):**
+
+| Comment | Resolution |
+|---|---|
+| `WithContext` with a no-span context silently inherits parent `spanCtx` (stale trace bug) | Removed `if span.IsValid()` guard — `spanCtx` is always overwritten; noop span yields zero value which clears inheritance |
+| Storing `trace.SpanContext` is better but still keeps `trace.Span` alive via `ContextWithSpan` | Switched storage to plain `spanCtx trace.SpanContext`; `sendOtelLog` uses `trace.ContextWithSpanContext(ctx.Background(), sc)` to reconstruct the minimal context the SDK bridge needs |
+| Missing test for "logger with existing spanCtx calls WithContext with no-span context" | Added `TestWithContext_StaleSpanCtx_ClearedWhenNoSpanInNewContext` |
+
+**Final otel package state:**
+- `AppLogger` interface: added `WithContext(ctx context.Context) AppLogger`
+- `OtelLogger` struct: `spanCtx trace.SpanContext` (value type, not pointer/context)
+- `OtelLogger.clone()`: unexported helper — copies all fields + attributes map; used by `With` and `WithContext`
+- `OtelLogger.WithContext`: unconditionally assigns `trace.SpanFromContext(ctx).SpanContext()` (zero value when no span → clears stale correlation)
+- `OtelLogger.sendOtelLog`: `trace.ContextWithSpanContext(context.Background(), sc)` when `sc.IsValid()`; otherwise `context.Background()`
+- **60 tests** — all pass; lint clean
+
+**Files changed:**
+- `otel/otel.go`
+- `otel/otel_test.go`
+- `PR-description-otel-withcontext.md` (PR description artifact)
+
+**Validation:**
+- ✅ `make lint PKG=otel` — 0 issues
+- ✅ `make test PKG=otel` — 60 tests pass
+
+**Pre-merge required:**
+- Publish `goLibMyCarrier/otel` as `v1.3.67` (PR #48 open)
+- In companion MC.TestEngine PR: update `go.mod` `v1.3.66` → `v1.3.67`, remove `replace` directives, run `go mod tidy`
 
 ### February 23, 2026 — Lint Go-Version Alignment + Full Repo Validation
 
@@ -677,11 +724,9 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ## Current Focus
 
-1. **OpenTelemetry improvements complete** - gRPC log export, SpanKind support, trace context serialization
-2. **E2E integration tests complete** - All 7 testcontainers-based tests pass, validating full pipeline flow
-3. **hydrateSlip bug fixed** - Combined `UpdateStepWithHistory` prevents step status overwrites
-4. **VCMT query fix** - `sign = 1` filter ensures correct row selection
-5. **Next: Merge test/slippy branch** - PR #31 ready for review and merge to main
+1. **otel `WithContext` PR (#48) ready to merge** — two rounds of review addressed; 60 tests pass; lint clean
+2. **MC.TestEngine companion PR** — remove `replace` directives, update `goLibMyCarrier/otel` to `v1.3.67` after tag is published
+3. **Next: Merge PR #31** (test/slippy branch) to main
 
 ---
 
@@ -778,6 +823,15 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - `FindByCommits`: `WHERE ... AND s.sign = 1 ORDER BY c.priority ASC, s.version DESC`
 **Anti-pattern:** Relying solely on `FINAL` or `LIMIT 1` without `sign = 1` filter.
 
+### Minimal Span Context Retention in WithContext
+**Decision:** `OtelLogger.WithContext` stores only `trace.SpanContext` (a 24-byte value type), not the full `context.Context` or `trace.Span`.
+**Rationale:** Storing a full `context.Context` retains all request-scoped values (HTTP request body, Gin context, deadlines, cancellation channels) for the lifetime of the derived logger. A logger frequently escapes its originating request (e.g., passed to background goroutines, middleware chains). Storing just the 24-byte `trace.SpanContext` achieves the same trace correlation with zero heap retention risk.
+**Implementation:**
+- `OtelLogger.spanCtx trace.SpanContext` — plain value field
+- `WithContext(ctx)` extracts via `trace.SpanFromContext(ctx).SpanContext()` — always overwrites (no stale-trace inheritance)
+- `sendOtelLog` reconstructs a minimal context via `trace.ContextWithSpanContext(context.Background(), sc)` for the SDK log bridge
+**Anti-pattern:** Storing `traceCtx context.Context` (retains heap), or `trace.Span` reference (retains recorder + SDK state).
+
 ### Cross-Process Trace Context Propagation
 **Decision:** Use W3C TRACEPARENT format and SerializedSpanContext for cross-process trace continuity.
 **Rationale:** Slippy pre-job and post-job run as separate Argo workflow containers. To maintain trace continuity, the span context must be serialized, passed via workflow artifacts, and deserialized in post-job.
@@ -820,8 +874,11 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 ## Next Steps (Not Yet Implemented)
 
 ### Immediate
+- [ ] Merge goLibMyCarrier otel PR #48; publish `v1.3.67` tag
+- [ ] Update MC.TestEngine `go.mod` → `v1.3.67`, remove `replace` directives, merge MC.TestEngine PR
+- [ ] Verify `autotriggertests` and `deploy-reporter` mock loggers have `WithContext` before upgrading their goLibMyCarrier version
 - [ ] Merge PR #31 (test/slippy branch) to main
-- [ ] Publish new goLibMyCarrier version with OTel improvements
+- [ ] Publish new goLibMyCarrier version with OTel + slippy improvements
 - [ ] Update all downstream consumers (pushhookparser, Slippy) to use new version
 - [ ] Validate trace continuity in production environment
 

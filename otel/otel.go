@@ -113,13 +113,12 @@ type OtelLogger struct {
 	traceProvider *sdktrace.TracerProvider
 	logger        otellog.Logger
 	logProvider   *sdklog.LoggerProvider
-	// traceCtx is a minimal context that carries only the active span extracted
-	// by WithContext. It is built as trace.ContextWithSpan(context.Background(), span)
-	// so that request-scoped values (deadlines, cancellations, HTTP request body,
-	// etc.) are not retained beyond the request lifetime, avoiding memory pressure
-	// from long-lived logger instances escaping their originating request.
-	// Nil means no trace correlation; sendOtelLog falls back to context.Background().
-	traceCtx context.Context
+	// spanCtx holds only the SpanContext (TraceID + SpanID + flags) for OTel
+	// log-trace correlation. Storing the 24-byte value type rather than a full
+	// context.Context or trace.Span avoids retaining request-scoped heap objects
+	// (HTTP request body, gin context, deadlines, etc.) beyond the request lifetime.
+	// Zero value (IsValid() == false) means no trace correlation.
+	spanCtx trace.SpanContext
 	// exitFunc is called by Fatal/Fatalf after logging. Defaults to os.Exit.
 	// Override in tests to prevent process termination.
 	exitFunc func(int)
@@ -243,17 +242,19 @@ func (l *OtelLogger) With(key string, value interface{}) AppLogger {
 }
 
 // WithContext returns a copy of the logger whose OTel log records will carry
-// the TraceId/SpanId of the active span from ctx. Only the span itself is
-// retained — other request-scoped values (deadlines, cancellations, HTTP
-// request body, etc.) from ctx are intentionally dropped by storing just
-// trace.ContextWithSpan(context.Background(), span). This prevents the logger
-// from inadvertently extending the lifetime of large request-scoped objects.
+// the TraceId/SpanId of the active span from ctx. Only the SpanContext value
+// (TraceID, SpanID, flags — 24 bytes) is stored; the Span object, request body,
+// deadlines, and all other context values are intentionally discarded to prevent
+// retaining large request-scoped objects beyond the request lifetime.
+//
+// The SpanContext is always overwritten — even when ctx has no active span. This
+// ensures a derived logger cannot accidentally inherit a stale trace correlation
+// from its parent logger.
 func (l *OtelLogger) WithContext(ctx context.Context) AppLogger {
 	newLogger := l.clone()
-	span := trace.SpanFromContext(ctx)
-	if span.SpanContext().IsValid() {
-		newLogger.traceCtx = trace.ContextWithSpan(context.Background(), span)
-	}
+	// SpanFromContext returns a noop span (IsValid() == false) when no span is
+	// active, so the zero SpanContext naturally clears any inherited trace.
+	newLogger.spanCtx = trace.SpanFromContext(ctx).SpanContext()
 	return newLogger
 }
 
@@ -277,7 +278,7 @@ func (l *OtelLogger) Shutdown(ctx context.Context) error {
 // clone returns a shallow copy of the logger with a fresh attributes map
 // containing all existing key-value pairs. All other fields are copied by
 // value, so callers can safely modify the returned logger's attributes or
-// traceCtx without affecting the original.
+// spanCtx without affecting the original.
 func (l *OtelLogger) clone() *OtelLogger {
 	newLogger := &OtelLogger{
 		appName:       l.appName,
@@ -290,7 +291,7 @@ func (l *OtelLogger) clone() *OtelLogger {
 		traceProvider: l.traceProvider,
 		logger:        l.logger,
 		logProvider:   l.logProvider,
-		traceCtx:      l.traceCtx,
+		spanCtx:       l.spanCtx,
 		exitFunc:      l.exitFunc,
 	}
 	for k, v := range l.attributes {
@@ -748,13 +749,14 @@ func (l *OtelLogger) sendOtelLog(level LogLevel, message string) {
 		logRecord.AddAttributes(otellog.String(k, fmt.Sprintf("%v", v)))
 	}
 
-	// Pass the trimmed trace context so the SDK log bridge can extract TraceId
-	// and SpanId via trace.SpanContextFromContext. traceCtx carries only the
-	// active span (no request-scoped values); falls back to context.Background()
-	// when no span was set via WithContext.
+	// Build a minimal context for Emit. The SDK log bridge calls
+	// trace.SpanContextFromContext to extract TraceID/SpanID; we satisfy that by
+	// using trace.ContextWithSpanContext, which wraps the stored SpanContext in an
+	// internal non-recording span — zero GC overhead, no retained heap objects.
+	// Falls back to context.Background() when no span was set via WithContext.
 	ctx := context.Background()
-	if l.traceCtx != nil {
-		ctx = l.traceCtx
+	if sc := l.spanCtx; sc.IsValid() {
+		ctx = trace.ContextWithSpanContext(context.Background(), sc)
 	}
 
 	// Emit the log record
