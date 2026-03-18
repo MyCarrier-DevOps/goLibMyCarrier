@@ -15,6 +15,8 @@ require (
 	golang.org/x/oauth2 v0.34.0
 )
 
+replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger
+
 require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect

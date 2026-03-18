@@ -7,6 +7,8 @@ require (
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.57
 )
 
+replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger
+
 require (
 	github.com/ClickHouse/ch-go v0.70.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
