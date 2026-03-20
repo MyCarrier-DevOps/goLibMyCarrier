@@ -493,6 +493,20 @@ func (m *MockStore) UpdateStepWithHistory(
 	return nil
 }
 
+// InsertAncestryLink writes a direct-parent link (no-op in mock).
+func (m *MockStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
+	return nil
+}
+
+// ResolveAncestry walks parent links to reconstruct ancestry (returns empty in mock).
+func (m *MockStore) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+	maxDepth int,
+) ([]AncestryEntry, error) {
+	return []AncestryEntry{}, nil
+}
+
 // Close releases any resources held by the store.
 func (m *MockStore) Close() error {
 	m.mu.Lock()

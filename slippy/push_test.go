@@ -594,15 +594,14 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
-		// Verify ancestry chain includes both direct parent and inherited ancestors
-		if len(ancestry) != 2 {
-			t.Fatalf("expected 2 ancestry entries (parent + inherited), got %d", len(ancestry))
+		// With the slip_ancestry table model, resolveAndAbandonAncestors only returns
+		// direct ancestors found via git history. Transitive ancestry (grandparent)
+		// is resolved at query time via the slip_ancestry table, not inherited inline.
+		if len(ancestry) != 1 {
+			t.Fatalf("expected 1 ancestry entry (direct parent only), got %d", len(ancestry))
 		}
 		if ancestry[0].CorrelationID != "corr-parent-1" {
 			t.Errorf("expected first entry 'corr-parent-1', got '%s'", ancestry[0].CorrelationID)
-		}
-		if ancestry[1].CorrelationID != "corr-grandparent-1" {
-			t.Errorf("expected second entry (inherited) 'corr-grandparent-1', got '%s'", ancestry[1].CorrelationID)
 		}
 
 		// Verify no abandonment (ancestor was terminal)

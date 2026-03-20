@@ -233,6 +233,10 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 		m.generateComponentStatesTableMigration(),
 		m.generateRoutingSlipsTTLMigration(),
 		m.generateComponentStatesTTLMigration(),
+		m.generateSlipAncestryTableMigration(),
+		m.generateAncestryDataMigration(),
+		m.generateDropHistoryViewMigration(),
+		m.generateDropAncestryColumnMigration(),
 	}
 }
 
@@ -273,9 +277,6 @@ func (m *DynamicMigrationManager) generateBaseTableMigration() clickhousemigrato
 
 				-- Complete audit trail (array wrapped in object for ClickHouse JSON compatibility)
 				state_history JSON DEFAULT '{"entries":[]}',
-
-				-- Ancestry chain tracking prior slips (array wrapped in object for ClickHouse JSON compatibility)
-				ancestry JSON DEFAULT '{"chain":[]}',
 
 				-- VersionedCollapsingMergeTree columns
 				-- sign: 1 = active row, -1 = cancelled row (for updates)
@@ -351,6 +352,132 @@ func (m *DynamicMigrationManager) generateComponentStatesTTLMigration() clickhou
 		`, m.database),
 		DownSQL: fmt.Sprintf(`
 			ALTER TABLE %s.slip_component_states REMOVE TTL
+		`, m.database),
+	}
+}
+
+// generateSlipAncestryTableMigration creates the slip_ancestry table for direct parent links.
+// This replaces the unbounded ancestry JSON array on routing_slips with O(1) parent links.
+// Full ancestry chains are resolved on demand by walking parent_correlation_id pointers.
+func (m *DynamicMigrationManager) generateSlipAncestryTableMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     7,
+		Name:        "create_slip_ancestry",
+		Description: "Creates slip_ancestry table with direct parent links replacing inline ancestry JSON",
+		UpSQL: fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %s.%s (
+				repository String,
+				branch String,
+				correlation_id String,
+				parent_correlation_id String,
+				parent_commit_sha String,
+				parent_status Enum8(
+					'pending' = 1,
+					'in_progress' = 2,
+					'completed' = 3,
+					'failed' = 4,
+					'compensating' = 5,
+					'compensated' = 6,
+					'abandoned' = 7,
+					'promoted' = 8
+				),
+				parent_failed_step String DEFAULT '',
+				parent_repository String DEFAULT '',
+				parent_branch String DEFAULT '',
+				created_at DateTime64(3) DEFAULT now64(3)
+			)
+			ENGINE = ReplacingMergeTree(created_at)
+			ORDER BY (repository, branch, correlation_id)
+			TTL created_at + INTERVAL 60 DAY
+			SETTINGS index_granularity = 8192
+		`, m.database, TableSlipAncestry),
+		DownSQL: fmt.Sprintf(`DROP TABLE IF EXISTS %s.%s`, m.database, TableSlipAncestry),
+	}
+}
+
+// generateAncestryDataMigration migrates existing ancestry data from the inline JSON
+// column on routing_slips to the new slip_ancestry table. For each slip that has ancestry,
+// only the first entry (direct parent) is extracted and inserted.
+// Uses row_number instead of FINAL for efficiency, and joins to get the parent's
+// created_at rather than the child's for consistent AncestryEntry.CreatedAt semantics.
+func (m *DynamicMigrationManager) generateAncestryDataMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     8,
+		Name:        "migrate_ancestry_data",
+		Description: "Extracts direct parent links from inline ancestry JSON into slip_ancestry table",
+		UpSQL: fmt.Sprintf(`
+			INSERT INTO %s.%s (
+				repository, branch, correlation_id,
+				parent_correlation_id, parent_commit_sha, parent_status,
+				parent_failed_step, parent_repository, parent_branch,
+				created_at
+			)
+			SELECT
+				rs.repository,
+				rs.branch,
+				rs.correlation_id,
+				rs.ancestry.chain.correlation_id[1],
+				rs.ancestry.chain.commit_sha[1],
+				rs.ancestry.chain.status[1],
+				COALESCE(rs.ancestry.chain.failed_step[1], ''),
+				COALESCE(parent_rs.repository, rs.repository),
+				COALESCE(parent_rs.branch, rs.branch),
+				COALESCE(parent_rs.created_at, rs.created_at)
+			FROM (
+				SELECT
+					repository, branch, correlation_id, ancestry, created_at,
+					row_number() OVER (
+						PARTITION BY correlation_id
+						ORDER BY version DESC, created_at DESC
+					) AS row_num
+				FROM %s.routing_slips
+				WHERE sign = 1
+			) AS rs
+			LEFT JOIN (
+				SELECT
+					correlation_id, repository, branch, created_at,
+					row_number() OVER (
+						PARTITION BY correlation_id
+						ORDER BY version DESC, created_at DESC
+					) AS row_num
+				FROM %s.routing_slips
+				WHERE sign = 1
+			) AS parent_rs
+				ON parent_rs.correlation_id = rs.ancestry.chain.correlation_id[1]
+				AND parent_rs.row_num = 1
+			WHERE rs.row_num = 1
+			  AND length(rs.ancestry.chain.correlation_id) > 0
+		`, m.database, TableSlipAncestry, m.database, m.database),
+		DownSQL: fmt.Sprintf(`TRUNCATE TABLE IF EXISTS %s.%s`, m.database, TableSlipAncestry),
+	}
+}
+
+// generateDropHistoryViewMigration drops the routing_slip_history_mv materialized view.
+// This must run before dropping the ancestry column, because the view reads from
+// routing_slips and ClickHouse blocks column drops while dependent views exist.
+func (m *DynamicMigrationManager) generateDropHistoryViewMigration() clickhousemigrator.Migration {
+	historyMigration := m.generateHistoryViewMigration()
+	return clickhousemigrator.Migration{
+		Version:     9,
+		Name:        "drop_history_view",
+		Description: "Drops routing_slip_history_mv so the ancestry column can be removed",
+		UpSQL:       historyMigration.DownSQL,
+		DownSQL:     historyMigration.UpSQL,
+	}
+}
+
+// generateDropAncestryColumnMigration removes the ancestry JSON column from routing_slips
+// after data has been migrated to the slip_ancestry table.
+func (m *DynamicMigrationManager) generateDropAncestryColumnMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     10,
+		Name:        "drop_ancestry_column",
+		Description: "Drops the ancestry JSON column from routing_slips (data now in slip_ancestry)",
+		UpSQL: fmt.Sprintf(`
+			ALTER TABLE %s.routing_slips DROP COLUMN IF EXISTS ancestry
+		`, m.database),
+		DownSQL: fmt.Sprintf(`
+			ALTER TABLE %s.routing_slips ADD COLUMN IF NOT EXISTS ancestry JSON DEFAULT '{"chain":[]}'
 		`, m.database),
 	}
 }
