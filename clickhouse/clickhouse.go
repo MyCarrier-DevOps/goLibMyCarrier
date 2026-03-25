@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"github.com/spf13/viper"
@@ -92,6 +93,7 @@ func retryOperation(ctx context.Context, operation func() error) error {
 // ClickhouseSessionInterface defines the interface for ClickHouse session operations
 type ClickhouseSessionInterface interface {
 	Connect(ch *ClickhouseConfig, ctx context.Context) error
+	Ping(ctx context.Context) error
 	Query(ctx context.Context, query string) (Rows, error)
 	QueryWithArgs(ctx context.Context, query string, args ...interface{}) (Rows, error)
 	QueryRow(ctx context.Context, query string, args ...interface{}) Row
@@ -282,6 +284,21 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 			TLS: &tls.Config{
 				InsecureSkipVerify: chsession.skipVerify,
 			},
+
+			// Pool health settings to prevent stale connections from silently
+			// blocking operations until Linux TCP retransmission timeout (~7 min).
+			// ConnMaxLifetime reaps connections before LB/firewall idle timeouts
+			// kill them. DialContext enables TCP keepalives so the OS detects
+			// dead peers proactively via keepalive probes.
+			DialContext: func(ctx context.Context, addr string) (net.Conn, error) {
+				return (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext(ctx, "tcp", addr)
+			},
+			ConnMaxLifetime: 5 * time.Minute,
+			MaxOpenConns:    10,
+			MaxIdleConns:    5,
 		})
 		if err != nil {
 			return fmt.Errorf("error connecting to ClickHouse: %w", err)
@@ -361,6 +378,14 @@ func (ch *ClickhouseSession) ExecWithArgs(ctx context.Context, stmt string, args
 	})
 }
 
+// Ping verifies the connection to ClickHouse is alive.
+func (ch *ClickhouseSession) Ping(ctx context.Context) error {
+	if ch.conn == nil {
+		return fmt.Errorf("clickhouse connection is not established")
+	}
+	return ch.conn.Ping(ctx)
+}
+
 // Close ClickHouse connection
 func (ch *ClickhouseSession) Close() error {
 	if ch.conn != nil {
@@ -391,6 +416,10 @@ func NewSessionFromConn(conn Conn) ClickhouseSessionInterface {
 
 func (w *connWrapper) Connect(cfg *ClickhouseConfig, ctx context.Context) error {
 	return nil // Already connected
+}
+
+func (w *connWrapper) Ping(ctx context.Context) error {
+	return w.conn.Ping(ctx)
 }
 
 func (w *connWrapper) Query(ctx context.Context, query string) (Rows, error) {

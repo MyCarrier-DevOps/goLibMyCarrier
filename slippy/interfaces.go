@@ -72,6 +72,10 @@ type SlipStore interface {
 
 	// Close releases any resources held by the store
 	Close() error
+
+	// Ping verifies the underlying database connection is alive.
+	// Returns nil if the connection is healthy, or an error if it is stale/dead.
+	Ping(ctx context.Context) error
 }
 
 // GitHubAPI defines the interface for GitHub operations.

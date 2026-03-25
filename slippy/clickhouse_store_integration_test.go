@@ -192,6 +192,10 @@ func (s *testClickhouseSession) Connect(ch *ch.ClickhouseConfig, ctx context.Con
 	return nil // Already connected
 }
 
+func (s *testClickhouseSession) Ping(ctx context.Context) error {
+	return s.conn.Ping(ctx)
+}
+
 func (s *testClickhouseSession) Query(ctx context.Context, query string) (ch.Rows, error) {
 	return s.conn.Query(ctx, query)
 }

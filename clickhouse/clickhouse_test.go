@@ -186,6 +186,11 @@ func (m *MockClickhouseSession) Close() error {
 	return args.Error(0)
 }
 
+func (m *MockClickhouseSession) Ping(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
 func (m *MockClickhouseSession) Conn() driver.Conn {
 	args := m.Called()
 	if args.Get(0) == nil {

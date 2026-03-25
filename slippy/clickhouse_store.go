@@ -642,6 +642,11 @@ func (s *ClickHouseStore) Close() error {
 	return s.session.Close()
 }
 
+// Ping verifies the ClickHouse connection is alive.
+func (s *ClickHouseStore) Ping(ctx context.Context) error {
+	return s.session.Ping(ctx)
+}
+
 // InsertAncestryLink writes a single direct-parent link to the slip_ancestry table.
 // Each slip has at most one parent entry, keeping storage O(1) per slip.
 func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
