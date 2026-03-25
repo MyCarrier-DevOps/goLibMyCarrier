@@ -550,6 +550,7 @@ func (m *MockStore) Reset() {
 	m.UpdateComponentCalls = nil
 	m.AppendHistoryCalls = nil
 	m.CloseCalls = 0
+	m.PingCalls = 0
 }
 
 // AddSlip adds a slip directly to the store for testing.
