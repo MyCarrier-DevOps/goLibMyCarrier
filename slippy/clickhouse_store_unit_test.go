@@ -2040,3 +2040,33 @@ func TestClickHouseStore_FindByCommits_QueryError(t *testing.T) {
 		t.Error("expected error, got nil")
 	}
 }
+
+func TestClickHouseStore_Ping_Success(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	err := store.Ping(context.Background())
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mockSession.PingCalls != 1 {
+		t.Errorf("expected 1 Ping call, got %d", mockSession.PingCalls)
+	}
+}
+
+func TestClickHouseStore_Ping_Error(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{
+		PingErr: errors.New("connection refused"),
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	err := store.Ping(context.Background())
+
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err.Error() != "connection refused" {
+		t.Errorf("expected 'connection refused', got '%s'", err.Error())
+	}
+}

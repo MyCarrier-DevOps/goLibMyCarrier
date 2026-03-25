@@ -245,6 +245,15 @@ func (c *Client) Store() SlipStore {
 	return c.store
 }
 
+// Ping verifies the underlying ClickHouse connection is alive.
+// This allows callers to detect stale pool connections before performing operations.
+func (c *Client) Ping(ctx context.Context) error {
+	if c.store == nil {
+		return fmt.Errorf("store is not initialized")
+	}
+	return c.store.Ping(ctx)
+}
+
 // GitHub returns the underlying GitHubAPI (useful for advanced operations).
 func (c *Client) GitHub() GitHubAPI {
 	return c.github

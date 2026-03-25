@@ -2010,7 +2010,7 @@ func TestOtelLogger_DefaultPortConstants(t *testing.T) {
 // correlation fields (TraceID, SpanID) that the SDK log bridge extracts from ctx.
 type captureOtelLogger struct {
 	embedded.Logger // required by the otellog.Logger interface
-	calls []captureEmitCall
+	calls           []captureEmitCall
 }
 
 type captureEmitCall struct {

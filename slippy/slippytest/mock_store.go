@@ -67,6 +67,10 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	CloseCalls            int
 
+	// Ping tracking and error injection
+	PingCalls int
+	PingError error
+
 	// Error injection for testing error paths
 	CreateError           error
 	LoadError             error
@@ -489,6 +493,15 @@ func (m *MockStore) Close() error {
 	return nil
 }
 
+// Ping verifies the database connection is alive (mock always returns PingError).
+func (m *MockStore) Ping(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.PingCalls++
+	return m.PingError
+}
+
 // Reset clears all stored data and call tracking.
 func (m *MockStore) Reset() {
 	m.mu.Lock()
@@ -506,6 +519,7 @@ func (m *MockStore) Reset() {
 	m.UpdateComponentCalls = nil
 	m.AppendHistoryCalls = nil
 	m.CloseCalls = 0
+	m.PingCalls = 0
 }
 
 // AddSlip adds a slip directly to the store for testing.

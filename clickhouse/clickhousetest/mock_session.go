@@ -46,6 +46,11 @@ type MockSession struct {
 	ConnectCalls []ConnectCall
 	ConnectErr   error
 
+	// Ping behavior
+	PingFunc  func(ctx context.Context) error
+	PingCalls int
+	PingErr   error
+
 	// Query behavior
 	QueryFunc  func(ctx context.Context, query string) (driver.Rows, error)
 	QueryCalls []QueryCall
@@ -91,6 +96,15 @@ func (m *MockSession) Connect(cfg *ch.ClickhouseConfig, ctx context.Context) err
 		return m.ConnectFunc(ctx)
 	}
 	return m.ConnectErr
+}
+
+// Ping implements ClickhouseSessionInterface.Ping
+func (m *MockSession) Ping(ctx context.Context) error {
+	m.PingCalls++
+	if m.PingFunc != nil {
+		return m.PingFunc(ctx)
+	}
+	return m.PingErr
 }
 
 // Query implements ClickhouseSessionInterface.Query
@@ -159,6 +173,7 @@ func (m *MockSession) Conn() driver.Conn {
 // Reset clears all recorded calls for reuse
 func (m *MockSession) Reset() {
 	m.ConnectCalls = nil
+	m.PingCalls = 0
 	m.QueryCalls = nil
 	m.QueryWithArgsCalls = nil
 	m.QueryRowCalls = nil

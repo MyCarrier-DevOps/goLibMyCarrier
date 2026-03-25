@@ -591,3 +591,47 @@ func TestNewClient_ValidationErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestClient_Ping(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		err := client.Ping(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if store.PingCalls != 1 {
+			t.Errorf("expected 1 Ping call, got %d", store.PingCalls)
+		}
+	})
+
+	t.Run("error propagation", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		store.PingError = errors.New("connection dead")
+
+		err := client.Ping(context.Background())
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if err.Error() != "connection dead" {
+			t.Errorf("expected 'connection dead', got '%s'", err.Error())
+		}
+	})
+
+	t.Run("nil store", func(t *testing.T) {
+		client := &Client{store: nil}
+
+		err := client.Ping(context.Background())
+		if err == nil {
+			t.Fatal("expected error for nil store")
+		}
+		if !errors.Is(err, err) {
+			t.Error("expected non-nil error")
+		}
+	})
+}

@@ -186,6 +186,11 @@ func (m *MockClickhouseSession) Close() error {
 	return args.Error(0)
 }
 
+func (m *MockClickhouseSession) Ping(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
 func (m *MockClickhouseSession) Conn() driver.Conn {
 	args := m.Called()
 	if args.Get(0) == nil {
@@ -2033,4 +2038,60 @@ func TestIsTransientError(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+func TestClickhouseSession_Ping_NilConnection(t *testing.T) {
+	session := &ClickhouseSession{
+		conn: nil,
+	}
+
+	err := session.Ping(context.Background())
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "clickhouse connection is not established")
+}
+
+func TestClickhouseSession_Ping_Success(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	mockConn.On("Ping", ctx).Return(nil)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Ping(ctx)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
+}
+
+func TestClickhouseSession_Ping_Error(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	expectedErr := errors.New("connection dead")
+	mockConn.On("Ping", ctx).Return(expectedErr)
+
+	session := &ClickhouseSession{
+		conn: mockConn,
+	}
+
+	err := session.Ping(ctx)
+
+	assert.Error(t, err)
+	assert.Equal(t, expectedErr, err)
+	mockConn.AssertExpectations(t)
+}
+
+func TestConnWrapper_Ping(t *testing.T) {
+	mockConn := &MockConn{}
+	ctx := context.Background()
+	mockConn.On("Ping", ctx).Return(nil)
+
+	wrapper := NewSessionFromConn(mockConn)
+
+	err := wrapper.Ping(ctx)
+
+	assert.NoError(t, err)
+	mockConn.AssertExpectations(t)
 }
