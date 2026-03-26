@@ -272,6 +272,10 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 		return fmt.Errorf("context cannot be nil")
 	}
 
+	// Capture skipVerify by value so the DialContext closure does not retain
+	// a reference to the entire ClickhouseSession for the pool's lifetime.
+	skipVerify := chsession.skipVerify
+
 	return retryOperation(ctx, func() error {
 		conn, err := clickhouse.Open(&clickhouse.Options{
 			Addr: []string{ch.ChHostname + ":" + ch.ChPort},
@@ -281,20 +285,27 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 				Password: ch.ChPassword,
 			},
 
-			TLS: &tls.Config{
-				InsecureSkipVerify: chsession.skipVerify,
-			},
-
 			// Pool health settings to prevent stale connections from silently
 			// blocking operations until Linux TCP retransmission timeout (~7 min).
 			// ConnMaxLifetime reaps connections before LB/firewall idle timeouts
 			// kill them. DialContext enables TCP keepalives so the OS detects
 			// dead peers proactively via keepalive probes.
+			//
+			// clickhouse-go v2 bypasses its built-in TLS wrapping when a custom
+			// DialContext is provided (see conn.go dial()), so DialContext must
+			// handle TLS itself. tls.DialWithDialer gives us TCP keepalives AND
+			// TLS in a single call, and its Timeout covers both the TCP connect
+			// and TLS handshake as a whole.
 			DialContext: func(ctx context.Context, addr string) (net.Conn, error) {
-				return (&net.Dialer{
-					Timeout:   10 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext(ctx, "tcp", addr)
+				return tls.DialWithDialer(
+					&net.Dialer{
+						Timeout:   10 * time.Second,
+						KeepAlive: 30 * time.Second,
+					},
+					"tcp",
+					addr,
+					&tls.Config{InsecureSkipVerify: skipVerify},
+				)
 			},
 			ConnMaxLifetime: 5 * time.Minute,
 			MaxOpenConns:    10,
@@ -305,6 +316,13 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 		}
 
 		if err := conn.Ping(ctx); err != nil {
+			// Close the pool so retries do not leak idle connections.
+			if closeErr := conn.Close(); closeErr != nil {
+				return errors.Join(
+					fmt.Errorf("ping failed: %w", err),
+					fmt.Errorf("close failed: %w", closeErr),
+				)
+			}
 			var exception *clickhouse.Exception
 			if errors.As(err, &exception) {
 				return fmt.Errorf(
