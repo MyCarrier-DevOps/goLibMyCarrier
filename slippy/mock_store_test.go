@@ -91,6 +91,10 @@ type MockStore struct {
 	SetImageTagCalls      []SetImageTagCall
 	CloseCalls            int
 
+	// Ping tracking and error injection
+	PingCalls int
+	PingError error
+
 	// Error injection for testing error paths
 	CreateError           error
 	LoadError             error
@@ -503,6 +507,19 @@ func (m *MockStore) UpdateStepWithHistory(
 	return nil
 }
 
+// InsertAncestryLink writes a direct-parent link (no-op in mock).
+func (m *MockStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
+	return nil
+}
+
+// ResolveAncestry walks parent links to reconstruct ancestry (returns empty in mock).
+func (m *MockStore) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+	maxDepth int,
+) ([]AncestryEntry, error) {
+	return []AncestryEntry{}, nil
+
 // SetComponentImageTag records the container image tag for a component in the in-memory slip.
 func (m *MockStore) SetComponentImageTag(
 	_ context.Context,
@@ -553,6 +570,18 @@ func (m *MockStore) Close() error {
 
 	return nil
 }
+
+// Ping verifies the database connection is alive (mock always returns PingError).
+func (m *MockStore) Ping(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.PingCalls++
+	return m.PingError
+}
+
+// Reset clears all stored data and call tracking.
+
 func (m *MockStore) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -569,6 +598,7 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.CloseCalls = 0
+	m.PingCalls = 0
 }
 
 // AddSlip adds a slip directly to the store for testing.

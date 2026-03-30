@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -36,6 +37,17 @@ func NewClient(config Config) (*Client, error) {
 	if config.Logger == nil {
 		config.Logger = NopLogger()
 	}
+
+	// Log database selection with reason
+	dbSource := "K8S_NAMESPACE"
+	if slippyDB := os.Getenv("SLIPPY_DATABASE"); slippyDB != "" {
+		dbSource = "SLIPPY_DATABASE override"
+	}
+	config.Logger.Info(ctx, "Database selected", map[string]interface{}{
+		"database":      config.Database,
+		"source":        dbSource,
+		"k8s_namespace": os.Getenv("K8S_NAMESPACE"),
+	})
 
 	// Initialize ClickHouse store from config
 	// Migrations are skipped if config.SkipMigrations is true (e.g., Slippy CLI trusts pushhookparser ran them)
@@ -142,6 +154,15 @@ func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, sta
 	return nil
 }
 
+// ResolveAncestry walks the slip_ancestry table to reconstruct a slip's full
+// ancestry chain on demand. Uses config.AncestryMaxDepth as the depth limit.
+func (c *Client) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+) ([]AncestryEntry, error) {
+	return c.store.ResolveAncestry(ctx, repository, branch, correlationID, c.config.AncestryMaxDepth)
+}
+
 // AbandonSlip marks a slip as abandoned, indicating it was superseded by a newer slip.
 // This should only be called on slips that are not already in a terminal state.
 // Returns an error if the slip is already terminal.
@@ -222,6 +243,15 @@ func (c *Client) Close() error {
 // Store returns the underlying SlipStore (useful for advanced operations).
 func (c *Client) Store() SlipStore {
 	return c.store
+}
+
+// Ping verifies the underlying ClickHouse connection is alive.
+// This allows callers to detect stale pool connections before performing operations.
+func (c *Client) Ping(ctx context.Context) error {
+	if c.store == nil {
+		return fmt.Errorf("store is not initialized")
+	}
+	return c.store.Ping(ctx)
 }
 
 // GitHub returns the underlying GitHubAPI (useful for advanced operations).

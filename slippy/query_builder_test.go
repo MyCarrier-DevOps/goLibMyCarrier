@@ -48,7 +48,7 @@ func TestSlipQueryBuilder_BuildSelectColumns(t *testing.T) {
 	coreColumns := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus,
-		ColumnStepDetails, ColumnStateHistory, ColumnAncestry,
+		ColumnStepDetails, ColumnStateHistory,
 		ColumnSign, ColumnVersion,
 	}
 	for _, col := range coreColumns {

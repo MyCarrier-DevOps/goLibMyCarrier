@@ -63,8 +63,23 @@ type SlipStore interface {
 	// stepName is the component step type (e.g. "build"); componentName is the service name.
 	SetComponentImageTag(ctx context.Context, correlationID, stepName, componentName, imageTag string) error
 
+	// InsertAncestryLink writes a single direct-parent link to the ancestry table.
+	InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error
+
+	// ResolveAncestry walks parent links to reconstruct the full ancestry chain.
+	// Returns entries ordered from direct parent to oldest ancestor, capped at maxDepth.
+	ResolveAncestry(
+		ctx context.Context,
+		repository, branch, correlationID string,
+		maxDepth int,
+	) ([]AncestryEntry, error)
+
 	// Close releases any resources held by the store
 	Close() error
+
+	// Ping verifies the underlying database connection is alive.
+	// Returns nil if the connection is healthy, or an error if it is stale/dead.
+	Ping(ctx context.Context) error
 }
 
 // GitHubAPI defines the interface for GitHub operations.

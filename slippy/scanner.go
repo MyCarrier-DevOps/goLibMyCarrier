@@ -30,7 +30,6 @@ type scanContext struct {
 	statusStr        string
 	stepDetailsJSON  *chcol.JSON // Native ClickHouse JSON type
 	stateHistoryJSON *chcol.JSON // Native ClickHouse JSON type
-	ancestryJSON     *chcol.JSON // Native ClickHouse JSON type for ancestry chain
 	stepStatuses     []string
 	aggregateJSONs   map[string]*chcol.JSON // Native ClickHouse JSON type
 	scanDest         []interface{}
@@ -43,7 +42,6 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 		slip:             &Slip{},
 		stepDetailsJSON:  chcol.NewJSON(),
 		stateHistoryJSON: chcol.NewJSON(),
-		ancestryJSON:     chcol.NewJSON(),
 		stepStatuses:     make([]string, len(s.config.Steps)),
 		aggregateJSONs:   make(map[string]*chcol.JSON),
 	}
@@ -59,7 +57,6 @@ func (s *SlipScanner) BuildScanContext(extraDest ...interface{}) *scanContext {
 		&ctx.statusStr,
 		ctx.stepDetailsJSON,
 		ctx.stateHistoryJSON,
-		ctx.ancestryJSON,
 		&ctx.slip.Sign,
 		&ctx.slip.Version,
 	}
@@ -147,20 +144,6 @@ func (s *SlipScanner) PopulateSlipFromScan(ctx *scanContext) error {
 	// This handles the case where timing was lost due to version conflicts during concurrent updates.
 	// The state_history is append-only and contains authoritative timestamps for state transitions.
 	s.reconstructStepTimingFromHistory(slip)
-
-	// Parse ancestry from chcol.JSON (unwrap from object)
-	if ctx.ancestryJSON != nil {
-		// Marshal to JSON bytes and unmarshal to Go structs
-		jsonBytes, err := ctx.ancestryJSON.MarshalJSON()
-		if err == nil {
-			var wrapper struct {
-				Chain []AncestryEntry `json:"chain"`
-			}
-			if err := json.Unmarshal(jsonBytes, &wrapper); err == nil {
-				slip.Ancestry = wrapper.Chain
-			}
-		}
-	}
 
 	return nil
 }

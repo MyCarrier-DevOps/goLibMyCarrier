@@ -94,6 +94,14 @@ type AncestryEntry struct {
 
 	// CreatedAt is when the ancestor slip was created
 	CreatedAt time.Time `json:"created_at"`
+
+	// Repository is the repository of the ancestor slip (e.g. "owner/repo").
+	// Used for cross-branch ancestry traversal when parent is on a different branch.
+	Repository string `json:"repository,omitempty"`
+
+	// Branch is the branch of the ancestor slip.
+	// Used for cross-branch ancestry traversal when parent is on a different branch.
+	Branch string `json:"branch,omitempty"`
 }
 
 // SlipWithCommit pairs a slip with the commit SHA that matched it.

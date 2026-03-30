@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
@@ -66,6 +67,18 @@ type Config struct {
 	pipelineLoadErr   error // Error from pipeline config loading
 }
 
+// defaultDatabase returns the database name based on the K8S_NAMESPACE environment variable.
+// If K8S_NAMESPACE ends with "-test" or "-dev", starts with "feature", or is exactly "dev",
+// it returns "ci_test"; otherwise "ci".
+func defaultDatabase() string {
+	ns := os.Getenv("K8S_NAMESPACE")
+	if strings.HasSuffix(ns, "-test") || strings.HasSuffix(ns, "-dev") || strings.HasPrefix(ns, "feature") ||
+		ns == "dev" {
+		return "ci_test"
+	}
+	return "ci"
+}
+
 // DefaultConfig returns a Config with sensible default values.
 func DefaultConfig() Config {
 	return Config{
@@ -73,7 +86,7 @@ func DefaultConfig() Config {
 		PollInterval:     60 * time.Second,
 		AncestryDepth:    25,
 		AncestryMaxDepth: 100,
-		Database:         "ci",
+		Database:         defaultDatabase(),
 	}
 }
 

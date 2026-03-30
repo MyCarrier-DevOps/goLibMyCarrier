@@ -14,6 +14,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"go.opentelemetry.io/otel/attribute"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/embedded"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func TestLogLevel_String(t *testing.T) {
@@ -1998,5 +2002,294 @@ func TestOtelLogger_DefaultPortConstants(t *testing.T) {
 	}
 	if DefaultHTTPPort != "4318" {
 		t.Errorf("DefaultHTTPPort should be '4318', got %q", DefaultHTTPPort)
+	}
+}
+
+// captureOtelLogger is a test double for otellog.Logger that records the context
+// and record passed to every Emit call, allowing tests to assert on trace
+// correlation fields (TraceID, SpanID) that the SDK log bridge extracts from ctx.
+type captureOtelLogger struct {
+	embedded.Logger // required by the otellog.Logger interface
+	calls           []captureEmitCall
+}
+
+type captureEmitCall struct {
+	ctx    context.Context
+	record otellog.Record
+}
+
+func (c *captureOtelLogger) Emit(ctx context.Context, r otellog.Record) {
+	c.calls = append(c.calls, captureEmitCall{ctx: ctx, record: r})
+}
+
+func (c *captureOtelLogger) Enabled(_ context.Context, _ otellog.EnabledParameters) bool {
+	return true
+}
+
+// TestWithContext_ExtractsSpanContextFromContext verifies that WithContext stores
+// only the SpanContext (TraceID + SpanID + flags) — not the full Span or any
+// other context value — so that only the minimal necessary state is retained.
+func TestWithContext_ExtractsSpanContextFromContext(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			t.Errorf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
+
+	ctx, span := tp.Tracer("test").Start(context.Background(), "test-span")
+	defer span.End()
+
+	wantSC := span.SpanContext()
+	if !wantSC.IsValid() {
+		t.Fatal("test span must have a valid SpanContext")
+	}
+
+	base := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+	}
+
+	derived, ok := base.WithContext(ctx).(*OtelLogger)
+	if !ok {
+		t.Fatal("WithContext must return *OtelLogger")
+	}
+
+	if !derived.spanCtx.IsValid() {
+		t.Fatal("WithContext must store a valid spanCtx when context has an active span")
+	}
+	if derived.spanCtx.TraceID() != wantSC.TraceID() || derived.spanCtx.SpanID() != wantSC.SpanID() {
+		t.Errorf("spanCtx carries wrong SpanContext:\ngot  TraceID=%v SpanID=%v\nwant TraceID=%v SpanID=%v",
+			derived.spanCtx.TraceID(), derived.spanCtx.SpanID(), wantSC.TraceID(), wantSC.SpanID())
+	}
+}
+
+// TestWithContext_NoSpan_ClearsSpanCtx verifies that passing a context with no
+// active span results in an invalid (zero) spanCtx, so sendOtelLog falls back to
+// context.Background() and emits no trace correlation fields.
+func TestWithContext_NoSpan_ClearsSpanCtx(t *testing.T) {
+	base := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+	}
+	derived, ok := base.WithContext(context.Background()).(*OtelLogger)
+	if !ok {
+		t.Fatal("WithContext must return *OtelLogger")
+	}
+	if derived.spanCtx.IsValid() {
+		t.Error("expected an invalid spanCtx when the context carries no active span")
+	}
+}
+
+// TestWithContext_StaleSpanCtx_ClearedWhenNoSpanInNewContext guards against the
+// "stale trace" bug: a logger derived from a parent that already holds a spanCtx
+// must NOT inherit that correlation when WithContext is called with a context
+// that has no active span.
+func TestWithContext_StaleSpanCtx_ClearedWhenNoSpanInNewContext(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			t.Errorf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
+
+	_, originalSpan := tp.Tracer("test").Start(context.Background(), "original-span")
+	defer originalSpan.End()
+
+	// Build a logger that already has a trace correlation.
+	parent := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+		spanCtx:    originalSpan.SpanContext(),
+	}
+	if !parent.spanCtx.IsValid() {
+		t.Fatal("parent must start with a valid spanCtx")
+	}
+
+	// Call WithContext with a context that has NO active span.
+	derived, ok := parent.WithContext(context.Background()).(*OtelLogger)
+	if !ok {
+		t.Fatal("WithContext must return *OtelLogger")
+	}
+
+	// The stale correlation must be cleared, not inherited.
+	if derived.spanCtx.IsValid() {
+		t.Errorf("expected spanCtx to be cleared (invalid), got TraceID=%v SpanID=%v",
+			derived.spanCtx.TraceID(), derived.spanCtx.SpanID())
+	}
+}
+
+// TestSendOtelLog_PassesSpanCtxToEmit verifies that sendOtelLog forwards the
+// stored spanCtx (via a non-recording span) to Emit so the SDK log bridge can
+// extract TraceID and SpanID for log-trace correlation.
+func TestSendOtelLog_PassesSpanCtxToEmit(t *testing.T) {
+	tp := sdktrace.NewTracerProvider()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			t.Errorf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
+
+	_, span := tp.Tracer("test").Start(context.Background(), "test-span")
+	defer span.End()
+
+	wantSC := span.SpanContext()
+
+	cap := &captureOtelLogger{}
+	logger := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+		logger:     cap,
+		spanCtx:    wantSC,
+	}
+
+	logger.sendOtelLog(LevelInfo, "hello")
+
+	if len(cap.calls) != 1 {
+		t.Fatalf("expected 1 Emit call, got %d", len(cap.calls))
+	}
+	gotSC := trace.SpanContextFromContext(cap.calls[0].ctx)
+	if gotSC.TraceID() != wantSC.TraceID() {
+		t.Errorf("TraceID: got %v, want %v", gotSC.TraceID(), wantSC.TraceID())
+	}
+	if gotSC.SpanID() != wantSC.SpanID() {
+		t.Errorf("SpanID: got %v, want %v", gotSC.SpanID(), wantSC.SpanID())
+	}
+}
+
+// TestSendOtelLog_FallsBackToBackgroundWhenNoSpanCtx verifies that when no
+// spanCtx is set (zero value), sendOtelLog emits with context.Background() so
+// the SDK bridge sees no span context and writes zero TraceID/SpanID.
+func TestSendOtelLog_FallsBackToBackgroundWhenNoSpanCtx(t *testing.T) {
+	cap := &captureOtelLogger{}
+	logger := &OtelLogger{
+		appName:    "test",
+		logLevel:   LevelInfo,
+		attributes: make(map[string]interface{}),
+		logger:     cap,
+		// spanCtx is zero value (IsValid() == false)
+	}
+
+	logger.sendOtelLog(LevelInfo, "hello")
+
+	if len(cap.calls) != 1 {
+		t.Fatalf("expected 1 Emit call, got %d", len(cap.calls))
+	}
+	sc := trace.SpanContextFromContext(cap.calls[0].ctx)
+	if sc.IsValid() {
+		t.Errorf("expected no span context in emitted ctx, got %v", sc)
+	}
+}
+
+// --- BuildCorrelationContext tests ---
+
+func TestBuildCorrelationContext_ValidUUID_SetsTraceID(t *testing.T) {
+	// Standard UUID-formatted correlation ID (dashes must be stripped).
+	correlationID := "550e8400-e29b-41d4-a716-446655440000"
+	ctx := BuildCorrelationContext(context.Background(), correlationID)
+
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context in the returned context")
+	}
+	if !sc.IsRemote() {
+		t.Error("expected span context to be marked as remote")
+	}
+	want := "550e8400e29b41d4a716446655440000"
+	if got := sc.TraceID().String(); got != want {
+		t.Errorf("TraceID: got %q, want %q", got, want)
+	}
+}
+
+func TestBuildCorrelationContext_ValidHexNoDashes_SetsTraceID(t *testing.T) {
+	// 32-char hex string with no dashes.
+	correlationID := "abcdef1234567890abcdef1234567890"
+	ctx := BuildCorrelationContext(context.Background(), correlationID)
+
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context")
+	}
+	if got := sc.TraceID().String(); got != correlationID {
+		t.Errorf("TraceID: got %q, want %q", got, correlationID)
+	}
+}
+
+func TestBuildCorrelationContext_InvalidShortString_ReturnsOriginalCtx(t *testing.T) {
+	// Too short — should be a no-op.
+	type key struct{}
+	origCtx := context.WithValue(context.Background(), key{}, "sentinel")
+	result := BuildCorrelationContext(origCtx, "tooshort")
+
+	if result != origCtx {
+		t.Error("expected the original context to be returned unchanged")
+	}
+}
+
+func TestBuildCorrelationContext_InvalidNonHex_ReturnsOriginalCtx(t *testing.T) {
+	// 32 chars but contains non-hex characters.
+	type key struct{}
+	origCtx := context.WithValue(context.Background(), key{}, "sentinel")
+	result := BuildCorrelationContext(origCtx, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz")
+
+	if result != origCtx {
+		t.Error("expected the original context to be returned unchanged")
+	}
+}
+
+func TestBuildCorrelationContext_AllZeros_ReturnsOriginalCtx(t *testing.T) {
+	// All-zero TraceID is not valid per the OTel spec.
+	type key struct{}
+	origCtx := context.WithValue(context.Background(), key{}, "sentinel")
+	result := BuildCorrelationContext(origCtx, "00000000000000000000000000000000")
+
+	if result != origCtx {
+		t.Error("expected the original context to be returned unchanged for all-zero TraceID")
+	}
+}
+
+func TestBuildCorrelationContext_PreservesParentTraceFlags(t *testing.T) {
+	// When a valid parent span is already active the returned context must
+	// carry the same trace flags (e.g. sampled bit) so downstream decisions
+	// are consistent with the upstream sampling choice.
+	tp := sdktrace.NewTracerProvider()
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			t.Errorf("failed to shutdown tracer provider: %v", err)
+		}
+	}()
+
+	_, span := tp.Tracer("test").Start(context.Background(), "parent")
+	defer span.End()
+	parentCtx := trace.ContextWithSpan(context.Background(), span)
+	parentFlags := span.SpanContext().TraceFlags()
+
+	correlationID := "abcdef1234567890abcdef1234567890"
+	resultCtx := BuildCorrelationContext(parentCtx, correlationID)
+
+	sc := trace.SpanContextFromContext(resultCtx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context")
+	}
+	if sc.TraceFlags() != parentFlags {
+		t.Errorf("TraceFlags: got %v, want %v (parent flags not preserved)", sc.TraceFlags(), parentFlags)
+	}
+}
+
+func TestBuildCorrelationContext_NoParentSpan_TraceFlagsUnset(t *testing.T) {
+	// No active span in parent context → TraceFlags should be zero.
+	correlationID := "abcdef1234567890abcdef1234567890"
+	ctx := BuildCorrelationContext(context.Background(), correlationID)
+
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() {
+		t.Fatal("expected a valid span context")
+	}
+	if sc.TraceFlags() != 0 {
+		t.Errorf("expected zero TraceFlags with no parent, got %v", sc.TraceFlags())
 	}
 }

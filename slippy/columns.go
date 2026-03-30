@@ -24,4 +24,15 @@ const (
 const (
 	TableRoutingSlips        = "routing_slips"
 	TableSlipComponentStates = "slip_component_states"
+	TableSlipAncestry        = "slip_ancestry"
+)
+
+// Column name constants for the slip_ancestry table.
+const (
+	ColumnParentCorrelationID = "parent_correlation_id"
+	ColumnParentCommitSHA     = "parent_commit_sha"
+	ColumnParentStatus        = "parent_status"
+	ColumnParentFailedStep    = "parent_failed_step"
+	ColumnParentRepository    = "parent_repository"
+	ColumnParentBranch        = "parent_branch"
 )

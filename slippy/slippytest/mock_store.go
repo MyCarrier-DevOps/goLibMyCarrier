@@ -68,6 +68,10 @@ type MockStore struct {
 	SetImageTagCalls      []SetImageTagCall
 	CloseCalls            int
 
+	// Ping tracking and error injection
+	PingCalls int
+	PingError error
+
 	// Error injection for testing error paths
 	CreateError           error
 	LoadError             error
@@ -534,6 +538,14 @@ func (m *MockStore) SetComponentImageTag(
 	}
 
 	return slippy.ErrSlipNotFound
+
+// Ping verifies the database connection is alive (mock always returns PingError).
+func (m *MockStore) Ping(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.PingCalls++
+	return m.PingError
 }
 
 // Reset clears all stored data and call tracking.
@@ -554,6 +566,7 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.CloseCalls = 0
+	m.PingCalls = 0
 }
 
 // AddSlip adds a slip directly to the store for testing.
@@ -610,6 +623,20 @@ func DeepCopySlip(slip *slippy.Slip) *slippy.Slip {
 	}
 
 	return cpy
+}
+
+// InsertAncestryLink writes a direct-parent link (no-op in mock).
+func (m *MockStore) InsertAncestryLink(ctx context.Context, slip *slippy.Slip, parent slippy.AncestryEntry) error {
+	return nil
+}
+
+// ResolveAncestry walks parent links to reconstruct ancestry (returns empty in mock).
+func (m *MockStore) ResolveAncestry(
+	ctx context.Context,
+	repository, branch, correlationID string,
+	maxDepth int,
+) ([]slippy.AncestryEntry, error) {
+	return []slippy.AncestryEntry{}, nil
 }
 
 // Ensure MockStore implements slippy.SlipStore at compile time.
