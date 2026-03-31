@@ -519,6 +519,7 @@ func (m *MockStore) ResolveAncestry(
 	maxDepth int,
 ) ([]AncestryEntry, error) {
 	return []AncestryEntry{}, nil
+}
 
 // SetComponentImageTag records the container image tag for a component in the in-memory slip.
 func (m *MockStore) SetComponentImageTag(

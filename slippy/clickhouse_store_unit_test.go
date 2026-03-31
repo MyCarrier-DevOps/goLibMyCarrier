@@ -2289,6 +2289,8 @@ func TestClickHouseStore_Ping_Error(t *testing.T) {
 	}
 	if err.Error() != "connection refused" {
 		t.Errorf("expected 'connection refused', got '%s'", err.Error())
+	}
+}
 
 // TestClickHouseStore_AppendHistory_DoesNotCallFullLoad is a regression test verifying that
 // AppendHistory no longer performs a full Load (QueryWithArgs) to read the entire routing_slips

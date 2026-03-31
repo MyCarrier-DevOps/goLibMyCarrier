@@ -538,6 +538,7 @@ func (m *MockStore) SetComponentImageTag(
 	}
 
 	return slippy.ErrSlipNotFound
+}
 
 // Ping verifies the database connection is alive (mock always returns PingError).
 func (m *MockStore) Ping(ctx context.Context) error {

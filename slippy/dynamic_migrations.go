@@ -373,13 +373,16 @@ func (m *DynamicMigrationManager) generateComponentStatesImageTagMigration() cli
 		DownSQL: fmt.Sprintf(`
 			ALTER TABLE %s.slip_component_states
 			DROP COLUMN IF EXISTS image_tag
+		`, m.database),
+	}
+}
 
 // generateSlipAncestryTableMigration creates the slip_ancestry table for direct parent links.
 // This replaces the unbounded ancestry JSON array on routing_slips with O(1) parent links.
 // Full ancestry chains are resolved on demand by walking parent_correlation_id pointers.
 func (m *DynamicMigrationManager) generateSlipAncestryTableMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
-		Version:     7,
+		Version:     8,
 		Name:        "create_slip_ancestry",
 		Description: "Creates slip_ancestry table with direct parent links replacing inline ancestry JSON",
 		UpSQL: fmt.Sprintf(`
@@ -420,7 +423,7 @@ func (m *DynamicMigrationManager) generateSlipAncestryTableMigration() clickhous
 // created_at rather than the child's for consistent AncestryEntry.CreatedAt semantics.
 func (m *DynamicMigrationManager) generateAncestryDataMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
-		Version:     8,
+		Version:     9,
 		Name:        "migrate_ancestry_data",
 		Description: "Extracts direct parent links from inline ancestry JSON into slip_ancestry table",
 		UpSQL: fmt.Sprintf(`
@@ -476,7 +479,7 @@ func (m *DynamicMigrationManager) generateAncestryDataMigration() clickhousemigr
 func (m *DynamicMigrationManager) generateDropHistoryViewMigration() clickhousemigrator.Migration {
 	historyMigration := m.generateHistoryViewMigration()
 	return clickhousemigrator.Migration{
-		Version:     9,
+		Version:     10,
 		Name:        "drop_history_view",
 		Description: "Drops routing_slip_history_mv so the ancestry column can be removed",
 		UpSQL:       historyMigration.DownSQL,
@@ -488,7 +491,7 @@ func (m *DynamicMigrationManager) generateDropHistoryViewMigration() clickhousem
 // after data has been migrated to the slip_ancestry table.
 func (m *DynamicMigrationManager) generateDropAncestryColumnMigration() clickhousemigrator.Migration {
 	return clickhousemigrator.Migration{
-		Version:     10,
+		Version:     11,
 		Name:        "drop_ancestry_column",
 		Description: "Drops the ancestry JSON column from routing_slips (data now in slip_ancestry)",
 		UpSQL: fmt.Sprintf(`
