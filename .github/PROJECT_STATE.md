@@ -563,10 +563,12 @@ All tests updated to match new signatures. Tests pass with coverage above 75% th
 E2E integration tests revealed that step status updates were being overwritten. After completing a step (e.g., `unit_tests_completed`), reloading the slip showed the step still as `pending`.
 
 **Root Cause:**
-The `AppendHistory` function was calling `Load()` → modify → `Update()` separately from `UpdateStep`. This created a race condition:
+The original `AppendHistory` function was calling `Load()` → modify → `Update()` separately from `UpdateStep`. This created a race condition:
 1. `UpdateStep` loads slip, updates step to `completed`, saves (version N)
 2. `AppendHistory` loads slip (gets version N with step=completed), appends history, saves (version N+1)
 3. But with VersionedCollapsingMergeTree, `AppendHistory`'s `Load()` could read stale data, overwriting the step status
+
+> **Note:** `AppendHistory` was subsequently reworked to use `loadStateHistoryFromDB` + `insertAtomicHistoryUpdate` (atomic UNION ALL DB-passthrough), eliminating its own Load→Update cycle. Standalone `AppendHistory` calls no longer risk overwriting step status. `UpdateStepWithHistory` remains the correct pattern when a step update and history append must be atomic with each other.
 
 **Solution:**
 Created `UpdateStepWithHistory` method that combines step update AND history append in a single atomic Load→modify→Update cycle.
@@ -956,6 +958,7 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 **Rationale:** Separate `UpdateStep` and `AppendHistory` calls create race conditions where `AppendHistory`'s `Load()` can read stale data and overwrite the step status change.
 **Implementation:**
 - `UpdateStepWithHistory` method performs Load→modify step→modify history→Update in one cycle
+- `AppendHistory` uses `insertAtomicHistoryUpdate` (atomic DB-passthrough UNION ALL; no Load→Update cycle — step columns are copied verbatim from the latest DB row)
 - Single version increment ensures both changes are applied atomically
 - Used by `UpdateStepWithStatus` in `steps.go`
 **Anti-pattern:** Calling `UpdateStep` followed by `AppendHistory` separately.

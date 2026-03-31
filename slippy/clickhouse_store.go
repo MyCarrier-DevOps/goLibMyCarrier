@@ -735,6 +735,10 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	newVersion uint64,
 	newStateHistoryJSON string,
 ) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
 	// Column names are needed to build the INSERT target list and the SELECT expressions.
 	// Values are unused for the DB-passthrough columns; we only need column names.
 	stepColumns, _, _ := s.queryBuilder.BuildStepColumnsAndValues(nil)

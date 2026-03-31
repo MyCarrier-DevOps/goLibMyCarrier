@@ -545,7 +545,19 @@ func (m *MockStore) SetComponentImageTag(
 		return ErrSlipNotFound
 	}
 
-	// Search all aggregate columns for the component (mock doesn't have a config mapping).
+	// Target the aggregate column using the step name. For standard configs,
+	// pluralizeMock(stepName) matches the column name directly. For custom aggregate
+	// column names fall back to scanning all aggregates.
+	columnName := pluralizeMock(stepName)
+	if componentData, ok := slip.Aggregates[columnName]; ok {
+		for i := range componentData {
+			if componentData[i].Component == componentName {
+				slip.Aggregates[columnName][i].ImageTag = imageTag
+				return nil
+			}
+		}
+		return ErrSlipNotFound
+	}
 	for colName, componentData := range slip.Aggregates {
 		for i := range componentData {
 			if componentData[i].Component == componentName {
@@ -554,7 +566,6 @@ func (m *MockStore) SetComponentImageTag(
 			}
 		}
 	}
-
 	return ErrSlipNotFound
 }
 
