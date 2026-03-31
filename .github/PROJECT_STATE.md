@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** March 18, 2026
-> **Status:** Multi-module Go library on Go 1.26; otel `WithContext` PR review complete; all CVEs remediated
+> **Last Updated:** March 31, 2026
+> **Status:** Multi-module Go library on Go 1.26; merged hotfix + main; all Copilot PR review comments resolved; MockSession now thread-safe
 
 ---
 
