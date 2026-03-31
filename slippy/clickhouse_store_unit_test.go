@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1529,31 +1530,45 @@ func TestClickHouseStore_HydrateSlip_PipelineLevelEvent_EmptyComponent(t *testin
 }
 
 // TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost is a regression test for the
-// concurrent lost-update bug. It verifies that two independent UpdateStep calls for
-// different pipeline steps each produce exactly one slip_component_states insert, with no
-// shared routing_slips load/write-back that could allow one writer to silently overwrite
-// the other writer's update.
+// concurrent lost-update bug. It runs two UpdateStep calls in separate goroutines for
+// different pipeline steps on the same slip and verifies that each produces exactly one
+// slip_component_states insert with no shared routing_slips load. Under the old RMW design,
+// both writers would race on routing_slips and one would silently overwrite the other's column.
 func TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	// Simulate two concurrent writers for different pipeline steps.
-	err1 := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted)
-	err2 := store.UpdateStep(context.Background(), "test-corr-001", "dev_deploy", "", StepStatusFailed)
+	var (
+		errsMu sync.Mutex
+		errs   []error
+	)
 
-	if err1 != nil {
-		t.Errorf("first UpdateStep (push_parsed) failed: %v", err1)
-	}
-	if err2 != nil {
-		t.Errorf("second UpdateStep (dev_deploy) failed: %v", err2)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		if err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted); err != nil {
+			errsMu.Lock()
+			errs = append(errs, fmt.Errorf("push_parsed: %w", err))
+			errsMu.Unlock()
+		}
+	})
+	wg.Go(func() {
+		if err := store.UpdateStep(context.Background(), "test-corr-001", "dev_deploy", "", StepStatusFailed); err != nil {
+			errsMu.Lock()
+			errs = append(errs, fmt.Errorf("dev_deploy: %w", err))
+			errsMu.Unlock()
+		}
+	})
+	wg.Wait()
+
+	for _, err := range errs {
+		t.Error(err)
 	}
 
-	// Each call must have produced exactly one slip_component_states insert.
-	// Under the old RMW design both writers would race on routing_slips and one
-	// would silently overwrite the other's column.
+	// Each concurrent call must have produced exactly one slip_component_states insert.
 	if len(mockSession.ExecWithArgsCalls) != 2 {
 		t.Errorf("expected 2 ExecWithArgs calls (one per step), got %d", len(mockSession.ExecWithArgsCalls))
 	}
+	// No routing_slips read (QueryRow) should have occurred — UpdateStep is a blind insert.
 	if len(mockSession.QueryRowCalls) != 0 {
 		t.Errorf("expected 0 QueryRow calls (no shared routing_slips load), got %d", len(mockSession.QueryRowCalls))
 	}

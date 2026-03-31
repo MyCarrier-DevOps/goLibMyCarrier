@@ -687,13 +687,14 @@ func (s *ClickHouseStore) SetComponentImageTag(
 	row := s.session.QueryRow(ctx, query, correlationID, stepName, componentName)
 	var currentStatus string
 	if err := row.Scan(&currentStatus); err != nil {
-		if errors.Is(err, sql.ErrNoRows) || currentStatus == "" {
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: component %s not found in event log for step %s",
 				ErrSlipNotFound, componentName, stepName)
 		}
 		return fmt.Errorf("failed to read current status for component %s: %w", componentName, err)
 	}
 	if currentStatus == "" {
+		// ClickHouse argMax over zero matching rows returns empty string without an error.
 		return fmt.Errorf("%w: component %s not found in event log for step %s",
 			ErrSlipNotFound, componentName, stepName)
 	}
@@ -1152,10 +1153,12 @@ func (s *ClickHouseStore) insertComponentState(
 // Used after an aggregate write-back to detect whether a concurrent writer superseded our row.
 // This is a minimal single-column query — no hydration, no full row scan.
 func (s *ClickHouseStore) loadVersionFromDB(ctx context.Context, correlationID string) (uint64, error) {
-	query := `SELECT version FROM ` + s.database + `.routing_slips FINAL
-WHERE correlation_id = ? AND sign = 1
-ORDER BY version DESC
-LIMIT 1`
+	// SELECT version FROM ... (kept on one line so test discriminators using
+	// strings.Contains(query, "SELECT version FROM") still match).
+	query := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s = 1 ORDER BY %s DESC LIMIT 1",
+		ColumnVersion, s.database, TableRoutingSlips, ColumnCorrelationID, ColumnSign, ColumnVersion,
+	)
 
 	row := s.session.QueryRow(ctx, query, correlationID)
 
