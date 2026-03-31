@@ -30,6 +30,13 @@ const (
 
 	// aggregateConflictBaseDelayMs is the base delay in milliseconds for conflict retries.
 	aggregateConflictBaseDelayMs = 10
+
+	// historyConflictMaxRetries is the maximum number of retries when a concurrent writer
+	// inserts a higher-version routing_slips row after our loadStateHistoryFromDB read,
+	// causing our appended history entry to be superseded. Reuses the same exponential
+	// backoff sequence as aggregateConflictMaxRetries. History is best-effort; exhaustion
+	// returns nil rather than an error.
+	historyConflictMaxRetries = 5
 )
 
 // calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
@@ -499,10 +506,10 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
 	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
 
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	historyConflictRetry := 0 // Counter for concurrent-writer conflict retries
 
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
+	// Retry loop handles slip-not-found scenarios and post-write history-conflict retries.
 	for {
 		// Check for context cancellation first
 		if ctx.Err() != nil {
@@ -561,6 +568,34 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 		); err != nil {
 			retrySpan.EndError(err)
 			return err
+		}
+
+		// Post-write version check: if a concurrent writer inserted a higher-version
+		// routing_slips row after our loadStateHistoryFromDB read, that row wins the
+		// last-write-wins merge and our appended entry is dropped. Detect and retry.
+		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionErr != nil {
+			// Non-fatal: accept potential history loss if the version check fails.
+			retrySpan.AddAttribute("slippy.history_version_check_error", versionErr.Error())
+			retrySpan.EndSuccess()
+			return nil
+		}
+		if latestVersion > newVersion {
+			historyConflictRetry++
+			retrySpan.AddAttribute("slippy.history_conflict_retry", historyConflictRetry)
+			if historyConflictRetry > historyConflictMaxRetries {
+				retrySpan.AddAttribute("slippy.history_conflict_retries_exhausted", true)
+				retrySpan.EndSuccess()
+				return nil
+			}
+			backoff := calculateAggregateConflictBackoff(historyConflictRetry)
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
 		}
 
 		retrySpan.EndSuccess()
@@ -677,6 +712,15 @@ func (s *ClickHouseStore) SetComponentImageTag(
 	ctx context.Context,
 	correlationID, stepName, componentName, imageTag string,
 ) error {
+	// Normalize stepName: the event log records rows with the component step type
+	// (e.g. "build"), but callers may pass an aggregate step name (e.g. "builds_completed").
+	// Translate aggregate step names to the component step type before querying.
+	if s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName) {
+		if componentStep := s.pipelineConfig.GetComponentStep(stepName); componentStep != "" {
+			stepName = componentStep
+		}
+	}
+
 	// Read the current status for this component from the event log.
 	query := fmt.Sprintf(`
 		SELECT argMax(status, timestamp)
@@ -1353,9 +1397,10 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		if aggregateStepName == "" {
 			// No aggregate step configured for this step. The step event is already
 			// persisted in slip_component_states. Append the history entry to routing_slips
-			// so the audit trail is preserved. AppendHistory does a Load + Update RMW;
-			// hydrateSlip ensures the written row reflects the correct step status from
-			// the event log, so this write cannot lose another step's status.
+			// so the audit trail is preserved. AppendHistory now performs a
+			// state_history-only read and an atomic append (e.g., via UNION ALL
+			// re-insert), so it does not rely on a full Load + Update RMW and
+			// therefore cannot lose another step's status.
 			retrySpan.EndSuccess()
 			return s.AppendHistory(ctx, correlationID, entry)
 		}

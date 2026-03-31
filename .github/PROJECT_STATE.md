@@ -146,14 +146,30 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 
 ## Recent Changes
 
-### March 31, 2026 — Copilot PR Review Resolutions + Merge Conflict Fix
+### March 31, 2026 — Copilot PR Review Resolutions Round 3
+
+**Copilot PR review fixes (4 comments):**
+
+1. **`insertAtomicHistoryUpdate` nil pipelineConfig guard** (confirmed already applied in Round 2) — no additional change needed.
+
+2. **`AppendHistory` concurrent history loss** (`clickhouse_store.go`): Identified race: if a concurrent writer (e.g. aggregate write-back) inserts a higher-version `routing_slips` row after `loadStateHistoryFromDB` reads but before `insertAtomicHistoryUpdate` writes, the concurrent row wins VCMT last-write-wins and the appended history entry is dropped. Fix: post-write `loadVersionFromDB` check after `insertAtomicHistoryUpdate`; if `latestVersion > newVersion`, retry the full read-append-write cycle with exponential backoff (reuses `calculateAggregateConflictBackoff`). Bounded by `historyConflictMaxRetries = 5`; exhaustion returns nil (history is best-effort). Added `slippy.history_conflict_retry`, `slippy.history_conflict_retries_exhausted`, `slippy.history_version_check_error` span attributes.
+
+3. **`SetComponentImageTag` stepName normalization** (`clickhouse_store.go`): The event log (`slip_component_states`) records rows with the component step type (e.g. `"build"`), but callers may pass an aggregate step name (e.g. `"builds_completed"`). Added normalization at the top of `ClickHouseStore.SetComponentImageTag`: if `pipelineConfig.IsAggregateStep(stepName)`, translate to the component step type via `pipelineConfig.GetComponentStep(stepName)` before querying.
+
+4. **`SetComponentImageTag` unit test stepNames** (`clickhouse_store_unit_test.go`): Three tests (`NotFound`, `EmptyStatus`, `InsertError`) used `stepName = "builds"` (aggregate). Changed to `"build"` (component step type) to reflect actual production usage (`Client.SetComponentImageTag` always passes `"build"`). Updated `AppendHistory_DoesNotCallFullLoad` to expect 2 QueryRow calls (loadStateHistoryFromDB + loadVersionFromDB).
+
+**Files changed:** `slippy/clickhouse_store.go`, `slippy/clickhouse_store_unit_test.go`
+
+**Validation:** All 12 modules pass; 83.3% slippy coverage.
+
+### March 31, 2026 — Copilot PR Review Resolutions Round 2 + Merge Conflict Fix
 
 **Merge conflict fix (`code-broken-merge` branch):**
 - Merged `hotfix/fix-post-status-resolution` with upstream `main` (v1.3.63→v1.3.69) — 4 truncated function bodies (missing `}`) from auto-merge + duplicate `Version: 7` migrations.
 - Fixed in 4 files: `dynamic_migrations.go` (DownSQL string cut off), `slippytest/mock_store.go`, `mock_store_test.go`, `clickhouse_store_unit_test.go`.
 - Renumbered main's migrations: `create_slip_ancestry` 7→8, `migrate_ancestry_data` 8→9, `drop_history_view` 9→10, `drop_ancestry_column` 10→11.
 
-**Copilot PR review fixes (3 comments):**
+**Copilot PR review fixes (Round 1 — 3 comments):**
 
 1. **`SetComponentImageTag` scan error** (`clickhouse_store.go` line ~692): `currentStatus == ""` check was inside `err != nil` branch — any scan error misclassified as `ErrSlipNotFound`. Fixed: `sql.ErrNoRows` → `ErrSlipNotFound`; empty-string case is a separate post-Scan guard (ClickHouse `argMax` over zero rows).
 
@@ -161,7 +177,15 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 
 3. **`ConcurrentStepsNeitherLost` was sequential** (`clickhouse_store_unit_test.go` line ~1531): Calls were sequential not concurrent. Now runs both in separate goroutines (`sync.WaitGroup.Go`). Required adding `sync.Mutex` to `clickhousetest.MockSession` to make it thread-safe for all concurrent tests.
 
-**Files changed:** `slippy/clickhouse_store.go`, `slippy/clickhouse_store_unit_test.go`, `clickhouse/clickhousetest/mock_session.go`
+**Copilot PR review fixes (Round 2 — 4 comments):**
+
+4. **`insertAtomicHistoryUpdate` nil pipelineConfig guard**: Added guard at top of function matching `insertRow` pattern.
+
+5. **`SetComponentImageTag` mock ignores stepName** (`slippytest/mock_store.go`, `mock_store_test.go`): Mocks scanned all aggregates. Fixed: try `pluralize(stepName)` first for targeted lookup; fall back to scan-all for custom column names.
+
+6. **PROJECT_STATE.md stale AppendHistory description**: Updated January 22 Root Cause section and Architectural Decisions to reflect `insertAtomicHistoryUpdate` atomic pass-through.
+
+**Files changed:** `slippy/clickhouse_store.go`, `slippy/clickhouse_store_unit_test.go`, `slippy/slippytest/mock_store.go`, `slippy/mock_store_test.go`, `clickhouse/clickhousetest/mock_session.go`, `.github/PROJECT_STATE.md`
 
 **Validation:** All 12 modules pass with `-race`; 83.3% slippy coverage.
 
@@ -227,7 +251,7 @@ Post-write conflict detection + exponential-backoff retry, without any schema ch
 Returns exponential delay clamped to [1, aggregateConflictMaxRetries]. Sequence: 10ms, 20ms, 40ms, 80ms, 160ms.
 
 **New Method `loadVersionFromDB(ctx, correlationID) (uint64, error)`:**
-Single-column `SELECT version FROM routing_slips FINAL WHERE sign=1 ORDER BY version DESC LIMIT 1` — reads only the version, no full row hydration. Returns `ErrSlipNotFound` on `sql.ErrNoRows`.
+Single-column `SELECT version FROM routing_slips WHERE sign = 1 ORDER BY version DESC LIMIT 1` (intentionally without `FINAL`) — reads only the version, no full row hydration. Returns `ErrSlipNotFound` on `sql.ErrNoRows`.
 
 **Updated `updateAggregateStatusFromComponentStates`:**
 After `s.Update()`: calls `loadVersionFromDB`, compares `latestVersion == slip.Version`. On mismatch (concurrent write), increments `conflictRetry`, backs off exponentially, and re-Loads + re-writes. On retries exhausted: returns `nil` (best-effort — the concurrent row already reflects an up-to-date aggregate from the event log). Failure of the version check itself is also non-fatal (`slippy.version_check_error` span attribute + nil return).

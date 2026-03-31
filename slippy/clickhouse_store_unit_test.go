@@ -2341,9 +2341,10 @@ func TestClickHouseStore_AppendHistory_DoesNotCallFullLoad(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	// Exactly one QueryRow call (loadStateHistoryFromDB), no full QueryWithArgs (Load).
-	if len(mockSession.QueryRowCalls) != 1 {
-		t.Errorf("expected 1 QueryRow call (loadStateHistoryFromDB), got %d", len(mockSession.QueryRowCalls))
+	// Exactly one QueryRow call (loadStateHistoryFromDB) + one for the post-write
+	// version check (loadVersionFromDB). No full QueryWithArgs (Load).
+	if len(mockSession.QueryRowCalls) != 2 {
+		t.Errorf("expected 2 QueryRow calls (loadStateHistoryFromDB + loadVersionFromDB), got %d", len(mockSession.QueryRowCalls))
 	}
 	if len(mockSession.QueryWithArgsCalls) != 0 {
 		t.Errorf("expected 0 QueryWithArgs calls (no full Load), got %d", len(mockSession.QueryWithArgsCalls))
@@ -3042,7 +3043,7 @@ func TestClickHouseStore_SetComponentImageTag_QueryRowError(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.SetComponentImageTag(
-		context.Background(), "corr-tag-err", "builds", "api", "v1.2.3",
+		context.Background(), "corr-tag-err", "build", "api", "v1.2.3",
 	)
 	if err == nil {
 		t.Fatal("expected an error when QueryRow fails, got nil")
@@ -3074,7 +3075,7 @@ func TestClickHouseStore_SetComponentImageTag_InsertError(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.SetComponentImageTag(
-		context.Background(), "corr-tag-insert-err", "builds", "api", "v1.2.3",
+		context.Background(), "corr-tag-insert-err", "build", "api", "v1.2.3",
 	)
 	if err == nil {
 		t.Fatal("expected an error when insert fails, got nil")
@@ -3508,7 +3509,7 @@ func TestClickHouseStore_SetComponentImageTag_NotFound(t *testing.T) {
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	err := store.SetComponentImageTag(context.Background(), "corr-tag-nf", "builds", "api", "v1.0.0")
+	err := store.SetComponentImageTag(context.Background(), "corr-tag-nf", "build", "api", "v1.0.0")
 	if !errors.Is(err, ErrSlipNotFound) {
 		t.Errorf("expected ErrSlipNotFound on sql.ErrNoRows, got %v", err)
 	}
@@ -3529,7 +3530,7 @@ func TestClickHouseStore_SetComponentImageTag_EmptyStatus(t *testing.T) {
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	err := store.SetComponentImageTag(context.Background(), "corr-tag-empty", "builds", "api", "v1.0.0")
+	err := store.SetComponentImageTag(context.Background(), "corr-tag-empty", "build", "api", "v1.0.0")
 	if !errors.Is(err, ErrSlipNotFound) {
 		t.Errorf("expected ErrSlipNotFound for empty status, got %v", err)
 	}
