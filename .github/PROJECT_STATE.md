@@ -146,6 +146,25 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 
 ## Recent Changes
 
+### March 31, 2026 — Copilot PR Review Resolutions + Merge Conflict Fix
+
+**Merge conflict fix (`code-broken-merge` branch):**
+- Merged `hotfix/fix-post-status-resolution` with upstream `main` (v1.3.63→v1.3.69) — 4 truncated function bodies (missing `}`) from auto-merge + duplicate `Version: 7` migrations.
+- Fixed in 4 files: `dynamic_migrations.go` (DownSQL string cut off), `slippytest/mock_store.go`, `mock_store_test.go`, `clickhouse_store_unit_test.go`.
+- Renumbered main's migrations: `create_slip_ancestry` 7→8, `migrate_ancestry_data` 8→9, `drop_history_view` 9→10, `drop_ancestry_column` 10→11.
+
+**Copilot PR review fixes (3 comments):**
+
+1. **`SetComponentImageTag` scan error** (`clickhouse_store.go` line ~692): `currentStatus == ""` check was inside `err != nil` branch — any scan error misclassified as `ErrSlipNotFound`. Fixed: `sql.ErrNoRows` → `ErrSlipNotFound`; empty-string case is a separate post-Scan guard (ClickHouse `argMax` over zero rows).
+
+2. **`loadVersionFromDB` used `FINAL`** (`clickhouse_store.go` line ~1154): Expensive and inconsistent with rest of repo. Dropped `FINAL`, switched to `fmt.Sprintf` with `TableRoutingSlips`/column constants, kept on one line so `strings.Contains(query, "SELECT version FROM")` test discriminators still match.
+
+3. **`ConcurrentStepsNeitherLost` was sequential** (`clickhouse_store_unit_test.go` line ~1531): Calls were sequential not concurrent. Now runs both in separate goroutines (`sync.WaitGroup.Go`). Required adding `sync.Mutex` to `clickhousetest.MockSession` to make it thread-safe for all concurrent tests.
+
+**Files changed:** `slippy/clickhouse_store.go`, `slippy/clickhouse_store_unit_test.go`, `clickhouse/clickhousetest/mock_session.go`
+
+**Validation:** All 12 modules pass with `-race`; 83.3% slippy coverage.
+
 ### March 18, 2026 — otel `WithContext` PR Review Iterations
 
 **Problem (original PR):**
