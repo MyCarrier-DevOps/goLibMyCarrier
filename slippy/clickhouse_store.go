@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
@@ -80,7 +81,7 @@ type ClickHouseStore struct {
 	queryBuilder      *SlipQueryBuilder
 	scanner           *SlipScanner
 	logger            Logger // Logger for operations (defaults to NopLogger)
-	hasAncestryColumn bool   // false after migration v11 drops the ancestry column
+	hasAncestryColumn atomic.Bool // false after migration v11 drops the ancestry column
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -133,14 +134,14 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 	}
 
 	store := &ClickHouseStore{
-		session:           session,
-		pipelineConfig:    opts.PipelineConfig,
-		database:          opts.Database,
-		queryBuilder:      NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
-		scanner:           NewSlipScanner(opts.PipelineConfig),
-		logger:            storeLogger,
-		hasAncestryColumn: true, // updated by detectAncestryColumn after migrations
+		session:        session,
+		pipelineConfig: opts.PipelineConfig,
+		database:       opts.Database,
+		queryBuilder:   NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
+		scanner:        NewSlipScanner(opts.PipelineConfig),
+		logger:         storeLogger,
 	}
+	store.hasAncestryColumn.Store(true) // conservative default; updated by detectAncestryColumn after migrations
 
 	// Run migrations unless explicitly skipped
 	if !opts.SkipMigrations {
@@ -184,15 +185,16 @@ func NewClickHouseStoreFromSession(
 	if database == "" {
 		database = "ci"
 	}
-	return &ClickHouseStore{
-		session:           session,
-		pipelineConfig:    pipelineConfig,
-		database:          database,
-		queryBuilder:      NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:           NewSlipScanner(pipelineConfig),
-		logger:            NopLogger(),
-		hasAncestryColumn: true, // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	store := &ClickHouseStore{
+		session:        session,
+		pipelineConfig: pipelineConfig,
+		database:       database,
+		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:        NewSlipScanner(pipelineConfig),
+		logger:         NopLogger(),
 	}
+	store.hasAncestryColumn.Store(true) // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	return store
 }
 
 // NewClickHouseStoreFromConn creates a store from an existing driver connection.
@@ -202,15 +204,16 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 	if database == "" {
 		database = "ci"
 	}
-	return &ClickHouseStore{
-		session:           ch.NewSessionFromConn(conn),
-		pipelineConfig:    pipelineConfig,
-		database:          database,
-		queryBuilder:      NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:           NewSlipScanner(pipelineConfig),
-		logger:            NopLogger(),
-		hasAncestryColumn: true, // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	store := &ClickHouseStore{
+		session:        ch.NewSessionFromConn(conn),
+		pipelineConfig: pipelineConfig,
+		database:       database,
+		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:        NewSlipScanner(pipelineConfig),
+		logger:         NopLogger(),
 	}
+	store.hasAncestryColumn.Store(true) // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	return store
 }
 
 // Session returns the underlying ClickHouse session interface.
@@ -771,7 +774,7 @@ func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
 	row := s.session.QueryRow(ctx, query, s.database)
 	if row == nil {
 		// Conservative default when the session returns no row descriptor.
-		s.hasAncestryColumn = true
+		s.hasAncestryColumn.Store(true)
 		return
 	}
 	var count uint64
@@ -781,10 +784,10 @@ func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
 		s.logger.Warn(ctx, "ancestry column probe failed; assuming ancestry column exists", map[string]interface{}{
 			"error": err.Error(),
 		})
-		s.hasAncestryColumn = true
+		s.hasAncestryColumn.Store(true)
 		return
 	}
-	s.hasAncestryColumn = count > 0
+	s.hasAncestryColumn.Store(count > 0)
 }
 
 // isAncestryColumnError reports whether err indicates ClickHouse does not recognise the ancestry
@@ -840,6 +843,10 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	stepColumns, _, _ := s.queryBuilder.BuildStepColumnsAndValues(nil)
 	aggregateColumns, _, _ := s.queryBuilder.BuildAggregateColumnsAndValues(nil)
 
+	// Snapshot the ancestry flag once so all three column lists are consistent even if
+	// a concurrent caller triggers the self-healing Store(false) between list builds.
+	hasAncestry := s.hasAncestryColumn.Load()
+
 	// Build INSERT column list: fixed columns + dynamic step/aggregate columns.
 	// ColumnAncestry is excluded when migration v11 has dropped it from routing_slips.
 	var allCols []string
@@ -848,7 +855,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
 		ColumnStateHistory,
 	)
-	if s.hasAncestryColumn {
+	if hasAncestry {
 		allCols = append(allCols, ColumnAncestry)
 	}
 	allCols = append(allCols, ColumnSign, ColumnVersion)
@@ -861,7 +868,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
 		ColumnStateHistory,
 	}
-	if s.hasAncestryColumn {
+	if hasAncestry {
 		cancelSelectCols = append(cancelSelectCols, ColumnAncestry)
 	}
 	cancelSelectCols = append(cancelSelectCols,
@@ -889,7 +896,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		ColumnStatus, ColumnStepDetails,
 		"CAST(? AS JSON)", // state_history override
 	}
-	if s.hasAncestryColumn {
+	if hasAncestry {
 		newRowSelectCols = append(newRowSelectCols, ColumnAncestry) // ancestry passthrough
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
@@ -918,15 +925,15 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		// New row SELECT WHERE param
 		correlationID,
 	)
-	if err != nil && s.hasAncestryColumn && isAncestryColumnError(err) {
+	if err != nil && hasAncestry && isAncestryColumnError(err) {
 		// The probe assumed ancestry exists but ClickHouse reports an unknown column —
 		// migration v11 has been applied despite the probe not seeing it (transient failure).
-		// Update the cached state and retry once without ancestry columns.
+		// Update the cached state atomically and retry once without ancestry columns.
 		s.logger.Warn(ctx, "ancestry column unknown to ClickHouse; retrying without it", map[string]interface{}{
 			"error":          err.Error(),
 			"correlation_id": correlationID,
 		})
-		s.hasAncestryColumn = false
+		s.hasAncestryColumn.Store(false)
 		return s.insertAtomicHistoryUpdate(ctx, correlationID, newVersion, newStateHistoryJSON)
 	}
 	return err
