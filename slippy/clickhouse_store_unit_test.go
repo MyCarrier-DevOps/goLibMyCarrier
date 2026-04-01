@@ -4183,53 +4183,79 @@ func TestClickHouseStore_InsertComponentState_NoImageTagColumn(t *testing.T) {
 
 // TestClickHouseStore_InsertComponentState_ImageTagColumnSelfHealing verifies that when
 // hasImageTagColumn is true but INSERT fails with a missing-column error, the store
-// flips hasImageTagColumn to false and retries without the image_tag column.
+// flips hasImageTagColumn to false and retries without the image_tag column for status-only
+// events (imageTag=""), but returns an error for explicit image tag events to avoid silent data loss.
 func TestClickHouseStore_InsertComponentState_ImageTagColumnSelfHealing(t *testing.T) {
-	var mu sync.Mutex
-	execCall := 0
-	var capturedStmts []string
+	t.Run("status-only event retries without image_tag", func(t *testing.T) {
+		var mu sync.Mutex
+		execCall := 0
+		var capturedStmts []string
 
-	mockSession := &clickhousetest.MockSession{
-		ExecWithArgsFunc: func(_ context.Context, stmt string, _ ...any) error {
-			mu.Lock()
-			execCall++
-			call := execCall
-			capturedStmts = append(capturedStmts, stmt)
-			mu.Unlock()
+		mockSession := &clickhousetest.MockSession{
+			ExecWithArgsFunc: func(_ context.Context, stmt string, _ ...any) error {
+				mu.Lock()
+				execCall++
+				call := execCall
+				capturedStmts = append(capturedStmts, stmt)
+				mu.Unlock()
 
-			if call == 1 {
+				if call == 1 {
+					return fmt.Errorf("Missing columns: 'image_tag' while processing query")
+				}
+				return nil
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		store.hasImageTagColumn.Store(true)
+
+		err := store.insertComponentState(
+			context.Background(), "corr-heal", "build", "svc-a", StepStatusRunning, "", "",
+		)
+		if err != nil {
+			t.Fatalf("expected self-healing retry to succeed, got %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if len(capturedStmts) != 2 {
+			t.Fatalf("expected 2 ExecWithArgs calls, got %d", len(capturedStmts))
+		}
+
+		if !strings.Contains(capturedStmts[0], "image_tag") {
+			t.Error("first INSERT should include image_tag")
+		}
+		if strings.Contains(capturedStmts[1], "image_tag") {
+			t.Error("retry INSERT should NOT include image_tag")
+		}
+
+		if store.hasImageTagColumn.Load() {
+			t.Error("expected hasImageTagColumn=false after self-healing")
+		}
+	})
+
+	t.Run("explicit image tag returns error instead of dropping", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			ExecWithArgsFunc: func(_ context.Context, _ string, _ ...any) error {
 				return fmt.Errorf("Missing columns: 'image_tag' while processing query")
-			}
-			return nil
-		},
-	}
-	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
-	store.hasImageTagColumn.Store(true)
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		store.hasImageTagColumn.Store(true)
 
-	err := store.insertComponentState(
-		context.Background(), "corr-heal", "build", "svc-a", StepStatusRunning, "", "v1.0.0",
-	)
-	if err != nil {
-		t.Fatalf("expected self-healing retry to succeed, got %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	if len(capturedStmts) != 2 {
-		t.Fatalf("expected 2 ExecWithArgs calls, got %d", len(capturedStmts))
-	}
-
-	if !strings.Contains(capturedStmts[0], "image_tag") {
-		t.Error("first INSERT should include image_tag")
-	}
-	if strings.Contains(capturedStmts[1], "image_tag") {
-		t.Error("retry INSERT should NOT include image_tag")
-	}
-
-	if store.hasImageTagColumn.Load() {
-		t.Error("expected hasImageTagColumn=false after self-healing")
-	}
+		err := store.insertComponentState(
+			context.Background(), "corr-heal", "build", "svc-a", StepStatusRunning, "", "v1.0.0",
+		)
+		if err == nil {
+			t.Fatal("expected error when image_tag is non-empty and column is missing")
+		}
+		if !strings.Contains(err.Error(), "migration v11 not yet applied") {
+			t.Errorf("expected migration-not-applied error, got: %v", err)
+		}
+		if store.hasImageTagColumn.Load() {
+			t.Error("expected hasImageTagColumn=false after detection")
+		}
+	})
 }
 
 // TestClickHouseStore_SetComponentImageTag_FallbackToOriginalStepName verifies that when

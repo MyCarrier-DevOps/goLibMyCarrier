@@ -1357,6 +1357,14 @@ func (s *ClickHouseStore) insertComponentState(
 	err := s.session.ExecWithArgs(ctx, query, args...)
 	if err != nil && hasImageTag && isImageTagColumnError(err) {
 		s.hasImageTagColumn.Store(false)
+		// If the caller explicitly set an image tag, do not silently drop it.
+		// Return an error so SetComponentImageTag surfaces a clear migration-not-applied message.
+		if imageTag != "" {
+			return fmt.Errorf(
+				"image_tag column not available (migration v11 not yet applied): "+
+					"cannot persist image tag for %s", componentName,
+			)
+		}
 		s.logger.Warn(ctx, "image_tag column missing; retrying without it", map[string]interface{}{
 			"error": err.Error(),
 		})
@@ -1574,8 +1582,12 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 			// state_history-only read and an atomic append (e.g., via UNION ALL
 			// re-insert), so it does not rely on a full Load + Update RMW and
 			// therefore cannot lose another step's status.
+			if appendErr := s.AppendHistory(retrySpan.Context(), correlationID, entry); appendErr != nil {
+				retrySpan.EndError(appendErr)
+				return appendErr
+			}
 			retrySpan.EndSuccess()
-			return s.AppendHistory(ctx, correlationID, entry)
+			return nil
 		}
 
 		// Append history entry to the same slip (atomic with aggregate update)
