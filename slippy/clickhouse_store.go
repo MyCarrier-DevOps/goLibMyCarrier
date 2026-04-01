@@ -80,7 +80,7 @@ type ClickHouseStore struct {
 	database          string
 	queryBuilder      *SlipQueryBuilder
 	scanner           *SlipScanner
-	logger            Logger // Logger for operations (defaults to NopLogger)
+	logger            Logger      // Logger for operations (defaults to NopLogger)
 	hasAncestryColumn atomic.Bool // false after migration v11 drops the ancestry column
 }
 
@@ -193,7 +193,8 @@ func NewClickHouseStoreFromSession(
 		scanner:        NewSlipScanner(pipelineConfig),
 		logger:         NopLogger(),
 	}
-	store.hasAncestryColumn.Store(true) // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	store.hasAncestryColumn.Store(true)
 	return store
 }
 
@@ -212,7 +213,8 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 		scanner:        NewSlipScanner(pipelineConfig),
 		logger:         NopLogger(),
 	}
-	store.hasAncestryColumn.Store(true) // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	store.hasAncestryColumn.Store(true)
 	return store
 }
 
