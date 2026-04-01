@@ -3665,3 +3665,404 @@ func TestUpdateExistingComponent_PreservesErrorOnFailure(t *testing.T) {
 		t.Errorf("expected Error='out of memory', got %q", dest.Error)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Gap 1: isAncestryColumnError — package-level function
+// ---------------------------------------------------------------------------
+
+// TestIsAncestryColumnError validates all branches of the isAncestryColumnError helper.
+func TestIsAncestryColumnError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "ancestry + Unknown identifier",
+			err:  fmt.Errorf("column %s: Unknown identifier in query", ColumnAncestry),
+			want: true,
+		},
+		{
+			name: "ancestry + Missing columns",
+			err:  fmt.Errorf("Missing columns: %s is not found", ColumnAncestry),
+			want: true,
+		},
+		{
+			name: "ancestry + UNKNOWN_IDENTIFIER code",
+			err:  fmt.Errorf("Code: UNKNOWN_IDENTIFIER, column %s", ColumnAncestry),
+			want: true,
+		},
+		{
+			name: "ancestry without sentinel string",
+			err:  fmt.Errorf("error with column %s: timeout", ColumnAncestry),
+			want: false,
+		},
+		{
+			name: "sentinel string without ancestry",
+			err:  errors.New("Unknown identifier in column foo"),
+			want: false,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("connection refused"),
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isAncestryColumnError(tc.err)
+			if got != tc.want {
+				t.Errorf("isAncestryColumnError(%q) = %v, want %v", tc.err.Error(), got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap 2: detectAncestryColumn — method
+// ---------------------------------------------------------------------------
+
+// TestClickHouseStore_DetectAncestryColumn tests the detectAncestryColumn method
+// for column-exists, column-absent, nil-row, and scan-error scenarios.
+func TestClickHouseStore_DetectAncestryColumn(t *testing.T) {
+	t.Run("column exists", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				if strings.Contains(query, "system.columns") {
+					return &clickhousetest.MockRow{
+						ScanFunc: func(dest ...any) error {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 1
+							}
+							return nil
+						},
+					}
+				}
+				return &clickhousetest.MockRow{}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		// Reset to false so we can verify detectAncestryColumn sets it true.
+		store.hasAncestryColumn.Store(false)
+
+		store.detectAncestryColumn(context.Background())
+
+		if !store.hasAncestryColumn.Load() {
+			t.Error("expected hasAncestryColumn=true when count=1")
+		}
+	})
+
+	t.Run("column does not exist", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				if strings.Contains(query, "system.columns") {
+					return &clickhousetest.MockRow{
+						ScanFunc: func(dest ...any) error {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 0
+							}
+							return nil
+						},
+					}
+				}
+				return &clickhousetest.MockRow{}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		store.detectAncestryColumn(context.Background())
+
+		if store.hasAncestryColumn.Load() {
+			t.Error("expected hasAncestryColumn=false when count=0")
+		}
+	})
+
+	t.Run("nil row — conservative default", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				if strings.Contains(query, "system.columns") {
+					return nil
+				}
+				return &clickhousetest.MockRow{}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		store.hasAncestryColumn.Store(false)
+
+		store.detectAncestryColumn(context.Background())
+
+		if !store.hasAncestryColumn.Load() {
+			t.Error("expected hasAncestryColumn=true (conservative) when row is nil")
+		}
+	})
+
+	t.Run("scan error — conservative default", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				if strings.Contains(query, "system.columns") {
+					return &clickhousetest.MockRow{
+						ScanFunc: func(_ ...any) error {
+							return errors.New("scan failed")
+						},
+					}
+				}
+				return &clickhousetest.MockRow{}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		store.hasAncestryColumn.Store(false)
+
+		store.detectAncestryColumn(context.Background())
+
+		if !store.hasAncestryColumn.Load() {
+			t.Error("expected hasAncestryColumn=true (conservative) on scan error")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Gap 3: insertAtomicHistoryUpdate self-healing on ancestry column error
+// ---------------------------------------------------------------------------
+
+// TestClickHouseStore_InsertAtomicHistoryUpdate_AncestryColumnSelfHealing verifies that when
+// ExecWithArgs returns an isAncestryColumnError, the function flips hasAncestryColumn to
+// false and retries exactly once without ancestry columns.
+func TestClickHouseStore_InsertAtomicHistoryUpdate_AncestryColumnSelfHealing(t *testing.T) {
+	var mu sync.Mutex
+	execCall := 0
+	var capturedStmts []string
+
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(_ context.Context, stmt string, _ ...any) error {
+			mu.Lock()
+			execCall++
+			call := execCall
+			capturedStmts = append(capturedStmts, stmt)
+			mu.Unlock()
+
+			if call == 1 {
+				// First call: simulate ancestry column error
+				return fmt.Errorf("Missing columns: '%s' while processing query", ColumnAncestry)
+			}
+			// Second call: succeed
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	// Start with ancestry column believed to exist.
+	store.hasAncestryColumn.Store(true)
+
+	err := store.insertAtomicHistoryUpdate(
+		context.Background(), "corr-self-heal", uint64(time.Now().UnixNano()), `{"entries":[]}`,
+	)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(capturedStmts) != 2 {
+		t.Fatalf("expected exactly 2 ExecWithArgs calls, got %d", len(capturedStmts))
+	}
+
+	// First call should include the ancestry column.
+	if !strings.Contains(capturedStmts[0], ColumnAncestry) {
+		t.Error("expected first ExecWithArgs call to contain ancestry column")
+	}
+
+	// Second call (retry) should NOT include the ancestry column.
+	if strings.Contains(capturedStmts[1], ColumnAncestry) {
+		t.Error("expected second ExecWithArgs call to omit ancestry column")
+	}
+
+	// hasAncestryColumn must now be false.
+	if store.hasAncestryColumn.Load() {
+		t.Error("expected hasAncestryColumn=false after self-healing")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap 4a: AppendHistory — post-write conflict retry (succeeds on second attempt)
+// ---------------------------------------------------------------------------
+
+// TestClickHouseStore_AppendHistory_ConflictRetry verifies that when loadVersionFromDB returns
+// a version higher than newVersion (simulating a concurrent writer), AppendHistory retries and
+// succeeds on the second attempt when the version matches.
+func TestClickHouseStore_AppendHistory_ConflictRetry(t *testing.T) {
+	var mu sync.Mutex
+	loadHistoryCallCount := 0
+	execCallCount := 0
+	versionCheckCallCount := 0
+	var lastInsertedVersion uint64
+
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+			// loadStateHistoryFromDB: SELECT state_history FROM ...
+			if strings.Contains(query, "SELECT state_history") {
+				mu.Lock()
+				loadHistoryCallCount++
+				mu.Unlock()
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if ptr, ok := dest[0].(*string); ok {
+							*ptr = `{"entries":[]}`
+						}
+						return nil
+					},
+				}
+			}
+			// loadVersionFromDB: SELECT version FROM ...
+			if strings.Contains(query, "SELECT version FROM") {
+				mu.Lock()
+				versionCheckCallCount++
+				call := versionCheckCallCount
+				mu.Unlock()
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if v, ok := dest[0].(*uint64); ok {
+							if call == 1 {
+								// First check: concurrent writer at a much higher version.
+								mu.Lock()
+								*v = lastInsertedVersion + 999999
+								mu.Unlock()
+							} else {
+								// Second check: our write won.
+								mu.Lock()
+								*v = lastInsertedVersion
+								mu.Unlock()
+							}
+						}
+						return nil
+					},
+				}
+			}
+			return &clickhousetest.MockRow{}
+		},
+		ExecWithArgsFunc: func(_ context.Context, stmt string, args ...any) error {
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				mu.Lock()
+				execCallCount++
+				// Capture the version argument (state_history param + version param).
+				// In insertAtomicHistoryUpdate, args layout:
+				// [0]=correlationID, [1]=newVersion (cancel WHERE), [2]=newHistoryJSON, [3]=newVersion, [4]=correlationID
+				if len(args) >= 4 {
+					if v, ok := args[3].(uint64); ok {
+						lastInsertedVersion = v
+					}
+				}
+				mu.Unlock()
+			}
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	entry := StateHistoryEntry{
+		Timestamp: time.Now(),
+		Step:      "push_parsed",
+		Status:    StepStatusCompleted,
+		Actor:     "test",
+	}
+
+	err := store.AppendHistory(context.Background(), "corr-conflict-history", entry)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Two loadStateHistoryFromDB calls: one initial + one retry.
+	if loadHistoryCallCount != 2 {
+		t.Errorf("expected 2 loadStateHistoryFromDB calls, got %d", loadHistoryCallCount)
+	}
+
+	// Two insertAtomicHistoryUpdate calls: one initial + one retry.
+	if execCallCount != 2 {
+		t.Errorf("expected 2 insertAtomicHistoryUpdate calls, got %d", execCallCount)
+	}
+
+	// Two loadVersionFromDB calls: one per attempt.
+	if versionCheckCallCount != 2 {
+		t.Errorf("expected 2 loadVersionFromDB calls, got %d", versionCheckCallCount)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap 4b: AppendHistory — conflict retry exhausted
+// ---------------------------------------------------------------------------
+
+// TestClickHouseStore_AppendHistory_ConflictRetryExhausted verifies that when loadVersionFromDB
+// always returns a higher version, AppendHistory returns nil (best-effort) after exhausting
+// historyConflictMaxRetries.
+func TestClickHouseStore_AppendHistory_ConflictRetryExhausted(t *testing.T) {
+	var mu sync.Mutex
+	loadHistoryCallCount := 0
+	execCallCount := 0
+
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+			if strings.Contains(query, "SELECT state_history") {
+				mu.Lock()
+				loadHistoryCallCount++
+				mu.Unlock()
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if ptr, ok := dest[0].(*string); ok {
+							*ptr = `{"entries":[]}`
+						}
+						return nil
+					},
+				}
+			}
+			if strings.Contains(query, "SELECT version FROM") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if v, ok := dest[0].(*uint64); ok {
+							// Always higher than any written version — simulates
+							// a concurrent writer that perpetually supersedes us.
+							*v = ^uint64(0)
+						}
+						return nil
+					},
+				}
+			}
+			return &clickhousetest.MockRow{}
+		},
+		ExecWithArgsFunc: func(_ context.Context, stmt string, _ ...any) error {
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				mu.Lock()
+				execCallCount++
+				mu.Unlock()
+			}
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	entry := StateHistoryEntry{
+		Timestamp: time.Now(),
+		Step:      "push_parsed",
+		Status:    StepStatusCompleted,
+		Actor:     "test",
+	}
+
+	err := store.AppendHistory(context.Background(), "corr-exhausted-history", entry)
+	if err != nil {
+		t.Errorf("expected nil (best-effort), got %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 1 initial + historyConflictMaxRetries re-reads = historyConflictMaxRetries + 1 total.
+	wantIterations := 1 + historyConflictMaxRetries
+	if loadHistoryCallCount != wantIterations {
+		t.Errorf("expected %d loadStateHistoryFromDB calls, got %d", wantIterations, loadHistoryCallCount)
+	}
+	if execCallCount != wantIterations {
+		t.Errorf("expected %d insertAtomicHistoryUpdate calls, got %d", wantIterations, execCallCount)
+	}
+}
