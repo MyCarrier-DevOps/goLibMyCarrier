@@ -74,12 +74,13 @@ func calculateAggregateConflictBackoff(retryNumber int) time.Duration {
 // The store is config-driven: the pipeline configuration determines which
 // step columns exist and how they are queried.
 type ClickHouseStore struct {
-	session        ch.ClickhouseSessionInterface
-	pipelineConfig *PipelineConfig
-	database       string
-	queryBuilder   *SlipQueryBuilder
-	scanner        *SlipScanner
-	logger         Logger // Logger for operations (defaults to NopLogger)
+	session             ch.ClickhouseSessionInterface
+	pipelineConfig      *PipelineConfig
+	database            string
+	queryBuilder        *SlipQueryBuilder
+	scanner             *SlipScanner
+	logger              Logger // Logger for operations (defaults to NopLogger)
+	hasAncestryColumn   bool   // false after migration v11 drops the ancestry column
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -132,12 +133,13 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 	}
 
 	store := &ClickHouseStore{
-		session:        session,
-		pipelineConfig: opts.PipelineConfig,
-		database:       opts.Database,
-		queryBuilder:   NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
-		scanner:        NewSlipScanner(opts.PipelineConfig),
-		logger:         storeLogger,
+		session:           session,
+		pipelineConfig:    opts.PipelineConfig,
+		database:          opts.Database,
+		queryBuilder:      NewSlipQueryBuilder(opts.PipelineConfig, opts.Database),
+		scanner:           NewSlipScanner(opts.PipelineConfig),
+		logger:            storeLogger,
+		hasAncestryColumn: true, // updated by detectAncestryColumn after migrations
 	}
 
 	// Run migrations unless explicitly skipped
@@ -165,6 +167,9 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		}
 	}
 
+	// Detect whether the ancestry column is still present (dropped by migration v11).
+	store.detectAncestryColumn(ctx)
+
 	return store, nil
 }
 
@@ -180,12 +185,13 @@ func NewClickHouseStoreFromSession(
 		database = "ci"
 	}
 	return &ClickHouseStore{
-		session:        session,
-		pipelineConfig: pipelineConfig,
-		database:       database,
-		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:        NewSlipScanner(pipelineConfig),
-		logger:         NopLogger(),
+		session:           session,
+		pipelineConfig:    pipelineConfig,
+		database:          database,
+		queryBuilder:      NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:           NewSlipScanner(pipelineConfig),
+		logger:            NopLogger(),
+		hasAncestryColumn: true, // default for test sessions; production uses detectAncestryColumn
 	}
 }
 
@@ -197,13 +203,33 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 		database = "ci"
 	}
 	return &ClickHouseStore{
-		session:        ch.NewSessionFromConn(conn),
-		pipelineConfig: pipelineConfig,
-		database:       database,
-		queryBuilder:   NewSlipQueryBuilder(pipelineConfig, database),
-		scanner:        NewSlipScanner(pipelineConfig),
-		logger:         NopLogger(),
+		session:           ch.NewSessionFromConn(conn),
+		pipelineConfig:    pipelineConfig,
+		database:          database,
+		queryBuilder:      NewSlipQueryBuilder(pipelineConfig, database),
+		scanner:           NewSlipScanner(pipelineConfig),
+		logger:            NopLogger(),
+		hasAncestryColumn: true, // default for compatibility; use detectAncestryColumn if needed
 	}
+}
+
+// detectAncestryColumn queries system.columns to determine whether the ancestry column
+// is still present in routing_slips. After migration v11 (drop_ancestry_column) is applied,
+// the column no longer exists and insertAtomicHistoryUpdate must omit it from query column lists.
+// On any query error the column is assumed present (conservative default avoids data loss).
+func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
+	query := fmt.Sprintf(
+		"SELECT count() FROM system.columns WHERE database = ? AND table = 'routing_slips' AND name = '%s'",
+		ColumnAncestry,
+	)
+	row := s.session.QueryRow(ctx, query, s.database)
+	var count uint64
+	if err := row.Scan(&count); err != nil {
+		// Conservative default: assume column exists to avoid data loss on transient errors.
+		s.hasAncestryColumn = true
+		return
+	}
+	s.hasAncestryColumn = count > 0
 }
 
 // Session returns the underlying ClickHouse session interface.
@@ -794,12 +820,17 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	aggregateColumns, _, _ := s.queryBuilder.BuildAggregateColumnsAndValues(nil)
 
 	// Build INSERT column list: fixed columns + dynamic step/aggregate columns.
+	// ColumnAncestry is excluded when migration v11 has dropped it from routing_slips.
 	var allCols []string
 	allCols = append(allCols,
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
-		ColumnStateHistory, ColumnAncestry, ColumnSign, ColumnVersion,
+		ColumnStateHistory,
 	)
+	if s.hasAncestryColumn {
+		allCols = append(allCols, ColumnAncestry)
+	}
+	allCols = append(allCols, ColumnSign, ColumnVersion)
 	allCols = append(allCols, stepColumns...)
 	allCols = append(allCols, aggregateColumns...)
 
@@ -807,10 +838,15 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	cancelSelectCols := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
-		ColumnStateHistory, ColumnAncestry,
+		ColumnStateHistory,
+	}
+	if s.hasAncestryColumn {
+		cancelSelectCols = append(cancelSelectCols, ColumnAncestry)
+	}
+	cancelSelectCols = append(cancelSelectCols,
 		"-1",          // sign
 		ColumnVersion, // keep original version for proper VCollapsingMergeTree collapsing
-	}
+	)
 	cancelSelectCols = append(cancelSelectCols, stepColumns...)
 	cancelSelectCols = append(cancelSelectCols, aggregateColumns...)
 
@@ -830,9 +866,12 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, "now64(6)", // updated_at
 		ColumnStatus, ColumnStepDetails,
-		"CAST(? AS JSON)", ColumnAncestry, // state_history=CAST(? AS JSON), ancestry passthrough
-		"1", "?", // sign=1, version=newVersion
+		"CAST(? AS JSON)", // state_history override
 	}
+	if s.hasAncestryColumn {
+		newRowSelectCols = append(newRowSelectCols, ColumnAncestry) // ancestry passthrough
+	}
+	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
 	newRowSelectCols = append(newRowSelectCols, stepColumns...)
 	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
 

@@ -2740,8 +2740,8 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetry(t *testi
 					},
 				}
 			}
-			// loadStateHistoryFromDB (state_history column only)
-			if strings.Contains(query, "state_history") && !strings.Contains(query, "*") {
+			// loadStateHistoryFromDB: SELECT state_history FROM ... (single-column; full Load starts with SELECT correlation_id)
+			if strings.Contains(query, "SELECT state_history") {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
 						if len(dest) > 0 {
@@ -2832,7 +2832,8 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetryExhausted
 					},
 				}
 			}
-			if strings.Contains(query, "state_history") && !strings.Contains(query, "*") {
+			// loadStateHistoryFromDB: SELECT state_history FROM ... (single-column; full Load starts with SELECT correlation_id)
+			if strings.Contains(query, "SELECT state_history") {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
 						if len(dest) > 0 {
