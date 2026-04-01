@@ -434,7 +434,10 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			t.Errorf("expected imageTag 'mycarrier/my-service:abc123-1234567890', got %q", call.ImageTag)
 		}
 		// Verify the in-memory slip was updated by the mock.
-		updatedSlip, _ := store.Load(ctx, "corr-img-1")
+		updatedSlip, err := store.Load(ctx, "corr-img-1")
+		if err != nil {
+			t.Fatalf("failed to load updated slip: %v", err)
+		}
 		if updatedSlip.Aggregates[buildAggregateStep][0].ImageTag != "mycarrier/my-service:abc123-1234567890" {
 			t.Errorf("expected image tag in slip aggregates, got %q", updatedSlip.Aggregates[buildAggregateStep][0].ImageTag)
 		}

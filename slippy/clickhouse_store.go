@@ -81,7 +81,8 @@ type ClickHouseStore struct {
 	queryBuilder      *SlipQueryBuilder
 	scanner           *SlipScanner
 	logger            Logger      // Logger for operations (defaults to NopLogger)
-	hasAncestryColumn atomic.Bool // false after migration v11 drops the ancestry column
+	hasAncestryColumn atomic.Bool // false after migration v10 drops the ancestry column
+	hasImageTagColumn atomic.Bool // false when slip_component_states lacks image_tag column (pre-v11)
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -142,6 +143,7 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		logger:         storeLogger,
 	}
 	store.hasAncestryColumn.Store(true) // conservative default; updated by detectAncestryColumn after migrations
+	store.hasImageTagColumn.Store(true) // conservative default; updated by detectImageTagColumn after migrations
 
 	// Run migrations unless explicitly skipped
 	if !opts.SkipMigrations {
@@ -168,8 +170,11 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		}
 	}
 
-	// Detect whether the ancestry column is still present (dropped by migration v11).
+	// Detect whether the ancestry column is still present (dropped by migration v10).
 	store.detectAncestryColumn(ctx)
+
+	// Detect whether the image_tag column exists (added by migration v11).
+	store.detectImageTagColumn(ctx)
 
 	return store, nil
 }
@@ -193,8 +198,9 @@ func NewClickHouseStoreFromSession(
 		scanner:        NewSlipScanner(pipelineConfig),
 		logger:         NopLogger(),
 	}
-	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v10 has already dropped the column
 	store.hasAncestryColumn.Store(true)
+	store.hasImageTagColumn.Store(true)
 	return store
 }
 
@@ -213,8 +219,9 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 		scanner:        NewSlipScanner(pipelineConfig),
 		logger:         NopLogger(),
 	}
-	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
+	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v10 has already dropped the column
 	store.hasAncestryColumn.Store(true)
+	store.hasImageTagColumn.Store(true)
 	return store
 }
 
@@ -729,6 +736,15 @@ func (s *ClickHouseStore) SetComponentImageTag(
 	ctx context.Context,
 	correlationID, stepName, componentName, imageTag string,
 ) error {
+	if !s.hasImageTagColumn.Load() {
+		return fmt.Errorf(
+			"image_tag column not available (migration v11 not yet applied): cannot set image tag for %s",
+			componentName,
+		)
+	}
+
+	originalStepName := stepName
+
 	// Normalize stepName: the event log records rows with the component step type
 	// (e.g. "build"), but callers may pass an aggregate step name (e.g. "builds_completed").
 	// Translate aggregate step names to the component step type before querying.
@@ -738,7 +754,34 @@ func (s *ClickHouseStore) SetComponentImageTag(
 		}
 	}
 
-	// Read the current status for this component from the event log.
+	currentStatus, err := s.queryComponentStatus(ctx, correlationID, stepName, componentName)
+	if err != nil {
+		return err
+	}
+
+	// If normalized name found nothing and we did normalize, try the original name as fallback.
+	if currentStatus == "" && originalStepName != stepName {
+		currentStatus, err = s.queryComponentStatus(ctx, correlationID, originalStepName, componentName)
+		if err != nil {
+			return err
+		}
+	}
+
+	if currentStatus == "" {
+		return fmt.Errorf("%w: component %s not found in event log for step %s",
+			ErrSlipNotFound, componentName, stepName)
+	}
+
+	return s.insertComponentState(ctx, correlationID, stepName, componentName,
+		StepStatus(currentStatus), "", imageTag)
+}
+
+// queryComponentStatus reads the latest status for a component from the event log.
+// Returns empty string (not an error) when no matching rows exist.
+func (s *ClickHouseStore) queryComponentStatus(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+) (string, error) {
 	query := fmt.Sprintf(`
 		SELECT argMax(status, timestamp)
 		FROM %s.%s
@@ -749,23 +792,15 @@ func (s *ClickHouseStore) SetComponentImageTag(
 	var currentStatus string
 	if err := row.Scan(&currentStatus); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("%w: component %s not found in event log for step %s",
-				ErrSlipNotFound, componentName, stepName)
+			return "", nil
 		}
-		return fmt.Errorf("failed to read current status for component %s: %w", componentName, err)
+		return "", fmt.Errorf("failed to read current status for component %s: %w", componentName, err)
 	}
-	if currentStatus == "" {
-		// ClickHouse argMax over zero matching rows returns empty string without an error.
-		return fmt.Errorf("%w: component %s not found in event log for step %s",
-			ErrSlipNotFound, componentName, stepName)
-	}
-
-	return s.insertComponentState(ctx, correlationID, stepName, componentName,
-		StepStatus(currentStatus), "", imageTag)
+	return currentStatus, nil
 }
 
 // detectAncestryColumn queries system.columns to determine whether the ancestry column
-// is still present in routing_slips. After migration v11 (drop_ancestry_column) is applied,
+// is still present in routing_slips. After migration v10 (drop_ancestry_column) is applied,
 // the column no longer exists and insertAtomicHistoryUpdate must omit it from query column lists.
 // On any query error the column is assumed present (conservative default avoids data loss).
 func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
@@ -792,16 +827,49 @@ func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
 	s.hasAncestryColumn.Store(count > 0)
 }
 
+// detectImageTagColumn queries system.columns to determine whether the image_tag column
+// exists in slip_component_states. Before migration v11 (add_image_tag_to_component_states)
+// the column does not exist and insertComponentState must omit it.
+// On any query error the column is assumed present (conservative default).
+func (s *ClickHouseStore) detectImageTagColumn(ctx context.Context) {
+	query := "SELECT count() FROM system.columns WHERE database = ? AND table = 'slip_component_states' AND name = 'image_tag'"
+	row := s.session.QueryRow(ctx, query, s.database)
+	if row == nil {
+		s.hasImageTagColumn.Store(true)
+		return
+	}
+	var count uint64
+	if err := row.Scan(&count); err != nil {
+		s.logger.Warn(ctx, "image_tag column probe failed; assuming column exists", map[string]interface{}{
+			"error": err.Error(),
+		})
+		s.hasImageTagColumn.Store(true)
+		return
+	}
+	s.hasImageTagColumn.Store(count > 0)
+}
+
 // isAncestryColumnError reports whether err indicates ClickHouse does not recognise the ancestry
 // column. This is used as a runtime fallback: when detectAncestryColumn conservatively assumed the
 // column exists (e.g. on a transient probe error) but the actual INSERT/SELECT fails because
-// migration v11 has already dropped it.
+// migration v10 has already dropped it.
 func isAncestryColumnError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, ColumnAncestry) &&
 		(strings.Contains(msg, "Unknown identifier") ||
 			strings.Contains(msg, "Missing columns") ||
 			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
+}
+
+// isImageTagColumnError reports whether err indicates ClickHouse does not recognise the image_tag
+// column. Used as a runtime fallback when detectImageTagColumn conservatively assumed the column
+// exists but the INSERT fails because migration v11 has not yet been applied.
+func isImageTagColumnError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "image_tag") &&
+		(strings.Contains(msg, "Missing columns") ||
+			strings.Contains(msg, "Unknown column") ||
+			strings.Contains(msg, "No such column"))
 }
 
 // loadStateHistoryFromDB reads only the state_history JSON column from the latest active
@@ -850,7 +918,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	hasAncestry := s.hasAncestryColumn.Load()
 
 	// Build INSERT column list: fixed columns + dynamic step/aggregate columns.
-	// ColumnAncestry is excluded when migration v11 has dropped it from routing_slips.
+	// ColumnAncestry is excluded when migration v10 has dropped it from routing_slips.
 	var allCols []string
 	allCols = append(allCols,
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
@@ -929,7 +997,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	)
 	if err != nil && hasAncestry && isAncestryColumnError(err) {
 		// The probe assumed ancestry exists but ClickHouse reports an unknown column —
-		// migration v11 has been applied despite the probe not seeing it (transient failure).
+		// migration v10 has been applied despite the probe not seeing it (transient failure).
 		// Update the cached state atomically and retry once without ancestry columns.
 		s.logger.Warn(ctx, "ancestry column unknown to ClickHouse; retrying without it", map[string]interface{}{
 			"error":          err.Error(),
@@ -1267,20 +1335,39 @@ func (s *ClickHouseStore) insertComponentState(
 	status StepStatus,
 	message, imageTag string,
 ) error {
-	query := fmt.Sprintf(`
-		INSERT INTO %s.%s (correlation_id, step, component, status, message, image_tag, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, s.database, TableSlipComponentStates)
+	hasImageTag := s.hasImageTagColumn.Load()
 
-	return s.session.ExecWithArgs(ctx, query,
-		correlationID,
-		stepName,
-		componentName,
-		string(status),
-		message,
-		imageTag,
-		time.Now(),
-	)
+	var query string
+	var args []interface{}
+
+	if hasImageTag {
+		query = fmt.Sprintf(`
+			INSERT INTO %s.%s (correlation_id, step, component, status, message, image_tag, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, s.database, TableSlipComponentStates)
+		args = []interface{}{correlationID, stepName, componentName, string(status), message, imageTag, time.Now()}
+	} else {
+		query = fmt.Sprintf(`
+			INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, s.database, TableSlipComponentStates)
+		args = []interface{}{correlationID, stepName, componentName, string(status), message, time.Now()}
+	}
+
+	err := s.session.ExecWithArgs(ctx, query, args...)
+	if err != nil && hasImageTag && isImageTagColumnError(err) {
+		s.hasImageTagColumn.Store(false)
+		s.logger.Warn(ctx, "image_tag column missing; retrying without it", map[string]interface{}{
+			"error": err.Error(),
+		})
+		query = fmt.Sprintf(`
+			INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, s.database, TableSlipComponentStates)
+		return s.session.ExecWithArgs(ctx, query,
+			correlationID, stepName, componentName, string(status), message, time.Now())
+	}
+	return err
 }
 
 // loadVersionFromDB fetches the current latest version of a slip from routing_slips.

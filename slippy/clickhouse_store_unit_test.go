@@ -4066,3 +4066,229 @@ func TestClickHouseStore_AppendHistory_ConflictRetryExhausted(t *testing.T) {
 		t.Errorf("expected %d insertAtomicHistoryUpdate calls, got %d", wantIterations, execCallCount)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Image tag column detection and backward compatibility
+// ---------------------------------------------------------------------------
+
+// TestClickHouseStore_DetectImageTagColumn verifies detectImageTagColumn for
+// column-exists, column-absent, nil-row, and scan-error scenarios.
+func TestClickHouseStore_DetectImageTagColumn(t *testing.T) {
+	t.Run("column exists", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				if strings.Contains(query, "system.columns") && strings.Contains(query, "image_tag") {
+					return &clickhousetest.MockRow{
+						ScanFunc: func(dest ...any) error {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 1
+							}
+							return nil
+						},
+					}
+				}
+				return &clickhousetest.MockRow{}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		store.hasImageTagColumn.Store(false)
+
+		store.detectImageTagColumn(context.Background())
+
+		if !store.hasImageTagColumn.Load() {
+			t.Error("expected hasImageTagColumn=true when count=1")
+		}
+	})
+
+	t.Run("column missing", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				if strings.Contains(query, "system.columns") && strings.Contains(query, "image_tag") {
+					return &clickhousetest.MockRow{
+						ScanFunc: func(dest ...any) error {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 0
+							}
+							return nil
+						},
+					}
+				}
+				return &clickhousetest.MockRow{}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		store.detectImageTagColumn(context.Background())
+
+		if store.hasImageTagColumn.Load() {
+			t.Error("expected hasImageTagColumn=false when count=0")
+		}
+	})
+
+	t.Run("query error — conservative default", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				if strings.Contains(query, "system.columns") && strings.Contains(query, "image_tag") {
+					return &clickhousetest.MockRow{
+						ScanFunc: func(_ ...any) error {
+							return errors.New("scan failed")
+						},
+					}
+				}
+				return &clickhousetest.MockRow{}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+		store.hasImageTagColumn.Store(false)
+
+		store.detectImageTagColumn(context.Background())
+
+		if !store.hasImageTagColumn.Load() {
+			t.Error("expected hasImageTagColumn=true (conservative) on scan error")
+		}
+	})
+}
+
+// TestClickHouseStore_InsertComponentState_NoImageTagColumn verifies that when
+// hasImageTagColumn is false the INSERT query omits the image_tag column.
+func TestClickHouseStore_InsertComponentState_NoImageTagColumn(t *testing.T) {
+	var capturedQuery string
+	var capturedArgCount int
+
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(_ context.Context, stmt string, args ...any) error {
+			capturedQuery = stmt
+			capturedArgCount = len(args)
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store.hasImageTagColumn.Store(false)
+
+	err := store.insertComponentState(
+		context.Background(), "corr-1", "build", "svc-a", StepStatusRunning, "", "",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if strings.Contains(capturedQuery, "image_tag") {
+		t.Error("INSERT query should NOT include image_tag when hasImageTagColumn=false")
+	}
+	// 6 args: correlation_id, step, component, status, message, timestamp
+	if capturedArgCount != 6 {
+		t.Errorf("expected 6 args (no image_tag), got %d", capturedArgCount)
+	}
+}
+
+// TestClickHouseStore_InsertComponentState_ImageTagColumnSelfHealing verifies that when
+// hasImageTagColumn is true but INSERT fails with a missing-column error, the store
+// flips hasImageTagColumn to false and retries without the image_tag column.
+func TestClickHouseStore_InsertComponentState_ImageTagColumnSelfHealing(t *testing.T) {
+	var mu sync.Mutex
+	execCall := 0
+	var capturedStmts []string
+
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(_ context.Context, stmt string, _ ...any) error {
+			mu.Lock()
+			execCall++
+			call := execCall
+			capturedStmts = append(capturedStmts, stmt)
+			mu.Unlock()
+
+			if call == 1 {
+				return fmt.Errorf("Missing columns: 'image_tag' while processing query")
+			}
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store.hasImageTagColumn.Store(true)
+
+	err := store.insertComponentState(
+		context.Background(), "corr-heal", "build", "svc-a", StepStatusRunning, "", "v1.0.0",
+	)
+	if err != nil {
+		t.Fatalf("expected self-healing retry to succeed, got %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(capturedStmts) != 2 {
+		t.Fatalf("expected 2 ExecWithArgs calls, got %d", len(capturedStmts))
+	}
+
+	if !strings.Contains(capturedStmts[0], "image_tag") {
+		t.Error("first INSERT should include image_tag")
+	}
+	if strings.Contains(capturedStmts[1], "image_tag") {
+		t.Error("retry INSERT should NOT include image_tag")
+	}
+
+	if store.hasImageTagColumn.Load() {
+		t.Error("expected hasImageTagColumn=false after self-healing")
+	}
+}
+
+// TestClickHouseStore_SetComponentImageTag_FallbackToOriginalStepName verifies that when
+// the normalized step name query returns empty, the original step name is tried as fallback.
+func TestClickHouseStore_SetComponentImageTag_FallbackToOriginalStepName(t *testing.T) {
+	queryRowCallCount := 0
+
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(_ context.Context, query string, args ...any) driver.Row {
+			if strings.Contains(query, "argMax(status") {
+				queryRowCallCount++
+				call := queryRowCallCount
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if ptr, ok := dest[0].(*string); ok {
+							if call == 1 {
+								// First call (normalized name "build") returns empty — component not found.
+								*ptr = ""
+							} else {
+								// Second call (original name "builds") returns a real status.
+								*ptr = "completed"
+							}
+						}
+						return nil
+					},
+				}
+			}
+			return &clickhousetest.MockRow{}
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	// "builds" is the aggregate step; it normalizes to "build" (the component step).
+	err := store.SetComponentImageTag(
+		context.Background(), "corr-fallback", "builds", "svc-a", "v2.0.0",
+	)
+	if err != nil {
+		t.Fatalf("expected fallback to succeed, got %v", err)
+	}
+
+	if queryRowCallCount != 2 {
+		t.Errorf("expected 2 QueryRow calls (normalized + original fallback), got %d", queryRowCallCount)
+	}
+}
+
+// TestClickHouseStore_SetComponentImageTag_NoImageTagColumn verifies that when
+// hasImageTagColumn is false, SetComponentImageTag returns a clear error message.
+func TestClickHouseStore_SetComponentImageTag_NoImageTagColumn(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store.hasImageTagColumn.Store(false)
+
+	err := store.SetComponentImageTag(
+		context.Background(), "corr-no-col", "build", "svc-a", "v1.0.0",
+	)
+	if err == nil {
+		t.Fatal("expected error when hasImageTagColumn=false, got nil")
+	}
+	if !strings.Contains(err.Error(), "image_tag column not available") {
+		t.Errorf("expected 'image_tag column not available' in error, got: %v", err)
+	}
+}

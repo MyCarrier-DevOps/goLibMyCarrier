@@ -538,7 +538,6 @@ func (m *MockStore) SetComponentImageTag(
 				return nil
 			}
 		}
-		return slippy.ErrSlipNotFound
 	}
 	for colName, componentData := range slip.Aggregates {
 		for i := range componentData {
