@@ -1436,6 +1436,92 @@ func TestClickHouseStore_UpdateStep_Success(t *testing.T) {
 	}
 }
 
+// TestClickHouseStore_HydrateSlip_StepNameAliasMerge is a regression test verifying that
+// component states stored under different step name aliases (e.g. "build" and "builds")
+// that resolve to the same aggregate are merged correctly during hydrateSlip. Without
+// normalization, applyComponentStatesToAggregate would be called twice for the same
+// aggregate, making the final status dependent on Go map iteration order.
+func TestClickHouseStore_HydrateSlip_StepNameAliasMerge(t *testing.T) {
+	config := testPipelineConfig()
+
+	olderTimestamp := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+	newerTimestamp := time.Date(2026, 1, 1, 11, 0, 0, 0, time.UTC)
+
+	// Row 1: "build" / "api" with status running (older)
+	// Row 2: "builds" / "api" with status completed (newer)
+	// Both "build" and "builds" resolve to the same aggregate step via resolveAggregateStepName.
+	callCount := 0
+	mockRows := &clickhousetest.MockRows{
+		NextData: []bool{true, true, false},
+		ScanFunc: func(dest ...any) error {
+			callCount++
+			var step, component, status string
+			var ts time.Time
+			switch callCount {
+			case 1:
+				step = "build"
+				component = "api"
+				status = string(StepStatusRunning)
+				ts = olderTimestamp
+			case 2:
+				step = "builds"
+				component = "api"
+				status = string(StepStatusCompleted)
+				ts = newerTimestamp
+			}
+			if ptr, ok := dest[0].(*string); ok {
+				*ptr = step
+			}
+			if ptr, ok := dest[1].(*string); ok {
+				*ptr = component
+			}
+			if ptr, ok := dest[2].(*string); ok {
+				*ptr = status
+			}
+			if ptr, ok := dest[3].(*string); ok {
+				*ptr = ""
+			}
+			if ptr, ok := dest[4].(*string); ok {
+				*ptr = ""
+			}
+			if ptr, ok := dest[5].(*time.Time); ok {
+				*ptr = ts
+			}
+			return nil
+		},
+	}
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(_ context.Context, _ string, _ ...any) (driver.Rows, error) {
+			return mockRows, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, config, "ci")
+	slip := &Slip{
+		CorrelationID: "test-alias-merge",
+		Steps: map[string]Step{
+			"builds": {Status: StepStatusPending},
+		},
+		Aggregates: map[string][]ComponentStepData{},
+	}
+
+	err := store.hydrateSlip(context.Background(), slip)
+	if err != nil {
+		t.Fatalf("hydrateSlip returned unexpected error: %v", err)
+	}
+
+	// The newer "completed" state (from "builds") must win over the older "running" (from "build").
+	comps := slip.Aggregates["builds"]
+	if len(comps) != 1 {
+		t.Fatalf("expected 1 component in Aggregates[builds], got %d: %+v", len(comps), comps)
+	}
+	if comps[0].Component != "api" {
+		t.Errorf("expected component name 'api', got %q", comps[0].Component)
+	}
+	if comps[0].Status != StepStatusCompleted {
+		t.Errorf("expected merged status completed (newer timestamp wins), got %s", comps[0].Status)
+	}
+}
+
 // TestClickHouseStore_HydrateSlip_PipelineLevelEvent_EmptyComponent is a regression test
 // for the concurrent lost-update fix. It verifies that pipeline-level step events stored
 // with component="" in slip_component_states are applied to the slip's Steps map during

@@ -1673,27 +1673,37 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		slip.Steps[state.Step] = step
 	}
 
-	// Second pass: group component-level states (component != "") by step -> component.
+	// Second pass: group component-level states (component != "") by resolved aggregate step -> component.
 	// Pipeline-level events (component="") are excluded here; they were handled above.
+	// Normalize step names to their aggregate column name so that historical data written
+	// under different aliases (e.g. "build" vs "builds_completed") is merged into a single
+	// aggregate entry and applyComponentStatesToAggregate runs exactly once per aggregate.
 	stateMap := make(map[string]map[string]componentStateRow)
 	for _, state := range states {
 		if state.Component == "" {
 			continue // already applied in first pass
 		}
-		if _, ok := stateMap[state.Step]; !ok {
-			stateMap[state.Step] = make(map[string]componentStateRow)
+		aggregateKey := s.resolveAggregateStepName(state.Step)
+		if aggregateKey == "" {
+			continue // no aggregate configured for this step
 		}
-		stateMap[state.Step][state.Component] = state
+		if _, ok := stateMap[aggregateKey]; !ok {
+			stateMap[aggregateKey] = make(map[string]componentStateRow)
+		}
+		// Keep the latest state for each component. If the same component appears
+		// under multiple step name aliases, the row with the latest timestamp wins.
+		if existing, exists := stateMap[aggregateKey][state.Component]; exists {
+			if state.Timestamp.After(existing.Timestamp) {
+				stateMap[aggregateKey][state.Component] = state
+			}
+		} else {
+			stateMap[aggregateKey][state.Component] = state
+		}
 	}
 
-	// Update aggregates in the slip
-	for stepNameFromDB, stepStates := range stateMap {
-		aggregateStepName := s.resolveAggregateStepName(stepNameFromDB)
-		if aggregateStepName == "" {
-			continue
-		}
-
-		// The aggregate JSON column name is the aggregate step name (e.g., "builds_completed")
+	// Update aggregates in the slip — stateMap is keyed by resolved aggregate
+	// step name so each aggregate is computed exactly once.
+	for aggregateStepName, stepStates := range stateMap {
 		aggregateColumn := aggregateStepName
 		s.applyComponentStatesToAggregate(slip, aggregateColumn, aggregateStepName, stepStates)
 	}
