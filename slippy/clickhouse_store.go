@@ -74,13 +74,13 @@ func calculateAggregateConflictBackoff(retryNumber int) time.Duration {
 // The store is config-driven: the pipeline configuration determines which
 // step columns exist and how they are queried.
 type ClickHouseStore struct {
-	session             ch.ClickhouseSessionInterface
-	pipelineConfig      *PipelineConfig
-	database            string
-	queryBuilder        *SlipQueryBuilder
-	scanner             *SlipScanner
-	logger              Logger // Logger for operations (defaults to NopLogger)
-	hasAncestryColumn bool // false after migration v11 drops the ancestry column
+	session           ch.ClickhouseSessionInterface
+	pipelineConfig    *PipelineConfig
+	database          string
+	queryBuilder      *SlipQueryBuilder
+	scanner           *SlipScanner
+	logger            Logger // Logger for operations (defaults to NopLogger)
+	hasAncestryColumn bool   // false after migration v11 drops the ancestry column
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
