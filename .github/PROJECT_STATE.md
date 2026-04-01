@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
 > **Last Updated:** April 1, 2026
-> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-4); coverage 82.7%; lint clean
+> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-6); coverage 82.2%; lint clean
 
 ---
 
@@ -146,19 +146,38 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 
 ## Recent Changes
 
-### March 31, 2026 — Copilot PR Review Resolutions Round 3
+### April 1, 2026 — Copilot PR Review Resolutions Round 5 (April 1 14:23 batch)
 
-**Copilot PR review fixes (4 comments):**
+1. **`NewClickHouseStoreFromSession` / `NewClickHouseStoreFromConn` hard-code `hasAncestryColumn=true`** (`clickhouse_store.go`): Both constructors default `hasAncestryColumn` to `true` (conservative). `insertAtomicHistoryUpdate` has a runtime self-healing fallback: if the first execute fails with an ancestry-column unknown error (`isAncestryColumnError`), the function logs a warning, sets `hasAncestryColumn = false`, and retries once without the ancestry columns. Avoids an unexpected probe `QueryRow` at construction time.
 
-1. **`insertAtomicHistoryUpdate` nil pipelineConfig guard** (confirmed already applied in Round 2) — no additional change needed.
+2. **`detectAncestryColumn` silent error handling** (`clickhouse_store.go`): Added nil-row guard before `Scan` (returns conservative `true` silently); on `Scan` failure logs error via `s.logger.Warn`. Runtime fallback in `insertAtomicHistoryUpdate` covers probe false-positive case.
 
-2. **`AppendHistory` concurrent history loss** (`clickhouse_store.go`): Identified race: if a concurrent writer (e.g. aggregate write-back) inserts a higher-version `routing_slips` row after `loadStateHistoryFromDB` reads but before `insertAtomicHistoryUpdate` writes, the concurrent row wins VCMT last-write-wins and the appended history entry is dropped. Fix: post-write `loadVersionFromDB` check after `insertAtomicHistoryUpdate`; if `latestVersion > newVersion`, retry the full read-append-write cycle with exponential backoff (reuses `calculateAggregateConflictBackoff`). Bounded by `historyConflictMaxRetries = 5`; exhaustion returns nil (history is best-effort). Added `slippy.history_conflict_retry`, `slippy.history_conflict_retries_exhausted`, `slippy.history_version_check_error` span attributes.
+3. **Makefile missing `-covermode=atomic`** (`makefile`): Added `-covermode=atomic` to both `go test` invocations (all-modules loop + single-module branch), aligning `make test` with `make check-coverage`.
 
-3. **`SetComponentImageTag` stepName normalization** (`clickhouse_store.go`): The event log (`slip_component_states`) records rows with the component step type (e.g. `"build"`), but callers may pass an aggregate step name (e.g. `"builds_completed"`). Added normalization at the top of `ClickHouseStore.SetComponentImageTag`: if `pipelineConfig.IsAggregateStep(stepName)`, translate to the component step type via `pipelineConfig.GetComponentStep(stepName)` before querying.
+**Validation:** 82.2% slippy coverage; lint 0 issues; `-race` clean.
+
+### April 1, 2026 — Copilot PR Review Resolutions Round 6 (April 1 15:26 batch)
+
+1. **`hasAncestryColumn` data race** (`clickhouse_store.go`): Changed `hasAncestryColumn bool` → `atomic.Bool` (`sync/atomic`; available since Go 1.19, module targets Go 1.26). Details:
+   - **Struct field** `atomic.Bool` — zero value `false`; all three constructors call `store.hasAncestryColumn.Store(true)` after construction (struct literals cannot initialise `atomic.Bool` inline).
+   - **`detectAncestryColumn`**: all three assignments use `Store()`.
+   - **`insertAtomicHistoryUpdate`**: snapshots value once at function entry (`hasAncestry := s.hasAncestryColumn.Load()`) so all three column lists (`allCols`, `cancelSelectCols`, `newRowSelectCols`) are built from the same value; self-heal path uses `s.hasAncestryColumn.Store(false)`.
+   - Eliminates `-race` data race. Flag transitions at most once (`true → false`) per store instance lifetime — `atomic.Bool` is the correct fit.
+
+**Commit:** `fix(slippy): make hasAncestryColumn concurrency-safe with atomic.Bool`
+**Validation:** 82.2% slippy coverage; lint 0 issues; `-race` clean.
+
+### April 1, 2026 — Ancestry Column Migration Compatibility (PR review r3022031584 batch)
+
+1. **`insertAtomicHistoryUpdate` hard-coded `ColumnAncestry`** (`clickhouse_store.go` line 894): After migration v11 (`drop_ancestry_column`) the ancestry column no longer exists; referencing it in the `INSERT/SELECT` caused query failures. Added `hasAncestryColumn bool` field to `ClickHouseStore` (default `true`). New `detectAncestryColumn(ctx)` method queries `system.columns` after migrations complete and sets the flag. `insertAtomicHistoryUpdate` now conditionally includes `ColumnAncestry` in all three column lists based on this flag. `NewClickHouseStoreFromConfig` calls `detectAncestryColumn` after migrations.
+
+2. **Too-broad `state_history` QueryRow discriminator** (`clickhouse_store_unit_test.go`): `ConflictRetry` and `ConflictRetryExhausted` test mocks used `strings.Contains(query, "state_history") && !strings.Contains(query, "*")` as the fetch branch discriminator. This could match the full slip `Load()` SELECT and return a wrong 1-column mock row. Fixed to `strings.Contains(query, "SELECT state_history")` — unambiguous since `loadStateHistoryFromDB` opens with `SELECT state_history\n\t\tFROM ...` while `Load()` opens with `SELECT correlation_id, ...`.
+
+**Validation:** `go build ./...` clean; `-race` tests pass; lint 0 issues.
 
 ---
 
-### April 1, 2026 — Copilot PR Review Resolutions Round 4
+### March 31, 2026 — Copilot PR Review Resolutions Round 3
 
 **Post-main-merge Copilot PR review fixes (after latest merge from main introduced further changes):**
 
