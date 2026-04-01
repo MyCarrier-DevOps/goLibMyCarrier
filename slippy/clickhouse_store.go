@@ -83,6 +83,7 @@ type ClickHouseStore struct {
 	logger            Logger      // Logger for operations (defaults to NopLogger)
 	hasAncestryColumn atomic.Bool // false after migration v10 drops the ancestry column
 	hasImageTagColumn atomic.Bool // false when slip_component_states lacks image_tag column (pre-v11)
+	lastVersion       atomic.Uint64 // monotonic version generator seeded from UnixNano; guarantees uniqueness under concurrency
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -101,6 +102,23 @@ type ClickHouseStoreOptions struct {
 
 	// Logger for migration output
 	Logger clickhousemigrator.Logger
+}
+
+// nextVersion returns a monotonically increasing version based on the current nanosecond
+// timestamp. Under concurrency, if two callers arrive in the same nanosecond, the second
+// caller gets lastVersion+1 instead of a duplicate timestamp. This guarantees unique
+// versions for VersionedCollapsingMergeTree ordering.
+func (s *ClickHouseStore) nextVersion() uint64 {
+	candidate := uint64(time.Now().UnixNano())
+	for {
+		prev := s.lastVersion.Load()
+		if candidate <= prev {
+			candidate = prev + 1
+		}
+		if s.lastVersion.CompareAndSwap(prev, candidate) {
+			return candidate
+		}
+	}
 }
 
 // NewClickHouseStoreFromConfig creates a new ClickHouse-backed slip store from config.
@@ -255,9 +273,7 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		slip.Sign = 1
 	}
 
-	// Generate timestamp-based version (nanoseconds since epoch)
-	// This ensures unique versions even if multiple Create calls happen concurrently
-	version := uint64(time.Now().UnixNano())
+	version := s.nextVersion()
 
 	if err := s.insertRow(ctx, slip, version); err != nil {
 		return fmt.Errorf("failed to create slip: %w", err)
@@ -419,9 +435,7 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Store the old version for the cancel row
 	oldVersion := slip.Version
 
-	// Generate new timestamp-based version (nanoseconds since epoch)
-	// This ensures unique versions across concurrent writers
-	newVersion := uint64(time.Now().UnixNano())
+	newVersion := s.nextVersion()
 
 	// Insert both cancel row and new row atomically
 	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
@@ -586,7 +600,7 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 			return fmt.Errorf("failed to marshal updated state history: %w", err)
 		}
 
-		newVersion := uint64(time.Now().UnixNano())
+		newVersion := s.nextVersion()
 		if err := s.insertAtomicHistoryUpdate(
 			retrySpan.Context(), correlationID, newVersion, string(newHistoryJSON),
 		); err != nil {

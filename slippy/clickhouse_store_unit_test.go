@@ -2500,6 +2500,48 @@ func TestClickHouseStore_SetComponentImageTag_PreservesCurrentStatus(t *testing.
 	}
 }
 
+// TestClickHouseStore_NextVersion_MonotonicUnderConcurrency verifies that nextVersion
+// returns strictly increasing values even when called concurrently from multiple goroutines.
+func TestClickHouseStore_NextVersion_MonotonicUnderConcurrency(t *testing.T) {
+	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
+
+	const goroutines = 10
+	const versionsPerGoroutine = 100
+
+	results := make([][]uint64, goroutines)
+
+	var wg sync.WaitGroup
+	for g := range goroutines {
+		results[g] = make([]uint64, versionsPerGoroutine)
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for i := range versionsPerGoroutine {
+				results[idx][i] = store.nextVersion()
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Collect all versions and verify uniqueness.
+	seen := make(map[uint64]bool, goroutines*versionsPerGoroutine)
+	for g := range goroutines {
+		for _, v := range results[g] {
+			if seen[v] {
+				t.Fatalf("duplicate version %d detected", v)
+			}
+			seen[v] = true
+		}
+		// Within each goroutine, versions must be strictly increasing.
+		for i := 1; i < versionsPerGoroutine; i++ {
+			if results[g][i] <= results[g][i-1] {
+				t.Fatalf("goroutine %d: version[%d]=%d <= version[%d]=%d",
+					g, i, results[g][i], i-1, results[g][i-1])
+			}
+		}
+	}
+}
+
 // TestCalculateAggregateConflictBackoff verifies the exponential backoff sequence for
 // aggregate write-back conflict retries.
 func TestCalculateAggregateConflictBackoff(t *testing.T) {
