@@ -106,11 +106,11 @@ func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 
 	return fmt.Sprintf(`
 		WITH commits AS (
-			SELECT 
+			SELECT
 				arrayJoin(range(1, length({commits:Array(String)}) + 1)) AS priority,
 				{commits:Array(String)}[priority] AS commit_sha
 		)
-		SELECT 
+		SELECT
 			%s,
 			c.commit_sha AS matched_commit
 		FROM %s.routing_slips s
@@ -131,11 +131,11 @@ func (b *SlipQueryBuilder) BuildFindAllByCommitsQuery() string {
 
 	return fmt.Sprintf(`
 		WITH commits AS (
-			SELECT 
+			SELECT
 				arrayJoin(range(1, length({commits:Array(String)}) + 1)) AS priority,
 				{commits:Array(String)}[priority] AS commit_sha
 		)
-		SELECT 
+		SELECT
 			%s,
 			c.commit_sha AS matched_commit
 		FROM %s.routing_slips s
@@ -144,6 +144,16 @@ func (b *SlipQueryBuilder) BuildFindAllByCommitsQuery() string {
 		  AND s.sign = 1
 		ORDER BY c.priority ASC, s.version DESC
 	`, selectColumns, b.database)
+}
+
+// BuildStepColumns returns only the step status column names, without building
+// placeholders or values.
+func (b *SlipQueryBuilder) BuildStepColumns() []string {
+	var columns []string
+	for _, step := range b.config.Steps {
+		columns = append(columns, b.StepStatusColumn(step.Name))
+	}
+	return columns
 }
 
 // BuildStepColumnsAndValues builds step status column data for INSERT.
@@ -163,6 +173,19 @@ func (b *SlipQueryBuilder) BuildStepColumnsAndValues(
 		values = append(values, string(status))
 	}
 	return columns, placeholders, values
+}
+
+// BuildAggregateColumns returns only the aggregate JSON column names, without
+// building placeholders, values, or performing any JSON marshaling.
+func (b *SlipQueryBuilder) BuildAggregateColumns() []string {
+	var columns []string
+	for _, step := range b.config.Steps {
+		if step.Aggregates == "" {
+			continue
+		}
+		columns = append(columns, b.AggregateColumn(step.Name))
+	}
+	return columns
 }
 
 // BuildAggregateColumnsAndValues builds aggregate JSON column data for INSERT.

@@ -400,3 +400,77 @@ func containsColumn(columns []string, target string) bool {
 	}
 	return false
 }
+
+func TestSlipQueryBuilder_BuildStepColumns(t *testing.T) {
+	config := &PipelineConfig{
+		Steps: []StepConfig{
+			{Name: "push_parsed"},
+			{Name: "builds", Aggregates: "component"},
+			{Name: "tests"},
+		},
+	}
+
+	qb := NewSlipQueryBuilder(config, "ci")
+	columns := qb.BuildStepColumns()
+	fullColumns, _, _ := qb.BuildStepColumnsAndValues(nil)
+
+	if len(columns) != len(fullColumns) {
+		t.Fatalf("BuildStepColumns() returned %d columns, BuildStepColumnsAndValues(nil) returned %d",
+			len(columns), len(fullColumns))
+	}
+	for i := range columns {
+		if columns[i] != fullColumns[i] {
+			t.Errorf("column[%d]: BuildStepColumns()=%q, BuildStepColumnsAndValues()=%q",
+				i, columns[i], fullColumns[i])
+		}
+	}
+}
+
+func TestSlipQueryBuilder_BuildAggregateColumns(t *testing.T) {
+	config := &PipelineConfig{
+		Steps: []StepConfig{
+			{Name: "push_parsed"},
+			{Name: "builds", Aggregates: "component"},
+			{Name: "tests", Aggregates: "component"},
+			{Name: "deploy"},
+		},
+	}
+
+	qb := NewSlipQueryBuilder(config, "ci")
+	columns := qb.BuildAggregateColumns()
+	fullColumns, _, _ := qb.BuildAggregateColumnsAndValues(nil)
+
+	if len(columns) != len(fullColumns) {
+		t.Fatalf("BuildAggregateColumns() returned %d columns, BuildAggregateColumnsAndValues(nil) returned %d",
+			len(columns), len(fullColumns))
+	}
+	for i := range columns {
+		if columns[i] != fullColumns[i] {
+			t.Errorf("column[%d]: BuildAggregateColumns()=%q, BuildAggregateColumnsAndValues()=%q",
+				i, columns[i], fullColumns[i])
+		}
+	}
+}
+
+func TestSlipQueryBuilder_BuildStepColumns_Empty(t *testing.T) {
+	config := &PipelineConfig{Steps: []StepConfig{}}
+	qb := NewSlipQueryBuilder(config, "ci")
+	columns := qb.BuildStepColumns()
+	if len(columns) != 0 {
+		t.Errorf("expected 0 columns for empty config, got %d", len(columns))
+	}
+}
+
+func TestSlipQueryBuilder_BuildAggregateColumns_NoAggregates(t *testing.T) {
+	config := &PipelineConfig{
+		Steps: []StepConfig{
+			{Name: "push_parsed"},
+			{Name: "deploy"},
+		},
+	}
+	qb := NewSlipQueryBuilder(config, "ci")
+	columns := qb.BuildAggregateColumns()
+	if len(columns) != 0 {
+		t.Errorf("expected 0 aggregate columns, got %d", len(columns))
+	}
+}

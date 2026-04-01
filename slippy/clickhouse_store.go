@@ -908,10 +908,9 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		return fmt.Errorf("pipeline config is required for store operations")
 	}
 
-	// Column names are needed to build the INSERT target list and the SELECT expressions.
-	// Values are unused for the DB-passthrough columns; we only need column names.
-	stepColumns, _, _ := s.queryBuilder.BuildStepColumnsAndValues(nil)
-	aggregateColumns, _, _ := s.queryBuilder.BuildAggregateColumnsAndValues(nil)
+	// Column names for the INSERT target list and SELECT expressions.
+	stepColumns := s.queryBuilder.BuildStepColumns()
+	aggregateColumns := s.queryBuilder.BuildAggregateColumns()
 
 	// Snapshot the ancestry flag once so all three column lists are consistent even if
 	// a concurrent caller triggers the self-healing Store(false) between list builds.
