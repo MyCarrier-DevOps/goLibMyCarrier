@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** March 31, 2026
-> **Status:** Multi-module Go library on Go 1.26; merged hotfix + main; all Copilot PR review comments resolved; MockSession now thread-safe
+> **Last Updated:** April 1, 2026
+> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-4); coverage 82.7%; lint clean
 
 ---
 
@@ -155,6 +155,30 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 2. **`AppendHistory` concurrent history loss** (`clickhouse_store.go`): Identified race: if a concurrent writer (e.g. aggregate write-back) inserts a higher-version `routing_slips` row after `loadStateHistoryFromDB` reads but before `insertAtomicHistoryUpdate` writes, the concurrent row wins VCMT last-write-wins and the appended history entry is dropped. Fix: post-write `loadVersionFromDB` check after `insertAtomicHistoryUpdate`; if `latestVersion > newVersion`, retry the full read-append-write cycle with exponential backoff (reuses `calculateAggregateConflictBackoff`). Bounded by `historyConflictMaxRetries = 5`; exhaustion returns nil (history is best-effort). Added `slippy.history_conflict_retry`, `slippy.history_conflict_retries_exhausted`, `slippy.history_version_check_error` span attributes.
 
 3. **`SetComponentImageTag` stepName normalization** (`clickhouse_store.go`): The event log (`slip_component_states`) records rows with the component step type (e.g. `"build"`), but callers may pass an aggregate step name (e.g. `"builds_completed"`). Added normalization at the top of `ClickHouseStore.SetComponentImageTag`: if `pipelineConfig.IsAggregateStep(stepName)`, translate to the component step type via `pipelineConfig.GetComponentStep(stepName)` before querying.
+
+---
+
+### April 1, 2026 — Copilot PR Review Resolutions Round 4
+
+**Post-main-merge Copilot PR review fixes (after latest merge from main introduced further changes):**
+
+1. **`insertAtomicHistoryUpdate` nil guard** — Confirmed already present from Round 2; verified by code inspection. No change needed.
+
+2. **`AppendHistory` concurrent history loss** — Confirmed already addressed in Round 3 with `historyConflictMaxRetries` retry loop. No change needed.
+
+3. **`SetComponentImageTag` stepName normalization** — Confirmed already present from Round 3. No change needed.
+
+4. **SetComponentImageTag test stepName** — Confirmed already using `"build"` (component step type), not `"builds"` (aggregate). No change needed.
+
+5. **`steps_test.go` `wg.Go()` compilation** — `sync.WaitGroup.Go` was added in Go 1.25; module is on Go 1.26. No issue.
+
+6. **`AppendHistory` JSON unmarshal silent data loss** (`clickhouse_store.go` line ~555): The previous code silently discarded all existing history on `json.Unmarshal` failure and overwrote with a single-entry list. Fix: return a hard error with span attribute `slippy.history_unmarshal_error` instead of proceeding. Added regression test `TestClickHouseStore_AppendHistory_MalformedHistoryJSON`.
+
+7. **`state.Message` mapped to `ComponentStepData.Error`** (`clickhouse_store.go` `buildComponentData`): Non-failure steps (e.g. running with a progress note) incorrectly populated the `.Error` field. Fix: only set `compData.Error` when `StepStatus(state.Status).IsFailure()`. Additionally `updateExistingComponent` now clears `dest.Error` when transitioning to a non-failure status, preventing stale errors from appearing on retried components. Added tests `TestBuildComponentData_MessageOnlyForFailure` and `TestUpdateExistingComponent_ClearsErrorOnNonFailure`.
+
+8. **`dynamic_migrations.go` version history comment** (`generateMigrationsFromConfig`): Added explicit version-to-name mapping table as a code comment to document the stable version sequence (v7=image_tag is released; v8-11 are new). All DDL is idempotent (`IF NOT EXISTS`, `IF EXISTS`); the v9 ancestry data INSERT is safe to re-run against `ReplacingMergeTree`.
+
+**Coverage:** 82.7% (slippy package), 82.0% (slippytest). **Lint:** 0 issues.
 
 4. **`SetComponentImageTag` unit test stepNames** (`clickhouse_store_unit_test.go`): Three tests (`NotFound`, `EmptyStatus`, `InsertError`) used `stepName = "builds"` (aggregate). Changed to `"build"` (component step type) to reflect actual production usage (`Client.SetComponentImageTag` always passes `"build"`). Updated `AppendHistory_DoesNotCallFullLoad` to expect 2 QueryRow calls (loadStateHistoryFromDB + loadVersionFromDB).
 

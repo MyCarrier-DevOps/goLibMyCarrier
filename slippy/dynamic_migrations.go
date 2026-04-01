@@ -225,6 +225,21 @@ func (m *DynamicMigrationManager) GenerateEnsurers() []clickhousemigrator.Schema
 
 // generateMigrationsFromConfig creates the core versioned migrations.
 // These define the table structure and run once per version.
+//
+// Version history (NEVER renumber or remove an entry — doing so breaks environments
+// that have already recorded a version as applied):
+//
+//	 1  create_routing_slips_base             — initial table
+//	 2  create_routing_slip_history_mv        — history materialized view
+//	 3  create_routing_slips_ancestry_column  — inline ancestry JSON column (deprecated)
+//	 4  create_slip_component_states          — component event-sourcing table
+//	 5  add_ttl_routing_slips                 — 60-day TTL on routing_slips
+//	 6  add_ttl_component_states              — 60-day TTL on slip_component_states
+//	 7  add_image_tag_to_component_states     — image_tag column (released)
+//	 8  create_slip_ancestry                  — normalised ancestry table
+//	 9  migrate_ancestry_data                 — backfill ancestry rows
+//	10  drop_history_view                     — remove MV before column drop
+//	11  drop_ancestry_column                  — remove inline ancestry JSON column
 func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemigrator.Migration {
 	return []clickhousemigrator.Migration{
 		m.generateBaseTableMigration(),

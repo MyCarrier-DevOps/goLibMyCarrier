@@ -850,7 +850,7 @@ func createMockSessionForUpdates(
 					},
 				}
 			}
-			// loadVersionFromDB: SELECT version FROM ... FINAL ... ORDER BY version DESC LIMIT 1
+			// loadVersionFromDB: SELECT version FROM ... ORDER BY version DESC LIMIT 1
 			if strings.Contains(query, "SELECT version FROM") {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
@@ -3554,5 +3554,113 @@ func TestClickHouseStore_AppendHistory_ContextCancelled(t *testing.T) {
 	}
 	if len(mockSession.QueryRowCalls) != 0 {
 		t.Errorf("expected 0 QueryRow calls, got %d", len(mockSession.QueryRowCalls))
+	}
+}
+
+// TestClickHouseStore_AppendHistory_MalformedHistoryJSON verifies that a malformed
+// state_history JSON value returns an error instead of silently discarding existing history.
+func TestClickHouseStore_AppendHistory_MalformedHistoryJSON(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			// loadStateHistoryFromDB returns successfully but with garbage JSON.
+			return &clickhousetest.MockRow{
+				ScanFunc: func(dest ...any) error {
+					if ptr, ok := dest[0].(*string); ok {
+						*ptr = "not-valid-json{"
+					}
+					return nil
+				},
+			}
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	entry := StateHistoryEntry{Step: "push_parsed", Status: StepStatusCompleted}
+	err := store.AppendHistory(context.Background(), "corr-ah-malformed", entry)
+	if err == nil {
+		t.Fatal("expected error for malformed history JSON, got nil")
+	}
+	// Must not have called ExecWithArgs (no write should follow a malformed read).
+	if len(mockSession.ExecWithArgsCalls) != 0 {
+		t.Errorf("expected no ExecWithArgs calls after malformed JSON, got %d",
+			len(mockSession.ExecWithArgsCalls))
+	}
+}
+
+// TestBuildComponentData_MessageOnlyForFailure verifies that state.Message is only
+// mapped to Error when the component's status is a failure. Non-failure statuses
+// (e.g. "running" with a progress note) must not produce an Error field.
+func TestBuildComponentData_MessageOnlyForFailure(t *testing.T) {
+	t.Run("failure with message sets Error", func(t *testing.T) {
+		state := componentStateRow{
+			Status:  string(StepStatusFailed),
+			Message: "build timeout",
+		}
+		got := buildComponentData("api", state)
+		if got.Error != "build timeout" {
+			t.Errorf("expected Error='build timeout', got %q", got.Error)
+		}
+	})
+
+	t.Run("running with message does not set Error", func(t *testing.T) {
+		state := componentStateRow{
+			Status:  string(StepStatusRunning),
+			Message: "building layer 3/5",
+		}
+		got := buildComponentData("api", state)
+		if got.Error != "" {
+			t.Errorf("expected empty Error for running status, got %q", got.Error)
+		}
+	})
+
+	t.Run("completed with message does not set Error", func(t *testing.T) {
+		state := componentStateRow{
+			Status:  string(StepStatusCompleted),
+			Message: "image pushed",
+		}
+		got := buildComponentData("api", state)
+		if got.Error != "" {
+			t.Errorf("expected empty Error for completed status, got %q", got.Error)
+		}
+	})
+}
+
+// TestUpdateExistingComponent_ClearsErrorOnNonFailure verifies that transitioning a
+// component away from a failure status clears any stale Error value.
+func TestUpdateExistingComponent_ClearsErrorOnNonFailure(t *testing.T) {
+	dest := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusFailed,
+		Error:     "previous error",
+	}
+	src := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusCompleted,
+		Error:     "", // retry succeeded — no new error
+	}
+	updateExistingComponent(&dest, src)
+	if dest.Error != "" {
+		t.Errorf("expected Error to be cleared on non-failure transition, got %q", dest.Error)
+	}
+	if dest.Status != StepStatusCompleted {
+		t.Errorf("expected status=completed, got %s", dest.Status)
+	}
+}
+
+// TestUpdateExistingComponent_PreservesErrorOnFailure verifies that a failure status
+// propagates the error message.
+func TestUpdateExistingComponent_PreservesErrorOnFailure(t *testing.T) {
+	dest := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusRunning,
+	}
+	src := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusFailed,
+		Error:     "out of memory",
+	}
+	updateExistingComponent(&dest, src)
+	if dest.Error != "out of memory" {
+		t.Errorf("expected Error='out of memory', got %q", dest.Error)
 	}
 }

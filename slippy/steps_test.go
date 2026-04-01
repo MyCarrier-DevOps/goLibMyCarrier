@@ -311,7 +311,7 @@ func TestClient_UpdateStepWithStatus_SingleStoreCallPerUpdate(t *testing.T) {
 			// Exactly one UpdateStepWithHistory call must be made: no client-side
 			// aggregate re-check or second load+update cycle.
 			if len(store.UpdateStepCalls) != 1 {
-				t.Errorf("expected exactly 1 UpdateStepWithHistory call, got %d\n"+
+				t.Fatalf("expected exactly 1 UpdateStepWithHistory call, got %d\n"+
 					"calls: %+v", len(store.UpdateStepCalls), store.UpdateStepCalls)
 			}
 			if store.UpdateStepCalls[0].StepName != tt.stepName {

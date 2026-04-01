@@ -552,8 +552,13 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 			Entries []StateHistoryEntry `json:"entries"`
 		}
 		if err := json.Unmarshal([]byte(existingHistoryJSON), &wrapper); err != nil {
-			// If unmarshal fails the history JSON is malformed; start with empty and append.
-			wrapper.Entries = nil
+			// History JSON is malformed. Returning an error here avoids silently
+			// discarding existing history. The caller's retry loop can surface this
+			// to the operator rather than overwriting potentially valid data.
+			parseErr := fmt.Errorf("state_history JSON is malformed for %s: %w", correlationID, err)
+			retrySpan.AddAttribute("slippy.history_unmarshal_error", parseErr.Error())
+			retrySpan.EndError(parseErr)
+			return parseErr
 		}
 		wrapper.Entries = append(wrapper.Entries, entry)
 		newHistoryJSON, err := json.Marshal(wrapper)
@@ -1612,7 +1617,9 @@ func buildComponentData(componentName string, state componentStateRow) Component
 		Status:    StepStatus(state.Status),
 		ImageTag:  state.ImageTag,
 	}
-	if state.Message != "" {
+	// Only populate Error for failure statuses; non-failure messages (e.g. progress
+	// notes on a running step) should not appear as errors in downstream consumers.
+	if state.Message != "" && StepStatus(state.Status).IsFailure() {
 		compData.Error = state.Message
 	}
 	if StepStatus(state.Status).IsRunning() {
@@ -1628,8 +1635,15 @@ func buildComponentData(componentName string, state componentStateRow) Component
 // existing non-zero values where the src field is zero.
 func updateExistingComponent(dest *ComponentStepData, src ComponentStepData) {
 	dest.Status = src.Status
-	if src.Error != "" {
-		dest.Error = src.Error
+	// When the new status is a failure, propagate the error message.
+	// When transitioning away from failure (e.g. a retry succeeds), clear any
+	// stale error so observers do not see incorrect error information.
+	if src.Status.IsFailure() {
+		if src.Error != "" {
+			dest.Error = src.Error
+		}
+	} else {
+		dest.Error = ""
 	}
 	if src.ImageTag != "" {
 		dest.ImageTag = src.ImageTag
