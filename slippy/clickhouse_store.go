@@ -830,7 +830,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
 		ColumnCreatedAt, "now64(6)", // updated_at
 		ColumnStatus, ColumnStepDetails,
-		"CAST(? AS JSON)", ColumnAncestry, // state_history overridden
+		"CAST(? AS JSON)", ColumnAncestry, // state_history=CAST(? AS JSON), ancestry passthrough
 		"1", "?", // sign=1, version=newVersion
 	}
 	newRowSelectCols = append(newRowSelectCols, stepColumns...)
