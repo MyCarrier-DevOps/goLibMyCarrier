@@ -191,7 +191,7 @@ func NewClickHouseStoreFromSession(
 		queryBuilder:      NewSlipQueryBuilder(pipelineConfig, database),
 		scanner:           NewSlipScanner(pipelineConfig),
 		logger:            NopLogger(),
-		hasAncestryColumn: true, // default for test sessions; production uses detectAncestryColumn
+		hasAncestryColumn: true, // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
 	}
 }
 
@@ -209,7 +209,7 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 		queryBuilder:      NewSlipQueryBuilder(pipelineConfig, database),
 		scanner:           NewSlipScanner(pipelineConfig),
 		logger:            NopLogger(),
-		hasAncestryColumn: true, // default for compatibility; use detectAncestryColumn if needed
+		hasAncestryColumn: true, // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
 	}
 }
 
@@ -223,13 +223,34 @@ func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
 		ColumnAncestry,
 	)
 	row := s.session.QueryRow(ctx, query, s.database)
+	if row == nil {
+		// Conservative default when the session returns no row descriptor.
+		s.hasAncestryColumn = true
+		return
+	}
 	var count uint64
 	if err := row.Scan(&count); err != nil {
 		// Conservative default: assume column exists to avoid data loss on transient errors.
+		// Log so operators can investigate if ancestry queries fail later.
+		s.logger.Warn(ctx, "ancestry column probe failed; assuming ancestry column exists", map[string]interface{}{
+			"error": err.Error(),
+		})
 		s.hasAncestryColumn = true
 		return
 	}
 	s.hasAncestryColumn = count > 0
+}
+
+// isAncestryColumnError reports whether err indicates ClickHouse does not recognise the ancestry
+// column. This is used as a runtime fallback: when detectAncestryColumn conservatively assumed the
+// column exists (e.g. on a transient probe error) but the actual INSERT/SELECT fails because
+// migration v11 has already dropped it.
+func isAncestryColumnError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, ColumnAncestry) &&
+		(strings.Contains(msg, "Unknown identifier") ||
+			strings.Contains(msg, "Missing columns") ||
+			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
 }
 
 // Session returns the underlying ClickHouse session interface.
@@ -889,7 +910,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		%s
 	`, s.database, TableRoutingSlips, strings.Join(allCols, ", "), cancelQuery, newRowQuery)
 
-	return s.session.ExecWithArgs(ctx, query,
+	err := s.session.ExecWithArgs(ctx, query,
 		// Cancel SELECT WHERE params
 		correlationID, newVersion,
 		// New row SELECT literal params (state_history, version)
@@ -897,6 +918,18 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		// New row SELECT WHERE param
 		correlationID,
 	)
+	if err != nil && s.hasAncestryColumn && isAncestryColumnError(err) {
+		// The probe assumed ancestry exists but ClickHouse reports an unknown column —
+		// migration v11 has been applied despite the probe not seeing it (transient failure).
+		// Update the cached state and retry once without ancestry columns.
+		s.logger.Warn(ctx, "ancestry column unknown to ClickHouse; retrying without it", map[string]interface{}{
+			"error":          err.Error(),
+			"correlation_id": correlationID,
+		})
+		s.hasAncestryColumn = false
+		return s.insertAtomicHistoryUpdate(ctx, correlationID, newVersion, newStateHistoryJSON)
+	}
+	return err
 }
 
 // insertRow inserts a single row into the routing_slips table.
