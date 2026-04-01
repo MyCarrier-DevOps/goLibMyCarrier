@@ -80,7 +80,7 @@ type ClickHouseStore struct {
 	queryBuilder        *SlipQueryBuilder
 	scanner             *SlipScanner
 	logger              Logger // Logger for operations (defaults to NopLogger)
-	hasAncestryColumn   bool   // false after migration v11 drops the ancestry column
+	hasAncestryColumn bool // false after migration v11 drops the ancestry column
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -211,46 +211,6 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 		logger:            NopLogger(),
 		hasAncestryColumn: true, // conservative default; insertAtomicHistoryUpdate self-heals on first call if v11 has already dropped the column
 	}
-}
-
-// detectAncestryColumn queries system.columns to determine whether the ancestry column
-// is still present in routing_slips. After migration v11 (drop_ancestry_column) is applied,
-// the column no longer exists and insertAtomicHistoryUpdate must omit it from query column lists.
-// On any query error the column is assumed present (conservative default avoids data loss).
-func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
-	query := fmt.Sprintf(
-		"SELECT count() FROM system.columns WHERE database = ? AND table = 'routing_slips' AND name = '%s'",
-		ColumnAncestry,
-	)
-	row := s.session.QueryRow(ctx, query, s.database)
-	if row == nil {
-		// Conservative default when the session returns no row descriptor.
-		s.hasAncestryColumn = true
-		return
-	}
-	var count uint64
-	if err := row.Scan(&count); err != nil {
-		// Conservative default: assume column exists to avoid data loss on transient errors.
-		// Log so operators can investigate if ancestry queries fail later.
-		s.logger.Warn(ctx, "ancestry column probe failed; assuming ancestry column exists", map[string]interface{}{
-			"error": err.Error(),
-		})
-		s.hasAncestryColumn = true
-		return
-	}
-	s.hasAncestryColumn = count > 0
-}
-
-// isAncestryColumnError reports whether err indicates ClickHouse does not recognise the ancestry
-// column. This is used as a runtime fallback: when detectAncestryColumn conservatively assumed the
-// column exists (e.g. on a transient probe error) but the actual INSERT/SELECT fails because
-// migration v11 has already dropped it.
-func isAncestryColumnError(err error) bool {
-	msg := err.Error()
-	return strings.Contains(msg, ColumnAncestry) &&
-		(strings.Contains(msg, "Unknown identifier") ||
-			strings.Contains(msg, "Missing columns") ||
-			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
 }
 
 // Session returns the underlying ClickHouse session interface.
@@ -797,6 +757,46 @@ func (s *ClickHouseStore) SetComponentImageTag(
 
 	return s.insertComponentState(ctx, correlationID, stepName, componentName,
 		StepStatus(currentStatus), "", imageTag)
+}
+
+// detectAncestryColumn queries system.columns to determine whether the ancestry column
+// is still present in routing_slips. After migration v11 (drop_ancestry_column) is applied,
+// the column no longer exists and insertAtomicHistoryUpdate must omit it from query column lists.
+// On any query error the column is assumed present (conservative default avoids data loss).
+func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
+	query := fmt.Sprintf(
+		"SELECT count() FROM system.columns WHERE database = ? AND table = 'routing_slips' AND name = '%s'",
+		ColumnAncestry,
+	)
+	row := s.session.QueryRow(ctx, query, s.database)
+	if row == nil {
+		// Conservative default when the session returns no row descriptor.
+		s.hasAncestryColumn = true
+		return
+	}
+	var count uint64
+	if err := row.Scan(&count); err != nil {
+		// Conservative default: assume column exists to avoid data loss on transient errors.
+		// Log so operators can investigate if ancestry queries fail later.
+		s.logger.Warn(ctx, "ancestry column probe failed; assuming ancestry column exists", map[string]interface{}{
+			"error": err.Error(),
+		})
+		s.hasAncestryColumn = true
+		return
+	}
+	s.hasAncestryColumn = count > 0
+}
+
+// isAncestryColumnError reports whether err indicates ClickHouse does not recognise the ancestry
+// column. This is used as a runtime fallback: when detectAncestryColumn conservatively assumed the
+// column exists (e.g. on a transient probe error) but the actual INSERT/SELECT fails because
+// migration v11 has already dropped it.
+func isAncestryColumnError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, ColumnAncestry) &&
+		(strings.Contains(msg, "Unknown identifier") ||
+			strings.Contains(msg, "Missing columns") ||
+			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
 }
 
 // loadStateHistoryFromDB reads only the state_history JSON column from the latest active
