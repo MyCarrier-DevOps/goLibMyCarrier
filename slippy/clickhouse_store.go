@@ -774,9 +774,11 @@ func (s *ClickHouseStore) SetComponentImageTag(
 }
 
 // nextVersion returns a monotonically increasing version based on the current nanosecond
-// timestamp. Under concurrency, if two callers arrive in the same nanosecond, the second
-// caller gets lastVersion+1 instead of a duplicate timestamp. This guarantees unique
-// versions for VersionedCollapsingMergeTree ordering.
+// timestamp for this ClickHouseStore instance. Under concurrency, if two callers arrive in
+// the same nanosecond, the second caller gets lastVersion+1 instead of a duplicate
+// timestamp. This guarantees per-instance monotonic and unique versions suitable for
+// VersionedCollapsingMergeTree ordering within a single writer, but does not provide
+// global uniqueness across processes or hosts.
 func (s *ClickHouseStore) nextVersion() uint64 {
 	candidate := uint64(time.Now().UnixNano())
 	for {
