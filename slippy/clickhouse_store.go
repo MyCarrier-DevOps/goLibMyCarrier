@@ -80,9 +80,9 @@ type ClickHouseStore struct {
 	database          string
 	queryBuilder      *SlipQueryBuilder
 	scanner           *SlipScanner
-	logger            Logger      // Logger for operations (defaults to NopLogger)
-	hasAncestryColumn atomic.Bool // false after migration v10 drops the ancestry column
-	hasImageTagColumn atomic.Bool // false when slip_component_states lacks image_tag column (pre-v11)
+	logger            Logger        // Logger for operations (defaults to NopLogger)
+	hasAncestryColumn atomic.Bool   // false after migration v10 drops the ancestry column
+	hasImageTagColumn atomic.Bool   // false when slip_component_states lacks image_tag column (pre-v11)
 	lastVersion       atomic.Uint64 // monotonic version generator seeded from UnixNano; guarantees uniqueness under concurrency
 }
 
@@ -102,23 +102,6 @@ type ClickHouseStoreOptions struct {
 
 	// Logger for migration output
 	Logger clickhousemigrator.Logger
-}
-
-// nextVersion returns a monotonically increasing version based on the current nanosecond
-// timestamp. Under concurrency, if two callers arrive in the same nanosecond, the second
-// caller gets lastVersion+1 instead of a duplicate timestamp. This guarantees unique
-// versions for VersionedCollapsingMergeTree ordering.
-func (s *ClickHouseStore) nextVersion() uint64 {
-	candidate := uint64(time.Now().UnixNano())
-	for {
-		prev := s.lastVersion.Load()
-		if candidate <= prev {
-			candidate = prev + 1
-		}
-		if s.lastVersion.CompareAndSwap(prev, candidate) {
-			return candidate
-		}
-	}
 }
 
 // NewClickHouseStoreFromConfig creates a new ClickHouse-backed slip store from config.
@@ -788,6 +771,23 @@ func (s *ClickHouseStore) SetComponentImageTag(
 
 	return s.insertComponentState(ctx, correlationID, stepName, componentName,
 		StepStatus(currentStatus), "", imageTag)
+}
+
+// nextVersion returns a monotonically increasing version based on the current nanosecond
+// timestamp. Under concurrency, if two callers arrive in the same nanosecond, the second
+// caller gets lastVersion+1 instead of a duplicate timestamp. This guarantees unique
+// versions for VersionedCollapsingMergeTree ordering.
+func (s *ClickHouseStore) nextVersion() uint64 {
+	candidate := uint64(time.Now().UnixNano())
+	for {
+		prev := s.lastVersion.Load()
+		if candidate <= prev {
+			candidate = prev + 1
+		}
+		if s.lastVersion.CompareAndSwap(prev, candidate) {
+			return candidate
+		}
+	}
 }
 
 // queryComponentStatus reads the latest status for a component from the event log.

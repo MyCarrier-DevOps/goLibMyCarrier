@@ -2511,12 +2511,12 @@ func TestClickHouseStore_NextVersion_MonotonicUnderConcurrency(t *testing.T) {
 	results := make([][]uint64, goroutines)
 
 	var wg sync.WaitGroup
-	for g := range goroutines {
+	for g := 0; g < goroutines; g++ {
 		results[g] = make([]uint64, versionsPerGoroutine)
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			for i := range versionsPerGoroutine {
+			for i := 0; i < versionsPerGoroutine; i++ {
 				results[idx][i] = store.nextVersion()
 			}
 		}(g)
@@ -2525,7 +2525,7 @@ func TestClickHouseStore_NextVersion_MonotonicUnderConcurrency(t *testing.T) {
 
 	// Collect all versions and verify uniqueness.
 	seen := make(map[uint64]bool, goroutines*versionsPerGoroutine)
-	for g := range goroutines {
+	for g := 0; g < goroutines; g++ {
 		for _, v := range results[g] {
 			if seen[v] {
 				t.Fatalf("duplicate version %d detected", v)
