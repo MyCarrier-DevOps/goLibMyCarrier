@@ -765,8 +765,8 @@ func (s *ClickHouseStore) SetComponentImageTag(
 	}
 
 	if currentStatus == "" {
-		return fmt.Errorf("%w: component %s not found in event log for step %s",
-			ErrSlipNotFound, componentName, stepName)
+		return fmt.Errorf("component %s not found in event log for step %s",
+			componentName, stepName)
 	}
 
 	return s.insertComponentState(ctx, correlationID, stepName, componentName,

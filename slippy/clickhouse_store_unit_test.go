@@ -3627,7 +3627,8 @@ func TestClickHouseStore_UpdateStepWithHistory_ComponentStep(t *testing.T) {
 // --- SetComponentImageTag ---
 
 // TestClickHouseStore_SetComponentImageTag_NotFound verifies that when the status read
-// returns sql.ErrNoRows, SetComponentImageTag returns ErrSlipNotFound.
+// returns sql.ErrNoRows, SetComponentImageTag returns an error indicating the component
+// was not found (not ErrSlipNotFound, since the slip may exist but the component has no events).
 func TestClickHouseStore_SetComponentImageTag_NotFound(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
@@ -3639,13 +3640,20 @@ func TestClickHouseStore_SetComponentImageTag_NotFound(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.SetComponentImageTag(context.Background(), "corr-tag-nf", "build", "api", "v1.0.0")
-	if !errors.Is(err, ErrSlipNotFound) {
-		t.Errorf("expected ErrSlipNotFound on sql.ErrNoRows, got %v", err)
+	if err == nil {
+		t.Fatal("expected error for missing component, got nil")
+	}
+	if errors.Is(err, ErrSlipNotFound) {
+		t.Errorf("error should not wrap ErrSlipNotFound for missing component state, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found in event log") {
+		t.Errorf("expected 'not found in event log' message, got %v", err)
 	}
 }
 
 // TestClickHouseStore_SetComponentImageTag_EmptyStatus verifies that when the status scan
-// succeeds but returns an empty string, SetComponentImageTag returns ErrSlipNotFound.
+// succeeds but returns an empty string, SetComponentImageTag returns an error indicating
+// the component was not found (not ErrSlipNotFound, since the slip may exist).
 func TestClickHouseStore_SetComponentImageTag_EmptyStatus(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
@@ -3660,8 +3668,14 @@ func TestClickHouseStore_SetComponentImageTag_EmptyStatus(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.SetComponentImageTag(context.Background(), "corr-tag-empty", "build", "api", "v1.0.0")
-	if !errors.Is(err, ErrSlipNotFound) {
-		t.Errorf("expected ErrSlipNotFound for empty status, got %v", err)
+	if err == nil {
+		t.Fatal("expected error for empty component status, got nil")
+	}
+	if errors.Is(err, ErrSlipNotFound) {
+		t.Errorf("error should not wrap ErrSlipNotFound for empty component status, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found in event log") {
+		t.Errorf("expected 'not found in event log' message, got %v", err)
 	}
 }
 
