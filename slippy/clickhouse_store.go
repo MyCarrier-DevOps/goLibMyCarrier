@@ -418,7 +418,10 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Store the old version for the cancel row
 	oldVersion := slip.Version
 
-	newVersion := s.nextVersionAfter(oldVersion)
+	newVersion := s.nextVersion()
+	if newVersion <= oldVersion {
+		newVersion = oldVersion + 1
+	}
 
 	// Insert both cancel row and new row atomically
 	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
@@ -591,7 +594,10 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 			// Post-write version check will still catch conflicts.
 			currentVersion = 0
 		}
-		newVersion := s.nextVersionAfter(currentVersion)
+		newVersion := s.nextVersion()
+		if newVersion <= currentVersion {
+			newVersion = currentVersion + 1
+		}
 		if err := s.insertAtomicHistoryUpdate(
 			retrySpan.Context(), correlationID, newVersion, string(newHistoryJSON),
 		); err != nil {
@@ -781,42 +787,18 @@ func (s *ClickHouseStore) SetComponentImageTag(
 		StepStatus(currentStatus), "", imageTag)
 }
 
-// nextVersion returns a monotonically increasing version based on the current nanosecond
-// timestamp for this ClickHouseStore instance. Under concurrency, if two callers arrive in
-// the same nanosecond, the second caller gets lastVersion+1 instead of a duplicate
-// timestamp. This guarantees per-instance monotonic and unique versions suitable for
-// VersionedCollapsingMergeTree ordering within a single writer, but does not provide
-// global uniqueness across processes or hosts.
+// nextVersion returns a nanosecond-epoch version. If the current wall clock
+// equals or falls behind the last version issued by this store instance,
+// it returns lastVersion+1 to keep versions monotonically increasing.
 func (s *ClickHouseStore) nextVersion() uint64 {
-	return s.nextVersionAfter(0)
-}
-
-// nextVersionAfter is like nextVersion but guarantees the returned version is
-// strictly greater than floor, provided floor < ^uint64(0). Use when the caller
-// must supersede an existing DB row whose version may have been set by a different
-// writer with a skewed clock.
-//
-// When floor == ^uint64(0) (MaxUint64), no value can exceed it. The function
-// returns MaxUint64 and updates lastVersion. In practice this is unreachable
-// because ClickHouse nanosecond-epoch versions stay well below MaxUint64.
-func (s *ClickHouseStore) nextVersionAfter(floor uint64) uint64 {
-	if floor == ^uint64(0) {
-		// No uint64 value can exceed MaxUint64. Return it and advance
-		// lastVersion so subsequent calls remain monotonic.
-		s.lastVersion.Store(floor)
-		return floor
-	}
-	candidate := uint64(time.Now().UnixNano())
-	if candidate <= floor {
-		candidate = floor + 1
-	}
 	for {
 		prev := s.lastVersion.Load()
-		if candidate <= prev {
-			candidate = prev + 1
+		v := uint64(time.Now().UnixNano())
+		if v <= prev {
+			v = prev + 1
 		}
-		if s.lastVersion.CompareAndSwap(prev, candidate) {
-			return candidate
+		if s.lastVersion.CompareAndSwap(prev, v) {
+			return v
 		}
 	}
 }
