@@ -885,7 +885,9 @@ func isImageTagColumnError(err error) bool {
 	return strings.Contains(msg, "image_tag") &&
 		(strings.Contains(msg, "Missing columns") ||
 			strings.Contains(msg, "Unknown column") ||
-			strings.Contains(msg, "No such column"))
+			strings.Contains(msg, "No such column") ||
+			strings.Contains(msg, "Unknown identifier") ||
+			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
 }
 
 // loadStateHistoryFromDB reads only the state_history JSON column from the latest active
@@ -1859,8 +1861,10 @@ func updateExistingComponent(dest *ComponentStepData, src ComponentStepData) {
 	if src.StartedAt != nil && dest.StartedAt == nil {
 		dest.StartedAt = src.StartedAt
 	}
-	if src.CompletedAt != nil && dest.CompletedAt == nil {
-		dest.CompletedAt = src.CompletedAt
+	if src.CompletedAt != nil {
+		if dest.CompletedAt == nil || src.CompletedAt.After(*dest.CompletedAt) {
+			dest.CompletedAt = src.CompletedAt
+		}
 	}
 }
 

@@ -3833,6 +3833,35 @@ func TestUpdateExistingComponent_PreservesErrorOnFailure(t *testing.T) {
 	}
 }
 
+// TestUpdateExistingComponent_CompletedAt_UpdatedOnRetry verifies that when a component
+// transitions from a terminal failure to a terminal success (retry scenario), CompletedAt
+// is updated to the later timestamp rather than keeping the stale failure timestamp.
+func TestUpdateExistingComponent_CompletedAt_UpdatedOnRetry(t *testing.T) {
+	failedTime := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
+	retryTime := time.Date(2026, 4, 2, 10, 5, 0, 0, time.UTC)
+
+	dest := ComponentStepData{
+		Component:   "api",
+		Status:      StepStatusFailed,
+		CompletedAt: &failedTime,
+	}
+	src := ComponentStepData{
+		Component:   "api",
+		Status:      StepStatusCompleted,
+		CompletedAt: &retryTime,
+	}
+	updateExistingComponent(&dest, src)
+	if dest.CompletedAt == nil {
+		t.Fatal("CompletedAt should not be nil after retry")
+	}
+	if !dest.CompletedAt.Equal(retryTime) {
+		t.Errorf("CompletedAt should be updated to retry time %v, got %v", retryTime, *dest.CompletedAt)
+	}
+	if dest.Status != StepStatusCompleted {
+		t.Errorf("expected status=completed, got %s", dest.Status)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Gap 1: isAncestryColumnError — package-level function
 // ---------------------------------------------------------------------------
@@ -3881,6 +3910,69 @@ func TestIsAncestryColumnError(t *testing.T) {
 			got := isAncestryColumnError(tc.err)
 			if got != tc.want {
 				t.Errorf("isAncestryColumnError(%q) = %v, want %v", tc.err.Error(), got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Gap 1b: isImageTagColumnError — package-level function
+// ---------------------------------------------------------------------------
+
+// TestIsImageTagColumnError validates all branches of the isImageTagColumnError helper.
+func TestIsImageTagColumnError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "image_tag + Missing columns",
+			err:  fmt.Errorf("Missing columns: image_tag is not found"),
+			want: true,
+		},
+		{
+			name: "image_tag + Unknown column",
+			err:  fmt.Errorf("Unknown column image_tag in table"),
+			want: true,
+		},
+		{
+			name: "image_tag + No such column",
+			err:  fmt.Errorf("No such column image_tag in schema"),
+			want: true,
+		},
+		{
+			name: "image_tag + Unknown identifier",
+			err:  fmt.Errorf("Unknown identifier: image_tag in query"),
+			want: true,
+		},
+		{
+			name: "image_tag + UNKNOWN_IDENTIFIER code",
+			err:  fmt.Errorf("Code: UNKNOWN_IDENTIFIER, column image_tag"),
+			want: true,
+		},
+		{
+			name: "image_tag without sentinel string",
+			err:  fmt.Errorf("image_tag: connection timeout"),
+			want: false,
+		},
+		{
+			name: "sentinel string without image_tag",
+			err:  errors.New("Unknown identifier in column foo"),
+			want: false,
+		},
+		{
+			name: "unrelated error",
+			err:  errors.New("connection refused"),
+			want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isImageTagColumnError(tc.err)
+			if got != tc.want {
+				t.Errorf("isImageTagColumnError(%q) = %v, want %v", tc.err.Error(), got, tc.want)
 			}
 		})
 	}
