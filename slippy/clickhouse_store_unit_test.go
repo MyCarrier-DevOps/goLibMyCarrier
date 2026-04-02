@@ -522,14 +522,24 @@ func TestClickHouseStore_UpdateStep(t *testing.T) {
 		// One ExecWithArgs call: the slip_component_states insert.
 		// Zero QueryRow calls: no slip load needed for non-aggregate pipeline steps.
 		if len(mockSession.ExecWithArgsCalls) != 1 {
-			t.Errorf("expected 1 ExecWithArgs call (component_states insert), got %d", len(mockSession.ExecWithArgsCalls))
+			t.Errorf(
+				"expected 1 ExecWithArgs call (component_states insert), got %d",
+				len(mockSession.ExecWithArgsCalls),
+			)
 		}
 		if len(mockSession.QueryRowCalls) != 0 {
-			t.Errorf("expected 0 QueryRow calls (no load for pure pipeline step), got %d", len(mockSession.QueryRowCalls))
+			t.Errorf(
+				"expected 0 QueryRow calls (no load for pure pipeline step), got %d",
+				len(mockSession.QueryRowCalls),
+			)
 		}
 		// The single insert must target slip_component_states.
 		if !strings.Contains(mockSession.ExecWithArgsCalls[0].Stmt, TableSlipComponentStates) {
-			t.Errorf("expected insert into %s, got query: %s", TableSlipComponentStates, mockSession.ExecWithArgsCalls[0].Stmt)
+			t.Errorf(
+				"expected insert into %s, got query: %s",
+				TableSlipComponentStates,
+				mockSession.ExecWithArgsCalls[0].Stmt,
+			)
 		}
 	})
 
@@ -1631,14 +1641,26 @@ func TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		if err := store.UpdateStep(context.Background(), "test-corr-001", "push_parsed", "", StepStatusCompleted); err != nil {
+		if err := store.UpdateStep(
+			context.Background(),
+			"test-corr-001",
+			"push_parsed",
+			"",
+			StepStatusCompleted,
+		); err != nil {
 			errsMu.Lock()
 			errs = append(errs, fmt.Errorf("push_parsed: %w", err))
 			errsMu.Unlock()
 		}
 	})
 	wg.Go(func() {
-		if err := store.UpdateStep(context.Background(), "test-corr-001", "dev_deploy", "", StepStatusFailed); err != nil {
+		if err := store.UpdateStep(
+			context.Background(),
+			"test-corr-001",
+			"dev_deploy",
+			"",
+			StepStatusFailed,
+		); err != nil {
 			errsMu.Lock()
 			errs = append(errs, fmt.Errorf("dev_deploy: %w", err))
 			errsMu.Unlock()
@@ -2430,7 +2452,10 @@ func TestClickHouseStore_AppendHistory_DoesNotCallFullLoad(t *testing.T) {
 	// Exactly one QueryRow call (loadStateHistoryFromDB) + one for the post-write
 	// version check (loadVersionFromDB). No full QueryWithArgs (Load).
 	if len(mockSession.QueryRowCalls) != 2 {
-		t.Errorf("expected 2 QueryRow calls (loadStateHistoryFromDB + loadVersionFromDB), got %d", len(mockSession.QueryRowCalls))
+		t.Errorf(
+			"expected 2 QueryRow calls (loadStateHistoryFromDB + loadVersionFromDB), got %d",
+			len(mockSession.QueryRowCalls),
+		)
 	}
 	if len(mockSession.QueryWithArgsCalls) != 0 {
 		t.Errorf("expected 0 QueryWithArgs calls (no full Load), got %d", len(mockSession.QueryWithArgsCalls))

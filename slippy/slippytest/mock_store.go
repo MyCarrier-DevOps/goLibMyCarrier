@@ -527,25 +527,36 @@ func (m *MockStore) SetComponentImageTag(
 		return slippy.ErrSlipNotFound
 	}
 
-	// Target the aggregate column using the step name. For standard configs,
-	// pluralize(stepName) matches the column name directly. For custom aggregate
-	// column names fall back to scanning all aggregates.
+	// Target the aggregate column derived from the step name first.
+	// If that column is not present, or the component is stored in other
+	// aggregate columns, fall back to scanning all aggregates and update
+	// every matching entry for this component.
 	columnName := pluralize(stepName)
+
+	found := false
 	if componentData, ok := slip.Aggregates[columnName]; ok {
 		for i := range componentData {
 			if componentData[i].Component == componentName {
 				slip.Aggregates[columnName][i].ImageTag = imageTag
-				return nil
+				found = true
 			}
 		}
 	}
+
 	for colName, componentData := range slip.Aggregates {
+		if colName == columnName {
+			continue
+		}
 		for i := range componentData {
 			if componentData[i].Component == componentName {
 				slip.Aggregates[colName][i].ImageTag = imageTag
-				return nil
+				found = true
 			}
 		}
+	}
+
+	if found {
+		return nil
 	}
 	return slippy.ErrSlipNotFound
 }

@@ -303,7 +303,14 @@ func TestClient_UpdateStepWithStatus_SingleStoreCallPerUpdate(t *testing.T) {
 			slip := createTestSlip("corr-single-call")
 			store.AddSlip(slip)
 
-			err := client.UpdateStepWithStatus(ctx, "corr-single-call", tt.stepName, tt.componentName, tt.status, "test msg")
+			err := client.UpdateStepWithStatus(
+				ctx,
+				"corr-single-call",
+				tt.stepName,
+				tt.componentName,
+				tt.status,
+				"test msg",
+			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -439,7 +446,10 @@ func TestClient_SetComponentImageTag(t *testing.T) {
 			t.Fatalf("failed to load updated slip: %v", err)
 		}
 		if updatedSlip.Aggregates[buildAggregateStep][0].ImageTag != "mycarrier/my-service:abc123-1234567890" {
-			t.Errorf("expected image tag in slip aggregates, got %q", updatedSlip.Aggregates[buildAggregateStep][0].ImageTag)
+			t.Errorf(
+				"expected image tag in slip aggregates, got %q",
+				updatedSlip.Aggregates[buildAggregateStep][0].ImageTag,
+			)
 		}
 	})
 
