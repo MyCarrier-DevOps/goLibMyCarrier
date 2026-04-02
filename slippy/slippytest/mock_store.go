@@ -23,6 +23,7 @@ package slippytest
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -558,7 +559,7 @@ func (m *MockStore) SetComponentImageTag(
 	if found {
 		return nil
 	}
-	return slippy.ErrSlipNotFound
+	return fmt.Errorf("component %s not found in any aggregate for step %s", componentName, stepName)
 }
 
 // Ping verifies the database connection is alive (mock always returns PingError).

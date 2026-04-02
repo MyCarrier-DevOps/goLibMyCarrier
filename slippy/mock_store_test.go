@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -576,7 +577,7 @@ func (m *MockStore) SetComponentImageTag(
 	if found {
 		return nil
 	}
-	return ErrSlipNotFound
+	return fmt.Errorf("component %s not found in any aggregate for step %s", componentName, stepName)
 }
 
 // Close releases any resources held by the store.
