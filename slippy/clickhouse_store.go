@@ -418,7 +418,7 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Store the old version for the cancel row
 	oldVersion := slip.Version
 
-	newVersion := s.nextVersion()
+	newVersion := s.nextVersionAfter(oldVersion)
 
 	// Insert both cancel row and new row atomically
 	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
@@ -583,7 +583,15 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 			return fmt.Errorf("failed to marshal updated state history: %w", err)
 		}
 
-		newVersion := s.nextVersion()
+		// Load current DB version so we can guarantee newVersion > existing version,
+		// preventing invisible updates when another writer used a skewed clock.
+		currentVersion, versionLoadErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionLoadErr != nil {
+			// Non-fatal: fall back to nextVersion() with no floor guarantee.
+			// Post-write version check will still catch conflicts.
+			currentVersion = 0
+		}
+		newVersion := s.nextVersionAfter(currentVersion)
 		if err := s.insertAtomicHistoryUpdate(
 			retrySpan.Context(), correlationID, newVersion, string(newHistoryJSON),
 		); err != nil {
@@ -780,7 +788,17 @@ func (s *ClickHouseStore) SetComponentImageTag(
 // VersionedCollapsingMergeTree ordering within a single writer, but does not provide
 // global uniqueness across processes or hosts.
 func (s *ClickHouseStore) nextVersion() uint64 {
+	return s.nextVersionAfter(0)
+}
+
+// nextVersionAfter is like nextVersion but guarantees the returned version is
+// strictly greater than floor. Use when the caller must supersede an existing
+// DB row whose version may have been set by a different writer with a skewed clock.
+func (s *ClickHouseStore) nextVersionAfter(floor uint64) uint64 {
 	candidate := uint64(time.Now().UnixNano())
+	if floor < ^uint64(0) && candidate <= floor {
+		candidate = floor + 1
+	}
 	for {
 		prev := s.lastVersion.Load()
 		if candidate <= prev {

@@ -2449,11 +2449,12 @@ func TestClickHouseStore_AppendHistory_DoesNotCallFullLoad(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 
-	// Exactly one QueryRow call (loadStateHistoryFromDB) + one for the post-write
-	// version check (loadVersionFromDB). No full QueryWithArgs (Load).
-	if len(mockSession.QueryRowCalls) != 2 {
+	// Exactly one QueryRow call (loadStateHistoryFromDB) + one for the pre-write
+	// version floor (loadVersionFromDB) + one for the post-write version check
+	// (loadVersionFromDB). No full QueryWithArgs (Load).
+	if len(mockSession.QueryRowCalls) != 3 {
 		t.Errorf(
-			"expected 2 QueryRow calls (loadStateHistoryFromDB + loadVersionFromDB), got %d",
+			"expected 3 QueryRow calls (loadStateHistoryFromDB + 2x loadVersionFromDB), got %d",
 			len(mockSession.QueryRowCalls),
 		)
 	}
@@ -2565,6 +2566,68 @@ func TestClickHouseStore_NextVersion_MonotonicUnderConcurrency(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestClickHouseStore_NextVersionAfter_FloorEnforcement verifies that nextVersionAfter
+// returns a version strictly greater than the provided floor, even when the floor
+// exceeds the current wall clock (simulating clock skew from a remote writer).
+func TestClickHouseStore_NextVersionAfter_FloorEnforcement(t *testing.T) {
+	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
+
+	t.Run("floor below clock returns clock-based version", func(t *testing.T) {
+		v := store.nextVersionAfter(0)
+		if v == 0 {
+			t.Fatal("expected non-zero version")
+		}
+	})
+
+	t.Run("floor above clock returns floor+1", func(t *testing.T) {
+		// Use a floor far in the future to guarantee it exceeds wall clock.
+		futureFloor := uint64(time.Now().UnixNano()) + 10_000_000_000 // +10s
+		v := store.nextVersionAfter(futureFloor)
+		if v <= futureFloor {
+			t.Fatalf("expected version > %d, got %d", futureFloor, v)
+		}
+		if v != futureFloor+1 {
+			t.Fatalf("expected version = %d (floor+1), got %d", futureFloor+1, v)
+		}
+	})
+
+	t.Run("lastVersion is updated to floor+1", func(t *testing.T) {
+		futureFloor := uint64(time.Now().UnixNano()) + 20_000_000_000 // +20s
+		v1 := store.nextVersionAfter(futureFloor)
+		// Next call with no floor should still be monotonic relative to v1.
+		v2 := store.nextVersion()
+		if v2 <= v1 {
+			t.Fatalf("expected v2 (%d) > v1 (%d) — lastVersion not updated", v2, v1)
+		}
+	})
+
+	t.Run("concurrent callers with same floor produce unique versions", func(t *testing.T) {
+		futureFloor := uint64(time.Now().UnixNano()) + 30_000_000_000
+		const goroutines = 10
+		results := make([]uint64, goroutines)
+		var wg sync.WaitGroup
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				results[idx] = store.nextVersionAfter(futureFloor)
+			}(i)
+		}
+		wg.Wait()
+
+		seen := make(map[uint64]bool, goroutines)
+		for _, v := range results {
+			if v <= futureFloor {
+				t.Fatalf("version %d not greater than floor %d", v, futureFloor)
+			}
+			if seen[v] {
+				t.Fatalf("duplicate version %d", v)
+			}
+			seen[v] = true
+		}
+	})
 }
 
 // TestCalculateAggregateConflictBackoff verifies the exponential backoff sequence for
@@ -4173,6 +4236,8 @@ func TestClickHouseStore_AppendHistory_ConflictRetry(t *testing.T) {
 				}
 			}
 			// loadVersionFromDB: SELECT version FROM ...
+			// With pre-write floor loading, even-numbered calls are post-write checks,
+			// odd-numbered calls are pre-write floor loads.
 			if strings.Contains(query, "SELECT version FROM") {
 				mu.Lock()
 				versionCheckCallCount++
@@ -4181,16 +4246,18 @@ func TestClickHouseStore_AppendHistory_ConflictRetry(t *testing.T) {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
 						if v, ok := dest[0].(*uint64); ok {
-							if call == 1 {
-								// First check: concurrent writer at a much higher version.
-								mu.Lock()
+							mu.Lock()
+							defer mu.Unlock()
+							switch {
+							case call%2 == 1:
+								// Pre-write floor loads: return 0 (no clock skew in this test).
+								*v = 0
+							case call == 2:
+								// First post-write check: concurrent writer at a much higher version.
 								*v = lastInsertedVersion + 999999
-								mu.Unlock()
-							} else {
-								// Second check: our write won.
-								mu.Lock()
+							default:
+								// Second post-write check: our write won.
 								*v = lastInsertedVersion
-								mu.Unlock()
 							}
 						}
 						return nil
@@ -4243,9 +4310,9 @@ func TestClickHouseStore_AppendHistory_ConflictRetry(t *testing.T) {
 		t.Errorf("expected 2 insertAtomicHistoryUpdate calls, got %d", execCallCount)
 	}
 
-	// Two loadVersionFromDB calls: one per attempt.
-	if versionCheckCallCount != 2 {
-		t.Errorf("expected 2 loadVersionFromDB calls, got %d", versionCheckCallCount)
+	// Four loadVersionFromDB calls: one pre-write + one post-write per attempt.
+	if versionCheckCallCount != 4 {
+		t.Errorf("expected 4 loadVersionFromDB calls, got %d", versionCheckCallCount)
 	}
 }
 
