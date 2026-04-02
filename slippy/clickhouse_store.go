@@ -1352,6 +1352,9 @@ func (s *ClickHouseStore) insertComponentState(
 ) error {
 	hasImageTag := s.hasImageTagColumn.Load()
 
+	// Capture timestamp once so retries preserve causal ordering in the event log.
+	timestamp := time.Now()
+
 	var query string
 	var args []interface{}
 
@@ -1360,13 +1363,13 @@ func (s *ClickHouseStore) insertComponentState(
 			INSERT INTO %s.%s (correlation_id, step, component, status, message, image_tag, timestamp)
 			VALUES (?, ?, ?, ?, ?, ?, ?)
 		`, s.database, TableSlipComponentStates)
-		args = []interface{}{correlationID, stepName, componentName, string(status), message, imageTag, time.Now()}
+		args = []interface{}{correlationID, stepName, componentName, string(status), message, imageTag, timestamp}
 	} else {
 		query = fmt.Sprintf(`
 			INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
 			VALUES (?, ?, ?, ?, ?, ?)
 		`, s.database, TableSlipComponentStates)
-		args = []interface{}{correlationID, stepName, componentName, string(status), message, time.Now()}
+		args = []interface{}{correlationID, stepName, componentName, string(status), message, timestamp}
 	}
 
 	err := s.session.ExecWithArgs(ctx, query, args...)
@@ -1388,7 +1391,7 @@ func (s *ClickHouseStore) insertComponentState(
 			VALUES (?, ?, ?, ?, ?, ?)
 		`, s.database, TableSlipComponentStates)
 		return s.session.ExecWithArgs(ctx, query,
-			correlationID, stepName, componentName, string(status), message, time.Now())
+			correlationID, stepName, componentName, string(status), message, timestamp)
 	}
 	return err
 }
