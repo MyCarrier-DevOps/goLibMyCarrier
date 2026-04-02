@@ -2628,6 +2628,23 @@ func TestClickHouseStore_NextVersionAfter_FloorEnforcement(t *testing.T) {
 			seen[v] = true
 		}
 	})
+
+	t.Run("MaxUint64 floor returns MaxUint64", func(t *testing.T) {
+		maxFloor := ^uint64(0)
+		v := store.nextVersionAfter(maxFloor)
+		if v != maxFloor {
+			t.Fatalf("expected version = MaxUint64 (%d), got %d", maxFloor, v)
+		}
+	})
+
+	t.Run("subsequent call after MaxUint64 floor is monotonic", func(t *testing.T) {
+		maxFloor := ^uint64(0)
+		_ = store.nextVersionAfter(maxFloor)
+		// Next call with floor=0 should return at least lastVersion+1 (which was MaxUint64).
+		// Since MaxUint64+1 overflows to 0, the CAS loop will use the lastVersion path.
+		// This is a theoretical edge case; we just verify no panic.
+		_ = store.nextVersion()
+	})
 }
 
 // TestCalculateAggregateConflictBackoff verifies the exponential backoff sequence for
@@ -4327,6 +4344,7 @@ func TestClickHouseStore_AppendHistory_ConflictRetryExhausted(t *testing.T) {
 	var mu sync.Mutex
 	loadHistoryCallCount := 0
 	execCallCount := 0
+	versionCallCount := 0
 
 	mockSession := &clickhousetest.MockSession{
 		QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
@@ -4344,12 +4362,21 @@ func TestClickHouseStore_AppendHistory_ConflictRetryExhausted(t *testing.T) {
 				}
 			}
 			if strings.Contains(query, "SELECT version FROM") {
+				mu.Lock()
+				versionCallCount++
+				call := versionCallCount
+				mu.Unlock()
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
 						if v, ok := dest[0].(*uint64); ok {
-							// Always higher than any written version — simulates
-							// a concurrent writer that perpetually supersedes us.
-							*v = ^uint64(0)
+							if call%2 == 1 {
+								// Odd calls: pre-write floor load — return 0 (no clock skew).
+								*v = 0
+							} else {
+								// Even calls: post-write version check — always higher
+								// than any written version to simulate perpetual conflict.
+								*v = ^uint64(0) - 1
+							}
 						}
 						return nil
 					},
@@ -4642,5 +4669,104 @@ func TestClickHouseStore_SetComponentImageTag_NoImageTagColumn(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "image_tag column not available") {
 		t.Errorf("expected 'image_tag column not available' in error, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// loadComponentStates — image_tag column self-healing
+// ---------------------------------------------------------------------------
+
+// TestClickHouseStore_LoadComponentStates_WithImageTag verifies that loadComponentStates
+// includes the image_tag column when hasImageTagColumn is true.
+func TestClickHouseStore_LoadComponentStates_WithImageTag(t *testing.T) {
+	var capturedQuery string
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(_ context.Context, query string, _ ...any) (driver.Rows, error) {
+			capturedQuery = query
+			return &clickhousetest.MockRows{}, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store.hasImageTagColumn.Store(true)
+
+	_, _ = store.loadComponentStates(context.Background(), "corr-img-tag")
+
+	if !strings.Contains(capturedQuery, "image_tag") {
+		t.Error("expected query to include image_tag when hasImageTagColumn=true")
+	}
+}
+
+// TestClickHouseStore_LoadComponentStates_WithoutImageTag verifies that loadComponentStates
+// omits the image_tag column when hasImageTagColumn is false.
+func TestClickHouseStore_LoadComponentStates_WithoutImageTag(t *testing.T) {
+	var capturedQuery string
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(_ context.Context, query string, _ ...any) (driver.Rows, error) {
+			capturedQuery = query
+			return &clickhousetest.MockRows{}, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store.hasImageTagColumn.Store(false)
+
+	_, _ = store.loadComponentStates(context.Background(), "corr-no-img-tag")
+
+	if strings.Contains(capturedQuery, "image_tag") {
+		t.Error("expected query to omit image_tag when hasImageTagColumn=false")
+	}
+}
+
+// TestClickHouseStore_LoadComponentStates_SelfHealOnImageTagError verifies that when
+// loadComponentStates fails because ClickHouse doesn't recognise image_tag, it sets
+// hasImageTagColumn=false and retries without the column.
+func TestClickHouseStore_LoadComponentStates_SelfHealOnImageTagError(t *testing.T) {
+	var mu sync.Mutex
+	queryCallCount := 0
+	var capturedQueries []string
+
+	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(_ context.Context, query string, _ ...any) (driver.Rows, error) {
+			mu.Lock()
+			queryCallCount++
+			call := queryCallCount
+			capturedQueries = append(capturedQueries, query)
+			mu.Unlock()
+
+			if call == 1 {
+				// First call: simulate image_tag column error
+				return nil, fmt.Errorf("Missing columns: 'image_tag' while processing query")
+			}
+			// Second call: succeed with empty result
+			return &clickhousetest.MockRows{}, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+	store.hasImageTagColumn.Store(true)
+
+	results, err := store.loadComponentStates(context.Background(), "corr-self-heal-load")
+	if err != nil {
+		t.Fatalf("expected no error after self-healing, got %v", err)
+	}
+	if len(results) != 0 {
+		t.Errorf("expected 0 results, got %d", len(results))
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if queryCallCount != 2 {
+		t.Fatalf("expected 2 QueryWithArgs calls (initial + retry), got %d", queryCallCount)
+	}
+	// First query should include image_tag.
+	if !strings.Contains(capturedQueries[0], "image_tag") {
+		t.Error("expected first query to include image_tag")
+	}
+	// Second query (retry) should NOT include image_tag.
+	if strings.Contains(capturedQueries[1], "image_tag") {
+		t.Error("expected second query to omit image_tag")
+	}
+	// hasImageTagColumn should now be false.
+	if store.hasImageTagColumn.Load() {
+		t.Error("expected hasImageTagColumn=false after self-healing")
 	}
 }

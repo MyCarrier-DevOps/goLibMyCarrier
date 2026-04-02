@@ -792,11 +792,22 @@ func (s *ClickHouseStore) nextVersion() uint64 {
 }
 
 // nextVersionAfter is like nextVersion but guarantees the returned version is
-// strictly greater than floor. Use when the caller must supersede an existing
-// DB row whose version may have been set by a different writer with a skewed clock.
+// strictly greater than floor, provided floor < ^uint64(0). Use when the caller
+// must supersede an existing DB row whose version may have been set by a different
+// writer with a skewed clock.
+//
+// When floor == ^uint64(0) (MaxUint64), no value can exceed it. The function
+// returns MaxUint64 and updates lastVersion. In practice this is unreachable
+// because ClickHouse nanosecond-epoch versions stay well below MaxUint64.
 func (s *ClickHouseStore) nextVersionAfter(floor uint64) uint64 {
+	if floor == ^uint64(0) {
+		// No uint64 value can exceed MaxUint64. Return it and advance
+		// lastVersion so subsequent calls remain monotonic.
+		s.lastVersion.Store(floor)
+		return floor
+	}
 	candidate := uint64(time.Now().UnixNano())
-	if floor < ^uint64(0) && candidate <= floor {
+	if candidate <= floor {
 		candidate = floor + 1
 	}
 	for {
@@ -1900,22 +1911,60 @@ func (s *ClickHouseStore) loadComponentStates(
 	ctx context.Context,
 	correlationID string,
 ) (results []componentStateRow, err error) {
+	hasImageTag := s.hasImageTagColumn.Load()
+
+	results, err = s.doLoadComponentStates(ctx, correlationID, hasImageTag)
+	if err != nil && hasImageTag && isImageTagColumnError(err) {
+		s.hasImageTagColumn.Store(false)
+		s.logger.Warn(ctx,
+			"image_tag column unknown in loadComponentStates; retrying without it",
+			map[string]interface{}{
+				"error":          err.Error(),
+				"correlation_id": correlationID,
+			})
+		return s.doLoadComponentStates(ctx, correlationID, false)
+	}
+	return results, err
+}
+
+// doLoadComponentStates is the inner query+scan implementation for loadComponentStates.
+// When includeImageTag is false, the image_tag column is omitted from SELECT and Scan.
+func (s *ClickHouseStore) doLoadComponentStates(
+	ctx context.Context,
+	correlationID string,
+	includeImageTag bool,
+) (results []componentStateRow, err error) {
 	// We want the latest state for each component.
 	// ReplacingMergeTree eventually deduplicates, but we use argMax to be sure given we might read unmerged parts.
 	// Note: We alias the max(timestamp) column as 'latest_ts' to avoid conflict with the 'timestamp' column
 	// used inside argMax functions. ClickHouse would otherwise interpret the alias as a nested aggregate.
-	query := fmt.Sprintf(`
-		SELECT
-			step,
-			component,
-			argMax(status, timestamp) as status,
-			argMax(message, timestamp) as message,
-			argMax(image_tag, timestamp) as image_tag,
-			max(timestamp) as latest_ts
-		FROM %s.%s
-		WHERE correlation_id = ?
-		GROUP BY step, component
-	`, s.database, TableSlipComponentStates)
+	var query string
+	if includeImageTag {
+		query = fmt.Sprintf(`
+			SELECT
+				step,
+				component,
+				argMax(status, timestamp) as status,
+				argMax(message, timestamp) as message,
+				argMax(image_tag, timestamp) as image_tag,
+				max(timestamp) as latest_ts
+			FROM %s.%s
+			WHERE correlation_id = ?
+			GROUP BY step, component
+		`, s.database, TableSlipComponentStates)
+	} else {
+		query = fmt.Sprintf(`
+			SELECT
+				step,
+				component,
+				argMax(status, timestamp) as status,
+				argMax(message, timestamp) as message,
+				max(timestamp) as latest_ts
+			FROM %s.%s
+			WHERE correlation_id = ?
+			GROUP BY step, component
+		`, s.database, TableSlipComponentStates)
+	}
 
 	rows, err := s.session.QueryWithArgs(ctx, query, correlationID)
 	if err != nil {
@@ -1930,10 +1979,18 @@ func (s *ClickHouseStore) loadComponentStates(
 
 	for rows.Next() {
 		var row componentStateRow
-		if err := rows.Scan(
-			&row.Step, &row.Component, &row.Status, &row.Message, &row.ImageTag, &row.Timestamp,
-		); err != nil {
-			return nil, fmt.Errorf("failed to scan component state: %w", err)
+		if includeImageTag {
+			if err := rows.Scan(
+				&row.Step, &row.Component, &row.Status, &row.Message, &row.ImageTag, &row.Timestamp,
+			); err != nil {
+				return nil, fmt.Errorf("failed to scan component state: %w", err)
+			}
+		} else {
+			if err := rows.Scan(
+				&row.Step, &row.Component, &row.Status, &row.Message, &row.Timestamp,
+			); err != nil {
+				return nil, fmt.Errorf("failed to scan component state: %w", err)
+			}
 		}
 		results = append(results, row)
 	}
