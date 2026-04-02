@@ -83,7 +83,7 @@ type ClickHouseStore struct {
 	logger            Logger        // Logger for operations (defaults to NopLogger)
 	hasAncestryColumn atomic.Bool   // false after migration v10 drops the ancestry column
 	hasImageTagColumn atomic.Bool   // false when slip_component_states lacks image_tag column (pre-v11)
-	lastVersion       atomic.Uint64 // monotonic version generator seeded from UnixNano; guarantees uniqueness under concurrency
+	lastVersion       atomic.Uint64 // per-store monotonic version generator; guarantees increasing versions within this process, but not global uniqueness across processes/hosts
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
