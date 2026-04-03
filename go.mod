@@ -8,5 +8,3 @@ go 1.26
 //   github.com/MyCarrier-DevOps/goLibMyCarrier/slippy
 //   github.com/MyCarrier-DevOps/goLibMyCarrier/logger
 // etc.
-
-require github.com/google/go-github/v82 v82.0.0 // indirect
