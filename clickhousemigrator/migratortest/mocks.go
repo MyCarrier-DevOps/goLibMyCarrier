@@ -325,6 +325,13 @@ func (m *MockRows) Err() error {
 	return m.RowError
 }
 
+// HasData returns true if there is at least one row.
+func (m *MockRows) HasData() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.RowData) > 0
+}
+
 // AddRow adds a row to the mock rows.
 func (m *MockRows) AddRow(values ...interface{}) {
 	m.mu.Lock()

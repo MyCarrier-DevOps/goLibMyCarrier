@@ -143,6 +143,11 @@ func (m *MockRows) Err() error {
 	return args.Error(0)
 }
 
+func (m *MockRows) HasData() bool {
+	args := m.Called()
+	return args.Bool(0)
+}
+
 // MockRow implements driver.Row for testing QueryRow
 type MockRow struct {
 	mock.Mock

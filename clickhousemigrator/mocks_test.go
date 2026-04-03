@@ -150,6 +150,11 @@ func (r *MockRows) Err() error {
 	return r.nextErr
 }
 
+// HasData implements driver.Rows.
+func (r *MockRows) HasData() bool {
+	return len(r.rows) > 0
+}
+
 // ExecCall records an Exec call.
 type ExecCall struct {
 	Query string
