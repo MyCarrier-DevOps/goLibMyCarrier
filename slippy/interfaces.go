@@ -59,6 +59,10 @@ type SlipStore interface {
 	// AppendHistory adds a state history entry to the slip
 	AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error
 
+	// SetComponentImageTag records the built container image tag for a component in the event log.
+	// stepName is the component step type (e.g. "build"); componentName is the service name.
+	SetComponentImageTag(ctx context.Context, correlationID, stepName, componentName, imageTag string) error
+
 	// InsertAncestryLink writes a single direct-parent link to the ancestry table.
 	InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error
 

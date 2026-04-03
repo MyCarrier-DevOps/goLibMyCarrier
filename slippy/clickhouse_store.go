@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
@@ -22,6 +23,21 @@ const (
 	// slipNotFoundMaxRetries is the maximum number of retries when slip doesn't exist.
 	// With linear backoff (5min + 10min + 15min), this gives ~30 minutes total wait time.
 	slipNotFoundMaxRetries = 3
+
+	// aggregateConflictMaxRetries is the maximum number of retries when a concurrent
+	// aggregate write-back supersedes our row before we can re-read and rewrite.
+	// Uses exponential backoff: 10ms, 20ms, 40ms, 80ms, 160ms (310ms total).
+	aggregateConflictMaxRetries = 5
+
+	// aggregateConflictBaseDelayMs is the base delay in milliseconds for conflict retries.
+	aggregateConflictBaseDelayMs = 10
+
+	// historyConflictMaxRetries is the maximum number of retries when a concurrent writer
+	// inserts a higher-version routing_slips row after our loadStateHistoryFromDB read,
+	// causing our appended history entry to be superseded. Reuses the same exponential
+	// backoff sequence as aggregateConflictMaxRetries. History is best-effort; exhaustion
+	// returns nil rather than an error.
+	historyConflictMaxRetries = 5
 )
 
 // calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
@@ -38,6 +54,19 @@ func calculateSlipNotFoundBackoff(retryNumber int) time.Duration {
 	return time.Duration(slipNotFoundBaseDelay*retryNumber) * time.Minute
 }
 
+// calculateAggregateConflictBackoff returns exponential backoff for aggregate write-back
+// conflicts. retryNumber is 1-indexed; the sequence is 10ms, 20ms, 40ms, 80ms, 160ms.
+func calculateAggregateConflictBackoff(retryNumber int) time.Duration {
+	if retryNumber < 1 {
+		retryNumber = 1
+	}
+	if retryNumber > aggregateConflictMaxRetries {
+		retryNumber = aggregateConflictMaxRetries
+	}
+	shift := retryNumber - 1
+	return time.Duration(aggregateConflictBaseDelayMs<<shift) * time.Millisecond
+}
+
 // ClickHouseStore implements SlipStore using ClickHouse as the backend.
 // The store uses correlation_id as the unique identifier for routing slips,
 // consistent with MyCarrier's organization-wide use of correlation_id to
@@ -46,12 +75,15 @@ func calculateSlipNotFoundBackoff(retryNumber int) time.Duration {
 // The store is config-driven: the pipeline configuration determines which
 // step columns exist and how they are queried.
 type ClickHouseStore struct {
-	session        ch.ClickhouseSessionInterface
-	pipelineConfig *PipelineConfig
-	database       string
-	queryBuilder   *SlipQueryBuilder
-	scanner        *SlipScanner
-	logger         Logger // Logger for operations (defaults to NopLogger)
+	session           ch.ClickhouseSessionInterface
+	pipelineConfig    *PipelineConfig
+	database          string
+	queryBuilder      *SlipQueryBuilder
+	scanner           *SlipScanner
+	logger            Logger        // Logger for operations (defaults to NopLogger)
+	hasAncestryColumn atomic.Bool   // false after migration v10 drops the ancestry column
+	hasImageTagColumn atomic.Bool   // false when slip_component_states lacks image_tag column (pre-v11)
+	lastVersion       atomic.Uint64 // per-store monotonic version generator; guarantees increasing versions within this process, but not global uniqueness across processes/hosts
 }
 
 // ClickHouseStoreOptions configures the ClickHouse store.
@@ -111,6 +143,8 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		scanner:        NewSlipScanner(opts.PipelineConfig),
 		logger:         storeLogger,
 	}
+	store.hasAncestryColumn.Store(true) // conservative default; updated by detectAncestryColumn after migrations
+	store.hasImageTagColumn.Store(true) // conservative default; updated by detectImageTagColumn after migrations
 
 	// Run migrations unless explicitly skipped
 	if !opts.SkipMigrations {
@@ -137,6 +171,12 @@ func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseSt
 		}
 	}
 
+	// Detect whether the ancestry column is still present (dropped by migration v10).
+	store.detectAncestryColumn(ctx)
+
+	// Detect whether the image_tag column exists (added by migration v11).
+	store.detectImageTagColumn(ctx)
+
 	return store, nil
 }
 
@@ -151,7 +191,7 @@ func NewClickHouseStoreFromSession(
 	if database == "" {
 		database = "ci"
 	}
-	return &ClickHouseStore{
+	store := &ClickHouseStore{
 		session:        session,
 		pipelineConfig: pipelineConfig,
 		database:       database,
@@ -159,6 +199,10 @@ func NewClickHouseStoreFromSession(
 		scanner:        NewSlipScanner(pipelineConfig),
 		logger:         NopLogger(),
 	}
+	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v10 has already dropped the column
+	store.hasAncestryColumn.Store(true)
+	store.hasImageTagColumn.Store(true)
+	return store
 }
 
 // NewClickHouseStoreFromConn creates a store from an existing driver connection.
@@ -168,7 +212,7 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 	if database == "" {
 		database = "ci"
 	}
-	return &ClickHouseStore{
+	store := &ClickHouseStore{
 		session:        ch.NewSessionFromConn(conn),
 		pipelineConfig: pipelineConfig,
 		database:       database,
@@ -176,6 +220,10 @@ func NewClickHouseStoreFromConn(conn ch.Conn, pipelineConfig *PipelineConfig, da
 		scanner:        NewSlipScanner(pipelineConfig),
 		logger:         NopLogger(),
 	}
+	// conservative default; insertAtomicHistoryUpdate self-heals on first call if v10 has already dropped the column
+	store.hasAncestryColumn.Store(true)
+	store.hasImageTagColumn.Store(true)
+	return store
 }
 
 // Session returns the underlying ClickHouse session interface.
@@ -208,9 +256,7 @@ func (s *ClickHouseStore) Create(ctx context.Context, slip *Slip) error {
 		slip.Sign = 1
 	}
 
-	// Generate timestamp-based version (nanoseconds since epoch)
-	// This ensures unique versions even if multiple Create calls happen concurrently
-	version := uint64(time.Now().UnixNano())
+	version := s.nextVersion()
 
 	if err := s.insertRow(ctx, slip, version); err != nil {
 		return fmt.Errorf("failed to create slip: %w", err)
@@ -372,9 +418,10 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	// Store the old version for the cancel row
 	oldVersion := slip.Version
 
-	// Generate new timestamp-based version (nanoseconds since epoch)
-	// This ensures unique versions across concurrent writers
-	newVersion := uint64(time.Now().UnixNano())
+	newVersion := s.nextVersion()
+	if newVersion <= oldVersion {
+		newVersion = oldVersion + 1
+	}
 
 	// Insert both cancel row and new row atomically
 	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
@@ -387,88 +434,37 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	return nil
 }
 
-// UpdateStep updates a specific step's status with automatic retry on version conflicts.
+// UpdateStep updates a specific step's status.
 // The correlationID is the unique identifier for the routing slip.
-// If a concurrent modification is detected, the slip is reloaded and the update is retried
-// with exponential backoff and jitter to prevent thundering herd.
+//
+// All updates — both component-level (componentName != "") and pipeline-level
+// (componentName == "") — are written to slip_component_states via event sourcing.
+// This eliminates the Read-Modify-Write race on routing_slips under concurrent writers:
+// each insert into the append-only event log is conflict-free, and hydrateSlip derives
+// the authoritative step status on every Load.
 func (s *ClickHouseStore) UpdateStep(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
-	// Handle component-level updates via event sourcing to avoid write contention.
-	// This writes to slip_component_states using ReplacingMergeTree.
-	if componentName != "" {
-		// First, insert the component state into the event sourcing table
-		if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status); err != nil {
-			return err
-		}
+	// Write the step event to the conflict-free event-sourcing table.
+	// Pipeline-level steps use componentName="" as a sentinel value.
+	if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status, "", ""); err != nil {
+		return err
+	}
 
-		// Now update the aggregate status in the routing_slips table.
-		// This ensures the slip reflects the current state of all components.
+	// Trigger aggregate write-back to routing_slips when there is an aggregate to update:
+	//   - componentName != "":  a component step that rolls up into an aggregate step.
+	//   - IsAggregateStep:      this step IS the aggregate itself (write-back keeps the
+	//                           routing_slips row consistent with the event store).
+	// For pure pipeline steps (non-aggregate, no component), the event log is the sole
+	// source of truth; hydrateSlip derives the step status on every Load, so no
+	// write-back to routing_slips is needed.
+	if componentName != "" || (s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName)) {
 		return s.updateAggregateStatusFromComponentStates(ctx, correlationID, stepName)
 	}
 
-	// Start tracing span for the retry operation
-	retrySpan := startRetrySpan(ctx, "UpdateStep", correlationID)
-	retrySpan.AddAttribute("slippy.step_name", stepName)
-	// Note: retrySpan is ended explicitly by success/error paths below, not via defer
-
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
-
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
-	for {
-		// Check for context cancellation first
-		if ctx.Err() != nil {
-			retrySpan.EndError(ctx.Err())
-			return ctx.Err()
-		}
-
-		// Load the current slip
-		slip, err := s.Load(retrySpan.Context(), correlationID)
-		if err != nil {
-			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
-			if errors.Is(err, ErrSlipNotFound) {
-				slipNotFoundRetry++
-				if slipNotFoundRetry > slipNotFoundMaxRetries {
-					err := fmt.Errorf("%w: slip not found after %d retries: %w",
-						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
-					retrySpan.EndError(err)
-					return err
-				}
-				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
-				retrySpan.RecordAttempt(backoff.Milliseconds())
-				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
-				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				// Use select to respect context cancellation during sleep
-				select {
-				case <-ctx.Done():
-					retrySpan.EndError(ctx.Err())
-					return ctx.Err()
-				case <-time.After(backoff):
-				}
-				continue
-			}
-			// Non-retryable load error
-			retrySpan.EndError(err)
-			return err
-		}
-
-		now := time.Now()
-
-		// Update pipeline-level steps
-		s.updatePipelineStep(slip, stepName, status, now)
-
-		err = s.Update(retrySpan.Context(), slip)
-		if err != nil {
-			retrySpan.EndError(err)
-			return err
-		}
-
-		retrySpan.EndSuccess()
-		return nil
-	}
+	return nil
 }
 
 // UpdateComponentStatus updates a component's step status with automatic retry on version conflicts.
@@ -481,112 +477,58 @@ func (s *ClickHouseStore) UpdateComponentStatus(
 	return s.UpdateStep(ctx, correlationID, stepType, componentName, status)
 }
 
-// UpdateStepWithHistory updates a step's status AND appends a history entry in a single atomic operation.
-// This prevents the race condition where a separate AppendHistory call could reload a stale slip
-// and overwrite the step update. Both changes are applied to the same loaded slip and committed
-// together in one Update call.
+// UpdateStepWithHistory updates a step's status AND appends a history entry.
+//
+// The step status is written to slip_component_states via the same conflict-free
+// event-sourcing path used by UpdateStep (both component-level and pipeline-level).
+// The history entry is persisted:
+//   - atomically alongside the aggregate write-back for component steps and aggregate steps;
+//   - via AppendHistory for pure pipeline steps with no aggregate.
 func (s *ClickHouseStore) UpdateStepWithHistory(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
 	status StepStatus,
 	entry StateHistoryEntry,
 ) error {
-	// Handle component-level updates via event sourcing to avoid write contention.
-	// This writes to slip_component_states using ReplacingMergeTree.
-	if componentName != "" {
-		// First, insert the component state into the event sourcing table
-		if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status); err != nil {
-			return err
-		}
+	// Store the step event in the conflict-free event-sourcing table.
+	// The message from the history entry is co-located in the event record.
+	if err := s.insertComponentState(
+		ctx, correlationID, stepName, componentName, status, entry.Message, "",
+	); err != nil {
+		return err
+	}
 
-		// Now update the aggregate status in the routing_slips table AND append history.
-		// This ensures the slip reflects the current state of all components.
+	// Persist history and (where applicable) the aggregate status to routing_slips.
+	//   - componentName != "":  component step → aggregate write-back carries the history.
+	//   - IsAggregateStep:      aggregate step itself → aggregate write-back carries the history.
+	//   - otherwise:            pure pipeline step → call AppendHistory directly.
+	if componentName != "" || (s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName)) {
 		return s.updateAggregateStatusFromComponentStatesWithHistory(ctx, correlationID, stepName, entry)
 	}
 
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
-
-	// Start operational tracing span for the retry operation.
-	// This creates a span in a separate trace from the pipeline content,
-	// keeping internal database operations out of the main pipeline trace.
-	retrySpan := startRetrySpan(ctx, "UpdateStepWithHistory", correlationID)
-	retrySpan.AddAttribute("slippy.step_name", stepName)
-	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
-	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
-	// Note: retrySpan is ended explicitly by success/error paths below, not via defer
-
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
-	for {
-		// Check for context cancellation first
-		if ctx.Err() != nil {
-			retrySpan.EndError(ctx.Err())
-			return ctx.Err()
-		}
-
-		// Load the current slip
-		slip, err := s.Load(retrySpan.Context(), correlationID)
-		if err != nil {
-			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
-			if errors.Is(err, ErrSlipNotFound) {
-				slipNotFoundRetry++
-				if slipNotFoundRetry > slipNotFoundMaxRetries {
-					err := fmt.Errorf("%w: slip not found after %d retries: %w",
-						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
-					retrySpan.EndError(err)
-					return err
-				}
-				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
-				retrySpan.RecordAttempt(backoff.Milliseconds())
-				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
-				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				// Use select to respect context cancellation during sleep
-				select {
-				case <-ctx.Done():
-					retrySpan.EndError(ctx.Err())
-					return ctx.Err()
-				case <-time.After(backoff):
-				}
-				continue
-			}
-			// Non-retryable load error
-			retrySpan.EndError(err)
-			return err
-		}
-
-		now := time.Now()
-
-		// Update pipeline-level steps
-		s.updatePipelineStep(slip, stepName, status, now)
-
-		// Append history entry to the same slip (atomic with step update)
-		slip.StateHistory = append(slip.StateHistory, entry)
-
-		// Single Update call commits both changes atomically
-		err = s.Update(retrySpan.Context(), slip)
-		if err != nil {
-			retrySpan.EndError(err)
-			return err
-		}
-
-		retrySpan.EndSuccess()
-		return nil
-	}
+	// Pure pipeline step: persist only the history entry to routing_slips.
+	return s.AppendHistory(ctx, correlationID, entry)
 }
 
 // AppendHistory adds a state history entry to the slip.
 // The correlationID is the unique identifier for the routing slip.
 // Will retry if the slip doesn't exist yet (waiting for creation).
+//
+// Unlike a full Load+Update cycle, AppendHistory reads only the existing
+// state_history column from routing_slips and then re-inserts the row
+// with all other columns copied verbatim from the latest DB row.
+// This prevents a concurrent step-status update from being overwritten in the
+// routing_slips cache by an in-flight AppendHistory that loaded a stale snapshot.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
 	// Start tracing span for the retry operation
 	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
 	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
 	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
 
-	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	historyConflictRetry := 0 // Counter for concurrent-writer conflict retries
 
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
+	// Retry loop handles slip-not-found scenarios and post-write history-conflict retries.
 	for {
 		// Check for context cancellation first
 		if ctx.Err() != nil {
@@ -594,9 +536,11 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 			return ctx.Err()
 		}
 
-		slip, err := s.Load(retrySpan.Context(), correlationID)
+		// Load only state_history to avoid a full hydrateSlip round-trip.
+		// This keeps step-status columns in the re-inserted row aligned with the
+		// current DB row rather than an in-memory view that might be stale.
+		existingHistoryJSON, err := s.loadStateHistoryFromDB(retrySpan.Context(), correlationID)
 		if err != nil {
-			// If slip doesn't exist yet, wait for it to be created (max 3 retries)
 			if errors.Is(err, ErrSlipNotFound) {
 				slipNotFoundRetry++
 				if slipNotFoundRetry > slipNotFoundMaxRetries {
@@ -610,7 +554,6 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 				retrySpan.RecordAttempt(backoff.Milliseconds())
 				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
 				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				// Use select to respect context cancellation during sleep
 				select {
 				case <-ctx.Done():
 					retrySpan.EndError(ctx.Err())
@@ -619,17 +562,75 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 				}
 				continue
 			}
-			// Non-retryable load error
 			retrySpan.EndError(err)
 			return err
 		}
 
-		slip.StateHistory = append(slip.StateHistory, entry)
-
-		err = s.Update(retrySpan.Context(), slip)
+		// Deserialize existing history, append the new entry, re-serialize.
+		var wrapper struct {
+			Entries []StateHistoryEntry `json:"entries"`
+		}
+		if err := json.Unmarshal([]byte(existingHistoryJSON), &wrapper); err != nil {
+			// History JSON is malformed. Returning an error here avoids silently
+			// discarding existing history. The caller's retry loop can surface this
+			// to the operator rather than overwriting potentially valid data.
+			parseErr := fmt.Errorf("state_history JSON is malformed for %s: %w", correlationID, err)
+			retrySpan.AddAttribute("slippy.history_unmarshal_error", parseErr.Error())
+			retrySpan.EndError(parseErr)
+			return parseErr
+		}
+		wrapper.Entries = append(wrapper.Entries, entry)
+		newHistoryJSON, err := json.Marshal(wrapper)
 		if err != nil {
 			retrySpan.EndError(err)
+			return fmt.Errorf("failed to marshal updated state history: %w", err)
+		}
+
+		// Load current DB version so we can guarantee newVersion > existing version,
+		// preventing invisible updates when another writer used a skewed clock.
+		currentVersion, versionLoadErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionLoadErr != nil {
+			// Non-fatal: fall back to nextVersion() with no floor guarantee.
+			// Post-write version check will still catch conflicts.
+			currentVersion = 0
+		}
+		newVersion := s.nextVersion()
+		if newVersion <= currentVersion {
+			newVersion = currentVersion + 1
+		}
+		if err := s.insertAtomicHistoryUpdate(
+			retrySpan.Context(), correlationID, newVersion, string(newHistoryJSON),
+		); err != nil {
+			retrySpan.EndError(err)
 			return err
+		}
+
+		// Post-write version check: if a concurrent writer inserted a higher-version
+		// routing_slips row after our loadStateHistoryFromDB read, that row wins the
+		// last-write-wins merge and our appended entry is dropped. Detect and retry.
+		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionErr != nil {
+			// Non-fatal: accept potential history loss if the version check fails.
+			retrySpan.AddAttribute("slippy.history_version_check_error", versionErr.Error())
+			retrySpan.EndSuccess()
+			return nil
+		}
+		if latestVersion > newVersion {
+			historyConflictRetry++
+			retrySpan.AddAttribute("slippy.history_conflict_retry", historyConflictRetry)
+			if historyConflictRetry > historyConflictMaxRetries {
+				retrySpan.AddAttribute("slippy.history_conflict_retries_exhausted", true)
+				retrySpan.EndSuccess()
+				return nil
+			}
+			backoff := calculateAggregateConflictBackoff(historyConflictRetry)
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
 		}
 
 		retrySpan.EndSuccess()
@@ -737,6 +738,303 @@ func (s *ClickHouseStore) ResolveAncestry(
 	}
 
 	return chain, nil
+}
+
+// SetComponentImageTag records the container image tag for a component by inserting a new
+// event-sourcing row that retains the component's current status and adds the image tag.
+// This replaces the previous Load→modify→Update RMW pattern with a conflict-free append.
+func (s *ClickHouseStore) SetComponentImageTag(
+	ctx context.Context,
+	correlationID, stepName, componentName, imageTag string,
+) error {
+	if !s.hasImageTagColumn.Load() {
+		return fmt.Errorf(
+			"image_tag column not available (migration v11 not yet applied): cannot set image tag for %s",
+			componentName,
+		)
+	}
+
+	originalStepName := stepName
+
+	// Normalize stepName: the event log records rows with the component step type
+	// (e.g. "build"), but callers may pass an aggregate step name (e.g. "builds_completed").
+	// Translate aggregate step names to the component step type before querying.
+	if s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName) {
+		if componentStep := s.pipelineConfig.GetComponentStep(stepName); componentStep != "" {
+			stepName = componentStep
+		}
+	}
+
+	currentStatus, err := s.queryComponentStatus(ctx, correlationID, stepName, componentName)
+	if err != nil {
+		return err
+	}
+
+	// If normalized name found nothing and we did normalize, try the original name as fallback.
+	if currentStatus == "" && originalStepName != stepName {
+		currentStatus, err = s.queryComponentStatus(ctx, correlationID, originalStepName, componentName)
+		if err != nil {
+			return err
+		}
+	}
+
+	if currentStatus == "" {
+		return fmt.Errorf("component %s not found in event log for step %s",
+			componentName, stepName)
+	}
+
+	return s.insertComponentState(ctx, correlationID, stepName, componentName,
+		StepStatus(currentStatus), "", imageTag)
+}
+
+// nextVersion returns a nanosecond-epoch version. If the current wall clock
+// equals or falls behind the last version issued by this store instance,
+// it returns lastVersion+1 to keep versions monotonically increasing.
+func (s *ClickHouseStore) nextVersion() uint64 {
+	for {
+		prev := s.lastVersion.Load()
+		v := uint64(time.Now().UnixNano())
+		if v <= prev {
+			v = prev + 1
+		}
+		if s.lastVersion.CompareAndSwap(prev, v) {
+			return v
+		}
+	}
+}
+
+// queryComponentStatus reads the latest status for a component from the event log.
+// Returns empty string (not an error) when no matching rows exist.
+func (s *ClickHouseStore) queryComponentStatus(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+) (string, error) {
+	query := fmt.Sprintf(`
+		SELECT argMax(status, timestamp)
+		FROM %s.%s
+		WHERE correlation_id = ? AND step = ? AND component = ?
+	`, s.database, TableSlipComponentStates)
+
+	row := s.session.QueryRow(ctx, query, correlationID, stepName, componentName)
+	var currentStatus string
+	if err := row.Scan(&currentStatus); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to read current status for component %s: %w", componentName, err)
+	}
+	return currentStatus, nil
+}
+
+// detectAncestryColumn queries system.columns to determine whether the ancestry column
+// is still present in routing_slips. After migration v10 (drop_ancestry_column) is applied,
+// the column no longer exists and insertAtomicHistoryUpdate must omit it from query column lists.
+// On any query error the column is assumed present (conservative default avoids data loss).
+func (s *ClickHouseStore) detectAncestryColumn(ctx context.Context) {
+	query := fmt.Sprintf(
+		"SELECT count() FROM system.columns WHERE database = ? AND table = 'routing_slips' AND name = '%s'",
+		ColumnAncestry,
+	)
+	row := s.session.QueryRow(ctx, query, s.database)
+	if row == nil {
+		// Conservative default when the session returns no row descriptor.
+		s.hasAncestryColumn.Store(true)
+		return
+	}
+	var count uint64
+	if err := row.Scan(&count); err != nil {
+		// Conservative default: assume column exists to avoid data loss on transient errors.
+		// Log so operators can investigate if ancestry queries fail later.
+		s.logger.Warn(ctx, "ancestry column probe failed; assuming ancestry column exists", map[string]interface{}{
+			"error": err.Error(),
+		})
+		s.hasAncestryColumn.Store(true)
+		return
+	}
+	s.hasAncestryColumn.Store(count > 0)
+}
+
+// detectImageTagColumn queries system.columns to determine whether the image_tag column
+// exists in slip_component_states. Before migration v11 (add_image_tag_to_component_states)
+// the column does not exist and insertComponentState must omit it.
+// On any query error the column is assumed present (conservative default).
+func (s *ClickHouseStore) detectImageTagColumn(ctx context.Context) {
+	query := "SELECT count() FROM system.columns WHERE database = ? AND table = 'slip_component_states' AND name = 'image_tag'"
+	row := s.session.QueryRow(ctx, query, s.database)
+	if row == nil {
+		s.hasImageTagColumn.Store(true)
+		return
+	}
+	var count uint64
+	if err := row.Scan(&count); err != nil {
+		s.logger.Warn(ctx, "image_tag column probe failed; assuming column exists", map[string]interface{}{
+			"error": err.Error(),
+		})
+		s.hasImageTagColumn.Store(true)
+		return
+	}
+	s.hasImageTagColumn.Store(count > 0)
+}
+
+// isAncestryColumnError reports whether err indicates ClickHouse does not recognise the ancestry
+// column. This is used as a runtime fallback: when detectAncestryColumn conservatively assumed the
+// column exists (e.g. on a transient probe error) but the actual INSERT/SELECT fails because
+// migration v10 has already dropped it.
+func isAncestryColumnError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, ColumnAncestry) &&
+		(strings.Contains(msg, "Unknown identifier") ||
+			strings.Contains(msg, "Missing columns") ||
+			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
+}
+
+// isImageTagColumnError reports whether err indicates ClickHouse does not recognise the image_tag
+// column. Used as a runtime fallback when detectImageTagColumn conservatively assumed the column
+// exists but the INSERT fails because migration v11 has not yet been applied.
+func isImageTagColumnError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "image_tag") &&
+		(strings.Contains(msg, "Missing columns") ||
+			strings.Contains(msg, "Unknown column") ||
+			strings.Contains(msg, "No such column") ||
+			strings.Contains(msg, "Unknown identifier") ||
+			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
+}
+
+// loadStateHistoryFromDB reads only the state_history JSON column from the latest active
+// routing_slips row for a given correlationID. Returns ErrSlipNotFound if no active row exists.
+func (s *ClickHouseStore) loadStateHistoryFromDB(ctx context.Context, correlationID string) (string, error) {
+	query := fmt.Sprintf(`
+		SELECT state_history
+		FROM %s.%s
+		WHERE %s = ? AND %s = 1
+		ORDER BY %s DESC
+		LIMIT 1
+	`, s.database, TableRoutingSlips, ColumnCorrelationID, ColumnSign, ColumnVersion)
+
+	row := s.session.QueryRow(ctx, query, correlationID)
+	var historyJSON string
+	if err := row.Scan(&historyJSON); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("%w: correlation_id=%s", ErrSlipNotFound, correlationID)
+		}
+		return "", fmt.Errorf("failed to load state_history for %s: %w", correlationID, err)
+	}
+	return historyJSON, nil
+}
+
+// insertAtomicHistoryUpdate cancels all active routing_slips rows for correlationID and inserts
+// a new row that is identical to the latest active row except for state_history, updated_at,
+// sign, and version. All step-status and aggregate columns are copied verbatim from the DB row,
+// preventing a stale in-memory snapshot from overwriting a concurrently-written step status.
+func (s *ClickHouseStore) insertAtomicHistoryUpdate(
+	ctx context.Context,
+	correlationID string,
+	newVersion uint64,
+	newStateHistoryJSON string,
+) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	// Column names for the INSERT target list and SELECT expressions.
+	stepColumns := s.queryBuilder.BuildStepColumns()
+	aggregateColumns := s.queryBuilder.BuildAggregateColumns()
+
+	// Snapshot the ancestry flag once so all three column lists are consistent even if
+	// a concurrent caller triggers the self-healing Store(false) between list builds.
+	hasAncestry := s.hasAncestryColumn.Load()
+
+	// Build INSERT column list: fixed columns + dynamic step/aggregate columns.
+	// ColumnAncestry is excluded when migration v10 has dropped it from routing_slips.
+	var allCols []string
+	allCols = append(allCols,
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
+		ColumnStateHistory,
+	)
+	if hasAncestry {
+		allCols = append(allCols, ColumnAncestry)
+	}
+	allCols = append(allCols, ColumnSign, ColumnVersion)
+	allCols = append(allCols, stepColumns...)
+	allCols = append(allCols, aggregateColumns...)
+
+	// Cancel SELECT: re-select all columns from existing active rows with sign flipped to -1.
+	cancelSelectCols := []string{
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
+		ColumnStateHistory,
+	}
+	if hasAncestry {
+		cancelSelectCols = append(cancelSelectCols, ColumnAncestry)
+	}
+	cancelSelectCols = append(cancelSelectCols,
+		"-1",          // sign
+		ColumnVersion, // keep original version for proper VCollapsingMergeTree collapsing
+	)
+	cancelSelectCols = append(cancelSelectCols, stepColumns...)
+	cancelSelectCols = append(cancelSelectCols, aggregateColumns...)
+
+	cancelQuery := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s < ? AND %s = 1",
+		strings.Join(cancelSelectCols, ", "),
+		s.database, TableRoutingSlips,
+		ColumnCorrelationID, ColumnVersion, ColumnSign,
+	)
+
+	// New-row SELECT: read all columns from the latest active DB row verbatim, except:
+	//   - updated_at → now64(6)
+	//   - state_history → provided literal (CAST to JSON)
+	//   - sign → 1
+	//   - version → new timestamp-based literal
+	newRowSelectCols := []string{
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, "now64(6)", // updated_at
+		ColumnStatus, ColumnStepDetails,
+		"CAST(? AS JSON)", // state_history override
+	}
+	if hasAncestry {
+		newRowSelectCols = append(newRowSelectCols, ColumnAncestry) // ancestry passthrough
+	}
+	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
+	newRowSelectCols = append(newRowSelectCols, stepColumns...)
+	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
+
+	newRowQuery := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s = 1 ORDER BY %s DESC LIMIT 1",
+		strings.Join(newRowSelectCols, ", "),
+		s.database, TableRoutingSlips,
+		ColumnCorrelationID, ColumnSign, ColumnVersion,
+	)
+
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		%s
+		UNION ALL
+		%s
+	`, s.database, TableRoutingSlips, strings.Join(allCols, ", "), cancelQuery, newRowQuery)
+
+	err := s.session.ExecWithArgs(ctx, query,
+		// Cancel SELECT WHERE params
+		correlationID, newVersion,
+		// New row SELECT literal params (state_history, version)
+		newStateHistoryJSON, newVersion,
+		// New row SELECT WHERE param
+		correlationID,
+	)
+	if err != nil && hasAncestry && isAncestryColumnError(err) {
+		// The probe assumed ancestry exists but ClickHouse reports an unknown column —
+		// migration v10 has been applied despite the probe not seeing it (transient failure).
+		// Update the cached state atomically and retry once without ancestry columns.
+		s.logger.Warn(ctx, "ancestry column unknown to ClickHouse; retrying without it", map[string]interface{}{
+			"error":          err.Error(),
+			"correlation_id": correlationID,
+		})
+		s.hasAncestryColumn.Store(false)
+		return s.insertAtomicHistoryUpdate(ctx, correlationID, newVersion, newStateHistoryJSON)
+	}
+	return err
 }
 
 // insertRow inserts a single row into the routing_slips table.
@@ -1015,17 +1313,6 @@ func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
 	return details
 }
 
-// updatePipelineStep updates a pipeline step's status if it exists.
-func (s *ClickHouseStore) updatePipelineStep(slip *Slip, stepName string, status StepStatus, now time.Time) {
-	if s.pipelineConfig.GetStep(stepName) == nil {
-		return
-	}
-
-	step := slip.Steps[stepName]
-	step.ApplyStatusTransition(status, now)
-	slip.Steps[stepName] = step
-}
-
 // computeAggregateStatus determines the aggregate status from component statuses.
 // The aggregate is:
 // - "failed" if any component has failed
@@ -1065,27 +1352,85 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 	return StepStatusPending
 }
 
-// insertComponentState inserts a new state for a component into the event sourcing table.
+// insertComponentState inserts a new state into the event sourcing table.
+// Both component-level steps (componentName != "") and pipeline-level steps
+// (componentName == "") are stored here, making all step updates conflict-free
+// under concurrent writers. The message is preserved for history reconstruction.
+// imageTag is an optional container image tag; pass "" when not applicable.
 func (s *ClickHouseStore) insertComponentState(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
 	status StepStatus,
+	message, imageTag string,
 ) error {
-	query := fmt.Sprintf(`
-		INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
-		VALUES (?, ?, ?, ?, ?, ?)
-	`, s.database, TableSlipComponentStates)
+	hasImageTag := s.hasImageTagColumn.Load()
 
-	// Note: We don't have a message passed in UpdateStep/UpdateComponentStatus signature currently.
-	// We pass empty string for message.
-	return s.session.ExecWithArgs(ctx, query,
-		correlationID,
-		stepName,
-		componentName,
-		string(status),
-		"", // message
-		time.Now(),
+	// Capture timestamp once so retries preserve causal ordering in the event log.
+	timestamp := time.Now()
+
+	var query string
+	var args []interface{}
+
+	if hasImageTag {
+		query = fmt.Sprintf(`
+			INSERT INTO %s.%s (correlation_id, step, component, status, message, image_tag, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`, s.database, TableSlipComponentStates)
+		args = []interface{}{correlationID, stepName, componentName, string(status), message, imageTag, timestamp}
+	} else {
+		query = fmt.Sprintf(`
+			INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, s.database, TableSlipComponentStates)
+		args = []interface{}{correlationID, stepName, componentName, string(status), message, timestamp}
+	}
+
+	err := s.session.ExecWithArgs(ctx, query, args...)
+	if err != nil && hasImageTag && isImageTagColumnError(err) {
+		s.hasImageTagColumn.Store(false)
+		// If the caller explicitly set an image tag, do not silently drop it.
+		// Return an error so SetComponentImageTag surfaces a clear migration-not-applied message.
+		if imageTag != "" {
+			return fmt.Errorf(
+				"image_tag column not available (migration v11 not yet applied): "+
+					"cannot persist image tag for %s", componentName,
+			)
+		}
+		s.logger.Warn(ctx, "image_tag column missing; retrying without it", map[string]interface{}{
+			"error": err.Error(),
+		})
+		query = fmt.Sprintf(`
+			INSERT INTO %s.%s (correlation_id, step, component, status, message, timestamp)
+			VALUES (?, ?, ?, ?, ?, ?)
+		`, s.database, TableSlipComponentStates)
+		return s.session.ExecWithArgs(ctx, query,
+			correlationID, stepName, componentName, string(status), message, timestamp)
+	}
+	return err
+}
+
+// loadVersionFromDB fetches the current latest version of a slip from routing_slips.
+// Used after an aggregate write-back to detect whether a concurrent writer superseded our row.
+// This is a minimal single-column query — no hydration, no full row scan.
+func (s *ClickHouseStore) loadVersionFromDB(ctx context.Context, correlationID string) (uint64, error) {
+	// SELECT version FROM ... (kept on one line so test discriminators using
+	// strings.Contains(query, "SELECT version FROM") still match).
+	query := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s = 1 ORDER BY %s DESC LIMIT 1",
+		ColumnVersion, s.database, TableRoutingSlips, ColumnCorrelationID, ColumnSign, ColumnVersion,
 	)
+
+	row := s.session.QueryRow(ctx, query, correlationID)
+
+	var version uint64
+	if err := row.Scan(&version); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrSlipNotFound
+		}
+		return 0, fmt.Errorf("failed to load version for conflict check: %w", err)
+	}
+
+	return version, nil
 }
 
 // updateAggregateStatusFromComponentStates loads the slip, hydrates it with component states,
@@ -1100,9 +1445,12 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 	retrySpan.AddAttribute("slippy.step_name", stepName)
 
 	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
+	conflictRetry := 0     // Counter for concurrent write-back conflict retries
 
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
+	// Retry loop handles two scenarios:
+	// 1. Slip not yet created (slipNotFoundRetry) — waits with linear backoff up to 30 minutes.
+	// 2. Concurrent write-back conflict (conflictRetry) — a concurrent writer superseded our
+	//    Update; re-Load and re-write with exponential backoff (10ms–160ms, max 5 retries).
 	for {
 		// Check for context cancellation first
 		if ctx.Err() != nil {
@@ -1141,20 +1489,7 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 			return err
 		}
 
-		// Determine the aggregate step name. The stepName could be either:
-		// 1. The component step name (e.g., "build") - need to look up the aggregate step
-		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
-		aggregateStepName := ""
-		if s.pipelineConfig != nil {
-			// First, try to get aggregate step from component step name
-			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepName)
-			if aggregateStepName == "" {
-				// If not found, check if the step name IS an aggregate step
-				if s.pipelineConfig.IsAggregateStep(stepName) {
-					aggregateStepName = stepName
-				}
-			}
-		}
+		aggregateStepName := s.resolveAggregateStepName(stepName)
 		if aggregateStepName == "" {
 			// No aggregate step configured for this step, nothing to update
 			retrySpan.EndSuccess()
@@ -1164,14 +1499,51 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 		// The slip was already hydrated by Load(), so the step status should reflect
 		// the computed aggregate from all component states.
 		// Now persist this back to the database.
-		err = s.Update(retrySpan.Context(), slip)
-		if err != nil {
+		if err = s.Update(retrySpan.Context(), slip); err != nil {
 			retrySpan.EndError(err)
 			return err
 		}
 
-		retrySpan.EndSuccess()
-		return nil
+		// Post-write conflict check: verify that our row was not immediately superseded
+		// by a concurrent aggregate write-back. ClickHouse has no atomic CAS, so we detect
+		// the conflict after the fact and retry from Load if needed.
+		latestVersion, err := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if err != nil {
+			// Version check failure is non-fatal: the write succeeded; we just cannot
+			// confirm whether it was superseded. Log and treat as success.
+			retrySpan.AddAttribute("slippy.version_check_error", err.Error())
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		if latestVersion == slip.Version {
+			// Our row is current — done.
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		// A concurrent writer superseded our row. Retry from Load so the final
+		// write includes all component completions seen so far.
+		conflictRetry++
+		if conflictRetry > aggregateConflictMaxRetries {
+			// Retries exhausted. The latest row in the DB was written by a concurrent
+			// writer that also re-Loaded from the conflict-free event log, so it reflects
+			// an up-to-date aggregate. This is a best-effort outcome, not data corruption.
+			retrySpan.AddAttribute("slippy.aggregate_conflict_retries_exhausted", true)
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		backoff := calculateAggregateConflictBackoff(conflictRetry)
+		retrySpan.RecordAttempt(backoff.Milliseconds())
+		retrySpan.AddAttribute("slippy.aggregate_conflict_retry", conflictRetry)
+		select {
+		case <-ctx.Done():
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		// continue → re-Load, re-compute, re-write
 	}
 }
 
@@ -1189,9 +1561,12 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
 
 	slipNotFoundRetry := 0 // Counter for slip-not-found retries (1-indexed when used)
+	conflictRetry := 0     // Counter for concurrent write-back conflict retries
 
-	// Retry loop handles slip-not-found scenarios (slip may not exist yet).
-	// With epoch-based versioning, version conflicts no longer occur.
+	// Retry loop handles two scenarios:
+	// 1. Slip not yet created (slipNotFoundRetry) — waits with linear backoff up to 30 minutes.
+	// 2. Concurrent write-back conflict (conflictRetry) — a concurrent writer superseded our
+	//    Update; re-Load and re-write with exponential backoff (10ms–160ms, max 5 retries).
 	for {
 		// Check for context cancellation first
 		if ctx.Err() != nil {
@@ -1230,22 +1605,18 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 			return err
 		}
 
-		// Determine the aggregate step name. The stepName could be either:
-		// 1. The component step name (e.g., "build") - need to look up the aggregate step
-		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
-		aggregateStepName := ""
-		if s.pipelineConfig != nil {
-			// First, try to get aggregate step from component step name
-			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepName)
-			if aggregateStepName == "" {
-				// If not found, check if the step name IS an aggregate step
-				if s.pipelineConfig.IsAggregateStep(stepName) {
-					aggregateStepName = stepName
-				}
-			}
-		}
+		aggregateStepName := s.resolveAggregateStepName(stepName)
 		if aggregateStepName == "" {
-			// No aggregate step configured for this step, nothing to update
+			// No aggregate step configured for this step. The step event is already
+			// persisted in slip_component_states. Append the history entry to routing_slips
+			// so the audit trail is preserved. AppendHistory now performs a
+			// state_history-only read and an atomic append (e.g., via UNION ALL
+			// re-insert), so it does not rely on a full Load + Update RMW and
+			// therefore cannot lose another step's status.
+			if appendErr := s.AppendHistory(retrySpan.Context(), correlationID, entry); appendErr != nil {
+				retrySpan.EndError(appendErr)
+				return appendErr
+			}
 			retrySpan.EndSuccess()
 			return nil
 		}
@@ -1256,14 +1627,43 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		// The slip was already hydrated by Load(), so the step status should reflect
 		// the computed aggregate from all component states.
 		// Now persist this back to the database with the history entry.
-		err = s.Update(retrySpan.Context(), slip)
-		if err != nil {
+		if err = s.Update(retrySpan.Context(), slip); err != nil {
 			retrySpan.EndError(err)
 			return err
 		}
 
-		retrySpan.EndSuccess()
-		return nil
+		// Post-write conflict check: verify our row was not immediately superseded
+		// by a concurrent aggregate write-back.
+		latestVersion, err := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if err != nil {
+			retrySpan.AddAttribute("slippy.version_check_error", err.Error())
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		if latestVersion == slip.Version {
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		// A concurrent writer superseded our row. Retry from Load.
+		conflictRetry++
+		if conflictRetry > aggregateConflictMaxRetries {
+			retrySpan.AddAttribute("slippy.aggregate_conflict_retries_exhausted", true)
+			retrySpan.EndSuccess()
+			return nil
+		}
+
+		backoff := calculateAggregateConflictBackoff(conflictRetry)
+		retrySpan.RecordAttempt(backoff.Milliseconds())
+		retrySpan.AddAttribute("slippy.aggregate_conflict_retry", conflictRetry)
+		select {
+		case <-ctx.Done():
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		// continue → re-Load, re-compute, re-write
 	}
 }
 
@@ -1288,120 +1688,195 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		slip.Aggregates = make(map[string][]ComponentStepData)
 	}
 
-	// Group states by component step -> component
-	stateMap := make(map[string]map[string]componentStateRow)
+	// First pass: apply pipeline-level step events (component="" sentinel).
+	// These come from UpdateStep/UpdateStepWithHistory calls for non-component steps
+	// and represent the authoritative step status stored in the event log.
+	// Applying them before the aggregate loop prevents the aggregate loop from
+	// treating component="" as an actual component name.
 	for _, state := range states {
-		if _, ok := stateMap[state.Step]; !ok {
-			stateMap[state.Step] = make(map[string]componentStateRow)
-		}
-		stateMap[state.Step][state.Component] = state
-	}
-
-	// Update aggregates in the slip
-	for stepNameFromDB, stepStates := range stateMap {
-		// Determine the aggregate step name. The step name from the database could be either:
-		// 1. The component step name (e.g., "build") - need to look up the aggregate step
-		// 2. The aggregate step name itself (e.g., "builds_completed") - use directly
-		aggregateStepName := ""
-		if s.pipelineConfig != nil {
-			// First, try to get aggregate step from component step name
-			aggregateStepName = s.pipelineConfig.GetAggregateStep(stepNameFromDB)
-			if aggregateStepName == "" {
-				// If not found, check if the step name IS an aggregate step
-				if s.pipelineConfig.IsAggregateStep(stepNameFromDB) {
-					aggregateStepName = stepNameFromDB
-				}
-			}
-		}
-		if aggregateStepName == "" {
-			// No aggregate step configured for this step
+		if state.Component != "" {
 			continue
 		}
+		step, ok := slip.Steps[state.Step]
+		if !ok {
+			continue
+		}
+		step.ApplyStatusTransition(StepStatus(state.Status), state.Timestamp)
+		slip.Steps[state.Step] = step
+	}
 
-		// The aggregate JSON column name is the aggregate step name (e.g., "builds_completed")
+	// Second pass: group component-level states (component != "") by resolved aggregate step -> component.
+	// Pipeline-level events (component="") are excluded here; they were handled above.
+	// Normalize step names to their aggregate column name so that historical data written
+	// under different aliases (e.g. "build" vs "builds_completed") is merged into a single
+	// aggregate entry and applyComponentStatesToAggregate runs exactly once per aggregate.
+	stateMap := make(map[string]map[string]componentStateRow)
+	for _, state := range states {
+		if state.Component == "" {
+			continue // already applied in first pass
+		}
+		aggregateKey := s.resolveAggregateStepName(state.Step)
+		if aggregateKey == "" {
+			continue // no aggregate configured for this step
+		}
+		if _, ok := stateMap[aggregateKey]; !ok {
+			stateMap[aggregateKey] = make(map[string]componentStateRow)
+		}
+		// Keep the latest state for each component. If the same component appears
+		// under multiple step name aliases, the row with the latest timestamp wins.
+		if existing, exists := stateMap[aggregateKey][state.Component]; exists {
+			if state.Timestamp.After(existing.Timestamp) {
+				stateMap[aggregateKey][state.Component] = state
+			}
+		} else {
+			stateMap[aggregateKey][state.Component] = state
+		}
+	}
+
+	// Update aggregates in the slip — stateMap is keyed by resolved aggregate
+	// step name so each aggregate is computed exactly once.
+	for aggregateStepName, stepStates := range stateMap {
 		aggregateColumn := aggregateStepName
-
-		// Get or create the component data list for this aggregate
-		componentDataList := slip.Aggregates[aggregateColumn]
-
-		// Build a map of existing components for quick lookup
-		existingComponents := make(map[string]int) // component name -> index
-		for i, comp := range componentDataList {
-			existingComponents[comp.Component] = i
-		}
-
-		updated := false
-		var maxTime time.Time
-
-		// Track the components that have actual state from the event sourcing table.
-		// These are the source of truth for aggregate status calculation.
-		// Original placeholder components (from pipeline config) that have no matching
-		// state entries should NOT be considered when computing aggregate status.
-		activeComponents := make([]ComponentStepData, 0, len(stepStates))
-
-		// Process each component state
-		for componentName, state := range stepStates {
-			ts := state.Timestamp
-			if ts.After(maxTime) {
-				maxTime = ts
-			}
-
-			compData := ComponentStepData{
-				Component: componentName,
-				Status:    StepStatus(state.Status),
-			}
-			if state.Message != "" {
-				compData.Error = state.Message
-			}
-			if StepStatus(state.Status).IsRunning() {
-				compData.StartedAt = &ts
-			}
-			if StepStatus(state.Status).IsTerminal() {
-				compData.CompletedAt = &ts
-			}
-
-			// Track this component for aggregate status calculation
-			activeComponents = append(activeComponents, compData)
-
-			if idx, exists := existingComponents[componentName]; exists {
-				// Update existing component entry
-				slip.Aggregates[aggregateColumn][idx].Status = compData.Status
-				if compData.Error != "" {
-					slip.Aggregates[aggregateColumn][idx].Error = compData.Error
-				}
-				if compData.StartedAt != nil && slip.Aggregates[aggregateColumn][idx].StartedAt == nil {
-					slip.Aggregates[aggregateColumn][idx].StartedAt = compData.StartedAt
-				}
-				if compData.CompletedAt != nil && slip.Aggregates[aggregateColumn][idx].CompletedAt == nil {
-					slip.Aggregates[aggregateColumn][idx].CompletedAt = compData.CompletedAt
-				}
-			} else {
-				// Add new component entry - this handles the case where the aggregate
-				// was empty ({"items":[]}) but component states exist in the event sourcing table
-				slip.Aggregates[aggregateColumn] = append(slip.Aggregates[aggregateColumn], compData)
-			}
-			updated = true
-		}
-
-		if updated {
-			// Recompute the step status based on ACTIVE components only.
-			// Active components are those with entries in the component_states table.
-			// This excludes original placeholder components that have different names
-			// from the actual workflow component names.
-			newStatus := s.computeAggregateStatus(activeComponents)
-
-			// Update the step status only if the step exists.
-			step, ok := slip.Steps[aggregateStepName]
-			if !ok {
-				continue
-			}
-			// We use the timestamp of the latest component update as the transition time
-			step.ApplyStatusTransition(newStatus, maxTime)
-			slip.Steps[aggregateStepName] = step
-		}
+		s.applyComponentStatesToAggregate(slip, aggregateColumn, aggregateStepName, stepStates)
 	}
 
 	return nil
+}
+
+// resolveAggregateStepName maps a database step name to its aggregate step name.
+// It handles both the component step type (e.g. "build") and the aggregate step name
+// itself (e.g. "builds_completed"), returning "" if no aggregate is configured.
+func (s *ClickHouseStore) resolveAggregateStepName(stepNameFromDB string) string {
+	if s.pipelineConfig == nil {
+		return ""
+	}
+	// First, try to get aggregate step from component step name
+	aggregateStepName := s.pipelineConfig.GetAggregateStep(stepNameFromDB)
+	if aggregateStepName != "" {
+		return aggregateStepName
+	}
+	// If not found, check if the step name IS an aggregate step
+	if s.pipelineConfig.IsAggregateStep(stepNameFromDB) {
+		return stepNameFromDB
+	}
+	return ""
+}
+
+// applyComponentStatesToAggregate updates the aggregate data in slip for the given
+// aggregateColumn (step key in slip.Aggregates) using the provided component states.
+// It updates existing component entries or adds new ones, then recomputes the aggregate
+// step status from active components only.
+func (s *ClickHouseStore) applyComponentStatesToAggregate(
+	slip *Slip,
+	aggregateColumn, aggregateStepName string,
+	stepStates map[string]componentStateRow,
+) {
+	// Get or create the component data list for this aggregate
+	componentDataList := slip.Aggregates[aggregateColumn]
+
+	// Build a map of existing components for quick lookup
+	existingComponents := make(map[string]int) // component name -> index
+	for i, comp := range componentDataList {
+		existingComponents[comp.Component] = i
+	}
+
+	updated := false
+	var maxTime time.Time
+
+	// Track the components that have actual state from the event sourcing table.
+	// These are the source of truth for aggregate status calculation.
+	// Original placeholder components (from pipeline config) that have no matching
+	// state entries should NOT be considered when computing aggregate status.
+	activeComponents := make([]ComponentStepData, 0, len(stepStates))
+
+	// Process each component state
+	for componentName, state := range stepStates {
+		ts := state.Timestamp
+		if ts.After(maxTime) {
+			maxTime = ts
+		}
+
+		compData := buildComponentData(componentName, state)
+
+		// Track this component for aggregate status calculation
+		activeComponents = append(activeComponents, compData)
+
+		if idx, exists := existingComponents[componentName]; exists {
+			updateExistingComponent(&slip.Aggregates[aggregateColumn][idx], compData)
+		} else {
+			// Add new component entry — handles the case where the aggregate was empty
+			// ({"items":[]}) but component states exist in the event sourcing table.
+			slip.Aggregates[aggregateColumn] = append(slip.Aggregates[aggregateColumn], compData)
+		}
+		updated = true
+	}
+
+	if !updated {
+		return
+	}
+
+	// Recompute the step status based on ACTIVE components only.
+	// Active components are those with entries in the component_states table.
+	// This excludes original placeholder components that have different names
+	// from the actual workflow component names.
+	newStatus := s.computeAggregateStatus(activeComponents)
+
+	step, ok := slip.Steps[aggregateStepName]
+	if !ok {
+		return
+	}
+	// We use the timestamp of the latest component update as the transition time
+	step.ApplyStatusTransition(newStatus, maxTime)
+	slip.Steps[aggregateStepName] = step
+}
+
+// buildComponentData constructs a ComponentStepData value from a raw componentStateRow.
+func buildComponentData(componentName string, state componentStateRow) ComponentStepData {
+	ts := state.Timestamp
+	compData := ComponentStepData{
+		Component: componentName,
+		Status:    StepStatus(state.Status),
+		ImageTag:  state.ImageTag,
+	}
+	// Only populate Error for failure statuses; non-failure messages (e.g. progress
+	// notes on a running step) should not appear as errors in downstream consumers.
+	if state.Message != "" && StepStatus(state.Status).IsFailure() {
+		compData.Error = state.Message
+	}
+	if StepStatus(state.Status).IsRunning() {
+		compData.StartedAt = &ts
+	}
+	if StepStatus(state.Status).IsTerminal() {
+		compData.CompletedAt = &ts
+	}
+	return compData
+}
+
+// updateExistingComponent merges updated fields from src into dest, preserving
+// existing non-zero values where the src field is zero.
+func updateExistingComponent(dest *ComponentStepData, src ComponentStepData) {
+	dest.Status = src.Status
+	// When the new status is a failure, propagate the error message.
+	// When transitioning away from failure (e.g. a retry succeeds), clear any
+	// stale error so observers do not see incorrect error information.
+	if src.Status.IsFailure() {
+		if src.Error != "" {
+			dest.Error = src.Error
+		}
+	} else {
+		dest.Error = ""
+	}
+	if src.ImageTag != "" {
+		dest.ImageTag = src.ImageTag
+	}
+	if src.StartedAt != nil && dest.StartedAt == nil {
+		dest.StartedAt = src.StartedAt
+	}
+	if src.CompletedAt != nil {
+		if dest.CompletedAt == nil || src.CompletedAt.After(*dest.CompletedAt) {
+			dest.CompletedAt = src.CompletedAt
+		}
+	}
 }
 
 type componentStateRow struct {
@@ -1409,6 +1884,7 @@ type componentStateRow struct {
 	Component string    `ch:"component"`
 	Status    string    `ch:"status"`
 	Message   string    `ch:"message"`
+	ImageTag  string    `ch:"image_tag"`
 	Timestamp time.Time `ch:"timestamp"`
 }
 
@@ -1417,21 +1893,60 @@ func (s *ClickHouseStore) loadComponentStates(
 	ctx context.Context,
 	correlationID string,
 ) (results []componentStateRow, err error) {
+	hasImageTag := s.hasImageTagColumn.Load()
+
+	results, err = s.doLoadComponentStates(ctx, correlationID, hasImageTag)
+	if err != nil && hasImageTag && isImageTagColumnError(err) {
+		s.hasImageTagColumn.Store(false)
+		s.logger.Warn(ctx,
+			"image_tag column unknown in loadComponentStates; retrying without it",
+			map[string]interface{}{
+				"error":          err.Error(),
+				"correlation_id": correlationID,
+			})
+		return s.doLoadComponentStates(ctx, correlationID, false)
+	}
+	return results, err
+}
+
+// doLoadComponentStates is the inner query+scan implementation for loadComponentStates.
+// When includeImageTag is false, the image_tag column is omitted from SELECT and Scan.
+func (s *ClickHouseStore) doLoadComponentStates(
+	ctx context.Context,
+	correlationID string,
+	includeImageTag bool,
+) (results []componentStateRow, err error) {
 	// We want the latest state for each component.
 	// ReplacingMergeTree eventually deduplicates, but we use argMax to be sure given we might read unmerged parts.
 	// Note: We alias the max(timestamp) column as 'latest_ts' to avoid conflict with the 'timestamp' column
 	// used inside argMax functions. ClickHouse would otherwise interpret the alias as a nested aggregate.
-	query := fmt.Sprintf(`
-		SELECT
-			step,
-			component,
-			argMax(status, timestamp) as status,
-			argMax(message, timestamp) as message,
-			max(timestamp) as latest_ts
-		FROM %s.%s
-		WHERE correlation_id = ?
-		GROUP BY step, component
-	`, s.database, TableSlipComponentStates)
+	var query string
+	if includeImageTag {
+		query = fmt.Sprintf(`
+			SELECT
+				step,
+				component,
+				argMax(status, timestamp) as status,
+				argMax(message, timestamp) as message,
+				argMax(image_tag, timestamp) as image_tag,
+				max(timestamp) as latest_ts
+			FROM %s.%s
+			WHERE correlation_id = ?
+			GROUP BY step, component
+		`, s.database, TableSlipComponentStates)
+	} else {
+		query = fmt.Sprintf(`
+			SELECT
+				step,
+				component,
+				argMax(status, timestamp) as status,
+				argMax(message, timestamp) as message,
+				max(timestamp) as latest_ts
+			FROM %s.%s
+			WHERE correlation_id = ?
+			GROUP BY step, component
+		`, s.database, TableSlipComponentStates)
+	}
 
 	rows, err := s.session.QueryWithArgs(ctx, query, correlationID)
 	if err != nil {
@@ -1446,8 +1961,18 @@ func (s *ClickHouseStore) loadComponentStates(
 
 	for rows.Next() {
 		var row componentStateRow
-		if err := rows.Scan(&row.Step, &row.Component, &row.Status, &row.Message, &row.Timestamp); err != nil {
-			return nil, fmt.Errorf("failed to scan component state: %w", err)
+		if includeImageTag {
+			if err := rows.Scan(
+				&row.Step, &row.Component, &row.Status, &row.Message, &row.ImageTag, &row.Timestamp,
+			); err != nil {
+				return nil, fmt.Errorf("failed to scan component state: %w", err)
+			}
+		} else {
+			if err := rows.Scan(
+				&row.Step, &row.Component, &row.Status, &row.Message, &row.Timestamp,
+			); err != nil {
+				return nil, fmt.Errorf("failed to scan component state: %w", err)
+			}
 		}
 		results = append(results, row)
 	}

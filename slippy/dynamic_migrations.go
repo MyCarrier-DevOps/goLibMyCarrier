@@ -225,6 +225,21 @@ func (m *DynamicMigrationManager) GenerateEnsurers() []clickhousemigrator.Schema
 
 // generateMigrationsFromConfig creates the core versioned migrations.
 // These define the table structure and run once per version.
+//
+// Version history (NEVER renumber or remove an entry — doing so breaks environments
+// that have already recorded a version as applied):
+//
+//	 1  create_routing_slips_base             — initial table
+//	 2  create_routing_slip_history_mv        — history materialized view
+//	 3  create_routing_slips_ancestry_column  — inline ancestry JSON column (deprecated)
+//	 4  create_slip_component_states          — component event-sourcing table
+//	 5  add_ttl_routing_slips                 — 60-day TTL on routing_slips
+//	 6  add_ttl_component_states              — 60-day TTL on slip_component_states
+//	 7  create_slip_ancestry                  — normalised ancestry table
+//	 8  migrate_ancestry_data                 — backfill ancestry rows
+//	 9  drop_history_view                     — remove MV before column drop
+//	10  drop_ancestry_column                  — remove inline ancestry JSON column
+//	11  add_image_tag_to_component_states     — image_tag column for event-sourced tags
 func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemigrator.Migration {
 	return []clickhousemigrator.Migration{
 		m.generateBaseTableMigration(),
@@ -237,6 +252,7 @@ func (m *DynamicMigrationManager) generateMigrationsFromConfig() []clickhousemig
 		m.generateAncestryDataMigration(),
 		m.generateDropHistoryViewMigration(),
 		m.generateDropAncestryColumnMigration(),
+		m.generateComponentStatesImageTagMigration(),
 	}
 }
 
@@ -352,6 +368,26 @@ func (m *DynamicMigrationManager) generateComponentStatesTTLMigration() clickhou
 		`, m.database),
 		DownSQL: fmt.Sprintf(`
 			ALTER TABLE %s.slip_component_states REMOVE TTL
+		`, m.database),
+	}
+}
+
+// generateComponentStatesImageTagMigration adds the image_tag column to slip_component_states.
+// This allows SetComponentImageTag to be event-sourced alongside status updates,
+// eliminating the full Read-Modify-Write race that existed when image tags were stored
+// exclusively in the routing_slips aggregate JSON column.
+func (m *DynamicMigrationManager) generateComponentStatesImageTagMigration() clickhousemigrator.Migration {
+	return clickhousemigrator.Migration{
+		Version:     11,
+		Name:        "add_image_tag_to_component_states",
+		Description: "Adds image_tag column to slip_component_states for event-sourced image tag tracking",
+		UpSQL: fmt.Sprintf(`
+			ALTER TABLE %s.slip_component_states
+			ADD COLUMN IF NOT EXISTS image_tag String DEFAULT ''
+		`, m.database),
+		DownSQL: fmt.Sprintf(`
+			ALTER TABLE %s.slip_component_states
+			DROP COLUMN IF EXISTS image_tag
 		`, m.database),
 	}
 }

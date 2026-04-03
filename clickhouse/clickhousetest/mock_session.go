@@ -5,6 +5,7 @@ package clickhousetest
 
 import (
 	"context"
+	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 
@@ -40,7 +41,10 @@ type QueryRowCall struct {
 
 // MockSession implements clickhouse.ClickhouseSessionInterface for testing.
 // It records all method calls and returns configurable responses.
+// All methods are safe for concurrent use.
 type MockSession struct {
+	mu sync.Mutex
+
 	// Connect behavior
 	ConnectFunc  func(ctx context.Context) error
 	ConnectCalls []ConnectCall
@@ -91,7 +95,9 @@ type MockSession struct {
 
 // Connect implements ClickhouseSessionInterface.Connect
 func (m *MockSession) Connect(cfg *ch.ClickhouseConfig, ctx context.Context) error {
+	m.mu.Lock()
 	m.ConnectCalls = append(m.ConnectCalls, ConnectCall{Config: cfg, Ctx: ctx})
+	m.mu.Unlock()
 	if m.ConnectFunc != nil {
 		return m.ConnectFunc(ctx)
 	}
@@ -100,7 +106,9 @@ func (m *MockSession) Connect(cfg *ch.ClickhouseConfig, ctx context.Context) err
 
 // Ping implements ClickhouseSessionInterface.Ping
 func (m *MockSession) Ping(ctx context.Context) error {
+	m.mu.Lock()
 	m.PingCalls++
+	m.mu.Unlock()
 	if m.PingFunc != nil {
 		return m.PingFunc(ctx)
 	}
@@ -109,7 +117,9 @@ func (m *MockSession) Ping(ctx context.Context) error {
 
 // Query implements ClickhouseSessionInterface.Query
 func (m *MockSession) Query(ctx context.Context, query string) (driver.Rows, error) {
+	m.mu.Lock()
 	m.QueryCalls = append(m.QueryCalls, QueryCall{Ctx: ctx, Query: query})
+	m.mu.Unlock()
 	if m.QueryFunc != nil {
 		return m.QueryFunc(ctx, query)
 	}
@@ -118,7 +128,9 @@ func (m *MockSession) Query(ctx context.Context, query string) (driver.Rows, err
 
 // QueryWithArgs implements ClickhouseSessionInterface.QueryWithArgs
 func (m *MockSession) QueryWithArgs(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+	m.mu.Lock()
 	m.QueryWithArgsCalls = append(m.QueryWithArgsCalls, QueryCall{Ctx: ctx, Query: query, Args: args})
+	m.mu.Unlock()
 	if m.QueryWithArgsFunc != nil {
 		return m.QueryWithArgsFunc(ctx, query, args...)
 	}
@@ -127,7 +139,9 @@ func (m *MockSession) QueryWithArgs(ctx context.Context, query string, args ...a
 
 // QueryRow implements ClickhouseSessionInterface.QueryRow
 func (m *MockSession) QueryRow(ctx context.Context, query string, args ...any) driver.Row {
+	m.mu.Lock()
 	m.QueryRowCalls = append(m.QueryRowCalls, QueryRowCall{Ctx: ctx, Query: query, Args: args})
+	m.mu.Unlock()
 	if m.QueryRowFunc != nil {
 		return m.QueryRowFunc(ctx, query, args...)
 	}
@@ -136,7 +150,9 @@ func (m *MockSession) QueryRow(ctx context.Context, query string, args ...any) d
 
 // Exec implements ClickhouseSessionInterface.Exec
 func (m *MockSession) Exec(ctx context.Context, stmt string) error {
+	m.mu.Lock()
 	m.ExecCalls = append(m.ExecCalls, ExecCall{Ctx: ctx, Stmt: stmt})
+	m.mu.Unlock()
 	if m.ExecFunc != nil {
 		return m.ExecFunc(ctx, stmt)
 	}
@@ -145,7 +161,9 @@ func (m *MockSession) Exec(ctx context.Context, stmt string) error {
 
 // ExecWithArgs implements ClickhouseSessionInterface.ExecWithArgs
 func (m *MockSession) ExecWithArgs(ctx context.Context, stmt string, args ...any) error {
+	m.mu.Lock()
 	m.ExecWithArgsCalls = append(m.ExecWithArgsCalls, ExecCall{Ctx: ctx, Stmt: stmt, Args: args})
+	m.mu.Unlock()
 	if m.ExecWithArgsFunc != nil {
 		return m.ExecWithArgsFunc(ctx, stmt, args...)
 	}
@@ -154,7 +172,9 @@ func (m *MockSession) ExecWithArgs(ctx context.Context, stmt string, args ...any
 
 // Close implements ClickhouseSessionInterface.Close
 func (m *MockSession) Close() error {
+	m.mu.Lock()
 	m.CloseCalls++
+	m.mu.Unlock()
 	if m.CloseFunc != nil {
 		return m.CloseFunc()
 	}
@@ -163,7 +183,9 @@ func (m *MockSession) Close() error {
 
 // Conn implements ClickhouseSessionInterface.Conn
 func (m *MockSession) Conn() driver.Conn {
+	m.mu.Lock()
 	m.ConnCalls++
+	m.mu.Unlock()
 	if m.ConnFunc != nil {
 		return m.ConnFunc()
 	}
@@ -172,6 +194,8 @@ func (m *MockSession) Conn() driver.Conn {
 
 // Reset clears all recorded calls for reuse
 func (m *MockSession) Reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.ConnectCalls = nil
 	m.PingCalls = 0
 	m.QueryCalls = nil

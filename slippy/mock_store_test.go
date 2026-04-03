@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 )
@@ -88,6 +89,7 @@ type MockStore struct {
 	UpdateStepCalls       []UpdateStepCall
 	UpdateComponentCalls  []UpdateComponentCall
 	AppendHistoryCalls    []AppendHistoryCall
+	SetImageTagCalls      []SetImageTagCall
 	CloseCalls            int
 
 	// Ping tracking and error injection
@@ -104,6 +106,7 @@ type MockStore struct {
 	UpdateStepError       error
 	UpdateComponentError  error
 	AppendHistoryError    error
+	SetImageTagError      error
 	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
@@ -162,6 +165,14 @@ type UpdateComponentCall struct {
 type AppendHistoryCall struct {
 	CorrelationID string
 	Entry         StateHistoryEntry
+}
+
+// SetImageTagCall records a SetComponentImageTag call.
+type SetImageTagCall struct {
+	CorrelationID string
+	StepName      string
+	ComponentName string
+	ImageTag      string
 }
 
 // NewMockStore creates a new MockStore with initialized maps.
@@ -511,6 +522,64 @@ func (m *MockStore) ResolveAncestry(
 	return []AncestryEntry{}, nil
 }
 
+// SetComponentImageTag records the container image tag for a component in the in-memory slip.
+func (m *MockStore) SetComponentImageTag(
+	_ context.Context,
+	correlationID, stepName, componentName, imageTag string,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.SetImageTagCalls = append(m.SetImageTagCalls, SetImageTagCall{
+		CorrelationID: correlationID,
+		StepName:      stepName,
+		ComponentName: componentName,
+		ImageTag:      imageTag,
+	})
+
+	if m.SetImageTagError != nil {
+		return m.SetImageTagError
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return ErrSlipNotFound
+	}
+
+	// Target the aggregate column derived from the step name first.
+	// If that column is not present, or the component is stored in other
+	// aggregate columns, fall back to scanning all aggregates and update
+	// every matching entry for this component.
+	columnName := pluralizeMock(stepName)
+
+	found := false
+	if componentData, ok := slip.Aggregates[columnName]; ok {
+		for i := range componentData {
+			if componentData[i].Component == componentName {
+				slip.Aggregates[columnName][i].ImageTag = imageTag
+				found = true
+			}
+		}
+	}
+
+	for colName, componentData := range slip.Aggregates {
+		if colName == columnName {
+			continue
+		}
+		for i := range componentData {
+			if componentData[i].Component == componentName {
+				slip.Aggregates[colName][i].ImageTag = imageTag
+				found = true
+			}
+		}
+	}
+
+	if found {
+		return nil
+	}
+	return fmt.Errorf("component %s not found in any aggregate for step %s", componentName, stepName)
+}
+
 // Close releases any resources held by the store.
 func (m *MockStore) Close() error {
 	m.mu.Lock()
@@ -535,6 +604,7 @@ func (m *MockStore) Ping(ctx context.Context) error {
 }
 
 // Reset clears all stored data and call tracking.
+
 func (m *MockStore) Reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -549,6 +619,7 @@ func (m *MockStore) Reset() {
 	m.UpdateStepCalls = nil
 	m.UpdateComponentCalls = nil
 	m.AppendHistoryCalls = nil
+	m.SetImageTagCalls = nil
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }
