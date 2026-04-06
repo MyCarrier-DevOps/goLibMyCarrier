@@ -302,6 +302,19 @@ func (m *MockRows) ScanStruct(dest any) error {
 	return nil
 }
 
+// HasData implements driver.Rows.HasData
+func (m *MockRows) HasData() bool {
+	if m.NextFunc != nil {
+		return true
+	}
+	for i := m.nextIdx; i < len(m.NextData); i++ {
+		if m.NextData[i] {
+			return true
+		}
+	}
+	return m.scanIdx < len(m.ScanData)
+}
+
 // Reset resets the row iterator state
 func (m *MockRows) Reset() {
 	m.nextIdx = 0
