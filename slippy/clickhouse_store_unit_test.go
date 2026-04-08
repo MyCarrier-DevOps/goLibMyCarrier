@@ -2421,15 +2421,14 @@ func TestClickHouseStore_Ping_Error(t *testing.T) {
 // one ExecWithArgs (insertAtomicHistoryUpdate), keeping all step/aggregate columns in sync with
 // the DB row rather than an in-memory snapshot.
 func TestClickHouseStore_AppendHistory_DoesNotCallFullLoad(t *testing.T) {
-	stateHistoryJSON := `{"entries":[]}`
 	mockSession := &clickhousetest.MockSession{
 		QueryRowRow: &clickhousetest.MockRow{
 			ScanFunc: func(dest ...any) error {
 				if len(dest) < 1 {
 					return fmt.Errorf("expected at least 1 scan destination, got 0")
 				}
-				if ptr, ok := dest[0].(*string); ok {
-					*ptr = stateHistoryJSON
+				if jsonPtr, ok := dest[0].(*chcol.JSON); ok {
+					_ = jsonPtr.Scan(map[string]interface{}{"entries": []interface{}{}})
 				}
 				return nil
 			},
@@ -3277,8 +3276,10 @@ func TestClickHouseStore_AppendHistory_InsertAtomicHistoryUpdateError(t *testing
 			// loadStateHistoryFromDB succeeds
 			return &clickhousetest.MockRow{
 				ScanFunc: func(dest ...any) error {
-					if ptr, ok := dest[0].(*string); ok {
-						*ptr = `{"entries":[]}`
+					if len(dest) > 0 {
+						if jsonPtr, ok := dest[0].(*chcol.JSON); ok {
+							_ = jsonPtr.Scan(map[string]interface{}{"entries": []interface{}{}})
+						}
 					}
 					return nil
 				},
@@ -3731,11 +3732,17 @@ func TestClickHouseStore_AppendHistory_ContextCancelled(t *testing.T) {
 func TestClickHouseStore_AppendHistory_MalformedHistoryJSON(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
-			// With clickhouse-go v2.44.0+, scanning a JSON column into *chcol.JSON;
-			// malformed JSON is rejected at scan time by the driver — simulate that.
+			// Populate *chcol.JSON with malformed JSON so the error is caught downstream
+			// at unmarshal time (json.Unmarshal in AppendHistory), matching the real
+			// production scenario where the column contains corrupt data.
 			return &clickhousetest.MockRow{
 				ScanFunc: func(dest ...any) error {
-					return fmt.Errorf("clickhouse: malformed JSON in state_history: not-valid-json{")
+					for _, d := range dest {
+						if jsonPtr, ok := d.(*chcol.JSON); ok {
+							return jsonPtr.Scan("not-valid-json{")
+						}
+					}
+					return fmt.Errorf("expected *chcol.JSON destination for state_history scan")
 				},
 			}
 		},
