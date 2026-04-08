@@ -19,3 +19,21 @@ branches:
     track-merge-message: false
     is-release-branch: false
     is-main-branch: true
+  feature:
+    regex: ^feature[/-]
+    mode: ContinuousDelivery
+    label: pre
+    increment: Minor
+    track-merge-target: true
+    track-merge-message: false
+    is-release-branch: false
+    is-main-branch: false
+  hotfix:
+    regex: ^hotfix[/-]
+    mode: ContinuousDelivery
+    label: pre
+    increment: Patch
+    track-merge-target: true
+    track-merge-message: false
+    is-release-branch: false
+    is-main-branch: false
