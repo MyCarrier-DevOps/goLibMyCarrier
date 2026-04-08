@@ -6,7 +6,6 @@ tag-prefix: '[vV]?'
 
 strategies:
   - TaggedCommit
-  - Fallback
 
 branches:
   main:
