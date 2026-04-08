@@ -915,6 +915,9 @@ func (s *ClickHouseStore) loadStateHistoryFromDB(ctx context.Context, correlatio
 	`, s.database, TableRoutingSlips, ColumnCorrelationID, ColumnSign, ColumnVersion)
 
 	row := s.session.QueryRow(ctx, query, correlationID)
+	if row == nil {
+		return "", fmt.Errorf("failed to load state_history for %s: query returned nil row", correlationID)
+	}
 	historyCol := chcol.NewJSON()
 	if err := row.Scan(historyCol); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
