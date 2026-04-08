@@ -280,15 +280,21 @@ jobs:
         $(echo -e "$DOC_LIST")
         EOF
     - name: Create Release
-      uses: actions/create-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: v${{ steps.release_version.outputs.version }}
-        release_name: Release v${{ steps.release_version.outputs.version }}
-        body_path: release_body.md
-        draft: false
-        prerelease: ${{ steps.release_version.outputs.prerelease }}
+        VERSION: ${{ steps.release_version.outputs.version }}
+        PRERELEASE: ${{ steps.release_version.outputs.prerelease }}
+      run: |
+        if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          echo "Release v$VERSION already exists, skipping"
+        else
+          PRERELEASE_FLAG=""
+          [[ "$PRERELEASE" == "true" ]] && PRERELEASE_FLAG="--prerelease"
+          gh release create "v$VERSION" \
+            --title "Release v$VERSION" \
+            --notes-file release_body.md \
+            $PRERELEASE_FLAG
+        fi
 
     - name: Refresh pkg.go.dev cache for main module
       env:
