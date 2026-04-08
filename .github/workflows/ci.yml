@@ -9,13 +9,15 @@ on:
       - '!README.md'
     branches:
       - main
-  pull_request: 
+      - 'feature/**'
+      - 'hotfix/**'
+  pull_request:
     paths:
       - '**'
       - '!docs/**'
       - '!.github/**'
       - '!README.md'
-    branches: 
+    branches:
       - main
 
 jobs:
@@ -66,7 +68,7 @@ jobs:
           profile: ./coverage-${{ matrix.module }}.out
           threshold-total: 75
           source-dir: ./${{ matrix.module }}
-      
+
   lint:
     name: lint-${{ matrix.module }}
     runs-on: ubuntu-latest
@@ -87,7 +89,7 @@ jobs:
         run: |
           go mod tidy
           golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...
-  
+
   vuln:
     name: check-sec-${{ matrix.module }}
     runs-on: ubuntu-latest
@@ -121,7 +123,7 @@ jobs:
           fi
           echo "All unit tests passed"
 
-  # Check that all lint jobs passed  
+  # Check that all lint jobs passed
   lint-check:
     name: "Lint status check"
     runs-on: ubuntu-latest
@@ -158,14 +160,17 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: 
+    needs:
       - discover
       - unit-tests-check
       - lint-check
       - vuln-check
-    if: github.ref == 'refs/heads/main'
+    if: |
+      github.ref == 'refs/heads/main' ||
+      startsWith(github.ref, 'refs/heads/feature/') ||
+      startsWith(github.ref, 'refs/heads/hotfix/')
     outputs:
-      version: ${{ steps.calculate_version.outputs.majorMinorPatch }}
+      version: ${{ steps.calculate_version.outputs.semVer }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -187,16 +192,16 @@ jobs:
       id: create_tags
       env:
         MODULES: ${{ needs.discover.outputs.modules }}
-        VERSION: ${{ steps.calculate_version.outputs.majorMinorPatch }}
+        VERSION: ${{ steps.calculate_version.outputs.semVer }}
       run: |
         git config user.name "$GITHUB_ACTOR"
         git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
-        
+
         # Create and push main library tag first
         echo "Creating main library tag v$VERSION"
         git tag -a "v$VERSION" -m "Release goLibMyCarrier v$VERSION"
         git push origin "v$VERSION"
-        
+
         # Create and push tags for each module dynamically
         MODULE_LIST=""
         for module in $(echo "$MODULES" | jq -r '.[]'); do
@@ -205,7 +210,7 @@ jobs:
           git push origin "$module/v$VERSION"
           MODULE_LIST="$MODULE_LIST- **$module** - $(head -1 $module/README.md 2>/dev/null | sed 's/^# //' || echo "$module package")\n"
         done
-        
+
         # Store module list for release notes
         echo "module_list<<EOF" >> $GITHUB_OUTPUT
         echo -e "$MODULE_LIST" >> $GITHUB_OUTPUT
@@ -214,7 +219,7 @@ jobs:
       id: release_body
       env:
         MODULES: ${{ needs.discover.outputs.modules }}
-        VERSION: ${{ steps.calculate_version.outputs.majorMinorPatch }}
+        VERSION: ${{ steps.calculate_version.outputs.semVer }}
       run: |
         # Generate package list for release notes
         PACKAGE_LIST=""
@@ -224,52 +229,60 @@ jobs:
           PACKAGE_LIST="$PACKAGE_LIST- **$module** - $DESC\n"
           DOC_LIST="$DOC_LIST- [$module](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/$module@v$VERSION)\n"
         done
-        
+
         cat << EOF > release_body.md
         # goLibMyCarrier v$VERSION
-        
+
         This release includes updates to all Go packages in the goLibMyCarrier collection.
-        
+
         ## Packages Released
-        
+
         All packages have been tagged with version \`v$VERSION\`:
 
         $(echo -e "$PACKAGE_LIST")
-        
+
         ## Installation
-        
+
         Install any package using:
         \`\`\`bash
         go get github.com/MyCarrier-DevOps/goLibMyCarrier/<package>@v$VERSION
         \`\`\`
-        
+
         ## Documentation
-        
+
         View package documentation on pkg.go.dev:
         $(echo -e "$DOC_LIST")
         EOF
+    - name: Determine release type
+      id: release_type
+      run: |
+        if [[ -z "${{ steps.calculate_version.outputs.preReleaseLabel }}" ]]; then
+          echo "prerelease=false" >> $GITHUB_OUTPUT
+        else
+          echo "prerelease=true" >> $GITHUB_OUTPUT
+        fi
     - name: Create Release
       uses: actions/create-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: v${{ steps.calculate_version.outputs.majorMinorPatch }}
-        release_name: Release v${{ steps.calculate_version.outputs.majorMinorPatch }}
+        tag_name: v${{ steps.calculate_version.outputs.semVer }}
+        release_name: Release v${{ steps.calculate_version.outputs.semVer }}
         body_path: release_body.md
         draft: false
-        prerelease: false
-    
+        prerelease: ${{ steps.release_type.outputs.prerelease }}
+
     - name: Refresh pkg.go.dev cache for main module
       env:
-        VERSION: ${{ steps.calculate_version.outputs.majorMinorPatch }}
+        VERSION: ${{ steps.calculate_version.outputs.semVer }}
       run: |
         # Request pkg.go.dev to fetch the new main module version
         echo "Requesting pkg.go.dev refresh for main module v$VERSION"
         curl -s "https://proxy.golang.org/github.com/!my!carrier-!dev!ops/go!lib!my!carrier/@v/v$VERSION.info" || true
-        
+
         # Give the proxy a moment to process
         sleep 2
-        
+
         # Trigger documentation generation for main module
         echo "Triggering pkg.go.dev documentation for main module"
         curl -s "https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier@v$VERSION" > /dev/null || true
@@ -293,16 +306,16 @@ jobs:
         run: |
           # Convert module path to Go module proxy format (uppercase letters become !lowercase)
           ENCODED_MODULE=$(echo "$MODULE" | sed 's/\([A-Z]\)/!\L\1/g')
-          
+
           # Request pkg.go.dev to fetch the submodule version via Go proxy
           echo "Requesting pkg.go.dev refresh for $MODULE/v$VERSION"
           curl -s "https://proxy.golang.org/github.com/!my!carrier-!dev!ops/go!lib!my!carrier/$ENCODED_MODULE/@v/v$VERSION.info" || true
-          
+
           # Give the proxy a moment to process
           sleep 2
-          
+
           # Trigger documentation generation for the submodule
           echo "Triggering pkg.go.dev documentation for $MODULE"
           curl -s "https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/$MODULE@v$VERSION" > /dev/null || true
-          
+
           echo "pkg.go.dev refresh completed for $MODULE"

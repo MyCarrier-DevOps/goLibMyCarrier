@@ -6,6 +6,7 @@ tag-prefix: '[vV]?'
 
 strategies:
   - TaggedCommit
+  - Fallback
 
 branches:
   main:
@@ -19,3 +20,25 @@ branches:
     track-merge-message: false
     is-release-branch: false
     is-main-branch: true
+  feature:
+    regex: ^feature[/-]
+    mode: ContinuousDelivery
+    label: '{BranchName}'
+    increment: Minor
+    prevent-increment:
+      of-merged-branch: false
+    track-merge-target: true
+    track-merge-message: true
+    is-release-branch: false
+    is-main-branch: false
+  hotfix:
+    regex: ^hotfix[/-]
+    mode: ContinuousDelivery
+    label: '{BranchName}'
+    increment: Patch
+    prevent-increment:
+      of-merged-branch: false
+    track-merge-target: true
+    track-merge-message: true
+    is-release-branch: false
+    is-main-branch: false
