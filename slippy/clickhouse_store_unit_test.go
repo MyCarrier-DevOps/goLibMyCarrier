@@ -851,12 +851,14 @@ func createMockSessionForUpdates(
 			if strings.Contains(query, "SELECT state_history") {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
-						if len(dest) > 0 {
-							if ptr, ok := dest[0].(*string); ok {
-								*ptr = `{"entries":[]}`
-							}
+						if len(dest) == 0 {
+							return fmt.Errorf("expected scan destination, got none")
 						}
-						return nil
+						jsonPtr, ok := dest[0].(*chcol.JSON)
+						if !ok {
+							return fmt.Errorf("expected dest[0] to be *chcol.JSON, got %T", dest[0])
+						}
+						return jsonPtr.Scan(map[string]any{"entries": []any{}})
 					},
 				}
 			}
@@ -2914,12 +2916,14 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetry(t *testi
 			if strings.Contains(query, "SELECT state_history") {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
-						if len(dest) > 0 {
-							if ptr, ok := dest[0].(*string); ok {
-								*ptr = `{"entries":[]}`
-							}
+						if len(dest) == 0 {
+							return fmt.Errorf("expected scan destination, got none")
 						}
-						return nil
+						jsonPtr, ok := dest[0].(*chcol.JSON)
+						if !ok {
+							return fmt.Errorf("expected dest[0] to be *chcol.JSON, got %T", dest[0])
+						}
+						return jsonPtr.Scan(map[string]any{"entries": []any{}})
 					},
 				}
 			}
@@ -3006,12 +3010,14 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetryExhausted
 			if strings.Contains(query, "SELECT state_history") {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
-						if len(dest) > 0 {
-							if ptr, ok := dest[0].(*string); ok {
-								*ptr = `{"entries":[]}`
-							}
+						if len(dest) == 0 {
+							return fmt.Errorf("expected scan destination, got none")
 						}
-						return nil
+						jsonPtr, ok := dest[0].(*chcol.JSON)
+						if !ok {
+							return fmt.Errorf("expected dest[0] to be *chcol.JSON, got %T", dest[0])
+						}
+						return jsonPtr.Scan(map[string]any{"entries": []any{}})
 					},
 				}
 			}
@@ -3751,17 +3757,11 @@ func TestClickHouseStore_AppendHistory_ContextCancelled(t *testing.T) {
 func TestClickHouseStore_AppendHistory_MalformedHistoryJSON(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
-			// Populate *chcol.JSON with malformed JSON so the error is caught downstream
-			// at unmarshal time (json.Unmarshal in AppendHistory), matching the real
-			// production scenario where the column contains corrupt data.
+			// Return a scan-time error simulating how clickhouse-go v2.44.0 rejects
+			// malformed JSON at row.Scan, matching the real production failure mode.
 			return &clickhousetest.MockRow{
 				ScanFunc: func(dest ...any) error {
-					for _, d := range dest {
-						if jsonPtr, ok := d.(*chcol.JSON); ok {
-							return jsonPtr.Scan("not-valid-json{")
-						}
-					}
-					return fmt.Errorf("expected *chcol.JSON destination for state_history scan")
+					return fmt.Errorf("clickhouse: failed to scan JSON column: invalid JSON data")
 				},
 			}
 		},
@@ -4190,10 +4190,14 @@ func TestClickHouseStore_AppendHistory_ConflictRetry(t *testing.T) {
 				mu.Unlock()
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
-						if ptr, ok := dest[0].(*string); ok {
-							*ptr = `{"entries":[]}`
+						if len(dest) == 0 {
+							return fmt.Errorf("expected scan destination, got none")
 						}
-						return nil
+						jsonPtr, ok := dest[0].(*chcol.JSON)
+						if !ok {
+							return fmt.Errorf("expected dest[0] to be *chcol.JSON, got %T", dest[0])
+						}
+						return jsonPtr.Scan(map[string]any{"entries": []any{}})
 					},
 				}
 			}
@@ -4299,10 +4303,14 @@ func TestClickHouseStore_AppendHistory_ConflictRetryExhausted(t *testing.T) {
 				mu.Unlock()
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
-						if ptr, ok := dest[0].(*string); ok {
-							*ptr = `{"entries":[]}`
+						if len(dest) == 0 {
+							return fmt.Errorf("expected scan destination, got none")
 						}
-						return nil
+						jsonPtr, ok := dest[0].(*chcol.JSON)
+						if !ok {
+							return fmt.Errorf("expected dest[0] to be *chcol.JSON, got %T", dest[0])
+						}
+						return jsonPtr.Scan(map[string]any{"entries": []any{}})
 					},
 				}
 			}
