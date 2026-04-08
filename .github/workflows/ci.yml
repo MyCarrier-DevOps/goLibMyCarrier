@@ -215,6 +215,9 @@ jobs:
         git config user.name "$GITHUB_ACTOR"
         git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
 
+        # Fetch all remote tags so local rev-parse checks are accurate
+        git fetch --tags --quiet
+
         # Create and push main library tag (idempotent: skip if already exists)
         if git rev-parse -q --verify "refs/tags/v$VERSION" > /dev/null 2>&1; then
           echo "Tag v$VERSION already exists, skipping"
