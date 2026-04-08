@@ -3731,13 +3731,11 @@ func TestClickHouseStore_AppendHistory_ContextCancelled(t *testing.T) {
 func TestClickHouseStore_AppendHistory_MalformedHistoryJSON(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
-			// loadStateHistoryFromDB returns successfully but with garbage JSON.
+			// With clickhouse-go v2.44.0+, scanning a JSON column into *chcol.JSON;
+			// malformed JSON is rejected at scan time by the driver — simulate that.
 			return &clickhousetest.MockRow{
 				ScanFunc: func(dest ...any) error {
-					if ptr, ok := dest[0].(*string); ok {
-						*ptr = "not-valid-json{"
-					}
-					return nil
+					return fmt.Errorf("clickhouse: malformed JSON in state_history: not-valid-json{")
 				},
 			}
 		},

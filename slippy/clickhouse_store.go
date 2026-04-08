@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2/lib/chcol"
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator"
 )
@@ -913,14 +914,18 @@ func (s *ClickHouseStore) loadStateHistoryFromDB(ctx context.Context, correlatio
 	`, s.database, TableRoutingSlips, ColumnCorrelationID, ColumnSign, ColumnVersion)
 
 	row := s.session.QueryRow(ctx, query, correlationID)
-	var historyJSON string
-	if err := row.Scan(&historyJSON); err != nil {
+	historyCol := chcol.NewJSON()
+	if err := row.Scan(historyCol); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", fmt.Errorf("%w: correlation_id=%s", ErrSlipNotFound, correlationID)
 		}
 		return "", fmt.Errorf("failed to load state_history for %s: %w", correlationID, err)
 	}
-	return historyJSON, nil
+	jsonBytes, err := historyCol.MarshalJSON()
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal state_history for %s: %w", correlationID, err)
+	}
+	return string(jsonBytes), nil
 }
 
 // insertAtomicHistoryUpdate cancels all active routing_slips rows for correlationID and inserts
