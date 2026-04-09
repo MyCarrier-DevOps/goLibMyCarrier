@@ -117,6 +117,7 @@ func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 		INNER JOIN commits c ON s.commit_sha = c.commit_sha
 		WHERE lower(s.repository) = lower({repository:String})
 		  AND s.sign = 1
+		  AND s.status NOT IN ('abandoned', 'promoted', 'compensated')
 		ORDER BY c.priority ASC, s.version DESC
 		LIMIT 1
 	`, selectColumns, b.database)

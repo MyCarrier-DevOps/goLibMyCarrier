@@ -162,7 +162,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 
 	// Check for existing slip (retry detection)
 	existingSlip, err := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
-	if err == nil && existingSlip != nil {
+	if err == nil && existingSlip != nil && !existingSlip.Status.IsTerminal() {
 		slip, err := c.handlePushRetry(ctx, existingSlip)
 		if err != nil {
 			return nil, err
