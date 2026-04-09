@@ -219,6 +219,16 @@ func TestSlipQueryBuilder_BuildFindByCommitsQuery(t *testing.T) {
 	if !strings.Contains(query, "LIMIT 1") {
 		t.Error("query should have LIMIT 1")
 	}
+	// Superseded terminal statuses must be excluded so stale abandoned/promoted/compensated
+	// slips are never returned to callers looking for an active slip.
+	if !strings.Contains(query, "s.status NOT IN") {
+		t.Error("query should filter out superseded terminal statuses (abandoned, promoted, compensated)")
+	}
+	// completed and failed must remain visible — completed is a valid historical result,
+	// failed is non-terminal and eligible for retry resolution.
+	if strings.Contains(query, "'completed'") {
+		t.Error("query must NOT exclude 'completed' — completed slips are valid FindByCommits results")
+	}
 }
 
 func TestSlipQueryBuilder_BuildFindAllByCommitsQuery(t *testing.T) {
@@ -240,6 +250,11 @@ func TestSlipQueryBuilder_BuildFindAllByCommitsQuery(t *testing.T) {
 	// Should NOT have LIMIT 1 (unlike BuildFindByCommitsQuery)
 	if strings.Contains(query, "LIMIT 1") {
 		t.Error("BuildFindAllByCommitsQuery should NOT have LIMIT 1")
+	}
+	// Must NOT have the status filter — ancestry search intentionally returns all statuses
+	// (including abandoned/promoted) to build the full lineage chain.
+	if strings.Contains(query, "s.status NOT IN") {
+		t.Error("BuildFindAllByCommitsQuery must NOT filter by status — ancestry search needs all slips")
 	}
 }
 

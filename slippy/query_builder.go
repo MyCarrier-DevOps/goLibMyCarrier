@@ -101,6 +101,13 @@ func (b *SlipQueryBuilder) AggregateColumn(stepName string) string {
 // BuildFindByCommitsQuery builds a query to find a slip by a list of commits.
 // Only selects active rows (sign=1) to exclude orphaned cancel rows.
 // Repository comparison is case-insensitive to handle variations in repository naming.
+//
+// The status filter excludes superseded terminal statuses: abandoned (replaced by a newer push),
+// promoted (squash-merged feature branch), and compensated (compensation completed). These slips
+// are stale and must not be returned to callers looking for the active slip.
+//
+// Intentionally NOT excluded: completed (CI ran successfully — still a valid lookup target for
+// history and reporting) and failed (non-terminal — eligible for retry resolution).
 func (b *SlipQueryBuilder) BuildFindByCommitsQuery() string {
 	selectColumns := b.BuildSelectColumnsWithPrefix("s.")
 
