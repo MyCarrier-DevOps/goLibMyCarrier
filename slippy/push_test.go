@@ -1007,6 +1007,82 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Errorf("integration slip = %q, want %q", loaded.Status, SlipStatusInProgress)
 		}
 	})
+
+	t.Run("abandons same-branch slip even when cross-branch slip sorts first in ancestry", func(t *testing.T) {
+		// Regression for the i==0 ordering bug:
+		// FindAllByCommits returns slips in commit-list order. If a cross-branch
+		// slip sits at a more recent commit position (index 0) than the same-branch
+		// slip (index 1), the same-branch slip must still be abandoned.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{
+			AncestryDepth:    25,
+			AncestryMaxDepth: 100,
+		})
+
+		now := time.Now()
+		// Cross-branch slip at a NEWER shared commit (will be returned first by FindAllByCommits)
+		crossBranchSlip := &Slip{
+			CorrelationID: "corr-integration-newer",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "shared-newer-commit", // nearer to HEAD in ancestry list
+			CreatedAt:     now.Add(-2 * time.Minute),
+			UpdatedAt:     now.Add(-2 * time.Minute),
+			Status:        SlipStatusInProgress,
+			Steps:         make(map[string]Step),
+		}
+		// Same-branch slip at an OLDER commit (will be returned second)
+		sameBranchSlip := &Slip{
+			CorrelationID: "corr-main-older",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "main-older-commit",
+			CreatedAt:     now.Add(-10 * time.Minute),
+			UpdatedAt:     now.Add(-10 * time.Minute),
+			Status:        SlipStatusInProgress,
+			Steps:         make(map[string]Step),
+		}
+		store.AddSlip(crossBranchSlip)
+		store.AddSlip(sameBranchSlip)
+
+		// Ancestry: newer shared commit comes before the older main commit
+		github.SetAncestry("owner", "repo", "main-new-commit", []string{
+			"main-new-commit", "shared-newer-commit", "main-older-commit",
+		})
+
+		opts := PushOptions{
+			CorrelationID: "corr-main-new",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "main-new-commit",
+		}
+
+		_, warnings := client.resolveAndAbandonAncestors(ctx, opts)
+		if len(warnings) > 0 {
+			t.Fatalf("unexpected warnings: %v", warnings)
+		}
+
+		// Exactly one Update call — the same-branch slip must be abandoned
+		if len(store.UpdateCalls) != 1 {
+			t.Fatalf("expected 1 Update call (same-branch abandon), got %d", len(store.UpdateCalls))
+		}
+		if store.UpdateCalls[0].Slip.CorrelationID != "corr-main-older" {
+			t.Errorf("expected 'corr-main-older' to be abandoned, got '%s'", store.UpdateCalls[0].Slip.CorrelationID)
+		}
+		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
+			t.Errorf("expected SlipStatusAbandoned, got %q", store.UpdateCalls[0].Slip.Status)
+		}
+
+		// Cross-branch slip must remain untouched
+		loaded, err := store.Load(ctx, "corr-integration-newer")
+		if err != nil {
+			t.Fatalf("failed to load integration slip: %v", err)
+		}
+		if loaded.Status != SlipStatusInProgress {
+			t.Errorf("integration slip status = %q, want %q", loaded.Status, SlipStatusInProgress)
+		}
+	})
 }
 
 func TestClient_findAncestorSlipsWithProgressiveDepth(t *testing.T) {
