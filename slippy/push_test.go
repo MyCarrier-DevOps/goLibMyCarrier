@@ -1049,7 +1049,7 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
-		// Only the same-branch (main) slip should have been abandoned (i==0)
+		// Only the same-branch (main) slip should have been abandoned.
 		if len(store.UpdateCalls) != 1 {
 			t.Fatalf("expected exactly 1 Update call (main-old-slip), got %d", len(store.UpdateCalls))
 		}

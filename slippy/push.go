@@ -338,11 +338,14 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 			}
 		}
 
-		// Only the most recent same-branch non-terminal slip needs a status update.
-		// Failed slips are non-terminal and eligible for abandonment here because
-		// a new push indicates the developer has moved on. If they wanted to retry
-		// the same commit, they would re-run without pushing and the non-terminal
-		// slip would be found by ancestry resolution.
+		// Only the most recent non-terminal ancestor slip needs a status update.
+		// Cross-branch skipping applies only when both branch values are known and
+		// different; if either branch is empty, we intentionally fall through to
+		// abandonment for backward compatibility with older slips that lack branch
+		// metadata. Failed slips are non-terminal and eligible for abandonment here
+		// because a new push indicates the developer has moved on. If they wanted
+		// to retry the same commit, they would re-run without pushing and the
+		// non-terminal slip would be found by ancestry resolution.
 		if !handledAncestor && !slip.Status.IsTerminal() {
 			switch {
 			case isSquashMerge:
