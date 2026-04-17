@@ -308,7 +308,13 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	// For squash merges: promote the feature branch slip
 	// For regular pushes: abandon non-terminal ancestor slips
 	var ancestry []AncestryEntry
-	for i, ancestorSlip := range ancestorSlips {
+	// handledAncestor tracks whether we have already promoted or abandoned an
+	// ancestor slip.  We use this instead of checking i == 0 so that a
+	// cross-branch slip that happens to sit at index 0 (because it shares a
+	// more-recent commit SHA with another branch) does not block abandonment of
+	// the first eligible same-branch non-terminal slip found later in the list.
+	handledAncestor := false
+	for _, ancestorSlip := range ancestorSlips {
 		slip := ancestorSlip.Slip
 
 		// Capture failure context BEFORE any status modification (abandon/promote).
@@ -332,14 +338,20 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 			}
 		}
 
-		// Only the first (most recent) non-terminal slip needs status update.
-		// Failed slips are non-terminal and eligible for abandonment here because
-		// a new push indicates the developer has moved on. If they wanted to retry
-		// the same commit, they would re-run without pushing and the non-terminal
-		// slip would be found by ancestry resolution.
-		if i == 0 && !slip.Status.IsTerminal() {
-			if isSquashMerge {
-				// Squash merge: promote the feature branch slip (successful outcome)
+		// Only the most recent non-terminal ancestor slip needs a status update.
+		// Cross-branch skipping applies only when both branch values are known and
+		// different; if either branch is empty, we intentionally fall through to
+		// abandonment for backward compatibility with older slips that lack branch
+		// metadata. Failed slips are non-terminal and eligible for abandonment here
+		// because a new push indicates the developer has moved on. If they wanted
+		// to retry the same commit, they would re-run without pushing and the
+		// non-terminal slip would be found by ancestry resolution.
+		if !handledAncestor && !slip.Status.IsTerminal() {
+			switch {
+			case isSquashMerge:
+				// Squash merge: promote the feature branch slip (successful outcome).
+				// Cross-branch promotion is expected here — the ancestor is on the
+				// feature branch being merged into the current branch.
 				c.logger.Info(ctx, "Promoting feature branch slip via squash merge", map[string]interface{}{
 					"promoted_id":     slip.CorrelationID,
 					"promoted_commit": shortSHA(slip.CommitSHA),
@@ -361,8 +373,27 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 					// Update the local copy to reflect the promotion
 					slip.Status = SlipStatusPromoted
 				}
-			} else {
-				// Regular push: abandon superseded slip
+				handledAncestor = true
+
+			case opts.Branch != "" && slip.Branch != "" && slip.Branch != opts.Branch:
+				// Cross-branch ancestor found via shared git history (e.g. a push to
+				// "main" whose ancestry walks through commits that also exist on
+				// "integration"). Only skip abandonment when both branch values are
+				// known and different; otherwise preserve existing abandonment
+				// behavior for slips with missing branch metadata.
+				// Do NOT set handledAncestor — keep looking for the first
+				// same-branch non-terminal slip further in the list.
+				c.logger.Info(ctx, "Skipping cross-branch ancestor slip (different branch)", map[string]interface{}{
+					"ancestor_id":        slip.CorrelationID,
+					"ancestor_branch":    slip.Branch,
+					"ancestor_commit":    shortSHA(slip.CommitSHA),
+					"ancestor_status":    string(slip.Status),
+					"current_branch":     opts.Branch,
+					"superseding_commit": shortSHA(opts.CommitSHA),
+				})
+
+			default:
+				// Regular push on the same branch: abandon the superseded slip.
 				c.logger.Info(ctx, "Abandoning superseded slip", map[string]interface{}{
 					"superseded_id":      slip.CorrelationID,
 					"superseded_commit":  shortSHA(slip.CommitSHA),
@@ -383,6 +414,7 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 					// Update the local copy to reflect the abandonment
 					slip.Status = SlipStatusAbandoned
 				}
+				handledAncestor = true
 			}
 		}
 
