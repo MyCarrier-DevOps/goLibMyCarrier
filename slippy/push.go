@@ -330,7 +330,8 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 		// the same commit, they would re-run without pushing and the non-terminal
 		// slip would be found by ancestry resolution.
 		if i == 0 && !slip.Status.IsTerminal() {
-			if isSquashMerge {
+			switch {
+			case isSquashMerge:
 				// Squash merge: promote the feature branch slip (successful outcome).
 				// Cross-branch promotion is expected here — the ancestor is on the
 				// feature branch being merged into the current branch.
@@ -355,21 +356,23 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 					// Update the local copy to reflect the promotion
 					slip.Status = SlipStatusPromoted
 				}
-			} else if slip.Branch != opts.Branch {
+
+			case opts.Branch != "" && slip.Branch != "" && slip.Branch != opts.Branch:
 				// Cross-branch ancestor found via shared git history (e.g. a push to
 				// "main" whose ancestry walks through commits that also exist on
-				// "integration"). Do NOT abandon the slip — it belongs to a different
-				// branch and is still actively in-flight there. Record it in the
-				// ancestry chain for history but leave its status untouched.
+				// "integration"). Only skip abandonment when both branch values are
+				// known and different; otherwise preserve existing abandonment
+				// behavior for slips with missing branch metadata.
 				c.logger.Info(ctx, "Skipping cross-branch ancestor slip (different branch)", map[string]interface{}{
-					"ancestor_id":      slip.CorrelationID,
-					"ancestor_branch":  slip.Branch,
-					"ancestor_commit":  shortSHA(slip.CommitSHA),
-					"ancestor_status":  string(slip.Status),
-					"current_branch":   opts.Branch,
+					"ancestor_id":        slip.CorrelationID,
+					"ancestor_branch":    slip.Branch,
+					"ancestor_commit":    shortSHA(slip.CommitSHA),
+					"ancestor_status":    string(slip.Status),
+					"current_branch":     opts.Branch,
 					"superseding_commit": shortSHA(opts.CommitSHA),
 				})
-			} else {
+
+			default:
 				// Regular push on the same branch: abandon the superseded slip.
 				c.logger.Info(ctx, "Abandoning superseded slip", map[string]interface{}{
 					"superseded_id":      slip.CorrelationID,
