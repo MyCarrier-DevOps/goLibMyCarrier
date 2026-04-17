@@ -226,6 +226,65 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	t.Run("new slip for terminal existing slip", func(t *testing.T) {
+		// When a terminal slip (abandoned, promoted, compensated, completed) already
+		// exists for the commit SHA, CreateSlipForPush must NOT call handlePushRetry.
+		// Instead it falls through and creates a fresh slip with the new correlation ID.
+		// This prevents webhook re-delivery or bot-commit races from resurrecting stale slips.
+		for _, termStatus := range []SlipStatus{
+			SlipStatusAbandoned, SlipStatusPromoted, SlipStatusCompensated, SlipStatusCompleted,
+		} {
+			termStatus := termStatus
+			t.Run(string(termStatus), func(t *testing.T) {
+				store := NewMockStore()
+				github := NewMockGitHubAPI()
+				config := testPipelineConfig()
+				client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+
+				// Pre-create terminal slip for the same commit
+				store.AddSlip(&Slip{
+					CorrelationID: "corr-terminal-old",
+					Repository:    "owner/repo",
+					Branch:        "main",
+					CommitSHA:     "terminal-commit-abc",
+					Status:        termStatus,
+					Steps:         map[string]Step{},
+					StateHistory:  []StateHistoryEntry{},
+				})
+
+				opts := PushOptions{
+					CorrelationID: "corr-new-after-terminal",
+					Repository:    "owner/repo",
+					Branch:        "main",
+					CommitSHA:     "terminal-commit-abc",
+					Components:    []ComponentDefinition{},
+				}
+
+				result, err := client.CreateSlipForPush(ctx, opts)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				// Must return the NEW slip, not the terminal one
+				if result.Slip.CorrelationID != "corr-new-after-terminal" {
+					t.Errorf("expected new slip ID 'corr-new-after-terminal', got '%s'", result.Slip.CorrelationID)
+				}
+
+				// Exactly one Create call for the new slip
+				if len(store.CreateCalls) != 1 {
+					t.Errorf("expected 1 Create call for new slip, got %d", len(store.CreateCalls))
+				}
+
+				// handlePushRetry resets push_parsed to running — must NOT have happened
+				for _, call := range store.UpdateStepCalls {
+					if call.StepName == "push_parsed" && call.Status == StepStatusRunning {
+						t.Error("handlePushRetry must not be called for a terminal existing slip")
+					}
+				}
+			})
+		}
+	})
+
 	t.Run("validation error", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
