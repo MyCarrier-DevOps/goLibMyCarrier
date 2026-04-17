@@ -142,6 +142,14 @@ type CreateSlipResult struct {
 // finds any existing slips for ancestor commits, and ensures they are
 // in a terminal state (abandoning non-terminal slips that are being superseded).
 //
+// Retry vs new-slip behavior for the same commit SHA:
+//   - If an existing slip is found and is non-terminal (in_progress, failed, etc.),
+//     it is retried via handlePushRetry (same correlation ID is reused).
+//   - If an existing slip is found and is terminal (abandoned, promoted, compensated,
+//     completed), it is treated as stale and a fresh slip is created with the new
+//     correlation ID from opts. This prevents resurrecting superseded slips on
+//     webhook re-delivery or bot-commit races.
+//
 // The returned CreateSlipResult contains both the slip and any non-fatal errors
 // that occurred during processing (e.g., ancestry resolution failures).
 // Callers should check Warnings for issues that didn't prevent slip creation
@@ -162,7 +170,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 
 	// Check for existing slip (retry detection)
 	existingSlip, err := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
-	if err == nil && existingSlip != nil {
+	if err == nil && existingSlip != nil && !existingSlip.Status.IsTerminal() {
 		slip, err := c.handlePushRetry(ctx, existingSlip)
 		if err != nil {
 			return nil, err
