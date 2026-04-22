@@ -73,12 +73,12 @@
     {
       "name": "prod_rollback",
       "description": "Automated GitOps + source repo rollback triggered when prod_alert_gate fails",
-      "prerequisites": ["prod_deploy"]
+      "prerequisites": ["prod_deploy", "prod_tests"]
     },
     {
       "name": "prod_steady_state",
       "description": "Pipeline terminal marker — all post-deploy steps finished",
-      "prerequisites": ["prod_deploy"]
+      "prerequisites": ["prod_deploy", "prod_tests"]
     }
   ]
 }
