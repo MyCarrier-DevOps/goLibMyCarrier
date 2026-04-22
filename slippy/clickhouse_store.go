@@ -508,7 +508,17 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 		return s.updateAggregateStatusFromComponentStatesWithHistory(ctx, correlationID, stepName, entry)
 	}
 
-	// Pure pipeline step: persist only the history entry to routing_slips.
+	// Pure pipeline step: persist the history entry AND update the step-status column
+	// in routing_slips atomically. Without the override, insertAtomicHistoryUpdate would
+	// copy the stale "running" value written earlier by the builds aggregate write-back
+	// (updateAggregateStatusFromComponentStatesWithHistory calls s.Update which snapshots
+	// unit_tests_status = "running" from hydrateSlip's first pass over slip_component_states).
+	// Passing the override makes the INSERT SELECT use the literal status we just wrote to
+	// slip_component_states, keeping routing_slips consistent without a Load+Update cycle.
+	if s.pipelineConfig != nil {
+		colName := s.queryBuilder.StepStatusColumn(stepName)
+		return s.appendHistoryWithOverrides(ctx, correlationID, entry, stepStatusOverride{colName, status})
+	}
 	return s.AppendHistory(ctx, correlationID, entry)
 }
 
@@ -522,122 +532,7 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 // This prevents a concurrent step-status update from being overwritten in the
 // routing_slips cache by an in-flight AppendHistory that loaded a stale snapshot.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
-	// Start tracing span for the retry operation
-	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
-	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
-	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
-
-	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
-	historyConflictRetry := 0 // Counter for concurrent-writer conflict retries
-
-	// Retry loop handles slip-not-found scenarios and post-write history-conflict retries.
-	for {
-		// Check for context cancellation first
-		if ctx.Err() != nil {
-			retrySpan.EndError(ctx.Err())
-			return ctx.Err()
-		}
-
-		// Load only state_history to avoid a full hydrateSlip round-trip.
-		// This keeps step-status columns in the re-inserted row aligned with the
-		// current DB row rather than an in-memory view that might be stale.
-		existingHistoryJSON, err := s.loadStateHistoryFromDB(retrySpan.Context(), correlationID)
-		if err != nil {
-			if errors.Is(err, ErrSlipNotFound) {
-				slipNotFoundRetry++
-				if slipNotFoundRetry > slipNotFoundMaxRetries {
-					err := fmt.Errorf("%w: slip not found after %d retries: %w",
-						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
-					retrySpan.EndError(err)
-					return err
-				}
-
-				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
-				retrySpan.RecordAttempt(backoff.Milliseconds())
-				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
-				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
-				select {
-				case <-ctx.Done():
-					retrySpan.EndError(ctx.Err())
-					return ctx.Err()
-				case <-time.After(backoff):
-				}
-				continue
-			}
-			retrySpan.EndError(err)
-			return err
-		}
-
-		// Deserialize existing history, append the new entry, re-serialize.
-		var wrapper struct {
-			Entries []StateHistoryEntry `json:"entries"`
-		}
-		if err := json.Unmarshal([]byte(existingHistoryJSON), &wrapper); err != nil {
-			// History JSON is malformed. Returning an error here avoids silently
-			// discarding existing history. The caller's retry loop can surface this
-			// to the operator rather than overwriting potentially valid data.
-			parseErr := fmt.Errorf("state_history JSON is malformed for %s: %w", correlationID, err)
-			retrySpan.AddAttribute("slippy.history_unmarshal_error", parseErr.Error())
-			retrySpan.EndError(parseErr)
-			return parseErr
-		}
-		wrapper.Entries = append(wrapper.Entries, entry)
-		newHistoryJSON, err := json.Marshal(wrapper)
-		if err != nil {
-			retrySpan.EndError(err)
-			return fmt.Errorf("failed to marshal updated state history: %w", err)
-		}
-
-		// Load current DB version so we can guarantee newVersion > existing version,
-		// preventing invisible updates when another writer used a skewed clock.
-		currentVersion, versionLoadErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
-		if versionLoadErr != nil {
-			// Non-fatal: fall back to nextVersion() with no floor guarantee.
-			// Post-write version check will still catch conflicts.
-			currentVersion = 0
-		}
-		newVersion := s.nextVersion()
-		if newVersion <= currentVersion {
-			newVersion = currentVersion + 1
-		}
-		if err := s.insertAtomicHistoryUpdate(
-			retrySpan.Context(), correlationID, newVersion, string(newHistoryJSON),
-		); err != nil {
-			retrySpan.EndError(err)
-			return err
-		}
-
-		// Post-write version check: if a concurrent writer inserted a higher-version
-		// routing_slips row after our loadStateHistoryFromDB read, that row wins the
-		// last-write-wins merge and our appended entry is dropped. Detect and retry.
-		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
-		if versionErr != nil {
-			// Non-fatal: accept potential history loss if the version check fails.
-			retrySpan.AddAttribute("slippy.history_version_check_error", versionErr.Error())
-			retrySpan.EndSuccess()
-			return nil
-		}
-		if latestVersion > newVersion {
-			historyConflictRetry++
-			retrySpan.AddAttribute("slippy.history_conflict_retry", historyConflictRetry)
-			if historyConflictRetry > historyConflictMaxRetries {
-				retrySpan.AddAttribute("slippy.history_conflict_retries_exhausted", true)
-				retrySpan.EndSuccess()
-				return nil
-			}
-			backoff := calculateAggregateConflictBackoff(historyConflictRetry)
-			select {
-			case <-ctx.Done():
-				retrySpan.EndError(ctx.Err())
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-			continue
-		}
-
-		retrySpan.EndSuccess()
-		return nil
-	}
+	return s.appendHistoryWithOverrides(ctx, correlationID, entry)
 }
 
 // Close releases any resources held by the store.
@@ -789,6 +684,137 @@ func (s *ClickHouseStore) SetComponentImageTag(
 		StepStatus(currentStatus), "", imageTag)
 }
 
+// appendHistoryWithOverrides is the internal implementation of AppendHistory.
+// When overrides are provided, the named step-status columns are written with the
+// supplied literal values instead of being copied verbatim from the DB row.
+// This is used by UpdateStepWithHistory to atomically persist both the history
+// entry and the step-status column for pure pipeline steps (non-aggregate,
+// componentName == ""), closing the gap where insertAtomicHistoryUpdate would
+// otherwise copy a stale "running" value from the DB.
+func (s *ClickHouseStore) appendHistoryWithOverrides(
+	ctx context.Context,
+	correlationID string,
+	entry StateHistoryEntry,
+	overrides ...stepStatusOverride,
+) error {
+	// Start tracing span for the retry operation
+	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
+	retrySpan.AddAttribute("slippy.entry_step", entry.Step)
+	retrySpan.AddAttribute("slippy.entry_status", string(entry.Status))
+
+	slipNotFoundRetry := 0    // Counter for slip-not-found retries (1-indexed when used)
+	historyConflictRetry := 0 // Counter for concurrent-writer conflict retries
+
+	// Retry loop handles slip-not-found scenarios and post-write history-conflict retries.
+	for {
+		// Check for context cancellation first
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
+		// Load only state_history to avoid a full hydrateSlip round-trip.
+		// This keeps step-status columns in the re-inserted row aligned with the
+		// current DB row rather than an in-memory view that might be stale.
+		existingHistoryJSON, err := s.loadStateHistoryFromDB(retrySpan.Context(), correlationID)
+		if err != nil {
+			if errors.Is(err, ErrSlipNotFound) {
+				slipNotFoundRetry++
+				if slipNotFoundRetry > slipNotFoundMaxRetries {
+					err := fmt.Errorf("%w: slip not found after %d retries: %w",
+						ErrMaxRetriesExceeded, slipNotFoundMaxRetries, ErrSlipNotFound)
+					retrySpan.EndError(err)
+					return err
+				}
+
+				backoff := calculateSlipNotFoundBackoff(slipNotFoundRetry)
+				retrySpan.RecordAttempt(backoff.Milliseconds())
+				retrySpan.AddAttribute("slippy.waiting_for_slip_creation", true)
+				retrySpan.AddAttribute("slippy.slip_not_found_retry", slipNotFoundRetry)
+				select {
+				case <-ctx.Done():
+					retrySpan.EndError(ctx.Err())
+					return ctx.Err()
+				case <-time.After(backoff):
+				}
+				continue
+			}
+			retrySpan.EndError(err)
+			return err
+		}
+
+		// Deserialize existing history, append the new entry, re-serialize.
+		var wrapper struct {
+			Entries []StateHistoryEntry `json:"entries"`
+		}
+		if err := json.Unmarshal([]byte(existingHistoryJSON), &wrapper); err != nil {
+			// History JSON is malformed. Returning an error here avoids silently
+			// discarding existing history. The caller's retry loop can surface this
+			// to the operator rather than overwriting potentially valid data.
+			parseErr := fmt.Errorf("state_history JSON is malformed for %s: %w", correlationID, err)
+			retrySpan.AddAttribute("slippy.history_unmarshal_error", parseErr.Error())
+			retrySpan.EndError(parseErr)
+			return parseErr
+		}
+		wrapper.Entries = append(wrapper.Entries, entry)
+		newHistoryJSON, err := json.Marshal(wrapper)
+		if err != nil {
+			retrySpan.EndError(err)
+			return fmt.Errorf("failed to marshal updated state history: %w", err)
+		}
+
+		// Load current DB version so we can guarantee newVersion > existing version,
+		// preventing invisible updates when another writer used a skewed clock.
+		currentVersion, versionLoadErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionLoadErr != nil {
+			// Non-fatal: fall back to nextVersion() with no floor guarantee.
+			// Post-write version check will still catch conflicts.
+			currentVersion = 0
+		}
+		newVersion := s.nextVersion()
+		if newVersion <= currentVersion {
+			newVersion = currentVersion + 1
+		}
+		if err := s.insertAtomicHistoryUpdate(
+			retrySpan.Context(), correlationID, newVersion, string(newHistoryJSON), overrides...,
+		); err != nil {
+			retrySpan.EndError(err)
+			return err
+		}
+
+		// Post-write version check: if a concurrent writer inserted a higher-version
+		// routing_slips row after our loadStateHistoryFromDB read, that row wins the
+		// last-write-wins merge and our appended entry is dropped. Detect and retry.
+		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionErr != nil {
+			// Non-fatal: accept potential history loss if the version check fails.
+			retrySpan.AddAttribute("slippy.history_version_check_error", versionErr.Error())
+			retrySpan.EndSuccess()
+			return nil
+		}
+		if latestVersion > newVersion {
+			historyConflictRetry++
+			retrySpan.AddAttribute("slippy.history_conflict_retry", historyConflictRetry)
+			if historyConflictRetry > historyConflictMaxRetries {
+				retrySpan.AddAttribute("slippy.history_conflict_retries_exhausted", true)
+				retrySpan.EndSuccess()
+				return nil
+			}
+			backoff := calculateAggregateConflictBackoff(historyConflictRetry)
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
+		retrySpan.EndSuccess()
+		return nil
+	}
+}
+
 // nextVersion returns a nanosecond-epoch version. If the current wall clock
 // equals or falls behind the last version issued by this store instance,
 // it returns lastVersion+1 to keep versions monotonically increasing.
@@ -932,6 +958,17 @@ func (s *ClickHouseStore) loadStateHistoryFromDB(ctx context.Context, correlatio
 	return string(jsonBytes), nil
 }
 
+// stepStatusOverride pairs a routing_slips step-status column name (e.g. "unit_tests_status")
+// with the literal value to write. When passed to insertAtomicHistoryUpdate the verbatim
+// DB column reference is replaced with a SQL literal so the step-status column is updated
+// atomically with the history entry. This is used by the pure-pipeline-step path in
+// UpdateStepWithHistory to persist the correct status in routing_slips without a separate
+// Load+Update round-trip.
+type stepStatusOverride struct {
+	columnName string
+	status     StepStatus
+}
+
 // insertAtomicHistoryUpdate cancels all active routing_slips rows for correlationID and inserts
 // a new row that is identical to the latest active row except for state_history, updated_at,
 // sign, and version. All step-status and aggregate columns are copied verbatim from the DB row,
@@ -941,6 +978,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	correlationID string,
 	newVersion uint64,
 	newStateHistoryJSON string,
+	overrides ...stepStatusOverride,
 ) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
@@ -1007,7 +1045,35 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		newRowSelectCols = append(newRowSelectCols, ColumnAncestry) // ancestry passthrough
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
-	newRowSelectCols = append(newRowSelectCols, stepColumns...)
+
+	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
+	// the verbatim DB column reference with a literal (?) so the step-status value is
+	// updated atomically alongside the history entry. This fixes the case where a pure
+	// pipeline step (e.g. unit_tests) would otherwise copy a stale "running" value from
+	// the routing_slips row that was last written by the builds aggregate write-back.
+	//
+	// Fast-path: AppendHistory always calls with zero overrides, so skip the map/slice
+	// allocations entirely in that common case.
+	var stepOverrideArgs []interface{}
+	if len(overrides) == 0 {
+		newRowSelectCols = append(newRowSelectCols, stepColumns...)
+	} else {
+		overrideByCol := make(map[string]StepStatus, len(overrides))
+		for _, o := range overrides {
+			overrideByCol[o.columnName] = o.status
+		}
+		stepSelectExprs := make([]string, 0, len(stepColumns))
+		stepOverrideArgs = make([]interface{}, 0, len(overrides))
+		for _, col := range stepColumns {
+			if overrideStatus, ok := overrideByCol[col]; ok {
+				stepSelectExprs = append(stepSelectExprs, "?")
+				stepOverrideArgs = append(stepOverrideArgs, string(overrideStatus))
+				continue
+			}
+			stepSelectExprs = append(stepSelectExprs, col)
+		}
+		newRowSelectCols = append(newRowSelectCols, stepSelectExprs...)
+	}
 	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
 
 	newRowQuery := fmt.Sprintf(
@@ -1024,14 +1090,18 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 		%s
 	`, s.database, TableRoutingSlips, strings.Join(allCols, ", "), cancelQuery, newRowQuery)
 
-	err := s.session.ExecWithArgs(ctx, query,
-		// Cancel SELECT WHERE params
-		correlationID, newVersion,
-		// New row SELECT literal params (state_history, version)
-		newStateHistoryJSON, newVersion,
-		// New row SELECT WHERE param
-		correlationID,
-	)
+	// Build the args slice in SELECT parameter order:
+	//   1. cancel-row WHERE:     correlationID, newVersion
+	//   2. new-row SELECT CAST:  newStateHistoryJSON  (state_history literal)
+	//   3. new-row SELECT ?:     newVersion           (version literal)
+	//   4. new-row step overrides in column order     (one ? per override)
+	//   5. new-row SELECT WHERE: correlationID
+	execArgs := make([]interface{}, 0, 5+len(stepOverrideArgs))
+	execArgs = append(execArgs, correlationID, newVersion, newStateHistoryJSON, newVersion)
+	execArgs = append(execArgs, stepOverrideArgs...)
+	execArgs = append(execArgs, correlationID)
+
+	err := s.session.ExecWithArgs(ctx, query, execArgs...)
 	if err != nil && hasAncestry && isAncestryColumnError(err) {
 		// The probe assumed ancestry exists but ClickHouse reports an unknown column —
 		// migration v10 has been applied despite the probe not seeing it (transient failure).
@@ -1041,7 +1111,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 			"correlation_id": correlationID,
 		})
 		s.hasAncestryColumn.Store(false)
-		return s.insertAtomicHistoryUpdate(ctx, correlationID, newVersion, newStateHistoryJSON)
+		return s.insertAtomicHistoryUpdate(ctx, correlationID, newVersion, newStateHistoryJSON, overrides...)
 	}
 	return err
 }
