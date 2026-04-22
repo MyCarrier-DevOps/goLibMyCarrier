@@ -3204,7 +3204,137 @@ func TestClickHouseStore_UpdateStepWithHistory_PurePipelineStep(t *testing.T) {
 	}
 }
 
-// TestClickHouseStore_SetComponentImageTag_QueryRowError verifies that when the initial
+// TestClickHouseStore_UpdateStepWithHistory_PurePipelineStep_StatusOverrideInSQL is a
+// regression test for the unit_tests_status staleness bug (introduced in v1.3.70).
+// It verifies that when UpdateStepWithHistory is called for a pure pipeline step
+// (non-aggregate, componentName == ""), insertAtomicHistoryUpdate replaces the step-status
+// column reference with a SQL literal (?) in the new-row SELECT instead of copying the
+// verbatim DB column value — and that the override status is injected into ExecWithArgs
+// args at the correct position.
+//
+// Without this fix, "running" written by the builds aggregate write-back would be copied
+// verbatim, leaving unit_tests_status (or any pure pipeline step status) permanently stale.
+func TestClickHouseStore_UpdateStepWithHistory_PurePipelineStep_StatusOverrideInSQL(t *testing.T) {
+	const corrID = "corr-status-override-regression"
+	mockSession := createMockSessionForUpdates(corrID, "myorg/myrepo", "main", "abc123", SlipStatusInProgress, 1)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	entry := StateHistoryEntry{
+		Timestamp: time.Now(),
+		Step:      "push_parsed",
+		Status:    StepStatusCompleted,
+		Actor:     "ci",
+	}
+
+	err := store.UpdateStepWithHistory(
+		context.Background(), corrID, "push_parsed", "", StepStatusCompleted, entry,
+	)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Find the routing_slips INSERT call (insertAtomicHistoryUpdate).
+	// The other ExecWithArgs call is the slip_component_states insert.
+	var historyStmt string
+	var historyArgs []any
+	for _, call := range mockSession.ExecWithArgsCalls {
+		if strings.Contains(call.Stmt, "routing_slips") {
+			historyStmt = call.Stmt
+			historyArgs = call.Args
+			break
+		}
+	}
+	if historyStmt == "" {
+		t.Fatal("expected a routing_slips INSERT (insertAtomicHistoryUpdate), found none")
+	}
+
+	// The override path must replace the step-status column reference with ? in the
+	// new-row SELECT. Without the fix, "push_parsed_status" appears 3 times in the query
+	// (INSERT column list + cancel SELECT + new-row SELECT). With the fix it appears
+	// exactly twice (INSERT column list + cancel SELECT only; new-row SELECT uses ?).
+	const colName = "push_parsed_status"
+	occurrences := strings.Count(historyStmt, colName)
+	if occurrences != 2 {
+		t.Errorf(
+			"expected %q to appear 2 times in routing_slips INSERT (column list + cancel SELECT only),"+
+				" got %d — new-row SELECT should use ? instead.\nQuery: %s",
+			colName, occurrences, historyStmt,
+		)
+	}
+
+	// Args order for insertAtomicHistoryUpdate with 1 override (push_parsed_status):
+	//   [0] correlationID          (cancel WHERE)
+	//   [1] newVersion (uint64)    (cancel WHERE)
+	//   [2] newStateHistoryJSON    (new-row CAST(? AS JSON) literal)
+	//   [3] newVersion (uint64)    (new-row version literal)
+	//   [4] "completed"            (push_parsed_status override value)  ← THE FIX
+	//   [5] correlationID          (new-row WHERE)
+	const wantArgCount = 6
+	if len(historyArgs) != wantArgCount {
+		t.Fatalf("expected %d ExecWithArgs args (5 base + 1 step override), got %d: %v",
+			wantArgCount, len(historyArgs), historyArgs)
+	}
+	overrideArg, ok := historyArgs[4].(string)
+	if !ok {
+		t.Fatalf("expected args[4] (step status override) to be string, got %T: %v",
+			historyArgs[4], historyArgs[4])
+	}
+	if overrideArg != string(StepStatusCompleted) {
+		t.Errorf("expected args[4] (step status override) = %q, got %q",
+			string(StepStatusCompleted), overrideArg)
+	}
+}
+
+// TestClickHouseStore_AppendHistory_NoStatusColumnOverride verifies the contrasting case:
+// AppendHistory (public, no overrides) must NOT inject extra step-status args and must
+// NOT replace the step-status column reference with ? — the verbatim DB column value is
+// copied as-is. This ensures the override mechanism is scoped exclusively to
+// UpdateStepWithHistory's pure-pipeline-step path and does not affect other callers.
+func TestClickHouseStore_AppendHistory_NoStatusColumnOverride(t *testing.T) {
+	const corrID = "corr-appendhistory-no-override"
+	mockSession := createMockSessionForUpdates(corrID, "myorg/myrepo", "main", "abc123", SlipStatusInProgress, 1)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	entry := StateHistoryEntry{
+		Timestamp: time.Now(),
+		Step:      "push_parsed",
+		Status:    StepStatusCompleted,
+		Actor:     "ci",
+	}
+
+	err := store.AppendHistory(context.Background(), corrID, entry)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// AppendHistory must produce exactly one ExecWithArgs call (insertAtomicHistoryUpdate).
+	if len(mockSession.ExecWithArgsCalls) != 1 {
+		t.Fatalf("expected 1 ExecWithArgs call, got %d", len(mockSession.ExecWithArgsCalls))
+	}
+	call := mockSession.ExecWithArgsCalls[0]
+
+	// Without overrides, exactly 5 base args:
+	//   [0] correlationID, [1] newVersion, [2] newStateHistoryJSON, [3] newVersion, [4] correlationID.
+	// No extra step-status arg injected.
+	const wantArgCount = 5
+	if len(call.Args) != wantArgCount {
+		t.Errorf("expected %d ExecWithArgs args (no override), got %d: %v",
+			wantArgCount, len(call.Args), call.Args)
+	}
+
+	// push_parsed_status must appear 3 times verbatim (INSERT column list + cancel SELECT +
+	// new-row SELECT), confirming the column is copied from DB and not replaced with ?.
+	const colName = "push_parsed_status"
+	occurrences := strings.Count(call.Stmt, colName)
+	if occurrences != 3 {
+		t.Errorf(
+			"expected %q to appear 3 times in routing_slips INSERT (column list + cancel + new-row SELECT), got %d.\nQuery: %s",
+			colName, occurrences, call.Stmt,
+		)
+	}
+}
+
+
 // status read (QueryRow) returns an error, SetComponentImageTag propagates it and does
 // not attempt an insert.
 func TestClickHouseStore_SetComponentImageTag_QueryRowError(t *testing.T) {
