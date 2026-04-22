@@ -1051,21 +1051,29 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	// updated atomically alongside the history entry. This fixes the case where a pure
 	// pipeline step (e.g. unit_tests) would otherwise copy a stale "running" value from
 	// the routing_slips row that was last written by the builds aggregate write-back.
-	overrideByCol := make(map[string]StepStatus, len(overrides))
-	for _, o := range overrides {
-		overrideByCol[o.columnName] = o.status
-	}
-	stepSelectExprs := make([]string, 0, len(stepColumns))
-	stepOverrideArgs := make([]interface{}, 0, len(overrides))
-	for _, col := range stepColumns {
-		if overrideStatus, ok := overrideByCol[col]; ok {
-			stepSelectExprs = append(stepSelectExprs, "?")
-			stepOverrideArgs = append(stepOverrideArgs, string(overrideStatus))
-		} else {
+	//
+	// Fast-path: AppendHistory always calls with zero overrides, so skip the map/slice
+	// allocations entirely in that common case.
+	var stepOverrideArgs []interface{}
+	if len(overrides) == 0 {
+		newRowSelectCols = append(newRowSelectCols, stepColumns...)
+	} else {
+		overrideByCol := make(map[string]StepStatus, len(overrides))
+		for _, o := range overrides {
+			overrideByCol[o.columnName] = o.status
+		}
+		stepSelectExprs := make([]string, 0, len(stepColumns))
+		stepOverrideArgs = make([]interface{}, 0, len(overrides))
+		for _, col := range stepColumns {
+			if overrideStatus, ok := overrideByCol[col]; ok {
+				stepSelectExprs = append(stepSelectExprs, "?")
+				stepOverrideArgs = append(stepOverrideArgs, string(overrideStatus))
+				continue
+			}
 			stepSelectExprs = append(stepSelectExprs, col)
 		}
+		newRowSelectCols = append(newRowSelectCols, stepSelectExprs...)
 	}
-	newRowSelectCols = append(newRowSelectCols, stepSelectExprs...)
 	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
 
 	newRowQuery := fmt.Sprintf(
