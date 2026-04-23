@@ -96,13 +96,16 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 					opts.StepName, opts.ComponentName,
 					fmt.Sprintf("prerequisites failed: %v", result.FailedPrereqs),
 				); abortErr != nil {
-					c.logger.Warn(ctx, "failed to set aborted status for step", map[string]interface{}{
+					fields := map[string]interface{}{
 						"correlation_id": opts.CorrelationID,
 						"step":           opts.StepName,
-						"component_name": opts.ComponentName,
 						"failed_prereqs": result.FailedPrereqs,
 						"error":          abortErr.Error(),
-					})
+					}
+					if opts.ComponentName != "" {
+						fields["component_name"] = opts.ComponentName
+					}
+					c.logger.Warn(ctx, "failed to set aborted status for step", fields)
 				}
 			}
 			return fmt.Errorf("%w: %v", ErrPrerequisiteFailed, result.FailedPrereqs)

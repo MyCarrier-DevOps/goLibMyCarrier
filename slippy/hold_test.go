@@ -522,7 +522,7 @@ func TestErrorHelpers(t *testing.T) {
 }
 
 // TestWaitForPrerequisites_AbortOnPrereqFailed verifies that when prerequisites fail,
-// the waiting step is marked as aborted. This is Fix 2 for the cascade-abort behaviour:
+// the waiting step is marked as aborted. This is Fix 2 for the cascade-abort behavior:
 // checkPipelineCompletion uses StepStatusAborted to identify cascade failures vs primary
 // failures, enabling correct recovery when the upstream step is retried and succeeds.
 func TestWaitForPrerequisites_AbortOnPrereqFailed(t *testing.T) {
