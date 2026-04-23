@@ -989,3 +989,110 @@ func TestClient_RunPostExecution_Error(t *testing.T) {
 		}
 	})
 }
+
+// TestUpdateStepWithStatus_PipelineCompletion verifies that terminal pipeline-level
+// step events trigger checkPipelineCompletion, which propagates step failures to
+// slip.status = "failed" and recovers it back to "in_progress" when all primary
+// failures are resolved on rerun.
+func TestUpdateStepWithStatus_PipelineCompletion(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("failed pipeline step sets slip status to failed", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-pcfail-1",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha1",
+			Status:        SlipStatusInProgress,
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusRunning},
+			},
+		}
+		store.AddSlip(slip)
+
+		if err := client.FailStep(ctx, "corr-pcfail-1", "unit_tests", "", "unit tests failed"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-pcfail-1")
+		if err != nil {
+			t.Fatalf("unexpected error loading slip: %v", err)
+		}
+		if loaded.Status != SlipStatusFailed {
+			t.Errorf("expected slip status %q after step failure, got %q", SlipStatusFailed, loaded.Status)
+		}
+	})
+
+	t.Run("component-level step failure does not set slip status to failed", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		// componentName != "" — pipeline completion check must be skipped
+		slip := &Slip{
+			CorrelationID: "corr-pcfail-2",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha2",
+			Status:        SlipStatusInProgress,
+			Steps: map[string]Step{
+				"builds": {Status: StepStatusRunning},
+			},
+		}
+		store.AddSlip(slip)
+
+		if err := client.FailStep(ctx, "corr-pcfail-2", "builds", "mc.invoice.api", "component build failed"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-pcfail-2")
+		if err != nil {
+			t.Fatalf("unexpected error loading slip: %v", err)
+		}
+		if loaded.Status != SlipStatusInProgress {
+			t.Errorf("expected slip status %q (pipeline check skipped for component step), got %q",
+				SlipStatusInProgress, loaded.Status)
+		}
+	})
+
+	t.Run("rerun success restores slip to in_progress and resets cascade steps to pending", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		// Post-failure state: unit_tests failed, dev_deploy aborted as cascade
+		slip := &Slip{
+			CorrelationID: "corr-pcfail-3",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha3",
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusFailed},
+				"dev_deploy": {Status: StepStatusAborted},
+			},
+		}
+		store.AddSlip(slip)
+
+		// Rerun: unit_tests succeeds
+		if err := client.CompleteStep(ctx, "corr-pcfail-3", "unit_tests", ""); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-pcfail-3")
+		if err != nil {
+			t.Fatalf("unexpected error loading slip: %v", err)
+		}
+		if loaded.Status != SlipStatusInProgress {
+			t.Errorf("expected slip status %q after recovery, got %q", SlipStatusInProgress, loaded.Status)
+		}
+		if loaded.Steps["dev_deploy"].Status != StepStatusPending {
+			t.Errorf("expected dev_deploy step %q after cascade reset, got %q",
+				StepStatusPending, loaded.Steps["dev_deploy"].Status)
+		}
+	})
+}

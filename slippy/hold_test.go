@@ -520,3 +520,57 @@ func TestErrorHelpers(t *testing.T) {
 		}
 	})
 }
+
+// TestWaitForPrerequisites_AbortOnPrereqFailed verifies that when prerequisites fail,
+// the waiting step is marked as aborted. This is Fix 2 for the cascade-abort behaviour:
+// checkPipelineCompletion uses StepStatusAborted to identify cascade failures vs primary
+// failures, enabling correct recovery when the upstream step is retried and succeeds.
+func TestWaitForPrerequisites_AbortOnPrereqFailed(t *testing.T) {
+	ctx := context.Background()
+
+	store := NewMockStore()
+	github := NewMockGitHubAPI()
+	client := NewClientWithDependencies(store, github, Config{
+		HoldTimeout:  1 * time.Second,
+		PollInterval: 100 * time.Millisecond,
+	})
+
+	slip := &Slip{
+		CorrelationID: "corr-abort-prereq-1",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "abort1",
+		Status:        SlipStatusInProgress,
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusFailed},
+			"dev_deploy": {Status: StepStatusRunning},
+		},
+	}
+	store.AddSlip(slip)
+
+	err := client.WaitForPrerequisites(ctx, HoldOptions{
+		CorrelationID: "corr-abort-prereq-1",
+		Prerequisites: []string{"unit_tests"},
+		StepName:      "dev_deploy",
+	})
+
+	if err == nil {
+		t.Fatal("expected ErrPrerequisiteFailed, got nil")
+	}
+	if !errors.Is(err, ErrPrerequisiteFailed) {
+		t.Errorf("expected ErrPrerequisiteFailed, got %v", err)
+	}
+
+	// dev_deploy must be marked aborted so checkPipelineCompletion can classify
+	// it as a cascade failure (distinct from primary failures like unit_tests).
+	var foundAbortCall bool
+	for _, call := range store.UpdateStepCalls {
+		if call.StepName == "dev_deploy" && call.Status == StepStatusAborted {
+			foundAbortCall = true
+			break
+		}
+	}
+	if !foundAbortCall {
+		t.Error("expected dev_deploy to be marked as aborted when prerequisites failed")
+	}
+}

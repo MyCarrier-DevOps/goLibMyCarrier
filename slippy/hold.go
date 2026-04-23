@@ -84,6 +84,24 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 			c.logger.Error(ctx, "Prerequisites failed", nil, map[string]interface{}{
 				"failed_prereqs": result.FailedPrereqs,
 			})
+			// Mark this step as aborted so checkPipelineCompletion can distinguish
+			// cascade failures (aborted by an upstream primary failure) from primary
+			// failures themselves. Without this, the recovery path in
+			// checkPipelineCompletion cannot know which downstream steps to reset to
+			// pending when the upstream failure is retried and succeeds.
+			// Mirrors the TimeoutStep pattern immediately above.
+			if opts.StepName != "" {
+				if abortErr := c.AbortStep(
+					ctx, opts.CorrelationID,
+					opts.StepName, opts.ComponentName,
+					fmt.Sprintf("prerequisites failed: %v", result.FailedPrereqs),
+				); abortErr != nil {
+					c.logger.Warn(ctx, "failed to set aborted status for step", map[string]interface{}{
+						"step":  opts.StepName,
+						"error": abortErr.Error(),
+					})
+				}
+			}
 			return fmt.Errorf("%w: %v", ErrPrerequisiteFailed, result.FailedPrereqs)
 
 		case PrereqStatusRunning:

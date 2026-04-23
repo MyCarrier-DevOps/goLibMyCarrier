@@ -84,6 +84,24 @@ func (c *Client) UpdateStepWithStatus(
 		"status":    string(status),
 	})
 
+	// After any terminal event on a pipeline-level step (componentName == ""),
+	// re-evaluate the overall pipeline state. This propagates step failures to
+	// slip.status = "failed" and recovers it back to "in_progress" when all
+	// primary failures are resolved on rerun.
+	//
+	// Component-level events (componentName != "") are skipped here because the
+	// aggregate step's own terminal event will trigger the check once all
+	// components have resolved — avoiding redundant checks on every component.
+	if status.IsTerminal() && componentName == "" {
+		if _, _, checkErr := c.checkPipelineCompletion(ctx, correlationID); checkErr != nil {
+			c.logger.Warn(ctx, "pipeline completion check failed (non-fatal)", map[string]interface{}{
+				"correlation_id": correlationID,
+				"step":           stepName,
+				"error":          checkErr.Error(),
+			})
+		}
+	}
+
 	return nil
 }
 
