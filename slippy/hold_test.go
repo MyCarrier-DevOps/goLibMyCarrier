@@ -563,14 +563,16 @@ func TestWaitForPrerequisites_AbortOnPrereqFailed(t *testing.T) {
 
 	// dev_deploy must be marked aborted so checkPipelineCompletion can classify
 	// it as a cascade failure (distinct from primary failures like unit_tests).
-	var foundAbortCall bool
-	for _, call := range store.UpdateStepCalls {
-		if call.StepName == "dev_deploy" && call.Status == StepStatusAborted {
-			foundAbortCall = true
-			break
-		}
+	loaded, loadErr := store.Load(ctx, "corr-abort-prereq-1")
+	if loadErr != nil {
+		t.Fatalf("load slip: %v", loadErr)
 	}
-	if !foundAbortCall {
-		t.Error("expected dev_deploy to be marked as aborted when prerequisites failed")
+
+	step, ok := loaded.Steps["dev_deploy"]
+	if !ok {
+		t.Fatal("expected dev_deploy step to exist")
+	}
+	if step.Status != StepStatusAborted {
+		t.Errorf("expected dev_deploy status %q, got %q", StepStatusAborted, step.Status)
 	}
 }

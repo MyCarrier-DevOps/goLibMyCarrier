@@ -97,7 +97,8 @@ func (c *Client) UpdateStepWithStatus(
 			c.logger.Warn(ctx, "pipeline completion check failed (non-fatal)", map[string]interface{}{
 				"correlation_id": correlationID,
 				"step":           stepName,
-				"error":          checkErr.Error(),
+				"status":         string(status),
+				"error":          checkErr,
 			})
 		}
 	}

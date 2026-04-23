@@ -97,8 +97,11 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 					fmt.Sprintf("prerequisites failed: %v", result.FailedPrereqs),
 				); abortErr != nil {
 					c.logger.Warn(ctx, "failed to set aborted status for step", map[string]interface{}{
-						"step":  opts.StepName,
-						"error": abortErr.Error(),
+						"correlation_id": opts.CorrelationID,
+						"step":           opts.StepName,
+						"component_name": opts.ComponentName,
+						"failed_prereqs": result.FailedPrereqs,
+						"error":          abortErr.Error(),
 					})
 				}
 			}
