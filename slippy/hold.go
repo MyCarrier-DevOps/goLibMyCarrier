@@ -89,7 +89,7 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 			// failures themselves. Without this, the recovery path in
 			// checkPipelineCompletion cannot know which downstream steps to reset to
 			// pending when the upstream failure is retried and succeeds.
-			// Mirrors the TimeoutStep pattern immediately above.
+			// Mirrors the timeout handling pattern.
 			if opts.StepName != "" {
 				if abortErr := c.AbortStep(
 					ctx, opts.CorrelationID,
@@ -100,7 +100,7 @@ func (c *Client) WaitForPrerequisites(ctx context.Context, opts HoldOptions) err
 						"correlation_id": opts.CorrelationID,
 						"step":           opts.StepName,
 						"failed_prereqs": result.FailedPrereqs,
-						"error":          abortErr.Error(),
+						"error":          abortErr,
 					}
 					if opts.ComponentName != "" {
 						fields["component_name"] = opts.ComponentName
