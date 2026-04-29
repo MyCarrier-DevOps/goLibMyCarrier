@@ -581,6 +581,13 @@ func (s *ClickHouseStore) UpdateSlipStatus(ctx context.Context, correlationID st
 		// Post-write version check: detect if a concurrent writer inserted a higher-version row.
 		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
 		if versionErr != nil {
+			s.logger.Warn(ctx,
+				"slip status version check skipped after successful insert — conflict detection unavailable",
+				map[string]interface{}{
+					"correlation_id": correlationID,
+					"new_status":     string(newStatus),
+					"error":          versionErr,
+				})
 			retrySpan.AddAttribute("slippy.status_version_check_error", versionErr.Error())
 			retrySpan.EndSuccess()
 			return nil
@@ -590,8 +597,10 @@ func (s *ClickHouseStore) UpdateSlipStatus(ctx context.Context, correlationID st
 			retrySpan.AddAttribute("slippy.status_conflict_retry", conflictRetry)
 			if conflictRetry > historyConflictMaxRetries {
 				retrySpan.AddAttribute("slippy.status_conflict_retries_exhausted", true)
-				retrySpan.EndSuccess()
-				return nil
+				exhaustedErr := fmt.Errorf(
+					"UpdateSlipStatus for %q exhausted conflict retries: %w", correlationID, ErrMaxRetriesExceeded)
+				retrySpan.EndError(exhaustedErr)
+				return exhaustedErr
 			}
 			backoff := calculateAggregateConflictBackoff(conflictRetry)
 			select {
