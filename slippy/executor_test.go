@@ -507,6 +507,37 @@ func TestClient_CheckPipelineCompletion(t *testing.T) {
 		}
 	})
 
+	t.Run("steady_state completed but primary failure remains", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-completion-steady-with-failure",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "abc123",
+			Status:        SlipStatusInProgress,
+			Steps: map[string]Step{
+				"prod_alert_gate":   {Status: StepStatusFailed},
+				"prod_rollback":     {Status: StepStatusCompleted},
+				"prod_steady_state": {Status: StepStatusCompleted},
+			},
+		}
+		store.AddSlip(slip)
+
+		completed, status, err := client.checkPipelineCompletion(ctx, "corr-completion-steady-with-failure")
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+		if completed {
+			t.Error("expected pipeline to not be marked complete (failed is non-terminal)")
+		}
+		if status != SlipStatusFailed {
+			t.Errorf("expected status 'failed', got '%s'", status)
+		}
+	})
+
 	t.Run("failed", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
@@ -1093,6 +1124,37 @@ func TestUpdateStepWithStatus_PipelineCompletion(t *testing.T) {
 		if loaded.Steps["dev_deploy"].Status != StepStatusPending {
 			t.Errorf("expected dev_deploy step %q after cascade reset, got %q",
 				StepStatusPending, loaded.Steps["dev_deploy"].Status)
+		}
+	})
+
+	t.Run("late terminal step update does not change abandoned slip status", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-pcfail-abandoned",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-abandoned",
+			Status:        SlipStatusAbandoned,
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusRunning},
+				"dev_deploy": {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(slip)
+
+		if err := client.CompleteStep(ctx, "corr-pcfail-abandoned", "unit_tests", ""); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-pcfail-abandoned")
+		if err != nil {
+			t.Fatalf("unexpected error loading slip: %v", err)
+		}
+		if loaded.Status != SlipStatusAbandoned {
+			t.Errorf("expected terminal slip status %q to remain unchanged, got %q", SlipStatusAbandoned, loaded.Status)
 		}
 	})
 }

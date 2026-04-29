@@ -258,17 +258,6 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		return true, SlipStatusCompleted, nil
 	}
 
-	// Check if prod_steady_state is completed
-	if step, ok := slip.Steps["prod_steady_state"]; ok && step.Status == StepStatusCompleted {
-		c.logger.Info(ctx, "Pipeline complete! Updating slip status to completed", map[string]interface{}{
-			"correlation_id": correlationID,
-		})
-		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted); err != nil {
-			return true, SlipStatusCompleted, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
-		}
-		return true, SlipStatusCompleted, nil
-	}
-
 	// Categorize step failures into primary (step itself failed) vs cascade (aborted by upstream).
 	// Primary failures indicate real problems that need resolution.
 	// Cascade failures are collateral damage from an upstream primary failure.
@@ -298,6 +287,18 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 			return false, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
 		return false, SlipStatusFailed, nil
+	}
+
+	// Mark pipeline completed only when steady-state is complete and there are
+	// no remaining primary failures.
+	if step, ok := slip.Steps["prod_steady_state"]; ok && step.Status == StepStatusCompleted {
+		c.logger.Info(ctx, "Pipeline complete! Updating slip status to completed", map[string]interface{}{
+			"correlation_id": correlationID,
+		})
+		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted); err != nil {
+			return true, SlipStatusCompleted, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
+		}
+		return true, SlipStatusCompleted, nil
 	}
 
 	// No primary failures remain. If the slip was previously failed, reconcile:

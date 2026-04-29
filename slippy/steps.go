@@ -94,11 +94,18 @@ func (c *Client) UpdateStepWithStatus(
 	// Client.UpdateStepWithStatus at the pipeline-step level. Aggregate rollups
 	// performed inside the store (updateAggregateStatusFromComponentStatesWithHistory)
 	// do not re-enter this path, so they do not trigger pipeline completion from here.
+	//
+	// Known race window: checkPipelineCompletion calls UpdateSlipStatus which does a
+	// full Load+store.Update row rewrite. A concurrent appendHistoryWithOverrides
+	// landing between the Load and Update may lose a state_history entry (last-write-wins).
+	// Step statuses are unaffected (hydrateSlip re-derives them from slip_component_states).
+	// Follow-up: UpdateSlipStatusAtomic (INSERT SELECT override for status column only)
+	// eliminates this race without a full row rewrite.
 	if status.IsTerminal() && componentName == "" {
 		if _, _, checkErr := c.checkPipelineCompletion(ctx, correlationID); checkErr != nil {
 			c.logger.Warn(ctx, "pipeline completion check failed (non-fatal)", map[string]interface{}{
 				"correlation_id": correlationID,
-				"step":           stepName,
+				"step_name":      stepName,
 				"status":         string(status),
 				"error":          checkErr,
 			})
