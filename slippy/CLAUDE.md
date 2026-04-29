@@ -2,6 +2,18 @@
 
 This document provides guidance for AI-assisted development of the slippy routing slip library and its integrations.
 
+**State machine specification and validation instructions are in `.github/`:**
+
+| File | Purpose |
+|------|---------|
+| `.github/STATE_MACHINE.md` | Low-level state machine: step write paths, persistence model, concurrency, recovery algorithm, validation checklist |
+| `.github/STATE_MACHINE_V2.md` | High-level pipeline phases: INIT → CI → DEV/PREPROD → PROD_GATE → PROD_RELEASE → COMPLETED/ROLLBACK |
+| `.github/VALIDATE_CLAUDE.md` | 8-step validation framework for Claude when reviewing code changes |
+| `.github/VALIDATE_COPILOT.md` | 8-rule checklist for Copilot code review |
+| `.github/PROJECT_STATE.md` | Project history, consistency invariants (I1–I4), and known discrepancy table |
+
+**Before making any changes to this package, read `.github/VALIDATE_CLAUDE.md` first.**
+
 ---
 
 ## Overview

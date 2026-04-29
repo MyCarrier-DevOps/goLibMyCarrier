@@ -68,6 +68,12 @@ func deepCopySlip(slip *Slip) *Slip {
 	return cpy
 }
 
+// UpdateSlipStatusCall records an UpdateSlipStatus call.
+type UpdateSlipStatusCall struct {
+	CorrelationID string
+	Status        SlipStatus
+}
+
 // MockStore is an in-memory implementation of SlipStore for testing.
 // It provides configurable behavior and tracking of method calls.
 type MockStore struct {
@@ -80,34 +86,36 @@ type MockStore struct {
 	CommitIndex map[string]string
 
 	// Call tracking
-	CreateCalls           []CreateCall
-	LoadCalls             []string
-	LoadByCommitCalls     []LoadByCommitCall
-	FindByCommitsCalls    []FindByCommitsCall
-	FindAllByCommitsCalls []FindAllByCommitsCall
-	UpdateCalls           []UpdateCall
-	UpdateStepCalls       []UpdateStepCall
-	UpdateComponentCalls  []UpdateComponentCall
-	AppendHistoryCalls    []AppendHistoryCall
-	SetImageTagCalls      []SetImageTagCall
-	CloseCalls            int
+	CreateCalls            []CreateCall
+	LoadCalls              []string
+	LoadByCommitCalls      []LoadByCommitCall
+	FindByCommitsCalls     []FindByCommitsCall
+	FindAllByCommitsCalls  []FindAllByCommitsCall
+	UpdateCalls            []UpdateCall
+	UpdateStepCalls        []UpdateStepCall
+	UpdateComponentCalls   []UpdateComponentCall
+	AppendHistoryCalls     []AppendHistoryCall
+	SetImageTagCalls       []SetImageTagCall
+	UpdateSlipStatusCalls  []UpdateSlipStatusCall
+	CloseCalls             int
 
 	// Ping tracking and error injection
 	PingCalls int
 	PingError error
 
 	// Error injection for testing error paths
-	CreateError           error
-	LoadError             error
-	LoadByCommitError     error
-	FindByCommitsError    error
-	FindAllByCommitsError error
-	UpdateError           error
-	UpdateStepError       error
-	UpdateComponentError  error
-	AppendHistoryError    error
-	SetImageTagError      error
-	CloseError            error
+	CreateError            error
+	LoadError              error
+	LoadByCommitError      error
+	FindByCommitsError     error
+	FindAllByCommitsError  error
+	UpdateError            error
+	UpdateStepError        error
+	UpdateComponentError   error
+	AppendHistoryError     error
+	SetImageTagError       error
+	UpdateSlipStatusError  error
+	CloseError             error
 
 	// Conditional error injection (returns error only for specific IDs)
 	CreateErrorFor          map[string]error
@@ -459,6 +467,29 @@ func (m *MockStore) AppendHistory(ctx context.Context, correlationID string, ent
 	return nil
 }
 
+// UpdateSlipStatus atomically updates the slip's status field.
+func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.UpdateSlipStatusCalls = append(m.UpdateSlipStatusCalls, UpdateSlipStatusCall{
+		CorrelationID: correlationID,
+		Status:        status,
+	})
+
+	if m.UpdateSlipStatusError != nil {
+		return m.UpdateSlipStatusError
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return ErrSlipNotFound
+	}
+
+	slip.Status = status
+	return nil
+}
+
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
 // This is the combined operation that prevents race conditions.
 func (m *MockStore) UpdateStepWithHistory(
@@ -620,6 +651,7 @@ func (m *MockStore) Reset() {
 	m.UpdateComponentCalls = nil
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
+	m.UpdateSlipStatusCalls = nil
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }

@@ -1157,4 +1157,63 @@ func TestUpdateStepWithStatus_PipelineCompletion(t *testing.T) {
 			t.Errorf("expected terminal slip status %q to remain unchanged, got %q", SlipStatusAbandoned, loaded.Status)
 		}
 	})
+
+	t.Run("checkPipelineCompletion uses UpdateSlipStatus not Load+Update for status change", func(t *testing.T) {
+		// Regression test: checkPipelineCompletion previously called client.UpdateSlipStatus
+		// which did store.Load() + store.Update(). Now client.UpdateSlipStatus delegates to
+		// store.UpdateSlipStatus (atomic INSERT SELECT), so store.Load must NOT be called by
+		// the status-update path, and store.Update must NOT be called at all.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-pcfail-atomic",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-atomic",
+			Status:        SlipStatusInProgress,
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusRunning},
+			},
+		}
+		store.AddSlip(slip)
+
+		// Record Load count BEFORE the call — checkPipelineCompletion itself calls Load once
+		// to read the slip; the status update must NOT cause an additional Load call.
+		if err := client.FailStep(ctx, "corr-pcfail-atomic", "unit_tests", "", "unit tests failed"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// checkPipelineCompletion calls store.Load exactly once (to read current slip state).
+		// UpdateSlipStatus must NOT add any additional Load calls.
+		// Expected: 1 load from checkPipelineCompletion.
+		loadCalls := len(store.LoadCalls)
+		if loadCalls != 1 {
+			t.Errorf("expected exactly 1 store.Load call (from checkPipelineCompletion), got %d", loadCalls)
+		}
+
+		// store.Update must NOT have been called (old Load+Update path eliminated).
+		if len(store.UpdateCalls) != 0 {
+			t.Errorf("expected 0 store.Update calls (atomic path), got %d", len(store.UpdateCalls))
+		}
+
+		// store.UpdateSlipStatus must have been called exactly once.
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Errorf("expected 1 store.UpdateSlipStatus call, got %d", len(store.UpdateSlipStatusCalls))
+		}
+		if store.UpdateSlipStatusCalls[0].Status != SlipStatusFailed {
+			t.Errorf("expected UpdateSlipStatus called with %q, got %q",
+				SlipStatusFailed, store.UpdateSlipStatusCalls[0].Status)
+		}
+
+		// The slip's status must reflect the update.
+		loaded, err := store.Load(ctx, "corr-pcfail-atomic")
+		if err != nil {
+			t.Fatalf("unexpected error loading slip: %v", err)
+		}
+		if loaded.Status != SlipStatusFailed {
+			t.Errorf("expected slip status %q, got %q", SlipStatusFailed, loaded.Status)
+		}
+	})
 }

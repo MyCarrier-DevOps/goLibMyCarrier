@@ -95,12 +95,9 @@ func (c *Client) UpdateStepWithStatus(
 	// performed inside the store (updateAggregateStatusFromComponentStatesWithHistory)
 	// do not re-enter this path, so they do not trigger pipeline completion from here.
 	//
-	// Known race window: checkPipelineCompletion calls UpdateSlipStatus which does a
-	// full Load+store.Update row rewrite. A concurrent appendHistoryWithOverrides
-	// landing between the Load and Update may lose a state_history entry (last-write-wins).
-	// Step statuses are unaffected (hydrateSlip re-derives them from slip_component_states).
-	// Follow-up: UpdateSlipStatusAtomic (INSERT SELECT override for status column only)
-	// eliminates this race without a full row rewrite.
+	// UpdateSlipStatus uses an atomic INSERT SELECT (store.UpdateSlipStatus) that copies
+	// the current DB row and overrides only the status column — no Load+Update round-trip.
+	// Concurrent appendHistoryWithOverrides calls cannot lose state_history entries here.
 	if status.IsTerminal() && componentName == "" {
 		if _, _, checkErr := c.checkPipelineCompletion(ctx, correlationID); checkErr != nil {
 			c.logger.Warn(ctx, "pipeline completion check failed (non-fatal)", map[string]interface{}{

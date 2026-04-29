@@ -4853,3 +4853,169 @@ func TestClickHouseStore_LoadComponentStates_SelfHealOnImageTagError(t *testing.
 		t.Error("expected hasImageTagColumn=false after self-healing")
 	}
 }
+
+// TestClickHouseStore_UpdateSlipStatus verifies that UpdateSlipStatus:
+//   - Issues an INSERT (ExecWithArgs), not a full Load (QueryWithArgs)
+//   - Retries when a concurrent writer inserts a higher-version row (post-write conflict)
+//   - Reflects the new status in the store after success
+func TestClickHouseStore_UpdateSlipStatus(t *testing.T) {
+	t.Run("executes INSERT not Load+Update", func(t *testing.T) {
+		// loadVersionFromDB (pre-write floor) and post-write check both return version=1,
+		// so latestVersion == newVersion → no retry.
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+				// Both loadVersionFromDB calls return version=1.
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 1
+							}
+						}
+						return nil
+					},
+				}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.UpdateSlipStatus(context.Background(), "corr-status-001", SlipStatusCompleted)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		// Must have issued exactly one ExecWithArgs (the INSERT SELECT).
+		if len(mockSession.ExecWithArgsCalls) != 1 {
+			t.Errorf(
+				"expected 1 ExecWithArgs call (INSERT SELECT), got %d",
+				len(mockSession.ExecWithArgsCalls),
+			)
+		}
+		// Must NOT have called QueryWithArgs (no full Load).
+		if len(mockSession.QueryWithArgsCalls) != 0 {
+			t.Errorf(
+				"expected 0 QueryWithArgs calls (no full Load), got %d",
+				len(mockSession.QueryWithArgsCalls),
+			)
+		}
+		// The INSERT must target routing_slips.
+		if !strings.Contains(mockSession.ExecWithArgsCalls[0].Stmt, TableRoutingSlips) {
+			t.Errorf(
+				"expected INSERT into %s, got query: %s",
+				TableRoutingSlips,
+				mockSession.ExecWithArgsCalls[0].Stmt,
+			)
+		}
+		// The new status must appear in the exec args.
+		foundStatus := false
+		for _, arg := range mockSession.ExecWithArgsCalls[0].Args {
+			if s, ok := arg.(string); ok && s == string(SlipStatusCompleted) {
+				foundStatus = true
+			}
+		}
+		if !foundStatus {
+			t.Errorf(
+				"expected status %q in ExecWithArgs args, args: %v",
+				SlipStatusCompleted, mockSession.ExecWithArgsCalls[0].Args,
+			)
+		}
+	})
+
+	t.Run("retries on post-write version conflict then succeeds", func(t *testing.T) {
+		// Strategy: capture each newVersion from ExecWithArgs. On the first post-write check,
+		// return capturedNewVersion+1 to simulate a concurrent writer landing a higher-version
+		// row. On the second post-write check, return capturedNewVersion exactly (no conflict).
+		// This avoids guessing epoch magnitudes.
+		callCount := 0
+		var capturedNewVersion uint64
+		var mu sync.Mutex
+
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+				mu.Lock()
+				callCount++
+				n := callCount
+				cv := capturedNewVersion
+				mu.Unlock()
+
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								switch n {
+								case 1: // pre-write floor, attempt 1: return 0 so nextVersion() floor logic triggers
+									*v = 0
+								case 2: // post-write check, attempt 1 → conflict (return capturedNewVersion+1)
+									if cv > 0 {
+										*v = cv + 1
+									} else {
+										*v = 2
+									}
+								case 3: // pre-write floor, attempt 2
+									*v = 0
+								default: // post-write check, attempt 2 → return capturedNewVersion (no conflict)
+									if cv > 0 {
+										*v = cv
+									} else {
+										*v = 1
+									}
+								}
+							}
+						}
+						return nil
+					},
+				}
+			},
+			ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
+				// args order: correlationID, newVersion(cancel), status, newVersion(new row), correlationID
+				if len(args) >= 4 {
+					if v, ok := args[3].(uint64); ok {
+						mu.Lock()
+						capturedNewVersion = v
+						mu.Unlock()
+					}
+				}
+				return nil
+			},
+		}
+
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.UpdateSlipStatus(context.Background(), "corr-status-002", SlipStatusFailed)
+		if err != nil {
+			t.Fatalf("expected no error after retry, got %v", err)
+		}
+
+		// Two INSERT attempts (one per loop iteration).
+		if len(mockSession.ExecWithArgsCalls) != 2 {
+			t.Errorf("expected 2 ExecWithArgs calls (2 INSERT attempts), got %d", len(mockSession.ExecWithArgsCalls))
+		}
+		// Four QueryRow calls: 2 pre-write + 2 post-write.
+		mu.Lock()
+		gotCallCount := callCount
+		mu.Unlock()
+		if gotCallCount != 4 {
+			t.Errorf("expected 4 QueryRow calls (2 pre-write + 2 post-write), got %d", gotCallCount)
+		}
+	})
+
+	t.Run("returns error when slip not found", func(t *testing.T) {
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+				return &clickhousetest.MockRow{
+					ScanErr: sql.ErrNoRows,
+				}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.UpdateSlipStatus(context.Background(), "nonexistent", SlipStatusCompleted)
+		if !errors.Is(err, ErrSlipNotFound) {
+			t.Errorf("expected ErrSlipNotFound, got %v", err)
+		}
+		// No INSERT should have been issued.
+		if len(mockSession.ExecWithArgsCalls) != 0 {
+			t.Errorf("expected 0 ExecWithArgs calls, got %d", len(mockSession.ExecWithArgsCalls))
+		}
+	})
+}

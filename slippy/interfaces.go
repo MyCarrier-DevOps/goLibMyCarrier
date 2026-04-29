@@ -59,6 +59,11 @@ type SlipStore interface {
 	// AppendHistory adds a state history entry to the slip
 	AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error
 
+	// UpdateSlipStatus atomically updates the slip's top-level status without a full Load+Update
+	// round-trip. Uses INSERT SELECT to copy the current DB row and override only the status
+	// column, preventing concurrent history appends from being lost under last-write-wins.
+	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
+
 	// SetComponentImageTag records the built container image tag for a component in the event log.
 	// stepName is the component step type (e.g. "build"); componentName is the service name.
 	SetComponentImageTag(ctx context.Context, correlationID, stepName, componentName, imageTag string) error
