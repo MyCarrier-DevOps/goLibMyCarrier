@@ -481,8 +481,8 @@ func TestStateMachine_I4_CompletedSlipIgnoresRecoveryAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkPipelineCompletion returned unexpected error: %v%s", err, stateMachineRef)
 	}
-	// The function short-circuits immediately on slip.Status == completed;
-	// it returns (false, "", nil) from the early-return path.
+	// The function short-circuits immediately when slip.Status == completed;
+	// it returns (true, SlipStatusCompleted, nil) from the early-return path.
 	_ = completed
 	_ = status
 

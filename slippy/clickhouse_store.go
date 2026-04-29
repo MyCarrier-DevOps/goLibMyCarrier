@@ -542,7 +542,7 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 //
 // The retry loop mirrors appendHistoryWithOverrides: load current version, write new version
 // (newVersion > currentVersion), post-write check, backoff+retry on conflict. On retry
-// exhaustion the function returns nil (best-effort, same as AppendHistory).
+// exhaustion the function returns an error, typically wrapping ErrMaxRetriesExceeded.
 func (s *ClickHouseStore) UpdateSlipStatus(ctx context.Context, correlationID string, newStatus SlipStatus) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
