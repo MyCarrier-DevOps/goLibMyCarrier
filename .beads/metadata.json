@@ -1,7 +1,0 @@
-{
-  "database": "dolt",
-  "backend": "dolt",
-  "dolt_mode": "embedded",
-  "dolt_database": "goLibMyCarrier",
-  "project_id": "d286c7a8-30b0-494f-acb7-0aa5336d3469"
-}
