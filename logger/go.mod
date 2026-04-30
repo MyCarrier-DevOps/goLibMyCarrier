@@ -5,7 +5,7 @@ go 1.26
 require (
 	github.com/smartystreets/goconvey v1.8.1
 	github.com/stretchr/testify v1.8.1
-	go.uber.org/zap v1.27.1
+	go.uber.org/zap v1.28.0
 )
 
 require (

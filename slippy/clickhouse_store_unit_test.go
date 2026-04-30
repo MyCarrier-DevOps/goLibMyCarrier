@@ -320,6 +320,23 @@ func TestClickHouseStore_LoadByCommit(t *testing.T) {
 			t.Errorf("expected ErrSlipNotFound, got %v", err)
 		}
 	})
+
+	t.Run("uses case-insensitive repository comparison", func(t *testing.T) {
+		var capturedQuery string
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				capturedQuery = query
+				return &clickhousetest.MockRow{ScanErr: ErrSlipNotFound}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		_, _ = store.LoadByCommit(context.Background(), "MyOrg/MyRepo", "abc123")
+
+		if !strings.Contains(capturedQuery, "lower(repository)") || !strings.Contains(capturedQuery, "lower(?)") {
+			t.Errorf("expected query to use lower() for case-insensitive repo match, got: %s", capturedQuery)
+		}
+	})
 }
 
 // TestClickHouseStore_FindByCommits tests the FindByCommits method.
@@ -3329,11 +3346,12 @@ func TestClickHouseStore_AppendHistory_NoStatusColumnOverride(t *testing.T) {
 	if occurrences != 3 {
 		t.Errorf(
 			"expected %q to appear 3 times in routing_slips INSERT (column list + cancel + new-row SELECT), got %d.\nQuery: %s",
-			colName, occurrences, call.Stmt,
+			colName,
+			occurrences,
+			call.Stmt,
 		)
 	}
 }
-
 
 // status read (QueryRow) returns an error, SetComponentImageTag propagates it and does
 // not attempt an insert.
