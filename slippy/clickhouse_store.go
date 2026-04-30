@@ -302,7 +302,7 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 	// Only select active rows (sign=1) to exclude orphaned cancel rows.
 	// Order by version DESC to get the latest version.
 	query := s.queryBuilder.BuildSelectQuery(
-		"WHERE repository = ? AND commit_sha = ? AND sign = 1",
+		"WHERE lower(repository) = lower(?) AND commit_sha = ? AND sign = 1",
 		"ORDER BY version DESC LIMIT 1",
 	)
 	slip, err := s.scanSlip(ctx, query, repository, commitSHA)
