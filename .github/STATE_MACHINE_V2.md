@@ -401,7 +401,7 @@ Auto-deployer is **read-only** (polls `GetSlip`). It triggers Argo workflows via
 
 ### `checkPipelineCompletion` Pseudocode
 
-**Location:** `executor.go:249`  
+**Location:** `executor.go:249`
 **Triggered by:** terminal event on a pure pipeline step (guard: `IsTerminal() && componentName == ""`)
 
 ```
@@ -495,6 +495,146 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 **Violation 3 (persistence):** `routing_slips` written before `insertComponentState` → if the process crashes between the two writes, `hydrateSlip` will not override the cached status; step is permanently stuck. Rule: `STATE_MACHINE.md §8`.
 
 **Violation 4 (phase independence):** New prerequisite added to a step that breaks phase independence — e.g., adding `unit_tests` to `dev_deploy` prereqs couples DEV TRACK to CI_PARALLEL completion. Rule: `STATE_MACHINE_V2.md` — DEV + PREPROD PARALLEL phase.
+
+---
+
+## Slippy simulation (Game) prompt
+
+Alias: Slippy agent validation.
+
+**Hard rule for both agents: every claim must cite `file_path:line_number` from the live codebase. No speculation, no assumptions, no inferences from spec docs alone. If a fact cannot be verified in code, label it `UNVERIFIED` and explain what is missing.**
+
+```text
+VARIABLES (set once at invocation; if not specified, defaults below apply):
+  CALLER_PATH    = /Volumes/repos/mycarrier/DevOps/Slippy          [default]
+  CALLER_BRANCH  = main                                              [default]
+  LIBRARY_SOURCE = go.mod                                            [default: resolve from CALLER_PATH go.mod]
+                   | or explicit path, e.g. /Volumes/repos/mycarrier/DevOps/goLibMyCarrier/slippy
+                   |   (use for post-PR#56 working tree or any unreleased in-tree version)
+  LIBRARY_LABEL  = auto-derived:
+                   • if LIBRARY_SOURCE=go.mod → "<version> (linked from <CALLER_PATH> go.mod)"
+                   • if LIBRARY_SOURCE=explicit path → "post-PR#56 working tree" (or describe the version)
+
+Both agents lock these values once and use them for ALL file:line citations throughout.
+Cross-version contamination (citing one version's code while claiming another) is a hard failure.
+
+----
+
+Run two subagents on the slippy pipeline (production.json):
+
+Agent 1 — Workflow Simulator, Haiku model.
+
+STEP 0 — Lock version (mandatory, before any other step):
+  • If LIBRARY_SOURCE=go.mod: read CALLER_PATH go.mod (on CALLER_BRANCH), extract the goLibMyCarrier version tag, locate that exact version in the Go module cache.
+    Set LIBRARY_LABEL = "<version> (linked from <CALLER_PATH> go.mod)".
+    Set LIBRARY_PATH  = $GOPATH/pkg/mod/github.com/!my!carrier-!dev!ops/go!lib!my!carrier/slippy@<version>
+  • If LIBRARY_SOURCE=explicit path: set LIBRARY_PATH = LIBRARY_SOURCE, LIBRARY_LABEL as provided.
+  • Write the locked values into the report header (first lines of slippy-simulation-report.md):
+      CALLER:  <CALLER_PATH> @ <CALLER_BRANCH>
+      LIBRARY: <LIBRARY_LABEL>
+      LIBRARY_PATH: <LIBRARY_PATH>
+  • Every library_code_ref in every emitted event uses LIBRARY_PATH as the path prefix.
+    If you cite a path outside LIBRARY_PATH for a library claim — that is a cross-version contamination error.
+
+Source of truth — read these BEFORE simulating:
+  • Caller: CALLER_PATH at CALLER_BRANCH.
+    Other valid callers (if CALLER_PATH overridden): slippy-api (slippy-api/internal/infrastructure/slip_writer.go), MC.TestEngine (TestEngine.Worker/pkg/worker/slippy.go), pushhookparser.
+  • Library: LIBRARY_PATH (locked in STEP 0 — not the local goLibMyCarrier working tree unless LIBRARY_SOURCE is explicit).
+  • Pipeline definition: goLibMyCarrier/slippy/production.json (steps, prerequisites, aggregates, is_gate).
+
+Section 1 — CLI/API surface enumeration (mandatory, FIRST):
+  • Enumerate every subcommand the chosen caller exposes by listing every file in its CLI/handler directory (e.g. ci/Slippy/internal/cli/*.go).
+    For each: file:line, command name, flags, the slippy library method it ultimately calls.
+  • Do NOT invent commands. If a transition you need cannot be driven by any enumerated command, explicitly mark it OUT-OF-CALLER and document who actually drives it
+    (e.g. dev_tests / preprod_tests are started by MC.TestEngine via ArgoCD PostSync; prod_alert_gate skip and prod_rollback are driven by alert-gate.yaml / gitops-rollback.yaml workflow templates).
+
+Section 1b — OUT-OF-CALLER driver source read (mandatory, FIRST, before emitting any event):
+  • For each OUT-OF-CALLER driver you will reference in the simulation, READ ITS ACTUAL SOURCE before emitting any event tagged with it. Do NOT infer behavior from production.json, the spec doc, or the step's prerequisites — read the driver.
+  • For workflow-core YAML drivers: read the full template body. Identify every step that calls a slippy CLI command (slippy pre-job, slippy post-job, slippy skip-step, slippy start-step). Note: prod_steady_state may be completed directly via post-job from an exit handler with NO prior pre-job — verify in alert-gate.yaml before claiming a running phase.
+  • For MC.TestEngine: read /Volumes/repos/mycarrier/DevOps/MC.TestEngine/TestEngine.Worker/pkg/worker/slippy.go. TestEngine may call ResolveSlip + StartStep directly, bypassing WaitForPrerequisites — verify before claiming a pre-job phase.
+  • For pushhookparser: read its slip-creation code. Confirm the initial step states (pending vs running) before emitting the T+0 snapshot.
+  • Document each driver's actual call chain in a "Section 1b — OUT-OF-CALLER driver call chains" table BEFORE Section 2 events. Columns: driver | file:line | what it calls (CLI command + library method) | step lifecycle (pre-job → post-job vs post-job-only vs StartStep+post-job vs skip-step).
+  • If you skip Section 1b for a driver, every event you emit for that driver MUST be labeled UNVERIFIED.
+
+Scenario:
+  • Simulate one complete slip from creation through prod_steady_state=completed.
+  • Start all no-prereq steps concurrently (per production.json).
+  • Inject ≥3 failures: one build component, one pure-pipeline step, and one concurrent same-timestamp pair with opposite outcomes (one success, one failure).
+  • Restart all failed steps to success and continue to terminal completion.
+
+Per-event format (one JSON object per transition):
+{
+  "t": "T+45s",
+  "caller_command": "<exact CLI command or 'OUT-OF-CALLER: <who>'>",
+  "caller_code_ref": "ci/Slippy/internal/cli/postjob.go:NN",
+  "library_call": "client.RunPostExecution(...)",
+  "library_code_ref": "slippy@vX.Y.Z/executor.go:203",
+  "step_transition": {"step": "...", "component": "...", "from": "...", "to": "..."},
+  "aggregate_transition": null | {"step": "...", "from": "...", "to": "..."},
+  "slip_transition": null | {"from": "...", "to": "..."},
+  "trigger_for_slip_change": "<file:line of the call site that fires checkPipelineCompletion, OR 'none — slip status unchanged'>",
+  "verification": "VERIFIED" | "UNVERIFIED — <what is missing>"
+}
+
+Forbidden claims (auto-fail an event if it appears):
+  • "cascade-aborted" without identifying an active WaitForPrerequisites poller for that step. Pending steps without a started runner stay 'pending', not 'aborted' (hold.go is the only abort path).
+    Note: in some library versions WaitForPrerequisites returns an error WITHOUT calling AbortStep — verify in the linked hold.go. If it doesn't write 'aborted' to the DB, no cascade-aborts occur.
+  • "Aggregate write-back fires checkPipelineCompletion" — the store's aggregate write-back calls s.Update directly; it does NOT re-enter Client.UpdateStepWithStatus.
+    Only the chain UpdateStepWithStatus(componentName=="") guard OR RunPostExecution → executor.go:229 fires checkPipelineCompletion. Cite which one for each slip transition.
+  • "checkPipelineCompletion fires for component events via UpdateStepWithStatus" — verify this by checking the actual linked-version steps.go guard. In some versions only RunPostExecution drives it.
+  • OUT-OF-CALLER step lifecycle claims (e.g. "prod_alert_gate runs pre-job → post-job", "prod_steady_state has a running phase", "TestEngine calls RunPreExecution") that were not verified by reading the driver source per Section 1b. Inference from prerequisites alone is not verification.
+  • Any timing claim (e.g. recovery at T+X) that is not derivable from the events you emitted.
+
+After each phase transition, emit a state snapshot:
+{ "phase": "...", "t": "...", "slip_status": "...", "primary_failures": [...], "cascade_aborted": [...], "running": [...], "completed": [...], "pending": [...] }
+
+Section "Open assumptions" must list every assumption with VERIFIED (file:line) or UNVERIFIED (what is missing).
+The simulation must be self-consistent: dev_tests=completed cannot precede dev_deploy=completed.
+
+Output file: slippy-simulation-report.md.
+
+----
+
+Agent 2 — State Validator, Sonnet model.
+
+STEP 0 — Read locked version from Agent 1's report header (mandatory, first):
+  • Open Agent 1's report file. Read the CALLER / LIBRARY / LIBRARY_PATH lines at the top.
+  • Set your LIBRARY_PATH and LIBRARY_LABEL to those exact values.
+  • Every library file:line you cite uses LIBRARY_PATH as the path prefix.
+  • Cross-version contamination is a hard failure: if you cite a path outside LIBRARY_PATH — mark yourself WRONG on that point.
+  • Do NOT resolve go.mod yourself — use what Agent 1 locked.
+
+Inputs:
+  • Agent 1's report file (path provided).
+  • LIBRARY_PATH from Agent 1's report header (the single source of library truth for this round).
+  • State machine spec: STATE_MACHINE_V2.md (invariants I1–I4 reference only — NOT a substitute for code).
+
+Validation rules:
+  1. Validate against LIBRARY_PATH only. Never switch to the local goLibMyCarrier working tree unless Agent 1's header says LIBRARY_SOURCE is an explicit local path.
+     If Agent 1 locked v1.3.75, all your library citations must be v1.3.75 paths — even if you know post-PR#56 behavior from training.
+  2. Classify every event as CORRECT / WRONG / PARTIAL with file:line citations.
+  3. Specifically check:
+     a) Does checkPipelineCompletion actually fire for each claimed trigger?
+        - For RunPostExecution: confirm executor.go:229 (or equivalent) in the linked version.
+        - For direct UpdateStepWithStatus: read the actual guard in steps.go for the linked version. The guard differs between v1.3.75 (no checkPipelineCompletion in steps.go at all) and post-PR-#56 versions (guard fires for componentName=="").
+     b) Cascade-abort claims — only valid if Agent 1 emitted (or implied) an active WaitForPrerequisites poller for that step. Otherwise mark WRONG.
+     c) Aggregate transitions — verify computeAggregateStatus and applyComponentStatesToAggregate in the linked clickhouse_store.go produce the claimed aggregate value.
+     d) "OUT-OF-CALLER" tags — verify Agent 1 honestly flagged transitions not driven by the chosen caller (TestEngine PostSync, alert-gate.yaml, gitops-rollback.yaml, prod-gate.yaml, etc.).
+     e) Recovery branch — confirm both conditions (slip.Status==failed AND len(primaryFailures)==0) hold at the recovery event Agent 1 identified.
+     f) Concurrent same-timestamp events — verify they are reachable through independent CLI invocations and the store's conflict-free path (insertComponentState retry loop) handles them.
+  4. List Agent 1's "Open assumptions" and re-classify each as VERIFIED / UNVERIFIED / WRONG with file:line.
+  5. Compute a correctness rate (correct events / total). Flag any "correct outcome, wrong reason" cases — they count as PARTIAL, not CORRECT.
+
+Output: slippy-simulation-validation.md with a per-event verdict table, a discrepancies section (4–8 lines per WRONG/PARTIAL event), a cross-cutting findings section, and a one-paragraph verdict.
+
+Hard rule: validate against LIBRARY_PATH only (read from Agent 1's report header). Do not apply memorized behavior from a different version — if you know post-PR#56 logic and LIBRARY_LABEL says v1.3.75, those are WRONG citations. Cite the actual code in the locked path.
+
+To switch codebase for next round: override LIBRARY_SOURCE in the VARIABLES block (e.g. set LIBRARY_SOURCE to the goLibMyCarrier working tree path for post-PR#56 testing).
+
+----
+
+Feed Agent 1's output file path to Agent 2. Both agents are read-only. Final deliverable: simulation-report.md + simulation-validation.md.
+```
 
 ---
 
