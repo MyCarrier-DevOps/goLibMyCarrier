@@ -45,3 +45,4 @@ bin/
 .dolt/
 *.db
 .beads-credential-key
+**/.beads
