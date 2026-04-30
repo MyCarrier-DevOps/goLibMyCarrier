@@ -3,8 +3,8 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator
 go 1.26
 
 require (
-	github.com/ClickHouse/clickhouse-go/v2 v2.44.0
-	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.70
+	github.com/ClickHouse/clickhouse-go/v2 v2.45.0
+	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.75
 )
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger
@@ -23,7 +23,7 @@ require (
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.27.1 // indirect
+	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
-	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 )
