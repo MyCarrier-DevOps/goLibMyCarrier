@@ -137,16 +137,9 @@ func (c *Client) LoadByCommit(ctx context.Context, repository, commitSHA string)
 
 // UpdateSlipStatus updates the overall slip status.
 func (c *Client) UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error {
-	slip, err := c.store.Load(ctx, correlationID)
-	if err != nil {
+	if err := c.store.UpdateSlipStatus(ctx, correlationID, status); err != nil {
 		return NewSlipError("update status", correlationID, err)
 	}
-
-	slip.Status = status
-	if err := c.store.Update(ctx, slip); err != nil {
-		return NewSlipError("update status", correlationID, err)
-	}
-
 	c.logger.Info(ctx, "Updated slip status", map[string]interface{}{
 		"correlation_id": correlationID,
 		"status":         string(status),

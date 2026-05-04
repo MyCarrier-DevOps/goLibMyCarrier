@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** April 1, 2026
-> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-6); coverage 82.2%; lint clean
+> **Last Updated:** April 29, 2026
+> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-6); coverage 82.2%; lint clean; state machine invariants documented; executor.go ordering fix applied
 
 ---
 
@@ -47,6 +47,27 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Event Sourcing for Component Updates** - uses high-throughput `ReplacingMergeTree` for component states
 - **Event Sourcing extended to pipeline-level steps** (March 4, 2026) - eliminates concurrent lost-update bug; see "Recent Changes"
 - See `slippy/CLAUDE.md` for detailed patterns
+- See `.github/STATE_MACHINE_V3.md` for state machine specification, algorithm reference, and validation guide
+
+#### Slippy State Machine — Consistency Invariants
+
+A **discrepancy** is any condition where `slip.status` violates one of these invariants.
+Source values from `slippy/status.go`.
+
+**Primary failure statuses:** `failed` · `error` · `timeout`
+**Cascade failure** (not primary — does not independently drive `slip.status`): `aborted`
+**Non-failure statuses:** `pending` · `held` · `running` · `completed` · `skipped`
+
+| # | Invariant | Violation |
+|---|-----------|-----------|
+| **I1** | If any step `status ∈ {failed, error, timeout}` → `slip.status MUST = failed` | `slip=in_progress` while primary failure exists |
+| **I2** | If no step `status ∈ {failed, error, timeout}` AND `prod_steady_state ≠ completed` → `slip.status MUST ≠ failed` | `slip=failed` when no primary failure exists |
+| **I3** | `slip=completed` ONLY when: `prod_steady_state=completed` AND no `{failed,error,timeout}` AND no `running` step | `slip=completed` with active failures or running steps |
+| **I4** | Once `slip=completed`, no event may change it | Any status change after `completed` |
+
+I1/I2 are eventually consistent — transient inconsistency between step event write and next `checkPipelineCompletion` call is acceptable. Permanent inconsistency is a violation.
+
+**Pipeline termination without completing:** `abandoned` (`AbandonSlip`, client.go:170 — new push supersedes branch), `promoted` (`PromoteSlip`, client.go:204 — PR squash-merge). Both bypass `checkPipelineCompletion`. No operator abort tool exists.
 
 ### Component State Event Sourcing (January 20, 2026)
 - **Status:** Complete & Validated
@@ -145,6 +166,42 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### April 29, 2026 — Slippy State Machine Documentation, Invariants & Bug Fixes
+
+**Context:** Interactive state-machine game session tracing every pipeline step transition, concurrent update scenario, and failure/recovery path against the live codebase and production workflow templates.
+
+#### Code fixes (local, staged/unstaged)
+
+1. **`executor.go` — `checkPipelineCompletion` ordering bug (I1/I3 violation)**
+   - The committed code checked `prod_steady_state=completed` **before** scanning for primary failures. If `prod_steady_state=completed` and any step simultaneously had `failed/error/timeout`, the slip would be marked `completed` instead of `failed`.
+   - Fixed: primaryFailures scan/check now runs **first** (`executor.go:280`), `prod_steady_state` check second (`executor.go:294`).
+   - Test added: `steady_state completed but primary failure remains` — verifies I3 enforcement.
+
+2. **`default.json` — `prod_alert_gate` and `prod_rollback` prerequisites corrected**
+   - Both had explicit `"prerequisites": ["prod_deploy", "prod_tests"]` in `default.json` — wrong; gate injection from `prod_gate` is the only blocking mechanism. Fixed to `[]`, matching `production.json`.
+
+3. **Slippy CLI PR #17 — `App.PostJob` should use `RunPostExecution`**
+   - `App.PostJob` was calling `CompleteStep`/`FailStep` directly, bypassing `RunPostExecution`. This meant `checkPipelineCompletion` was never triggered for aggregate/component build steps — `slip.status` stayed stale after builds fail or complete.
+   - Fix: replaced with `client.RunPostExecution(...)`. Verification and telemetry logic preserved.
+   - PR: https://github.com/MyCarrier-DevOps/Slippy/pull/17
+
+#### New documentation files (in `slippy/`)
+
+| File | Purpose |
+|------|---------|
+| `STATE_MACHINE.md` | Low-level state machine: step write paths, concurrency model, recovery algorithm, validation checklist |
+| `STATE_MACHINE_V3.md` | High-level pipeline phases: INIT → CI_PARALLEL → DEV/PREPROD → PROD_GATE → PROD_RELEASE → PROD_MONITORING → COMPLETED/ROLLBACK |
+| `VALIDATE_CLAUDE.md` | 8-step Claude validation framework for code changes — maps each change type to the relevant invariant and phase |
+| `VALIDATE_COPILOT.md` | 8-rule Copilot checklist for code review — concrete code patterns to flag |
+
+#### Known discrepancies catalogued (see Technical Debt section)
+
+9 discrepancies found across docs (#1-#5), code (#1, #6), and design (#7-#9). See below.
+
+**Validation:** `go build ./...` clean · all tests pass · new test for I3 ordering added.
+
+---
 
 ### April 1, 2026 — Copilot PR Review Resolutions Round 5 (April 1 14:23 batch)
 
@@ -938,9 +995,22 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ## Current Focus
 
-1. **Aggregate write-back OCC conflict retry implemented** (March 5, 2026) — post-write conflict detection + exponential-backoff retry in both aggregate write-back functions; lint clean, 80.5% coverage.
-2. **Ready for PR merge** — covers event-sourcing fix, 4-phase residual fix, and write-back conflict retry.
-3. **Next: Publish & propagate** — release new goLibMyCarrier version; update downstream consumers.
+1. **State machine invariants documented** (April 29, 2026) — `STATE_MACHINE.md`, `STATE_MACHINE_V3.md`, `VALIDATE_CLAUDE.md`, `VALIDATE_COPILOT.md` in `.github/`; 9 discrepancies catalogued.
+2. **`executor.go` ordering fix** — `checkPipelineCompletion` primaryFailures now checked before `prod_steady_state`; test added; staged, pending commit.
+3. **`default.json` prerequisites fix** — `prod_alert_gate`/`prod_rollback` prerequisites corrected to `[]`; unstaged, pending commit.
+4. **PR #56 Copilot review fixes** (April 29, 2026) — 3 unresolved comments addressed; pending commit:
+   - `steps.go`: `"step"` → `"step_name"` in warn log for consistency
+   - `steps.go`: race window comment updated (now documents that the race is resolved — see item 5 below)
+   - `executor_test.go`: regression test added — late terminal step update on abandoned slip must not change slip status
+5. **`UpdateSlipStatusAtomic` implemented** (April 29, 2026) — eliminates the Load+Update clobber risk in `UpdateSlipStatus`; pending commit:
+   - `clickhouse_store.go`: new `UpdateSlipStatus` store method using atomic INSERT SELECT (copies current row, overrides only `status` column; same retry loop as `appendHistoryWithOverrides`)
+   - `interfaces.go`: `UpdateSlipStatus` added to `SlipStore` interface
+   - `client.go`: `UpdateSlipStatus` now delegates to `store.UpdateSlipStatus` — no more Load+Update round-trip
+   - `mock_store_test.go` + `slippytest/mock_store.go`: mocks updated
+   - `clickhouse_store_unit_test.go`: 3 unit tests — verifies INSERT only (no Load), retry on conflict, ErrSlipNotFound
+   - `executor_test.go`: regression test verifies `checkPipelineCompletion` uses store.UpdateSlipStatus (0 store.Load calls for status update)
+5. **Slippy CLI PR #17** — `App.PostJob` → `RunPostExecution` fix; in review at https://github.com/MyCarrier-DevOps/Slippy/pull/17.
+6. **Open design discrepancies** (#7, #8, #9) — TestEngine/preprod/prod_gate design gaps; need team decision before action.
 
 ---
 
@@ -1083,6 +1153,22 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - [ ] `NewClickHouseStoreFromConfig` at 0% coverage - requires real ClickHouse connection
 - [ ] `NewClient` in slippy at 18.2% coverage - requires real ClickHouse/GitHub connections
 - [ ] `chcol.JSON` mocking limitations - step_details timestamp parsing cannot be unit tested (requires integration tests)
+
+### Slippy State Machine Discrepancies
+
+Discovered April 29, 2026. Full detail and fix status in `slippy/DISCREPANCIES.md`.
+
+| # | Classification | Description | Status |
+|---|---------------|-------------|--------|
+| #1 | Code bug + Docs | `checkPipelineCompletion` checked `prod_steady_state` before primary failures — violated I1/I3 | ✅ Fixed |
+| #2 | Docs | `checkPipelineCompletion` short-circuit described as `IsTerminal()` — code only guards `== completed` | ✅ Fixed in docs |
+| #3 | Docs + Code | `prod_alert_gate` / `prod_rollback` prerequisites listed as `[prod_deploy, prod_tests]` — should be `[]` | ✅ Fixed |
+| #4 | Docs | `push_parsed` listed as step #0 — `builds` is step #0 in config mode | ✅ Fixed in docs |
+| #5 | Docs | `dev_deploy` prerequisites documented as `[builds, unit_tests, secret_scan]` — production.json has `[builds]` only | ✅ Fixed in docs |
+| #6 | **Code gap** | Slippy CLI `App.PostJob` calls `CompleteStep`/`FailStep` directly; `checkPipelineCompletion` never fires for component steps — `slip.status` stale after builds events | ✅ PR #17 in review |
+| #7 | Design gap | TestEngine calls `StartStep` without `WaitForPrerequisites` — tests can start against wrong/incomplete deployment | ❌ Open — team decision |
+| #8 | Design gap | `preprod_deploy` has no dependency on `dev_deploy` or `dev_tests` — preprod can proceed when dev has failed | ❌ Open — team decision |
+| #9 | Design gap | `prod_gate` can open on `preprod_tests` results from a failed deployment (stale test evidence gates production) | ❌ Open — team decision |
 
 ---
 

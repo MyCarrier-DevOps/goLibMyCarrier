@@ -2,6 +2,15 @@
 
 This document provides guidance for AI-assisted development of the slippy routing slip library and its integrations.
 
+**State machine specification and validation instructions are in `.github/`:**
+
+| File | Purpose |
+|------|---------|
+| `.github/STATE_MACHINE_V3.md` | Full specification: pipeline phases, consistency invariants (I1–I4), algorithm reference, validation checklist, and automated test coverage |
+| `.github/PROJECT_STATE.md` | Project history, known discrepancy table, and architectural decisions |
+
+**Before making any changes to this package, read `.github/STATE_MACHINE_V3.md` first.**
+
 ---
 
 ## Overview
@@ -79,7 +88,7 @@ func InitializeSlippy(ctx context.Context, logger Logger) (*slippy.Client, error
     }
 
     cfg := slippy.ConfigFromEnv()
-    
+
     if err := cfg.Validate(); err != nil {
         return handleInitError(logger, err)  // Shadow mode determines blocking
     }
@@ -235,7 +244,7 @@ func TestMyFunction(t *testing.T) {
     store := NewMockStore()
     github := NewMockGitHub()
     client := slippy.NewClientWithDependencies(store, github, config)
-    
+
     // Test with mocks
 }
 ```
@@ -248,14 +257,14 @@ Always test both shadow mode ON and OFF:
 func TestOperation_ShadowModeOn(t *testing.T) {
     os.Setenv("SLIPPY_SHADOW_MODE", "true")
     defer os.Unsetenv("SLIPPY_SHADOW_MODE")
-    
+
     err := operationThatMightFail()
     assert.NoError(t, err)  // Shadow mode swallows errors
 }
 
 func TestOperation_ShadowModeOff(t *testing.T) {
     os.Unsetenv("SLIPPY_SHADOW_MODE")
-    
+
     err := operationThatMightFail()
     assert.Error(t, err)  // Production mode returns errors
 }

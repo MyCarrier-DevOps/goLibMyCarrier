@@ -252,21 +252,19 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		return false, "", fmt.Errorf("%w: failed to load slip for completion check: %s", ErrSlipNotFound, err.Error())
 	}
 
-	// A successfully completed slip is immutable — it is the only status that
-	// should never be modified. Short-circuit to avoid any re-evaluation.
-	if slip.Status == SlipStatusCompleted {
+	// Terminal-immutable statuses per STATE_MACHINE_V3.md §Pipeline termination states:
+	// completed, abandoned, and promoted are all pipeline-terminal and must bypass
+	// checkPipelineCompletion entirely to prevent late step events from overwriting
+	// the slip status back to "failed".
+	switch slip.Status {
+	case SlipStatusCompleted:
 		return true, SlipStatusCompleted, nil
-	}
-
-	// Check if prod_steady_state is completed
-	if step, ok := slip.Steps["prod_steady_state"]; ok && step.Status == StepStatusCompleted {
-		c.logger.Info(ctx, "Pipeline complete! Updating slip status to completed", map[string]interface{}{
-			"correlation_id": correlationID,
-		})
-		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted); err != nil {
-			return true, SlipStatusCompleted, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
-		}
-		return true, SlipStatusCompleted, nil
+	case SlipStatusAbandoned:
+		return false, SlipStatusAbandoned, nil
+	case SlipStatusPromoted:
+		return false, SlipStatusPromoted, nil
+	case SlipStatusPending, SlipStatusInProgress, SlipStatusFailed, SlipStatusCompensating, SlipStatusCompensated:
+		// These statuses proceed to normal pipeline-completion evaluation below.
 	}
 
 	// Categorize step failures into primary (step itself failed) vs cascade (aborted by upstream).
@@ -298,6 +296,18 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 			return false, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
 		return false, SlipStatusFailed, nil
+	}
+
+	// Mark pipeline completed only when steady-state is complete and there are
+	// no remaining primary failures.
+	if step, ok := slip.Steps["prod_steady_state"]; ok && step.Status == StepStatusCompleted {
+		c.logger.Info(ctx, "Pipeline complete! Updating slip status to completed", map[string]interface{}{
+			"correlation_id": correlationID,
+		})
+		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted); err != nil {
+			return true, SlipStatusCompleted, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
+		}
+		return true, SlipStatusCompleted, nil
 	}
 
 	// No primary failures remain. If the slip was previously failed, reconcile:

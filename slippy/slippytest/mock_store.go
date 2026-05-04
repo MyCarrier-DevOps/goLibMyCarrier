@@ -67,6 +67,7 @@ type MockStore struct {
 	UpdateComponentCalls  []UpdateComponentCall
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
+	UpdateSlipStatusCalls []UpdateSlipStatusCall
 	CloseCalls            int
 
 	// Ping tracking and error injection
@@ -84,6 +85,7 @@ type MockStore struct {
 	UpdateComponentError  error
 	AppendHistoryError    error
 	SetImageTagError      error
+	UpdateSlipStatusError error
 	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
@@ -150,6 +152,12 @@ type SetImageTagCall struct {
 	StepName      string
 	ComponentName string
 	ImageTag      string
+}
+
+// UpdateSlipStatusCall records an UpdateSlipStatus call.
+type UpdateSlipStatusCall struct {
+	CorrelationID string
+	Status        slippy.SlipStatus
 }
 
 // NewMockStore creates a new MockStore with initialized maps.
@@ -441,6 +449,29 @@ func (m *MockStore) AppendHistory(ctx context.Context, correlationID string, ent
 	return nil
 }
 
+// UpdateSlipStatus atomically updates the slip's status field.
+func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, status slippy.SlipStatus) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.UpdateSlipStatusCalls = append(m.UpdateSlipStatusCalls, UpdateSlipStatusCall{
+		CorrelationID: correlationID,
+		Status:        status,
+	})
+
+	if m.UpdateSlipStatusError != nil {
+		return m.UpdateSlipStatusError
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return slippy.ErrSlipNotFound
+	}
+
+	slip.Status = status
+	return nil
+}
+
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
 // This is the combined operation that prevents race conditions.
 func (m *MockStore) UpdateStepWithHistory(
@@ -588,6 +619,7 @@ func (m *MockStore) Reset() {
 	m.UpdateComponentCalls = nil
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
+	m.UpdateSlipStatusCalls = nil
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }

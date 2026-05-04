@@ -534,3 +534,12 @@ When performing a code review, systematically verify:
 - [ ] Complex logic has explanatory comments
 - [ ] README is updated if needed
 - [ ] Breaking changes are documented
+
+### Slippy State Machine (if `slippy/` changed)
+- [ ] Read `.github/STATE_MACHINE_V3.md` Code Validation Guide before approving.
+- [ ] All 8 Validation Checklist items from V3 verified for the change.
+- [ ] `state_machine_invariants_test.go` (I1–I4) passes locally.
+- [ ] If `production.json` topology changed: confirm initial steps (`builds`/`unit_tests`/`secret_scan`/`package_artifact`) prereqs still `[]`; DEV/PREPROD independence preserved (`dev_deploy` prereqs = `[builds]` only). See `slippy/production.json`.
+- [ ] If `executor.go` `checkPipelineCompletion` order changed: verify (1) completed short-circuit → (2) primaryFailures → (3) prod_steady_state → (4) recovery branch sequence preserved (`executor.go:456-510` pseudocode in V3 §checkPipelineCompletion).
+- [ ] If new caller of `StartStep`/`FailStep`/`CompleteStep` added: confirm pre/post path used (no direct `routing_slips` writes); component callers (`componentName != ""`) do NOT trigger `checkPipelineCompletion` (`steps.go:101`).
+- [ ] `PROJECT_STATE.md` updated if invariant violation discovered.

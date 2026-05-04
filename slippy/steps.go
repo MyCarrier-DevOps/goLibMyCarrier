@@ -84,6 +84,31 @@ func (c *Client) UpdateStepWithStatus(
 		"status":    string(status),
 	})
 
+	// After any terminal event on a pipeline-level step (componentName == ""),
+	// re-evaluate the overall pipeline state. This propagates step failures to
+	// slip.status = "failed" and recovers it back to "in_progress" when all
+	// primary failures are resolved on rerun.
+	//
+	// Component-level events (componentName != "") are skipped here because this
+	// completion check only runs for terminal updates that pass through
+	// Client.UpdateStepWithStatus at the pipeline-step level. Aggregate rollups
+	// performed inside the store (updateAggregateStatusFromComponentStatesWithHistory)
+	// do not re-enter this path, so they do not trigger pipeline completion from here.
+	//
+	// UpdateSlipStatus uses an atomic INSERT SELECT (store.UpdateSlipStatus) that copies
+	// the current DB row and overrides only the status column — no Load+Update round-trip.
+	// Concurrent appendHistoryWithOverrides calls cannot lose state_history entries here.
+	if status.IsTerminal() && componentName == "" {
+		if _, _, checkErr := c.checkPipelineCompletion(ctx, correlationID); checkErr != nil {
+			c.logger.Warn(ctx, "pipeline completion check failed (non-fatal)", map[string]interface{}{
+				"correlation_id": correlationID,
+				"step_name":      stepName,
+				"status":         string(status),
+				"error":          checkErr,
+			})
+		}
+	}
+
 	return nil
 }
 

@@ -527,3 +527,151 @@ func createTestSlip(correlationID string) *Slip {
 		StateHistory:  []StateHistoryEntry{},
 	}
 }
+
+// TestClient_AggregateBuildFailurePropagatesSlipFailed verifies the end-to-end rule:
+// a failing build component causes the aggregate "builds" step to become failed,
+// which in turn drives slip.status → failed.
+//
+// State machine reference: .github/STATE_MACHINE_V3.md §Lifecycle:
+//
+//	"Aggregate builds: any single component primary failure → aggregate failed →
+//	 slip=failed. Aggregate completed only when all components terminal-success."
+//
+// The mock store does not perform ClickHouse-side aggregate rollup
+// (updateAggregateStatusFromComponentStatesWithHistory), so this test exercises the
+// pipeline-step path directly: once the store rolls up a component failure into the
+// aggregate step status, executor calls FailStep("builds", "", reason) at the
+// pipeline-step level (componentName == ""), which triggers checkPipelineCompletion
+// and sets slip.status = failed.
+func TestClient_AggregateBuildFailurePropagatesSlipFailed(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("single component failure sets builds=failed and slip=failed", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+
+		// Seed a slip with three build components: two running, one will fail.
+		// "builds" is the aggregate pipeline step; "build" is the component type.
+		slip := &Slip{
+			CorrelationID: "corr-agg-build-fail",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-agg-build-fail",
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+			Status:        SlipStatusInProgress,
+			Steps: map[string]Step{
+				"builds": {Status: StepStatusRunning},
+			},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {
+					{Component: "api", Status: StepStatusRunning},
+					{Component: "worker", Status: StepStatusRunning},
+					{Component: "gateway", Status: StepStatusRunning},
+				},
+			},
+		}
+		store.AddSlip(slip)
+
+		// Simulate two components completing successfully and one failing.
+		// At the component level the mock store records the call but does NOT
+		// recompute the aggregate status (that is ClickHouse-store behaviour).
+		// We therefore update the in-memory aggregate state manually to match
+		// what the production path would produce, then call FailStep on the
+		// pipeline-level aggregate step ("builds", componentName="") to trigger
+		// checkPipelineCompletion — exactly what the executor does after rollup.
+		store.Slips["corr-agg-build-fail"].Aggregates["builds"][0].Status = StepStatusCompleted // api
+		store.Slips["corr-agg-build-fail"].Aggregates["builds"][1].Status = StepStatusFailed    // worker
+		// gateway remains running (preserved, unchanged by the failure)
+
+		// Production path: aggregate rollup determines builds=failed because
+		// at least one component is a primary failure.  Executor then calls
+		// FailStep on the pipeline-level "builds" step (componentName == "").
+		if err := client.FailStep(ctx, "corr-agg-build-fail", "builds", "", "worker build failed"); err != nil {
+			t.Fatalf("FailStep(builds) returned unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-agg-build-fail")
+		if err != nil {
+			t.Fatalf("failed to load slip: %v", err)
+		}
+
+		// Primary assertion: aggregate step "builds" must be failed.
+		if loaded.Steps["builds"].Status != StepStatusFailed {
+			t.Errorf("expected builds step status %q, got %q",
+				StepStatusFailed, loaded.Steps["builds"].Status)
+		}
+
+		// Primary assertion: slip.status must be failed (I1 invariant).
+		if loaded.Status != SlipStatusFailed {
+			t.Errorf("expected slip.status %q after builds failure, got %q",
+				SlipStatusFailed, loaded.Status)
+		}
+
+		// Secondary assertion: other component states are preserved as-is.
+		apiStatus := loaded.Aggregates["builds"][0].Status
+		if apiStatus != StepStatusCompleted {
+			t.Errorf("expected api component status %q to be preserved, got %q",
+				StepStatusCompleted, apiStatus)
+		}
+		workerStatus := loaded.Aggregates["builds"][1].Status
+		if workerStatus != StepStatusFailed {
+			t.Errorf("expected worker component status %q to be preserved, got %q",
+				StepStatusFailed, workerStatus)
+		}
+		gatewayStatus := loaded.Aggregates["builds"][2].Status
+		if gatewayStatus != StepStatusRunning {
+			t.Errorf("expected gateway component status %q to remain unchanged, got %q",
+				StepStatusRunning, gatewayStatus)
+		}
+	})
+
+	t.Run("all components succeed keeps slip in_progress", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+
+		slip := &Slip{
+			CorrelationID: "corr-agg-build-ok",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-agg-build-ok",
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
+			Status:        SlipStatusInProgress,
+			Steps: map[string]Step{
+				"builds": {Status: StepStatusRunning},
+			},
+			Aggregates: map[string][]ComponentStepData{
+				"builds": {
+					{Component: "api", Status: StepStatusRunning},
+					{Component: "worker", Status: StepStatusRunning},
+				},
+			},
+		}
+		store.AddSlip(slip)
+
+		// All components succeed → executor calls CompleteStep on the aggregate step.
+		if err := client.CompleteStep(ctx, "corr-agg-build-ok", "builds", ""); err != nil {
+			t.Fatalf("CompleteStep(builds) returned unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-agg-build-ok")
+		if err != nil {
+			t.Fatalf("failed to load slip: %v", err)
+		}
+
+		if loaded.Steps["builds"].Status != StepStatusCompleted {
+			t.Errorf("expected builds step status %q, got %q",
+				StepStatusCompleted, loaded.Steps["builds"].Status)
+		}
+		// slip should remain in_progress (not yet at prod_steady_state)
+		if loaded.Status != SlipStatusInProgress {
+			t.Errorf("expected slip.status %q after builds success, got %q",
+				SlipStatusInProgress, loaded.Status)
+		}
+	})
+}

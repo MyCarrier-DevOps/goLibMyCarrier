@@ -67,13 +67,13 @@
     },
     {
       "name": "prod_alert_gate",
-      "description": "Post-deploy alert monitoring — watches for degradation signals after production deploy",
-      "prerequisites": ["prod_deploy", "prod_tests"]
+      "description": "Post-release monitoring and release-failure handling gate for production",
+      "prerequisites": []
     },
     {
       "name": "prod_rollback",
-      "description": "Automated GitOps + source repo rollback triggered when prod_alert_gate fails",
-      "prerequisites": ["prod_deploy", "prod_tests"]
+      "description": "Automated GitOps + source repo rollback triggered by alert-gate or failed production deploy paths",
+      "prerequisites": []
     },
     {
       "name": "prod_steady_state",

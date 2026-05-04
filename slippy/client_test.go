@@ -235,15 +235,19 @@ func TestClient_UpdateSlipStatus(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		// Verify the update was made
-		if len(store.UpdateCalls) != 1 {
-			t.Errorf("expected 1 Update call, got %d", len(store.UpdateCalls))
+		// Verify the update was routed through store.UpdateSlipStatus (atomic path).
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Errorf("expected 1 UpdateSlipStatus call, got %d", len(store.UpdateSlipStatusCalls))
 		}
-		if store.UpdateCalls[0].Slip.Status != SlipStatusInProgress {
-			t.Errorf("expected status InProgress, got %s", store.UpdateCalls[0].Slip.Status)
+		if store.UpdateSlipStatusCalls[0].Status != SlipStatusInProgress {
+			t.Errorf("expected status InProgress, got %s", store.UpdateSlipStatusCalls[0].Status)
+		}
+		// No legacy Load+Update round-trip.
+		if len(store.UpdateCalls) != 0 {
+			t.Errorf("expected 0 Update calls (atomic path), got %d", len(store.UpdateCalls))
 		}
 
-		// Verify the store reflects the change
+		// Verify the store reflects the change.
 		updated, _ := store.Load(ctx, "corr-789")
 		if updated.Status != SlipStatusInProgress {
 			t.Errorf("expected updated status InProgress, got %s", updated.Status)
@@ -283,7 +287,7 @@ func TestClient_UpdateSlipStatus(t *testing.T) {
 			Steps:         make(map[string]Step),
 		}
 		store.AddSlip(slip)
-		store.UpdateError = errors.New("update failed")
+		store.UpdateSlipStatusError = errors.New("update failed")
 
 		err := client.UpdateSlipStatus(ctx, "corr-999", SlipStatusFailed)
 		if err == nil {

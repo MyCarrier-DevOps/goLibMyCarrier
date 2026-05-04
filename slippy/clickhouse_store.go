@@ -535,6 +535,88 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 	return s.appendHistoryWithOverrides(ctx, correlationID, entry)
 }
 
+// UpdateSlipStatus atomically updates the slip's status column without a full Load+Update
+// round-trip. It uses an INSERT SELECT that copies the current routing_slips row verbatim
+// and overrides only the `status` column, preventing concurrent `appendHistoryWithOverrides`
+// writes from losing their `state_history` entry due to last-write-wins collapsing.
+//
+// The retry loop mirrors appendHistoryWithOverrides: load current version, write new version
+// (newVersion > currentVersion), post-write check, backoff+retry on conflict. On retry
+// exhaustion the function returns an error, typically wrapping ErrMaxRetriesExceeded.
+func (s *ClickHouseStore) UpdateSlipStatus(ctx context.Context, correlationID string, newStatus SlipStatus) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	retrySpan := startRetrySpan(ctx, "UpdateSlipStatus", correlationID)
+	retrySpan.AddAttribute("slippy.new_status", string(newStatus))
+
+	conflictRetry := 0
+
+	for {
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
+		currentVersion, versionLoadErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionLoadErr != nil {
+			if errors.Is(versionLoadErr, ErrSlipNotFound) {
+				retrySpan.EndError(versionLoadErr)
+				return versionLoadErr
+			}
+			// Non-fatal: fall back to nextVersion() with no floor guarantee.
+			currentVersion = 0
+		}
+		newVersion := s.nextVersion()
+		if newVersion <= currentVersion {
+			newVersion = currentVersion + 1
+		}
+
+		if err := s.insertAtomicStatusUpdate(retrySpan.Context(), correlationID, newVersion, newStatus); err != nil {
+			retrySpan.EndError(err)
+			return err
+		}
+
+		// Post-write version check: detect if a concurrent writer inserted a higher-version row.
+		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionErr != nil {
+			s.logger.Warn(ctx,
+				"slip status version check skipped after successful insert — conflict detection unavailable",
+				map[string]interface{}{
+					"correlation_id": correlationID,
+					"new_status":     string(newStatus),
+					"error":          versionErr,
+				})
+			retrySpan.AddAttribute("slippy.status_version_check_error", versionErr.Error())
+			retrySpan.EndSuccess()
+			return nil
+		}
+		if latestVersion > newVersion {
+			conflictRetry++
+			retrySpan.AddAttribute("slippy.status_conflict_retry", conflictRetry)
+			if conflictRetry > historyConflictMaxRetries {
+				retrySpan.AddAttribute("slippy.status_conflict_retries_exhausted", true)
+				exhaustedErr := fmt.Errorf(
+					"UpdateSlipStatus for %q exhausted conflict retries: %w", correlationID, ErrMaxRetriesExceeded)
+				retrySpan.EndError(exhaustedErr)
+				return exhaustedErr
+			}
+			backoff := calculateAggregateConflictBackoff(conflictRetry)
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
+		retrySpan.EndSuccess()
+		return nil
+	}
+}
+
 // Close releases any resources held by the store.
 func (s *ClickHouseStore) Close() error {
 	return s.session.Close()
@@ -813,6 +895,106 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 		retrySpan.EndSuccess()
 		return nil
 	}
+}
+
+// insertAtomicStatusUpdate cancels all active routing_slips rows for correlationID and inserts
+// a new row that is identical to the latest active row except for status, updated_at, sign,
+// and version. All other columns (including state_history) are copied verbatim from the DB row,
+// preventing concurrent appendHistoryWithOverrides writes from losing their state_history entry.
+func (s *ClickHouseStore) insertAtomicStatusUpdate(
+	ctx context.Context,
+	correlationID string,
+	newVersion uint64,
+	newStatus SlipStatus,
+) error {
+	stepColumns := s.queryBuilder.BuildStepColumns()
+	aggregateColumns := s.queryBuilder.BuildAggregateColumns()
+
+	hasAncestry := s.hasAncestryColumn.Load()
+
+	// Build INSERT column list: fixed columns + dynamic step/aggregate columns.
+	var allCols []string
+	allCols = append(allCols,
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
+		ColumnStateHistory,
+	)
+	if hasAncestry {
+		allCols = append(allCols, ColumnAncestry)
+	}
+	allCols = append(allCols, ColumnSign, ColumnVersion)
+	allCols = append(allCols, stepColumns...)
+	allCols = append(allCols, aggregateColumns...)
+
+	// Cancel SELECT: re-select all columns from existing active rows with sign flipped to -1.
+	cancelSelectCols := []string{
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails,
+		ColumnStateHistory,
+	}
+	if hasAncestry {
+		cancelSelectCols = append(cancelSelectCols, ColumnAncestry)
+	}
+	cancelSelectCols = append(cancelSelectCols,
+		"-1",          // sign
+		ColumnVersion, // keep original version for proper VCollapsingMergeTree collapsing
+	)
+	cancelSelectCols = append(cancelSelectCols, stepColumns...)
+	cancelSelectCols = append(cancelSelectCols, aggregateColumns...)
+
+	cancelQuery := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s < ? AND %s = 1",
+		strings.Join(cancelSelectCols, ", "),
+		s.database, TableRoutingSlips,
+		ColumnCorrelationID, ColumnVersion, ColumnSign,
+	)
+
+	// New-row SELECT: copy all columns verbatim except status, updated_at, sign, version.
+	newRowSelectCols := []string{
+		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
+		ColumnCreatedAt, "now64(6)", // updated_at
+		"?", // status override
+		ColumnStepDetails,
+		ColumnStateHistory, // copied verbatim — preserves concurrent history appends
+	}
+	if hasAncestry {
+		newRowSelectCols = append(newRowSelectCols, ColumnAncestry)
+	}
+	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
+	newRowSelectCols = append(newRowSelectCols, stepColumns...)
+	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
+
+	newRowQuery := fmt.Sprintf(
+		"SELECT %s FROM %s.%s WHERE %s = ? AND %s = 1 ORDER BY %s DESC LIMIT 1",
+		strings.Join(newRowSelectCols, ", "),
+		s.database, TableRoutingSlips,
+		ColumnCorrelationID, ColumnSign, ColumnVersion,
+	)
+
+	query := fmt.Sprintf(`
+		INSERT INTO %s.%s (%s)
+		%s
+		UNION ALL
+		%s
+	`, s.database, TableRoutingSlips, strings.Join(allCols, ", "), cancelQuery, newRowQuery)
+
+	// Args order:
+	//   1. cancel-row WHERE:     correlationID, newVersion
+	//   2. new-row SELECT ?:     newStatus (status literal)
+	//   3. new-row SELECT ?:     newVersion (version literal)
+	//   4. new-row SELECT WHERE: correlationID
+	execArgs := []interface{}{correlationID, newVersion, string(newStatus), newVersion, correlationID}
+
+	err := s.session.ExecWithArgs(ctx, query, execArgs...)
+	if err != nil && hasAncestry && isAncestryColumnError(err) {
+		s.logger.Warn(ctx, "ancestry column unknown to ClickHouse; retrying without it", map[string]interface{}{
+			"error":          err.Error(),
+			"correlation_id": correlationID,
+		})
+		s.hasAncestryColumn.Store(false)
+		return s.insertAtomicStatusUpdate(ctx, correlationID, newVersion, newStatus)
+	}
+	return err
 }
 
 // nextVersion returns a nanosecond-epoch version. If the current wall clock
