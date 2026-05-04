@@ -263,6 +263,8 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		return false, SlipStatusAbandoned, nil
 	case SlipStatusPromoted:
 		return false, SlipStatusPromoted, nil
+	case SlipStatusPending, SlipStatusInProgress, SlipStatusFailed, SlipStatusCompensating, SlipStatusCompensated:
+		// These statuses proceed to normal pipeline-completion evaluation below.
 	}
 
 	// Categorize step failures into primary (step itself failed) vs cascade (aborted by upstream).
