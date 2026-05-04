@@ -236,6 +236,43 @@ func (c *Client) RunPostExecution(ctx context.Context, opts PostExecutionOptions
 	return result, nil
 }
 
+// slipStatusOverrideWriter is an optional interface implemented by store backends that support
+// atomic step-column overrides during a slip-status update. ClickHouseStore implements this;
+// mock stores used in unit tests do not need to (the type assertion falls back gracefully to
+// the standard UpdateSlipStatus path, which is correct for in-memory tests).
+type slipStatusOverrideWriter interface {
+	updateSlipStatusWithOverrides(
+		ctx context.Context,
+		correlationID string,
+		status SlipStatus,
+		overrides ...stepStatusOverride,
+	) error
+}
+
+// updateSlipStatusWithStepOverrides calls the store's override-aware variant when available,
+// falling back to the standard UpdateSlipStatus for stores that do not implement it (e.g.,
+// MockStore in unit tests). This allows checkPipelineCompletion to pass step-column literals
+// that prevent the stale-clone race in insertAtomicStatusUpdate without breaking the
+// SlipStore interface or requiring every mock to implement the override path.
+func (c *Client) updateSlipStatusWithStepOverrides(
+	ctx context.Context,
+	correlationID string,
+	status SlipStatus,
+	overrides ...stepStatusOverride,
+) error {
+	if w, ok := c.store.(slipStatusOverrideWriter); ok && len(overrides) > 0 {
+		if err := w.updateSlipStatusWithOverrides(ctx, correlationID, status, overrides...); err != nil {
+			return NewSlipError("update status", correlationID, err)
+		}
+		c.logger.Info(ctx, "Updated slip status", map[string]interface{}{
+			"correlation_id": correlationID,
+			"status":         string(status),
+		})
+		return nil
+	}
+	return c.UpdateSlipStatus(ctx, correlationID, status)
+}
+
 // checkPipelineCompletion checks if the entire pipeline is complete and updates slip status.
 // Returns (completed, status, error). The error is returned rather than swallowed to allow
 // callers (and shadow mode settings) to decide how to handle failures.
@@ -286,13 +323,20 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 	// If any step has a primary failure, the pipeline is in a failed state.
 	// Return completed=false because Failed is non-terminal — the pipeline can
 	// recover if the failed steps are retried and succeed.
+	//
+	// Pass the primary-failure steps as step-column overrides so that
+	// insertAtomicStatusUpdate writes their status as literals rather than
+	// cloning from the DB row. This closes the ClickHouse async-insert visibility
+	// gap (VersionedCollapsingMergeTree without FINAL) where the just-written step
+	// row may not yet be visible to the SELECT inside insertAtomicStatusUpdate.
 	if len(primaryFailures) > 0 {
 		c.logger.Info(ctx, "Pipeline has primary step failure(s), updating slip status", map[string]interface{}{
 			"correlation_id":   correlationID,
 			"primary_failures": primaryFailures,
 			"cascade_failures": cascadeFailures,
 		})
-		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed); err != nil {
+		overrides := buildStepOverridesFromSlip(slip, primaryFailures)
+		if err := c.updateSlipStatusWithStepOverrides(ctx, correlationID, SlipStatusFailed, overrides...); err != nil {
 			return false, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
 		return false, SlipStatusFailed, nil
@@ -300,11 +344,16 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 
 	// Mark pipeline completed only when steady-state is complete and there are
 	// no remaining primary failures.
+	//
+	// Pass prod_steady_state=completed as an override for the same reason.
 	if step, ok := slip.Steps["prod_steady_state"]; ok && step.Status == StepStatusCompleted {
 		c.logger.Info(ctx, "Pipeline complete! Updating slip status to completed", map[string]interface{}{
 			"correlation_id": correlationID,
 		})
-		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusCompleted); err != nil {
+		overrides := buildStepOverridesFromSlip(slip, []string{"prod_steady_state"})
+		if err := c.updateSlipStatusWithStepOverrides(
+			ctx, correlationID, SlipStatusCompleted, overrides...,
+		); err != nil {
 			return true, SlipStatusCompleted, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
 		return true, SlipStatusCompleted, nil
@@ -356,6 +405,28 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 	}
 
 	return false, slip.Status, nil
+}
+
+// buildStepOverridesFromSlip constructs a slice of stepStatusOverride from the named steps
+// in the slip, looking up each step's column name from the client's query builder if available.
+// Steps not found in slip.Steps are silently skipped.
+func buildStepOverridesFromSlip(slip *Slip, stepNames []string) []stepStatusOverride {
+	if len(stepNames) == 0 {
+		return nil
+	}
+	overrides := make([]stepStatusOverride, 0, len(stepNames))
+	for _, name := range stepNames {
+		step, ok := slip.Steps[name]
+		if !ok {
+			continue
+		}
+		// Column name convention: <step_name>_status (matches QueryBuilder.StepStatusColumn).
+		overrides = append(overrides, stepStatusOverride{
+			columnName: name + "_status",
+			status:     step.Status,
+		})
+	}
+	return overrides
 }
 
 // ParsePrerequisites parses a comma-separated string of prerequisites.

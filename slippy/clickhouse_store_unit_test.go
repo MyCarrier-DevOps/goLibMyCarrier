@@ -5037,3 +5037,290 @@ func TestClickHouseStore_UpdateSlipStatus(t *testing.T) {
 		}
 	})
 }
+
+// TestInsertAtomicStatusUpdate_WithStepOverride verifies that when insertAtomicStatusUpdate
+// receives a stepStatusOverride, the generated query replaces the verbatim DB column reference
+// with a literal "?" placeholder and the correct string value appears in the args.
+//
+// This is the fix for the stale-clone race (goLibMyCarrier-nl3): under ClickHouse async insert
+// visibility (VersionedCollapsingMergeTree without FINAL), the SELECT inside
+// insertAtomicStatusUpdate may not see a row just written by appendHistoryWithOverrides.
+// Passing overrides ensures the step column has the correct literal value regardless of
+// DB visibility lag.
+func TestInsertAtomicStatusUpdate_WithStepOverride(t *testing.T) {
+	t.Run("override replaces verbatim column ref with literal in query and args", func(t *testing.T) {
+		var capturedQuery string
+		var capturedArgs []interface{}
+
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+				// Return a version number so the retry loop can load a version and perform the
+				// post-write check. First call (loadVersionFromDB pre-write) returns version 1;
+				// second call (loadVersionFromDB post-write) returns the same value so no retry.
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 1
+							}
+						}
+						return nil
+					},
+				}
+			},
+			ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
+				capturedQuery = query
+				capturedArgs = make([]interface{}, len(args))
+				copy(capturedArgs, args)
+				return nil
+			},
+		}
+
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		override := stepStatusOverride{
+			columnName: "unit_tests_status",
+			status:     StepStatusFailed,
+		}
+		err := store.updateSlipStatusWithOverrides(
+			context.Background(), "corr-override-001", SlipStatusFailed, override,
+		)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		// The generated query must contain a "?" placeholder where unit_tests_status would
+		// normally appear as a verbatim column reference.
+		if !strings.Contains(capturedQuery, "?") {
+			t.Error("expected query to contain '?' placeholder for step override")
+		}
+
+		// The string "failed" (override value) must appear in the args.
+		foundOverrideArg := false
+		for _, arg := range capturedArgs {
+			if s, ok := arg.(string); ok && s == string(StepStatusFailed) {
+				foundOverrideArg = true
+				break
+			}
+		}
+		if !foundOverrideArg {
+			t.Errorf("expected args to contain %q (step override value), got: %v",
+				string(StepStatusFailed), capturedArgs)
+		}
+
+		// The column name appears in two places when overridden:
+		//   1. The INSERT column list (always present)
+		//   2. The cancel-row SELECT (always copies verbatim, including step columns)
+		// The new-row SELECT should NOT repeat it (replaced by "?").
+		// Without override it appears three times (INSERT list + cancel SELECT + new-row SELECT).
+		occurrences := strings.Count(capturedQuery, "unit_tests_status")
+		if occurrences != 2 {
+			t.Errorf("expected unit_tests_status to appear exactly twice (INSERT col list + cancel SELECT; new-row SELECT replaced by ?), got %d occurrences in query:\n%s",
+				occurrences, capturedQuery)
+		}
+	})
+
+	t.Run("no overrides produces verbatim column reference (baseline)", func(t *testing.T) {
+		var capturedQuery string
+
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 1
+							}
+						}
+						return nil
+					},
+				}
+			},
+			ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
+				capturedQuery = query
+				return nil
+			},
+		}
+
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		err := store.UpdateSlipStatus(context.Background(), "corr-nooverride-001", SlipStatusFailed)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		// Without override, unit_tests_status should appear three times:
+		//   1. INSERT column list
+		//   2. Cancel-row SELECT (verbatim copy)
+		//   3. New-row SELECT (verbatim copy — the column that would be stale under async insert lag)
+		occurrences := strings.Count(capturedQuery, "unit_tests_status")
+		if occurrences != 3 {
+			t.Errorf("expected unit_tests_status to appear three times (INSERT list + cancel SELECT + new-row SELECT) without override, got %d occurrences",
+				occurrences)
+		}
+	})
+
+	t.Run("multiple overrides all appear as literals", func(t *testing.T) {
+		var capturedQuery string
+		var capturedArgs []interface{}
+
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if len(dest) > 0 {
+							if v, ok := dest[0].(*uint64); ok {
+								*v = 1
+							}
+						}
+						return nil
+					},
+				}
+			},
+			ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
+				capturedQuery = query
+				capturedArgs = make([]interface{}, len(args))
+				copy(capturedArgs, args)
+				return nil
+			},
+		}
+
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		overrides := []stepStatusOverride{
+			{columnName: "unit_tests_status", status: StepStatusFailed},
+			{columnName: "dev_deploy_status", status: StepStatusAborted},
+		}
+		err := store.updateSlipStatusWithOverrides(
+			context.Background(), "corr-multi-001", SlipStatusFailed, overrides...,
+		)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		// Both column names should appear exactly twice (INSERT col list + cancel SELECT).
+		// The new-row SELECT replaces them with "?" literals.
+		for _, colName := range []string{"unit_tests_status", "dev_deploy_status"} {
+			occurrences := strings.Count(capturedQuery, colName)
+			if occurrences != 2 {
+				t.Errorf("expected %s to appear twice (INSERT col list + cancel SELECT; new-row SELECT replaced by ?), got %d occurrences",
+					colName, occurrences)
+			}
+		}
+
+		// Both override values must be in args.
+		for _, wantVal := range []string{string(StepStatusFailed), string(StepStatusAborted)} {
+			found := false
+			for _, arg := range capturedArgs {
+				if s, ok := arg.(string); ok && s == wantVal {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected args to contain %q, got: %v", wantVal, capturedArgs)
+			}
+		}
+	})
+}
+
+// TestUpdateSlipStatusWithStepOverrides_ClientRouting verifies that
+// updateSlipStatusWithStepOverrides on *Client correctly routes to
+// updateSlipStatusWithOverrides when the store implements slipStatusOverrideWriter,
+// and falls back to UpdateSlipStatus when it does not.
+func TestUpdateSlipStatusWithStepOverrides_ClientRouting(t *testing.T) {
+	t.Run("falls back to standard UpdateSlipStatus for MockStore (no override support)", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		corrID := "client-routing-001"
+		store.AddSlip(&Slip{
+			CorrelationID: corrID,
+			Status:        SlipStatusInProgress,
+		})
+
+		override := stepStatusOverride{columnName: "unit_tests_status", status: StepStatusFailed}
+		err := client.updateSlipStatusWithStepOverrides(
+			context.Background(), corrID, SlipStatusFailed, override,
+		)
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+
+		// MockStore does not implement slipStatusOverrideWriter, so the fallback
+		// path calls UpdateSlipStatus, which should have updated the slip status.
+		loaded, _ := store.Load(context.Background(), corrID)
+		if loaded.Status != SlipStatusFailed {
+			t.Errorf("expected slip.status=%q after fallback UpdateSlipStatus, got %q",
+				SlipStatusFailed, loaded.Status)
+		}
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Errorf("expected 1 UpdateSlipStatus call via fallback, got %d", len(store.UpdateSlipStatusCalls))
+		}
+	})
+}
+
+// TestBuildStepOverridesFromSlip verifies the override-construction helper.
+func TestBuildStepOverridesFromSlip(t *testing.T) {
+	t.Run("builds overrides for named steps", func(t *testing.T) {
+		slip := &Slip{
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusFailed},
+				"dev_deploy": {Status: StepStatusAborted},
+			},
+		}
+		overrides := buildStepOverridesFromSlip(slip, []string{"unit_tests", "dev_deploy"})
+		if len(overrides) != 2 {
+			t.Fatalf("expected 2 overrides, got %d", len(overrides))
+		}
+		byCol := make(map[string]StepStatus)
+		for _, o := range overrides {
+			byCol[o.columnName] = o.status
+		}
+		if byCol["unit_tests_status"] != StepStatusFailed {
+			t.Errorf("expected unit_tests_status=%q, got %q", StepStatusFailed, byCol["unit_tests_status"])
+		}
+		if byCol["dev_deploy_status"] != StepStatusAborted {
+			t.Errorf("expected dev_deploy_status=%q, got %q", StepStatusAborted, byCol["dev_deploy_status"])
+		}
+	})
+
+	t.Run("skips steps not in slip.Steps", func(t *testing.T) {
+		slip := &Slip{
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusFailed},
+			},
+		}
+		overrides := buildStepOverridesFromSlip(slip, []string{"unit_tests", "nonexistent"})
+		if len(overrides) != 1 {
+			t.Fatalf("expected 1 override (nonexistent skipped), got %d", len(overrides))
+		}
+	})
+
+	t.Run("returns nil for empty step list", func(t *testing.T) {
+		slip := &Slip{Steps: map[string]Step{"unit_tests": {Status: StepStatusFailed}}}
+		overrides := buildStepOverridesFromSlip(slip, nil)
+		if overrides != nil {
+			t.Errorf("expected nil for empty names, got %v", overrides)
+		}
+	})
+
+	t.Run("prod_steady_state completed override", func(t *testing.T) {
+		slip := &Slip{
+			Steps: map[string]Step{
+				"prod_steady_state": {Status: StepStatusCompleted},
+			},
+		}
+		overrides := buildStepOverridesFromSlip(slip, []string{"prod_steady_state"})
+		if len(overrides) != 1 {
+			t.Fatalf("expected 1 override, got %d", len(overrides))
+		}
+		if overrides[0].columnName != "prod_steady_state_status" {
+			t.Errorf("expected column name prod_steady_state_status, got %s", overrides[0].columnName)
+		}
+		if overrides[0].status != StepStatusCompleted {
+			t.Errorf("expected status completed, got %s", overrides[0].status)
+		}
+	})
+}
