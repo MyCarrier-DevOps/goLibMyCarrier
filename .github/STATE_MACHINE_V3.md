@@ -1,29 +1,70 @@
-# Slippy Pipeline — High-Level State Machine
+# Slippy Pipeline - High-Level State Machine
 
-**Companion to:** `STATE_MACHINE.md` (low-level per-step rules)
-**Purpose:** full-pipeline view — how stages progress, what blocks, what recovers, what terminates.
+**Purpose:** full-pipeline view - how stages progress, what blocks, what recovers, what terminates.
 **Source config:** `production.json`
+
+---
+
+## Statuses
+
+**Slip statuses:** `in_progress`, `failed`, `completed`, `abandoned`, `promoted`.
+- `abandoned` / `promoted`: pipeline-terminal, bypass `checkPipelineCompletion` (see Pipeline termination note below).
+
+**Step statuses:** `pending`, `held`, `running`, `completed`, `skipped`, `failed`, `error`, `timeout`, `aborted`.
+- `completed` / `skipped`: terminal-success.
+- `failed` / `error` / `timeout`: terminal primary failure.
+- `aborted`: terminal-cascade (upstream prereq failed). **Reversible** — auto-reset to `pending` by recovery branch in `checkPipelineCompletion` when last primary failure resolves (`executor.go:307-346`).
+- Full table: see Step Status Reference below.
+
+**Glossary:**
+- *Primary failure* — step in `{failed, error, timeout}`. Drives `slip.status=failed`.
+- *Cascade abort* — step in `aborted` because prereq failed. Does NOT drive `slip.status=failed`.
+- *Aggregate step* — rollup of N components (e.g. `builds`). Status derived from component states.
+- *Pure pipeline step* — `componentName == ""` (e.g. `unit_tests`, `dev_deploy`).
+
+## Rules
+
+### Identity
+- Slip route unique per correlation id.
+
+### Topology
+- Step dependencies defined by pipeline config (`production.json`).
+- Initial steps (no prereqs): `builds`, `unit_tests`, `secret_scan`, `package_artifact`.
+- Final step: `prod_steady_state`.
+- All initial steps run in parallel for same correlation id. Build components run in parallel within `builds` aggregate.
+- Downstream steps run per config-defined prereqs (see Pipeline Flow diagram).
+
+### Lifecycle
+- Slippy CLI `-pre` (`StartStep` / `WaitForPrerequisites`) and `-post` (`RunPostExecution`) drive every step transition. No direct `routing_slips` writes outside this path.
+- Step terminal status propagates to `slip.status` via `checkPipelineCompletion`:
+  - Any primary failure → `slip=failed`.
+  - **FailStep(X) scope:** only `X.status → failed` and `slip.status → failed`. No other step rows modified synchronously. Downstream steps self-abort lazily when each one calls `WaitForPrerequisites` and observes the failed prereq (`hold.go:83-110`).
+  - All primary failures resolved AND `slip=failed` → `slip=in_progress`; cascade-aborted steps reset to `pending`.
+  - `prod_steady_state=completed` AND zero primary failures → `slip=completed` (terminal, immutable).
+- Aggregate `builds`: any single component primary failure → aggregate `failed` → `slip=failed`. Aggregate `completed` only when all components terminal-success.
+- Recovery path per step: `failed → running → completed`. Slip recovery fires on terminal post-event of last unresolved primary failure.
 
 ---
 
 ## Consistency Invariants
 
 A **discrepancy** is any condition where `slip.status` violates one of these invariants.
-Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt — Slippy State Machine Discrepancies).
+Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - Slippy State Machine Discrepancies).
 
 | # | Invariant |
 |---|-----------|
-| **I1** | `slip=in_progress` while any step has `status ∈ {failed, error, timeout}` → **violation** |
-| **I2** | `slip=failed` while no step has `status ∈ {failed, error, timeout}` AND pipeline not completed → **violation** |
-| **I3** | `slip=completed` while any step has `status ∈ {failed, error, timeout}` OR `status = running` → **violation** |
-| **I4** | Any status change after `slip=completed` → **violation** |
+| **I1** | `slip=in_progress` while any step is a primary failure (`status ∈ {failed, error, timeout}`) → **violation** |
+| **I2** | `slip=failed` with zero primary failures → **violation** |
+| **I3** | `slip=completed` while any step is a primary failure OR `status = running` → **violation** |
+| **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335) |
 
 **Note on `aborted`:** cascade failures (`aborted`) are NOT primary failures — they do not independently drive `slip=failed` and are not counted in I1/I2/I3.
-**Note on `pending`/`held`/`skipped`:** these do not block any transition including completion (I3).
+**Note on `pending`/`held`:** non-terminal, do not block any transition including completion (I3).
+**Note on `skipped`:** terminal-success, treated as `completed`. Does not block I3.
 
 **Pipeline termination without completing:**
-- `abandoned` — automatic when a newer push supersedes this branch (`AbandonSlip`, `client.go:170`)
-- `promoted` — automatic on PR squash-merge to another branch (`PromoteSlip`, `client.go:204`)
+- `abandoned` - automatic when a newer push supersedes this branch (`AbandonSlip`, `client.go:170`)
+- `promoted` - automatic on PR squash-merge to another branch (`PromoteSlip`, `client.go:204`)
 - No operator abort tool exists. Both bypass `checkPipelineCompletion`.
 
 ---
@@ -41,7 +82,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
                           ┌─────────────────────────────────────────────────────────────┐
                           │                      CI_PARALLEL                             │
                           │  builds (×N components) · unit_tests · secret_scan          │
-                          │  package_artifact  —  all running concurrently               │
+                          │  package_artifact  -  all running concurrently               │
                           │  slip.status = in_progress                                   │
                           └────┬──────────────────────────────────────────┬─────────────┘
                                │                                          │
@@ -51,7 +92,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
                                │                               ┌─────────────────────┐
                                │                               │     CI_FAILED        │
                                │                               │  slip.status=failed  │
-                               │                               │  downstream blocked  │
+                               │                               │ downstream lazy-abort│
                                │                               └──────────┬──────────┘
                                │                                          │ re-run failed step
                                │                               ┌──────────┴──────────┐
@@ -103,7 +144,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
                                                               │  │ tests, alert_    │   │
                                                               │  │ gate, rollback,  │   │
                                                               │  │ steady_state     │   │
-                                                              │  │ all = aborted    │   │
+                                                              │  │ self-abort lazy  │   │
                                                               │  └────────┬────────┘   │
                                                               │           │ re-run gate │
                                                               │           │ (cascade    │
@@ -161,6 +202,10 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
 └───────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+> **Note:** "downstream lazy-abort" means downstream step rows are NOT changed by FailStep. Each downstream step transitions to `aborted` only when its own `WaitForPrerequisites` call observes the failed prereq.
+
+> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch (`executor.go:307-346`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
+
 ---
 
 ## Pipeline Phases
@@ -187,7 +232,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
 | | Any step `failed/error/timeout` → `CI_FAILED` |
 
 **Key:** `dev_deploy` and `preprod_deploy` have different unblock conditions.
-`dev_deploy` unblocks as soon as `builds` completes — does **not** wait for `unit_tests` or `secret_scan`.
+`dev_deploy` unblocks as soon as `builds` completes - does **not** wait for `unit_tests` or `secret_scan`.
 
 ---
 
@@ -208,13 +253,13 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
 
 | Phase | slip.status | Trigger | Failure effect |
 |-------|------------|---------|----------------|
-| `dev_deploy=running` | `in_progress` | `builds=completed` | `failed` — does NOT block preprod |
-| `dev_tests=running` | `in_progress` | ArgoCD PostSync → TestEngine ⚠️ | `failed` — does NOT block preprod |
+| `dev_deploy=running` | `in_progress` | `builds=completed` | `failed` - does NOT block preprod |
+| `dev_tests=running` | `in_progress` | ArgoCD PostSync → TestEngine ⚠️ | `failed` - does NOT block preprod |
 | `dev_deploy=failed` | `failed` | post-job | `dev_tests` aborts if waiting; preprod unaffected |
 | `dev_tests=failed` | `failed` | TestEngine RunPostExecution | preprod unaffected (not a prereq) |
 
 > ⚠️ TestEngine starts `dev_tests` via `StartStep` directly (no `WaitForPrerequisites`).
-> Tests can start before or during `dev_deploy` in rerun/race scenarios (PROJECT_STATE.md — discrepancy #7).
+> Tests can start before or during `dev_deploy` in rerun/race scenarios (PROJECT_STATE.md - discrepancy #7).
 
 ---
 
@@ -222,12 +267,12 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
 
 | Phase | slip.status | Trigger | Failure effect |
 |-------|------------|---------|----------------|
-| `preprod_deploy=running` | `in_progress` | `builds+unit_tests+secret_scan=completed` | `failed` — blocks `prod_gate` |
-| `preprod_tests=running` | `in_progress` | ArgoCD PostSync → TestEngine ⚠️ | `failed` — blocks `prod_gate` |
+| `preprod_deploy=running` | `in_progress` | `builds+unit_tests+secret_scan=completed` | `failed` - blocks `prod_gate` |
+| `preprod_tests=running` | `in_progress` | ArgoCD PostSync → TestEngine ⚠️ | `failed` - blocks `prod_gate` |
 | `preprod_deploy=failed` | `failed` | post-job | `preprod_tests` aborts if waiting; `prod_gate` blocked |
 | `preprod_tests=failed` | `failed` | TestEngine RunPostExecution | `prod_gate` blocked until resolved |
 
-> ⚠️ `preprod_tests` can run against a failed or restarted deployment (PROJECT_STATE.md — discrepancy #9).
+> ⚠️ `preprod_tests` can run against a failed or restarted deployment (PROJECT_STATE.md - discrepancy #9).
 > `prod_gate` has no awareness of which deployment the test results belong to.
 
 ---
@@ -240,7 +285,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt —
 | **Prereqs** | `preprod_deploy=completed` AND `preprod_tests=completed` |
 | **Running** | `prod_gate` (is_gate=true) |
 | **On success** | All downstream prod steps unblocked; pipeline continues to `PROD_RELEASE` |
-| **On failure** | `slip=failed`; ALL downstream steps cascade-aborted in one sweep: `prod_release_created`, `prod_deploy`, `prod_tests`, `prod_alert_gate`, `prod_rollback`, `prod_steady_state` |
+| **On failure** | `slip=failed` (FailStep only flips `prod_gate` + `slip.status`). Downstream steps NOT immediately aborted — each self-aborts lazily when its own `WaitForPrerequisites` observes `prod_gate=failed` (`hold.go:83-110`). Steps whose pre-job never runs stay `pending`. |
 | **Recovery** | Re-run `prod_gate` → success → cascade steps reset to `pending` → `prod_gate=completed` must then unblock each downstream step individually as they restart |
 
 ---
@@ -270,11 +315,11 @@ prod_gate=completed
 | | |
 |---|---|
 | **slip.status** | `in_progress` |
-| **Running** | `prod_alert_gate` — watches production health (SLOs, error rates, alerts) |
-| **Prereqs in config** | `[]` — only gate injection (`prod_gate=completed`) blocks it |
+| **Running** | `prod_alert_gate` - watches production health (SLOs, error rates, alerts) |
+| **Prereqs in config** | `[]` - only gate injection (`prod_gate=completed`) blocks it |
 | **On pass** | `alert-gate.yaml` skips `prod_rollback`, marks `prod_steady_state=completed` → `slip=completed` |
 | **On failure** | `alert-gate.yaml` triggers `gitops-rollback.yaml` → `ROLLING_BACK` |
-| **⚠️ Gap** | Can start even when `prod_deploy=failed` — gate injection is satisfied but deploy never succeeded (PROJECT_STATE.md — discrepancies #8, #9) |
+| **⚠️ Gap** | Can start even when `prod_deploy=failed` - gate injection is satisfied but deploy never succeeded (PROJECT_STATE.md - discrepancies #8, #9) |
 
 ---
 
@@ -283,7 +328,7 @@ prod_gate=completed
 | | |
 |---|---|
 | **slip.status** | `failed` |
-| **Running** | `prod_rollback` — automated GitOps + source repo rollback |
+| **Running** | `prod_rollback` - automated GitOps + source repo rollback |
 | **On rollback complete** | `gitops-rollback.yaml` marks `prod_steady_state=failed` → `PIPELINE_DONE` |
 | **prod_steady_state=failed** | Adds to `primaryFailures`; `slip=failed` (already); pipeline effectively closed |
 
@@ -293,7 +338,7 @@ prod_gate=completed
 
 | | |
 |---|---|
-| **slip.status** | `completed` — **TERMINAL, IMMUTABLE** |
+| **slip.status** | `completed` - **TERMINAL, IMMUTABLE** |
 | **Triggered by** | `prod_steady_state=completed` with `primaryFailures=0` |
 | **Triggered from** | `alert-gate.yaml` on pass: marks `prod_steady_state=completed` |
 | **checkPipelineCompletion** | Short-circuits immediately: `slip.Status==completed → return` |
@@ -305,26 +350,29 @@ prod_gate=completed
 
 | | |
 |---|---|
-| **slip.status** | `failed` — non-terminal but no natural recovery path |
+| **slip.status** | `failed` - non-terminal but no natural recovery path |
 | **Triggered by** | `prod_steady_state=failed` (set by `gitops-rollback.yaml` after rollback) |
-| **Technically recoverable?** | Yes — `failed` is non-terminal. But re-running `prod_steady_state` to `completed` after a rollback is semantically wrong |
+| **Technically recoverable?** | Yes - `failed` is non-terminal. But re-running `prod_steady_state` to `completed` after a rollback is semantically wrong |
 | **In practice** | Next push to the branch creates a new slip; this one is abandoned |
 
 ---
 
 ## Failure States Summary
 
+> **Lazy cascade note:** "Cascade aborts" column lists steps that WILL transition to `aborted` IF they call `WaitForPrerequisites` after the failure. FailStep itself does not write these rows. Steps that never enter pre-job remain in their current status.
+
 | Failure point | slip.status | What is blocked | Cascade aborts | Recovery trigger |
 |---------------|------------|-----------------|----------------|-----------------|
 | `builds` failed | `failed` | `dev_deploy`, `preprod_deploy`, all downstream | All steps depending on builds | Re-run `builds` (any component) |
 | `unit_tests` failed | `failed` | `preprod_deploy` | `preprod_deploy` + all downstream | Re-run `unit_tests` |
 | `secret_scan` failed | `failed` | `preprod_deploy` | `preprod_deploy` + all downstream | Re-run `secret_scan` |
-| `dev_deploy` failed | `failed` | `dev_tests` | `dev_tests` (if waiting) | Re-run `dev_deploy` — does NOT block preprod |
-| `dev_tests` failed | `failed` | Nothing downstream | None | Re-run `dev_tests` — does NOT block preprod |
+| `package_artifact` failed | `failed` | Nothing downstream | None | Re-run `package_artifact` - no step depends on it |
+| `dev_deploy` failed | `failed` | `dev_tests` | `dev_tests` (if waiting) | Re-run `dev_deploy` - does NOT block preprod |
+| `dev_tests` failed | `failed` | Nothing downstream | None | Re-run `dev_tests` - does NOT block preprod |
 | `preprod_deploy` failed | `failed` | `preprod_tests`, `prod_gate` | `preprod_tests` (if waiting) | Re-run `preprod_deploy` |
 | `preprod_tests` failed | `failed` | `prod_gate` | None | Re-run `preprod_tests` |
 | `prod_gate` failed | `failed` | All production steps | `prod_release_created`, `prod_deploy`, `prod_tests`, `prod_alert_gate`, `prod_rollback`, `prod_steady_state` | Re-run `prod_gate` |
-| `prod_release_created` failed | `failed` | `prod_deploy`, `prod_tests` | None (prereqs not met — they stay pending) | Re-run `prod_release_created` |
+| `prod_release_created` failed | `failed` | `prod_deploy`, `prod_tests` | None (prereqs not met - they stay pending) | Re-run `prod_release_created` |
 | `prod_deploy` failed | `failed` | `prod_tests`, `prod_steady_state` | `prod_tests` (if in WaitForPrerequisites) | Re-run `prod_deploy` |
 | `prod_tests` failed | `failed` | `prod_steady_state` | None | Re-run `prod_tests` |
 | `prod_alert_gate` failed | `failed` | `prod_steady_state` | None | Triggers rollback instead |
@@ -340,7 +388,7 @@ slip recovers from failed → in_progress when:
   slip.Status == failed at the moment checkPipelineCompletion fires
 
 On recovery:
-  cascade-aborted (aborted) steps → reset to pending automatically
+  cascade-aborted (`aborted`) steps → reset to `pending` automatically by `checkPipelineCompletion` recovery branch (`executor.go:307-346`). `aborted` is the ONLY reversible terminal step status; `failed`, `error`, `timeout`, `completed`, `skipped` are not auto-reset. Peer steps in `running`/`held`/`pending` are NEVER modified by FailStep — only the failing step's own row and `slip.status` change synchronously.
   slip.status → in_progress
   External orchestrators (auto-deployer, Argo) must re-trigger the pending steps
 ```
@@ -389,7 +437,7 @@ Auto-deployer is **read-only** (polls `GetSlip`). It triggers Argo workflows via
 |-------|---------------------|
 | `CI_PARALLEL` | Waits for CI prereqs to complete before triggering deploys |
 | `DEV_RUNNING` | Triggers `dev_deploy` if not already started; watches for completion |
-| `DEV_TESTS_RUNNING` | If `dev_tests=failed`: F2/F3 retry — POSTs `/autotriggertests` |
+| `DEV_TESTS_RUNNING` | If `dev_tests=failed`: F2/F3 retry - POSTs `/autotriggertests` |
 | `PREPROD_RUNNING` | Triggers `preprod_deploy`; watches for completion |
 | `PREPROD_TESTS_RUNNING` | If `preprod_tests=failed`: F2/F3 retry |
 | `PROD_RELEASE` | Monitors prod_gate → prod_release_created → prod_deploy → prod_tests sequentially; does NOT auto-retry |
@@ -427,7 +475,7 @@ checkPipelineCompletion(ctx, correlationID):
     UpdateSlipStatus(completed)   // TERMINAL
     return
 
-  // CHECK 3: recovery — all primary failures resolved
+  // CHECK 3: recovery - all primary failures resolved
   if slip.Status == failed AND len(primaryFailures) == 0:
     for each step in cascadeFailures:
       UpdateStepWithStatus(step, pending, "reset: upstream failure resolved")
@@ -444,23 +492,23 @@ checkPipelineCompletion(ctx, correlationID):
 
 | Category | `componentName` | Example | Update path in store |
 |----------|-----------------|---------|---------------------|
-| Pure pipeline | `""` | `unit_tests`, `dev_deploy`, `prod_gate` | `appendHistoryWithOverrides` — atomic INSERT SELECT, one column override |
-| Aggregate | `""` (rollup) | `builds` | `updateAggregateStatusFromComponentStatesWithHistory` — full Load+hydrateSlip+Update |
+| Pure pipeline | `""` | `unit_tests`, `dev_deploy`, `prod_gate` | `appendHistoryWithOverrides` - atomic INSERT SELECT, one column override |
+| Aggregate | `""` (rollup) | `builds` | `updateAggregateStatusFromComponentStatesWithHistory` - full Load+hydrateSlip+Update |
 | Component | `"mc.x.y"` | individual build | `insertComponentState` + triggers aggregate recalc |
 
 ### Step Status Reference
 
 | Status | Terminal? | IsSuccess() | IsFailure() | Category |
 |--------|-----------|-------------|-------------|----------|
-| `pending` | No | — | — | Initial |
-| `held` | No | — | — | Waiting for prereqs |
-| `running` | No | — | — | Executing |
-| `completed` | Yes | ✅ | — | Success |
-| `skipped` | Yes | ✅ | — | Success (treated as completed) |
-| `failed` | Yes | — | ✅ primary | Primary failure |
-| `error` | Yes | — | ✅ primary | Primary failure |
-| `timeout` | Yes | — | ✅ primary | Primary failure |
-| `aborted` | Yes | — | ✅ cascade | Cascade — upstream prereq failed |
+| `pending` | No | - | - | Initial |
+| `held` | No | - | - | Waiting for prereqs |
+| `running` | No | - | - | Executing |
+| `completed` | Yes | ✅ | - | Success |
+| `skipped` | Yes | ✅ | - | Success (treated as completed) |
+| `failed` | Yes | - | ✅ primary | Primary failure |
+| `error` | Yes | - | ✅ primary | Primary failure |
+| `timeout` | Yes | - | ✅ primary | Primary failure |
+| `aborted` | Yes* | - | ✅ cascade | Cascade - upstream prereq failed. *Reversible: auto-reset to `pending` on recovery (`executor.go:307-346`). |
 
 ---
 
@@ -470,31 +518,31 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 ### Validation Checklist
 
-1. **`checkPipelineCompletion` call path** — a `checkPipelineCompletion` call MUST fire after every terminal step event on a pure pipeline step (`componentName == ""`). Flag any new caller that calls `CompleteStep`/`FailStep` directly for aggregate/component steps without also calling `RunPostExecution`.
+1. **`checkPipelineCompletion` call path** - a `checkPipelineCompletion` call MUST fire after every terminal step event on a pure pipeline step (`componentName == ""`). Flag any new caller that calls `CompleteStep`/`FailStep` directly for aggregate/component steps without also calling `RunPostExecution`.
 
-2. **`checkPipelineCompletion` internal order** — the algorithm MUST follow: (a) completed short-circuit, (b) scan primaryFailures and cascadeFailures, (c) primaryFailures check FIRST → failed, (d) prod_steady_state check SECOND → completed, (e) recovery check THIRD. Flag any reordering of steps (c) and (d).
+2. **`checkPipelineCompletion` internal order** - the algorithm MUST follow: (a) completed short-circuit, (b) scan primaryFailures and cascadeFailures, (c) primaryFailures check FIRST → failed, (d) prod_steady_state check SECOND → completed, (e) recovery check THIRD. Flag any reordering of steps (c) and (d).
 
-3. **Event log written first** — `insertComponentState` MUST be called before any `routing_slips` write. Flag any change that writes to `routing_slips` before writing to `slip_component_states`.
+3. **Event log written first** - `insertComponentState` MUST be called before any `routing_slips` write. Flag any change that writes to `routing_slips` before writing to `slip_component_states`.
 
-4. **Slip status at creation** — `initializeSlipForPush` MUST set `Status: SlipStatusInProgress`, not `pending`.
+4. **Slip status at creation** - `initializeSlipForPush` MUST set `Status: SlipStatusInProgress`, not `pending`.
 
-5. **Recovery conditions** — recovery (`failed` → `in_progress`) requires BOTH: `slip.Status == SlipStatusFailed` AND `len(primaryFailures) == 0`. Flag any change that triggers cascade reset without verifying both conditions.
+5. **Recovery conditions** - recovery (`failed` → `in_progress`) requires BOTH: `slip.Status == SlipStatusFailed` AND `len(primaryFailures) == 0`. Flag any change that triggers cascade reset without verifying both conditions.
 
-6. **`WaitForPrerequisites` in new callers** — any new integration that calls `StartStep` (pre-job) MUST either call `WaitForPrerequisites` first, or document the explicit assumption about why prereqs are guaranteed at call time.
+6. **`WaitForPrerequisites` in new callers** - any new integration that calls `StartStep` (pre-job) MUST either call `WaitForPrerequisites` first, or document the explicit assumption about why prereqs are guaranteed at call time.
 
-7. **Pipeline config changes** — for any new step or prerequisite change, trace the cascade abort scope and verify `prod_steady_state` terminal path is still reachable. Verify `dev_deploy` prereqs remain `[builds]` only (adding `unit_tests`/`secret_scan` breaks CI_PARALLEL → DEV independence).
+7. **Pipeline config changes** - for any new step or prerequisite change, trace the cascade abort scope and verify `prod_steady_state` terminal path is still reachable. Verify `dev_deploy` prereqs remain `[builds]` only (adding `unit_tests`/`secret_scan` breaks CI_PARALLEL → DEV independence).
 
-8. **Pipeline phase impact** — identify which pipeline phase(s) the change touches (STATE_MACHINE_V2.md phases) and verify phase transition behaviour is preserved. Flag any change where the high-level phase flow would need to be redrawn but hasn't been updated.
+8. **Pipeline phase impact** - identify which pipeline phase(s) the change touches (STATE_MACHINE_V3.md phases) and verify phase transition behaviour is preserved. Flag any change where the high-level phase flow would need to be redrawn but hasn't been updated.
 
 ### 4 Most Common Violations
 
-**Violation 1 (I1 — indirect):** `CompleteStep`/`FailStep` called directly for `componentName!=""` without `RunPostExecution` → `slip.status` will not update after build component events. `slip` stays `in_progress` when builds fail (CI_FAILED never reached). Rule: `STATE_MACHINE.md §6`.
+**Violation 1 (I1 - indirect):** `CompleteStep`/`FailStep` called directly for `componentName!=""` without `RunPostExecution` → `slip.status` will not update after build component events. `slip` stays `in_progress` when builds fail (CI_FAILED never reached). Rule: `STATE_MACHINE.md §6`.
 
-**Violation 2 (I3):** `checkPipelineCompletion` order changed — `prod_steady_state` check placed before primary failures scan → pipeline can be marked `completed` despite having failed steps. Rule: `STATE_MACHINE.md §5` — algorithm order.
+**Violation 2 (I3):** `checkPipelineCompletion` order changed - `prod_steady_state` check placed before primary failures scan → pipeline can be marked `completed` despite having failed steps. Rule: `STATE_MACHINE.md §5` - algorithm order.
 
 **Violation 3 (persistence):** `routing_slips` written before `insertComponentState` → if the process crashes between the two writes, `hydrateSlip` will not override the cached status; step is permanently stuck. Rule: `STATE_MACHINE.md §8`.
 
-**Violation 4 (phase independence):** New prerequisite added to a step that breaks phase independence — e.g., adding `unit_tests` to `dev_deploy` prereqs couples DEV TRACK to CI_PARALLEL completion. Rule: `STATE_MACHINE_V2.md` — DEV + PREPROD PARALLEL phase.
+**Violation 4 (phase independence):** New prerequisite added to a step that breaks phase independence - e.g., adding `unit_tests` to `dev_deploy` prereqs couples DEV TRACK to CI_PARALLEL completion. Rule: `STATE_MACHINE_V3.md` - DEV + PREPROD PARALLEL phase.
 
 ---
 
@@ -502,138 +550,146 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 Alias: Slippy agent validation.
 
-**Hard rule for both agents: every claim must cite `file_path:line_number` from the live codebase. No speculation, no assumptions, no inferences from spec docs alone. If a fact cannot be verified in code, label it `UNVERIFIED` and explain what is missing.**
+---
 
-```text
-VARIABLES (set once at invocation; if not specified, defaults below apply):
-  CALLER_PATH    = /Volumes/repos/mycarrier/DevOps/Slippy          [default]
-  CALLER_BRANCH  = main                                              [default]
-  LIBRARY_SOURCE = go.mod                                            [default: resolve from CALLER_PATH go.mod]
-                   | or explicit path, e.g. /Volumes/repos/mycarrier/DevOps/goLibMyCarrier/slippy
-                   |   (use for post-PR#56 working tree or any unreleased in-tree version)
-  LIBRARY_LABEL  = auto-derived:
-                   • if LIBRARY_SOURCE=go.mod → "<version> (linked from <CALLER_PATH> go.mod)"
-                   • if LIBRARY_SOURCE=explicit path → "post-PR#56 working tree" (or describe the version)
+### Agent 1 — Workflow Simulator (Haiku)
 
-Both agents lock these values once and use them for ALL file:line citations throughout.
-Cross-version contamination (citing one version's code while claiming another) is a hard failure.
+Drives the slippy pipeline (`production.json`) by issuing requests to Agent 2 turn-by-turn (synchronous). Agent 1 does NOT touch state directly.
 
-----
+**Agent 1 boundary:** Agent 1 emits step-level requests ONLY (start step, complete step with outcome, re-run step, mutation attempts).
 
-Run two subagents on the slippy pipeline (production.json):
+**CLI semantics (Agent 1 = Slippy CLI user — each request maps to a CLI verb, not a raw library call):**
 
-Agent 1 — Workflow Simulator, Haiku model.
+| Verb | CLI command | Outcome |
+|------|-------------|---------|
+| `WaitForPrerequisites(<step>)` | `slippy pre-job <step>` | WFP + StartStep chain → step `running` (prereqs ok), `held` (blocked), or `aborted` (prereq failed). Cite `prejob.go:44`, `app.go:169-235` |
+| `CompleteStep(<step>, completed)` | `slippy post-job --success <step>` | step `completed`; triggers `checkPipelineCompletion` |
+| `FailStep(<step>, failed)` | `slippy post-job --failed <step>` | step `failed`; triggers `checkPipelineCompletion` (slip.status flips internally — Agent 1 does NOT report it) |
+| `RerunStep(<step>, running)` | re-invoke pre-job after `failed → pending` | step `running` |
+| `CreateSlip` | push handler creates slip | initial state |
 
-STEP 0 — Lock version (mandatory, before any other step):
-  • If LIBRARY_SOURCE=go.mod: read CALLER_PATH go.mod (on CALLER_BRANCH), extract the goLibMyCarrier version tag, locate that exact version in the Go module cache.
-    Set LIBRARY_LABEL = "<version> (linked from <CALLER_PATH> go.mod)".
-    Set LIBRARY_PATH  = $GOPATH/pkg/mod/github.com/!my!carrier-!dev!ops/go!lib!my!carrier/slippy@<version>
-  • If LIBRARY_SOURCE=explicit path: set LIBRARY_PATH = LIBRARY_SOURCE, LIBRARY_LABEL as provided.
-  • Write the locked values into the report header (first lines of slippy-simulation-report.md):
-      CALLER:  <CALLER_PATH> @ <CALLER_BRANCH>
-      LIBRARY: <LIBRARY_LABEL>
-      LIBRARY_PATH: <LIBRARY_PATH>
-  • Every library_code_ref in every emitted event uses LIBRARY_PATH as the path prefix.
-    If you cite a path outside LIBRARY_PATH for a library claim — that is a cross-version contamination error.
+Library-level WFP/StartStep/CompleteStep/FailStep are NOT separately invocable from CLI.
 
-Source of truth — read these BEFORE simulating:
-  • Caller: CALLER_PATH at CALLER_BRANCH.
-    Other valid callers (if CALLER_PATH overridden): slippy-api (slippy-api/internal/infrastructure/slip_writer.go), MC.TestEngine (TestEngine.Worker/pkg/worker/slippy.go), pushhookparser.
-  • Library: LIBRARY_PATH (locked in STEP 0 — not the local goLibMyCarrier working tree unless LIBRARY_SOURCE is explicit).
-  • Pipeline definition: goLibMyCarrier/slippy/production.json (steps, prerequisites, aggregates, is_gate).
+**STEP 0** — ask Agent 2 to create a new pipeline slip route.
 
-Section 1 — CLI/API surface enumeration (mandatory, FIRST):
-  • Enumerate every subcommand the chosen caller exposes by listing every file in its CLI/handler directory (e.g. ci/Slippy/internal/cli/*.go).
-    For each: file:line, command name, flags, the slippy library method it ultimately calls.
-  • Do NOT invent commands. If a transition you need cannot be driven by any enumerated command, explicitly mark it OUT-OF-CALLER and document who actually drives it
-    (e.g. dev_tests / preprod_tests are started by MC.TestEngine via ArgoCD PostSync; prod_alert_gate skip and prod_rollback are driven by alert-gate.yaml / gitops-rollback.yaml workflow templates).
+**STEP 1** — ask Agent 2 to start 3 parallel initial steps:
+- `builds` with N components, N random ∈ [1, 5]
+- `unit_tests`
+- `secret_scan`
 
-Section 1b — OUT-OF-CALLER driver source read (mandatory, FIRST, before emitting any event):
-  • For each OUT-OF-CALLER driver you will reference in the simulation, READ ITS ACTUAL SOURCE before emitting any event tagged with it. Do NOT infer behavior from production.json, the spec doc, or the step's prerequisites — read the driver.
-  • For workflow-core YAML drivers: read the full template body. Identify every step that calls a slippy CLI command (slippy pre-job, slippy post-job, slippy skip-step, slippy start-step). Note: prod_steady_state may be completed directly via post-job from an exit handler with NO prior pre-job — verify in alert-gate.yaml before claiming a running phase.
-  • For MC.TestEngine: read /Volumes/repos/mycarrier/DevOps/MC.TestEngine/TestEngine.Worker/pkg/worker/slippy.go. TestEngine may call ResolveSlip + StartStep directly, bypassing WaitForPrerequisites — verify before claiming a pre-job phase.
-  • For pushhookparser: read its slip-creation code. Confirm the initial step states (pending vs running) before emitting the T+0 snapshot.
-  • Document each driver's actual call chain in a "Section 1b — OUT-OF-CALLER driver call chains" table BEFORE Section 2 events. Columns: driver | file:line | what it calls (CLI command + library method) | step lifecycle (pre-job → post-job vs post-job-only vs StartStep+post-job vs skip-step).
-  • If you skip Section 1b for a driver, every event you emit for that driver MUST be labeled UNVERIFIED.
+**STEP 2** — report completion of all 3 initial steps to Agent 2 simultaneously. Random F failures, F ∈ [0, 2] (0 allowed). For builds: failure means at least 1 component failed.
 
-Scenario:
-  • Simulate one complete slip from creation through prod_steady_state=completed.
-  • Start all no-prereq steps concurrently (per production.json).
-  • Inject ≥3 failures: one build component, one pure-pipeline step, and one concurrent same-timestamp pair with opposite outcomes (one success, one failure).
-  • Restart all failed steps to success and continue to terminal completion.
+**STEP 3** — if STEP 2 had failures: ask Agent 2 to mark all failed steps as re-run (`failed → running`) at the same time, then mark all as `completed` (first re-run always succeeds).
 
-Per-event format (one JSON object per transition):
-{
-  "t": "T+45s",
-  "caller_command": "<exact CLI command or 'OUT-OF-CALLER: <who>'>",
-  "caller_code_ref": "ci/Slippy/internal/cli/postjob.go:NN",
-  "library_call": "client.RunPostExecution(...)",
-  "library_code_ref": "slippy@vX.Y.Z/executor.go:203",
-  "step_transition": {"step": "...", "component": "...", "from": "...", "to": "..."},
-  "aggregate_transition": null | {"step": "...", "from": "...", "to": "..."},
-  "slip_transition": null | {"from": "...", "to": "..."},
-  "trigger_for_slip_change": "<file:line of the call site that fires checkPipelineCompletion, OR 'none — slip status unchanged'>",
-  "verification": "VERIFIED" | "UNVERIFIED — <what is missing>"
-}
+**STEP 4** — for each remaining step in `production.json` (topological order):
+- ask Agent 2 to confirm prereqs complete; wait if not.
+- ask Agent 2 to start the step.
+- ask Agent 2 to complete the step. Outcome: 30% `failed`, 70% `completed`.
+- if `failed`: ask Agent 2 to re-run (`failed → running → completed`). Max 1 retry per step (always succeeds on retry).
+- `prod_rollback`: run ONLY if `prod_alert_gate=failed`; otherwise stays `pending`, skip directly to `prod_steady_state`.
+- proceed to next step.
 
-Forbidden claims (auto-fail an event if it appears):
-  • "cascade-aborted" without identifying an active WaitForPrerequisites poller for that step. Pending steps without a started runner stay 'pending', not 'aborted' (hold.go is the only abort path).
-    Note: in some library versions WaitForPrerequisites returns an error WITHOUT calling AbortStep — verify in the linked hold.go. If it doesn't write 'aborted' to the DB, no cascade-aborts occur.
-  • "Aggregate write-back fires checkPipelineCompletion" — the store's aggregate write-back calls s.Update directly; it does NOT re-enter Client.UpdateStepWithStatus.
-    Only the chain UpdateStepWithStatus(componentName=="") guard OR RunPostExecution → executor.go:229 fires checkPipelineCompletion. Cite which one for each slip transition.
-  • "checkPipelineCompletion fires for component events via UpdateStepWithStatus" — verify this by checking the actual linked-version steps.go guard. In some versions only RunPostExecution drives it.
-  • OUT-OF-CALLER step lifecycle claims (e.g. "prod_alert_gate runs pre-job → post-job", "prod_steady_state has a running phase", "TestEngine calls RunPreExecution") that were not verified by reading the driver source per Section 1b. Inference from prerequisites alone is not verification.
-  • Any timing claim (e.g. recovery at T+X) that is not derivable from the events you emitted.
+**STEP 5 — Cascade-abort scenario** — once `prod_gate` is reached, force `prod_gate=failed`.
 
-After each phase transition, emit a state snapshot:
-{ "phase": "...", "t": "...", "slip_status": "...", "primary_failures": [...], "cascade_aborted": [...], "running": [...], "completed": [...], "pending": [...] }
+**STEP 6 — Recovery-cascade-reset scenario** — ask Agent 2 to re-run `prod_gate` to `in_progress` then to `completed`.
 
-Section "Open assumptions" must list every assumption with VERIFIED (file:line) or UNVERIFIED (what is missing).
-The simulation must be self-consistent: dev_tests=completed cannot precede dev_deploy=completed.
+**STEP 7** — resume STEP 4 logic from `prod_release_created` to `prod_steady_state=completed`.
 
-Output file: slippy-simulation-report.md.
+**STEP 8 — Terminal/immutable test** — after `slip=completed`, attempt one further step mutation (e.g. ask Agent 2 to set `prod_steady_state=failed`).  Agent 1 just emits the mutation attempt; verification is Agent 2's job.
 
-----
+> **DO NOT EMIT `slip.status` in any event row.** `slip.status` is derived and owned by Agent 2.
+> Only emit step transitions (e.g. `prod_gate=failed`, `unit_tests=completed`), never slip outcomes (e.g. `slip=failed`, `slip=in_progress`).
 
-Agent 2 — State Validator, Sonnet model.
+**Output:** `workflow-simulation-report.md` — chronological event log with columns:
+`| seq | timestamp | request | claimed step status | scenario tag |`
 
-STEP 0 — Read locked version from Agent 1's report header (mandatory, first):
-  • Open Agent 1's report file. Read the CALLER / LIBRARY / LIBRARY_PATH lines at the top.
-  • Set your LIBRARY_PATH and LIBRARY_LABEL to those exact values.
-  • Every library file:line you cite uses LIBRARY_PATH as the path prefix.
-  • Cross-version contamination is a hard failure: if you cite a path outside LIBRARY_PATH — mark yourself WRONG on that point.
-  • Do NOT resolve go.mod yourself — use what Agent 1 locked.
+---
 
-Inputs:
-  • Agent 1's report file (path provided).
-  • LIBRARY_PATH from Agent 1's report header (the single source of library truth for this round).
-  • State machine spec: STATE_MACHINE_V2.md (invariants I1–I4 reference only — NOT a substitute for code).
+### Agent 2 — Library Robustness Validator (Sonnet)
 
-Validation rules:
-  1. Validate against LIBRARY_PATH only. Never switch to the local goLibMyCarrier working tree unless Agent 1's header says LIBRARY_SOURCE is an explicit local path.
-     If Agent 1 locked v1.3.75, all your library citations must be v1.3.75 paths — even if you know post-PR#56 behavior from training.
-  2. Classify every event as CORRECT / WRONG / PARTIAL with file:line citations.
-  3. Specifically check:
-     a) Does checkPipelineCompletion actually fire for each claimed trigger?
-        - For RunPostExecution: confirm executor.go:229 (or equivalent) in the linked version.
-        - For direct UpdateStepWithStatus: read the actual guard in steps.go for the linked version. The guard differs between v1.3.75 (no checkPipelineCompletion in steps.go at all) and post-PR-#56 versions (guard fires for componentName=="").
-     b) Cascade-abort claims — only valid if Agent 1 emitted (or implied) an active WaitForPrerequisites poller for that step. Otherwise mark WRONG.
-     c) Aggregate transitions — verify computeAggregateStatus and applyComponentStatesToAggregate in the linked clickhouse_store.go produce the claimed aggregate value.
-     d) "OUT-OF-CALLER" tags — verify Agent 1 honestly flagged transitions not driven by the chosen caller (TestEngine PostSync, alert-gate.yaml, gitops-rollback.yaml, prod-gate.yaml, etc.).
-     e) Recovery branch — confirm both conditions (slip.Status==failed AND len(primaryFailures)==0) hold at the recovery event Agent 1 identified.
-     f) Concurrent same-timestamp events — verify they are reachable through independent CLI invocations and the store's conflict-free path (insertComponentState retry loop) handles them.
-  4. List Agent 1's "Open assumptions" and re-classify each as VERIFIED / UNVERIFIED / WRONG with file:line.
-  5. Compute a correctness rate (correct events / total). Flag any "correct outcome, wrong reason" cases — they count as PARTIAL, not CORRECT.
+**Role:** Agent 2 — Library Robustness Validator. Drives virtual slip state per slippy library logic and scores library invariant compliance under adversarial inputs from Agent 1.
 
-Output: slippy-simulation-validation.md with a per-event verdict table, a discrepancies section (4–8 lines per WRONG/PARTIAL event), a cross-cutting findings section, and a one-paragraph verdict.
+**Virtual state shape (per correlation id):**
+- `slip.status`
+- `steps[name].status`
+- `steps[builds].components[name].status`
+- `event_log[]`
 
-Hard rule: validate against LIBRARY_PATH only (read from Agent 1's report header). Do not apply memorized behavior from a different version — if you know post-PR#56 logic and LIBRARY_LABEL says v1.3.75, those are WRONG citations. Cite the actual code in the locked path.
+**Inputs:** Agent 1 events — may be valid CLI verbs, wrong claims, fabricated verbs, `slip.status` events, narration, or other adversarial output.
 
-To switch codebase for next round: override LIBRARY_SOURCE in the VARIABLES block (e.g. set LIBRARY_SOURCE to the goLibMyCarrier working tree path for post-PR#56 testing).
+**Validation rules:**
+1. Validate against library source code only. Read files; do not fabricate.
+2. For each Agent 1 event:
+   - Apply to virtual state per CLI/library logic.
+   - Determine library outcome (accepted / rejected / partial).
+   - Check all invariants on resulting state.
+   - Score event PASS / FAIL / N/A per scoring model below.
+3. Agent 1's claimed step/slip status is INPUT, not grading criteria. Library-derived state is the truth.
 
-----
+**Scoring model:**
 
-Feed Agent 1's output file path to Agent 2. Both agents are read-only. Final deliverable: simulation-report.md + simulation-validation.md.
+For each Agent 1 event, Agent 2:
+1. Applies the event to virtual state per library logic (read source — do not fake).
+2. Determines library response: accepted? rejected? state transition?
+3. After applying, checks all invariants on the derived state.
+4. Score per event:
+   - **PASS** — library handled correctly: valid input applied + invariants hold; OR invalid input gracefully rejected (fabricated verb, post-completed mutation, etc.) without breaking state.
+   - **FAIL** — library would produce inconsistent state: an invariant breaks (I1/I2/I3/I4), or aggregate inconsistent with components, or cascade/recovery wrong.
+   - **N/A** — Agent 1 emitted a non-event (informational row, slip.status report, narration). Skipped, not counted toward total.
+
+Final correctness = PASS / (PASS + FAIL).
+
+**Specifically check:**
+- **I1:** `slip=in_progress` with primary failure → FAIL
+- **I2:** `slip=failed` with zero primary failures → FAIL
+- **I3:** `slip=completed` with primary failure or running step → FAIL
+- **I4:** `slip.status` changed after `slip=completed` → FAIL
+- **Aggregate `builds`:** derived value matches `computeAggregateStatus` over current components → else FAIL
+- **Lazy cascade:** only steps that called WFP after prereq failure are aborted → else FAIL
+- **Recovery:** `aborted → pending` only when `slip.Status==failed` AND `len(primaryFailures)==0` → else FAIL
+- **Conditional `prod_rollback`:** should never enter `running` unless `prod_alert_gate=failed` → else FAIL
+- **Fabricated CLI verb:** library rejects (no state change) → PASS; if state changed → FAIL
+- **Verb/outcome mismatch** (e.g. `CompleteStep(..., failed)`): library rejects → PASS
+
+**Per-turn behavior:**
+- Receive Agent 1 event.
+- Apply to virtual state per library logic.
+- Determine library outcome (accepted / rejected / partial).
+- Check all invariants on resulting state.
+- Reply to Agent 1 with: library action, derived step status, derived `slip.status`, verdict (PASS/FAIL/N/A), citation.
+- Append to `slippy-simulation-report.md`.
+
+**Output:** `slippy-simulation-report.md` — per-event verdict table with columns:
+`| seq | request | library_action (accepted/rejected) | derived_step | derived_slip | invariants_held | verdict | citation |`
+
+- `verdict` = PASS / FAIL / N/A
+- `invariants_held` = comma-separated list of which invariants checked OK, or `BROKEN: I3` (for example) if failed.
+
+Also includes: **Library Failures** section (4–8 lines per FAIL event only), cross-cutting findings, one-paragraph verdict, final correctness rate = PASS / (PASS + FAIL).
+
+---
+
+### Flow
+
+Synchronous turn-by-turn. Agent 1 emits one request → Agent 2 processes, mutates virtual state, validates, replies → Agent 1 reads reply → emits next request. No batch handoff.
+
+### Cross-run correctness tracking
+
+After each run append one row to `slippy-simulation-history.md`:
+
+```
+| run_id | timestamp | git_sha | total_events | pass | fail | n_a | correctness_rate | notes |
+```
+
+- `correctness_rate` = PASS / (PASS + FAIL)
+- `notes` describes library robustness observations (e.g., invariant violations found, fabricated-verb rejection coverage, recovery correctness).
+
+Rate trend (drop ≥5pp run-over-run) flags regression. No hard threshold gate — purely diagnostic.
+
+**Final deliverables per run:**
+- `workflow-simulation-report.md` (Agent 1)
+- `slippy-simulation-report.md` (Agent 2)
+- `slippy-simulation-history.md` (appended)
 ```
 
 ---

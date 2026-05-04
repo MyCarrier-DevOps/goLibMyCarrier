@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-const stateMachineRef = "\n\nInvariant violated. Validate your changes against .github/STATE_MACHINE_V2.md"
+const stateMachineRef = "\n\nInvariant violated. Validate your changes against .github/STATE_MACHINE_V3.md"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // I1: Primary failure must propagate to slip.status=failed

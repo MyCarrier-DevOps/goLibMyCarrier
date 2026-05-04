@@ -47,7 +47,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Event Sourcing for Component Updates** - uses high-throughput `ReplacingMergeTree` for component states
 - **Event Sourcing extended to pipeline-level steps** (March 4, 2026) - eliminates concurrent lost-update bug; see "Recent Changes"
 - See `slippy/CLAUDE.md` for detailed patterns
-- See `.github/STATE_MACHINE_V2.md` for state machine specification, algorithm reference, and validation guide
+- See `.github/STATE_MACHINE_V3.md` for state machine specification, algorithm reference, and validation guide
 
 #### Slippy State Machine — Consistency Invariants
 
@@ -191,7 +191,7 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 | File | Purpose |
 |------|---------|
 | `STATE_MACHINE.md` | Low-level state machine: step write paths, concurrency model, recovery algorithm, validation checklist |
-| `STATE_MACHINE_V2.md` | High-level pipeline phases: INIT → CI_PARALLEL → DEV/PREPROD → PROD_GATE → PROD_RELEASE → PROD_MONITORING → COMPLETED/ROLLBACK |
+| `STATE_MACHINE_V3.md` | High-level pipeline phases: INIT → CI_PARALLEL → DEV/PREPROD → PROD_GATE → PROD_RELEASE → PROD_MONITORING → COMPLETED/ROLLBACK |
 | `VALIDATE_CLAUDE.md` | 8-step Claude validation framework for code changes — maps each change type to the relevant invariant and phase |
 | `VALIDATE_COPILOT.md` | 8-rule Copilot checklist for code review — concrete code patterns to flag |
 
@@ -995,7 +995,7 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 
 ## Current Focus
 
-1. **State machine invariants documented** (April 29, 2026) — `STATE_MACHINE.md`, `STATE_MACHINE_V2.md`, `VALIDATE_CLAUDE.md`, `VALIDATE_COPILOT.md` in `.github/`; 9 discrepancies catalogued.
+1. **State machine invariants documented** (April 29, 2026) — `STATE_MACHINE.md`, `STATE_MACHINE_V3.md`, `VALIDATE_CLAUDE.md`, `VALIDATE_COPILOT.md` in `.github/`; 9 discrepancies catalogued.
 2. **`executor.go` ordering fix** — `checkPipelineCompletion` primaryFailures now checked before `prod_steady_state`; test added; staged, pending commit.
 3. **`default.json` prerequisites fix** — `prod_alert_gate`/`prod_rollback` prerequisites corrected to `[]`; unstaged, pending commit.
 4. **PR #56 Copilot review fixes** (April 29, 2026) — 3 unresolved comments addressed; pending commit:
