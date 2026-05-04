@@ -1839,20 +1839,12 @@ func TestClient_PromoteSlip(t *testing.T) {
 	})
 }
 
-// TestClient_PromoteSlip_Immutable documents the spec/code drift for promoted slip immutability.
+// TestClient_PromoteSlip_Immutable verifies that a promoted slip is pipeline-terminal and
+// immutable: late step events (FailStep, UpdateStepWithStatus) must not overwrite slip.status.
 //
 // STATE_MACHINE_V3.md §Pipeline termination states:
 //
 //	"abandoned / promoted: pipeline-terminal, bypass checkPipelineCompletion"
-//
-// Current code (slippy/executor.go checkPipelineCompletion) only short-circuits when
-// slip.Status==completed. It does NOT short-circuit for promoted or abandoned. As a result,
-// late terminal step events (FailStep, UpdateStepWithStatus with a failed status) on a
-// promoted slip incorrectly overwrite slip.status back to "failed".
-//
-// Spec-correct sub-tests are marked t.Skip and reference bd issue goLibMyCarrier-awt.
-// Sub-tests that assert current (spec-violating) behavior remain as live PASS tests so
-// regressions are detectable and the gap is clearly documented.
 func TestClient_PromoteSlip_Immutable(t *testing.T) {
 	ctx := context.Background()
 
@@ -1922,14 +1914,9 @@ func TestClient_PromoteSlip_Immutable(t *testing.T) {
 		}
 	})
 
-	// Sub-test 3: FailStep on a promoted slip — CURRENT (SPEC-VIOLATING) behavior.
-	// checkPipelineCompletion sees the primary failure and overwrites slip.status to "failed".
-	// This sub-test asserts what the code actually does today, so it passes and acts as a
-	// regression guard until goLibMyCarrier-awt is fixed.
-	t.Run("post-promotion FailStep currently overwrites slip status to failed (spec violation)", func(t *testing.T) {
-		t.Log("KNOWN SPEC/CODE DRIFT: slip.status should remain 'promoted' per STATE_MACHINE_V3.md. " +
-			"Tracked in bd issue goLibMyCarrier-awt.")
-
+	// Sub-test 3: FailStep on a promoted slip must leave slip.status as promoted.
+	// checkPipelineCompletion short-circuits on promoted per STATE_MACHINE_V3.md.
+	t.Run("post-promotion FailStep does not change slip status", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
@@ -1955,25 +1942,15 @@ func TestClient_PromoteSlip_Immutable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to load slip: %v", err)
 		}
-		// Current behavior: checkPipelineCompletion overwrites promoted → failed.
-		// Once goLibMyCarrier-awt is fixed, this assertion should change to SlipStatusPromoted.
-		if loaded.Status != SlipStatusFailed {
-			t.Errorf("current behavior: expected slip.status %q after FailStep on promoted slip, got %q (if this is now 'promoted', fix goLibMyCarrier-awt is in and this sub-test needs updating)",
-				SlipStatusFailed, loaded.Status)
+		if loaded.Status != SlipStatusPromoted {
+			t.Errorf("expected slip.status %q to remain unchanged after FailStep on promoted slip, got %q",
+				SlipStatusPromoted, loaded.Status)
 		}
 	})
 
-	// Sub-test 4: Spec-correct FailStep assertion — skipped until goLibMyCarrier-awt is fixed.
-	t.Run("post-promotion FailStep must not change slip status (spec-correct, pending fix)", func(t *testing.T) {
-		t.Skip("known spec/code drift — tracked in bd issue goLibMyCarrier-awt: " +
-			"checkPipelineCompletion missing short-circuit for promoted/abandoned")
-	})
-
-	// Sub-test 5: UpdateStepWithStatus on a promoted slip — CURRENT (SPEC-VIOLATING) behavior.
-	t.Run("post-promotion UpdateStepWithStatus currently overwrites slip status to failed (spec violation)", func(t *testing.T) {
-		t.Log("KNOWN SPEC/CODE DRIFT: slip.status should remain 'promoted' per STATE_MACHINE_V3.md. " +
-			"Tracked in bd issue goLibMyCarrier-awt.")
-
+	// Sub-test 5: UpdateStepWithStatus on a promoted slip must leave slip.status as promoted.
+	// checkPipelineCompletion short-circuits on promoted per STATE_MACHINE_V3.md.
+	t.Run("post-promotion UpdateStepWithStatus does not change slip status", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
@@ -1998,18 +1975,149 @@ func TestClient_PromoteSlip_Immutable(t *testing.T) {
 		if err != nil {
 			t.Fatalf("failed to load slip: %v", err)
 		}
-		// Current behavior: checkPipelineCompletion overwrites promoted → failed.
-		// Once goLibMyCarrier-awt is fixed, this assertion should change to SlipStatusPromoted.
-		if loaded.Status != SlipStatusFailed {
-			t.Errorf("current behavior: expected slip.status %q after UpdateStepWithStatus on promoted slip, got %q (if this is now 'promoted', fix goLibMyCarrier-awt is in and this sub-test needs updating)",
-				SlipStatusFailed, loaded.Status)
+		if loaded.Status != SlipStatusPromoted {
+			t.Errorf("expected slip.status %q to remain unchanged after UpdateStepWithStatus on promoted slip, got %q",
+				SlipStatusPromoted, loaded.Status)
+		}
+	})
+}
+
+// TestClient_AbandonSlip_Immutable verifies that an abandoned slip is pipeline-terminal and
+// immutable: late step events (FailStep, CompleteStep, UpdateStepWithStatus) must not overwrite
+// slip.status.
+//
+// STATE_MACHINE_V3.md §Pipeline termination states:
+//
+//	"abandoned / promoted: pipeline-terminal, bypass checkPipelineCompletion"
+func TestClient_AbandonSlip_Immutable(t *testing.T) {
+	ctx := context.Background()
+
+	// Sub-test 1: AbandonSlip itself sets slip.status to abandoned.
+	t.Run("AbandonSlip sets slip status to abandoned", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-abandon-basic",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-abandon-basic",
+			Status:        SlipStatusInProgress,
+			Steps:         map[string]Step{},
+		}
+		store.AddSlip(slip)
+
+		if err := client.AbandonSlip(ctx, "corr-abandon-basic", "corr-main-newer"); err != nil {
+			t.Fatalf("AbandonSlip returned unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-abandon-basic")
+		if err != nil {
+			t.Fatalf("failed to load slip: %v", err)
+		}
+		if loaded.Status != SlipStatusAbandoned {
+			t.Errorf("expected slip.status %q after AbandonSlip, got %q", SlipStatusAbandoned, loaded.Status)
 		}
 	})
 
-	// Sub-test 6: Spec-correct UpdateStepWithStatus assertion — skipped until goLibMyCarrier-awt is fixed.
-	t.Run("post-promotion UpdateStepWithStatus must not change slip status (spec-correct, pending fix)", func(t *testing.T) {
-		t.Skip("known spec/code drift — tracked in bd issue goLibMyCarrier-awt: " +
-			"checkPipelineCompletion missing short-circuit for promoted/abandoned")
+	// Sub-test 2: FailStep on an abandoned slip must leave slip.status as abandoned.
+	// checkPipelineCompletion short-circuits on abandoned per STATE_MACHINE_V3.md.
+	t.Run("post-abandon FailStep does not change slip status", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-abandoned-fail",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-abandoned-fail",
+			Status:        SlipStatusAbandoned,
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusRunning},
+				"dev_deploy": {Status: StepStatusPending},
+			},
+		}
+		store.AddSlip(slip)
+
+		if err := client.FailStep(ctx, "corr-abandoned-fail", "unit_tests", "", "late failure"); err != nil {
+			t.Fatalf("FailStep returned unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-abandoned-fail")
+		if err != nil {
+			t.Fatalf("failed to load slip: %v", err)
+		}
+		if loaded.Status != SlipStatusAbandoned {
+			t.Errorf("expected slip.status %q to remain unchanged after FailStep on abandoned slip, got %q",
+				SlipStatusAbandoned, loaded.Status)
+		}
+	})
+
+	// Sub-test 3: CompleteStep on an abandoned slip must leave slip.status as abandoned.
+	t.Run("post-abandon CompleteStep does not change slip status", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-abandoned-complete",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-abandoned-complete",
+			Status:        SlipStatusAbandoned,
+			Steps: map[string]Step{
+				"unit_tests": {Status: StepStatusRunning},
+			},
+		}
+		store.AddSlip(slip)
+
+		if err := client.CompleteStep(ctx, "corr-abandoned-complete", "unit_tests", ""); err != nil {
+			t.Fatalf("CompleteStep returned unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-abandoned-complete")
+		if err != nil {
+			t.Fatalf("failed to load slip: %v", err)
+		}
+		if loaded.Status != SlipStatusAbandoned {
+			t.Errorf("expected slip.status %q to remain unchanged after CompleteStep on abandoned slip, got %q",
+				SlipStatusAbandoned, loaded.Status)
+		}
+	})
+
+	// Sub-test 4: UpdateStepWithStatus with a failed status on an abandoned slip must leave
+	// slip.status as abandoned.
+	t.Run("post-abandon UpdateStepWithStatus does not change slip status", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		slip := &Slip{
+			CorrelationID: "corr-abandoned-update",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-abandoned-update",
+			Status:        SlipStatusAbandoned,
+			Steps: map[string]Step{
+				"builds": {Status: StepStatusRunning},
+			},
+		}
+		store.AddSlip(slip)
+
+		if err := client.UpdateStepWithStatus(ctx, "corr-abandoned-update", "builds", "", StepStatusFailed, "late build failure"); err != nil {
+			t.Fatalf("UpdateStepWithStatus returned unexpected error: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, "corr-abandoned-update")
+		if err != nil {
+			t.Fatalf("failed to load slip: %v", err)
+		}
+		if loaded.Status != SlipStatusAbandoned {
+			t.Errorf("expected slip.status %q to remain unchanged after UpdateStepWithStatus on abandoned slip, got %q",
+				SlipStatusAbandoned, loaded.Status)
+		}
 	})
 }
 

@@ -711,6 +711,8 @@ The file `slippy/state_machine_invariants_test.go` is the machine-readable enfor
 | `TestStateMachine_I3_PrimaryFailureBlocksCompletion` | I3 | Primary failure blocks completion even when `prod_steady_state=completed` |
 | `TestStateMachine_I4_CompletedSlipIsImmutable` | I4 | `FailStep` on a completed slip does not change `slip.status` |
 | `TestStateMachine_I4_CompletedSlipIgnoresRecoveryAttempts` | I4 | `checkPipelineCompletion` on a completed slip changes nothing |
+| `TestClient_PromoteSlip_Immutable` | I4 | `FailStep`/`UpdateStepWithStatus` on a promoted slip does not change `slip.status` |
+| `TestClient_AbandonSlip_Immutable` | I4 | `FailStep`/`CompleteStep`/`UpdateStepWithStatus` on an abandoned slip does not change `slip.status` |
 
 Run with: `go test -run TestStateMachine ./slippy/...`
 
