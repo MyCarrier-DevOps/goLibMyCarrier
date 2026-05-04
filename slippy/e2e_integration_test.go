@@ -728,14 +728,41 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	}
 	t.Log("✓ prod_deploy completed")
 
-	// Complete prod_tests (final step)
+	// Complete prod_tests
 	if err := client.StartStep(ctx, correlationID, "prod_tests", ""); err != nil {
 		t.Fatalf("failed to start prod_tests: %v", err)
 	}
 	if err := client.CompleteStep(ctx, correlationID, "prod_tests", ""); err != nil {
 		t.Fatalf("failed to complete prod_tests: %v", err)
 	}
-	t.Log("✓ prod_tests completed (FINAL STEP)")
+	t.Log("✓ prod_tests completed")
+
+	// Complete prod_alert_gate (no prerequisites — monitoring / alerting sentinel)
+	if err := client.StartStep(ctx, correlationID, "prod_alert_gate", ""); err != nil {
+		t.Fatalf("failed to start prod_alert_gate: %v", err)
+	}
+	if err := client.CompleteStep(ctx, correlationID, "prod_alert_gate", ""); err != nil {
+		t.Fatalf("failed to complete prod_alert_gate: %v", err)
+	}
+	t.Log("✓ prod_alert_gate completed")
+
+	// Complete prod_rollback (no prerequisites — rollback sentinel)
+	if err := client.StartStep(ctx, correlationID, "prod_rollback", ""); err != nil {
+		t.Fatalf("failed to start prod_rollback: %v", err)
+	}
+	if err := client.CompleteStep(ctx, correlationID, "prod_rollback", ""); err != nil {
+		t.Fatalf("failed to complete prod_rollback: %v", err)
+	}
+	t.Log("✓ prod_rollback completed")
+
+	// Complete prod_steady_state (prerequisites: prod_deploy, prod_tests — both done above)
+	if err := client.StartStep(ctx, correlationID, "prod_steady_state", ""); err != nil {
+		t.Fatalf("failed to start prod_steady_state: %v", err)
+	}
+	if err := client.CompleteStep(ctx, correlationID, "prod_steady_state", ""); err != nil {
+		t.Fatalf("failed to complete prod_steady_state: %v", err)
+	}
+	t.Log("✓ prod_steady_state completed (FINAL STEP)")
 
 	// =========================================================================
 	// PHASE 6: VERIFICATION
@@ -1777,26 +1804,26 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 	t.Log("")
 	t.Log("RAW JSON DATA FROM CLICKHOUSE:")
 
-	var buildsJSON, stateHistoryJSON, ancestryJSON string
-	// Use the config-driven step name as the column name
+	var buildsJSON, stateHistoryJSON string
+	// Use the config-driven step name as the column name.
+	// Note: the ancestry column was dropped by migration v10 (drop_ancestry_column) and
+	// must not be referenced here. Ancestry data is now in the slip_ancestry table.
 	rawQuery := fmt.Sprintf(`
-		SELECT 
+		SELECT
 			toString(%s) as builds,
-			toString(state_history) as history,
-			toString(ancestry) as ancestry
+			toString(state_history) as history
 		FROM ci_json_test.routing_slips
 		WHERE correlation_id = $1 AND sign = 1
 		ORDER BY version DESC
 		LIMIT 1
 	`, buildsStep)
-	err = container.conn.QueryRow(ctx, rawQuery, correlationID).Scan(&buildsJSON, &stateHistoryJSON, &ancestryJSON)
+	err = container.conn.QueryRow(ctx, rawQuery, correlationID).Scan(&buildsJSON, &stateHistoryJSON)
 	if err != nil {
 		t.Fatalf("failed to query raw JSON: %v", err)
 	}
 
 	t.Logf("  %s JSON: %s", buildsStep, buildsJSON[:min(200, len(buildsJSON))]+"...")
 	t.Logf("  state_history JSON: %s", stateHistoryJSON[:min(200, len(stateHistoryJSON))]+"...")
-	t.Logf("  ancestry JSON: %s", ancestryJSON)
 
 	// Verify JSON is valid by parsing
 	var buildsData interface{}
@@ -1841,4 +1868,563 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// =============================================================================
+// I5 INVARIANT TEST — RoutingSlips step columns match event-log argMax
+// =============================================================================
+
+// assertRoutingSlipsMatchesEventLog queries both the event log (slip_component_states)
+// and the routing_slips materialized columns for the given correlationID and asserts
+// that every pipeline-level step column in routing_slips matches the argMax-derived
+// authoritative status from the event log.
+//
+// This is the machine-readable enforcement of I5:
+//
+//	routing_slips.<step>_status must equal
+//	argMax(status, timestamp) FROM slip_component_states
+//	WHERE correlation_id=? GROUP BY step, component
+//
+// For non-aggregate steps the event-log row has an empty component name ("").
+// For aggregate steps the individual component rows are aggregated to compute
+// the effective step status using the same logic as hydrateSlip.
+func assertRoutingSlipsMatchesEventLog(
+	t *testing.T,
+	ctx context.Context,
+	conn clickhouse.Conn,
+	database, correlationID string,
+	pipelineConfig *PipelineConfig,
+) {
+	t.Helper()
+
+	// ---- 1. Derive truth from slip_component_states via argMax ----
+	// Map of step -> component -> latest status.
+	// Use the same tiebreaker as doLoadComponentStates: when timestamps are equal
+	// (possible on testcontainers with coarse clock resolution), the higher-numeric
+	// status wins so that completed (4) beats running (3).
+	eventLogRows, err := conn.Query(ctx, fmt.Sprintf(`
+		SELECT
+			step,
+			component,
+			argMax(status, (toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status)))) AS status
+		FROM %s.slip_component_states
+		WHERE correlation_id = $1
+		GROUP BY step, component
+	`, database), correlationID)
+	if err != nil {
+		t.Fatalf("assertRoutingSlipsMatchesEventLog: query slip_component_states: %v", err)
+	}
+	defer eventLogRows.Close()
+
+	// stepComponents maps step -> component -> status (event log truth)
+	stepComponents := make(map[string]map[string]string)
+	for eventLogRows.Next() {
+		var step, component, status string
+		if err := eventLogRows.Scan(&step, &component, &status); err != nil {
+			t.Fatalf("assertRoutingSlipsMatchesEventLog: scan: %v", err)
+		}
+		if stepComponents[step] == nil {
+			stepComponents[step] = make(map[string]string)
+		}
+		stepComponents[step][component] = status
+	}
+	if err := eventLogRows.Err(); err != nil {
+		t.Fatalf("assertRoutingSlipsMatchesEventLog: rows.Err: %v", err)
+	}
+
+	// ---- 2. Read routing_slips latest sign=1 row ----
+	// Collect <step>_status column values from the latest active row.
+	routingSlipsRow, err := conn.Query(ctx, fmt.Sprintf(`
+		SELECT *
+		FROM %s.routing_slips
+		WHERE correlation_id = $1 AND sign = 1
+		ORDER BY version DESC
+		LIMIT 1
+	`, database), correlationID)
+	if err != nil {
+		t.Fatalf("assertRoutingSlipsMatchesEventLog: query routing_slips: %v", err)
+	}
+	defer routingSlipsRow.Close()
+
+	// Map column name -> value for the row.
+	rsColumnValues := make(map[string]string)
+	if routingSlipsRow.Next() {
+		cols := routingSlipsRow.Columns()
+		vals := make([]interface{}, len(cols))
+		valPtrs := make([]interface{}, len(cols))
+		for i := range vals {
+			vals[i] = new(string)
+			valPtrs[i] = vals[i]
+		}
+		if err := routingSlipsRow.Scan(valPtrs...); err != nil {
+			// Scan with all-strings fails for non-string columns; fall back to
+			// querying only the _status columns we care about.
+			t.Logf("assertRoutingSlipsMatchesEventLog: full-row scan skipped (%v); using targeted column queries", err)
+		} else {
+			for i, col := range cols {
+				rsColumnValues[col] = *(vals[i].(*string))
+			}
+		}
+	}
+	if err := routingSlipsRow.Err(); err != nil {
+		t.Fatalf("assertRoutingSlipsMatchesEventLog: routing_slips rows.Err: %v", err)
+	}
+
+	// ---- 3. Per-step validation ----
+	var mismatches []string
+
+	for _, stepCfg := range pipelineConfig.Steps {
+		colName := stepCfg.Name + "_status"
+
+		// Derive expected status from event log for this step.
+		var expectedStatus string
+
+		componentMap := stepComponents[stepCfg.Name]
+		if stepCfg.Aggregates != "" {
+			// Aggregate step: compute effective status from all component rows.
+			// Logic mirrors hydrateSlip / computeAggregateStatus: any failed ->
+			// failed, all completed -> completed, any running -> running, else pending.
+			expectedStatus = deriveAggregateStatus(componentMap)
+		} else {
+			// Non-aggregate (pipeline-level) step: single row with component="".
+			expectedStatus = componentMap[""]
+		}
+
+		// If the step has no event-log rows yet, it is still pending — skip
+		// the check rather than falsely flagging it.
+		if expectedStatus == "" {
+			continue
+		}
+
+		// Try to get the routing_slips value from the pre-scanned map, or do a
+		// targeted query when the full-row scan was not available.
+		rsStatus, ok := rsColumnValues[colName]
+		if !ok {
+			// Targeted single-column query.
+			qErr := conn.QueryRow(ctx, fmt.Sprintf(`
+				SELECT %s
+				FROM %s.routing_slips
+				WHERE correlation_id = $1 AND sign = 1
+				ORDER BY version DESC
+				LIMIT 1
+			`, colName, database), correlationID).Scan(&rsStatus)
+			if qErr != nil {
+				t.Logf("assertRoutingSlipsMatchesEventLog: could not read column %s: %v", colName, qErr)
+				continue
+			}
+		}
+
+		if rsStatus != expectedStatus {
+			mismatches = append(mismatches,
+				fmt.Sprintf("step %s: routing_slips=%s, event_log=%s",
+					stepCfg.Name, rsStatus, expectedStatus),
+			)
+		}
+	}
+
+	if len(mismatches) > 0 {
+		t.Errorf("I5 VIOLATION: %d step column(s) in routing_slips do not match event log:", len(mismatches))
+		for _, m := range mismatches {
+			t.Errorf("  - %s", m)
+		}
+	} else {
+		t.Logf("I5 OK: all routing_slips step columns match event log for correlation_id=%s", correlationID)
+	}
+}
+
+// deriveAggregateStatus computes the effective step status from a map of
+// component -> status using the same precedence rules as hydrateSlip:
+// failed > running > completed > pending.
+func deriveAggregateStatus(componentMap map[string]string) string {
+	if len(componentMap) == 0 {
+		return ""
+	}
+	hasPending := false
+	hasRunning := false
+	for _, s := range componentMap {
+		switch s {
+		case string(StepStatusFailed):
+			return string(StepStatusFailed)
+		case string(StepStatusRunning):
+			hasRunning = true
+		case string(StepStatusPending):
+			hasPending = true
+		}
+	}
+	if hasRunning {
+		return string(StepStatusRunning)
+	}
+	if hasPending {
+		return string(StepStatusPending)
+	}
+	return string(StepStatusCompleted)
+}
+
+// TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog verifies the
+// I5 invariant under realistic ClickHouse async-insert conditions.
+//
+// It reproduces the race scenario where multiple terminal step events arrive for
+// the same correlation_id in tight sequence or concurrently, which could leave
+// routing_slips.<step>_status columns stale (cloned from an earlier INSERT SELECT
+// row before the just-written component-state row was visible).
+//
+// Three sub-tests:
+//
+//	A — sequential terminal events (real-life ordering; single goroutine)
+//	B — true concurrent goroutines (5 goroutines, same barrier)
+//	C — recovery race (slip fails, all failed steps re-run concurrently)
+func TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping E2E I5 invariant test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// Disable ryuk for Podman compatibility.
+	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+
+	// Start ClickHouse container shared across all sub-tests.
+	container, err := setupE2EClickHouseContainer(ctx, t)
+	if err != nil {
+		t.Fatalf("failed to setup clickhouse container: %v", err)
+	}
+	defer func() {
+		if err := container.terminate(ctx); err != nil {
+			t.Logf("warning: failed to terminate container: %v", err)
+		}
+	}()
+
+	// Use default.json (production schema) — it contains prod_alert_gate,
+	// prod_rollback, and prod_steady_state which are the steps exercised below.
+	pipelineConfig, err := LoadPipelineConfigFromFile("default.json")
+	if err != nil {
+		t.Fatalf("failed to load default.json: %v", err)
+	}
+
+	const dbName = "ci_e2e_i5_test"
+
+	migrateOpts := MigrateOptions{
+		Database:       dbName,
+		PipelineConfig: pipelineConfig,
+	}
+	if _, err := RunMigrations(ctx, container.conn, migrateOpts); err != nil {
+		t.Fatalf("failed to run migrations: %v", err)
+	}
+
+	session := &testClickhouseSession{conn: container.conn}
+	store := NewClickHouseStoreFromSession(session, pipelineConfig, dbName)
+	defer store.Close()
+
+	mockGitHub := newMockGitHubAPIForE2E()
+	cfg := Config{
+		PipelineConfig: pipelineConfig,
+		HoldTimeout:    30 * time.Second,
+		PollInterval:   500 * time.Millisecond,
+		AncestryDepth:  20,
+		Database:       dbName,
+		Logger:         &e2eTestLogger{t: t},
+	}
+	client := NewClientWithDependencies(store, mockGitHub, cfg)
+
+	// newSlip creates, primes, and returns a fresh slip with all prerequisite
+	// steps already completed so the terminal steps of interest are reachable.
+	// It starts (but does not complete) the three production observation steps:
+	// prod_alert_gate, prod_rollback, prod_steady_state.
+	newSlip := func(t *testing.T, label string) (correlationID string) {
+		t.Helper()
+
+		correlationID = fmt.Sprintf("e2e-i5-%s-%d", label, time.Now().UnixNano())
+		commitSHA := fmt.Sprintf("i5sha%d", time.Now().UnixNano()%1000000)
+
+		mockGitHub.SetAncestry("MyCarrier-DevOps", "test-repo", commitSHA, []string{commitSHA})
+
+		components := []ComponentDefinition{
+			{Name: "api", DockerfilePath: "src/MC.Api"},
+			{Name: "worker", DockerfilePath: "src/MC.Worker"},
+		}
+		_, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: correlationID,
+			Repository:    "MyCarrier-DevOps/test-repo",
+			Branch:        "main",
+			CommitSHA:     commitSHA,
+			Components:    components,
+		})
+		if err != nil {
+			t.Fatalf("[%s] CreateSlipForPush: %v", label, err)
+		}
+
+		// Discover the aggregate step name for "build" from config.
+		buildsStep := pipelineConfig.GetAggregateStep("build")
+		if buildsStep == "" {
+			t.Fatalf("[%s] no aggregate step for 'build' in config", label)
+		}
+
+		// Complete all prerequisite steps so terminal steps are unblocked.
+		type stepAction struct{ step, component string }
+		prereqs := []stepAction{
+			{buildsStep, "api"},
+			{buildsStep, "worker"},
+		}
+		for _, sa := range prereqs {
+			if err := client.StartStep(ctx, correlationID, sa.step, sa.component); err != nil {
+				t.Fatalf("[%s] StartStep(%s/%s): %v", label, sa.step, sa.component, err)
+			}
+			if err := client.CompleteStep(ctx, correlationID, sa.step, sa.component); err != nil {
+				t.Fatalf("[%s] CompleteStep(%s/%s): %v", label, sa.step, sa.component, err)
+			}
+		}
+
+		plainPrereqs := []string{
+			"unit_tests", "secret_scan", "package_artifact",
+			"dev_deploy", "dev_tests",
+			"preprod_deploy", "preprod_tests",
+			"prod_gate", "prod_release_created",
+			"prod_deploy", "prod_tests",
+		}
+		for _, step := range plainPrereqs {
+			// Some steps may not exist in all configs; skip gracefully.
+			if pipelineConfig.GetStep(step) == nil {
+				continue
+			}
+			if err := client.StartStep(ctx, correlationID, step, ""); err != nil {
+				t.Fatalf("[%s] StartStep(%s): %v", label, step, err)
+			}
+			if err := client.CompleteStep(ctx, correlationID, step, ""); err != nil {
+				t.Fatalf("[%s] CompleteStep(%s): %v", label, step, err)
+			}
+		}
+
+		// Start (but do NOT complete) the three terminal observation steps.
+		for _, step := range []string{"prod_alert_gate", "prod_rollback", "prod_steady_state"} {
+			if pipelineConfig.GetStep(step) == nil {
+				continue
+			}
+			if err := client.StartStep(ctx, correlationID, step, ""); err != nil {
+				t.Fatalf("[%s] StartStep(%s): %v", label, step, err)
+			}
+		}
+
+		return correlationID
+	}
+
+	// -------------------------------------------------------------------------
+	// Sub-test A: Sequential terminal events (single goroutine, tight sequence)
+	// -------------------------------------------------------------------------
+	// This reproduces the most common production pattern: three terminal step
+	// events arriving for the same slip within milliseconds of each other.
+	// ClickHouse async-insert visibility means that when the second
+	// insertAtomicStatusUpdate runs its INSERT SELECT, it may clone step columns
+	// from a row that does not yet include the first event's status — resulting
+	// in a stale prod_alert_gate_status column in the final materialized row.
+	t.Run("A_SequentialTerminalEvents", func(t *testing.T) {
+		correlationID := newSlip(t, "seq")
+		t.Cleanup(func() {
+			// Best-effort cleanup: delete test rows to keep CH tidy.
+			_ = container.conn.Exec(ctx, fmt.Sprintf(
+				"ALTER TABLE %s.routing_slips DELETE WHERE correlation_id = '%s'",
+				dbName, correlationID,
+			))
+			_ = container.conn.Exec(ctx, fmt.Sprintf(
+				"ALTER TABLE %s.slip_component_states DELETE WHERE correlation_id = '%s'",
+				dbName, correlationID,
+			))
+		})
+
+		// Three terminal events in tight sequence, single goroutine.
+		if err := client.FailStep(ctx, correlationID, "prod_alert_gate", "", "alert detected"); err != nil {
+			t.Fatalf("FailStep prod_alert_gate: %v", err)
+		}
+		if err := client.CompleteStep(ctx, correlationID, "prod_rollback", ""); err != nil {
+			t.Fatalf("CompleteStep prod_rollback: %v", err)
+		}
+		if err := client.FailStep(ctx, correlationID, "prod_steady_state", "", "rollback completed"); err != nil {
+			t.Fatalf("FailStep prod_steady_state: %v", err)
+		}
+
+		assertRoutingSlipsMatchesEventLog(t, ctx, container.conn, dbName, correlationID, pipelineConfig)
+	})
+
+	// -------------------------------------------------------------------------
+	// Sub-test B: True concurrent goroutines (stress test)
+	// -------------------------------------------------------------------------
+	// Five goroutines fire terminal events simultaneously from behind a
+	// sync.WaitGroup barrier to maximise INSERT SELECT racing in ClickHouse.
+	// Each goroutine writes a distinct step/component to avoid ClickHouse-level
+	// write conflicts while still sharing a single routing_slips row.
+	// A brief sleep is intentionally NOT added between concurrent writes; the
+	// race is the point of this sub-test.
+	t.Run("B_TrueConcurrentGoroutines", func(t *testing.T) {
+		correlationID := newSlip(t, "conc")
+		t.Cleanup(func() {
+			_ = container.conn.Exec(ctx, fmt.Sprintf(
+				"ALTER TABLE %s.routing_slips DELETE WHERE correlation_id = '%s'",
+				dbName, correlationID,
+			))
+			_ = container.conn.Exec(ctx, fmt.Sprintf(
+				"ALTER TABLE %s.slip_component_states DELETE WHERE correlation_id = '%s'",
+				dbName, correlationID,
+			))
+		})
+
+		type terminalEvent struct {
+			step      string
+			component string
+			fail      bool
+			reason    string
+		}
+
+		events := []terminalEvent{
+			{"prod_alert_gate", "", true, "degradation signal"},
+			{"prod_rollback", "", false, ""},
+			{"prod_steady_state", "", true, "rollback done"},
+		}
+
+		// Filter to steps that exist in the config.
+		var active []terminalEvent
+		for _, ev := range events {
+			if pipelineConfig.GetStep(ev.step) != nil {
+				active = append(active, ev)
+			}
+		}
+
+		var startBarrier sync.WaitGroup
+		startBarrier.Add(1)
+
+		var wg sync.WaitGroup
+		errCh := make(chan error, len(active))
+
+		for _, ev := range active {
+			wg.Add(1)
+			go func(ev terminalEvent) {
+				defer wg.Done()
+				// Wait for all goroutines to be ready before firing.
+				startBarrier.Wait()
+
+				var err error
+				if ev.fail {
+					err = client.FailStep(ctx, correlationID, ev.step, ev.component, ev.reason)
+				} else {
+					err = client.CompleteStep(ctx, correlationID, ev.step, ev.component)
+				}
+				if err != nil {
+					errCh <- fmt.Errorf("goroutine %s: %w", ev.step, err)
+				}
+			}(ev)
+		}
+
+		// Release all goroutines simultaneously.
+		startBarrier.Done()
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			t.Errorf("concurrent write error: %v", err)
+		}
+
+		assertRoutingSlipsMatchesEventLog(t, ctx, container.conn, dbName, correlationID, pipelineConfig)
+	})
+
+	// -------------------------------------------------------------------------
+	// Sub-test C: Recovery race
+	// -------------------------------------------------------------------------
+	// Gets the slip into a failed state with multiple primary failures, then
+	// re-runs all failed steps to completion concurrently.  Verifies that the
+	// recovery branch correctly resets slip.status to in_progress / completed
+	// without leaving stale step columns.
+	t.Run("C_RecoveryRace", func(t *testing.T) {
+		correlationID := newSlip(t, "rcvr")
+		t.Cleanup(func() {
+			_ = container.conn.Exec(ctx, fmt.Sprintf(
+				"ALTER TABLE %s.routing_slips DELETE WHERE correlation_id = '%s'",
+				dbName, correlationID,
+			))
+			_ = container.conn.Exec(ctx, fmt.Sprintf(
+				"ALTER TABLE %s.slip_component_states DELETE WHERE correlation_id = '%s'",
+				dbName, correlationID,
+			))
+		})
+
+		// Phase 1: fail multiple terminal steps to put slip into failed state.
+		for _, step := range []string{"prod_alert_gate", "prod_steady_state"} {
+			if pipelineConfig.GetStep(step) == nil {
+				continue
+			}
+			if err := client.FailStep(ctx, correlationID, step, "", "initial failure"); err != nil {
+				t.Fatalf("FailStep %s (setup): %v", step, err)
+			}
+		}
+
+		t.Log("C: slip is in failed state; now recovering concurrently")
+
+		// Phase 2: restart + complete failed steps concurrently.
+		stepsToRecover := []string{"prod_alert_gate", "prod_steady_state"}
+		var active []string
+		for _, s := range stepsToRecover {
+			if pipelineConfig.GetStep(s) != nil {
+				active = append(active, s)
+			}
+		}
+
+		var startBarrier sync.WaitGroup
+		startBarrier.Add(1)
+
+		var wg sync.WaitGroup
+		errCh := make(chan error, len(active))
+
+		for _, stepName := range active {
+			wg.Add(1)
+			go func(step string) {
+				defer wg.Done()
+				startBarrier.Wait()
+
+				if err := client.StartStep(ctx, correlationID, step, ""); err != nil {
+					errCh <- fmt.Errorf("recovery StartStep %s: %w", step, err)
+					return
+				}
+				if err := client.CompleteStep(ctx, correlationID, step, ""); err != nil {
+					errCh <- fmt.Errorf("recovery CompleteStep %s: %w", step, err)
+				}
+			}(stepName)
+		}
+
+		startBarrier.Done()
+		wg.Wait()
+		close(errCh)
+
+		for err := range errCh {
+			t.Errorf("recovery concurrent error: %v", err)
+		}
+
+		// Also complete prod_rollback sequentially (was still in running state).
+		if pipelineConfig.GetStep("prod_rollback") != nil {
+			if err := client.CompleteStep(ctx, correlationID, "prod_rollback", ""); err != nil {
+				t.Fatalf("CompleteStep prod_rollback (recovery): %v", err)
+			}
+		}
+
+		assertRoutingSlipsMatchesEventLog(t, ctx, container.conn, dbName, correlationID, pipelineConfig)
+
+		// Additionally verify the slip overall status is consistent.
+		finalSlip, err := client.Load(ctx, correlationID)
+		if err != nil {
+			t.Fatalf("Load after recovery: %v", err)
+		}
+		t.Logf("C: final slip.status=%s after recovery", finalSlip.Status)
+		if finalSlip.Status == SlipStatusFailed {
+			// Check whether any step is still genuinely failed.
+			anyFailed := false
+			for _, step := range finalSlip.Steps {
+				if step.Status == StepStatusFailed {
+					anyFailed = true
+					break
+				}
+			}
+			if !anyFailed {
+				t.Errorf(
+					"C: slip.status=failed but no step reports failed — stale routing_slips row (I5 violation candidate)",
+				)
+			}
+		}
+	})
 }

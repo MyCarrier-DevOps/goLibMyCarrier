@@ -21,6 +21,8 @@
 - *Cascade abort* — step in `aborted` because prereq failed. Does NOT drive `slip.status=failed`.
 - *Aggregate step* — rollup of N components (e.g. `builds`). Status derived from component states.
 - *Pure pipeline step* — `componentName == ""` (e.g. `unit_tests`, `dev_deploy`).
+- *Event log* — `slip_component_states` table. Append-only. Authoritative source of step status history. argMax-derived view is the truth.
+- *Materialized step columns* — `routing_slips.<step>_status` columns. Cached projection from event log. Must always match argMax-derived status (per I5).
 
 ## Rules
 
@@ -49,7 +51,7 @@
 ## Consistency Invariants
 
 A **discrepancy** is any condition where `slip.status` violates one of these invariants.
-Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - Slippy State Machine Discrepancies).
+Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - Slippy State Machine Discrepancies). bd issue `goLibMyCarrier-nl3` covers a concrete I5 violation example (write-path stale column clone). bd issue `goLibMyCarrier-yix` is a related but distinct bug (decision-time staleness in `hydrateSlip` — separate from the I5 write-path issue).
 
 | # | Invariant |
 |---|-----------|
@@ -57,6 +59,9 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 | **I2** | `slip=failed` with zero primary failures → **violation** |
 | **I3** | `slip=completed` while any step is a primary failure OR `status = running` → **violation** |
 | **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335) |
+| **I5** | `routing_slips.<step>_status` column does not match event-log-derived status (via `argMax(status, timestamp) FROM slip_component_states GROUP BY step`) → **materialization violation** |
+
+**Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative event log in `slip_component_states`. Divergence indicates a write-path bug, not a state-machine logic bug.
 
 **Note on `aborted`:** cascade failures (`aborted`) are NOT primary failures — they do not independently drive `slip=failed` and are not counted in I1/I2/I3.
 **Note on `pending`/`held`:** non-terminal, do not block any transition including completion (I3).
@@ -534,6 +539,10 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 8. **Pipeline phase impact** - identify which pipeline phase(s) the change touches (STATE_MACHINE_V3.md phases) and verify phase transition behaviour is preserved. Flag any change where the high-level phase flow would need to be redrawn but hasn't been updated.
 
+9. **Atomic INSERT SELECT must override step columns being modified** — any new caller of `insertAtomicStatusUpdate`, `appendHistoryWithOverrides`, or `insertAtomicHistoryUpdate` MUST pass `stepStatusOverride` for every step whose status the caller intends to change. Verbatim cloning of step columns is unsafe under VersionedCollapsingMergeTree without FINAL — the just-written row may not be visible to the next SELECT.
+
+10. **Event log is source of truth** — never read raw `routing_slips.<step>_status` for correctness decisions. Always go through `Load` + `hydrateSlip`, OR query `slip_component_states` directly with `argMax(status, timestamp)`.
+
 ### 4 Most Common Violations
 
 **Violation 1 (I1 - indirect):** `CompleteStep`/`FailStep` called directly for `componentName!=""` without `RunPostExecution` → `slip.status` will not update after build component events. `slip` stays `in_progress` when builds fail (CI_FAILED never reached). Rule: `STATE_MACHINE.md §6`.
@@ -543,6 +552,8 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 **Violation 3 (persistence):** `routing_slips` written before `insertComponentState` → if the process crashes between the two writes, `hydrateSlip` will not override the cached status; step is permanently stuck. Rule: `STATE_MACHINE.md §8`.
 
 **Violation 4 (phase independence):** New prerequisite added to a step that breaks phase independence - e.g., adding `unit_tests` to `dev_deploy` prereqs couples DEV TRACK to CI_PARALLEL completion. Rule: `STATE_MACHINE_V3.md` - DEV + PREPROD PARALLEL phase.
+
+**Violation 5 (I5):** `insertAtomicStatusUpdate` (or any INSERT SELECT in the write path) clones step columns from a stale source row when the just-written row is not yet visible (ClickHouse async insert visibility under VersionedCollapsingMergeTree without FINAL). routing_slips column reverts to stale value while event log shows correct status. Fix: pass `stepStatusOverride` for the modified step into the atomic INSERT SELECT path. Rule: see bd issue `goLibMyCarrier-nl3`.
 
 ---
 
@@ -714,6 +725,12 @@ The file `slippy/state_machine_invariants_test.go` is the machine-readable enfor
 | `TestClient_PromoteSlip_Immutable` | I4 | `FailStep`/`UpdateStepWithStatus` on a promoted slip does not change `slip.status` |
 | `TestClient_AbandonSlip_Immutable` | I4 | `FailStep`/`CompleteStep`/`UpdateStepWithStatus` on an abandoned slip does not change `slip.status` |
 
+| `TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride` | I5 | `FailStep` on a running step wires the step-override through `checkPipelineCompletion`; `slip.status=failed` and the failing step column retains its authoritative value. Mock-based: verifies API contract (override computed and applied), not the ClickHouse async-insert race. See goLibMyCarrier-nl3. |
+| `TestStateMachine_I5_StaleStepColumnNotPropagated` | I5 | Sequential terminal events (`FailStep` → `CompleteStep` → `FailStep`) do not revert earlier step columns to stale values; every `checkPipelineCompletion` call preserves all current primary-failure overrides. Mock-based: synchronous store cannot reproduce the visibility race; validates override-wiring contract. See goLibMyCarrier-nl3. |
+| `TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog` | I5 | Under sequential and concurrent terminal step events, `routing_slips.<step>_status` matches `argMax`-derived status from `slip_component_states`; recovery race leaves no stale columns. File: `slippy/e2e_integration_test.go` (build tag: `integration`). |
+
 Run with: `go test -run TestStateMachine ./slippy/...`
+
+Run I5 e2e test with: `go test -tags integration -run TestE2E_ConcurrentTerminalStepEvents -v ./slippy/...`
 
 Failing tests indicate an invariant violation and MUST be resolved before merging.

@@ -543,78 +543,10 @@ func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID strin
 // The retry loop mirrors appendHistoryWithOverrides: load current version, write new version
 // (newVersion > currentVersion), post-write check, backoff+retry on conflict. On retry
 // exhaustion the function returns an error, typically wrapping ErrMaxRetriesExceeded.
+//
+// To pass step-column overrides (fixing the stale-clone race), use updateSlipStatusWithOverrides.
 func (s *ClickHouseStore) UpdateSlipStatus(ctx context.Context, correlationID string, newStatus SlipStatus) error {
-	if s.pipelineConfig == nil {
-		return fmt.Errorf("pipeline config is required for store operations")
-	}
-
-	retrySpan := startRetrySpan(ctx, "UpdateSlipStatus", correlationID)
-	retrySpan.AddAttribute("slippy.new_status", string(newStatus))
-
-	conflictRetry := 0
-
-	for {
-		if ctx.Err() != nil {
-			retrySpan.EndError(ctx.Err())
-			return ctx.Err()
-		}
-
-		currentVersion, versionLoadErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
-		if versionLoadErr != nil {
-			if errors.Is(versionLoadErr, ErrSlipNotFound) {
-				retrySpan.EndError(versionLoadErr)
-				return versionLoadErr
-			}
-			// Non-fatal: fall back to nextVersion() with no floor guarantee.
-			currentVersion = 0
-		}
-		newVersion := s.nextVersion()
-		if newVersion <= currentVersion {
-			newVersion = currentVersion + 1
-		}
-
-		if err := s.insertAtomicStatusUpdate(retrySpan.Context(), correlationID, newVersion, newStatus); err != nil {
-			retrySpan.EndError(err)
-			return err
-		}
-
-		// Post-write version check: detect if a concurrent writer inserted a higher-version row.
-		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
-		if versionErr != nil {
-			s.logger.Warn(ctx,
-				"slip status version check skipped after successful insert — conflict detection unavailable",
-				map[string]interface{}{
-					"correlation_id": correlationID,
-					"new_status":     string(newStatus),
-					"error":          versionErr,
-				})
-			retrySpan.AddAttribute("slippy.status_version_check_error", versionErr.Error())
-			retrySpan.EndSuccess()
-			return nil
-		}
-		if latestVersion > newVersion {
-			conflictRetry++
-			retrySpan.AddAttribute("slippy.status_conflict_retry", conflictRetry)
-			if conflictRetry > historyConflictMaxRetries {
-				retrySpan.AddAttribute("slippy.status_conflict_retries_exhausted", true)
-				exhaustedErr := fmt.Errorf(
-					"UpdateSlipStatus for %q exhausted conflict retries: %w", correlationID, ErrMaxRetriesExceeded)
-				retrySpan.EndError(exhaustedErr)
-				return exhaustedErr
-			}
-			backoff := calculateAggregateConflictBackoff(conflictRetry)
-			select {
-			case <-ctx.Done():
-				retrySpan.EndError(ctx.Err())
-				return ctx.Err()
-			case <-time.After(backoff):
-			}
-			continue
-		}
-
-		retrySpan.EndSuccess()
-		return nil
-	}
+	return s.updateSlipStatusWithOverrides(ctx, correlationID, newStatus)
 }
 
 // Close releases any resources held by the store.
@@ -901,11 +833,20 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 // a new row that is identical to the latest active row except for status, updated_at, sign,
 // and version. All other columns (including state_history) are copied verbatim from the DB row,
 // preventing concurrent appendHistoryWithOverrides writes from losing their state_history entry.
+//
+// Optional overrides replace the verbatim DB reference for specific step-status columns with a
+// literal value. This closes the stale-clone race that occurs when checkPipelineCompletion calls
+// UpdateSlipStatus immediately after appendHistoryWithOverrides: under ClickHouse async insert
+// visibility (VersionedCollapsingMergeTree without FINAL) the just-written step row may not yet
+// be visible, so the SELECT would copy the old (stale) step status into the new row. Passing the
+// same stepStatusOverride used by appendHistoryWithOverrides ensures the two operations agree on
+// the step value regardless of visibility lag.
 func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	ctx context.Context,
 	correlationID string,
 	newVersion uint64,
 	newStatus SlipStatus,
+	overrides ...stepStatusOverride,
 ) error {
 	stepColumns := s.queryBuilder.BuildStepColumns()
 	aggregateColumns := s.queryBuilder.BuildAggregateColumns()
@@ -961,7 +902,34 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 		newRowSelectCols = append(newRowSelectCols, ColumnAncestry)
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
-	newRowSelectCols = append(newRowSelectCols, stepColumns...)
+
+	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
+	// the verbatim DB column reference with a literal (?) so the step-status value is
+	// updated atomically alongside the slip-status change. This mirrors the identical
+	// pattern in insertAtomicHistoryUpdate and fixes the stale-clone race described in
+	// the function comment above.
+	//
+	// Fast-path: the common case (no overrides) skips the map/slice allocations.
+	var stepOverrideArgs []interface{}
+	if len(overrides) == 0 {
+		newRowSelectCols = append(newRowSelectCols, stepColumns...)
+	} else {
+		overrideByCol := make(map[string]StepStatus, len(overrides))
+		for _, o := range overrides {
+			overrideByCol[o.columnName] = o.status
+		}
+		stepSelectExprs := make([]string, 0, len(stepColumns))
+		stepOverrideArgs = make([]interface{}, 0, len(overrides))
+		for _, col := range stepColumns {
+			if overrideStatus, ok := overrideByCol[col]; ok {
+				stepSelectExprs = append(stepSelectExprs, "?")
+				stepOverrideArgs = append(stepOverrideArgs, string(overrideStatus))
+				continue
+			}
+			stepSelectExprs = append(stepSelectExprs, col)
+		}
+		newRowSelectCols = append(newRowSelectCols, stepSelectExprs...)
+	}
 	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
 
 	newRowQuery := fmt.Sprintf(
@@ -979,11 +947,15 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	`, s.database, TableRoutingSlips, strings.Join(allCols, ", "), cancelQuery, newRowQuery)
 
 	// Args order:
-	//   1. cancel-row WHERE:     correlationID, newVersion
-	//   2. new-row SELECT ?:     newStatus (status literal)
-	//   3. new-row SELECT ?:     newVersion (version literal)
-	//   4. new-row SELECT WHERE: correlationID
-	execArgs := []interface{}{correlationID, newVersion, string(newStatus), newVersion, correlationID}
+	//   1. cancel-row WHERE:       correlationID, newVersion
+	//   2. new-row SELECT ?:       newStatus (status literal)
+	//   3. new-row SELECT ?:       newVersion (version literal)
+	//   4. new-row step overrides: one ? per override, in stepColumns order
+	//   5. new-row SELECT WHERE:   correlationID
+	execArgs := make([]interface{}, 0, 5+len(stepOverrideArgs))
+	execArgs = append(execArgs, correlationID, newVersion, string(newStatus), newVersion)
+	execArgs = append(execArgs, stepOverrideArgs...)
+	execArgs = append(execArgs, correlationID)
 
 	err := s.session.ExecWithArgs(ctx, query, execArgs...)
 	if err != nil && hasAncestry && isAncestryColumnError(err) {
@@ -992,9 +964,92 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 			"correlation_id": correlationID,
 		})
 		s.hasAncestryColumn.Store(false)
-		return s.insertAtomicStatusUpdate(ctx, correlationID, newVersion, newStatus)
+		return s.insertAtomicStatusUpdate(ctx, correlationID, newVersion, newStatus, overrides...)
 	}
 	return err
+}
+
+// updateSlipStatusWithOverrides is the internal variant of UpdateSlipStatus that accepts
+// step-column overrides. It is exposed via the slipStatusOverrideWriter interface so that
+// checkPipelineCompletion can pass the triggering step's status as a literal, closing the
+// stale-clone race described in insertAtomicStatusUpdate.
+func (s *ClickHouseStore) updateSlipStatusWithOverrides(
+	ctx context.Context,
+	correlationID string,
+	newStatus SlipStatus,
+	overrides ...stepStatusOverride,
+) error {
+	if s.pipelineConfig == nil {
+		return fmt.Errorf("pipeline config is required for store operations")
+	}
+
+	retrySpan := startRetrySpan(ctx, "UpdateSlipStatus", correlationID)
+	retrySpan.AddAttribute("slippy.new_status", string(newStatus))
+
+	conflictRetry := 0
+
+	for {
+		if ctx.Err() != nil {
+			retrySpan.EndError(ctx.Err())
+			return ctx.Err()
+		}
+
+		currentVersion, versionLoadErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionLoadErr != nil {
+			if errors.Is(versionLoadErr, ErrSlipNotFound) {
+				retrySpan.EndError(versionLoadErr)
+				return versionLoadErr
+			}
+			currentVersion = 0
+		}
+		newVersion := s.nextVersion()
+		if newVersion <= currentVersion {
+			newVersion = currentVersion + 1
+		}
+
+		if err := s.insertAtomicStatusUpdate(
+			retrySpan.Context(), correlationID, newVersion, newStatus, overrides...,
+		); err != nil {
+			retrySpan.EndError(err)
+			return err
+		}
+
+		latestVersion, versionErr := s.loadVersionFromDB(retrySpan.Context(), correlationID)
+		if versionErr != nil {
+			s.logger.Warn(ctx,
+				"slip status version check skipped after successful insert — conflict detection unavailable",
+				map[string]interface{}{
+					"correlation_id": correlationID,
+					"new_status":     string(newStatus),
+					"error":          versionErr,
+				})
+			retrySpan.AddAttribute("slippy.status_version_check_error", versionErr.Error())
+			retrySpan.EndSuccess()
+			return nil
+		}
+		if latestVersion > newVersion {
+			conflictRetry++
+			retrySpan.AddAttribute("slippy.status_conflict_retry", conflictRetry)
+			if conflictRetry > historyConflictMaxRetries {
+				retrySpan.AddAttribute("slippy.status_conflict_retries_exhausted", true)
+				exhaustedErr := fmt.Errorf(
+					"UpdateSlipStatus for %q exhausted conflict retries: %w", correlationID, ErrMaxRetriesExceeded)
+				retrySpan.EndError(exhaustedErr)
+				return exhaustedErr
+			}
+			backoff := calculateAggregateConflictBackoff(conflictRetry)
+			select {
+			case <-ctx.Done():
+				retrySpan.EndError(ctx.Err())
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			continue
+		}
+
+		retrySpan.EndSuccess()
+		return nil
+	}
 }
 
 // nextVersion returns a nanosecond-epoch version. If the current wall clock
@@ -1090,11 +1145,17 @@ func (s *ClickHouseStore) detectImageTagColumn(ctx context.Context) {
 // column. This is used as a runtime fallback: when detectAncestryColumn conservatively assumed the
 // column exists (e.g. on a transient probe error) but the actual INSERT/SELECT fails because
 // migration v10 has already dropped it.
+//
+// ClickHouse error text varies by version:
+//   - ≤24.x: "Unknown identifier: ancestry" (UNKNOWN_IDENTIFIER, code 47)
+//   - 24.x+:  "Missing columns: ancestry"
+//   - 25.x+:  "No such column ancestry in table …" (THERE_IS_NO_COLUMN, code 16)
 func isAncestryColumnError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, ColumnAncestry) &&
 		(strings.Contains(msg, "Unknown identifier") ||
 			strings.Contains(msg, "Missing columns") ||
+			strings.Contains(msg, "No such column") ||
 			strings.Contains(msg, "UNKNOWN_IDENTIFIER"))
 }
 
@@ -1983,11 +2044,25 @@ func (s *ClickHouseStore) hydrateSlip(ctx context.Context, slip *Slip) error {
 		if _, ok := stateMap[aggregateKey]; !ok {
 			stateMap[aggregateKey] = make(map[string]componentStateRow)
 		}
-		// Keep the latest state for each component. If the same component appears
-		// under multiple step name aliases, the row with the latest timestamp wins.
+		// Merge state for each component. If the same component appears under
+		// multiple step-name aliases (e.g. "build" vs "builds"), the row with the
+		// latest timestamp wins for status — but the image_tag from any row is
+		// preserved, because SetComponentImageTag may insert under the component
+		// step type ("build") while status events come in under the aggregate name
+		// ("builds"). Last-write-wins on timestamp for status; any non-empty
+		// image_tag is retained across aliases.
 		if existing, exists := stateMap[aggregateKey][state.Component]; exists {
 			if state.Timestamp.After(existing.Timestamp) {
+				// Newer row wins for status; preserve any image_tag already captured.
+				if existing.ImageTag != "" && state.ImageTag == "" {
+					state.ImageTag = existing.ImageTag
+				}
 				stateMap[aggregateKey][state.Component] = state
+			} else if state.ImageTag != "" && existing.ImageTag == "" {
+				// Older or same-time row: only update image_tag if it adds new info.
+				merged := existing
+				merged.ImageTag = state.ImageTag
+				stateMap[aggregateKey][state.Component] = merged
 			}
 		} else {
 			stateMap[aggregateKey][state.Component] = state
@@ -2179,34 +2254,72 @@ func (s *ClickHouseStore) doLoadComponentStates(
 ) (results []componentStateRow, err error) {
 	// We want the latest state for each component.
 	// ReplacingMergeTree eventually deduplicates, but we use argMax to be sure given we might read unmerged parts.
-	// Note: We alias the max(timestamp) column as 'latest_ts' to avoid conflict with the 'timestamp' column
-	// used inside argMax functions. ClickHouse would otherwise interpret the alias as a nested aggregate.
+	//
+	// Tiebreaker: argMax(status, (timestamp, toUInt8(status))) orders by timestamp first,
+	// then by status numeric value when timestamps are equal. This ensures that a "completed"
+	// event (Enum8 value 4) beats a "running" event (value 3) when both share the same
+	// timestamp — a situation that can arise when the host clock has coarser than microsecond
+	// resolution (e.g. testcontainers on some platforms return second-granularity timestamps).
+	//
+	// Status Enum8 values: pending=1, held=2, running=3, completed=4, failed=5, error=6,
+	// aborted=7, timeout=8, skipped=9. Higher numeric value always represents a more
+	// advanced state, so max-numeric tiebreaking is always correct.
+	//
+	// Note: We alias the max(timestamp) column as 'latest_ts' to avoid conflict with the
+	// 'timestamp' column used inside argMax functions. ClickHouse would otherwise interpret
+	// the alias as a nested aggregate.
+	// Sort key for argMax: encodes timestamp, status ordinal, and (when image_tag is available)
+	// whether the row carries an image_tag value. A single UInt64 avoids the nested-aggregate
+	// error that CH 25.x raises when tuple arguments are used inside argMax.
+	//
+	// Formula with image_tag (includeImageTag=true):
+	//   epoch_microseconds * 200 + status_ordinal * 2 + (image_tag != '' ? 1 : 0)
+	//
+	// Formula without image_tag (includeImageTag=false):
+	//   epoch_microseconds * 100 + status_ordinal
+	//
+	// Tiebreak rules:
+	//  1. Later timestamp wins (primary).
+	//  2. Higher-value status wins on same-second ties: completed (4) > running (3).
+	//  3. Row with image_tag set wins over row without, for same timestamp+status.
+	//     This ensures SetComponentImageTag rows (which carry the same status as the
+	//     preceding CompleteStep row) are not overwritten by the status-only row.
+	const sortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 200 + toUInt64(toUInt8(status)) * 2 + if(image_tag != '', 1, 0)"
+	const sortKeyNoImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
+
 	var query string
 	if includeImageTag {
+		// image_tag gets a separate sort key that masks out rows where the tag is empty.
+		// argMax(image_tag, if(image_tag != '', sort_key, 0)) means:
+		//   - rows with a non-empty image_tag compete on sort_key (use the latest non-empty tag),
+		//   - rows with empty image_tag get sort_key=0 and always lose to any tagged row.
+		// This ensures SetComponentImageTag events survive even when a later CompleteStep event
+		// (which has a higher sort_key but no tag) comes in for the same component.
+		const imageTagSortKey = "if(image_tag != '', " + sortKeyWithImageTag + ", 0)"
 		query = fmt.Sprintf(`
 			SELECT
 				step,
 				component,
-				argMax(status, timestamp) as status,
-				argMax(message, timestamp) as message,
-				argMax(image_tag, timestamp) as image_tag,
+				argMax(status, %s) as latest_status,
+				argMax(message, %s) as latest_message,
+				argMax(image_tag, %s) as latest_image_tag,
 				max(timestamp) as latest_ts
 			FROM %s.%s
 			WHERE correlation_id = ?
 			GROUP BY step, component
-		`, s.database, TableSlipComponentStates)
+		`, sortKeyWithImageTag, sortKeyWithImageTag, imageTagSortKey, s.database, TableSlipComponentStates)
 	} else {
 		query = fmt.Sprintf(`
 			SELECT
 				step,
 				component,
-				argMax(status, timestamp) as status,
-				argMax(message, timestamp) as message,
+				argMax(status, %s) as latest_status,
+				argMax(message, %s) as latest_message,
 				max(timestamp) as latest_ts
 			FROM %s.%s
 			WHERE correlation_id = ?
 			GROUP BY step, component
-		`, s.database, TableSlipComponentStates)
+		`, sortKeyNoImageTag, sortKeyNoImageTag, s.database, TableSlipComponentStates)
 	}
 
 	rows, err := s.session.QueryWithArgs(ctx, query, correlationID)
