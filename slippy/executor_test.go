@@ -1076,7 +1076,13 @@ func TestUpdateStepWithStatus_PipelineCompletion(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		if err := client.FailStep(ctx, "corr-pcfail-2", "builds", "mc.invoice.api", "component build failed"); err != nil {
+		if err := client.FailStep(
+			ctx,
+			"corr-pcfail-2",
+			"builds",
+			"mc.invoice.api",
+			"component build failed",
+		); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
