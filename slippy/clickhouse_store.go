@@ -1864,6 +1864,16 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 		// async-insert flush timing.
 		overlayComponentState(slip, stepName, aggregateStepName, componentName, insertedStatus, insertedAt)
 
+		// Note: this recompute uses slip.Aggregates[aggregateStepName] directly, which
+		// includes any pending placeholder components alongside active ones. This differs
+		// from applyComponentStatesToAggregate (called inside hydrateSlip) which filters to
+		// active-only components from the event log. In the async-insert race scenario the
+		// newly-overlaid component is non-pending, and computeAggregateStatus treats absent
+		// vs pending components identically (both count as "not completed"), so the divergence
+		// is semantically neutral for the convergence path. At the final boundary — all real
+		// components complete + one placeholder still pending — this path returns
+		// "running" rather than "completed". Pre-existing condition; alignment of the two
+		// paths tracked as a separate follow-up.
 		// Re-derive the aggregate step status from the overlaid Aggregates so that
 		// Update() writes the correct value to the {step}_status scalar column.
 		// Without this, slip.Steps[aggregateStepName].Status retains the stale value
@@ -2009,6 +2019,16 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		// async-insert flush timing.
 		overlayComponentState(slip, stepName, aggregateStepName, componentName, insertedStatus, insertedAt)
 
+		// Note: this recompute uses slip.Aggregates[aggregateStepName] directly, which
+		// includes any pending placeholder components alongside active ones. This differs
+		// from applyComponentStatesToAggregate (called inside hydrateSlip) which filters to
+		// active-only components from the event log. In the async-insert race scenario the
+		// newly-overlaid component is non-pending, and computeAggregateStatus treats absent
+		// vs pending components identically (both count as "not completed"), so the divergence
+		// is semantically neutral for the convergence path. At the final boundary — all real
+		// components complete + one placeholder still pending — this path returns
+		// "running" rather than "completed". Pre-existing condition; alignment of the two
+		// paths tracked as a separate follow-up.
 		// Re-derive the aggregate step status from the overlaid Aggregates so that
 		// Update() writes the correct value to the {step}_status scalar column.
 		// Without this, slip.Steps[aggregateStepName].Status retains the stale value
@@ -2195,10 +2215,11 @@ func (s *ClickHouseStore) resolveAggregateStepName(stepNameFromDB string) string
 //   - componentName == "" (pipeline-level sentinel) is handled: the Step's status in
 //     slip.Steps[stepName] is updated directly rather than touching Aggregates.
 //
-// aggregateStepName must be the resolved canonical aggregate step name (e.g. "builds"),
-// not the component-type alias (e.g. "build"). Callers obtain this via
-// resolveAggregateStepName(stepName). Pass "" if no aggregate step exists for this step
-// (in which case a new component entry is added under stepName as a fallback).
+// Precondition: aggregateStepName must be non-empty when componentName is non-empty.
+// It must be the resolved canonical aggregate step name (e.g. "builds"), not the
+// component-type alias (e.g. "build"). Callers obtain this via
+// resolveAggregateStepName(stepName). The pipeline-level sentinel path
+// (componentName == "") is the only path that does not use aggregateStepName.
 func overlayComponentState(
 	slip *Slip,
 	stepName, aggregateStepName, componentName string,
@@ -2217,6 +2238,14 @@ func overlayComponentState(
 				slip.Steps[stepName] = step
 			}
 		}
+		return
+	}
+
+	// Defensive guard: callers MUST resolve aggregateStepName before invoking the
+	// component-overlay path. Returning early here prevents a future regression where
+	// a component lands under an alias key (e.g. "build") that BuildAggregateColumnsAndValues
+	// never reads — see PR #59 round-2 finding N1.
+	if aggregateStepName == "" {
 		return
 	}
 
@@ -2256,11 +2285,7 @@ func overlayComponentState(
 		// Component not yet present in any aggregate bucket. Add it under the canonical
 		// aggregate step name (e.g. "builds") so that BuildAggregateColumnsAndValues,
 		// which keys off the canonical name, can serialize this component.
-		// Fall back to stepName only if aggregateStepName was not resolved.
 		bucketKey := aggregateStepName
-		if bucketKey == "" {
-			bucketKey = stepName
-		}
 		comp := ComponentStepData{
 			Component: componentName,
 			Status:    status,
