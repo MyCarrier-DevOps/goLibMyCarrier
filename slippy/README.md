@@ -278,6 +278,8 @@ type ComponentStepData struct {
 
 When all components in an aggregate complete, the parent step (e.g., `builds_completed`) is automatically updated.
 
+**Read-your-own-writes overlay:** ClickHouse `async_insert=1` means a row inserted into `slip_component_states` may not be visible to the subsequent `SELECT` inside `hydrateSlip` on the same connection (~200 ms async flush window). `overlayComponentState` (clickhouse_store.go) closes this gap: after `Load()` and before `Update()`, the just-written component state is merged into the in-memory `*Slip` so `computeAggregateStatus` always sees the freshly inserted row. Without this, the aggregate step could get permanently stuck at `running` even after all components complete.
+
 ### Steps
 
 Steps track individual pipeline stages. Each step has:

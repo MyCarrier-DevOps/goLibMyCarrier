@@ -63,6 +63,8 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 
 **Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative event log in `slip_component_states`. Divergence indicates a write-path bug, not a state-machine logic bug.
 
+**I5 — async-insert visibility race (resolved):** With `async_insert=1`, the `INSERT` issued by `insertComponentState` may not be visible to the subsequent `SELECT` inside `hydrateSlip` on the same connection, causing `computeAggregateStatus` to return a stale (e.g. `running`) result that is written back to `routing_slips` — permanently stuck. **Fix:** `overlayComponentState` (clickhouse_store.go) merges the just-inserted row into the in-memory `*Slip` immediately after `Load()` and before `Update()` inside both `updateAggregateStatus*` functions. This is a read-your-own-writes safety net: I1 conformance is guaranteed even when the event log row is not yet flushed. External readers (HyperDX) may see a transient `~200ms` window of bounded staleness — this was the pre-existing async-flush latency and is an acceptable trade-off vs. the previous permanent staleness.
+
 **Note on `aborted`:** cascade failures (`aborted`) are NOT primary failures — they do not independently drive `slip=failed` and are not counted in I1/I2/I3.
 **Note on `pending`/`held`:** non-terminal, do not block any transition including completion (I3).
 **Note on `skipped`:** terminal-success, treated as `completed`. Does not block I3.

@@ -86,36 +86,36 @@ type MockStore struct {
 	CommitIndex map[string]string
 
 	// Call tracking
-	CreateCalls            []CreateCall
-	LoadCalls              []string
-	LoadByCommitCalls      []LoadByCommitCall
-	FindByCommitsCalls     []FindByCommitsCall
-	FindAllByCommitsCalls  []FindAllByCommitsCall
-	UpdateCalls            []UpdateCall
-	UpdateStepCalls        []UpdateStepCall
-	UpdateComponentCalls   []UpdateComponentCall
-	AppendHistoryCalls     []AppendHistoryCall
-	SetImageTagCalls       []SetImageTagCall
-	UpdateSlipStatusCalls  []UpdateSlipStatusCall
-	CloseCalls             int
+	CreateCalls           []CreateCall
+	LoadCalls             []string
+	LoadByCommitCalls     []LoadByCommitCall
+	FindByCommitsCalls    []FindByCommitsCall
+	FindAllByCommitsCalls []FindAllByCommitsCall
+	UpdateCalls           []UpdateCall
+	UpdateStepCalls       []UpdateStepCall
+	UpdateComponentCalls  []UpdateComponentCall
+	AppendHistoryCalls    []AppendHistoryCall
+	SetImageTagCalls      []SetImageTagCall
+	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	CloseCalls            int
 
 	// Ping tracking and error injection
 	PingCalls int
 	PingError error
 
 	// Error injection for testing error paths
-	CreateError            error
-	LoadError              error
-	LoadByCommitError      error
-	FindByCommitsError     error
-	FindAllByCommitsError  error
-	UpdateError            error
-	UpdateStepError        error
-	UpdateComponentError   error
-	AppendHistoryError     error
-	SetImageTagError       error
-	UpdateSlipStatusError  error
-	CloseError             error
+	CreateError           error
+	LoadError             error
+	LoadByCommitError     error
+	FindByCommitsError    error
+	FindAllByCommitsError error
+	UpdateError           error
+	UpdateStepError       error
+	UpdateComponentError  error
+	AppendHistoryError    error
+	SetImageTagError      error
+	UpdateSlipStatusError error
+	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
 	CreateErrorFor          map[string]error

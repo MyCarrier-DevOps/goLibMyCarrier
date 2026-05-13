@@ -1967,7 +1967,14 @@ func TestClient_PromoteSlip_Immutable(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		if err := client.UpdateStepWithStatus(ctx, "corr-promoted-update", "builds", "", StepStatusFailed, "late build failure"); err != nil {
+		if err := client.UpdateStepWithStatus(
+			ctx,
+			"corr-promoted-update",
+			"builds",
+			"",
+			StepStatusFailed,
+			"late build failure",
+		); err != nil {
 			t.Fatalf("UpdateStepWithStatus returned unexpected error: %v", err)
 		}
 
@@ -2106,7 +2113,14 @@ func TestClient_AbandonSlip_Immutable(t *testing.T) {
 		}
 		store.AddSlip(slip)
 
-		if err := client.UpdateStepWithStatus(ctx, "corr-abandoned-update", "builds", "", StepStatusFailed, "late build failure"); err != nil {
+		if err := client.UpdateStepWithStatus(
+			ctx,
+			"corr-abandoned-update",
+			"builds",
+			"",
+			StepStatusFailed,
+			"late build failure",
+		); err != nil {
 			t.Fatalf("UpdateStepWithStatus returned unexpected error: %v", err)
 		}
 

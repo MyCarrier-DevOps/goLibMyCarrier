@@ -2755,7 +2755,14 @@ func TestClickHouseStore_UpdateAggregateStatus_ConflictRetry(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	// "build" has an aggregate step "builds" in testPipelineConfig.
-	err := store.updateAggregateStatusFromComponentStates(context.Background(), "corr-conflict", "build")
+	err := store.updateAggregateStatusFromComponentStates(
+		context.Background(),
+		"corr-conflict",
+		"build",
+		"api",
+		StepStatusCompleted,
+		time.Time{},
+	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
 	}
@@ -2831,7 +2838,14 @@ func TestClickHouseStore_UpdateAggregateStatus_ConflictRetryExhausted(t *testing
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	// Should return nil even when all retries are exhausted.
-	err := store.updateAggregateStatusFromComponentStates(context.Background(), "corr-exhausted", "build")
+	err := store.updateAggregateStatusFromComponentStates(
+		context.Background(),
+		"corr-exhausted",
+		"build",
+		"api",
+		StepStatusCompleted,
+		time.Time{},
+	)
 	if err != nil {
 		t.Errorf("expected nil (best-effort outcome), got %v", err)
 	}
@@ -2870,7 +2884,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_NoConflict(t *testing.
 	}
 
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-withhistory-ok", "builds", entry,
+		context.Background(), "corr-withhistory-ok", "builds", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -2970,7 +2984,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetry(t *testi
 	}
 
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-retry", "builds", entry,
+		context.Background(), "corr-wh-retry", "builds", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -3064,7 +3078,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetryExhausted
 	}
 
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-exhausted", "builds", entry,
+		context.Background(), "corr-wh-exhausted", "builds", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if err != nil {
 		t.Errorf("expected nil (best-effort outcome), got %v", err)
@@ -3091,7 +3105,7 @@ func TestClickHouseStore_UpdateAggregateStatus_NoConflict(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.updateAggregateStatusFromComponentStates(
-		context.Background(), "corr-no-conflict", "build",
+		context.Background(), "corr-no-conflict", "build", "api", StepStatusCompleted, time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -3157,7 +3171,7 @@ func TestClickHouseStore_UpdateAggregateStatus_VersionCheckError(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.updateAggregateStatusFromComponentStates(
-		context.Background(), "corr-vcheck-err", "build",
+		context.Background(), "corr-vcheck-err", "build", "api", StepStatusCompleted, time.Time{},
 	)
 	// loadVersionFromDB errors are non-fatal; function must return nil.
 	if err != nil {
@@ -3492,7 +3506,14 @@ func TestClickHouseStore_UpdateAggregateStatus_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancel before calling
 
-	err := store.updateAggregateStatusFromComponentStates(ctx, "corr-ctx-cancel", "build")
+	err := store.updateAggregateStatusFromComponentStates(
+		ctx,
+		"corr-ctx-cancel",
+		"build",
+		"api",
+		StepStatusCompleted,
+		time.Time{},
+	)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
@@ -3516,7 +3537,14 @@ func TestClickHouseStore_UpdateAggregateStatus_LoadError(t *testing.T) {
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	err := store.updateAggregateStatusFromComponentStates(context.Background(), "corr-load-err", "build")
+	err := store.updateAggregateStatusFromComponentStates(
+		context.Background(),
+		"corr-load-err",
+		"build",
+		"api",
+		StepStatusCompleted,
+		time.Time{},
+	)
 	if err == nil {
 		t.Fatal("expected error from Load failure, got nil")
 	}
@@ -3545,7 +3573,14 @@ func TestClickHouseStore_UpdateAggregateStatus_ErrSlipNotFound_ContextCancelledD
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	err := store.updateAggregateStatusFromComponentStates(ctx, "corr-slip-wait-cancel", "build")
+	err := store.updateAggregateStatusFromComponentStates(
+		ctx,
+		"corr-slip-wait-cancel",
+		"build",
+		"api",
+		StepStatusCompleted,
+		time.Time{},
+	)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled during ErrSlipNotFound wait, got %v", err)
 	}
@@ -3562,7 +3597,7 @@ func TestClickHouseStore_UpdateAggregateStatus_NoAggregateStep(t *testing.T) {
 
 	// "push_parsed" has no Aggregates field → resolveAggregateStepName returns "".
 	err := store.updateAggregateStatusFromComponentStates(
-		context.Background(), "corr-no-agg", "push_parsed",
+		context.Background(), "corr-no-agg", "push_parsed", "api", StepStatusCompleted, time.Time{},
 	)
 	if err != nil {
 		t.Fatalf("expected nil for step with no aggregate, got %v", err)
@@ -3611,7 +3646,7 @@ func TestClickHouseStore_UpdateAggregateStatus_UpdateFails(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	err := store.updateAggregateStatusFromComponentStates(
-		context.Background(), "corr-update-fail", "build",
+		context.Background(), "corr-update-fail", "build", "api", StepStatusCompleted, time.Time{},
 	)
 	if err == nil {
 		t.Fatal("expected error when Update fails, got nil")
@@ -3631,7 +3666,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ContextCancelled(t *te
 
 	entry := StateHistoryEntry{Step: "builds", Status: StepStatusCompleted}
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		ctx, "corr-wh-ctx", "builds", entry,
+		ctx, "corr-wh-ctx", "builds", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled, got %v", err)
@@ -3654,7 +3689,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_LoadError(t *testing.T
 
 	entry := StateHistoryEntry{Step: "builds", Status: StepStatusCompleted}
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-load-err", "builds", entry,
+		context.Background(), "corr-wh-load-err", "builds", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if err == nil {
 		t.Fatal("expected error from Load failure, got nil")
@@ -3673,7 +3708,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_NoAggregateStep(t *tes
 	// function calls AppendHistory (which does a state_history read + UNION ALL insert).
 	entry := StateHistoryEntry{Step: "push_parsed", Status: StepStatusCompleted}
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-no-agg", "push_parsed", entry,
+		context.Background(), "corr-wh-no-agg", "push_parsed", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if err != nil {
 		t.Fatalf("expected nil, got %v", err)
@@ -3712,7 +3747,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ErrSlipNotFound_Contex
 
 	entry := StateHistoryEntry{Step: "builds", Status: StepStatusCompleted}
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		ctx, "corr-wh-slip-cancel", "builds", entry,
+		ctx, "corr-wh-slip-cancel", "builds", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled during ErrSlipNotFound wait, got %v", err)
@@ -3752,7 +3787,7 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_UpdateFails(t *testing
 
 	entry := StateHistoryEntry{Step: "builds", Status: StepStatusCompleted}
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-upd-fail", "builds", entry,
+		context.Background(), "corr-wh-upd-fail", "builds", "api", StepStatusCompleted, time.Time{}, entry,
 	)
 	if err == nil {
 		t.Fatal("expected error when Update fails, got nil")
@@ -5115,8 +5150,11 @@ func TestInsertAtomicStatusUpdate_WithStepOverride(t *testing.T) {
 		// Without override it appears three times (INSERT list + cancel SELECT + new-row SELECT).
 		occurrences := strings.Count(capturedQuery, "unit_tests_status")
 		if occurrences != 2 {
-			t.Errorf("expected unit_tests_status to appear exactly twice (INSERT col list + cancel SELECT; new-row SELECT replaced by ?), got %d occurrences in query:\n%s",
-				occurrences, capturedQuery)
+			t.Errorf(
+				"expected unit_tests_status to appear exactly twice (INSERT col list + cancel SELECT; new-row SELECT replaced by ?), got %d occurrences in query:\n%s",
+				occurrences,
+				capturedQuery,
+			)
 		}
 	})
 
@@ -5155,8 +5193,10 @@ func TestInsertAtomicStatusUpdate_WithStepOverride(t *testing.T) {
 		//   3. New-row SELECT (verbatim copy — the column that would be stale under async insert lag)
 		occurrences := strings.Count(capturedQuery, "unit_tests_status")
 		if occurrences != 3 {
-			t.Errorf("expected unit_tests_status to appear three times (INSERT list + cancel SELECT + new-row SELECT) without override, got %d occurrences",
-				occurrences)
+			t.Errorf(
+				"expected unit_tests_status to appear three times (INSERT list + cancel SELECT + new-row SELECT) without override, got %d occurrences",
+				occurrences,
+			)
 		}
 	})
 
@@ -5203,8 +5243,11 @@ func TestInsertAtomicStatusUpdate_WithStepOverride(t *testing.T) {
 		for _, colName := range []string{"unit_tests_status", "dev_deploy_status"} {
 			occurrences := strings.Count(capturedQuery, colName)
 			if occurrences != 2 {
-				t.Errorf("expected %s to appear twice (INSERT col list + cancel SELECT; new-row SELECT replaced by ?), got %d occurrences",
-					colName, occurrences)
+				t.Errorf(
+					"expected %s to appear twice (INSERT col list + cancel SELECT; new-row SELECT replaced by ?), got %d occurrences",
+					colName,
+					occurrences,
+				)
 			}
 		}
 
@@ -5323,4 +5366,319 @@ func TestBuildStepOverridesFromSlip(t *testing.T) {
 			t.Errorf("expected status completed, got %s", overrides[0].status)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// overlayComponentState unit tests
+// ---------------------------------------------------------------------------
+
+// TestOverlayComponentState_AddsNewComponent verifies that overlayComponentState inserts a
+// component entry when the slip has no existing record for that component under any aggregate.
+func TestOverlayComponentState_AddsNewComponent(t *testing.T) {
+	ts := time.Now()
+	slip := &Slip{
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {{Component: "api", Status: StepStatusRunning}},
+		},
+		Steps: map[string]Step{
+			"builds": {Status: StepStatusRunning},
+		},
+	}
+
+	overlayComponentState(slip, "builds", "builds", "worker", StepStatusCompleted, ts)
+
+	bucket := slip.Aggregates["builds"]
+	found := false
+	for _, c := range bucket {
+		if c.Component == "worker" {
+			found = true
+			if c.Status != StepStatusCompleted {
+				t.Errorf("expected worker status completed, got %s", c.Status)
+			}
+		}
+	}
+	if !found {
+		t.Error("expected worker component to be added to builds aggregate")
+	}
+}
+
+// TestOverlayComponentState_ReplacesOlderEntry verifies that overlayComponentState replaces
+// an existing component entry when the overlay timestamp is newer.
+func TestOverlayComponentState_ReplacesOlderEntry(t *testing.T) {
+	old := time.Now().Add(-time.Second)
+	newer := time.Now()
+
+	completedAt := old
+	slip := &Slip{
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {{
+				Component:   "api",
+				Status:      StepStatusRunning,
+				StartedAt:   &old,
+				CompletedAt: &completedAt,
+			}},
+		},
+		Steps: map[string]Step{"builds": {Status: StepStatusRunning}},
+	}
+
+	overlayComponentState(slip, "builds", "builds", "api", StepStatusCompleted, newer)
+
+	comp := slip.Aggregates["builds"][0]
+	if comp.Status != StepStatusCompleted {
+		t.Errorf("expected api status completed after overlay, got %s", comp.Status)
+	}
+}
+
+// TestOverlayComponentState_LeavesNewerEntryAlone verifies defensive behavior: if the loaded
+// entry is somehow newer than the overlay timestamp, the overlay does not downgrade it.
+func TestOverlayComponentState_LeavesNewerEntryAlone(t *testing.T) {
+	future := time.Now().Add(time.Second)
+	now := time.Now()
+
+	slip := &Slip{
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {{
+				Component:   "api",
+				Status:      StepStatusCompleted,
+				CompletedAt: &future,
+			}},
+		},
+		Steps: map[string]Step{"builds": {Status: StepStatusCompleted}},
+	}
+
+	// Attempt to overlay with an older running status — should be ignored.
+	overlayComponentState(slip, "builds", "builds", "api", StepStatusRunning, now)
+
+	comp := slip.Aggregates["builds"][0]
+	if comp.Status != StepStatusCompleted {
+		t.Errorf("expected api status to remain completed, got %s", comp.Status)
+	}
+}
+
+// TestOverlayComponentState_OnlyTouchesNamedComponent verifies that overlayComponentState
+// only mutates the named component and leaves all others unchanged.
+func TestOverlayComponentState_OnlyTouchesNamedComponent(t *testing.T) {
+	ts := time.Now()
+	slip := &Slip{
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {
+				{Component: "api", Status: StepStatusRunning},
+				{Component: "worker", Status: StepStatusRunning},
+			},
+		},
+		Steps: map[string]Step{"builds": {Status: StepStatusRunning}},
+	}
+
+	overlayComponentState(slip, "builds", "builds", "api", StepStatusCompleted, ts)
+
+	for _, c := range slip.Aggregates["builds"] {
+		if c.Component == "worker" && c.Status != StepStatusRunning {
+			t.Errorf("worker status should remain running, got %s", c.Status)
+		}
+	}
+}
+
+// TestOverlayComponentState_NilSlip verifies that overlayComponentState is safe to call
+// with a nil slip.
+func TestOverlayComponentState_NilSlip(t *testing.T) {
+	// Should not panic.
+	overlayComponentState(nil, "builds", "builds", "api", StepStatusCompleted, time.Now())
+}
+
+// TestOverlayComponentState_PipelineLevelStep verifies that a pipeline-level step (componentName="")
+// updates slip.Steps directly instead of touching Aggregates.
+func TestOverlayComponentState_PipelineLevelStep(t *testing.T) {
+	ts := time.Now()
+	slip := &Slip{
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusRunning},
+		},
+		Aggregates: map[string][]ComponentStepData{},
+	}
+
+	overlayComponentState(slip, "unit_tests", "", "", StepStatusCompleted, ts)
+
+	if slip.Steps["unit_tests"].Status != StepStatusCompleted {
+		t.Errorf("expected unit_tests status completed, got %s", slip.Steps["unit_tests"].Status)
+	}
+	// Aggregates must remain untouched.
+	if len(slip.Aggregates) != 0 {
+		t.Error("Aggregates should not be modified for pipeline-level overlay")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Async-insert race regression test
+// ---------------------------------------------------------------------------
+
+// TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace is a deterministic regression
+// test for the ClickHouse async-insert visibility race described in slip d15f1808 / 51a2cb11.
+//
+// Scenario: CompleteStep is called for component "api" on step "build" → "builds" aggregate.
+// The async INSERT is buffered; the subsequent SELECT (inside hydrateSlip) returns the OLD
+// state (running). Without the overlay, computeAggregateStatus sees all components as running
+// and writes builds_status=running back to routing_slips — permanently stuck.
+// With the overlay, the just-inserted row is merged in-memory before Update, so the
+// correct aggregate (completed) is written.
+func TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace(t *testing.T) {
+	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
+
+	staleTimestamp := time.Now().Add(-100 * time.Millisecond)
+	insertedAt := time.Now()
+
+	// Post-Load slip: both api and worker are running (stale SELECT result — async INSERT not flushed).
+	// This simulates what hydrateSlip returns when the just-inserted row is not visible yet.
+	staleStart := staleTimestamp
+	slip := &Slip{
+		CorrelationID: "test-race-001",
+		Version:       1,
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {
+				{Component: "api", Status: StepStatusRunning, StartedAt: &staleStart},
+				{Component: "worker", Status: StepStatusRunning, StartedAt: &staleStart},
+			},
+		},
+		Steps: map[string]Step{
+			"builds": {Status: StepStatusRunning},
+		},
+	}
+
+	// Verify the pre-condition: without overlay, both components are stale-running.
+	activeWithoutOverlay := []ComponentStepData{
+		{Component: "api", Status: StepStatusRunning},
+		{Component: "worker", Status: StepStatusRunning},
+	}
+	statusWithoutOverlay := store.computeAggregateStatus(activeWithoutOverlay)
+	if statusWithoutOverlay != StepStatusRunning {
+		t.Errorf("pre-overlay: expected running aggregate, got %s", statusWithoutOverlay)
+	}
+
+	// Apply overlay: api=completed (the just-inserted CompleteStep row).
+	// stepName="build" (the component step type alias), aggregateStepName="builds", component="api".
+	overlayComponentState(slip, "build", "builds", "api", StepStatusCompleted, insertedAt)
+
+	// api is now overlaid as completed; worker is still running.
+	// Collect all active components for aggregate computation.
+	collectActive := func(s *Slip) []ComponentStepData {
+		var all []ComponentStepData
+		for _, comps := range s.Aggregates {
+			all = append(all, comps...)
+		}
+		return all
+	}
+
+	statusOneComplete := store.computeAggregateStatus(collectActive(slip))
+	if statusOneComplete != StepStatusRunning {
+		// aggregate still running — worker not finished yet. This is correct.
+		t.Errorf("one-complete: expected running (worker still running), got %s", statusOneComplete)
+	}
+
+	// Simulate worker also completing (second CompleteStep call, also with async lag).
+	overlayComponentState(slip, "build", "builds", "worker", StepStatusCompleted, insertedAt)
+
+	statusBothComplete := store.computeAggregateStatus(collectActive(slip))
+	if statusBothComplete != StepStatusCompleted {
+		t.Errorf(
+			"both-complete: expected completed aggregate, got %s (this is the regression — without overlay, stuck as running)",
+			statusBothComplete,
+		)
+	}
+}
+
+// TestOverlayUpdatesStepsStatus_T1Regression verifies that after overlayComponentState
+// patches slip.Aggregates, the caller's recompute block correctly updates
+// slip.Steps[aggregateStepName].Status. Without Fix T1, slip.Steps["builds"].Status
+// remains stale (running) even when all components complete, causing Update() to write
+// builds_status=running to the routing_slips scalar column.
+func TestOverlayUpdatesStepsStatus_T1Regression(t *testing.T) {
+	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
+
+	staleTimestamp := time.Now().Add(-100 * time.Millisecond)
+	insertedAt := time.Now()
+	staleStart := staleTimestamp
+
+	slip := &Slip{
+		CorrelationID: "test-t1-001",
+		Version:       1,
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {
+				{Component: "api", Status: StepStatusRunning, StartedAt: &staleStart},
+				{Component: "worker", Status: StepStatusRunning, StartedAt: &staleStart},
+			},
+		},
+		Steps: map[string]Step{
+			"builds": {Status: StepStatusRunning},
+		},
+	}
+
+	aggregateStepName := "builds"
+
+	// Overlay both components as completed (simulating both async inserts not yet visible).
+	overlayComponentState(slip, "build", aggregateStepName, "api", StepStatusCompleted, insertedAt)
+	overlayComponentState(slip, "build", aggregateStepName, "worker", StepStatusCompleted, insertedAt)
+
+	// This block mirrors the Fix T1 code in updateAggregateStatusFromComponentStates.
+	// Without this block, slip.Steps["builds"].Status stays StepStatusRunning.
+	if comps := slip.Aggregates[aggregateStepName]; len(comps) > 0 {
+		recomputedStatus := store.computeAggregateStatus(comps)
+		if step, ok := slip.Steps[aggregateStepName]; ok {
+			step.ApplyStatusTransition(recomputedStatus, insertedAt)
+			slip.Steps[aggregateStepName] = step
+		}
+	}
+
+	got := slip.Steps["builds"].Status
+	if got != StepStatusCompleted {
+		t.Errorf("T1 regression: slip.Steps[\"builds\"].Status = %s, want %s"+
+			" — without Fix T1 the scalar builds_status column is written as stale running",
+			got, StepStatusCompleted)
+	}
+}
+
+// TestOverlayNewComponentUnderCanonicalKey_T2Regression verifies that when a brand-new
+// component (not yet in any Aggregates bucket) is overlaid with a component-type alias
+// as stepName (e.g. "build"), the component is stored under the canonical aggregate key
+// ("builds") rather than the alias key ("build").
+//
+// Without Fix T2, the new component lands under "build", but BuildAggregateColumnsAndValues
+// only looks up "builds", so the component is silently dropped from the serialised row.
+func TestOverlayNewComponentUnderCanonicalKey_T2Regression(t *testing.T) {
+	insertedAt := time.Now()
+
+	slip := &Slip{
+		CorrelationID: "test-t2-001",
+		Version:       1,
+		Aggregates:    map[string][]ComponentStepData{}, // no pre-existing components
+		Steps: map[string]Step{
+			"builds": {Status: StepStatusPending},
+		},
+	}
+
+	// stepName is the alias "build"; aggregateStepName is the canonical "builds".
+	overlayComponentState(slip, "build", "builds", "api", StepStatusCompleted, insertedAt)
+
+	// The component must live under the canonical key "builds".
+	comps, ok := slip.Aggregates["builds"]
+	if !ok || len(comps) == 0 {
+		t.Fatalf("T2 regression: expected component under canonical key \"builds\", got Aggregates=%v", slip.Aggregates)
+	}
+
+	found := false
+	for _, c := range comps {
+		if c.Component == "api" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf(
+			"T2 regression: component \"api\" not found under canonical key \"builds\", Aggregates=%v",
+			slip.Aggregates,
+		)
+	}
+
+	// Must NOT appear under the alias key "build" — that would be the pre-fix behaviour.
+	if aliasComps := slip.Aggregates["build"]; len(aliasComps) > 0 {
+		t.Errorf("T2 regression: component unexpectedly stored under alias key \"build\"; should be under \"builds\"")
+	}
 }

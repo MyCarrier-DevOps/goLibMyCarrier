@@ -52,13 +52,25 @@ bd close <id>         # Complete work
 
 ## Build & Test
 
-_Add your build and test commands here_
+**Always use Makefile targets, NOT raw `go` commands.** The Makefile encodes the canonical lint config, coverage thresholds, and tool versions used by CI.
 
 ```bash
-# Example:
-# npm install
-# npm test
+make lint            # golangci-lint (NOT raw `golangci-lint run`)
+make test            # go test w/ race + count + coverage flags (NOT raw `go test ./...`)
+make fmt             # gofmt/goimports (NOT raw `gofmt -l`)
+make tidy            # go mod tidy across all modules
+make check-sec       # gosec scan (NOT raw `gosec ./...`)
+make check-coverage  # coverage threshold gate
+make bump            # version bump helper
 ```
+
+Available targets: `make help` (if defined) or `grep -E "^[a-z_-]+:" Makefile`.
+
+**Raw `go build ./...` / `go vet ./...` are acceptable for quick verification** but final gate before commit must run `make lint && make test`.
+
+**For subagents:** when briefing, include the Makefile targets explicitly. Don't let an agent reach for `golangci-lint run` or `go test ./...` directly — the Makefile flags differ from defaults and CI compares against Makefile output.
+
+This applies to **all** Go-based MyCarrier tools that have a Makefile (slippy-api, MC.TestEngine, Slippy CLI, etc.).
 
 ## Architecture Overview
 

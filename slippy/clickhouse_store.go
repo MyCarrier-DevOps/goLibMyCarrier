@@ -449,6 +449,17 @@ func (s *ClickHouseStore) UpdateStep(
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
+	// Capture the write timestamp before the INSERT so the overlay uses the
+	// same logical time as the row being written (within clock granularity).
+	//
+	// Clock-skew / retry note: on a conflict-retry path the server may have already
+	// flushed the async-insert row with a timestamp slightly later than insertedAt
+	// (ClickHouse server clock vs. client clock). In that case overlayComponentState
+	// will find the existing entry newer and silently skip the overlay. This is safe:
+	// the flushed row is already the correct, up-to-date value, so the subsequent Load
+	// inside the retry loop will hydrate the correct state.
+	insertedAt := time.Now()
+
 	// Write the step event to the conflict-free event-sourcing table.
 	// Pipeline-level steps use componentName="" as a sentinel value.
 	if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status, "", ""); err != nil {
@@ -463,7 +474,14 @@ func (s *ClickHouseStore) UpdateStep(
 	// source of truth; hydrateSlip derives the step status on every Load, so no
 	// write-back to routing_slips is needed.
 	if componentName != "" || (s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName)) {
-		return s.updateAggregateStatusFromComponentStates(ctx, correlationID, stepName)
+		return s.updateAggregateStatusFromComponentStates(
+			ctx,
+			correlationID,
+			stepName,
+			componentName,
+			status,
+			insertedAt,
+		)
 	}
 
 	return nil
@@ -492,6 +510,17 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	status StepStatus,
 	entry StateHistoryEntry,
 ) error {
+	// Capture the write timestamp before the INSERT so the overlay uses the
+	// same logical time as the row being written (within clock granularity).
+	//
+	// Clock-skew / retry note: on a conflict-retry path the server may have already
+	// flushed the async-insert row with a timestamp slightly later than insertedAt
+	// (ClickHouse server clock vs. client clock). In that case overlayComponentState
+	// will find the existing entry newer and silently skip the overlay. This is safe:
+	// the flushed row is already the correct, up-to-date value, so the subsequent Load
+	// inside the retry loop will hydrate the correct state.
+	insertedAt := time.Now()
+
 	// Store the step event in the conflict-free event-sourcing table.
 	// The message from the history entry is co-located in the event record.
 	if err := s.insertComponentState(
@@ -505,7 +534,15 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	//   - IsAggregateStep:      aggregate step itself → aggregate write-back carries the history.
 	//   - otherwise:            pure pipeline step → call AppendHistory directly.
 	if componentName != "" || (s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName)) {
-		return s.updateAggregateStatusFromComponentStatesWithHistory(ctx, correlationID, stepName, entry)
+		return s.updateAggregateStatusFromComponentStatesWithHistory(
+			ctx,
+			correlationID,
+			stepName,
+			componentName,
+			status,
+			insertedAt,
+			entry,
+		)
 	}
 
 	// Pure pipeline step: persist the history entry AND update the step-status column
@@ -1756,11 +1793,13 @@ func (s *ClickHouseStore) loadVersionFromDB(ctx context.Context, correlationID s
 }
 
 // updateAggregateStatusFromComponentStates loads the slip, hydrates it with component states,
-// and persists the updated aggregate status back to the routing_slips table.
+// applies the read-your-own-writes overlay for the just-inserted row, and persists the
+// updated aggregate status back to the routing_slips table.
 // This is called after a component state update to ensure the slip reflects the current aggregate status.
 func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 	ctx context.Context,
 	correlationID, stepName string,
+	componentName string, insertedStatus StepStatus, insertedAt time.Time,
 ) error {
 	// Start tracing span for the retry operation
 	retrySpan := startRetrySpan(ctx, "updateAggregateStatusFromComponentStates", correlationID)
@@ -1816,6 +1855,35 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 			// No aggregate step configured for this step, nothing to update
 			retrySpan.EndSuccess()
 			return nil
+		}
+
+		// Read-your-own-writes safety net: ClickHouse async_insert=1 means the row we
+		// just inserted into slip_component_states may not be visible to the SELECT inside
+		// hydrateSlip yet. Overlay the just-written component state onto the in-memory slip
+		// so that computeAggregateStatus sees the correct current state regardless of
+		// async-insert flush timing.
+		overlayComponentState(slip, stepName, aggregateStepName, componentName, insertedStatus, insertedAt)
+
+		// Note: this recompute uses slip.Aggregates[aggregateStepName] directly, which
+		// includes any pending placeholder components alongside active ones. This differs
+		// from applyComponentStatesToAggregate (called inside hydrateSlip) which filters to
+		// active-only components from the event log. In the async-insert race scenario the
+		// newly-overlaid component is non-pending, and computeAggregateStatus treats absent
+		// vs pending components identically (both count as "not completed"), so the divergence
+		// is semantically neutral for the convergence path. At the final boundary — all real
+		// components complete + one placeholder still pending — this path returns
+		// "running" rather than "completed". Pre-existing condition; alignment of the two
+		// paths tracked as a separate follow-up.
+		// Re-derive the aggregate step status from the overlaid Aggregates so that
+		// Update() writes the correct value to the {step}_status scalar column.
+		// Without this, slip.Steps[aggregateStepName].Status retains the stale value
+		// set by applyComponentStatesToAggregate during hydrateSlip.
+		if comps := slip.Aggregates[aggregateStepName]; len(comps) > 0 {
+			recomputedStatus := s.computeAggregateStatus(comps)
+			if step, ok := slip.Steps[aggregateStepName]; ok {
+				step.ApplyStatusTransition(recomputedStatus, insertedAt)
+				slip.Steps[aggregateStepName] = step
+			}
 		}
 
 		// The slip was already hydrated by Load(), so the step status should reflect
@@ -1874,6 +1942,7 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 	ctx context.Context,
 	correlationID, stepName string,
+	componentName string, insertedStatus StepStatus, insertedAt time.Time,
 	entry StateHistoryEntry,
 ) error {
 	// Start tracing span for the retry operation
@@ -1941,6 +2010,35 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 			}
 			retrySpan.EndSuccess()
 			return nil
+		}
+
+		// Read-your-own-writes safety net: ClickHouse async_insert=1 means the row we
+		// just inserted into slip_component_states may not be visible to the SELECT inside
+		// hydrateSlip yet. Overlay the just-written component state onto the in-memory slip
+		// so that computeAggregateStatus sees the correct current state regardless of
+		// async-insert flush timing.
+		overlayComponentState(slip, stepName, aggregateStepName, componentName, insertedStatus, insertedAt)
+
+		// Note: this recompute uses slip.Aggregates[aggregateStepName] directly, which
+		// includes any pending placeholder components alongside active ones. This differs
+		// from applyComponentStatesToAggregate (called inside hydrateSlip) which filters to
+		// active-only components from the event log. In the async-insert race scenario the
+		// newly-overlaid component is non-pending, and computeAggregateStatus treats absent
+		// vs pending components identically (both count as "not completed"), so the divergence
+		// is semantically neutral for the convergence path. At the final boundary — all real
+		// components complete + one placeholder still pending — this path returns
+		// "running" rather than "completed". Pre-existing condition; alignment of the two
+		// paths tracked as a separate follow-up.
+		// Re-derive the aggregate step status from the overlaid Aggregates so that
+		// Update() writes the correct value to the {step}_status scalar column.
+		// Without this, slip.Steps[aggregateStepName].Status retains the stale value
+		// set by applyComponentStatesToAggregate during hydrateSlip.
+		if comps := slip.Aggregates[aggregateStepName]; len(comps) > 0 {
+			recomputedStatus := s.computeAggregateStatus(comps)
+			if step, ok := slip.Steps[aggregateStepName]; ok {
+				step.ApplyStatusTransition(recomputedStatus, insertedAt)
+				slip.Steps[aggregateStepName] = step
+			}
 		}
 
 		// Append history entry to the same slip (atomic with aggregate update)
@@ -2096,6 +2194,125 @@ func (s *ClickHouseStore) resolveAggregateStepName(stepNameFromDB string) string
 		return stepNameFromDB
 	}
 	return ""
+}
+
+// overlayComponentState applies a just-written component state to an in-memory slip,
+// acting as a read-your-own-writes safety net for ClickHouse async-insert visibility lag.
+//
+// When async_insert=1 is active server-side, a row inserted into slip_component_states
+// may not be visible to a subsequent SELECT on the same connection until the async buffer
+// is flushed (typically ~200 ms). overlayComponentState merges the just-inserted row
+// directly into the in-memory Slip so that computeAggregateStatus derives the correct
+// aggregate status without waiting for flush.
+//
+// Overlay rules:
+//   - If the slip has no aggregate entry for this component, the component is added under
+//     aggregateStepName (the canonical bucket key, e.g. "builds" — NOT the alias "build").
+//     Using the canonical key ensures BuildAggregateColumnsAndValues finds the component.
+//   - If the existing entry has an older (or equal) updatedAt, the new state wins.
+//   - If the existing entry is somehow newer, it is left untouched (defensive; should not
+//     occur in the normal single-writer path).
+//   - componentName == "" (pipeline-level sentinel) is handled: the Step's status in
+//     slip.Steps[stepName] is updated directly rather than touching Aggregates.
+//
+// Precondition: aggregateStepName must be non-empty when componentName is non-empty.
+// It must be the resolved canonical aggregate step name (e.g. "builds"), not the
+// component-type alias (e.g. "build"). Callers obtain this via
+// resolveAggregateStepName(stepName). The pipeline-level sentinel path
+// (componentName == "") is the only path that does not use aggregateStepName.
+func overlayComponentState(
+	slip *Slip,
+	stepName, aggregateStepName, componentName string,
+	status StepStatus,
+	updatedAt time.Time,
+) {
+	if slip == nil {
+		return
+	}
+
+	if componentName == "" {
+		// Pipeline-level step (sentinel): update Steps directly, not Aggregates.
+		if step, ok := slip.Steps[stepName]; ok {
+			if step.CompletedAt == nil || updatedAt.After(*step.CompletedAt) {
+				step.ApplyStatusTransition(status, updatedAt)
+				slip.Steps[stepName] = step
+			}
+		}
+		return
+	}
+
+	// Defensive guard: callers MUST resolve aggregateStepName before invoking the
+	// component-overlay path. Returning early here prevents a future regression where
+	// a component lands under an alias key (e.g. "build") that BuildAggregateColumnsAndValues
+	// never reads — see PR #59 round-2 finding N1.
+	if aggregateStepName == "" {
+		return
+	}
+
+	// Ensure Aggregates map exists.
+	if slip.Aggregates == nil {
+		slip.Aggregates = make(map[string][]ComponentStepData)
+	}
+
+	// Search all aggregate buckets for the named component and update whichever one
+	// contains it. This covers both the canonical key ("builds") and any legacy alias
+	// key ("build") that may have been written by an earlier code path.
+	updated := false
+	for aggregateKey := range slip.Aggregates {
+		components := slip.Aggregates[aggregateKey]
+		for i := range components {
+			if components[i].Component != componentName {
+				continue
+			}
+			// Found existing entry — replace only if our row is newer.
+			existing := &components[i]
+			existingTime := latestComponentTime(existing)
+			if !updatedAt.After(existingTime) {
+				// Existing entry is same age or newer; leave it.
+				updated = true // mark found so we don't add a duplicate below
+				break
+			}
+			existing.ApplyStatusTransition(status, updatedAt)
+			updated = true
+			break
+		}
+		if updated {
+			break
+		}
+	}
+
+	if !updated {
+		// Component not yet present in any aggregate bucket. Add it under the canonical
+		// aggregate step name (e.g. "builds") so that BuildAggregateColumnsAndValues,
+		// which keys off the canonical name, can serialize this component.
+		bucketKey := aggregateStepName
+		comp := ComponentStepData{
+			Component: componentName,
+			Status:    status,
+		}
+		comp.ApplyStatusTransition(status, updatedAt)
+		slip.Aggregates[bucketKey] = append(slip.Aggregates[bucketKey], comp)
+	}
+}
+
+// latestComponentTime returns the most recent timestamp recorded on a ComponentStepData.
+// Used by overlayComponentState to decide whether the overlay row is newer than what
+// hydrateSlip loaded from ClickHouse.
+//
+// Pending / placeholder entries (inserted by pipeline config initialisation) have no
+// timestamps, so this function returns the zero time for them. The zero return is
+// intentional: any real overlay event (non-zero updatedAt) will always be After(zero),
+// so overlay always wins against a DB placeholder. This prevents stale pending entries
+// from blocking an in-flight overlay.
+func latestComponentTime(c *ComponentStepData) time.Time {
+	var t time.Time
+	if c.CompletedAt != nil && c.CompletedAt.After(t) {
+		t = *c.CompletedAt
+	}
+	if c.StartedAt != nil && c.StartedAt.After(t) {
+		t = *c.StartedAt
+	}
+	return t
 }
 
 // applyComponentStatesToAggregate updates the aggregate data in slip for the given

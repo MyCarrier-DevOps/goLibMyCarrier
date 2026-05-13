@@ -167,6 +167,50 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 
 ## Recent Changes
 
+### May 13, 2026 — Async-Insert Race Fix in Aggregate Write-Back (PR #59)
+
+**Context:** Production slips `d15f1808-5727-4df4-83d8-c526afd2c79e` and `51a2cb11-960b-4974-b131-2d85513cb4ba` (both MC.Invoice) observed permanently stuck at `builds_status = running` even after all components completed. Root cause: ClickHouse `async_insert=1` server-side meant the row inserted by `insertComponentState` was not visible to the immediately-subsequent `loadComponentStates` SELECT on the same `driver.Conn`. `computeAggregateStatus` read pre-insert state and `Update()` wrote it back; the conflict-retry version check passed (no concurrent writer) so no retry fixed it. ReplacingMergeTree eventually merged the row but `routing_slips` write-back never re-fired. I5 invariant permanently violated.
+
+#### Fix (`slippy/clickhouse_store.go`)
+
+1. **`overlayComponentState`** — new pure function. Read-your-own-writes pattern: after `insertComponentState`, merge the just-written component into the in-memory `slip.Aggregates[aggregateStepName]` slice. Closes the visibility race in Go memory without changing ClickHouse settings (preserves async-insert throughput).
+2. **`latestComponentTime`** — helper for age comparison (max of `CompletedAt` / `StartedAt`).
+3. **Wiring** — both `UpdateStep` (~L449) and `UpdateStepWithHistory` (~L496) capture `insertedAt := time.Now()` before INSERT, thread `componentName`/`status`/`insertedAt` into the aggregate functions. Both `updateAggregateStatusFromComponentStates` (~L1836) and `updateAggregateStatusFromComponentStatesWithHistory` (~L1969) call `overlayComponentState` after `Load()` and before `Update()`.
+4. **Recompute block (review-driven correction)** — after the overlay, recompute aggregate status from the merged `slip.Aggregates[aggregateStepName]` and apply to `slip.Steps[aggregateStepName]` via `ApplyStatusTransition`. Required because `Update()` → `BuildStepColumnsAndValues` reads the scalar `{step}_status` Enum8 column from `slip.Steps`, not `slip.Aggregates`. Without this, the overlay patched the aggregate JSON column correctly but the scalar column stayed stale. **Identified by PR review round 1, finding T1.**
+5. **Canonical bucket key (review-driven correction)** — `overlayComponentState` now takes `aggregateStepName` as a parameter and uses it as the bucket key when appending a new component (rather than using the raw `stepName` which may be a component-type alias like `"build"`). `BuildAggregateColumnsAndValues` only reads the canonical key (e.g. `"builds"`). **Identified by PR review round 1, finding T2.**
+6. **Defensive guard + doc polish (round 2)** — `overlayComponentState` now early-returns when `aggregateStepName == ""` on the component-overlay path (pipeline-level sentinel with `componentName == ""` still uses `stepName` directly). Doc-comment rewritten to state the non-empty precondition explicitly. Dead `bucketKey` fallback removed. **Identified by PR review round 2, finding N1.**
+7. **Placeholder-divergence note (round 2)** — comment added above both recompute blocks explaining that they pass `slip.Aggregates[aggregateStepName]` (all components incl. pending placeholders) to `computeAggregateStatus`, vs. `applyComponentStatesToAggregate` which filters to active-only. Semantically neutral in the convergence path; full alignment tracked as separate follow-up. **Identified by PR review round 2, finding N2.**
+
+#### Tests
+
+- `TestOverlayComponentState_*` — 6 unit tests covering add/replace/leave-alone/single-component/nil-slip/pipeline-level-step cases
+- `TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace` — original regression test for in-memory Aggregates correctness
+- `TestOverlayUpdatesStepsStatus_T1Regression` — explicitly asserts `slip.Steps["builds"].Status == completed` post-overlay (would fail without the recompute block)
+- `TestOverlayNewComponentUnderCanonicalKey_T2Regression` — asserts new components land in canonical bucket, not alias bucket
+
+#### Spec alignment (`STATE_MACHINE_V3.md`)
+
+| Invariant | Impact |
+|---|---|
+| I1 (aggregate from event log) | Preserved — overlay row IS the just-appended event |
+| Append-only events | Preserved |
+| Terminal-success monotonic | Preserved |
+| **I5** (cached column == event-log-derived) | **Strengthened** — eliminates permanent stale window. External CH readers retain bounded ~200ms staleness during async flush (unchanged); the fix only eliminates permanent staleness from the write-back path. |
+| Single authoritative write per terminal event | Preserved |
+
+#### Out of scope (separate follow-ups tracked)
+
+1. **Cache invalidation** — `slippy-api/internal/infrastructure/cache.go` is passthrough today. When Dragonfly cache activates, `invalidate` at `slip_write_handler.go:364` must clear cached entries.
+2. **Gap B — crash recovery** — if slippy-api crashes between `insertComponentState` and the routing_slips Update, no mechanism re-fires the aggregate. Needs WAL or periodic reconciler.
+3. **Stuck-slip backfill** — slips `d15f1808`, `51a2cb11`, plus any others stuck before this fix lands. Need `-1` cancel + `+1` corrected pair via one-off script.
+4. **Pre-existing placeholder-divergence** — `computeAggregateStatus` filtering paths in `applyComponentStatesToAggregate` (active-only) vs recompute block (all incl. placeholders) — neutral in current scenario but worth aligning.
+
+**PR:** https://github.com/MyCarrier-DevOps/goLibMyCarrier/pull/59
+**Review trail:** 3 commits — initial overlay (`1981532`), round-1 corrections (`97c408f`: T1+T2 critical, T3+T4+T5 doc/test), round-2 polish (N1+N2 guard + comments).
+**Validation:** `go build ./...` clean · `go vet ./...` clean · `gofmt -l` clean · `go test ./slippy/... -race` PASS (slippy 3.7s, slippytest 1.7s)
+
+---
+
 ### April 29, 2026 — Slippy State Machine Documentation, Invariants & Bug Fixes
 
 **Context:** Interactive state-machine game session tracing every pipeline step transition, concurrent update scenario, and failure/recovery path against the live codebase and production workflow templates.

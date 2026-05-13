@@ -614,12 +614,15 @@ func TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride(t *testing.T) {
 // TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog (integration tag).
 //
 // Precondition: slip=in_progress, prod_alert_gate=running, prod_rollback=running,
-//               prod_steady_state=running
+//
+//	prod_steady_state=running
+//
 // Actions (sequential):
-//   1. FailStep(prod_alert_gate)     → slip=failed, one primary failure
-//   2. CompleteStep(prod_rollback)   → checkPipelineCompletion re-runs; prod_alert_gate
-//                                      still a primary failure, must remain in overrides
-//   3. FailStep(prod_steady_state)   → second primary failure added
+//  1. FailStep(prod_alert_gate)     → slip=failed, one primary failure
+//  2. CompleteStep(prod_rollback)   → checkPipelineCompletion re-runs; prod_alert_gate
+//     still a primary failure, must remain in overrides
+//  3. FailStep(prod_steady_state)   → second primary failure added
+//
 // Expected after all three actions:
 //   - slip.status == failed
 //   - prod_alert_gate.status == failed
