@@ -175,6 +175,7 @@ jobs:
       github.ref == 'refs/heads/main' ||
       startsWith(github.ref, 'refs/heads/feature/') ||
       startsWith(github.ref, 'refs/heads/fix/') ||
+      startsWith(github.ref, 'refs/heads/feat/') ||
       startsWith(github.ref, 'refs/heads/hotfix/')
     outputs:
       version: ${{ steps.release_version.outputs.version }}
