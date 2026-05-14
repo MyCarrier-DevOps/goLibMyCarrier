@@ -8,6 +8,7 @@
 package slippyapi
 
 import (
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -28,22 +29,36 @@ const (
 	apiURLNonProd = "https://slippy-api-test.api.mycarrier.tech/v1"
 )
 
+// ErrNotConfigured is returned by ResolveAPIURL when neither SLIPPY_API_URL
+// nor K8S_NAMESPACE is set (or both are whitespace-only). This is the
+// "slippy not configured" path — callers decide whether that means
+// "disabled" or "fail with not-configured error" by testing with
+// errors.Is(err, slippyapi.ErrNotConfigured).
+var ErrNotConfigured = errors.New("slippyapi: not configured (K8S_NAMESPACE unset)")
+
 // ResolveAPIURL returns the slippy-api base URL for the current environment.
 //
 // Resolution order:
-//  1. SLIPPY_API_URL — explicit override. Honored verbatim (after TrimSpace),
-//     so integration tests, local dev, in-cluster URLs, and incident-time
-//     redirection all work without code changes.
+//  1. SLIPPY_API_URL — explicit override. Honored verbatim (after TrimSpace
+//     and trailing-slash trim), so integration tests, local dev, in-cluster
+//     URLs, and incident-time redirection all work without code changes.
 //  2. K8S_NAMESPACE mapped to a known cluster URL:
 //     argo-events       -> apiURLProd
 //     argo-events-test  -> apiURLNonProd
-//  3. ("", nil) when K8S_NAMESPACE is unset, empty, or whitespace-only.
-//     This is the "slippy not configured" path — callers decide whether
-//     that means "disabled" or "fail with not-configured error."
+//  3. ("", ErrNotConfigured) when K8S_NAMESPACE is unset, empty, or
+//     whitespace-only. Callers distinguish this from other errors via
+//     errors.Is(err, slippyapi.ErrNotConfigured).
 //  4. ("", error) when K8S_NAMESPACE has a non-empty value that does not
 //     map to a known cluster (operator typo, new cluster not yet added).
 //     Fails fast rather than silently routing to the wrong place or
 //     collapsing into the disabled path.
+//
+// The returned URL never ends with a trailing slash.
+//
+// Note: this allow-list is intentionally narrower than slippy/config.go's
+// K8S_NAMESPACE classification; sibling-package namespaces like `feature-*`
+// or `*-dev` will error here. Operators on those namespaces must set
+// SLIPPY_API_URL explicitly.
 //
 // The mapping is intentionally a code-level constant: cluster topology
 // changes are rare and should travel through goLibMyCarrier review +
@@ -64,11 +79,11 @@ func ResolveAPIURL() (string, error) {
 				envAPIURL, explicit,
 			)
 		}
-		return explicit, nil
+		return strings.TrimRight(explicit, "/"), nil
 	}
 	switch ns := strings.TrimSpace(os.Getenv(envK8sNamespace)); ns {
 	case "":
-		return "", nil
+		return "", ErrNotConfigured
 	case "argo-events":
 		return apiURLProd, nil
 	case "argo-events-test":
