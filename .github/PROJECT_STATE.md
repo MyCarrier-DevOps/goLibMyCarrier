@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
-> **Last Updated:** April 29, 2026
-> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-6); coverage 82.2%; lint clean; state machine invariants documented; executor.go ordering fix applied
+> **Last Updated:** 2026-05-14
+> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-6); coverage 83.9% (slippy); lint clean; state machine invariants documented; executor.go ordering fix applied; placeholder-filter divergence bug fixed (Path B recompute now aligns with Path A)
 
 ---
 
@@ -166,6 +166,37 @@ When edge cases are detected, warnings are logged with context. See [resolveAndA
 ---
 
 ## Recent Changes
+
+### 2026-05-14 — Placeholder-Filter Divergence Fix in Path B Recompute (branch: fix/slippy-aggregate-placeholder-filter)
+
+**Context:** Feature-branch slips for MC.*/ITM.* repos were permanently stuck at `builds_status = running` even after all real build components completed. Root cause: `initializeSlipForPush` seeds the `builds` aggregate with PascalCase placeholder entries (e.g. `ExampleApi`, `ExampleWorker`) that have nil timestamps. The Path B recompute blocks in both `updateAggregateStatusFromComponentStates` and `updateAggregateStatusFromComponentStatesWithHistory` passed the full `slip.Aggregates[aggregateStepName]` slice — including these placeholders — to `computeAggregateStatus`. At the final boundary (all real components completed, placeholders still pending), `computeAggregateStatus` returned `running`. The Path A code (`applyComponentStatesToAggregate`, called inside `hydrateSlip`) already filtered to active-only components; Path B did not, causing divergence at the one-write-per-terminal-event point.
+
+#### Fix (`slippy/clickhouse_store.go`)
+
+1. **`filterActiveComponents`** — new helper (placed near `latestComponentTime`). Returns only components that have at least one timestamp set (`!latestComponentTime(&c).IsZero()`), excluding placeholder entries.
+2. **`updateAggregateStatusFromComponentStates` recompute block** — replaced `slip.Aggregates[aggregateStepName]` with `filterActiveComponents(slip.Aggregates[aggregateStepName])`. Added guard: skip recompute if `len(active) == 0`.
+3. **`updateAggregateStatusFromComponentStatesWithHistory` recompute block** — same change as above.
+4. **Stale comment removed** — both recompute blocks had a comment calling the divergence "semantically neutral / tracked as follow-up". Replaced with a concise note explaining the filter, the bug it prevents, and the alignment with Path A.
+
+#### Tests (`slippy/clickhouse_store_unit_test.go`)
+
+- `TestFilterActiveComponents` — table-driven, 5 cases: pure placeholders, mixed, all-active, empty, nil.
+- `TestFilterActiveComponents_DirectUnit` — standalone direct unit test (no mock infrastructure).
+- `TestUpdateAggregateStatusFromComponentStates_PlaceholderDivergence_FinalBoundary` — full-flow regression: seed 2 placeholders + 1 completed active, trigger final component completing, assert `builds_status != running`.
+- `TestUpdateAggregateStatusFromComponentStatesWithHistory_PlaceholderDivergence_FinalBoundary` — same for WithHistory variant.
+- `TestUpdateAggregateStatusFromComponentStates_AllPlaceholders_NoChange` — guards `len(active)==0` path: placeholder-only aggregate, single new active component arrives, function completes without error.
+
+#### Spec alignment
+
+- `STATE_MACHINE_V3.md` I5 note extended with a second resolved-bug entry documenting this fix.
+- `PROJECT_STATE.md` status line updated (coverage 83.9%, placeholder-filter fix noted).
+
+#### Quality gates
+
+- `make lint` — 0 issues (all modules).
+- `make test` — all modules PASS; slippy coverage 83.9% (up from 82.2%).
+
+---
 
 ### May 13, 2026 — Async-Insert Race Fix in Aggregate Write-Back (PR #59)
 

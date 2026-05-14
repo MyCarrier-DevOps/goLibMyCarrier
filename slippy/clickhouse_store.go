@@ -1864,22 +1864,20 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 		// async-insert flush timing.
 		overlayComponentState(slip, stepName, aggregateStepName, componentName, insertedStatus, insertedAt)
 
-		// Note: this recompute uses slip.Aggregates[aggregateStepName] directly, which
-		// includes any pending placeholder components alongside active ones. This differs
-		// from applyComponentStatesToAggregate (called inside hydrateSlip) which filters to
-		// active-only components from the event log. In the async-insert race scenario the
-		// newly-overlaid component is non-pending, and computeAggregateStatus treats absent
-		// vs pending components identically (both count as "not completed"), so the divergence
-		// is semantically neutral for the convergence path. At the final boundary — all real
-		// components complete + one placeholder still pending — this path returns
-		// "running" rather than "completed". Pre-existing condition; alignment of the two
-		// paths tracked as a separate follow-up.
 		// Re-derive the aggregate step status from the overlaid Aggregates so that
 		// Update() writes the correct value to the {step}_status scalar column.
 		// Without this, slip.Steps[aggregateStepName].Status retains the stale value
 		// set by applyComponentStatesToAggregate during hydrateSlip.
-		if comps := slip.Aggregates[aggregateStepName]; len(comps) > 0 {
-			recomputedStatus := s.computeAggregateStatus(comps)
+		//
+		// Note: filter to active-only components before recomputing. This aligns Path B
+		// (updateAggregateStatus* recompute) with Path A (applyComponentStatesToAggregate
+		// inside hydrateSlip). Placeholder entries seeded by initializeSlipForPush have no
+		// timestamps and must be excluded — including them would cause
+		// computeAggregateStatus to return "running" at the final boundary (all real
+		// components complete, one placeholder still pending), leaving builds_status stuck
+		// on "running" on feature-branch MC.*/ITM.* repos.
+		if active := filterActiveComponents(slip.Aggregates[aggregateStepName]); len(active) > 0 {
+			recomputedStatus := s.computeAggregateStatus(active)
 			if step, ok := slip.Steps[aggregateStepName]; ok {
 				step.ApplyStatusTransition(recomputedStatus, insertedAt)
 				slip.Steps[aggregateStepName] = step
@@ -2019,22 +2017,20 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		// async-insert flush timing.
 		overlayComponentState(slip, stepName, aggregateStepName, componentName, insertedStatus, insertedAt)
 
-		// Note: this recompute uses slip.Aggregates[aggregateStepName] directly, which
-		// includes any pending placeholder components alongside active ones. This differs
-		// from applyComponentStatesToAggregate (called inside hydrateSlip) which filters to
-		// active-only components from the event log. In the async-insert race scenario the
-		// newly-overlaid component is non-pending, and computeAggregateStatus treats absent
-		// vs pending components identically (both count as "not completed"), so the divergence
-		// is semantically neutral for the convergence path. At the final boundary — all real
-		// components complete + one placeholder still pending — this path returns
-		// "running" rather than "completed". Pre-existing condition; alignment of the two
-		// paths tracked as a separate follow-up.
 		// Re-derive the aggregate step status from the overlaid Aggregates so that
 		// Update() writes the correct value to the {step}_status scalar column.
 		// Without this, slip.Steps[aggregateStepName].Status retains the stale value
 		// set by applyComponentStatesToAggregate during hydrateSlip.
-		if comps := slip.Aggregates[aggregateStepName]; len(comps) > 0 {
-			recomputedStatus := s.computeAggregateStatus(comps)
+		//
+		// Note: filter to active-only components before recomputing. This aligns Path B
+		// (updateAggregateStatus* recompute) with Path A (applyComponentStatesToAggregate
+		// inside hydrateSlip). Placeholder entries seeded by initializeSlipForPush have no
+		// timestamps and must be excluded — including them would cause
+		// computeAggregateStatus to return "running" at the final boundary (all real
+		// components complete, one placeholder still pending), leaving builds_status stuck
+		// on "running" on feature-branch MC.*/ITM.* repos.
+		if active := filterActiveComponents(slip.Aggregates[aggregateStepName]); len(active) > 0 {
+			recomputedStatus := s.computeAggregateStatus(active)
 			if step, ok := slip.Steps[aggregateStepName]; ok {
 				step.ApplyStatusTransition(recomputedStatus, insertedAt)
 				slip.Steps[aggregateStepName] = step
@@ -2313,6 +2309,26 @@ func latestComponentTime(c *ComponentStepData) time.Time {
 		t = *c.StartedAt
 	}
 	return t
+}
+
+// filterActiveComponents returns components that have at least one timestamp set,
+// excluding placeholder entries seeded by initializeSlipForPush. Active components
+// are the source of truth for aggregate status — mirrors the filter used inside
+// applyComponentStatesToAggregate.
+//
+// Assumption: component events in slip_component_states are only emitted for
+// non-pending statuses. A non-zero latestComponentTime therefore reliably
+// distinguishes an active component from a placeholder. If callers ever emit
+// pending events with timestamps, this predicate diverges from Path A's
+// event-log-derived activeComponents slice.
+func filterActiveComponents(comps []ComponentStepData) []ComponentStepData {
+	active := make([]ComponentStepData, 0, len(comps))
+	for i := range comps {
+		if !latestComponentTime(&comps[i]).IsZero() {
+			active = append(active, comps[i])
+		}
+	}
+	return active
 }
 
 // applyComponentStatesToAggregate updates the aggregate data in slip for the given
