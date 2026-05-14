@@ -2315,6 +2315,12 @@ func latestComponentTime(c *ComponentStepData) time.Time {
 // excluding placeholder entries seeded by initializeSlipForPush. Active components
 // are the source of truth for aggregate status — mirrors the filter used inside
 // applyComponentStatesToAggregate.
+//
+// Assumption: component events in slip_component_states are only emitted for
+// non-pending statuses. A non-zero latestComponentTime therefore reliably
+// distinguishes an active component from a placeholder. If callers ever emit
+// pending events with timestamps, this predicate diverges from Path A's
+// event-log-derived activeComponents slice.
 func filterActiveComponents(comps []ComponentStepData) []ComponentStepData {
 	active := make([]ComponentStepData, 0, len(comps))
 	for i := range comps {

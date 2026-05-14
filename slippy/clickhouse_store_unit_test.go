@@ -5940,9 +5940,13 @@ func TestUpdateAggregateStatusFromComponentStates_PlaceholderDivergence_FinalBou
 		}
 	}
 
+	// Guard: the INSERT must have been observed — otherwise the test fixture is broken
+	// and the assertion below passes vacuously.
+	if writtenBuildsStatus == "" {
+		t.Fatalf("test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback")
+	}
+
 	// The aggregate must be "completed" — not "running".
-	// If writtenBuildsStatus is empty the Insert did not include a status column,
-	// which would be a separate bug; but primarily we care it is not "running".
 	if StepStatus(writtenBuildsStatus) == StepStatusRunning {
 		t.Errorf(
 			"builds_status written as %q — placeholder-filter bug: placeholders prevented completion",
@@ -6000,6 +6004,12 @@ func TestUpdateAggregateStatusFromComponentStatesWithHistory_PlaceholderDivergen
 		}
 	}
 
+	// Guard: the INSERT must have been observed — otherwise the test fixture is broken
+	// and the assertion below passes vacuously.
+	if writtenBuildsStatus == "" {
+		t.Fatalf("test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback")
+	}
+
 	if StepStatus(writtenBuildsStatus) == StepStatusRunning {
 		t.Errorf(
 			"builds_status written as %q — placeholder-filter bug: placeholders prevented completion (WithHistory variant)",
@@ -6008,11 +6018,13 @@ func TestUpdateAggregateStatusFromComponentStatesWithHistory_PlaceholderDivergen
 	}
 }
 
-// TestUpdateAggregateStatusFromComponentStates_AllPlaceholders_NoChange guards the
-// len(active)==0 branch: when the builds aggregate contains only placeholder entries
-// (no active components yet), the recompute block must be skipped entirely — the
-// existing step status must not be overwritten.
-func TestUpdateAggregateStatusFromComponentStates_AllPlaceholders_NoChange(t *testing.T) {
+// TestUpdateAggregateStatusFromComponentStates_PlaceholdersIgnored_ArrivingComponentSetsStatus
+// verifies the integration flow when the builds aggregate contains only placeholder entries
+// at the time the first real component event arrives. filterActiveComponents strips the
+// placeholders (covered by TestFilterActiveComponents "pure placeholders" case); the
+// arriving component is overlaid as the sole active entry and the recompute block runs
+// against it. This test validates no error occurs and the function completes successfully.
+func TestUpdateAggregateStatusFromComponentStates_PlaceholdersIgnored_ArrivingComponentSetsStatus(t *testing.T) {
 	// All items are placeholders (no timestamps).
 	buildsItems := []ComponentStepData{
 		{Component: "ExampleApi", Status: StepStatusPending},
