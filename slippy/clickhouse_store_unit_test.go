@@ -5682,3 +5682,418 @@ func TestOverlayNewComponentUnderCanonicalKey_T2Regression(t *testing.T) {
 		t.Errorf("T2 regression: component unexpectedly stored under alias key \"build\"; should be under \"builds\"")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Placeholder-filter tests — filterActiveComponents + Path B recompute
+// ---------------------------------------------------------------------------
+
+// TestFilterActiveComponents is a table-driven test for the filterActiveComponents helper.
+// It covers the three key cases: pure-placeholder input, mixed input, and all-active input.
+func TestFilterActiveComponents(t *testing.T) {
+	now := time.Now()
+
+	noTimestamp := ComponentStepData{Component: "ExampleApi", Status: StepStatusPending}
+	withStarted := ComponentStepData{Component: "mc.example.api", Status: StepStatusRunning, StartedAt: &now}
+	withCompleted := ComponentStepData{Component: "mc.example.worker", Status: StepStatusCompleted, CompletedAt: &now}
+
+	cases := []struct {
+		name  string
+		input []ComponentStepData
+		want  int // expected len of result
+	}{
+		{
+			name:  "pure placeholders — all excluded",
+			input: []ComponentStepData{noTimestamp, {Component: "ExampleWorker", Status: StepStatusPending}},
+			want:  0,
+		},
+		{
+			name:  "mixed — only timestamped pass through",
+			input: []ComponentStepData{noTimestamp, withStarted, withCompleted},
+			want:  2,
+		},
+		{
+			name:  "all active — all pass through",
+			input: []ComponentStepData{withStarted, withCompleted},
+			want:  2,
+		},
+		{
+			name:  "empty input — returns empty",
+			input: []ComponentStepData{},
+			want:  0,
+		},
+		{
+			name:  "nil input — returns empty",
+			input: nil,
+			want:  0,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := filterActiveComponents(tc.input)
+			if len(got) != tc.want {
+				t.Errorf("filterActiveComponents: got len %d, want %d (input: %+v)", len(got), tc.want, tc.input)
+			}
+			// Verify no placeholder (zero-time) entries leaked through.
+			for _, c := range got {
+				if latestComponentTime(&c).IsZero() {
+					t.Errorf("filterActiveComponents: placeholder leaked into result: %+v", c)
+				}
+			}
+		})
+	}
+}
+
+// buildMockSlipRowWithBuildsData is a helper that creates a MockRow that returns the
+// given buildsItems as the builds aggregate JSON when scanned. It mirrors the layout
+// of createMockScanRow (17 columns).
+func buildMockSlipRowWithBuildsData(
+	correlationID string,
+	status SlipStatus,
+	buildsItems []ComponentStepData,
+) *clickhousetest.MockRow {
+	now := time.Now()
+
+	stepDetailsData := map[string]any{"push_parsed": map[string]any{"started_at": now.Format(time.RFC3339Nano)}}
+	stateHistoryData := map[string]any{"entries": []any{}}
+	buildsData := map[string]any{"items": buildsItems}
+	unitTestsData := map[string]any{"items": []any{}}
+
+	return &clickhousetest.MockRow{
+		ScanFunc: func(dest ...any) error {
+			if len(dest) < 17 {
+				return fmt.Errorf("not enough scan destinations: got %d, want 17", len(dest))
+			}
+			if ptr, ok := dest[0].(*string); ok {
+				*ptr = correlationID
+			}
+			if ptr, ok := dest[1].(*string); ok {
+				*ptr = "myorg/myrepo"
+			}
+			if ptr, ok := dest[2].(*string); ok {
+				*ptr = "feature/test"
+			}
+			if ptr, ok := dest[3].(*string); ok {
+				*ptr = "abc123"
+			}
+			if ptr, ok := dest[4].(*time.Time); ok {
+				*ptr = now
+			}
+			if ptr, ok := dest[5].(*time.Time); ok {
+				*ptr = now
+			}
+			if ptr, ok := dest[6].(*string); ok {
+				*ptr = string(status)
+			}
+			if jsonPtr, ok := dest[7].(*chcol.JSON); ok {
+				_ = jsonPtr.Scan(stepDetailsData)
+			}
+			if jsonPtr, ok := dest[8].(*chcol.JSON); ok {
+				_ = jsonPtr.Scan(stateHistoryData)
+			}
+			if ptr, ok := dest[9].(*int8); ok {
+				*ptr = 1
+			}
+			if ptr, ok := dest[10].(*uint32); ok {
+				*ptr = 1
+			}
+			for i := 11; i < 15; i++ {
+				if ptr, ok := dest[i].(*string); ok {
+					*ptr = string(StepStatusPending)
+				}
+			}
+			if jsonPtr, ok := dest[15].(*chcol.JSON); ok {
+				_ = jsonPtr.Scan(buildsData)
+			}
+			if jsonPtr, ok := dest[16].(*chcol.JSON); ok {
+				_ = jsonPtr.Scan(unitTestsData)
+			}
+			return nil
+		},
+	}
+}
+
+// buildMockSessionWithBuildsData wraps buildMockSlipRowWithBuildsData into a full
+// MockSession suitable for the updateAggregateStatus* functions (handles Load,
+// max(version), SELECT version, and ExecWithArgs for routing_slips).
+func buildMockSessionWithBuildsData(
+	correlationID string,
+	status SlipStatus,
+	buildsItems []ComponentStepData,
+) *clickhousetest.MockSession {
+	slipRow := buildMockSlipRowWithBuildsData(correlationID, status, buildsItems)
+	var lastInsertedVersion uint64 = 1
+
+	return &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(ctx context.Context, query string, args ...any) (driver.Rows, error) {
+			return &clickhousetest.MockRows{}, nil // hydrateSlip rows — empty (no component states from DB)
+		},
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			if strings.Contains(query, "max(version)") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if v, ok := dest[0].(*sql.NullInt64); ok {
+							v.Int64 = int64(lastInsertedVersion)
+							v.Valid = true
+						}
+						return nil
+					},
+				}
+			}
+			if strings.Contains(query, "SELECT state_history") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if jsonPtr, ok := dest[0].(*chcol.JSON); ok {
+							return jsonPtr.Scan(map[string]any{"entries": []any{}})
+						}
+						return nil
+					},
+				}
+			}
+			if strings.Contains(query, "SELECT version FROM") {
+				return &clickhousetest.MockRow{
+					ScanFunc: func(dest ...any) error {
+						if v, ok := dest[0].(*uint64); ok {
+							*v = lastInsertedVersion
+						}
+						return nil
+					},
+				}
+			}
+			return slipRow
+		},
+		ExecWithArgsFunc: func(ctx context.Context, stmt string, args ...any) error {
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				if len(args) >= 2 {
+					if v, ok := args[1].(uint64); ok {
+						lastInsertedVersion = v
+					}
+				}
+			}
+			return nil
+		},
+	}
+}
+
+// TestUpdateAggregateStatusFromComponentStates_PlaceholderDivergence_FinalBoundary is the
+// primary regression test for the placeholder-filter bug.
+//
+// Scenario: a feature-branch slip has 2 PascalCase placeholders (ExampleApi, ExampleWorker)
+// seeded by initializeSlipForPush, plus 2 completed active entries (mc.example.api,
+// mc.example.worker) overlaid from the event log. When the final active component
+// (mc.example.worker) calls updateAggregateStatusFromComponentStates, the builds step
+// must be recomputed as "completed" — NOT "running".
+//
+// Pre-fix behaviour: computeAggregateStatus saw all 4 components (2 pending placeholders
+// + 2 completed), treated pending as not-done, and returned "running".
+// Post-fix behaviour: filterActiveComponents strips the 2 placeholders; only the 2
+// completed active components are fed to computeAggregateStatus → "completed".
+func TestUpdateAggregateStatusFromComponentStates_PlaceholderDivergence_FinalBoundary(t *testing.T) {
+	now := time.Now()
+	prevNow := now.Add(-50 * time.Millisecond)
+
+	// The slip loaded from DB (after hydrateSlip) contains:
+	//   - 2 PascalCase placeholder entries (no timestamps → not active)
+	//   - 1 already-completed active entry mc.example.api (from a prior overlay)
+	// The currently-arriving event is mc.example.worker completing.
+	buildsItems := []ComponentStepData{
+		// Placeholder entries — no timestamps
+		{Component: "ExampleApi", Status: StepStatusPending},
+		{Component: "ExampleWorker", Status: StepStatusPending},
+		// Active entry already overlaid (prior event)
+		{Component: "mc.example.api", Status: StepStatusCompleted, CompletedAt: &prevNow},
+	}
+
+	mockSession := buildMockSessionWithBuildsData("corr-placeholder-final", SlipStatusInProgress, buildsItems)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	// The final component completing — this triggers the recompute block.
+	err := store.updateAggregateStatusFromComponentStates(
+		context.Background(),
+		"corr-placeholder-final",
+		"build",              // stepName (alias)
+		"mc.example.worker", // component completing
+		StepStatusCompleted,
+		now,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Find what builds_status value was written to routing_slips.
+	// The ExecWithArgs calls include the routing_slips INSERT.
+	// The status is embedded in the args slice; we check the last routing_slips write.
+	var writtenBuildsStatus string
+	for _, call := range mockSession.ExecWithArgsCalls {
+		if strings.Contains(call.Stmt, "routing_slips") && strings.Contains(call.Stmt, "INSERT") {
+			// Scan args for the builds_status value. In the column layout produced by
+			// BuildStepAndAggregateColumns, step status columns come after sign/version.
+			// Rather than hardcode an index, scan all string args for a status value.
+			for _, arg := range call.Args {
+				if s, ok := arg.(string); ok {
+					switch StepStatus(s) {
+					case StepStatusCompleted, StepStatusRunning, StepStatusPending, StepStatusFailed:
+						writtenBuildsStatus = s
+					}
+				}
+			}
+		}
+	}
+
+	// Guard: the INSERT must have been observed — otherwise the test fixture is broken
+	// and the assertion below passes vacuously.
+	if writtenBuildsStatus == "" {
+		t.Fatalf("test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback")
+	}
+
+	// The aggregate must be "completed" — not "running".
+	if StepStatus(writtenBuildsStatus) == StepStatusRunning {
+		t.Errorf(
+			"builds_status written as %q — placeholder-filter bug: placeholders prevented completion",
+			writtenBuildsStatus,
+		)
+	}
+}
+
+// TestUpdateAggregateStatusFromComponentStatesWithHistory_PlaceholderDivergence_FinalBoundary
+// mirrors TestUpdateAggregateStatusFromComponentStates_PlaceholderDivergence_FinalBoundary
+// for the WithHistory variant of the function.
+func TestUpdateAggregateStatusFromComponentStatesWithHistory_PlaceholderDivergence_FinalBoundary(t *testing.T) {
+	now := time.Now()
+	prevNow := now.Add(-50 * time.Millisecond)
+
+	buildsItems := []ComponentStepData{
+		{Component: "ExampleApi", Status: StepStatusPending},
+		{Component: "ExampleWorker", Status: StepStatusPending},
+		{Component: "mc.example.api", Status: StepStatusCompleted, CompletedAt: &prevNow},
+	}
+
+	mockSession := buildMockSessionWithBuildsData("corr-placeholder-final-hist", SlipStatusInProgress, buildsItems)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	entry := StateHistoryEntry{
+		Timestamp: now,
+		Step:      "builds",
+		Status:    StepStatusCompleted,
+	}
+
+	err := store.updateAggregateStatusFromComponentStatesWithHistory(
+		context.Background(),
+		"corr-placeholder-final-hist",
+		"build",
+		"mc.example.worker",
+		StepStatusCompleted,
+		now,
+		entry,
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var writtenBuildsStatus string
+	for _, call := range mockSession.ExecWithArgsCalls {
+		if strings.Contains(call.Stmt, "routing_slips") && strings.Contains(call.Stmt, "INSERT") {
+			for _, arg := range call.Args {
+				if s, ok := arg.(string); ok {
+					switch StepStatus(s) {
+					case StepStatusCompleted, StepStatusRunning, StepStatusPending, StepStatusFailed:
+						writtenBuildsStatus = s
+					}
+				}
+			}
+		}
+	}
+
+	// Guard: the INSERT must have been observed — otherwise the test fixture is broken
+	// and the assertion below passes vacuously.
+	if writtenBuildsStatus == "" {
+		t.Fatalf("test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback")
+	}
+
+	if StepStatus(writtenBuildsStatus) == StepStatusRunning {
+		t.Errorf(
+			"builds_status written as %q — placeholder-filter bug: placeholders prevented completion (WithHistory variant)",
+			writtenBuildsStatus,
+		)
+	}
+}
+
+// TestUpdateAggregateStatusFromComponentStates_PlaceholdersIgnored_ArrivingComponentSetsStatus
+// verifies the integration flow when the builds aggregate contains only placeholder entries
+// at the time the first real component event arrives. filterActiveComponents strips the
+// placeholders (covered by TestFilterActiveComponents "pure placeholders" case); the
+// arriving component is overlaid as the sole active entry and the recompute block runs
+// against it. This test validates no error occurs and the function completes successfully.
+func TestUpdateAggregateStatusFromComponentStates_PlaceholdersIgnored_ArrivingComponentSetsStatus(t *testing.T) {
+	// All items are placeholders (no timestamps).
+	buildsItems := []ComponentStepData{
+		{Component: "ExampleApi", Status: StepStatusPending},
+		{Component: "ExampleWorker", Status: StepStatusPending},
+	}
+
+	mockSession := buildMockSessionWithBuildsData("corr-all-placeholders", SlipStatusInProgress, buildsItems)
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	// Simulate an event arriving for an unknown component before hydrateSlip has seen
+	// any real component state. The overlay will add a new active entry but only after
+	// the filter runs against the existing placeholder-only slice.
+	//
+	// With the fix, filterActiveComponents returns empty for the pre-overlay slice.
+	// overlayComponentState then adds "mc.example.api" (active), and the recompute block
+	// runs on that single active component — this test validates no error occurs and
+	// the function completes successfully.
+	err := store.updateAggregateStatusFromComponentStates(
+		context.Background(),
+		"corr-all-placeholders",
+		"build",
+		"mc.example.api",
+		StepStatusRunning,
+		time.Now(),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error when builds has only placeholders initially: %v", err)
+	}
+}
+
+// TestFilterActiveComponents_DirectUnit provides a standalone direct unit test
+// of filterActiveComponents that does not depend on the mock session infrastructure.
+// This is intentionally redundant with TestFilterActiveComponents to catch regressions
+// in isolation from mock wiring changes.
+func TestFilterActiveComponents_DirectUnit(t *testing.T) {
+	now := time.Now()
+
+	// Pure placeholders — both nil timestamps.
+	placeholders := []ComponentStepData{
+		{Component: "ExampleApi", Status: StepStatusPending},
+		{Component: "ExampleWorker", Status: StepStatusPending},
+	}
+	if got := filterActiveComponents(placeholders); len(got) != 0 {
+		t.Errorf("expected 0 active components from pure placeholders, got %d: %+v", len(got), got)
+	}
+
+	// Mixed: 2 placeholders + 2 timestamped active.
+	mixed := []ComponentStepData{
+		{Component: "ExampleApi", Status: StepStatusPending},
+		{Component: "ExampleWorker", Status: StepStatusPending},
+		{Component: "mc.example.api", Status: StepStatusCompleted, CompletedAt: &now},
+		{Component: "mc.example.worker", Status: StepStatusCompleted, CompletedAt: &now},
+	}
+	got := filterActiveComponents(mixed)
+	if len(got) != 2 {
+		t.Errorf("expected 2 active components from mixed list, got %d: %+v", len(got), got)
+	}
+	for _, c := range got {
+		if c.Component == "ExampleApi" || c.Component == "ExampleWorker" {
+			t.Errorf("placeholder %q leaked into active set", c.Component)
+		}
+	}
+
+	// All active — none filtered.
+	allActive := []ComponentStepData{
+		{Component: "mc.example.api", Status: StepStatusCompleted, CompletedAt: &now},
+		{Component: "mc.example.worker", Status: StepStatusRunning, StartedAt: &now},
+	}
+	if got := filterActiveComponents(allActive); len(got) != 2 {
+		t.Errorf("expected all 2 active components kept, got %d", len(got))
+	}
+}
