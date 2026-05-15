@@ -497,10 +497,15 @@ func parseNextPageURL(linkHeader string) string {
 
 // generateAppJWT creates a JWT for authenticating as the GitHub App.
 func (g *GraphQLClient) generateAppJWT() (string, error) {
+	// JWT timing chosen to survive clock drift between this host and GitHub:
+	//   - iat backdated 60s so a host clock running ahead of GitHub never
+	//     produces an iat in GitHub's future
+	//   - exp set so (exp - iat) is strictly less than GitHub's 600s ceiling
+	//     ("Expiration time' claim ('exp') is too far in the future")
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"iat": now.Unix(),
-		"exp": now.Add(10 * time.Minute).Unix(),
+		"iat": now.Add(-60 * time.Second).Unix(),
+		"exp": now.Add(9*time.Minute - time.Second).Unix(),
 		"iss": g.appID,
 	}
 

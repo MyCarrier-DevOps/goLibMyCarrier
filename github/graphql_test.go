@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -876,6 +877,38 @@ func TestGenerateAppJWT(t *testing.T) {
 	assert.NotEmpty(t, token)
 	// JWT tokens have 3 parts separated by dots
 	assert.Regexp(t, `^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`, token)
+}
+
+func TestGenerateAppJWT_ClockSkewMargin(t *testing.T) {
+	privateKey := testPrivateKey(t)
+
+	client, err := NewGraphQLClient(GraphQLConfig{
+		AppID:      12345,
+		PrivateKey: privateKey,
+	}, nil)
+	require.NoError(t, err)
+
+	tokenStr, err := client.generateAppJWT()
+	require.NoError(t, err)
+
+	parsed, _, err := new(jwt.Parser).ParseUnverified(tokenStr, jwt.MapClaims{})
+	require.NoError(t, err)
+
+	claims := parsed.Claims.(jwt.MapClaims)
+	iat := int64(claims["iat"].(float64))
+	exp := int64(claims["exp"].(float64))
+	now := time.Now().Unix()
+
+	// iat backdated to tolerate slippy-api host leading GitHub clock
+	assert.LessOrEqual(t, iat, now, "iat must not be in the future")
+	assert.GreaterOrEqual(t, iat, now-120, "iat backdating should be ~60s, allow jitter")
+
+	// exp-iat strictly under GitHub's 600s ceiling
+	assert.Less(t, exp-iat, int64(600), "exp-iat must be < 600s per GitHub spec")
+	assert.GreaterOrEqual(t, exp-iat, int64(480), "exp-iat must remain useful (>=8min)")
+
+	// exp future-dated
+	assert.Greater(t, exp, now, "exp must be future-dated")
 }
 
 // ---- Edge Cases ----
