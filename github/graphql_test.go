@@ -909,6 +909,22 @@ func TestGenerateAppJWT_ClockSkewMargin(t *testing.T) {
 
 	// exp future-dated
 	assert.Greater(t, exp, now, "exp must be future-dated")
+
+	// GitHub's actual server-side check is against its own wall clock at
+	// receive time. Assert the invariant from now's perspective too — guards
+	// against a regression where iat backdating is removed but exp is unchanged.
+	assert.LessOrEqual(t, exp-now, int64(600), "exp must be within 600s of wall-clock now (the actual GitHub check)")
+	assert.Greater(t, exp, iat, "exp must be after iat")
+
+	// Regression guard: iss claim must be appID
+	iss, ok := claims["iss"]
+	require.True(t, ok, "iss claim must be present")
+	// jwt.MapClaims encodes int64 as float64 via JSON
+	assert.Equal(t, float64(12345), iss, "iss must match configured appID")
+
+	// Regression guard: signing alg must be RS256 (GitHub requires asymmetric)
+	require.NotNil(t, parsed.Header, "JWT header must be present")
+	assert.Equal(t, "RS256", parsed.Header["alg"], "alg must be RS256")
 }
 
 // ---- Edge Cases ----
