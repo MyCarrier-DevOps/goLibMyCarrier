@@ -5911,7 +5911,7 @@ func TestUpdateAggregateStatusFromComponentStates_PlaceholderDivergence_FinalBou
 	err := store.updateAggregateStatusFromComponentStates(
 		context.Background(),
 		"corr-placeholder-final",
-		"build",              // stepName (alias)
+		"build",             // stepName (alias)
 		"mc.example.worker", // component completing
 		StepStatusCompleted,
 		now,
@@ -5943,7 +5943,9 @@ func TestUpdateAggregateStatusFromComponentStates_PlaceholderDivergence_FinalBou
 	// Guard: the INSERT must have been observed — otherwise the test fixture is broken
 	// and the assertion below passes vacuously.
 	if writtenBuildsStatus == "" {
-		t.Fatalf("test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback")
+		t.Fatalf(
+			"test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback",
+		)
 	}
 
 	// The aggregate must be "completed" — not "running".
@@ -6007,7 +6009,9 @@ func TestUpdateAggregateStatusFromComponentStatesWithHistory_PlaceholderDivergen
 	// Guard: the INSERT must have been observed — otherwise the test fixture is broken
 	// and the assertion below passes vacuously.
 	if writtenBuildsStatus == "" {
-		t.Fatalf("test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback")
+		t.Fatalf(
+			"test fixture broken: no routing_slips INSERT observed in ExecWithArgsCalls — cannot validate writeback",
+		)
 	}
 
 	if StepStatus(writtenBuildsStatus) == StepStatusRunning {

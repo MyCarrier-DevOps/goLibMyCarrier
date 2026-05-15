@@ -9,6 +9,7 @@
 
 -   **`argocdclient`**: Provides a client to fetch ArgoCD application and manifest data with retry logic and error handling.
 -   **`auth`**: Provides authentication middleware for Gin framework.
+-   **`cievents`**: Constructs the CloudEvents (`git.push`, `unit.tester`, `scan.secrets`) that drive MyCarrier's CI pipeline. Compose-only — no transport — so both pushhookparser and pipeline-api can share the canonical payload shape.
 -   **`clickhouse`**: Provides utilities to connect and query ClickHouse database.
 -   **`github`**: Provides utilities to authenticate and interact with Github.
 -   **`kafka`**: Provides utilities to produce and consume messages from Kafka.
@@ -37,6 +38,7 @@ go get -u github.com/MyCarrier-DevOps/goLibMyCarrier/kafka@v1.3.6
 |---------|--------------|----------------|
 | `argocdclient` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient) |
 | `auth` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/auth.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/auth) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/auth)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/auth) |
+| `cievents` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/cievents.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/cievents) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/cievents)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/cievents) |
 | `clickhouse` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse) |
 | `github` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/github.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/github) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/github)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/github) |
 | `kafka` | [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka) | [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/kafka) |
