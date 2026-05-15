@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -876,6 +877,54 @@ func TestGenerateAppJWT(t *testing.T) {
 	assert.NotEmpty(t, token)
 	// JWT tokens have 3 parts separated by dots
 	assert.Regexp(t, `^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`, token)
+}
+
+func TestGenerateAppJWT_ClockSkewMargin(t *testing.T) {
+	privateKey := testPrivateKey(t)
+
+	client, err := NewGraphQLClient(GraphQLConfig{
+		AppID:      12345,
+		PrivateKey: privateKey,
+	}, nil)
+	require.NoError(t, err)
+
+	tokenStr, err := client.generateAppJWT()
+	require.NoError(t, err)
+
+	parsed, _, err := new(jwt.Parser).ParseUnverified(tokenStr, jwt.MapClaims{})
+	require.NoError(t, err)
+
+	claims := parsed.Claims.(jwt.MapClaims)
+	iat := int64(claims["iat"].(float64))
+	exp := int64(claims["exp"].(float64))
+	now := time.Now().Unix()
+
+	// iat backdated to tolerate slippy-api host leading GitHub clock
+	assert.LessOrEqual(t, iat, now, "iat must not be in the future")
+	assert.GreaterOrEqual(t, iat, now-120, "iat backdating should be ~60s, allow jitter")
+
+	// exp-iat strictly under GitHub's 600s ceiling
+	assert.Less(t, exp-iat, int64(600), "exp-iat must be < 600s per GitHub spec")
+	assert.GreaterOrEqual(t, exp-iat, int64(480), "exp-iat must remain useful (>=8min)")
+
+	// exp future-dated
+	assert.Greater(t, exp, now, "exp must be future-dated")
+
+	// GitHub's actual server-side check is against its own wall clock at
+	// receive time. Assert the invariant from now's perspective too — guards
+	// against a regression where iat backdating is removed but exp is unchanged.
+	assert.LessOrEqual(t, exp-now, int64(600), "exp must be within 600s of wall-clock now (the actual GitHub check)")
+	assert.Greater(t, exp, iat, "exp must be after iat")
+
+	// Regression guard: iss claim must be appID
+	iss, ok := claims["iss"]
+	require.True(t, ok, "iss claim must be present")
+	// jwt.MapClaims encodes int64 as float64 via JSON
+	assert.Equal(t, float64(12345), iss, "iss must match configured appID")
+
+	// Regression guard: signing alg must be RS256 (GitHub requires asymmetric)
+	require.NotNil(t, parsed.Header, "JWT header must be present")
+	assert.Equal(t, "RS256", parsed.Header["alg"], "alg must be RS256")
 }
 
 // ---- Edge Cases ----

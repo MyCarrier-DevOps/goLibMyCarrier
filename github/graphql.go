@@ -18,6 +18,20 @@ import (
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/logger"
 )
 
+// GitHub App JWT timing parameters. See:
+// https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
+//
+// GitHub's hard ceiling: exp - iat <= 600s, measured against GitHub's clock.
+// ghAppJWTBackdate shifts iat into the past to tolerate the issuing host's
+// clock leading GitHub's clock; ghAppJWTLifetime keeps exp - iat strictly
+// under 600s. The 60s backdating is the dominant skew-tolerance term:
+// widening lifetime beyond ~540s does not increase tolerance because the
+// iat-not-in-future check caps it at the backdate value.
+const (
+	ghAppJWTBackdate = 60 * time.Second
+	ghAppJWTLifetime = 599 * time.Second
+)
+
 // GraphQLConfig holds GitHub GraphQL API authentication configuration.
 // It supports automatic installation discovery per organization.
 type GraphQLConfig struct {
@@ -497,10 +511,15 @@ func parseNextPageURL(linkHeader string) string {
 
 // generateAppJWT creates a JWT for authenticating as the GitHub App.
 func (g *GraphQLClient) generateAppJWT() (string, error) {
-	now := time.Now()
+	// Snapshot and truncate to whole seconds so sub-second jitter cannot
+	// push exp-iat across GitHub's 600s ceiling. Derive exp from iat (not
+	// from now) so the spec invariant (exp - iat < 600s) is structural, not
+	// arithmetic-dependent.
+	iat := time.Now().Add(-ghAppJWTBackdate).Truncate(time.Second)
+	exp := iat.Add(ghAppJWTLifetime)
 	claims := jwt.MapClaims{
-		"iat": now.Unix(),
-		"exp": now.Add(10 * time.Minute).Unix(),
+		"iat": iat.Unix(),
+		"exp": exp.Unix(),
 		"iss": g.appID,
 	}
 
