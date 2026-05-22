@@ -213,6 +213,215 @@ func TestFromRaw_LeadingDotFootGun(t *testing.T) {
 	}
 }
 
+// TestArgoCDAppName covers the 4-branch ArgoCD app-name derivation rules
+// against representative service inputs plus edge cases. Each test row
+// pins observable behavior for one (service, environment, chartType)
+// tuple.
+func TestArgoCDAppName(t *testing.T) {
+	tests := []struct {
+		name      string
+		service   string
+		env       string
+		chartType string
+		want      string
+	}{
+		// chartType == "mc-environment" → new scheme: "{svc}-{env}"
+		{
+			name:      "mc-environment + dev",
+			service:   "mycarrier-frontend",
+			env:       "dev",
+			chartType: "mc-environment",
+			want:      "mycarrier-frontend-dev",
+		},
+		{
+			name:      "mc-environment + preprod",
+			service:   "mycarrier-frontend",
+			env:       "preprod",
+			chartType: "mc-environment",
+			want:      "mycarrier-frontend-preprod",
+		},
+		{
+			name:      "mc-environment + prod",
+			service:   "mycarrier-frontend",
+			env:       "prod",
+			chartType: "mc-environment",
+			want:      "mycarrier-frontend-prod",
+		},
+		{
+			name:      "mc-environment + featureN",
+			service:   "mycarrier-frontend",
+			env:       "feature20",
+			chartType: "mc-environment",
+			want:      "mycarrier-frontend-feature20",
+		},
+
+		// Legacy ladder: feature* env → "{svc}-offload-{env}"
+		{
+			name:      "legacy mycarrier-helm + feature20",
+			service:   "mycarrier-frontend",
+			env:       "feature20",
+			chartType: "mycarrier-helm",
+			want:      "mycarrier-frontend-offload-feature20",
+		},
+		{
+			name:      "legacy empty chartType + feature20",
+			service:   "mycarrier-frontend",
+			env:       "feature20",
+			chartType: "",
+			want:      "mycarrier-frontend-offload-feature20",
+		},
+
+		// Legacy ladder: env == "prod" → "production-csp-prod-{svc}"
+		{
+			name:      "legacy mycarrier-helm + prod",
+			service:   "mycarrier-frontend",
+			env:       "prod",
+			chartType: "mycarrier-helm",
+			want:      "production-csp-prod-mycarrier-frontend",
+		},
+		{
+			name:      "legacy empty chartType + prod",
+			service:   "mycarrier-frontend",
+			env:       "prod",
+			chartType: "",
+			want:      "production-csp-prod-mycarrier-frontend",
+		},
+
+		// Legacy ladder: default → "development-{env}-{svc}"
+		{
+			name:      "legacy mycarrier-helm + dev",
+			service:   "mycarrier-frontend",
+			env:       "dev",
+			chartType: "mycarrier-helm",
+			want:      "development-dev-mycarrier-frontend",
+		},
+		{
+			name:      "legacy mycarrier-helm + preprod",
+			service:   "mycarrier-frontend",
+			env:       "preprod",
+			chartType: "mycarrier-helm",
+			want:      "development-preprod-mycarrier-frontend",
+		},
+		{
+			name:      "legacy empty chartType + dev",
+			service:   "mycarrier-frontend",
+			env:       "dev",
+			chartType: "",
+			want:      "development-dev-mycarrier-frontend",
+		},
+
+		// Single-token service across all four branches
+		{
+			name:      "mc-environment + dev (single-token svc)",
+			service:   "order",
+			env:       "dev",
+			chartType: "mc-environment",
+			want:      "order-dev",
+		},
+		{
+			name:      "legacy + feature20 (single-token svc)",
+			service:   "order",
+			env:       "feature20",
+			chartType: "mycarrier-helm",
+			want:      "order-offload-feature20",
+		},
+		{
+			name:      "legacy + prod (single-token svc)",
+			service:   "order",
+			env:       "prod",
+			chartType: "mycarrier-helm",
+			want:      "production-csp-prod-order",
+		},
+		{
+			name:      "legacy + dev (single-token svc)",
+			service:   "order",
+			env:       "dev",
+			chartType: "mycarrier-helm",
+			want:      "development-dev-order",
+		},
+
+		// Edge cases
+		{
+			name:      "empty service returns empty (mc-environment)",
+			service:   "",
+			env:       "dev",
+			chartType: "mc-environment",
+			want:      "",
+		},
+		{
+			name:      "empty service returns empty (legacy)",
+			service:   "",
+			env:       "prod",
+			chartType: "mycarrier-helm",
+			want:      "",
+		},
+		{
+			name:      "mixed-case env normalized (FeatureX → featurex)",
+			service:   "mycarrier-frontend",
+			env:       "FeatureX",
+			chartType: "mycarrier-helm",
+			want:      "mycarrier-frontend-offload-featurex",
+		},
+		{
+			name:      "mixed-case chartType normalized (MC-Environment)",
+			service:   "mycarrier-frontend",
+			env:       "dev",
+			chartType: "MC-Environment",
+			want:      "mycarrier-frontend-dev",
+		},
+		{
+			name:      "unusual env feature-test-1 still feature-prefix",
+			service:   "mycarrier-frontend",
+			env:       "feature-test-1",
+			chartType: "mycarrier-helm",
+			want:      "mycarrier-frontend-offload-feature-test-1",
+		},
+		{
+			name:      "whitespace env trimmed",
+			service:   "mycarrier-frontend",
+			env:       "  dev  ",
+			chartType: "mycarrier-helm",
+			want:      "development-dev-mycarrier-frontend",
+		},
+		{
+			name:      "unknown chartType falls through to legacy",
+			service:   "mycarrier-frontend",
+			env:       "dev",
+			chartType: "some-other-chart",
+			want:      "development-dev-mycarrier-frontend",
+		},
+		// Empty environment — locked-in behavior. Falls through the legacy
+		// ladder (not feature-prefix, not "prod") and yields the documented
+		// "development--{svc}" form. Callers should validate env non-empty
+		// before invoking; this assertion guards against silent change.
+		{
+			name:      "empty environment legacy yields development--svc",
+			service:   "mycarrier-frontend",
+			env:       "",
+			chartType: "mycarrier-helm",
+			want:      "development--mycarrier-frontend",
+		},
+		{
+			name:      "empty environment mc-environment yields svc-",
+			service:   "mycarrier-frontend",
+			env:       "",
+			chartType: "mc-environment",
+			want:      "mycarrier-frontend-",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := Names{Service: tt.service}
+			got := n.ArgoCDAppName(tt.env, tt.chartType)
+			if got != tt.want {
+				t.Errorf("Names{Service:%q}.ArgoCDAppName(%q, %q) = %q, want %q",
+					tt.service, tt.env, tt.chartType, got, tt.want)
+			}
+		})
+	}
+}
+
 func BenchmarkFromRaw(b *testing.B) {
 	// Hot path: the most common input shape (full GitHub repo name from
 	// webhook events).
