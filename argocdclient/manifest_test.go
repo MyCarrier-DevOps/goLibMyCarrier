@@ -1,10 +1,13 @@
 package argocdclient
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
 )
@@ -307,5 +310,77 @@ func TestGetManifests_RequestCreationError(t *testing.T) {
 	_, err := c.GetManifests("", "test-app")
 	if err == nil {
 		t.Fatal("expected error for invalid request creation, got nil")
+	}
+}
+
+func TestGetManifestsWithContext_Success(t *testing.T) {
+	response := map[string]interface{}{
+		"manifests": []string{"m1", "m2"},
+	}
+	body, _ := json.Marshal(response)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	result, err := client.GetManifestsWithContext(context.Background(), "", "test-app")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(result) != 2 {
+		t.Errorf("expected 2 manifests, got %d", len(result))
+	}
+}
+
+func TestGetManifestsWithContext_Canceled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{"manifests":[]}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	client.retryableClient.RetryMax = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.GetManifestsWithContext(ctx, "", "test-app")
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled in error chain, got %v", err)
+	}
+}
+
+func TestGetManifestsWithContext_DeadlineExceeded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{"manifests":[]}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	client.retryableClient.RetryMax = 0
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	_, err := client.GetManifestsWithContext(ctx, "", "test-app")
+	if err == nil {
+		t.Fatal("expected error from expired deadline, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded in error chain, got %v", err)
 	}
 }

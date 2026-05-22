@@ -1,10 +1,13 @@
 package argocdclient
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGetApplication_Success(t *testing.T) {
@@ -301,6 +304,78 @@ func TestGetApplication_ServiceUnavailableError(t *testing.T) {
 	// The retryable client retries 5xx errors and eventually gives up
 	if !contains(err.Error(), "giving up") {
 		t.Errorf("expected error message to contain 'giving up', got: %v", err)
+	}
+}
+
+func TestGetApplicationWithContext_Success(t *testing.T) {
+	appData := map[string]interface{}{"name": "ctx-app"}
+	body, _ := json.Marshal(appData)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	result, err := client.GetApplicationWithContext(context.Background(), "ctx-app")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if result["name"] != "ctx-app" {
+		t.Errorf("expected app name 'ctx-app', got %v", result["name"])
+	}
+}
+
+func TestGetApplicationWithContext_Canceled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{"name":"x"}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	// Keep retries deterministic so ctx errors propagate quickly.
+	client.retryableClient.RetryMax = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.GetApplicationWithContext(ctx, "test-app")
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected error chain to contain context.Canceled, got %v", err)
+	}
+}
+
+func TestGetApplicationWithContext_DeadlineExceeded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Sleep longer than the ctx deadline.
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{"name":"x"}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	client.retryableClient.RetryMax = 0
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	_, err := client.GetApplicationWithContext(ctx, "test-app")
+	if err == nil {
+		t.Fatal("expected error from expired deadline, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected error chain to contain context.DeadlineExceeded, got %v", err)
 	}
 }
 
