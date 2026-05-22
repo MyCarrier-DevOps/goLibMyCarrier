@@ -195,6 +195,65 @@ Retrieves application manifests from ArgoCD for the specified application and re
 - `[]string`: Array of manifest YAML strings
 - `error`: Request or parsing error
 
+## Instance Routing
+
+MyCarrier runs three ArgoCD control planes (DEV / MGMT / PROD). The
+`RouteInstance(appName)` helper classifies an ArgoCD application name to
+the correct control plane so the caller can pick the matching
+`(server, token)` pair from environment-scoped configuration.
+
+### Routing rules (priority order)
+
+| # | Pattern in `appName` | Instance | Use case |
+|---|---|---|---|
+| 1 | contains `-offload-` | `InstanceDev` | Legacy feature offload (any env shape) |
+| 2 | prefix `development-dev-` or `development-preprod-` | `InstanceMgmt` | Legacy dev / preprod |
+| 3 | prefix `production-csp-` | `InstanceMgmt` | Legacy prod cluster selector |
+| 4 | suffix `-prod` (NOT `-preprod`) | `InstanceProd` | New `mc-environment` scheme prod |
+| 5 | _otherwise_ (default) | `InstanceDev` | New `mc-environment` scheme dev / preprod / feature |
+
+Empty `appName` returns `InstanceDev`. The `-preprod` carve-out for rule
+4 prevents preprod app names from mis-routing to PROD even though they
+match `-prod` as a substring.
+
+The `Instance.String()` method returns the canonical short label
+(`DEV` / `MGMT` / `PROD`), or `UNKNOWN` for any unmapped value so
+operators reading logs aren't misled when an unmapped int slips
+through. These strings are used as env-var suffixes
+(e.g. `ARGOCD_SERVER_DEV`) and observability tags.
+
+**API shape note.** `Names.ArgoCDAppName` is a *method* on `Names`
+because its input is the canonical service form — binding it to the
+struct enforces the precondition that the caller has already routed the
+raw repo identifier through `FromRaw`. `RouteInstance`, by contrast, is
+a *free function* because its input is an arbitrary ArgoCD application
+name arriving from heterogeneous sources (ArgoCD webhooks, GitOps
+events, CLI tools) that are not bound to a canonical struct. Keeping
+routing free-function avoids forcing every caller to construct a
+`Names` they don't otherwise need.
+
+### Worked examples
+
+| `appName` | `RouteInstance` | Reason |
+|---|---|---|
+| `mycarrier-frontend-offload-feature20` | `InstanceDev` | rule 1 (offload) |
+| `development-dev-mycarrier-frontend` | `InstanceMgmt` | rule 2 |
+| `development-preprod-mycarrier-frontend` | `InstanceMgmt` | rule 2 |
+| `production-csp-prod-mycarrier-frontend` | `InstanceMgmt` | rule 3 |
+| `mycarrier-frontend-prod` | `InstanceProd` | rule 4 |
+| `mycarrier-frontend-preprod` | `InstanceDev` | rule 4 carve-out → default |
+| `mycarrier-frontend-dev` | `InstanceDev` | default |
+| `mycarrier-frontend-feature20` | `InstanceDev` | default (new scheme feature) |
+| `""` | `InstanceDev` | empty fallback |
+
+```go
+appName := "mycarrier-frontend-prod"
+instance := argocdclient.RouteInstance(appName)
+fmt.Println(instance)        // InstanceProd
+fmt.Println(instance.String()) // "PROD"
+// Caller then reads ARGOCD_SERVER_PROD / ARGOCD_AUTHTOKEN_PROD.
+```
+
 ## Retry Strategy
 
 Both `GetArgoApplication` and `GetManifests` implement the same retry strategy:

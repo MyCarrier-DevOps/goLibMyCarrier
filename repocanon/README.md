@@ -94,6 +94,57 @@ and ArgoCD. `FromRaw` does **not** reject these inputs — callers MUST
 validate output against RFC 1123 before passing `Service` to k8s/ArgoCD
 APIs. Pinned by `TestFromRaw_LeadingDotFootGun`.
 
+## `ArgoCDAppName` method
+
+`Names.ArgoCDAppName(environment, chartType) string` composes the canonical
+ArgoCD application name from a normalized `Service` plus the deploy
+environment and chart-type. The rules mirror
+`workflow-core/workflows/templates/render-deploy-core.yaml` exactly so
+that workflow YAML and Go consumers stay in lock-step.
+
+### Derivation rules (priority order)
+
+| Condition | Result | Notes |
+|---|---|---|
+| `chartType == "mc-environment"` | `{svc}-{env}` | New unified scheme (any env) |
+| `environment` starts with `feature` | `{svc}-offload-{env}` | Legacy feature offload |
+| `environment == "prod"` | `production-csp-prod-{svc}` | Legacy prod cluster selector |
+| _otherwise_ | `development-{env}-{svc}` | Legacy dev / preprod default |
+
+`environment` and `chartType` are lowercased + whitespace-trimmed before
+matching. The canonical `Service` form (kebab) is preserved verbatim.
+Empty `Service` returns `""` — callers must validate emptiness before
+passing the result to Kubernetes / ArgoCD APIs.
+
+### Worked examples
+
+| `Service` | `environment` | `chartType` | Result |
+|---|---|---|---|
+| `mycarrier-frontend` | `feature20` | `mc-environment` | `mycarrier-frontend-feature20` |
+| `mycarrier-frontend` | `dev` | `mc-environment` | `mycarrier-frontend-dev` |
+| `mycarrier-frontend` | `prod` | `mc-environment` | `mycarrier-frontend-prod` |
+| `mycarrier-frontend` | `feature20` | `mycarrier-helm` | `mycarrier-frontend-offload-feature20` |
+| `mycarrier-frontend` | `prod` | `mycarrier-helm` | `production-csp-prod-mycarrier-frontend` |
+| `mycarrier-frontend` | `preprod` | `mycarrier-helm` | `development-preprod-mycarrier-frontend` |
+| `order` | `dev` | `mycarrier-helm` | `development-dev-order` |
+| `""` | `dev` | `mc-environment` | `""` (empty Service → empty result) |
+
+### Locked-in edge cases
+
+- **Empty environment** falls through to the legacy default branch and
+  yields `development--{svc}` (locked in by `TestArgoCDAppName`). Callers
+  should validate environment non-empty before invoking.
+- **Mixed-case input** is normalized (`"FeatureX"` → matches feature
+  prefix, output `{svc}-offload-featurex`).
+- **Unknown chartType** (anything other than `mc-environment`) triggers
+  the legacy 3-branch ladder.
+
+```go
+names := repocanon.FromRaw("MC.MyCarrier.Frontend")
+appName := names.ArgoCDAppName("feature20", "mc-environment")
+// → "mycarrier-frontend-feature20"
+```
+
 ## Why not strip dots in `Repository`?
 
 The `ci.repoproperties.repository` column in ClickHouse stores GitHub's

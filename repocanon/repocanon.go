@@ -109,3 +109,46 @@ func FromRaw(raw string) Names {
 		Repository: "mc." + strings.ReplaceAll(s, "-", "."),
 	}
 }
+
+// ArgoCDAppName composes the canonical ArgoCD application name from the
+// canonical Service plus the deploy environment and chart-type. Rules
+// match workflow-core/workflows/templates/render-deploy-core.yaml:
+//
+//	chartType == "mc-environment"     → "{svc}-{env}"
+//	environment startswith "feature"  → "{svc}-offload-{env}"      (legacy)
+//	environment == "prod"             → "production-csp-prod-{svc}" (legacy)
+//	otherwise                          → "development-{env}-{svc}"  (legacy)
+//
+// Empty Service returns empty string — callers must validate emptiness
+// before passing the result to ArgoCD/Kubernetes APIs (no nonsense names
+// like "-dev"). environment and chartType are lowercased + whitespace-
+// trimmed for comparison and for substitution; the canonical Service form
+// (kebab) is preserved verbatim.
+//
+// Empty environment falls through to the legacy default branch and yields
+// "development--{svc}" (locked in by TestArgoCDAppName); callers should
+// validate environment non-empty before invoking. Unknown chartType
+// (anything other than "mc-environment") triggers the legacy 3-branch
+// ladder.
+//
+// Callers must ensure both Service and environment are non-empty; this
+// method does not validate them, and empty inputs produce invalid DNS
+// labels (e.g. "development--svc", "svc-") that ArgoCD will reject.
+func (n Names) ArgoCDAppName(environment, chartType string) string {
+	if n.Service == "" {
+		return ""
+	}
+	env := strings.ToLower(strings.TrimSpace(environment))
+	chart := strings.ToLower(strings.TrimSpace(chartType))
+
+	if chart == "mc-environment" {
+		return n.Service + "-" + env
+	}
+	if strings.HasPrefix(env, "feature") {
+		return n.Service + "-offload-" + env
+	}
+	if env == "prod" {
+		return "production-csp-prod-" + n.Service
+	}
+	return "development-" + env + "-" + n.Service
+}
