@@ -1,10 +1,16 @@
 package argocdclient
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/viper"
 )
+
+// ErrNilViper is returned by LoadConfigFromViper when the caller
+// passes a nil *viper.Viper. Exported as a sentinel so callers can match it
+// with errors.Is rather than string comparison.
+var ErrNilViper = errors.New("viper instance cannot be nil")
 
 // Config holds the configuration for ArgoCD client operations.
 // Only ServerUrl and AuthToken are required fields; AppName and Revision are optional.
@@ -42,6 +48,27 @@ func LoadConfig() (*Config, error) {
 	}
 
 	vp.AutomaticEnv()
+
+	return LoadConfigFromViper(vp)
+}
+
+// LoadConfigFromViper loads the ArgoCD client configuration from a
+// caller-provided viper instance. The caller owns the viper instance — this
+// function does NOT call BindEnv/AutomaticEnv/SetEnvPrefix on it. The caller
+// is responsible for any env binding they need, and may pre-populate values
+// via vp.Set(...) to override secrets without touching process environment.
+//
+// Use this constructor when you need to:
+//   - Inject explicit values for testing (vp.Set("auth_token", "..."))
+//   - Share a viper instance across multiple configs in your application
+//   - Override secrets pulled from a secret manager without setting env vars
+//
+// For the default env-binding behaviour, use LoadConfig().
+func LoadConfigFromViper(vp *viper.Viper) (*Config, error) {
+	if vp == nil {
+		return nil, ErrNilViper
+	}
+
 	var config Config
 
 	if err := vp.Unmarshal(&config); err != nil {

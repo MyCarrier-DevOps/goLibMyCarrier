@@ -172,6 +172,24 @@ Loads configuration from environment variables and validates required fields (Se
 - `*Config`: Populated configuration struct
 - `error`: Validation or binding error
 
+#### LoadConfigFromViper(vp *viper.Viper) (*Config, error)
+
+Loads configuration from a caller-provided viper instance — useful for tests,
+secret-manager-backed values, or applications that already manage configuration
+through a shared viper:
+
+```go
+v := viper.New()
+v.Set("server_url", "https://argocd.example.com")
+v.Set("auth_token", tokenFromVault) // no env mutation needed
+
+config, err := argocdclient.LoadConfigFromViper(v)
+```
+
+The function does NOT call `BindEnv` / `AutomaticEnv` on the passed-in viper —
+the caller owns env binding. Returns `ErrNilViper` if `vp` is nil. For the
+default env-binding behaviour, use `LoadConfig()`.
+
 #### (c *Client) GetApplication(argoAppName string) (map[string]interface{}, error)
 
 Retrieves ArgoCD application data for the specified application name using the configured client.

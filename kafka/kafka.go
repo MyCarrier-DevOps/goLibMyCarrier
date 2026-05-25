@@ -2,6 +2,7 @@ package kafka
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 
 	"strconv"
@@ -10,6 +11,11 @@ import (
 	"github.com/segmentio/kafka-go/sasl/scram"
 	"github.com/spf13/viper"
 )
+
+// ErrNilViper is returned by LoadConfigFromViper when the caller
+// passes a nil *viper.Viper. Exported as a sentinel so callers can match it
+// with errors.Is rather than string comparison.
+var ErrNilViper = errors.New("viper instance cannot be nil")
 
 // KafkaConfig represents the configuration for Kafka.
 type KafkaConfig struct {
@@ -64,9 +70,33 @@ func LoadConfig() (*KafkaConfig, error) {
 	// Read environment variables
 	vp.AutomaticEnv()
 
+	return LoadConfigFromViper(vp)
+}
+
+// LoadConfigFromViper loads the configuration from a caller-provided viper
+// instance. The caller owns the viper instance — this function does NOT call
+// BindEnv/AutomaticEnv/SetEnvPrefix on it. The caller is responsible for any
+// env binding they need, and may pre-populate values via vp.Set(...) to
+// override secrets without touching process environment.
+//
+// Defaults for optional fields (groupid, partition, insecure_skip_verify) are
+// applied via applyDefaults after Unmarshal, which only fills empty values so
+// caller-set values are preserved.
+//
+// Use this constructor when you need to:
+//   - Inject explicit values for testing (vp.Set("password", "secret"))
+//   - Share a viper instance across multiple configs in your application
+//   - Override secrets pulled from a secret manager without setting env vars
+//
+// For the default env-binding behaviour, use LoadConfig().
+func LoadConfigFromViper(vp *viper.Viper) (*KafkaConfig, error) {
+	if vp == nil {
+		return nil, ErrNilViper
+	}
+
 	var kafkaConfig KafkaConfig
 
-	// Unmarshal environment variables into the Config struct
+	// Unmarshal viper values into the Config struct
 	if err := vp.Unmarshal(&kafkaConfig); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}

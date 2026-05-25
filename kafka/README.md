@@ -36,6 +36,27 @@ if err != nil {
 }
 ```
 
+### Loading Configuration from a Caller-Provided Viper
+
+Use `LoadConfigFromViper` when you want to drive configuration from your own
+viper instance — useful for tests, secret-manager-backed values, or
+applications that already manage configuration through a shared viper:
+
+```go
+v := viper.New()
+v.Set("address", "kafka.example.com:9093")
+v.Set("topic", "events")
+v.Set("username", "svc")
+v.Set("password", secretFromVault) // no env mutation needed
+
+config, err := kafka.LoadConfigFromViper(v)
+```
+
+The function does NOT call `BindEnv` / `AutomaticEnv` on the passed-in viper —
+the caller owns env binding. Defaults (`groupid` `default-group`, `partition`
+`0`, `insecure_skip_verify` `false`) are still applied for fields the caller
+leaves unset.
+
 ### Initializing a Kafka Reader
 
 Use the `InitializeKafkaReader` function to create a Kafka reader:
