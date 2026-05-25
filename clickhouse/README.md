@@ -34,6 +34,26 @@ if err != nil {
 }
 ```
 
+### Loading Configuration from a Caller-Provided Viper
+
+Use `ClickhouseLoadConfigFromViper` when you want to drive configuration from
+your own viper instance — useful for tests, secret-manager-backed values, or
+applications that already manage configuration through a shared viper:
+
+```go
+v := viper.New()
+v.Set("chhostname", "ch.example.com")
+v.Set("chusername", "svc")
+v.Set("chpassword", secretFromVault) // no env mutation needed
+v.Set("chdatabase", "analytics")
+
+config, err := ClickhouseLoadConfigFromViper(v)
+```
+
+The function does NOT call `BindEnv` / `AutomaticEnv` on the passed-in viper —
+the caller owns env binding. Defaults for `chport` (`9440`) and `chskipverify`
+(`false`) are still applied via `SetDefault` if the caller does not set them.
+
 ### Creating a ClickHouse Session
 
 Use the `NewClickhouseSession` function to create a new session:

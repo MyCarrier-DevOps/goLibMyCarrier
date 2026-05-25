@@ -53,6 +53,25 @@ client := session.Client()
 token := session.AuthToken()
 ```
 
+### Loading Configuration from a Caller-Provided Viper
+
+Use `GithubLoadConfigFromViper` when you want to drive configuration from your
+own viper instance — useful for tests, secret-manager-backed values, or
+applications that already manage configuration through a shared viper:
+
+```go
+vp := viper.New()
+vp.Set("pem", pemFromVault)
+vp.Set("app_id", "12345")
+vp.Set("install_id", "67890")
+
+config, err := github_handler.GithubLoadConfigFromViper(vp)
+```
+
+The function does NOT call `BindEnv` / `AutomaticEnv` on the passed-in viper —
+the caller owns env binding. Use this to inject secrets via `vp.Set` without
+mutating process environment.
+
 ## 📂 Repository Operations
 
 ### Simple Repository Cloning
