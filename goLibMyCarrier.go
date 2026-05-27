@@ -14,6 +14,7 @@ package goLibMyCarrier
 //   - github.com/MyCarrier-DevOps/goLibMyCarrier/kafka - Kafka messaging client
 //   - github.com/MyCarrier-DevOps/goLibMyCarrier/logger - Structured logging interfaces
 //   - github.com/MyCarrier-DevOps/goLibMyCarrier/otel - OpenTelemetry instrumentation
+//   - github.com/MyCarrier-DevOps/goLibMyCarrier/pollyapi - Polly API client (CI/CD notifications)
 //   - github.com/MyCarrier-DevOps/goLibMyCarrier/slippy - Routing slip orchestration
 //   - github.com/MyCarrier-DevOps/goLibMyCarrier/vault - HashiCorp Vault client
 //   - github.com/MyCarrier-DevOps/goLibMyCarrier/yaml - YAML utilities
