@@ -1,9 +1,12 @@
 package argocdclient
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/spf13/viper"
 )
 
 // testConfigEnvVars sets up test environment variables
@@ -302,5 +305,58 @@ func BenchmarkLoadConfig(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Unexpected error: %v", err)
 		}
+	}
+}
+
+// TestLoadConfigFromViper_CallerViperWins verifies that values set
+// explicitly on the caller-provided viper instance are honoured by the
+// constructor, even when no ARGOCD_* env vars are bound on that viper.
+// This is the key property that lets callers inject secrets via vp.Set
+// without having to mutate process environment.
+func TestLoadConfigFromViper_CallerViperWins(t *testing.T) {
+	// Explicitly clear env so we can prove caller-provided values are sourced
+	// from the viper instance, not from environment fall-through.
+	if err := os.Unsetenv("ARGOCD_SERVER"); err != nil {
+		t.Fatalf("Failed to unset ARGOCD_SERVER: %v", err)
+	}
+	if err := os.Unsetenv("ARGOCD_AUTHTOKEN"); err != nil {
+		t.Fatalf("Failed to unset ARGOCD_AUTHTOKEN: %v", err)
+	}
+
+	vp := viper.New()
+	vp.Set("server_url", "https://argocd.explicit.example.com")
+	vp.Set("auth_token", "explicit-test-token")
+
+	cfg, err := LoadConfigFromViper(vp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if cfg.ServerUrl != "https://argocd.explicit.example.com" {
+		t.Errorf("ServerUrl mismatch: got %q", cfg.ServerUrl)
+	}
+	if cfg.AuthToken != "explicit-test-token" {
+		t.Errorf("AuthToken mismatch: got %q", cfg.AuthToken)
+	}
+}
+
+// TestLoadConfigFromViper_NilViper guards against nil deref.
+func TestLoadConfigFromViper_NilViper(t *testing.T) {
+	cfg, err := LoadConfigFromViper(nil)
+	if err == nil {
+		t.Fatal("expected error for nil viper")
+	}
+	if cfg != nil {
+		t.Errorf("expected nil config, got %+v", cfg)
+	}
+	// Primary assertion: callers should be able to match the sentinel via errors.Is.
+	if !errors.Is(err, ErrNilViper) {
+		t.Errorf("expected error to wrap ErrNilViper, got: %v", err)
+	}
+	// Belt-and-suspenders: preserve string-match check until callers migrate.
+	if !strings.Contains(err.Error(), "viper instance cannot be nil") {
+		t.Errorf("expected error message to mention nil viper, got: %v", err)
 	}
 }

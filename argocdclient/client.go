@@ -1,6 +1,7 @@
 package argocdclient
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
@@ -42,8 +43,13 @@ func NewClient(config *Config) *Client {
 // It sets Authorization and Content-Type headers, handles retries via the
 // retryable HTTP client, and classifies 4xx vs 5xx errors.
 // Returns the raw response body on success.
-func (c *Client) doGET(url string) ([]byte, error) {
-	req, err := retryablehttp.NewRequest("GET", url, nil)
+//
+// The request honors ctx cancellation/deadline. ctx must be non-nil; callers
+// should pass context.Background() explicitly if no deadline/cancellation is
+// desired. Internal helper; signature change is intentional and not part of the
+// public API.
+func (c *Client) doGET(ctx context.Context, url string) ([]byte, error) {
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}

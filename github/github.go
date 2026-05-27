@@ -2,6 +2,7 @@ package github_handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -11,6 +12,11 @@ import (
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
 )
+
+// ErrNilViper is returned by GithubLoadConfigFromViper when the caller
+// passes a nil *viper.Viper. Exported as a sentinel so callers can match it
+// with errors.Is rather than string comparison.
+var ErrNilViper = errors.New("viper instance cannot be nil")
 
 type GithubSession struct {
 	pem       string
@@ -44,15 +50,34 @@ func GithubLoadConfig() (*GithubConfig, error) {
 	// Read environment variables
 	vp.AutomaticEnv()
 
+	return GithubLoadConfigFromViper(vp)
+}
+
+// GithubLoadConfigFromViper loads the configuration from a caller-provided
+// viper instance. The caller owns the viper instance — this function does NOT
+// call BindEnv/AutomaticEnv/SetEnvPrefix on it. The caller is responsible for
+// any env binding they need, and may pre-populate values via vp.Set(...) to
+// override secrets without touching process environment.
+//
+// Use this constructor when you need to:
+//   - Inject explicit values for testing (vp.Set("pem", pemBytes))
+//   - Share a viper instance across multiple configs in your application
+//   - Override secrets pulled from a secret manager without setting env vars
+//
+// For the default env-binding behaviour, use GithubLoadConfig().
+func GithubLoadConfigFromViper(vp *viper.Viper) (*GithubConfig, error) {
+	if vp == nil {
+		return nil, ErrNilViper
+	}
+
 	var GithubConfig GithubConfig
 
-	// Unmarshal environment variables into the Config struct
+	// Unmarshal viper values into the Config struct
 	if err := vp.Unmarshal(&GithubConfig); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
-	err := validateConfig(&GithubConfig)
-	if err != nil {
+	if err := validateConfig(&GithubConfig); err != nil {
 		return nil, err
 	}
 	return &GithubConfig, nil

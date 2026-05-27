@@ -80,6 +80,25 @@ func main() {
 }
 ```
 
+### Loading Configuration from a Caller-Provided Viper
+
+Use `VaultLoadConfigFromViper` when you want to drive configuration from your
+own viper instance — useful for tests, secret-manager-backed values, or
+applications that already manage configuration through a shared viper:
+
+```go
+v := viper.New()
+v.Set("vaultaddress", "https://vault.example.com:8200")
+v.Set("credentials.role_id", roleIDFromFileMount)
+v.Set("credentials.secret_id", secretIDFromFileMount) // no env mutation needed
+
+config, err := vault.VaultLoadConfigFromViper(v)
+```
+
+The function does NOT call `BindEnv` / `AutomaticEnv` on the passed-in viper —
+the caller owns env binding. For the default env-binding behaviour, use
+`VaultLoadConfig()`.
+
 ### Advanced Usage with Custom Configuration
 
 ```go

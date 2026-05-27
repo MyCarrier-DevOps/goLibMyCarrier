@@ -1,10 +1,13 @@
 package argocdclient
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGetArgoApplicationResourceTree_Success(t *testing.T) {
@@ -157,5 +160,75 @@ func TestGetArgoApplicationResourceTree_RequestCreationError(t *testing.T) {
 	_, err := c.GetArgoApplicationResourceTree("test-app")
 	if err == nil {
 		t.Fatal("expected error for invalid request creation, got nil")
+	}
+}
+
+func TestGetArgoApplicationResourceTreeWithContext_Success(t *testing.T) {
+	resourceTree := map[string]interface{}{"status": "ok"}
+	body, _ := json.Marshal(resourceTree)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write(body); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	result, err := client.GetArgoApplicationResourceTreeWithContext(context.Background(), "test-app")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if result["status"] != "ok" {
+		t.Errorf("expected status 'ok', got %v", result["status"])
+	}
+}
+
+func TestGetArgoApplicationResourceTreeWithContext_Canceled(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	client.retryableClient.RetryMax = 0
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.GetArgoApplicationResourceTreeWithContext(ctx, "test-app")
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled in error chain, got %v", err)
+	}
+}
+
+func TestGetArgoApplicationResourceTreeWithContext_DeadlineExceeded(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(200)
+		if _, err := w.Write([]byte(`{}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	client.retryableClient.RetryMax = 0
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+	defer cancel()
+
+	_, err := client.GetArgoApplicationResourceTreeWithContext(ctx, "test-app")
+	if err == nil {
+		t.Fatal("expected error from expired deadline, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected context.DeadlineExceeded in error chain, got %v", err)
 	}
 }

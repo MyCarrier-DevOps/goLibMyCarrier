@@ -10,8 +10,10 @@ import (
 
 	chdriver "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // MockClickhouseSession implements ClickhouseSessionInterface for testing
@@ -2099,4 +2101,66 @@ func TestConnWrapper_Ping(t *testing.T) {
 
 	assert.NoError(t, err)
 	mockConn.AssertExpectations(t)
+}
+
+// TestClickhouseLoadConfigFromViper_CallerViperWins verifies that values set
+// explicitly on the caller-provided viper instance are honoured by the
+// constructor, even when no CLICKHOUSE_* env vars are bound on that viper.
+// This is the key property that lets callers inject secrets via v.Set without
+// having to mutate process environment.
+func TestClickhouseLoadConfigFromViper_CallerViperWins(t *testing.T) {
+	// Explicitly clear env so we can prove caller-provided values are sourced
+	// from the viper instance, not from environment fall-through.
+	t.Setenv("CLICKHOUSE_HOSTNAME", "")
+	t.Setenv("CLICKHOUSE_USERNAME", "")
+	t.Setenv("CLICKHOUSE_PASSWORD", "")
+	t.Setenv("CLICKHOUSE_DATABASE", "")
+	t.Setenv("CLICKHOUSE_PORT", "")
+	t.Setenv("CLICKHOUSE_SKIP_VERIFY", "")
+
+	v := viper.New()
+	v.Set("chhostname", "explicit-host")
+	v.Set("chusername", "explicit-user")
+	v.Set("chpassword", "explicit-test-password")
+	v.Set("chdatabase", "explicit-db")
+	v.Set("chport", "9001")
+	v.Set("chskipverify", "true")
+
+	cfg, err := ClickhouseLoadConfigFromViper(v)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, "explicit-host", cfg.ChHostname)
+	assert.Equal(t, "explicit-user", cfg.ChUsername)
+	assert.Equal(t, "explicit-test-password", cfg.ChPassword)
+	assert.Equal(t, "explicit-db", cfg.ChDatabase)
+	assert.Equal(t, "9001", cfg.ChPort)
+	assert.Equal(t, "true", cfg.ChSkipVerify)
+}
+
+// TestClickhouseLoadConfigFromViper_NilViper guards against nil deref.
+func TestClickhouseLoadConfigFromViper_NilViper(t *testing.T) {
+	cfg, err := ClickhouseLoadConfigFromViper(nil)
+	assert.Error(t, err)
+	assert.Nil(t, cfg)
+	// Primary assertion: callers should be able to match the sentinel via errors.Is.
+	assert.True(t, errors.Is(err, ErrNilViper), "expected error to wrap ErrNilViper, got: %v", err)
+	// Belt-and-suspenders: preserve string-match check until callers migrate.
+	assert.Contains(t, err.Error(), "viper instance cannot be nil")
+}
+
+// TestClickhouseLoadConfigFromViper_DefaultsApplied verifies that optional
+// fields receive their defaults when not set on the caller's viper.
+func TestClickhouseLoadConfigFromViper_DefaultsApplied(t *testing.T) {
+	v := viper.New()
+	v.Set("chhostname", "host")
+	v.Set("chusername", "user")
+	v.Set("chpassword", "pw")
+	v.Set("chdatabase", "db")
+	// chport and chskipverify intentionally unset
+
+	cfg, err := ClickhouseLoadConfigFromViper(v)
+	require.NoError(t, err)
+	assert.Equal(t, "9440", cfg.ChPort)
+	assert.Equal(t, "false", cfg.ChSkipVerify)
 }

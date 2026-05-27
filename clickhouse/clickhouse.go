@@ -37,6 +37,11 @@ func Named(name string, value interface{}) driver.NamedValue {
 // This can be overridden in tests for faster execution.
 var DefaultRetryIntervals = []time.Duration{2 * time.Second, 3 * time.Second, 5 * time.Second}
 
+// ErrNilViper is returned by ClickhouseLoadConfigFromViper when the caller
+// passes a nil *viper.Viper. Exported as a sentinel so callers can match it
+// with errors.Is rather than string comparison.
+var ErrNilViper = errors.New("viper instance cannot be nil")
+
 // isTransientError determines whether a ClickHouse error is transient (and thus
 // worth retrying) or permanent (e.g. syntax error, authentication failure).
 // Server-side exceptions (clickhouse.Exception) are treated as non-transient
@@ -164,16 +169,39 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 		return nil, fmt.Errorf("failed to bind environment variable for chport: %w", err)
 	}
 
-	// Set defaults for optional fields
-	v.SetDefault("chport", "9440")
-	v.SetDefault("chskipverify", "false")
-
 	// Read environment variables
 	v.AutomaticEnv()
 
+	return ClickhouseLoadConfigFromViper(v)
+}
+
+// ClickhouseLoadConfigFromViper loads the configuration from a caller-provided
+// viper instance. The caller owns the viper instance — this function does NOT
+// call BindEnv/AutomaticEnv/SetEnvPrefix on it. The caller is responsible for
+// any env binding they need, and may pre-populate values via v.Set(...) to
+// override secrets without touching process environment.
+//
+// Defaults for optional fields (chport, chskipverify) are applied via
+// SetDefault, which only takes effect if the key is unset.
+//
+// Use this constructor when you need to:
+//   - Inject explicit values for testing (v.Set("chpassword", "secret"))
+//   - Share a viper instance across multiple configs in your application
+//   - Override secrets pulled from a secret manager without setting env vars
+//
+// For the default env-binding behaviour, use ClickhouseLoadConfig().
+func ClickhouseLoadConfigFromViper(v *viper.Viper) (*ClickhouseConfig, error) {
+	if v == nil {
+		return nil, ErrNilViper
+	}
+
+	// Set defaults for optional fields (no-op if caller already set them)
+	v.SetDefault("chport", "9440")
+	v.SetDefault("chskipverify", "false")
+
 	var ClickhouseConfig ClickhouseConfig
 
-	// Unmarshal environment variables into the Config struct
+	// Unmarshal viper values into the Config struct
 	if err := v.Unmarshal(&ClickhouseConfig); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}

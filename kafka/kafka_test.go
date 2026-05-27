@@ -1,9 +1,12 @@
 package kafka
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -610,4 +613,73 @@ func TestInitializeKafkaWriter_RequirementsExample(t *testing.T) {
 	// Close the writer to prevent resource leaks
 	err = writer.Close()
 	assert.NoError(t, err)
+}
+
+// TestLoadConfigFromViper_CallerViperWins verifies that values set
+// explicitly on the caller-provided viper instance are honoured by the
+// constructor, even when no KAFKA_* env vars are bound on that viper.
+// This is the key property that lets callers inject secrets via vp.Set
+// without having to mutate process environment.
+func TestLoadConfigFromViper_CallerViperWins(t *testing.T) {
+	// Explicitly clear env so we can prove caller-provided values are sourced
+	// from the viper instance, not from environment fall-through.
+	t.Setenv("KAFKA_ADDRESS", "")
+	t.Setenv("KAFKA_TOPIC", "")
+	t.Setenv("KAFKA_TOPIC_PREFIX", "")
+	t.Setenv("KAFKA_USERNAME", "")
+	t.Setenv("KAFKA_PASSWORD", "")
+	t.Setenv("KAFKA_GROUPID", "")
+	t.Setenv("KAFKA_PARTITION", "")
+	t.Setenv("KAFKA_INSECURE_SKIP_VERIFY", "")
+	t.Setenv("KAFKA_START_OFFSET", "")
+
+	vp := viper.New()
+	vp.Set("address", "explicit-broker:9092")
+	vp.Set("topic", "explicit-topic")
+	vp.Set("username", "explicit-user")
+	vp.Set("password", "explicit-test-password")
+	vp.Set("groupid", "explicit-group")
+	vp.Set("partition", "3")
+	vp.Set("insecure_skip_verify", "true")
+
+	cfg, err := LoadConfigFromViper(vp)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, "explicit-broker:9092", cfg.Address)
+	assert.Equal(t, "explicit-topic", cfg.Topic)
+	assert.Equal(t, "explicit-user", cfg.Username)
+	assert.Equal(t, "explicit-test-password", cfg.Password)
+	assert.Equal(t, "explicit-group", cfg.GroupID)
+	assert.Equal(t, "3", cfg.Partition)
+	assert.Equal(t, "true", cfg.InsecureSkipVerify)
+}
+
+// TestLoadConfigFromViper_NilViper guards against nil deref.
+func TestLoadConfigFromViper_NilViper(t *testing.T) {
+	cfg, err := LoadConfigFromViper(nil)
+	assert.Error(t, err)
+	assert.Nil(t, cfg)
+	// Primary assertion: callers should be able to match the sentinel via errors.Is.
+	assert.True(t, errors.Is(err, ErrNilViper), "expected error to wrap ErrNilViper, got: %v", err)
+	// Belt-and-suspenders: preserve string-match check until callers migrate.
+	assert.Contains(t, err.Error(), "viper instance cannot be nil")
+}
+
+// TestLoadConfigFromViper_DefaultsApplied verifies that optional fields
+// receive their defaults (via applyDefaults) when not set on the caller's
+// viper. Required fields are still set so validation succeeds.
+func TestLoadConfigFromViper_DefaultsApplied(t *testing.T) {
+	vp := viper.New()
+	vp.Set("address", "broker:9092")
+	vp.Set("topic", "t")
+	vp.Set("username", "u")
+	vp.Set("password", "p")
+	// groupid, partition, insecure_skip_verify intentionally unset
+
+	cfg, err := LoadConfigFromViper(vp)
+	require.NoError(t, err)
+	assert.Equal(t, "default-group", cfg.GroupID)
+	assert.Equal(t, "0", cfg.Partition)
+	assert.Equal(t, "false", cfg.InsecureSkipVerify)
 }

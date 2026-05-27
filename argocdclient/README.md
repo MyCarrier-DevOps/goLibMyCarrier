@@ -172,6 +172,24 @@ Loads configuration from environment variables and validates required fields (Se
 - `*Config`: Populated configuration struct
 - `error`: Validation or binding error
 
+#### LoadConfigFromViper(vp *viper.Viper) (*Config, error)
+
+Loads configuration from a caller-provided viper instance — useful for tests,
+secret-manager-backed values, or applications that already manage configuration
+through a shared viper:
+
+```go
+v := viper.New()
+v.Set("server_url", "https://argocd.example.com")
+v.Set("auth_token", tokenFromVault) // no env mutation needed
+
+config, err := argocdclient.LoadConfigFromViper(v)
+```
+
+The function does NOT call `BindEnv` / `AutomaticEnv` on the passed-in viper —
+the caller owns env binding. Returns `ErrNilViper` if `vp` is nil. For the
+default env-binding behaviour, use `LoadConfig()`.
+
 #### (c *Client) GetApplication(argoAppName string) (map[string]interface{}, error)
 
 Retrieves ArgoCD application data for the specified application name using the configured client.
@@ -194,6 +212,16 @@ Retrieves application manifests from ArgoCD for the specified application and re
 **Returns:**
 - `[]string`: Array of manifest YAML strings
 - `error`: Request or parsing error
+
+#### Context-aware variants
+
+Each of the above methods has a `*WithContext` variant that accepts a
+`context.Context` as the first argument. See the [Context Support](#context-support)
+section above for details and the recommended usage pattern.
+
+- `(c *Client) GetApplicationWithContext(ctx context.Context, argoAppName string) (map[string]interface{}, error)`
+- `(c *Client) GetManifestsWithContext(ctx context.Context, revision, argoAppName string) ([]string, error)`
+- `(c *Client) GetArgoApplicationResourceTreeWithContext(ctx context.Context, argoAppName string) (map[string]interface{}, error)`
 
 ## Instance Routing
 
@@ -253,6 +281,42 @@ fmt.Println(instance)        // InstanceProd
 fmt.Println(instance.String()) // "PROD"
 // Caller then reads ARGOCD_SERVER_PROD / ARGOCD_AUTHTOKEN_PROD.
 ```
+
+## Context Support
+
+All public HTTP methods on `Client` have context-aware variants suffixed with
+`WithContext`. The ctx-aware variants honor `ctx` cancellation and deadline so
+callers can bound HTTP latency (including connect, TLS handshake, and read)
+by their own timeouts — important when an upstream operation like
+`WaitForSyncStart` advertises ctx-cancellation honoring and must not be
+outlived by a hung TCP connection.
+
+| Existing (no-ctx)                       | Context-aware variant (preferred in new code)          |
+|----------------------------------------|--------------------------------------------------------|
+| `GetApplication(name)`                 | `GetApplicationWithContext(ctx, name)`                 |
+| `GetManifests(rev, name)`              | `GetManifestsWithContext(ctx, rev, name)`              |
+| `GetArgoApplicationResourceTree(name)` | `GetArgoApplicationResourceTreeWithContext(ctx, name)` |
+
+The no-ctx variants are retained for backward compatibility and delegate
+internally to the ctx-aware variants with `context.Background()` — behavior
+for existing callers is unchanged.
+
+```go
+ctx, cancel := context.WithTimeout(parentCtx, 30*time.Second)
+defer cancel()
+
+appData, err := client.GetApplicationWithContext(ctx, "my-application")
+if err != nil {
+    // errors.Is(err, context.DeadlineExceeded) // deadline hit
+    // errors.Is(err, context.Canceled)         // parent cancelled
+    log.Fatal(err)
+}
+```
+
+Note on retry interaction: the underlying `retryablehttp.Client` uses
+`DefaultRetryPolicy`, which does **not** retry requests that fail with
+`context.Canceled` or `context.DeadlineExceeded`. A cancelled or expired ctx
+short-circuits retries and returns promptly.
 
 ## Retry Strategy
 

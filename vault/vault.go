@@ -2,6 +2,7 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,11 @@ import (
 	"github.com/hashicorp/vault-client-go/schema"
 	"github.com/spf13/viper"
 )
+
+// ErrNilViper is returned by VaultLoadConfigFromViper when the caller
+// passes a nil *viper.Viper. Exported as a sentinel so callers can match it
+// with errors.Is rather than string comparison.
+var ErrNilViper = errors.New("viper instance cannot be nil")
 
 // VaultClientInterface defines the interface for Vault operations
 type VaultClientInterface interface {
@@ -69,9 +75,35 @@ func (v *ViperConfigLoader) LoadConfig() (*VaultConfig, error) {
 	// Read environment variables
 	vp.AutomaticEnv()
 
+	return VaultLoadConfigFromViper(vp)
+}
+
+// VaultLoadConfig is a convenience function that uses the default ViperConfigLoader
+func VaultLoadConfig() (*VaultConfig, error) {
+	loader := &ViperConfigLoader{}
+	return loader.LoadConfig()
+}
+
+// VaultLoadConfigFromViper loads the configuration from a caller-provided
+// viper instance. The caller owns the viper instance — this function does NOT
+// call BindEnv/AutomaticEnv/SetEnvPrefix on it. The caller is responsible for
+// any env binding they need, and may pre-populate values via vp.Set(...) to
+// override secrets without touching process environment.
+//
+// Use this constructor when you need to:
+//   - Inject explicit values for testing (vp.Set("credentials.secret_id", "..."))
+//   - Share a viper instance across multiple configs in your application
+//   - Override secrets pulled from a secret manager without setting env vars
+//
+// For the default env-binding behaviour, use VaultLoadConfig().
+func VaultLoadConfigFromViper(vp *viper.Viper) (*VaultConfig, error) {
+	if vp == nil {
+		return nil, ErrNilViper
+	}
+
 	var config VaultConfig
 
-	// Unmarshal environment variables into the Config struct
+	// Unmarshal viper values into the Config struct
 	if err := vp.Unmarshal(&config); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
@@ -82,12 +114,6 @@ func (v *ViperConfigLoader) LoadConfig() (*VaultConfig, error) {
 	}
 
 	return &config, nil
-}
-
-// VaultLoadConfig is a convenience function that uses the default ViperConfigLoader
-func VaultLoadConfig() (*VaultConfig, error) {
-	loader := &ViperConfigLoader{}
-	return loader.LoadConfig()
 }
 
 // validateConfig validates the loaded configuration.

@@ -3,6 +3,7 @@ package github_handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,7 +13,9 @@ import (
 	"testing"
 
 	"github.com/google/go-github/v82/github"
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Helper functions for pointer creation (replacing deprecated github.String, github.Int, github.Bool)
@@ -554,4 +557,48 @@ func ExampleGithubSession_CreatePullRequest() {
 	}
 
 	fmt.Printf("Created PR #%d: %s\n", pr.GetNumber(), pr.GetTitle())
+}
+
+// TestGithubLoadConfigFromViper_CallerViperWins verifies that values set
+// explicitly on the caller-provided viper instance are honoured by the
+// constructor, even when no GITHUB_* env vars are bound on that viper.
+// This is the key property that lets callers inject secrets via vp.Set
+// without having to mutate process environment.
+func TestGithubLoadConfigFromViper_CallerViperWins(t *testing.T) {
+	// Explicitly clear env so we can prove caller-provided values are sourced
+	// from the viper instance, not from environment fall-through.
+	if err := os.Unsetenv("GITHUB_APP_PRIVATE_KEY"); err != nil {
+		t.Fatalf("Failed to unset GITHUB_APP_PRIVATE_KEY: %v", err)
+	}
+	if err := os.Unsetenv("GITHUB_APP_ID"); err != nil {
+		t.Fatalf("Failed to unset GITHUB_APP_ID: %v", err)
+	}
+	if err := os.Unsetenv("GITHUB_APP_INSTALLATION_ID"); err != nil {
+		t.Fatalf("Failed to unset GITHUB_APP_INSTALLATION_ID: %v", err)
+	}
+
+	vp := viper.New()
+	// PEM must be >= 10 chars to pass validation; use an obviously fake value.
+	vp.Set("pem", "explicit-test-pem-payload")
+	vp.Set("app_id", "99999")
+	vp.Set("install_id", "88888")
+
+	cfg, err := GithubLoadConfigFromViper(vp)
+	require.NoError(t, err)
+	require.NotNil(t, cfg)
+
+	assert.Equal(t, "explicit-test-pem-payload", cfg.Pem)
+	assert.Equal(t, "99999", cfg.AppId)
+	assert.Equal(t, "88888", cfg.InstallId)
+}
+
+// TestGithubLoadConfigFromViper_NilViper guards against nil deref.
+func TestGithubLoadConfigFromViper_NilViper(t *testing.T) {
+	cfg, err := GithubLoadConfigFromViper(nil)
+	assert.Error(t, err)
+	assert.Nil(t, cfg)
+	// Primary assertion: callers should be able to match the sentinel via errors.Is.
+	assert.True(t, errors.Is(err, ErrNilViper), "expected error to wrap ErrNilViper, got: %v", err)
+	// Belt-and-suspenders: preserve string-match check until callers migrate.
+	assert.Contains(t, err.Error(), "viper instance cannot be nil")
 }
