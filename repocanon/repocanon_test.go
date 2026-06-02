@@ -547,6 +547,41 @@ func TestArgoCDAppNames(t *testing.T) {
 			wantL2:    "frontend.domains-dev",
 			wantHasL2: true,
 		},
+		{
+			// Mixed-case env is lowercased + trimmed before routing, so PROD
+			// normalizes through metaEnv=prod -> cluster=production-csp and
+			// the L2 suffix is also lowercased. Parity with TestArgoCDAppName.
+			name:      "mixed-case PROD normalizes to prod",
+			env:       "PROD",
+			chartType: "mc-environment",
+			appStack:  "mycarrier",
+			wantL1:    "production-csp-prod-mycarrier",
+			wantL2:    "mycarrier-prod",
+			wantHasL2: true,
+		},
+		{
+			// appStack is preserved verbatim (NOT trimmed), unlike env/chartType.
+			// Pinning the current contract: leading/trailing whitespace in
+			// appStack leaks into the rendered names. Callers must pre-trim.
+			name:      "whitespace in appStack preserved verbatim",
+			env:       "dev",
+			chartType: "mc-environment",
+			appStack:  "  mycarrier  ",
+			wantL1:    "development-dev-  mycarrier  ",
+			wantL2:    "  mycarrier  -dev",
+			wantHasL2: true,
+		},
+		{
+			// G3 guard: empty appStack short-circuits to ("", "", false)
+			// instead of emitting invalid trailing-dash names.
+			name:      "empty appStack returns empty + hasL2=false",
+			env:       "dev",
+			chartType: "mc-environment",
+			appStack:  "",
+			wantL1:    "",
+			wantL2:    "",
+			wantHasL2: false,
+		},
 	}
 
 	for _, tt := range tests {

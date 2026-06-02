@@ -151,9 +151,13 @@ func ClusterFor(metaEnv string) string {
 // cases — e.g. MC.Frontend.Domains uses "frontend.domains").
 //
 // environment and chartType are lowercased + whitespace-trimmed for routing;
-// appStack is preserved verbatim. Empty appStack yields names with empty
-// segments — callers should validate non-empty before invoking.
+// appStack is preserved verbatim. Empty appStack short-circuits to
+// ("", "", false) — we refuse to emit names with trailing/empty segments
+// (e.g. "development-dev-") that ArgoCD/Kubernetes would reject anyway.
 func (n Names) ArgoCDAppNames(environment, chartType, appStack string) (l1, l2 string, hasL2 bool) {
+	if appStack == "" {
+		return "", "", false
+	}
 	env := strings.ToLower(strings.TrimSpace(environment))
 	chart := strings.ToLower(strings.TrimSpace(chartType))
 
