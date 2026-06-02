@@ -422,6 +422,188 @@ func TestArgoCDAppName(t *testing.T) {
 	}
 }
 
+// TestMetaEnvFor pins the prod/dev bucket routing used by gitops layout.
+func TestMetaEnvFor(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want string
+	}{
+		{name: "prod", env: "prod", want: "prod"},
+		{name: "dev", env: "dev", want: "dev"},
+		{name: "preprod", env: "preprod", want: "dev"},
+		{name: "feature17", env: "feature17", want: "dev"},
+		{name: "empty", env: "", want: "dev"},
+		{name: "mixed-case PROD", env: "PROD", want: "prod"},
+		{name: "whitespace prod", env: "  prod  ", want: "prod"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := MetaEnvFor(tt.env); got != tt.want {
+				t.Errorf("MetaEnvFor(%q) = %q, want %q", tt.env, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestClusterFor pins the metaEnv -> ArgoCD cluster name mapping (matches
+// Vault clusterSecrets/<env>.name).
+func TestClusterFor(t *testing.T) {
+	tests := []struct {
+		name    string
+		metaEnv string
+		want    string
+	}{
+		{name: "prod", metaEnv: "prod", want: "production-csp"},
+		{name: "dev", metaEnv: "dev", want: "development"},
+		{name: "preprod (non-prod default)", metaEnv: "preprod", want: "development"},
+		{name: "unknown falls back to development", metaEnv: "wat", want: "development"},
+		{name: "empty falls back to development", metaEnv: "", want: "development"},
+		{name: "mixed-case PROD", metaEnv: "PROD", want: "production-csp"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ClusterFor(tt.metaEnv); got != tt.want {
+				t.Errorf("ClusterFor(%q) = %q, want %q", tt.metaEnv, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestArgoCDAppNames pins the dual-layer L1 (gitops-watcher) + L2
+// (chart-sourced workload) ArgoCD app-name derivation. L1 is always
+// "<cluster>-<metaEnv>-<appStack>"; L2 only exists for mc-environment
+// charts and for mycarrier-helm offload feature envs.
+func TestArgoCDAppNames(t *testing.T) {
+	tests := []struct {
+		name      string
+		env       string
+		chartType string
+		appStack  string
+		wantL1    string
+		wantL2    string
+		wantHasL2 bool
+	}{
+		{
+			name:      "mc-environment + prod + mycarrier",
+			env:       "prod",
+			chartType: "mc-environment",
+			appStack:  "mycarrier",
+			wantL1:    "production-csp-prod-mycarrier",
+			wantL2:    "mycarrier-prod",
+			wantHasL2: true,
+		},
+		{
+			name:      "mc-environment + feature17 + mycarrier",
+			env:       "feature17",
+			chartType: "mc-environment",
+			appStack:  "mycarrier",
+			wantL1:    "development-dev-mycarrier",
+			wantL2:    "mycarrier-feature17",
+			wantHasL2: true,
+		},
+		{
+			name:      "mc-environment + dev + mycarrier",
+			env:       "dev",
+			chartType: "mc-environment",
+			appStack:  "mycarrier",
+			wantL1:    "development-dev-mycarrier",
+			wantL2:    "mycarrier-dev",
+			wantHasL2: true,
+		},
+		{
+			name:      "mycarrier-helm + prod + quote (no L2)",
+			env:       "prod",
+			chartType: "mycarrier-helm",
+			appStack:  "quote",
+			wantL1:    "production-csp-prod-quote",
+			wantL2:    "",
+			wantHasL2: false,
+		},
+		{
+			name:      "mycarrier-helm + dev + quote (no L2)",
+			env:       "dev",
+			chartType: "mycarrier-helm",
+			appStack:  "quote",
+			wantL1:    "development-dev-quote",
+			wantL2:    "",
+			wantHasL2: false,
+		},
+		{
+			name:      "mycarrier-helm + feature13 + quote (offload)",
+			env:       "feature13",
+			chartType: "mycarrier-helm",
+			appStack:  "quote",
+			wantL1:    "development-dev-quote",
+			wantL2:    "quote-offload-feature13",
+			wantHasL2: true,
+		},
+		{
+			name:      "appStack divergence: frontend.domains used literally in L1",
+			env:       "dev",
+			chartType: "mc-environment",
+			appStack:  "frontend.domains",
+			wantL1:    "development-dev-frontend.domains",
+			wantL2:    "frontend.domains-dev",
+			wantHasL2: true,
+		},
+		{
+			// Mixed-case env is lowercased + trimmed before routing, so PROD
+			// normalizes through metaEnv=prod -> cluster=production-csp and
+			// the L2 suffix is also lowercased. Parity with TestArgoCDAppName.
+			name:      "mixed-case PROD normalizes to prod",
+			env:       "PROD",
+			chartType: "mc-environment",
+			appStack:  "mycarrier",
+			wantL1:    "production-csp-prod-mycarrier",
+			wantL2:    "mycarrier-prod",
+			wantHasL2: true,
+		},
+		{
+			// appStack is preserved verbatim (NOT trimmed), unlike env/chartType.
+			// Pinning the current contract: leading/trailing whitespace in
+			// appStack leaks into the rendered names. Callers must pre-trim.
+			name:      "whitespace in appStack preserved verbatim",
+			env:       "dev",
+			chartType: "mc-environment",
+			appStack:  "  mycarrier  ",
+			wantL1:    "development-dev-  mycarrier  ",
+			wantL2:    "  mycarrier  -dev",
+			wantHasL2: true,
+		},
+		{
+			// G3 guard: empty appStack short-circuits to ("", "", false)
+			// instead of emitting invalid trailing-dash names.
+			name:      "empty appStack returns empty + hasL2=false",
+			env:       "dev",
+			chartType: "mc-environment",
+			appStack:  "",
+			wantL1:    "",
+			wantL2:    "",
+			wantHasL2: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Names.Service is intentionally divergent from appStack here to
+			// prove ArgoCDAppNames uses the explicit appStack param, not
+			// n.Service.
+			n := Names{Service: "frontend-domains"}
+			l1, l2, hasL2 := n.ArgoCDAppNames(tt.env, tt.chartType, tt.appStack)
+			if l1 != tt.wantL1 {
+				t.Errorf("L1 = %q, want %q", l1, tt.wantL1)
+			}
+			if l2 != tt.wantL2 {
+				t.Errorf("L2 = %q, want %q", l2, tt.wantL2)
+			}
+			if hasL2 != tt.wantHasL2 {
+				t.Errorf("hasL2 = %v, want %v", hasL2, tt.wantHasL2)
+			}
+		})
+	}
+}
+
 func BenchmarkFromRaw(b *testing.B) {
 	// Hot path: the most common input shape (full GitHub repo name from
 	// webhook events).

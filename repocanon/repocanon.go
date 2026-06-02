@@ -110,6 +110,75 @@ func FromRaw(raw string) Names {
 	}
 }
 
+// MetaEnvFor maps a deploy environment to its gitops "metaEnv" bucket.
+// Returns "prod" when env == "prod", otherwise "dev". The gitops repo
+// layout uses Apps/<metaEnv>-<appstack>/ for child paths.
+//
+// Input is lowercased and whitespace-trimmed before comparison.
+func MetaEnvFor(environment string) string {
+	if strings.ToLower(strings.TrimSpace(environment)) == "prod" {
+		return "prod"
+	}
+	return "dev"
+}
+
+// ClusterFor maps a gitops metaEnv to the ArgoCD cluster name (from Vault
+// clusterSecrets/<env>.name). "prod" -> "production-csp"; "dev" -> "development".
+// Falls back to "development" for unknown metaEnvs (matches the cluster
+// generator's non-prod default).
+//
+// Input is lowercased and whitespace-trimmed before comparison.
+func ClusterFor(metaEnv string) string {
+	if strings.ToLower(strings.TrimSpace(metaEnv)) == "prod" {
+		return "production-csp"
+	}
+	return "development"
+}
+
+// ArgoCDAppNames returns the deterministic ArgoCD app names for both layers:
+//
+//	l1 — gitops-watcher Application, always present
+//	     format: "<cluster>-<metaEnv>-<appStack>" (matches the per-cluster
+//	     bootstrap ApplicationSet template at
+//	     ManagementInfra/Apps/app-cluster-gitops/app-cluster-bootstrapper.yaml).
+//	l2 — chart-sourced workload Application, only for chart types that emit one
+//	     mc-environment chart       -> "<appStack>-<environment>"
+//	     mycarrier-helm + feature*  -> "<appStack>-offload-<environment>"  (offload)
+//	     otherwise                  -> "", hasL2=false
+//
+// appStack must be the value rendered from helm values' global.appStack
+// (callers supply explicitly; it can differ from Names.Service in rare
+// cases — e.g. MC.Frontend.Domains uses "frontend.domains").
+//
+// environment and chartType are lowercased + whitespace-trimmed for routing;
+// appStack is preserved verbatim. Empty appStack short-circuits to
+// ("", "", false) — we refuse to emit names with trailing/empty segments
+// (e.g. "development-dev-") that ArgoCD/Kubernetes would reject anyway.
+func (n Names) ArgoCDAppNames(environment, chartType, appStack string) (l1, l2 string, hasL2 bool) {
+	if appStack == "" {
+		return "", "", false
+	}
+	env := strings.ToLower(strings.TrimSpace(environment))
+	chart := strings.ToLower(strings.TrimSpace(chartType))
+
+	metaEnv := MetaEnvFor(env)
+	cluster := ClusterFor(metaEnv)
+	l1 = cluster + "-" + metaEnv + "-" + appStack
+
+	switch {
+	case chart == "mc-environment":
+		l2 = appStack + "-" + env
+		hasL2 = true
+	case strings.HasPrefix(env, "feature"):
+		l2 = appStack + "-offload-" + env
+		hasL2 = true
+	default:
+		l2 = ""
+		hasL2 = false
+	}
+	return l1, l2, hasL2
+}
+
 // ArgoCDAppName composes the canonical ArgoCD application name from the
 // canonical Service plus the deploy environment and chart-type. Rules
 // match workflow-core/workflows/templates/render-deploy-core.yaml:
