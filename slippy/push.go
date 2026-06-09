@@ -697,11 +697,18 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 		for i, stepConfig := range c.pipelineConfig.Steps {
 			step := Step{Status: StepStatusPending}
 
-			// First step starts as running
+			// First step starts as running (unless it's an aggregate with no components)
 			if i == 0 {
 				firstStep = stepConfig.Name
-				step.Status = StepStatusRunning
-				step.StartedAt = &now
+				// Only auto-run first step if it's NOT an aggregate step,
+				// OR if it's an aggregate but has components to process.
+				// This prevents mobile apps (zero-component slips) from getting stuck.
+				isAggregateStep := stepConfig.Aggregates != ""
+				hasComponents := len(opts.Components) > 0
+				if !isAggregateStep || hasComponents {
+					step.Status = StepStatusRunning
+					step.StartedAt = &now
+				}
 			}
 
 			steps[stepConfig.Name] = step
