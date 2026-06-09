@@ -525,6 +525,76 @@ func TestClient_InitializeSlipForPush_EmptyComponents(t *testing.T) {
 	}
 }
 
+// TestClient_InitializeSlipForPush_MobileApp tests initialization for mobile builds (zero components on aggregate first step).
+// Mobile builds have no Docker images, so the first step should NOT be marked as RUNNING.
+// This prevents the pipeline from getting stuck with a RUNNING step that has no components to complete.
+func TestClient_InitializeSlipForPush_MobileApp(t *testing.T) {
+	store := NewMockStore()
+	github := NewMockGitHubAPI()
+
+	// Create a config where the first step is an aggregate
+	// (typical for pipelines that build components)
+	config := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline config",
+		Steps: []StepConfig{
+			{
+				Name:       "builds",
+				Description: "Builds completed",
+				Aggregates: "build", // First step IS an aggregate
+			},
+			{Name: "unit_tests", Description: "Unit tests", Prerequisites: []string{"builds"}},
+		},
+	}
+	// Initialize internal lookup maps
+	config.stepsByName = make(map[string]*StepConfig)
+	config.aggregateMap = make(map[string]string)
+	config.gateSteps = make([]string, 0)
+	for i := range config.Steps {
+		step := &config.Steps[i]
+		step.order = i
+		config.stepsByName[step.Name] = step
+		if step.Aggregates != "" {
+			config.aggregateMap[step.Aggregates] = step.Name
+		}
+	}
+
+	client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+
+	opts := PushOptions{
+		CorrelationID: "corr-mobile-app",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "mobile123",
+		Components:    []ComponentDefinition{}, // Mobile app: zero components
+	}
+
+	slip := client.initializeSlipForPush(opts, nil)
+
+	// CRITICAL: First step should be PENDING (not RUNNING) when it's an aggregate with zero components
+	// This allows the step to auto-complete since there are no components to wait for
+	firstStepName := config.Steps[0].Name
+	if slip.Steps[firstStepName].Status != StepStatusPending {
+		t.Errorf(
+			"expected %s status 'pending' for zero-component aggregate (mobile app), got '%s'",
+			firstStepName,
+			slip.Steps[firstStepName].Status,
+		)
+	}
+	if slip.Steps[firstStepName].StartedAt != nil {
+		t.Errorf("expected %s StartedAt to be nil for zero-component aggregate", firstStepName)
+	}
+
+	// Verify aggregates have empty component data
+	if slip.Aggregates == nil {
+		t.Error("expected Aggregates to be initialized (not nil)")
+	}
+	if len(slip.Aggregates["builds"]) != 0 {
+		t.Errorf("expected 0 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
+	}
+}
+
 func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 	ctx := context.Background()
 
