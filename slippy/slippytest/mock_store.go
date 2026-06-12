@@ -60,6 +60,7 @@ type MockStore struct {
 	CreateCalls           []CreateCall
 	LoadCalls             []string
 	LoadByCommitCalls     []LoadByCommitCall
+	LoadLiveByCommitCalls []LoadByCommitCall
 	FindByCommitsCalls    []FindByCommitsCall
 	FindAllByCommitsCalls []FindAllByCommitsCall
 	UpdateCalls           []UpdateCall
@@ -78,6 +79,7 @@ type MockStore struct {
 	CreateError           error
 	LoadError             error
 	LoadByCommitError     error
+	LoadLiveByCommitError error
 	FindByCommitsError    error
 	FindAllByCommitsError error
 	UpdateError           error
@@ -244,6 +246,42 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 
 	slip, ok := m.Slips[correlationID]
 	if !ok {
+		return nil, slippy.ErrSlipNotFound
+	}
+
+	return DeepCopySlip(slip), nil
+}
+
+// LoadLiveByCommit retrieves the most recent live slip by repository and commit SHA,
+// excluding superseded terminal statuses (abandoned, promoted, compensated).
+func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*slippy.Slip, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.LoadLiveByCommitCalls = append(m.LoadLiveByCommitCalls, LoadByCommitCall{
+		Repository: repository,
+		CommitSHA:  commitSHA,
+	})
+
+	if m.LoadLiveByCommitError != nil {
+		return nil, m.LoadLiveByCommitError
+	}
+
+	key := repository + ":" + commitSHA
+	correlationID, ok := m.CommitIndex[key]
+	if !ok {
+		return nil, slippy.ErrSlipNotFound
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return nil, slippy.ErrSlipNotFound
+	}
+
+	// Mirror prod semantics: exclude terminal-superseded statuses.
+	if slip.Status == slippy.SlipStatusAbandoned ||
+		slip.Status == slippy.SlipStatusPromoted ||
+		slip.Status == slippy.SlipStatusCompensated {
 		return nil, slippy.ErrSlipNotFound
 	}
 
@@ -612,6 +650,7 @@ func (m *MockStore) Reset() {
 	m.CreateCalls = nil
 	m.LoadCalls = nil
 	m.LoadByCommitCalls = nil
+	m.LoadLiveByCommitCalls = nil
 	m.FindByCommitsCalls = nil
 	m.FindAllByCommitsCalls = nil
 	m.UpdateCalls = nil

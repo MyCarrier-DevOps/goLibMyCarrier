@@ -317,6 +317,47 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 	return slip, nil
 }
 
+// LoadLiveByCommit looks up the most recent LIVE routing slip for (repository, commitSHA).
+//
+// Exclusion semantics:
+//   - Excludes superseded-terminal statuses: abandoned, promoted, compensated.
+//   - Does NOT exclude 'completed' — callers needing full SlipStatus.IsTerminal()
+//     semantics (which also treats completed as terminal) must keep their post-call
+//     guard.
+//   - Returns ErrSlipNotFound when no live slip exists.
+//   - For ancestry-aware lookups use FindByCommits / ResolveSlip instead.
+//
+// VCMT collapse: the inner max(version) subquery picks the latest version per
+// correlation_id within the (repo, commit) scope before the status filter is
+// applied, so an abandoned latest version excludes the whole correlation rather
+// than surfacing a stale earlier-version row.
+func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
+	if s.pipelineConfig == nil {
+		return nil, fmt.Errorf("pipeline config is required for store operations")
+	}
+	query := s.queryBuilder.BuildSelectQuery(
+		fmt.Sprintf(
+			"WHERE lower(repository) = lower(?) AND commit_sha = ? AND sign = 1 "+
+				"AND (correlation_id, version) IN ("+
+				"  SELECT correlation_id, max(version) FROM %s.%s"+
+				"  WHERE lower(repository) = lower(?) AND commit_sha = ? AND sign = 1"+
+				"  GROUP BY correlation_id"+
+				") "+
+				"AND status NOT IN ('abandoned', 'promoted', 'compensated')",
+			s.database, TableRoutingSlips,
+		),
+		"ORDER BY version DESC LIMIT 1",
+	)
+	slip, err := s.scanSlip(ctx, query, repository, commitSHA, repository, commitSHA)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.hydrateSlip(ctx, slip); err != nil {
+		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
+	}
+	return slip, nil
+}
+
 // FindByCommits finds a slip matching any commit in the ordered list.
 // Returns the slip for the first (most recent) matching commit.
 func (s *ClickHouseStore) FindByCommits(

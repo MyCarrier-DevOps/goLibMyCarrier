@@ -89,6 +89,7 @@ type MockStore struct {
 	CreateCalls           []CreateCall
 	LoadCalls             []string
 	LoadByCommitCalls     []LoadByCommitCall
+	LoadLiveByCommitCalls []LoadByCommitCall
 	FindByCommitsCalls    []FindByCommitsCall
 	FindAllByCommitsCalls []FindAllByCommitsCall
 	UpdateCalls           []UpdateCall
@@ -107,6 +108,7 @@ type MockStore struct {
 	CreateError           error
 	LoadError             error
 	LoadByCommitError     error
+	LoadLiveByCommitError error
 	FindByCommitsError    error
 	FindAllByCommitsError error
 	UpdateError           error
@@ -269,6 +271,44 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 
 	slip, ok := m.Slips[correlationID]
 	if !ok {
+		return nil, ErrSlipNotFound
+	}
+
+	return deepCopySlip(slip), nil
+}
+
+// LoadLiveByCommit retrieves the most recent live slip by repository and commit SHA,
+// excluding superseded terminal statuses (abandoned, promoted, compensated).
+func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
+	m.mu.Lock()
+	m.LoadLiveByCommitCalls = append(m.LoadLiveByCommitCalls, LoadByCommitCall{
+		Repository: repository,
+		CommitSHA:  commitSHA,
+	})
+	m.mu.Unlock()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.LoadLiveByCommitError != nil {
+		return nil, m.LoadLiveByCommitError
+	}
+
+	key := repository + ":" + commitSHA
+	correlationID, ok := m.CommitIndex[key]
+	if !ok {
+		return nil, ErrSlipNotFound
+	}
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return nil, ErrSlipNotFound
+	}
+
+	// Mirror prod semantics: exclude terminal-superseded statuses.
+	if slip.Status == SlipStatusAbandoned ||
+		slip.Status == SlipStatusPromoted ||
+		slip.Status == SlipStatusCompensated {
 		return nil, ErrSlipNotFound
 	}
 
@@ -645,6 +685,7 @@ func (m *MockStore) Reset() {
 	m.CreateCalls = nil
 	m.LoadCalls = nil
 	m.LoadByCommitCalls = nil
+	m.LoadLiveByCommitCalls = nil
 	m.FindByCommitsCalls = nil
 	m.UpdateCalls = nil
 	m.UpdateStepCalls = nil

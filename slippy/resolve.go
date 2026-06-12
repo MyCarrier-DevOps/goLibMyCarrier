@@ -132,6 +132,16 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 
 		commitSHA := extractCommitFromImageTag(opts.ImageTag)
 		if commitSHA != "" {
+			// Intentionally LoadByCommit, NOT LoadLiveByCommit. The image tag encodes
+			// the exact SHA, but the *intent* here is "find the canonical slip for the
+			// image that is being deployed" — even when that slip's status has since
+			// transitioned to abandoned/promoted/compensated upstream. An image built
+			// from a slip that was later superseded (force-push, squash-merge promote,
+			// rollback) still physically exists and may still be deployed; the deploy
+			// webhook must be able to attach its state to the original build slip.
+			// Filtering terminal-superseded statuses here would drop those late-arriving
+			// deploy events on the floor. Migration to LoadLiveByCommit is NOT correct
+			// for this call site.
 			slip, err := c.store.LoadByCommit(ctx, opts.Repository, commitSHA)
 			if err == nil && slip != nil {
 				c.logger.Info(ctx, "Resolved slip via image tag", map[string]interface{}{

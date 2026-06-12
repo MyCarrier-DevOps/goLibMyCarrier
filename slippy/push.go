@@ -168,8 +168,16 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		Warnings: make([]error, 0),
 	}
 
-	// Check for existing slip (retry detection)
-	existingSlip, err := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
+	// Check for existing slip (retry detection).
+	//
+	// Exact-SHA intent: this lookup is keyed on the precise commit SHA being pushed,
+	// not on git ancestry — we want to detect "is there an in-flight slip for THIS
+	// commit?". LoadLiveByCommit filters out superseded-terminal statuses
+	// (abandoned/promoted/compensated) at the DB layer so webhook re-deliveries
+	// after the slip was superseded don't resurrect stale rows. The IsTerminal()
+	// guard below remains because LoadLiveByCommit does NOT filter 'completed',
+	// and a completed slip must still fall through to fresh-slip creation.
+	existingSlip, err := c.store.LoadLiveByCommit(ctx, opts.Repository, opts.CommitSHA)
 	if err == nil && existingSlip != nil && !existingSlip.Status.IsTerminal() {
 		slip, err := c.handlePushRetry(ctx, existingSlip)
 		if err != nil {
