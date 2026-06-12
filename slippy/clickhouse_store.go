@@ -327,6 +327,16 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 //   - Returns ErrSlipNotFound when no live slip exists.
 //   - For ancestry-aware lookups use FindByCommits / ResolveSlip instead.
 //
+// Why 'completed' is intentionally NOT in the NOT IN list: callers that need
+// to reject completed slips (e.g. the dedup-loser polling path that treats
+// completed as "race already finished, create fresh") must apply
+// SlipStatus.IsTerminal() at the caller level — see slip_writer.go's
+// awaitExistingSlip and push.go's CreateSlipForPush for the canonical pattern.
+// The query filters only the *superseded-terminal* subset because including
+// 'completed' here would cause callers using LoadLiveByCommit for status
+// reporting (build dashboards, deploy webhooks attaching to finished builds)
+// to get false ErrSlipNotFound responses for slips that successfully finished.
+//
 // VCMT collapse: the inner max(version) subquery picks the latest version per
 // correlation_id within the (repo, commit) scope before the status filter is
 // applied, so an abandoned latest version excludes the whole correlation rather
@@ -334,6 +344,12 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	if s.pipelineConfig == nil {
 		return nil, fmt.Errorf("pipeline config is required for store operations")
+	}
+	if repository == "" {
+		return nil, fmt.Errorf("repository is required")
+	}
+	if commitSHA == "" {
+		return nil, fmt.Errorf("commit_sha is required")
 	}
 	query := s.queryBuilder.BuildSelectQuery(
 		fmt.Sprintf(
