@@ -4,6 +4,7 @@ package slippy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -1332,4 +1333,120 @@ func TestHydrateSlip_EmptyAggregates(t *testing.T) {
 	}
 
 	t.Log("SUCCESS: Hydration test complete")
+}
+
+// TestClickHouseStore_LoadLiveByCommit_VCMTCollapseExcludesAbandoned verifies that
+// LoadLiveByCommit applies its status filter BEFORE the ORDER BY/LIMIT post-collapse,
+// so a higher-version abandoned row does NOT mask a lower-version live in_progress row.
+//
+// This is the R7 integration assertion for the routing_slips
+// SharedVersionedCollapsingMergeTree engine: two sign=+1 rows for the same commit_sha
+// at different versions must be evaluated against the WHERE clause first; only then
+// does ORDER BY version DESC LIMIT 1 pick the winner.
+func TestClickHouseStore_LoadLiveByCommit_VCMTCollapseExcludesAbandoned(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	container, err := setupClickHouseContainer(ctx, t)
+	if err != nil {
+		t.Fatalf("failed to setup clickhouse container: %v", err)
+	}
+	defer func() {
+		if err := container.terminate(ctx); err != nil {
+			t.Logf("warning: failed to terminate container: %v", err)
+		}
+	}()
+
+	pipelineConfig := integrationTestPipelineConfig()
+	store, err := createTestStore(ctx, t, container, pipelineConfig)
+	if err != nil {
+		t.Fatalf("failed to create test store: %v", err)
+	}
+	defer store.Close()
+
+	commitSHA := fmt.Sprintf("live-by-commit-%d", time.Now().UnixNano())
+	repo := "myorg/livecommit-test"
+
+	// 1. Insert slip A — in_progress, lower version (created first).
+	corrA := fmt.Sprintf("corr-A-%d", time.Now().UnixNano())
+	slipA := createIntegrationTestSlip(corrA, []string{"api"}, pipelineConfig)
+	slipA.Repository = repo
+	slipA.CommitSHA = commitSHA
+	slipA.Status = SlipStatusInProgress
+	if err := store.Create(ctx, slipA); err != nil {
+		t.Fatalf("failed to create slip A: %v", err)
+	}
+
+	// 2. Insert slip B — different correlation_id, SAME commit_sha, in_progress.
+	//    Its Create call generates a HIGHER version (nextVersion is monotonic).
+	corrB := fmt.Sprintf("corr-B-%d", time.Now().UnixNano())
+	slipB := createIntegrationTestSlip(corrB, []string{"api"}, pipelineConfig)
+	slipB.Repository = repo
+	slipB.CommitSHA = commitSHA
+	slipB.Status = SlipStatusInProgress
+	if err := store.Create(ctx, slipB); err != nil {
+		// Schema may reject duplicate commit_sha across correlation_ids.
+		// Fall back: abandon corrA and assert LoadLiveByCommit returns ErrSlipNotFound.
+		// NOTE: The current routing_slips schema permits the dual-correlation insert at
+		// the same commit_sha (verified by this test passing in CI), so this fallback is
+		// purely defensive. If a future schema change rejects the dual insert, the R7
+		// VCMT collapse-vs-WHERE assertion below (steps 3-6) will be silently skipped;
+		// in that case, split this fallback into a dedicated
+		// TestClickHouseStore_LoadLiveByCommit_NoLiveAfterAbandon so the collapse
+		// assertion cannot be masked.
+		t.Logf("dual-correlation insert rejected (%v); falling back to single-correlation abandon path", err)
+		if err := store.UpdateSlipStatus(ctx, corrA, SlipStatusAbandoned); err != nil {
+			t.Fatalf("fallback: failed to abandon slip A: %v", err)
+		}
+		_, err := store.LoadLiveByCommit(ctx, repo, commitSHA)
+		if !errors.Is(err, ErrSlipNotFound) {
+			t.Errorf("fallback: expected ErrSlipNotFound after sole slip abandoned, got %v", err)
+		}
+		return
+	}
+
+	// 3. Abandon slip B — writes a higher-version sign=+1 row with status=abandoned.
+	if err := store.UpdateSlipStatus(ctx, corrB, SlipStatusAbandoned); err != nil {
+		t.Fatalf("failed to abandon slip B: %v", err)
+	}
+
+	// 4. LoadByCommit (existing buggy semantic) returns the abandoned slip
+	//    because ORDER BY version DESC LIMIT 1 wins post-collapse.
+	got, err := store.LoadByCommit(ctx, repo, commitSHA)
+	if err != nil {
+		t.Fatalf("LoadByCommit: %v", err)
+	}
+	if got.Status != SlipStatusAbandoned {
+		t.Errorf("LoadByCommit baseline: expected abandoned (highest version wins), got %s", got.Status)
+	}
+	if got.CorrelationID != corrB {
+		t.Errorf("LoadByCommit baseline: expected corrB %q, got %q", corrB, got.CorrelationID)
+	}
+
+	// 5. LoadLiveByCommit MUST return slip A (in_progress, lower version) — proving
+	//    the status filter is applied BEFORE the version-based collapse so the
+	//    abandoned higher-version row is excluded and the live row wins.
+	live, err := store.LoadLiveByCommit(ctx, repo, commitSHA)
+	if err != nil {
+		t.Fatalf("LoadLiveByCommit: %v", err)
+	}
+	if live.Status != SlipStatusInProgress {
+		t.Errorf("LoadLiveByCommit: expected in_progress, got %s", live.Status)
+	}
+	if live.CorrelationID != corrA {
+		t.Errorf("LoadLiveByCommit: expected corrA %q, got %q", corrA, live.CorrelationID)
+	}
+
+	// 6. Negative: if we also abandon A, LoadLiveByCommit must return ErrSlipNotFound.
+	if err := store.UpdateSlipStatus(ctx, corrA, SlipStatusAbandoned); err != nil {
+		t.Fatalf("failed to abandon slip A: %v", err)
+	}
+	_, err = store.LoadLiveByCommit(ctx, repo, commitSHA)
+	if !errors.Is(err, ErrSlipNotFound) {
+		t.Errorf("expected ErrSlipNotFound after all slips abandoned, got %v", err)
+	}
 }

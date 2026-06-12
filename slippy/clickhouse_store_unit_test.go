@@ -1239,6 +1239,72 @@ func TestClickHouseStore_HydrateSlip_AllComponentStatesCompleted_AggregateComple
 	}
 }
 
+// TestClickHouseStore_LoadLiveByCommit tests the LoadLiveByCommit method.
+func TestClickHouseStore_LoadLiveByCommit(t *testing.T) {
+	t.Run("not found returns ErrSlipNotFound", func(t *testing.T) {
+		mockRow := &clickhousetest.MockRow{
+			ScanErr: ErrSlipNotFound,
+		}
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: mockRow,
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		_, err := store.LoadLiveByCommit(context.Background(), "myorg/myrepo", "nonexistent")
+		if !errors.Is(err, ErrSlipNotFound) {
+			t.Errorf("expected ErrSlipNotFound, got %v", err)
+		}
+	})
+
+	t.Run("query contains status exclusion clause", func(t *testing.T) {
+		var capturedQuery string
+		mockSession := &clickhousetest.MockSession{
+			QueryRowFunc: func(_ context.Context, query string, _ ...any) driver.Row {
+				capturedQuery = query
+				return &clickhousetest.MockRow{ScanErr: ErrSlipNotFound}
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		_, _ = store.LoadLiveByCommit(context.Background(), "MyOrg/MyRepo", "abc123")
+
+		needles := []string{
+			"lower(repository)",
+			"sign = 1",
+			"status NOT IN ('abandoned', 'promoted', 'compensated')",
+			"max(version)",
+			"GROUP BY correlation_id",
+		}
+		for _, needle := range needles {
+			if !strings.Contains(capturedQuery, needle) {
+				t.Errorf("expected query to contain %q, got: %s", needle, capturedQuery)
+			}
+		}
+	})
+
+	t.Run("success returns slip", func(t *testing.T) {
+		mockRow := createMockScanRow("test-corr-002", "myorg/myrepo", "main", "abc123", SlipStatusInProgress)
+		mockSession := &clickhousetest.MockSession{
+			QueryRowRow: mockRow,
+			QueryWithArgsRows: &clickhousetest.MockRows{
+				CloseErr: nil,
+			},
+		}
+		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+		slip, err := store.LoadLiveByCommit(context.Background(), "myorg/myrepo", "abc123")
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if slip == nil {
+			t.Fatal("expected slip to be non-nil")
+		}
+		if slip.CommitSHA != "abc123" {
+			t.Errorf("expected commit_sha 'abc123', got '%s'", slip.CommitSHA)
+		}
+	})
+}
+
 // TestClickHouseStore_LoadByCommit_Success tests successful slip loading by commit.
 func TestClickHouseStore_LoadByCommit_Success(t *testing.T) {
 	mockRow := createMockScanRow("test-corr-001", "myorg/myrepo", "main", "abc123", SlipStatusPending)

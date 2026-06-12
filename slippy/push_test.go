@@ -285,6 +285,41 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	t.Run("retry detection uses LoadLiveByCommit not LoadByCommit", func(t *testing.T) {
+		// Guard against accidental regression of the F1 migration. CreateSlipForPush's
+		// retry-detection lookup is exact-SHA intent and must route through
+		// LoadLiveByCommit so superseded-terminal slips (abandoned/promoted/compensated)
+		// are filtered at the DB layer rather than relying solely on the post-call
+		// IsTerminal() guard. The IsTerminal() guard still catches the 'completed'
+		// case since LoadLiveByCommit does not filter completed slips.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		opts := PushOptions{
+			CorrelationID: "corr-routing-check",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "routing-check-sha",
+			Components:    []ComponentDefinition{},
+		}
+
+		_, err := client.CreateSlipForPush(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(store.LoadLiveByCommitCalls) != 1 {
+			t.Errorf("expected exactly 1 LoadLiveByCommit call, got %d", len(store.LoadLiveByCommitCalls))
+		}
+		if len(store.LoadByCommitCalls) != 0 {
+			t.Errorf(
+				"expected 0 LoadByCommit calls (retry detection must use LoadLiveByCommit), got %d",
+				len(store.LoadByCommitCalls),
+			)
+		}
+	})
+
 	t.Run("validation error", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()

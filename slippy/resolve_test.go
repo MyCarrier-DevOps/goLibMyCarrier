@@ -251,6 +251,73 @@ func TestClient_ResolveSlip(t *testing.T) {
 	})
 }
 
+// TestResolveSlip_ImageTagFallback_ReturnsPromotedSlip asserts that the
+// image-tag fallback path in ResolveSlip (resolve.go:135) returns a slip even
+// when its status has transitioned to 'promoted'. This is the R1 contract
+// preserved by using LoadByCommit (not LoadLiveByCommit) on the fallback path:
+// late-arriving deploy events for images built from a slip that was later
+// promoted by a squash-merge upstream must still resolve to the original
+// build slip, not fail with ErrSlipNotFound.
+func TestResolveSlip_ImageTagFallback_ReturnsPromotedSlip(t *testing.T) {
+	ctx := context.Background()
+
+	store := NewMockStore()
+	github := NewMockGitHubAPI()
+	client := NewClientWithDependencies(store, github, Config{
+		AncestryDepth: 20,
+	})
+
+	// Promoted slip whose commit SHA is encoded in a downstream image tag.
+	// Use a valid 7-char lowercase hex SHA so extractCommitFromImageTag picks
+	// it up (its regex requires [a-f0-9]{7,40}).
+	promotedSlip := &Slip{
+		CorrelationID: "corr-promoted-r1",
+		Repository:    "owner/repo",
+		Branch:        "feature/x",
+		CommitSHA:     "abcdef1",
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		Status:        SlipStatusPromoted,
+		Steps:         make(map[string]Step),
+	}
+	store.AddSlip(promotedSlip)
+
+	// Ancestry path must not match — force fallback to image-tag.
+	github.SetAncestry("owner", "repo", "HEAD", []string{"nomatch1", "nomatch2"})
+
+	result, err := client.ResolveSlip(ctx, ResolveOptions{
+		Repository: "owner/repo",
+		Branch:     "main",
+		Ref:        "HEAD",
+		ImageTag:   "mycarrier/svc:abcdef1-1234567890",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result == nil || result.Slip == nil {
+		t.Fatal("expected non-nil result and slip")
+	}
+	if result.Slip.CorrelationID != "corr-promoted-r1" {
+		t.Errorf("expected correlation_id 'corr-promoted-r1', got '%s'", result.Slip.CorrelationID)
+	}
+	if result.Slip.Status != SlipStatusPromoted {
+		t.Errorf("expected status promoted, got '%s'", result.Slip.Status)
+	}
+	if result.ResolvedBy != "image_tag" {
+		t.Errorf("expected ResolvedBy 'image_tag', got '%s'", result.ResolvedBy)
+	}
+
+	// Verify the fallback specifically used LoadByCommit (R1 contract), not
+	// LoadLiveByCommit, so that promoted slips are preserved.
+	if len(store.LoadByCommitCalls) == 0 {
+		t.Error("expected LoadByCommit to be called on image-tag fallback path")
+	}
+	if len(store.LoadLiveByCommitCalls) != 0 {
+		t.Errorf("LoadLiveByCommit must NOT be used on image-tag fallback path "+
+			"(R1 contract), got %d calls", len(store.LoadLiveByCommitCalls))
+	}
+}
+
 func TestParseRepository(t *testing.T) {
 	tests := []struct {
 		name      string

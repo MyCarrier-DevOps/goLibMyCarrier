@@ -26,6 +26,12 @@ type SlipStore interface {
 	// LoadByCommit retrieves a slip by repository and commit SHA
 	LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error)
 
+	// LoadLiveByCommit returns the LIVE (non-terminal) slip for the exact (repository, commitSHA).
+	// Excludes status in {abandoned, promoted, compensated}. Returns ErrSlipNotFound when no live
+	// slip exists. Use for in-flight dedup paths that require exact-SHA semantics. For
+	// ancestry-aware lookups use FindByCommits/ResolveSlip.
+	LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error)
+
 	// FindByCommits finds a slip matching any commit in the ordered list.
 	// Returns the slip for the first (most recent) matching commit.
 	// The third return value is the matched commit SHA.
