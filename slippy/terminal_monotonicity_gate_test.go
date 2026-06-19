@@ -38,6 +38,73 @@ func gateMockSession(priorStatus string) *clickhousetest.MockSession {
 }
 
 // -----------------------------------------------------------------------------
+// gateEnabled — env-flag rollback contract (Plan v3 §G.1)
+// -----------------------------------------------------------------------------
+
+// TestGateEnabled_DefaultsOn verifies the fail-safe default: when the env var
+// is unset, the gate is ON. This is the production-default rollback contract.
+func TestGateEnabled_DefaultsOn(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "")
+	// t.Setenv on empty string sets the var to ""; gateEnabled treats empty as default-ON.
+	if !gateEnabled() {
+		t.Fatal("gateEnabled() must default ON when env is empty")
+	}
+}
+
+// TestGateEnabled_FalseEnvDisables verifies the explicit kill-switch path.
+func TestGateEnabled_FalseEnvDisables(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
+	if gateEnabled() {
+		t.Fatal("gateEnabled() must return false when SLIPPY_I5_GATE_ENABLED=false")
+	}
+}
+
+// TestGateEnabled_TrueEnvEnables verifies explicit-on round-trips correctly.
+func TestGateEnabled_TrueEnvEnables(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "true")
+	if !gateEnabled() {
+		t.Fatal("gateEnabled() must return true when SLIPPY_I5_GATE_ENABLED=true")
+	}
+}
+
+// TestGateEnabled_UnparseableFailsSafe verifies an unparseable value is
+// treated as ON (fail-safe). A typo or accidental garbage value must NOT
+// silently disable the safety gate.
+func TestGateEnabled_UnparseableFailsSafe(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "garbage")
+	if !gateEnabled() {
+		t.Fatal("gateEnabled() must fail-safe ON for unparseable env value")
+	}
+}
+
+// TestEnforceTerminalMonotonicity_GateDisabled_ReturnsNil proves the
+// short-circuit path: when the env-flag disables the gate, enforce returns
+// nil immediately and NEVER issues a CH pre-flight query — even if the prior
+// state would otherwise trip the gate.
+func TestEnforceTerminalMonotonicity_GateDisabled_ReturnsNil(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
+
+	session := &clickhousetest.MockSession{
+		// If the short-circuit fails, the gate would issue a QueryRow and we'd
+		// fail the test loudly. Configure to t.Fatal on any query.
+		QueryRowFunc: func(_ context.Context, _ string, _ ...any) driver.Row {
+			t.Fatal("gate must NOT issue QueryRow when SLIPPY_I5_GATE_ENABLED=false")
+			return mockGateRow("completed")
+		},
+	}
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+
+	// Even with a hypothetical prior=completed (a refuse cell in normal mode),
+	// the disabled gate must allow the write.
+	err := store.enforceTerminalMonotonicity(
+		context.Background(), "corr-gate-disabled", "dev_deploy", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Fatalf("disabled gate must return nil; got %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // isRecoveryAllowed — predicate unit tests
 // -----------------------------------------------------------------------------
 

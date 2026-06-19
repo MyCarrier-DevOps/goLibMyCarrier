@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -973,7 +975,7 @@ var gateBypassSteps = map[string]bool{
 //
 // Allow rules (precondition: prior is terminal):
 //  1. prior == aborted AND incoming == pending
-//     → cascade-reset after resolved upstream failure (see executor.go:377,
+//     → cascade-reset after resolved upstream failure (see executor.go:376,
 //     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
 //  2. prior IN {failed, aborted, error, timeout, skipped} AND incoming == completed
 //     → operator/automation recovery (see slippy-api TestCompleteStep_AllowsRecoveryFromFailed
@@ -1008,6 +1010,30 @@ func isRecoveryAllowed(prior, incoming StepStatus) bool {
 	return false
 }
 
+// slippyI5GateEnabledEnv is the env-var name for the gate kill switch.
+// Plan v3 §G.1 rollback contract: empty or unparseable → fail-safe ON;
+// only an explicit parseable-false value disables the gate.
+const slippyI5GateEnabledEnv = "SLIPPY_I5_GATE_ENABLED"
+
+// gateEnabled returns true unless the gate is explicitly disabled via the
+// SLIPPY_I5_GATE_ENABLED env var. Default ON for fail-safe; only
+// SLIPPY_I5_GATE_ENABLED=false (or 0, False, etc. per strconv.ParseBool)
+// disables. Unparseable values fail-safe ON.
+//
+// This is the documented Plan v3 §G.1 rollback path — symmetric with
+// SLIPPY_I5_LOCK_ENABLED on the slippy-api side.
+func gateEnabled() bool {
+	v := os.Getenv(slippyI5GateEnabledEnv)
+	if v == "" {
+		return true // default ON
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return true // unparseable → fail-safe ON
+	}
+	return on
+}
+
 // enforceTerminalMonotonicity is the INSERT-time gate that prevents stale or
 // out-of-order writes from overwriting a terminal step status. Called from
 // UpdateStep and UpdateStepWithHistory BEFORE the slip_component_states INSERT.
@@ -1027,6 +1053,10 @@ func (s *ClickHouseStore) enforceTerminalMonotonicity(
 	correlationID, stepName, componentName string,
 	incoming StepStatus,
 ) error {
+	// Plan v3 §G.1 env-flag kill switch (rollback contract).
+	if !gateEnabled() {
+		return nil
+	}
 	// Step-level bypass (defensive, see gateBypassSteps godoc).
 	if gateBypassSteps[stepName] {
 		return nil
