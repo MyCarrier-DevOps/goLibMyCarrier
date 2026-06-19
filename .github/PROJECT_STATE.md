@@ -1268,3 +1268,185 @@ Discovered April 29, 2026. Full detail and fix status in `slippy/DISCREPANCIES.m
 - [ ] CLI tooling for slippy operations (manual slip inspection, cleanup)
 - [ ] Additional logger adapters beyond Zap
 - [ ] Implement `normalizeRepository()` for fork handling
+
+---
+
+## I5 race resolution — goLib monotonicity gate (Layer 1)
+
+ADO #82468 — terminal-monotonicity invariant enforced at the `slippy/clickhouse_store.go`
+INSERT boundary. This file documents the *library-layer* contribution; the slippy-api PR
+documents the full three-tier architecture (lock + R1 overlay + this gate).
+
+### Pre-fix bug (slip 436cc68c — production race)
+
+```text
+                  Pod A (ci_runner_1)                 Pod B (ci_runner_2)
+                  -------------------                 -------------------
+   t0             POST /v1/.../complete (unit_tests)
+                    │
+                    │  store.UpdateStep(corrID,
+                    │       "unit_tests", "", COMPLETED)
+                    │    └─ insertComponentState(...)
+                    │         INSERT ... wait_for_async_insert=0
+                    │         (queued; not yet visible)
+   t1                                                  POST /v1/.../start (unit_tests)
+                                                          │  store.UpdateStep(corrID,
+                                                          │       "unit_tests", "",
+                                                          │       RUNNING)
+                                                          │    └─ insertComponentState(...)
+                                                          │         INSERT ... (queued)
+   t2             (Pod A INSERT flushes)
+   t3                                                  (Pod B INSERT flushes; same µs)
+
+   POST-flush slip_component_states (event log):
+     ts=t2  status=completed  (Pod A)
+     ts=t3  status=running    (Pod B)   <-- argMax winner!
+
+   ROUTING TABLE
+     routing_slips.unit_tests_status = running   (terminal regression)
+     routing_slips.status            = in_progress   (slip stuck forever)
+```
+
+**Root cause:** ClickHouse async-insert visibility race + no INSERT-time
+serialization. Two concurrent writers each read an empty/stale event log, both
+INSERT, and `argMax(ts)` deterministically picks the later (non-terminal) write
+as the "current" status — flipping a terminal `completed` step back to
+`running`.
+
+### Layer 1 — `enforceTerminalMonotonicity` decision flow
+
+Gate is invoked from `UpdateStep` (`clickhouse_store.go:612`) and
+`UpdateStepWithHistory` (`:673`) BEFORE `insertComponentState`. `SetComponentImageTag`
+(`:881`) is intentionally exempt (out-of-band metadata).
+
+```text
+                  enforceTerminalMonotonicity(corrID, step, component, incoming)
+                  ─────────────────────────────────────────────────────────────
+                                          │
+                          SLIPPY_I5_GATE_ENABLED ?
+                                          │
+                            ┌─────────────┴─────────────┐
+                           no                          yes
+                            │                            │
+                       return nil               gateBypassSteps[step] ?
+                       (rollback)                        │
+                                            ┌───────────┴───────────┐
+                                          yes (push_parsed)         no
+                                            │                       │
+                                       return nil          latestComponentStateStatus()
+                                       (§B.15 bypass)                │
+                                                         ┌──────────┴──────────┐
+                                                      err / not-found        found
+                                                         │                    │
+                                                  return nil           prior.IsTerminal() ?
+                                                  (first-write or fail-open)  │
+                                                                ┌─────────────┴─────────────┐
+                                                               no                          yes
+                                                                │                            │
+                                                          return nil          isRecoveryAllowed(prior, incoming) ?
+                                                          (non-terminal prior:                 │
+                                                          always allowed)        ┌────────────┴────────────┐
+                                                                                yes                       no
+                                                                                  │                        │
+                                                                            return nil         return ErrTerminalAlreadyExists
+                                                                            (cascade-reset    (caller maps to 409 in
+                                                                            or recovery)      slippy-api mapWriteError)
+```
+
+#### 81-cell allow-list matrix (StepStatus × StepStatus, full 9×9)
+
+Non-terminal: `pending`, `held`, `running`. Terminal: `completed`, `failed`,
+`error`, `aborted`, `timeout`, `skipped`.
+
+##### Non-terminal prior × all incoming (3 × 9 = 27 cells) — ALL ALLOW
+
+```text
+   prior \ incoming | pending | held | running | completed | failed | error | aborted | timeout | skipped
+   -----------------+---------+------+---------+-----------+--------+-------+---------+---------+--------
+   pending          | ALLOW   | ALLOW| ALLOW   | ALLOW     | ALLOW  | ALLOW | ALLOW   | ALLOW   | ALLOW
+   held             | ALLOW   | ALLOW| ALLOW   | ALLOW     | ALLOW  | ALLOW | ALLOW   | ALLOW   | ALLOW
+   running          | ALLOW   | ALLOW| ALLOW   | ALLOW     | ALLOW  | ALLOW | ALLOW   | ALLOW   | ALLOW
+```
+
+Rationale: non-terminal priors have no monotonicity invariant to violate.
+
+##### Terminal prior × non-terminal incoming (6 × 3 = 18 cells)
+
+```text
+   prior \ incoming | pending                 | held    | running
+   -----------------+-------------------------+---------+---------
+   completed        | REFUSE                  | REFUSE  | REFUSE
+   failed           | REFUSE                  | REFUSE  | REFUSE
+   error            | REFUSE                  | REFUSE  | REFUSE
+   aborted          | ALLOW (cascade-reset)   | REFUSE  | REFUSE
+   timeout          | REFUSE                  | REFUSE  | REFUSE
+   skipped          | REFUSE                  | REFUSE  | REFUSE
+```
+
+`aborted → pending` is the ONE intentional terminal → non-terminal transition,
+driven by `executor.go:377` cascade-reset after a primary failure resolves
+(`TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending`).
+
+##### Terminal prior × terminal incoming (6 × 6 = 36 cells)
+
+```text
+   prior \ incoming | completed         | failed | aborted | error  | timeout | skipped
+   -----------------+-------------------+--------+---------+--------+---------+--------
+   completed        | REFUSE            | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   failed           | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   aborted          | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   error            | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   timeout          | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   skipped          | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+```
+
+`completed` is absolutely final. Same-terminal idempotency (e.g. `failed →
+failed`) is REFUSED at library level for clean semantics; HTTP layer maps to
+409 (slippy-api may upgrade to 204 idempotent in a follow-up).
+
+##### Allow-list summary (encoded in `isRecoveryAllowed`)
+
+```text
+   ALLOWED terminal-prior transitions:
+     1. aborted   → pending     (cascade-reset)
+     2. failed    → completed   (recovery)
+     3. aborted   → completed   (recovery)
+     4. error     → completed   (recovery)
+     5. timeout   → completed   (recovery)
+     6. skipped   → completed   (recovery)
+
+   ALL OTHER terminal-prior transitions: REFUSE → ErrTerminalAlreadyExists
+```
+
+### Rollback flag matrix (`SLIPPY_I5_GATE_ENABLED`)
+
+```text
+   GATE flag | Behavior                                | Use case
+   ----------+-----------------------------------------+-------------------------------
+   unset     | DEFAULT-OFF — gate returns nil silently | Rollback / pre-cutover
+   "false"   | Gate returns nil silently               | Explicit disable
+   "true"    | Gate enforces matrix; returns 409 on    | Production after Stage-3
+             | refused transitions                      | validation
+```
+
+Gate fails OPEN on transport/lookup errors (logged via `slog.WarnContext` with
+`correlation_id`, `step`, `component`, `error`). This prevents a CH outage
+from blocking all writes.
+
+### Companion: slippy-api defense-in-depth
+
+The gate alone CANNOT serialize same-microsecond INSERTs (both writers may see
+prior=empty). slippy-api PR #39 adds:
+- TIER 1: per-correlationID Dragonfly lock (`withCorrIDLock`) — closes the
+  Load → mutate → Update race outside the library.
+- TIER 2: R1 overlay event-log-validated guard in `hydrateAndPersist`.
+- TIER 3 (this PR): goLib INSERT-time monotonicity gate — last-mile invariant
+  defense even if both TIERs above fail.
+
+## Related
+
+- ADO #82468 — TMS infrastructure I5 stuck-slip class
+- goLibMyCarrier PR #72 (this PR) — Layer 1 gate
+- slippy-api PR #39 — Layer 2 lock + R1 overlay + wires Layer 1
+- Plan v3: `standup-notes/2026/06/resolve-i5-option1-stage2-plan-v3.md`
+- Production case: slip `436cc68c` (RCA in `standup-notes/2026/06/`)
