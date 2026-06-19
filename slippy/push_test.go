@@ -226,6 +226,110 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	t.Run("failed existing slip - supersedes and creates fresh", func(t *testing.T) {
+		// A prior pipeline for this EXACT commit ran and FAILED (non-terminal, stuck).
+		// A new push for the same commit (retrigger-ci replay, or webhook re-delivery of
+		// a failed run) must abandon the failed slip and create a FRESH slip with the
+		// caller's correlation ID — NOT reuse it via handlePushRetry. Reusing it returns
+		// a different correlation ID to the caller (slippy-api → pushhookparser), which
+		// reads that as a dedup and suppresses builds + unit tests (the retrigger bug).
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-old-failed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "failed-commit-xyz",
+			Status:        SlipStatusFailed,
+			Steps: map[string]Step{
+				"builds": {Status: StepStatusFailed},
+			},
+			StateHistory: []StateHistoryEntry{},
+		})
+
+		opts := PushOptions{
+			CorrelationID: "corr-retrigger-new",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "failed-commit-xyz", // same commit — a retrigger replay
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		}
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Must return the NEW slip so the caller does not see a dedup.
+		if result.Slip.CorrelationID != "corr-retrigger-new" {
+			t.Errorf("expected new slip ID 'corr-retrigger-new', got '%s'", result.Slip.CorrelationID)
+		}
+		// Exactly one Create call for the fresh slip.
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected 1 Create call for fresh slip, got %d", len(store.CreateCalls))
+		}
+		// The old failed slip must be abandoned (terminal, excluded from future live lookups).
+		old, ok := store.Slips["corr-old-failed"]
+		if !ok {
+			t.Fatal("old slip missing from store")
+		}
+		if old.Status != SlipStatusAbandoned {
+			t.Errorf("expected old failed slip to be abandoned, got %q", old.Status)
+		}
+		// handlePushRetry (reset push_parsed -> running) must NOT run for a failed slip.
+		for _, call := range store.UpdateStepCalls {
+			if call.StepName == "push_parsed" && call.Status == StepStatusRunning {
+				t.Error("handlePushRetry must not run for a failed existing slip (should supersede)")
+			}
+		}
+	})
+
+	t.Run("failed existing slip - abandon error is non-fatal, still creates fresh", func(t *testing.T) {
+		// If abandoning the failed slip fails, slip creation must still proceed (with a
+		// recorded warning). Blocking here would re-introduce the "retrigger never builds"
+		// bug; a lingering failed row is shadowed by the newer slip (version DESC).
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-old-failed-2",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "failed-commit-abc",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		// AbandonSlip internally does Load + Update; fail the Update so abandon errors.
+		// (Create is unaffected by UpdateError, so fresh-slip creation still succeeds.)
+		store.UpdateError = errors.New("clickhouse unavailable")
+
+		opts := PushOptions{
+			CorrelationID: "corr-retrigger-2",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "failed-commit-abc",
+		}
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error (abandon failure must be non-fatal): %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-retrigger-2" {
+			t.Errorf("expected fresh slip 'corr-retrigger-2', got '%s'", result.Slip.CorrelationID)
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected 1 Create call, got %d", len(store.CreateCalls))
+		}
+		if len(result.Warnings) == 0 {
+			t.Error("expected a warning recorded for the failed abandon")
+		}
+	})
+
 	t.Run("new slip for terminal existing slip", func(t *testing.T) {
 		// When a terminal slip (abandoned, promoted, compensated, completed) already
 		// exists for the commit SHA, CreateSlipForPush must NOT call handlePushRetry.

@@ -142,13 +142,17 @@ type CreateSlipResult struct {
 // finds any existing slips for ancestor commits, and ensures they are
 // in a terminal state (abandoning non-terminal slips that are being superseded).
 //
-// Retry vs new-slip behavior for the same commit SHA:
-//   - If an existing slip is found and is non-terminal (in_progress, failed, etc.),
-//     it is retried via handlePushRetry (same correlation ID is reused).
-//   - If an existing slip is found and is terminal (abandoned, promoted, compensated,
-//     completed), it is treated as stale and a fresh slip is created with the new
-//     correlation ID from opts. This prevents resurrecting superseded slips on
-//     webhook re-delivery or bot-commit races.
+// Retry vs supersede vs new-slip behavior for the same commit SHA:
+//   - Existing slip is non-terminal AND in_progress/pending/compensating: retried via
+//     handlePushRetry (same correlation ID is reused) — the pipeline is still in flight,
+//     so re-dispatching would double-run work.
+//   - Existing slip is failed: the stuck slip is abandoned and a fresh slip is created
+//     with the new correlation ID from opts. A failed slip never advances without a step
+//     re-run, so a new push for the same commit (retrigger-ci replay, or webhook
+//     re-delivery of a failed run) is treated as a deliberate request to run CI again.
+//   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
+//     stale and a fresh slip is created with the new correlation ID from opts. This
+//     prevents resurrecting superseded slips on webhook re-delivery or bot-commit races.
 //
 // The returned CreateSlipResult contains both the slip and any non-fatal errors
 // that occurred during processing (e.g., ancestry resolution failures).
@@ -168,7 +172,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		Warnings: make([]error, 0),
 	}
 
-	// Check for existing slip (retry detection).
+	// Check for existing slip (retry detection / same-commit supersede decision).
 	//
 	// Exact-SHA intent: this lookup is keyed on the precise commit SHA being pushed,
 	// not on git ancestry — we want to detect "is there an in-flight slip for THIS
@@ -179,13 +183,50 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	// and a completed slip must still fall through to fresh-slip creation.
 	existingSlip, err := c.store.LoadLiveByCommit(ctx, opts.Repository, opts.CommitSHA)
 	if err == nil && existingSlip != nil && !existingSlip.Status.IsTerminal() {
-		slip, err := c.handlePushRetry(ctx, existingSlip)
-		if err != nil {
-			return nil, err
+		// A live (non-terminal) slip already exists for this EXACT commit. What we do
+		// next depends on whether the prior pipeline can still make progress on its own:
+		//
+		//   - in_progress / pending / compensating: the prior pipeline is actively
+		//     running (or a concurrent create just won the repo:sha race). Reuse the
+		//     existing slip and reset push_parsed via handlePushRetry — re-dispatching
+		//     builds here would double-run work that is already in flight. The caller
+		//     (slippy-api → pushhookparser) detects that the returned correlation_id
+		//     differs from the one it sent and suppresses duplicate side-effects.
+		//
+		//   - failed: the prior pipeline is stuck. A failed slip never advances on its
+		//     own — it only recovers when its failed STEPS are re-run, which a fresh
+		//     push event does not do. So a new push for the same commit (a retrigger-ci
+		//     replay, or a webhook re-delivery of a failed run) is a deliberate request
+		//     to run CI again. Abandon the failed slip and fall through to fresh-slip
+		//     creation with the caller's correlation_id, so the caller sees a NEW slip
+		//     (not a dedup) and re-dispatches builds + unit tests. This is the
+		//     same-commit case of the "next push supersedes the old slip, creates a new
+		//     one" model (STATE_MACHINE_V3.md §"Pipeline termination without completing").
+		if existingSlip.Status != SlipStatusFailed {
+			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
+			if retryErr != nil {
+				return nil, retryErr
+			}
+			result.Slip = slip
+			result.AncestryResolved = len(slip.Ancestry) > 0
+			return result, nil
 		}
-		result.Slip = slip
-		result.AncestryResolved = len(slip.Ancestry) > 0
-		return result, nil
+
+		c.logger.Info(ctx, "Superseding failed slip for same commit (retrigger / re-run)", map[string]interface{}{
+			"superseded_id":     existingSlip.CorrelationID,
+			"superseded_commit": shortSHA(existingSlip.CommitSHA),
+			"superseded_status": string(existingSlip.Status),
+			"superseding_id":    opts.CorrelationID,
+		})
+		if abandonErr := c.AbandonSlip(ctx, existingSlip.CorrelationID, opts.CorrelationID); abandonErr != nil {
+			// Non-fatal: record as a warning and still create the fresh slip. A
+			// lingering non-terminal failed row is shadowed by the newer slip
+			// (LoadLiveByCommit orders by version DESC), and blocking fresh-slip
+			// creation here would re-introduce the "retrigger never builds" bug.
+			result.Warnings = append(result.Warnings,
+				fmt.Errorf("failed to abandon superseded failed slip %s: %w", existingSlip.CorrelationID, abandonErr))
+		}
+		// fall through to fresh-slip creation with opts.CorrelationID
 	}
 
 	// Resolve ancestry chain and abandon superseded slips
