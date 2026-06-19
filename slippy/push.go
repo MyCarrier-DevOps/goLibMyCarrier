@@ -183,15 +183,9 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	// and a completed slip must still fall through to fresh-slip creation.
 	existingSlip, err := c.store.LoadLiveByCommit(ctx, opts.Repository, opts.CommitSHA)
 	if err == nil && existingSlip != nil && !existingSlip.Status.IsTerminal() {
-		// A live (non-terminal) slip already exists for this EXACT commit. What we do
-		// next depends on whether the prior pipeline can still make progress on its own:
-		//
-		//   - in_progress / pending / compensating: the prior pipeline is actively
-		//     running (or a concurrent create just won the repo:sha race). Reuse the
-		//     existing slip and reset push_parsed via handlePushRetry — re-dispatching
-		//     builds here would double-run work that is already in flight. The caller
-		//     (slippy-api → pushhookparser) detects that the returned correlation_id
-		//     differs from the one it sent and suppresses duplicate side-effects.
+		// A live (non-terminal) slip already exists for this EXACT commit (existingSlip.Status
+		// is a SlipStatus, not a step status). What we do next depends on whether the prior
+		// pipeline can still make progress on its own:
 		//
 		//   - failed: the prior pipeline is stuck. A failed slip never advances on its
 		//     own — it only recovers when its failed STEPS are re-run, which a fresh
@@ -202,6 +196,15 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     (not a dedup) and re-dispatches builds + unit tests. This is the
 		//     same-commit case of the "next push supersedes the old slip, creates a new
 		//     one" model (STATE_MACHINE_V3.md §"Pipeline termination without completing").
+		//
+		//   - any OTHER non-terminal slip status — in_progress in practice (the enum also
+		//     defines pending/compensating, which this pipeline does not use; see
+		//     STATE_MACHINE_V3.md): the prior pipeline is still in flight, or a concurrent
+		//     create just won the repo:sha race. Reuse the existing slip and reset
+		//     push_parsed via handlePushRetry — re-dispatching builds here would double-run
+		//     work that is already running. The caller (slippy-api → pushhookparser) detects
+		//     that the returned correlation_id differs from the one it sent and suppresses
+		//     duplicate side-effects.
 		if existingSlip.Status != SlipStatusFailed {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
