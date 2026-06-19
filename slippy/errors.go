@@ -58,6 +58,33 @@ var (
 	// ErrMaxRetriesExceeded indicates the maximum number of retry attempts was reached.
 	// This occurs when a slip is not found after multiple retries.
 	ErrMaxRetriesExceeded = errors.New("maximum retry attempts exceeded")
+
+	// ErrTerminalAlreadyExists indicates that an INSERT into slip_component_states
+	// was refused because the (correlation_id, step, component) tuple already has a
+	// terminal status and the proposed transition is not on the recovery allow-list.
+	//
+	// This sentinel is returned by the INSERT-time terminal-monotonicity gate that
+	// closes the I5 race (ADO #82468). The gate refuses:
+	//   - terminal → non-terminal (e.g. failed → running) — EXCEPT aborted → pending
+	//     (cascade-reset after upstream failure resolved, see executor.go:377).
+	//   - terminal → same-terminal (e.g. failed → failed) — idempotency must be
+	//     handled at the HTTP layer (typically converted to 204 No Content).
+	//   - terminal → different-terminal (e.g. failed → aborted, completed → failed) —
+	//     cross-terminal label swaps are not legitimate state transitions.
+	//
+	// The gate ALLOWS:
+	//   - empty event log (first write) — no monotonicity invariant to violate.
+	//   - prior non-terminal → anything.
+	//   - prior aborted → pending (cascade-reset, see executor.go:377 and
+	//     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
+	//   - prior {failed, aborted, error, timeout, skipped} → completed
+	//     (operator/automation recovery, see slippy-api TestCompleteStep_AllowsRecoveryFromFailed).
+	//
+	// Callers should map this sentinel to HTTP 409 Conflict at the API boundary
+	// (errors.Is(err, slippy.ErrTerminalAlreadyExists)). It propagates through
+	// SlipError / StepError via standard errors.Unwrap so that errors.Is at the
+	// outermost caller continues to work.
+	ErrTerminalAlreadyExists = errors.New("terminal status already recorded for step")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

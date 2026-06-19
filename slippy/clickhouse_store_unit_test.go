@@ -1761,9 +1761,13 @@ func TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost(t *testing.T) {
 	if len(mockSession.ExecWithArgsCalls) != 2 {
 		t.Errorf("expected 2 ExecWithArgs calls (one per step), got %d", len(mockSession.ExecWithArgsCalls))
 	}
-	// No routing_slips read (QueryRow) should have occurred — UpdateStep is a blind insert.
-	if len(mockSession.QueryRowCalls) != 0 {
-		t.Errorf("expected 0 QueryRow calls (no shared routing_slips load), got %d", len(mockSession.QueryRowCalls))
+	// QueryRow expected: 1 from the I5 terminal-monotonicity gate pre-flight for
+	// dev_deploy (push_parsed bypasses the gate via gateBypassSteps). No
+	// routing_slips Load happens — UpdateStep remains a blind insert with the
+	// gate's argMax point-lookup against slip_component_states as the only read.
+	if len(mockSession.QueryRowCalls) != 1 {
+		t.Errorf("expected 1 QueryRow call (I5 gate pre-flight for dev_deploy; push_parsed bypassed), got %d",
+			len(mockSession.QueryRowCalls))
 	}
 
 	// Verify the two inserts target slip_component_states and carry the correct step names.
@@ -6173,7 +6177,7 @@ func TestFilterActiveComponents_DirectUnit(t *testing.T) {
 // =============================================================================
 
 // TestLatestStepStatusFromEvents_QueryShape pins the SQL shape: must use argMax
-// with the no-image-tag sort-key constant and filter component='' for
+// with the no-image-tag sort-key constant and filter component=” for
 // pipeline-level rows.
 func TestLatestStepStatusFromEvents_QueryShape(t *testing.T) {
 	var capturedQuery string

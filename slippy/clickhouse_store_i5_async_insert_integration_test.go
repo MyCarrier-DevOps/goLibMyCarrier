@@ -23,7 +23,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -40,7 +39,7 @@ func setupClickHouseContainerWithAsyncInsert(
 	ctx context.Context, t *testing.T,
 ) (*clickhouseContainer, clickhouse.Conn, error) {
 	t.Helper()
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	req := testcontainers.ContainerRequest{
 		Image:        "clickhouse/clickhouse-server:25.8",
@@ -317,10 +316,13 @@ func TestI5_OptionD_OverridePinsTerminalStatus_AsyncInsert(t *testing.T) {
 		colStatus, _ := readUnitTestsStatusFromRouting(t, ctx, conn, dbName, corrID)
 		if colStatus != string(StepStatusRunning) {
 			// The bug DIDN'T manifest — that means the test framework is masking
-			// the read-your-writes window. Flag clearly because the positive
-			// case's signal is meaningless without this negative control.
-			t.Logf(
-				"WARNING: negative control did NOT reproduce the bug — routing_slips.unit_tests_completed_status=%q (expected %q). The async-insert window may not be wide enough on this runner; the positive case's pass becomes less informative.",
+			// the read-your-writes window. HARD FAIL (per prior reviewer Mod):
+			// the positive case's signal is meaningless without this negative
+			// control reproducing the bug. A silent t.Logf here lets the
+			// async-insert window collapse on CI runners without anyone
+			// noticing that the positive case stopped proving anything.
+			t.Fatalf(
+				"negative control did NOT reproduce the I5 bug — routing_slips.unit_tests_completed_status=%q (expected %q). The async-insert window is not wide enough on this runner; the positive case can no longer be trusted to prove the fix. Investigate test harness before re-enabling the positive case.",
 				colStatus, StepStatusRunning,
 			)
 		}

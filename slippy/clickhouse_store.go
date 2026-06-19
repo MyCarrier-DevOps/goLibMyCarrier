@@ -607,6 +607,14 @@ func (s *ClickHouseStore) UpdateStep(
 	// inside the retry loop will hydrate the correct state.
 	insertedAt := time.Now()
 
+	// I5 (ADO #82468): INSERT-time terminal-monotonicity gate. Refuses writes
+	// that would overwrite a terminal status outside the recovery allow-list.
+	// See enforceTerminalMonotonicity for the matrix; CH pre-flight failures
+	// fail-OPEN with a structured WARN per §J error policy.
+	if err := s.enforceTerminalMonotonicity(ctx, correlationID, stepName, componentName, status); err != nil {
+		return err
+	}
+
 	// Write the step event to the conflict-free event-sourcing table.
 	// Pipeline-level steps use componentName="" as a sentinel value.
 	if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status, "", ""); err != nil {
@@ -667,6 +675,14 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// the flushed row is already the correct, up-to-date value, so the subsequent Load
 	// inside the retry loop will hydrate the correct state.
 	insertedAt := time.Now()
+
+	// I5 (ADO #82468): INSERT-time terminal-monotonicity gate. Refuses writes
+	// that would overwrite a terminal status outside the recovery allow-list.
+	// See enforceTerminalMonotonicity for the matrix; CH pre-flight failures
+	// fail-OPEN with a structured WARN per §J error policy.
+	if err := s.enforceTerminalMonotonicity(ctx, correlationID, stepName, componentName, status); err != nil {
+		return err
+	}
 
 	// Store the step event in the conflict-free event-sourcing table.
 	// The message from the history entry is co-located in the event record.
@@ -880,6 +896,166 @@ func (s *ClickHouseStore) SetComponentImageTag(
 
 	return s.insertComponentState(ctx, correlationID, stepName, componentName,
 		StepStatus(currentStatus), "", imageTag)
+}
+
+// latestComponentStateStatus returns the most recent StepStatus for a
+// (correlation_id, step, component) tuple from slip_component_states, using
+// the same argMax tiebreaker formula as LatestStepStatusFromEvents.
+//
+// It is the internal companion to LatestStepStatusFromEvents that supports a
+// caller-supplied component name (the public method is hardcoded to
+// component=”). Used by enforceTerminalMonotonicity to detect prior terminal
+// states for both pipeline-level (component="") and component-level rows.
+//
+// Return contract:
+//   - (status, true, nil)    — at least one event row exists for the tuple
+//   - ("", false, nil)       — no event row yet
+//   - ("", false, err)       — query failure (caller MUST fail open per §J)
+//
+// Cost: sub-ms point lookup (argMax over the primary key prefix). The query
+// uses the no-image-tag sort key because the gate only cares about status
+// ordering, not image-tag presence.
+func (s *ClickHouseStore) latestComponentStateStatus(
+	ctx context.Context, correlationID, stepName, componentName string,
+) (StepStatus, bool, error) {
+	query := fmt.Sprintf(`
+		SELECT argMax(status, %s)
+		FROM %s.%s
+		WHERE correlation_id = ?
+		  AND step           = ?
+		  AND component      = ?
+		GROUP BY correlation_id
+	`, componentEventSortKeyNoImageTag, s.database, TableSlipComponentStates)
+
+	row := s.session.QueryRow(ctx, query, correlationID, stepName, componentName)
+	if row == nil {
+		return "", false, fmt.Errorf(
+			"latestComponentStateStatus: query returned nil row for %s/%s/%s",
+			correlationID, stepName, componentName,
+		)
+	}
+	var statusStr string
+	if err := row.Scan(&statusStr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("latestComponentStateStatus: %w", err)
+	}
+	if statusStr == "" {
+		return "", false, nil
+	}
+	return StepStatus(statusStr), true, nil
+}
+
+// gateBypassSteps lists step names that bypass enforceTerminalMonotonicity.
+// Justification per step is documented inline. Adding a step here is a
+// security/correctness decision — require code review citing the specific
+// callsite that needs the bypass.
+//
+// Defensive belt-and-braces: empirical 90d ClickHouse probe shows ZERO
+// terminal push_parsed rows landing under push_parsed in production today —
+// the bypass is reserved for a future consumer (or a regressed handlePushRetry
+// path) that may write completed/failed under push_parsed before the dedup
+// lock would intercept. Keeping the bypass in code prevents an accidental
+// blockage if the upstream pattern changes.
+var gateBypassSteps = map[string]bool{
+	// push_parsed is reset to running by handlePushRetry (push.go:678) on
+	// duplicate push deduplication. The reset is intentional and the prior
+	// state MAY be terminal (completed) from the first push. No I5 exposure
+	// because handlePushRetry runs single-threaded behind the dedup_lock.go
+	// repo:sha lock — no concurrent writer can race against it.
+	"push_parsed": true,
+}
+
+// isRecoveryAllowed encodes the explicit allow-list of terminal → X transitions
+// permitted by the gate. Returns true only if the (prior, incoming) pair is
+// on the allow-list.
+//
+// Allow rules (precondition: prior is terminal):
+//  1. prior == aborted AND incoming == pending
+//     → cascade-reset after resolved upstream failure (see executor.go:377,
+//     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
+//  2. prior IN {failed, aborted, error, timeout, skipped} AND incoming == completed
+//     → operator/automation recovery (see slippy-api TestCompleteStep_AllowsRecoveryFromFailed
+//     at slip_write_handler_test.go:678).
+//
+// REFUSE all other terminal → {terminal, non-terminal} transitions including:
+//   - completed → anything (completed is absolutely final).
+//   - same-terminal idempotency (e.g. failed → failed) — HTTP layer handles idempotency.
+//   - cross-terminal label swaps (e.g. failed → aborted).
+//   - other terminal → non-terminal (e.g. failed → running, completed → pending).
+func isRecoveryAllowed(prior, incoming StepStatus) bool {
+	// Rule 1: aborted → pending cascade-reset.
+	if prior == StepStatusAborted && incoming == StepStatusPending {
+		return true
+	}
+	// Rule 2: recoverable-terminal → completed. Default arm of the switch is
+	// intentional — non-recoverable terminals (completed) and all
+	// non-terminals fall through to "refuse". Listed explicitly to satisfy
+	// the exhaustive lint check.
+	if incoming == StepStatusCompleted {
+		switch prior {
+		case StepStatusFailed, StepStatusAborted, StepStatusError,
+			StepStatusTimeout, StepStatusSkipped:
+			return true
+		case StepStatusCompleted, StepStatusPending, StepStatusHeld, StepStatusRunning:
+			// completed → completed: refuse same-terminal idempotency at lib level.
+			// pending/held/running: not terminal; this branch is dead because
+			// the gate only calls isRecoveryAllowed when prior is terminal.
+			return false
+		}
+	}
+	return false
+}
+
+// enforceTerminalMonotonicity is the INSERT-time gate that prevents stale or
+// out-of-order writes from overwriting a terminal step status. Called from
+// UpdateStep and UpdateStepWithHistory BEFORE the slip_component_states INSERT.
+//
+// Returns:
+//   - nil:                          INSERT permitted (no prior, prior non-terminal,
+//     or transition on the recovery allow-list).
+//   - ErrTerminalAlreadyExists:     INSERT refused (gate hit).
+//   - nil + structured WARN log:    CH pre-flight failure (fail-OPEN per §J error
+//     policy — gate is defense-in-depth; primary
+//     race coverage lives in the per-corr-id lock).
+//
+// SetComponentImageTag is exempt (§B.5) because it preserves the current
+// status — it is metadata-only, not a status transition.
+func (s *ClickHouseStore) enforceTerminalMonotonicity(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	incoming StepStatus,
+) error {
+	// Step-level bypass (defensive, see gateBypassSteps godoc).
+	if gateBypassSteps[stepName] {
+		return nil
+	}
+
+	prior, found, err := s.latestComponentStateStatus(ctx, correlationID, stepName, componentName)
+	if err != nil {
+		// Fail OPEN: log warn + continue. Gate is best-effort defense-in-depth;
+		// the per-corr-id lock (slippy-api scope) is the primary safety net.
+		// (nilerr lint exemption: the nil return is the intentional fail-open
+		// per plan v3 §J error policy — see enforceTerminalMonotonicity godoc.)
+		s.logger.Warn(ctx, "i5: terminal-monotonicity pre-flight failed; failing open",
+			map[string]interface{}{
+				"correlation_id": correlationID,
+				"step":           stepName,
+				"component":      componentName,
+				"error":          err.Error(),
+			})
+		return nil //nolint:nilerr // fail-open is the documented §J error policy
+	}
+	if !found || !prior.IsTerminal() {
+		// First write or prior non-terminal — always allow.
+		return nil
+	}
+	if isRecoveryAllowed(prior, incoming) {
+		return nil
+	}
+	// Prior is terminal; transition is NOT on the allow-list. Refuse.
+	return ErrTerminalAlreadyExists
 }
 
 // appendHistoryWithOverrides is the internal implementation of AppendHistory.
