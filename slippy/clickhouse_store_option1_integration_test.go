@@ -209,6 +209,53 @@ func TestI5_Option1_InsertComponentStateGate(t *testing.T) {
 	})
 
 	// -------------------------------------------------------------------------
+	// 7a. failed_then_running_allowed — Argo workflow-step retry (rule 3)
+	// Argo's workflow-step retryStrategy re-runs pre-job → main → post-job.
+	// pre-job (Slippy CLI prejob) POSTs /start which insert-paths through
+	// this gate. Without rule 3, the gate returns 409 and Argo's
+	// retryStrategy.expression (matches only exit 143/137/-1) does not
+	// catch 409, so the workflow step abandons → slip wedges.
+	// -------------------------------------------------------------------------
+	t.Run("7a_failed_then_running_allowed", func(t *testing.T) {
+		corrID := freshCorrID("opt1-7a")
+		seedTerminal(t, corrID, "dev_deploy", "", StepStatusFailed)
+		if err := store.UpdateStep(ctx, corrID, "dev_deploy", "", StepStatusRunning); err != nil {
+			t.Fatalf("rule 3 (Argo retry): failed → running MUST be allowed; got %v", err)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// 7b. timeout_then_running_allowed — Argo workflow-step retry (rule 3)
+	// CI-typical retry-with-extension pattern after a step times out.
+	// -------------------------------------------------------------------------
+	t.Run("7b_timeout_then_running_allowed", func(t *testing.T) {
+		corrID := freshCorrID("opt1-7b")
+		seedTerminal(t, corrID, "dev_deploy", "", StepStatusTimeout)
+		if err := store.UpdateStep(ctx, corrID, "dev_deploy", "", StepStatusRunning); err != nil {
+			t.Fatalf("rule 3 (Argo retry): timeout → running MUST be allowed; got %v", err)
+		}
+	})
+
+	// -------------------------------------------------------------------------
+	// 7c. error_or_skipped_then_running_refused — narrow allow-list
+	// 90d production data (ci.slip_component_states, queried 2026-06) shows
+	// zero terminal → running transitions for error or skipped priors. They
+	// stay refused until empirical evidence of a real retry pattern shows up.
+	// -------------------------------------------------------------------------
+	t.Run("7c_error_or_skipped_then_running_refused", func(t *testing.T) {
+		for _, prior := range []StepStatus{StepStatusError, StepStatusSkipped} {
+			t.Run(string(prior), func(t *testing.T) {
+				corrID := freshCorrID("opt1-7c")
+				seedTerminal(t, corrID, "dev_deploy", "", prior)
+				err := store.UpdateStep(ctx, corrID, "dev_deploy", "", StepStatusRunning)
+				if !errors.Is(err, ErrTerminalAlreadyExists) {
+					t.Fatalf("%s → running must remain refused (no production evidence); got %v", prior, err)
+				}
+			})
+		}
+	})
+
+	// -------------------------------------------------------------------------
 	// 8. PriorAborted_IncomingCompleted_Recovery
 	// -------------------------------------------------------------------------
 	t.Run("8_PriorAborted_IncomingCompleted_Recovery", func(t *testing.T) {
@@ -257,7 +304,16 @@ func TestI5_Option1_InsertComponentStateGate(t *testing.T) {
 		// to A must refuse, writing first state to B must allow.
 		seedTerminal(t, corrID, "build", "api", StepStatusCompleted)
 		// A: completed → failed refused.
-		if err := store.UpdateStep(ctx, corrID, "build", "api", StepStatusFailed); !errors.Is(err, ErrTerminalAlreadyExists) {
+		if err := store.UpdateStep(
+			ctx,
+			corrID,
+			"build",
+			"api",
+			StepStatusFailed,
+		); !errors.Is(
+			err,
+			ErrTerminalAlreadyExists,
+		) {
 			t.Fatalf("build/api completed → failed must refuse; got %v", err)
 		}
 		// B: first write allowed.
@@ -340,7 +396,16 @@ func TestI5_Option1_InsertComponentStateGate(t *testing.T) {
 			t.Fatalf("running → completed must be allowed; got %v", err)
 		}
 		// Repeat terminal — gate sees completed prior, refuses.
-		if err := store.UpdateStep(ctx, corrID, "dev_deploy", "", StepStatusCompleted); !errors.Is(err, ErrTerminalAlreadyExists) {
+		if err := store.UpdateStep(
+			ctx,
+			corrID,
+			"dev_deploy",
+			"",
+			StepStatusCompleted,
+		); !errors.Is(
+			err,
+			ErrTerminalAlreadyExists,
+		) {
 			t.Fatalf("completed → completed across seconds must STILL refuse; got %v", err)
 		}
 	})
@@ -383,7 +448,10 @@ func TestI5_Option1_InsertComponentStateGate(t *testing.T) {
 			}
 		}
 		if refusals == 0 {
-			t.Fatalf("expected at least one ErrTerminalAlreadyExists under contention vs settled completed prior; errs=%v", errs)
+			t.Fatalf(
+				"expected at least one ErrTerminalAlreadyExists under contention vs settled completed prior; errs=%v",
+				errs,
+			)
 		}
 	})
 
@@ -478,7 +546,16 @@ func TestI5_Option1_InsertComponentStateGate(t *testing.T) {
 		}
 		time.Sleep(1100 * time.Millisecond)
 		// Second completed must refuse (completed is now prior).
-		if err := store.UpdateStep(ctx, corrID, "dev_deploy", "", StepStatusCompleted); !errors.Is(err, ErrTerminalAlreadyExists) {
+		if err := store.UpdateStep(
+			ctx,
+			corrID,
+			"dev_deploy",
+			"",
+			StepStatusCompleted,
+		); !errors.Is(
+			err,
+			ErrTerminalAlreadyExists,
+		) {
 			t.Fatalf("completed → completed after recovery must refuse; got %v", err)
 		}
 	})

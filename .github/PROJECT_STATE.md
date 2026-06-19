@@ -1374,18 +1374,40 @@ Rationale: non-terminal priors have no monotonicity invariant to violate.
 
 ```text
    prior \ incoming | pending                 | held    | running
-   -----------------+-------------------------+---------+---------
+   -----------------+-------------------------+---------+----------------------
    completed        | REFUSE                  | REFUSE  | REFUSE
-   failed           | REFUSE                  | REFUSE  | REFUSE
-   error            | REFUSE                  | REFUSE  | REFUSE
-   aborted          | ALLOW (cascade-reset)   | REFUSE  | REFUSE
-   timeout          | REFUSE                  | REFUSE  | REFUSE
-   skipped          | REFUSE                  | REFUSE  | REFUSE
+   failed           | REFUSE                  | REFUSE  | ALLOW (Argo retry)
+   error            | REFUSE                  | REFUSE  | REFUSE (no prod data)
+   aborted          | ALLOW (cascade-reset)   | REFUSE  | REFUSE (use cascade)
+   timeout          | REFUSE                  | REFUSE  | ALLOW (Argo retry)
+   skipped          | REFUSE                  | REFUSE  | REFUSE (no prod data)
 ```
 
-`aborted → pending` is the ONE intentional terminal → non-terminal transition,
-driven by `executor.go:377` cascade-reset after a primary failure resolves
-(`TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending`).
+Terminal → non-terminal allowed cells:
+
+1. `aborted → pending` — cascade-reset after primary failure resolves
+   (`executor.go:377`,
+   `TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending`).
+2. `failed → running`, `timeout → running` — Argo workflow-step retry. Argo's
+   workflow-step-level `retryStrategy` re-runs the entire step (pre-job → main
+   → post-job). The pre-job container (Slippy CLI prejob) POSTs
+   `/v1/slips/{id}/steps/{name}/start` to slippy-api, which inserts through
+   this gate. Without these allows the gate returns 409 and Argo's
+   `retryStrategy.expression` (matches only `lastRetry.exitCode ∈ {143, 137,
+   -1}`) does NOT catch the 409 → the workflow step abandons → the slip
+   wedges at failed/timeout. Empirically validated against
+   `workflow-dev/workflows/templates/{auto-deployer.yaml, autotriggertests.yaml,
+   mc-env-tag-reset.yaml, offload-purge.yaml}`.
+
+`aborted → running` is INTENTIONALLY REFUSED: cascade-aborted steps must go
+through `aborted → pending` (rule 1) to re-enter the queue; a direct
+`aborted → running` bypasses the recovery contract.
+
+`error → running` and `skipped → running` are REFUSED based on production
+evidence: a 90-day window of `ci.slip_component_states` (54,473 rows, queried
+2026-06) shows ZERO occurrences of any terminal → running transition,
+confirming neither error nor skipped has a real retry-running pattern. If
+such a pattern surfaces, narrow the allow-list at that point.
 
 ##### Terminal prior × terminal incoming (6 × 6 = 36 cells)
 
@@ -1414,8 +1436,18 @@ failed`) is REFUSED at library level for clean semantics; HTTP layer maps to
      4. error     → completed   (recovery)
      5. timeout   → completed   (recovery)
      6. skipped   → completed   (recovery)
+     7. failed    → running     (Argo workflow-step retry)
+     8. timeout   → running     (Argo workflow-step retry)
 
    ALL OTHER terminal-prior transitions: REFUSE → ErrTerminalAlreadyExists
+
+   NOTE on rules 7-8: Argo's workflow-step retryStrategy re-runs pre-job →
+   main → post-job. Pre-job (Slippy CLI prejob) POSTs /start. Without
+   rules 7-8 the gate returns 409, Argo's retryStrategy.expression catches
+   only signal exit codes (143/137/-1), not 409, and the step abandons →
+   slip wedges. aborted/error/skipped → running remain REFUSED
+   (aborted uses cascade-reset; error/skipped have zero production
+   occurrences in a 90-day window).
 ```
 
 ### Rollback flag matrix (`SLIPPY_I5_GATE_ENABLED`)

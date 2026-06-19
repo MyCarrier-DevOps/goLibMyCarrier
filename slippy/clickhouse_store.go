@@ -974,18 +974,44 @@ var gateBypassSteps = map[string]bool{
 // on the allow-list.
 //
 // Allow rules (precondition: prior is terminal):
+//
 //  1. prior == aborted AND incoming == pending
 //     → cascade-reset after resolved upstream failure (see executor.go:376,
 //     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
+//
 //  2. prior IN {failed, aborted, error, timeout, skipped} AND incoming == completed
 //     → operator/automation recovery (see slippy-api TestCompleteStep_AllowsRecoveryFromFailed
 //     at slip_write_handler_test.go:678).
+//
+//  3. prior IN {failed, timeout} AND incoming == running
+//     → Argo workflow-step retry. Argo's workflow-step-level retryStrategy
+//     re-runs the entire step (pre-job → main → post-job). The pre-job
+//     container (Slippy CLI prejob) POSTs /v1/slips/{id}/steps/{name}/start
+//     to slippy-api, which insert-paths through this gate. Without this
+//     allow-list entry the gate returns ErrTerminalAlreadyExists → 409;
+//     Argo's retryStrategy.expression matches only `asInt(lastRetry.exitCode)
+//     in {143,137,-1}` (SIGTERM / SIGKILL / network) and does NOT catch
+//     409/exit 1, so the workflow step abandons permanently and the slip
+//     wedges at failed/timeout. failed→running is the most common retry
+//     path; timeout→running is the CI-typical retry-with-extension path.
+//
+//     aborted → running is INTENTIONALLY EXCLUDED: cascade-aborted steps
+//     must go through aborted → pending (cascade-reset) to re-enter the
+//     queue. A direct aborted → running bypasses the recovery contract.
+//
+//     error → running and skipped → running are INTENTIONALLY EXCLUDED:
+//     90d production data (ci.slip_component_states, 54,473 rows, queried
+//     2026-06) shows zero occurrences of any terminal → running transition,
+//     including error and skipped. With no empirical evidence that these
+//     are legitimate retry paths, we keep them REFUSED. If a real workflow
+//     pattern surfaces them, narrow the allow-list to add them then.
 //
 // REFUSE all other terminal → {terminal, non-terminal} transitions including:
 //   - completed → anything (completed is absolutely final).
 //   - same-terminal idempotency (e.g. failed → failed) — HTTP layer handles idempotency.
 //   - cross-terminal label swaps (e.g. failed → aborted).
-//   - other terminal → non-terminal (e.g. failed → running, completed → pending).
+//   - aborted → running (use aborted → pending cascade-reset instead).
+//   - error → running, skipped → running (no production evidence; see above).
 func isRecoveryAllowed(prior, incoming StepStatus) bool {
 	// Rule 1: aborted → pending cascade-reset.
 	if prior == StepStatusAborted && incoming == StepStatusPending {
@@ -1004,6 +1030,22 @@ func isRecoveryAllowed(prior, incoming StepStatus) bool {
 			// completed → completed: refuse same-terminal idempotency at lib level.
 			// pending/held/running: not terminal; this branch is dead because
 			// the gate only calls isRecoveryAllowed when prior is terminal.
+			return false
+		}
+	}
+	// Rule 3: Argo workflow-step retry (failed/timeout → running). See godoc
+	// above for full rationale. aborted/error/skipped → running remain REFUSED.
+	if incoming == StepStatusRunning {
+		switch prior {
+		case StepStatusFailed, StepStatusTimeout:
+			return true
+		case StepStatusAborted, StepStatusError, StepStatusSkipped,
+			StepStatusCompleted, StepStatusPending, StepStatusHeld, StepStatusRunning:
+			// aborted → running: must go through aborted → pending cascade-reset.
+			// error / skipped → running: zero production occurrences (90d, 2026-06).
+			// completed → running: completed is absolutely final.
+			// pending/held/running → running: dead branch (gate only calls
+			// isRecoveryAllowed when prior is terminal).
 			return false
 		}
 	}

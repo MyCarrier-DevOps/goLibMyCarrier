@@ -207,7 +207,8 @@ func TestEnforceTerminalMonotonicity_PriorNonTerminal_AllowAnything(t *testing.T
 }
 
 // TestEnforceTerminalMonotonicity_RecoveryAllow covers the §D.4 recovery
-// allow-list arm of the gate. recoverable → completed AND aborted → pending.
+// allow-list arm of the gate. recoverable → completed, aborted → pending,
+// failed/timeout → running (Argo workflow-step retry).
 func TestEnforceTerminalMonotonicity_RecoveryAllow(t *testing.T) {
 	cases := []struct {
 		prior, incoming StepStatus
@@ -218,6 +219,8 @@ func TestEnforceTerminalMonotonicity_RecoveryAllow(t *testing.T) {
 		{StepStatusTimeout, StepStatusCompleted},
 		{StepStatusSkipped, StepStatusCompleted},
 		{StepStatusAborted, StepStatusPending}, // cascade-reset
+		{StepStatusFailed, StepStatusRunning},  // Argo workflow-step retry
+		{StepStatusTimeout, StepStatusRunning}, // Argo workflow-step retry
 	}
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s_to_%s", c.prior, c.incoming), func(t *testing.T) {
@@ -235,8 +238,10 @@ func TestEnforceTerminalMonotonicity_RecoveryAllow(t *testing.T) {
 }
 
 // TestEnforceTerminalMonotonicity_PriorTerminal_IncomingNonTerminal_Refused covers
-// the §D.2 terminal × non-terminal sub-matrix EXCEPT the aborted → pending cell.
-// This is the I5 bug-class hotspot.
+// the §D.2 terminal × non-terminal sub-matrix EXCEPT the explicit allow-list
+// cells: aborted → pending (cascade-reset), failed → running and
+// timeout → running (Argo workflow-step retry). This is the I5 bug-class
+// hotspot — every other cell must refuse with ErrTerminalAlreadyExists.
 func TestEnforceTerminalMonotonicity_PriorTerminal_IncomingNonTerminal_Refused(t *testing.T) {
 	priors := []StepStatus{
 		StepStatusCompleted, StepStatusFailed, StepStatusError,
@@ -245,9 +250,12 @@ func TestEnforceTerminalMonotonicity_PriorTerminal_IncomingNonTerminal_Refused(t
 	incomings := []StepStatus{StepStatusPending, StepStatusHeld, StepStatusRunning}
 	for _, prior := range priors {
 		for _, incoming := range incomings {
-			// Skip the one explicit allow-list cell.
+			// Skip the explicit allow-list cells.
 			if prior == StepStatusAborted && incoming == StepStatusPending {
-				continue
+				continue // cascade-reset
+			}
+			if (prior == StepStatusFailed || prior == StepStatusTimeout) && incoming == StepStatusRunning {
+				continue // Argo workflow-step retry
 			}
 			t.Run(fmt.Sprintf("%s_to_%s", prior, incoming), func(t *testing.T) {
 				session := gateMockSession(string(prior))
@@ -261,6 +269,112 @@ func TestEnforceTerminalMonotonicity_PriorTerminal_IncomingNonTerminal_Refused(t
 				}
 			})
 		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Argo workflow-step retry: failed/timeout → running ALLOWED (rule 3)
+// aborted/error/skipped → running REFUSED (intentional narrow allow-list)
+// -----------------------------------------------------------------------------
+
+// TestIsRecoveryAllowed_FailedToRunning_True proves the rule-3 predicate path
+// for the most common Argo workflow-step retry pattern (failed → running).
+// See isRecoveryAllowed godoc for the full Argo retryStrategy rationale.
+func TestIsRecoveryAllowed_FailedToRunning_True(t *testing.T) {
+	if !isRecoveryAllowed(StepStatusFailed, StepStatusRunning) {
+		t.Fatal("failed → running must be allowed (rule 3: Argo workflow-step retry)")
+	}
+}
+
+// TestIsRecoveryAllowed_TimeoutToRunning_True proves the rule-3 predicate path
+// for the CI-typical retry-with-extension pattern (timeout → running).
+func TestIsRecoveryAllowed_TimeoutToRunning_True(t *testing.T) {
+	if !isRecoveryAllowed(StepStatusTimeout, StepStatusRunning) {
+		t.Fatal("timeout → running must be allowed (rule 3: Argo workflow-step retry)")
+	}
+}
+
+// TestIsRecoveryAllowed_AbortedToRunning_False is the I5 §J risk #13
+// regression guard: cascade-aborted steps must NEVER re-enter via the running
+// path directly. They must go through aborted → pending (cascade-reset).
+func TestIsRecoveryAllowed_AbortedToRunning_False(t *testing.T) {
+	if isRecoveryAllowed(StepStatusAborted, StepStatusRunning) {
+		t.Fatal("aborted → running must NOT be allowed (use aborted → pending cascade-reset)")
+	}
+}
+
+// TestIsRecoveryAllowed_ErrorOrSkippedToRunning_False guards the intentional
+// narrow allow-list. 90d production data (queried 2026-06) shows zero
+// terminal → running transitions for error or skipped priors. If such a
+// pattern surfaces, narrow the allow-list at that point.
+func TestIsRecoveryAllowed_ErrorOrSkippedToRunning_False(t *testing.T) {
+	for _, prior := range []StepStatus{StepStatusError, StepStatusSkipped} {
+		t.Run(string(prior), func(t *testing.T) {
+			if isRecoveryAllowed(prior, StepStatusRunning) {
+				t.Errorf("%s → running must NOT be allowed (no production evidence)", prior)
+			}
+		})
+	}
+}
+
+// TestEnforceTerminalMonotonicity_FailedToRunning_Allowed exercises the
+// rule-3 allow-list through the enforcement gate (not just the predicate).
+// This proves the Argo workflow-step retry contract end-to-end at the
+// monotonicity-gate layer.
+func TestEnforceTerminalMonotonicity_FailedToRunning_Allowed(t *testing.T) {
+	session := gateMockSession(string(StepStatusFailed))
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+	err := store.enforceTerminalMonotonicity(
+		context.Background(), "corr-failed-retry", "dev_deploy", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Fatalf("failed → running (Argo retry) must be allowed; got %v", err)
+	}
+}
+
+// TestEnforceTerminalMonotonicity_TimeoutToRunning_Allowed exercises the
+// rule-3 allow-list for the timeout-retry path through the enforcement gate.
+func TestEnforceTerminalMonotonicity_TimeoutToRunning_Allowed(t *testing.T) {
+	session := gateMockSession(string(StepStatusTimeout))
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+	err := store.enforceTerminalMonotonicity(
+		context.Background(), "corr-timeout-retry", "dev_deploy", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Fatalf("timeout → running (Argo retry) must be allowed; got %v", err)
+	}
+}
+
+// TestEnforceTerminalMonotonicity_AbortedToRunning_Refused is the §J risk #13
+// regression test at the enforcement gate layer. If this ever flips to
+// allowed, the cascade-reset contract has been violated.
+func TestEnforceTerminalMonotonicity_AbortedToRunning_Refused(t *testing.T) {
+	session := gateMockSession(string(StepStatusAborted))
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+	err := store.enforceTerminalMonotonicity(
+		context.Background(), "corr-aborted-running", "dev_deploy", "", StepStatusRunning,
+	)
+	if !errors.Is(err, ErrTerminalAlreadyExists) {
+		t.Fatalf("§J risk #13: aborted → running MUST refuse with ErrTerminalAlreadyExists; got %v", err)
+	}
+}
+
+// TestEnforceTerminalMonotonicity_ErrorOrSkippedToRunning_Refused exercises
+// the intentional narrow-allow-list refusal at the gate layer. If real
+// workflow patterns surface error/skipped → running transitions, this test
+// is the place to widen the allow-list.
+func TestEnforceTerminalMonotonicity_ErrorOrSkippedToRunning_Refused(t *testing.T) {
+	for _, prior := range []StepStatus{StepStatusError, StepStatusSkipped} {
+		t.Run(string(prior), func(t *testing.T) {
+			session := gateMockSession(string(prior))
+			store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+			err := store.enforceTerminalMonotonicity(
+				context.Background(), "corr-narrow-allow", "dev_deploy", "", StepStatusRunning,
+			)
+			if !errors.Is(err, ErrTerminalAlreadyExists) {
+				t.Fatalf("%s → running must refuse with ErrTerminalAlreadyExists; got %v", prior, err)
+			}
+		})
 	}
 }
 
