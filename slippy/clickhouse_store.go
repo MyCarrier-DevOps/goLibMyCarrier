@@ -589,11 +589,16 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// Persist history and (where applicable) the aggregate status to routing_slips.
 	//
 	// The aggregate/cache write-back is BEST-EFFORT: insertComponentState above already
-	// durably recorded the step event in the conflict-free event-sourcing table. The
-	// routing_slips aggregate columns are a read-time cache — hydrateSlip recomputes
-	// every step/aggregate status from slip_component_states on every Load, so a
-	// lost or timed-out write-back self-heals on the next Load. Therefore any error
-	// from the write-back must NOT fail this call once the event insert has succeeded.
+	// durably recorded the step event in the conflict-free event-sourcing table.
+	//
+	// Self-heal scope: hydrateSlip recomputes STEP and AGGREGATE STATUS from
+	// slip_component_states on every Load, so a lost write-back for those columns
+	// self-heals on the next Load. The state_history AUDIT ENTRY for this transition
+	// is NOT reconstructed by hydration — it lives only in the routing_slips
+	// state_history column written by this write-back, so a lost write-back permanently
+	// drops that audit entry. Therefore any error from the write-back must NOT fail
+	// this call once the event insert has succeeded, but callers should monitor the
+	// "state_history_lost" warning field to detect audit gaps.
 	//
 	//   - componentName != "":  component step → aggregate write-back carries the history.
 	//   - IsAggregateStep:      aggregate step itself → aggregate write-back carries the history.
@@ -608,16 +613,20 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 			insertedAt,
 			entry,
 		); err != nil {
-			// The event is durable; swallow the write-back error and let the next
-			// Load recompute aggregate status from slip_component_states.
-			s.logger.Warn(ctx,
-				"aggregate writeback failed after durable event insert; deferred to read-time hydration",
+			// The event is durable; swallow the write-back error. Step/aggregate STATUS
+			// self-heals on next Load (recomputed by hydrateSlip). The state_history
+			// audit entry for this transition is NOT rebuilt by hydration and is lost.
+			s.logger.Warn(
+				ctx,
+				"aggregate writeback failed after durable event insert; step/aggregate status will self-heal on next Load but state_history audit entry for this transition is lost",
 				map[string]interface{}{
-					"correlation_id": correlationID,
-					"step":           stepName,
-					"component":      componentName,
-					"error":          err.Error(),
-				})
+					"correlation_id":     correlationID,
+					"step":               stepName,
+					"component":          componentName,
+					"error":              err.Error(),
+					"state_history_lost": true,
+				},
+			)
 		}
 		return nil
 	}
@@ -630,30 +639,42 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// Passing the override makes the INSERT SELECT use the literal status we just wrote to
 	// slip_component_states, keeping routing_slips consistent without a Load+Update cycle.
 	//
-	// Same best-effort semantics: the event is already durable; swallow cache write-back
-	// errors so a timeout here does not corrupt slip state from the caller's perspective.
+	// Same best-effort semantics: the event is already durable; swallow write-back errors.
+	// Step STATUS self-heals on next Load (recomputed by hydrateSlip from slip_component_states).
+	// The state_history audit entry for this transition is NOT rebuilt by hydration and is lost
+	// if this write-back fails.
 	if s.pipelineConfig != nil {
 		colName := s.queryBuilder.StepStatusColumn(stepName)
 		err := s.appendHistoryWithOverrides(ctx, correlationID, entry, stepStatusOverride{colName, status})
 		if err != nil {
-			s.logger.Warn(ctx,
-				"pipeline step history writeback failed after durable event insert; deferred to read-time hydration",
+			s.logger.Warn(
+				ctx,
+				"pipeline step history writeback failed after durable event insert; step status will self-heal on next Load but state_history audit entry for this transition is lost",
 				map[string]interface{}{
-					"correlation_id": correlationID,
-					"step":           stepName,
-					"error":          err.Error(),
-				})
+					"correlation_id":     correlationID,
+					"step":               stepName,
+					"error":              err.Error(),
+					"state_history_lost": true,
+				},
+			)
 		}
 		return nil
 	}
+	// Fallback: no pipelineConfig, so call AppendHistory directly. Best-effort: the event
+	// is already durable. Step STATUS self-heals on next Load (recomputed by hydrateSlip).
+	// The state_history audit entry for this transition is NOT rebuilt by hydration and is
+	// lost if this write-back fails.
 	if err := s.AppendHistory(ctx, correlationID, entry); err != nil {
-		s.logger.Warn(ctx,
-			"history writeback failed after durable event insert; deferred to read-time hydration",
+		s.logger.Warn(
+			ctx,
+			"history writeback failed after durable event insert; step status will self-heal on next Load but state_history audit entry for this transition is lost",
 			map[string]interface{}{
-				"correlation_id": correlationID,
-				"step":           stepName,
-				"error":          err.Error(),
-			})
+				"correlation_id":     correlationID,
+				"step":               stepName,
+				"error":              err.Error(),
+				"state_history_lost": true,
+			},
+		)
 	}
 	return nil
 }
