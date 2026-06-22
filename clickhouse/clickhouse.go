@@ -46,6 +46,14 @@ const (
 	DefaultMaxOpenConns    = 50
 	DefaultMaxIdleConns    = 10
 	DefaultConnMaxLifetime = 60 * time.Second
+
+	// defaultMaxExecutionTime caps the server-side wall-clock budget (in seconds)
+	// for any individual query. This prevents a slow aggregate write-back or
+	// expensive read-modify-write from blocking goroutines indefinitely when the
+	// caller's context has already been cancelled (e.g. slippy-api's 15 s step
+	// timeout). ClickHouse will return an exception rather than hanging; callers
+	// that treat write-backs as best-effort can ignore the resulting error.
+	defaultMaxExecutionTime = 300
 )
 
 // ResolvePoolSettings returns the connection-pool values to use, substituting
@@ -400,6 +408,14 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 			ConnMaxLifetime: lifetime,
 			MaxOpenConns:    maxOpen,
 			MaxIdleConns:    maxIdle,
+			// Bound every query's server-side execution time. Prevents a slow
+			// aggregate write-back from keeping a server thread busy after the
+			// calling goroutine's context has timed out (e.g. slippy-api 15s
+			// step deadline). The value is intentionally generous (5 min) —
+			// it guards against runaway queries, not against fast timeouts.
+			Settings: clickhouse.Settings{
+				"max_execution_time": defaultMaxExecutionTime,
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("error connecting to ClickHouse: %w", err)

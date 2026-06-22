@@ -587,11 +587,19 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	}
 
 	// Persist history and (where applicable) the aggregate status to routing_slips.
+	//
+	// The aggregate/cache write-back is BEST-EFFORT: insertComponentState above already
+	// durably recorded the step event in the conflict-free event-sourcing table. The
+	// routing_slips aggregate columns are a read-time cache — hydrateSlip recomputes
+	// every step/aggregate status from slip_component_states on every Load, so a
+	// lost or timed-out write-back self-heals on the next Load. Therefore any error
+	// from the write-back must NOT fail this call once the event insert has succeeded.
+	//
 	//   - componentName != "":  component step → aggregate write-back carries the history.
 	//   - IsAggregateStep:      aggregate step itself → aggregate write-back carries the history.
 	//   - otherwise:            pure pipeline step → call AppendHistory directly.
 	if componentName != "" || (s.pipelineConfig != nil && s.pipelineConfig.IsAggregateStep(stepName)) {
-		return s.updateAggregateStatusFromComponentStatesWithHistory(
+		if err := s.updateAggregateStatusFromComponentStatesWithHistory(
 			ctx,
 			correlationID,
 			stepName,
@@ -599,7 +607,19 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 			status,
 			insertedAt,
 			entry,
-		)
+		); err != nil {
+			// The event is durable; swallow the write-back error and let the next
+			// Load recompute aggregate status from slip_component_states.
+			s.logger.Warn(ctx,
+				"aggregate writeback failed after durable event insert; deferred to read-time hydration",
+				map[string]interface{}{
+					"correlation_id": correlationID,
+					"step":           stepName,
+					"component":      componentName,
+					"error":          err.Error(),
+				})
+		}
+		return nil
 	}
 
 	// Pure pipeline step: persist the history entry AND update the step-status column
@@ -609,11 +629,33 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// unit_tests_status = "running" from hydrateSlip's first pass over slip_component_states).
 	// Passing the override makes the INSERT SELECT use the literal status we just wrote to
 	// slip_component_states, keeping routing_slips consistent without a Load+Update cycle.
+	//
+	// Same best-effort semantics: the event is already durable; swallow cache write-back
+	// errors so a timeout here does not corrupt slip state from the caller's perspective.
 	if s.pipelineConfig != nil {
 		colName := s.queryBuilder.StepStatusColumn(stepName)
-		return s.appendHistoryWithOverrides(ctx, correlationID, entry, stepStatusOverride{colName, status})
+		err := s.appendHistoryWithOverrides(ctx, correlationID, entry, stepStatusOverride{colName, status})
+		if err != nil {
+			s.logger.Warn(ctx,
+				"pipeline step history writeback failed after durable event insert; deferred to read-time hydration",
+				map[string]interface{}{
+					"correlation_id": correlationID,
+					"step":           stepName,
+					"error":          err.Error(),
+				})
+		}
+		return nil
 	}
-	return s.AppendHistory(ctx, correlationID, entry)
+	if err := s.AppendHistory(ctx, correlationID, entry); err != nil {
+		s.logger.Warn(ctx,
+			"history writeback failed after durable event insert; deferred to read-time hydration",
+			map[string]interface{}{
+				"correlation_id": correlationID,
+				"step":           stepName,
+				"error":          err.Error(),
+			})
+	}
+	return nil
 }
 
 // AppendHistory adds a state history entry to the slip.
