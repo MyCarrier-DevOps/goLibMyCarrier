@@ -66,7 +66,8 @@ var (
 	// This sentinel is returned by the INSERT-time terminal-monotonicity gate that
 	// closes the I5 race (ADO #82468). The gate refuses:
 	//   - terminal → non-terminal (e.g. failed → running) — EXCEPT aborted → pending
-	//     (cascade-reset after upstream failure resolved, see executor.go:377).
+	//     (cascade-reset after upstream failure resolved, see the cascade-reset
+	//     loop in Client.checkPipelineCompletion in executor.go).
 	//   - terminal → same-terminal (e.g. failed → failed) — idempotency must be
 	//     handled at the HTTP layer (typically converted to 204 No Content).
 	//   - terminal → different-terminal (e.g. failed → aborted, completed → failed) —
@@ -75,7 +76,8 @@ var (
 	// The gate ALLOWS:
 	//   - empty event log (first write) — no monotonicity invariant to violate.
 	//   - prior non-terminal → anything.
-	//   - prior aborted → pending (cascade-reset, see executor.go:377 and
+	//   - prior aborted → pending (cascade-reset, see the cascade-reset loop in
+	//     Client.checkPipelineCompletion in executor.go and
 	//     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
 	//   - prior {failed, aborted, error, timeout, skipped} → completed
 	//     (operator/automation recovery, see slippy-api TestCompleteStep_AllowsRecoveryFromFailed).
