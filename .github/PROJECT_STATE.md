@@ -1455,11 +1455,19 @@ failed`) is REFUSED at library level for clean semantics; HTTP layer maps to
 ```text
    GATE flag | Behavior                                | Use case
    ----------+-----------------------------------------+-------------------------------
-   unset     | DEFAULT-OFF — gate returns nil silently | Rollback / pre-cutover
-   "false"   | Gate returns nil silently               | Explicit disable
-   "true"    | Gate enforces matrix; returns 409 on    | Production after Stage-3
-             | refused transitions                      | validation
+   unset     | DEFAULT-ON (fail-safe) — gate enforces  | Production default
+             | matrix; returns 409 on refused          |
+             | transitions                             |
+   "false"   | Gate returns nil silently               | Rollback / explicit disable
+   "true"    | Gate enforces matrix; returns 409 on    | Explicit enable (equivalent
+             | refused transitions                     | to unset)
 ```
+
+`gateEnabled()` (clickhouse_store.go) treats `SLIPPY_I5_GATE_ENABLED` as a
+fail-safe boolean: only the explicit string `"false"` disables the gate; any
+other value, including unset, leaves it enforcing. Earlier drafts of this
+doc described `unset` as DEFAULT-OFF — that was wrong. The deployed default
+is ON.
 
 Gate fails OPEN on transport/lookup errors (logged via `slog.WarnContext` with
 `correlation_id`, `step`, `component`, `error`). This prevents a CH outage
