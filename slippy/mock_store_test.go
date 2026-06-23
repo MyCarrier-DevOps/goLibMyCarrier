@@ -86,20 +86,20 @@ type MockStore struct {
 	CommitIndex map[string]string
 
 	// Call tracking
-	CreateCalls           []CreateCall
-	LoadCalls             []string
-	LoadByCommitCalls     []LoadByCommitCall
-	LoadLiveByCommitCalls []LoadByCommitCall
-	FindByCommitsCalls    []FindByCommitsCall
-	FindAllByCommitsCalls []FindAllByCommitsCall
-	UpdateCalls           []UpdateCall
-	UpdateStepCalls       []UpdateStepCall
-	UpdateComponentCalls  []UpdateComponentCall
-	AppendHistoryCalls    []AppendHistoryCall
-	SetImageTagCalls      []SetImageTagCall
-	UpdateSlipStatusCalls          []UpdateSlipStatusCall
+	CreateCalls                     []CreateCall
+	LoadCalls                       []string
+	LoadByCommitCalls               []LoadByCommitCall
+	LoadLiveByCommitCalls           []LoadByCommitCall
+	FindByCommitsCalls              []FindByCommitsCall
+	FindAllByCommitsCalls           []FindAllByCommitsCall
+	UpdateCalls                     []UpdateCall
+	UpdateStepCalls                 []UpdateStepCall
+	UpdateComponentCalls            []UpdateComponentCall
+	AppendHistoryCalls              []AppendHistoryCall
+	SetImageTagCalls                []SetImageTagCall
+	UpdateSlipStatusCalls           []UpdateSlipStatusCall
 	LatestStepStatusFromEventsCalls []LatestStepStatusFromEventsCall
-	CloseCalls                     int
+	CloseCalls                      int
 
 	// LatestStepStatusFromEventsFn lets tests inject a custom response per (corrID, step).
 	// When nil, the default response is ("", false, nil) — no event yet, do not block overlay.
