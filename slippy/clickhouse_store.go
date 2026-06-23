@@ -1083,6 +1083,15 @@ func isGateBypassed(step string) bool {
 //     are legitimate retry paths, we keep them REFUSED. If a real workflow
 //     pattern surfaces them, narrow the allow-list to add them then.
 //
+//     Deliberate divergence from STATE_MACHINE_V3.md: SMV3 §lines 15,20
+//     groups {failed, error, timeout} as a single "primary failure" class
+//     and contemplates an "error → running" recovery transition. We
+//     diverge from the spec here on empirical grounds — the 90d production
+//     sweep above found zero error→running rows. Adding error (and
+//     symmetrically skipped) to Rule 3 is a one-line allow-list extension
+//     once observability surfaces a legitimate case. See ADO #82468 plan
+//     v3 §C.3 for the basis.
+//
 // REFUSE all other terminal → {terminal, non-terminal} transitions including:
 //   - completed → anything (completed is absolutely final).
 //   - same-terminal idempotency (e.g. failed → failed) — HTTP layer handles idempotency.
