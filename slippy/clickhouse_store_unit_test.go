@@ -6635,3 +6635,121 @@ func TestBuildStepDetails_OverrideForUnknownColumn_NoPanic(t *testing.T) {
 var _ = sync.Mutex{}
 var _ = fmt.Sprintf
 var _ = chcol.NewJSON
+
+// TestUpdateStepWithHistory_WritebackErrorAfterEventInsert verifies the best-effort
+// writeback semantics: when insertComponentState succeeds but the subsequent aggregate
+// writeback (or pipeline-step history writeback) returns an error, UpdateStepWithHistory
+// must return nil — not propagate the writeback error.
+//
+// The event record is the authoritative source of truth; routing_slips is a cache that
+// hydrateSlip recomputes from slip_component_states on every Load, so a failed writeback
+// self-heals on the next read.
+func TestUpdateStepWithHistory_WritebackErrorAfterEventInsert(t *testing.T) {
+	const corrID = "corr-best-effort-writeback"
+	writebackErr := fmt.Errorf("simulated CH timeout on aggregate writeback")
+
+	// -- Subtest 1: component step (aggregate writeback path) -----------------
+	t.Run("component_step_writeback_error_returns_nil", func(t *testing.T) {
+		// Base mock: event-log insert succeeds; routing_slips insert fails.
+		base := createMockSessionForUpdates(corrID, "myorg/myrepo", "main", "abc123", SlipStatusInProgress, 1)
+		origExec := base.ExecWithArgsFunc
+		base.ExecWithArgsFunc = func(ctx context.Context, stmt string, args ...any) error {
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				return writebackErr
+			}
+			return origExec(ctx, stmt, args...)
+		}
+		store := NewClickHouseStoreFromSession(base, testPipelineConfig(), "ci")
+
+		entry := StateHistoryEntry{
+			Timestamp: time.Now(),
+			Step:      "builds",
+			Status:    StepStatusCompleted,
+			Actor:     "ci",
+		}
+
+		err := store.UpdateStepWithHistory(
+			context.Background(), corrID, "builds", "api", StepStatusCompleted, entry,
+		)
+		if err != nil {
+			t.Errorf("expected nil when writeback errors after durable event insert; got: %v", err)
+		}
+
+		// Confirm the event-log insert (slip_component_states) was still executed.
+		componentInserts := 0
+		for _, call := range base.ExecWithArgsCalls {
+			if strings.Contains(call.Stmt, TableSlipComponentStates) {
+				componentInserts++
+			}
+		}
+		if componentInserts != 1 {
+			t.Errorf("expected 1 slip_component_states insert, got %d", componentInserts)
+		}
+	})
+
+	// -- Subtest 2: insertComponentState failure must still propagate ----------
+	t.Run("event_insert_failure_propagates", func(t *testing.T) {
+		eventErr := fmt.Errorf("simulated CH failure on event insert")
+		base := createMockSessionForUpdates(corrID, "myorg/myrepo", "main", "abc123", SlipStatusInProgress, 1)
+		base.ExecWithArgsFunc = func(ctx context.Context, stmt string, args ...any) error {
+			if strings.Contains(stmt, TableSlipComponentStates) {
+				return eventErr
+			}
+			return nil
+		}
+		store := NewClickHouseStoreFromSession(base, testPipelineConfig(), "ci")
+
+		entry := StateHistoryEntry{
+			Timestamp: time.Now(),
+			Step:      "builds",
+			Status:    StepStatusCompleted,
+			Actor:     "ci",
+		}
+
+		err := store.UpdateStepWithHistory(
+			context.Background(), corrID, "builds", "api", StepStatusCompleted, entry,
+		)
+		if err == nil {
+			t.Error("expected error when event insert fails; got nil")
+		}
+	})
+
+	// -- Subtest 3: pure pipeline step writeback error returns nil -------------
+	t.Run("pure_pipeline_step_writeback_error_returns_nil", func(t *testing.T) {
+		base := createMockSessionForUpdates(corrID, "myorg/myrepo", "main", "abc123", SlipStatusInProgress, 1)
+		origExec := base.ExecWithArgsFunc
+		base.ExecWithArgsFunc = func(ctx context.Context, stmt string, args ...any) error {
+			if strings.Contains(stmt, "routing_slips") && strings.Contains(stmt, "INSERT") {
+				return writebackErr
+			}
+			return origExec(ctx, stmt, args...)
+		}
+		store := NewClickHouseStoreFromSession(base, testPipelineConfig(), "ci")
+
+		entry := StateHistoryEntry{
+			Timestamp: time.Now(),
+			Step:      "push_parsed",
+			Status:    StepStatusCompleted,
+			Actor:     "ci",
+		}
+
+		// "push_parsed" is a pure pipeline step (no component, not aggregate).
+		err := store.UpdateStepWithHistory(
+			context.Background(), corrID, "push_parsed", "", StepStatusCompleted, entry,
+		)
+		if err != nil {
+			t.Errorf("expected nil when pure-pipeline writeback errors after durable event insert; got: %v", err)
+		}
+
+		// Confirm the event-log insert still executed.
+		componentInserts := 0
+		for _, call := range base.ExecWithArgsCalls {
+			if strings.Contains(call.Stmt, TableSlipComponentStates) {
+				componentInserts++
+			}
+		}
+		if componentInserts != 1 {
+			t.Errorf("expected 1 slip_component_states insert, got %d", componentInserts)
+		}
+	})
+}

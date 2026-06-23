@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/viper"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -37,6 +38,46 @@ func Named(name string, value interface{}) driver.NamedValue {
 // This can be overridden in tests for faster execution.
 var DefaultRetryIntervals = []time.Duration{2 * time.Second, 3 * time.Second, 5 * time.Second}
 
+// Connection pool defaults. Applied when ClickhouseConfig leaves the field
+// zero-valued. ConnMaxLifetime is kept short so that stale connections behind
+// LBs/firewalls (which may silently half-close idle peers) are reaped quickly
+// rather than blocking the next request until TCP retransmission timeout.
+const (
+	DefaultMaxOpenConns    = 50
+	DefaultMaxIdleConns    = 10
+	DefaultConnMaxLifetime = 60 * time.Second
+
+	// defaultMaxExecutionTime caps the server-side wall-clock budget (in seconds)
+	// for any individual query. This prevents a slow aggregate write-back or
+	// expensive read-modify-write from blocking goroutines indefinitely when the
+	// caller's context has already been cancelled (e.g. slippy-api's 15 s step
+	// timeout). ClickHouse will return an exception rather than hanging; callers
+	// that treat write-backs as best-effort can ignore the resulting error.
+	defaultMaxExecutionTime = 300
+)
+
+// ResolvePoolSettings returns the connection-pool values to use, substituting
+// the package defaults for any zero-valued field in cfg. Exported so callers
+// (and tests) can introspect what will actually be applied to the driver.
+func ResolvePoolSettings(cfg *ClickhouseConfig) (maxOpen, maxIdle int, lifetime time.Duration) {
+	maxOpen = DefaultMaxOpenConns
+	maxIdle = DefaultMaxIdleConns
+	lifetime = DefaultConnMaxLifetime
+	if cfg == nil {
+		return maxOpen, maxIdle, lifetime
+	}
+	if cfg.MaxOpenConns > 0 {
+		maxOpen = cfg.MaxOpenConns
+	}
+	if cfg.MaxIdleConns > 0 {
+		maxIdle = cfg.MaxIdleConns
+	}
+	if cfg.ConnMaxLifetime > 0 {
+		lifetime = cfg.ConnMaxLifetime
+	}
+	return maxOpen, maxIdle, lifetime
+}
+
 // ErrNilViper is returned by ClickhouseLoadConfigFromViper when the caller
 // passes a nil *viper.Viper. Exported as a sentinel so callers can match it
 // with errors.Is rather than string comparison.
@@ -46,8 +87,17 @@ var ErrNilViper = errors.New("viper instance cannot be nil")
 // worth retrying) or permanent (e.g. syntax error, authentication failure).
 // Server-side exceptions (clickhouse.Exception) are treated as non-transient
 // since they indicate query or configuration problems that won't resolve on retry.
+//
+// Context cancellation errors (context.Canceled, context.DeadlineExceeded) are
+// also treated as non-transient: the caller has explicitly given up, so retrying
+// is wrong. Treating them as transient sends the wrapper into a retry loop whose
+// first select{} immediately fires ctx.Done(), producing the misleading
+// "operation cancelled after 0 retries" wrap that hides the actual cancellation.
 func isTransientError(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var exception *clickhouse.Exception
@@ -140,6 +190,12 @@ type ClickhouseConfig struct {
 	ChDatabase   string `mapstructure:"chdatabase"`
 	ChSkipVerify string `mapstructure:"chskipverify"`
 	ChPort       string `mapstructure:"chport"`
+
+	// Connection-pool tunables. Leave zero to inherit the package defaults
+	// (see DefaultMaxOpenConns, DefaultMaxIdleConns, DefaultConnMaxLifetime).
+	MaxOpenConns    int           `mapstructure:"maxopenconns"`
+	MaxIdleConns    int           `mapstructure:"maxidleconns"`
+	ConnMaxLifetime time.Duration `mapstructure:"connmaxlifetime"`
 }
 
 // LoadConfig loads the configuration from environment variables using Viper.
@@ -167,6 +223,15 @@ func ClickhouseLoadConfig() (*ClickhouseConfig, error) {
 	}
 	if err := v.BindEnv("chport", "CLICKHOUSE_PORT"); err != nil {
 		return nil, fmt.Errorf("failed to bind environment variable for chport: %w", err)
+	}
+	if err := v.BindEnv("maxopenconns", "CLICKHOUSE_MAX_OPEN_CONNS"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for maxopenconns: %w", err)
+	}
+	if err := v.BindEnv("maxidleconns", "CLICKHOUSE_MAX_IDLE_CONNS"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for maxidleconns: %w", err)
+	}
+	if err := v.BindEnv("connmaxlifetime", "CLICKHOUSE_CONN_MAX_LIFETIME"); err != nil {
+		return nil, fmt.Errorf("failed to bind environment variable for connmaxlifetime: %w", err)
 	}
 
 	// Read environment variables
@@ -201,8 +266,12 @@ func ClickhouseLoadConfigFromViper(v *viper.Viper) (*ClickhouseConfig, error) {
 
 	var ClickhouseConfig ClickhouseConfig
 
-	// Unmarshal viper values into the Config struct
-	if err := v.Unmarshal(&ClickhouseConfig); err != nil {
+	// Unmarshal viper values into the Config struct. The duration decode hook
+	// lets ConnMaxLifetime be set via env (e.g. CLICKHOUSE_CONN_MAX_LIFETIME=60s)
+	// since AutomaticEnv only produces strings.
+	if err := v.Unmarshal(&ClickhouseConfig, viper.DecodeHook(
+		mapstructure.StringToTimeDurationHookFunc(),
+	)); err != nil {
 		return nil, fmt.Errorf("unable to decode into struct, %w", err)
 	}
 
@@ -303,6 +372,7 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 	// Capture skipVerify by value so the DialContext closure does not retain
 	// a reference to the entire ClickhouseSession for the pool's lifetime.
 	skipVerify := chsession.skipVerify
+	maxOpen, maxIdle, lifetime := ResolvePoolSettings(ch)
 
 	return retryOperation(ctx, func() error {
 		conn, err := clickhouse.Open(&clickhouse.Options{
@@ -335,9 +405,17 @@ func (chsession *ClickhouseSession) Connect(ch *ClickhouseConfig, ctx context.Co
 					&tls.Config{InsecureSkipVerify: skipVerify},
 				)
 			},
-			ConnMaxLifetime: 5 * time.Minute,
-			MaxOpenConns:    10,
-			MaxIdleConns:    5,
+			ConnMaxLifetime: lifetime,
+			MaxOpenConns:    maxOpen,
+			MaxIdleConns:    maxIdle,
+			// Bound every query's server-side execution time. Prevents a slow
+			// aggregate write-back from keeping a server thread busy after the
+			// calling goroutine's context has timed out (e.g. slippy-api 15s
+			// step deadline). The value is intentionally generous (5 min) —
+			// it guards against runaway queries, not against fast timeouts.
+			Settings: clickhouse.Settings{
+				"max_execution_time": defaultMaxExecutionTime,
+			},
 		})
 		if err != nil {
 			return fmt.Errorf("error connecting to ClickHouse: %w", err)

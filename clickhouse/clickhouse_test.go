@@ -2037,6 +2037,26 @@ func TestIsTransientError(t *testing.T) {
 			}),
 			expected: false,
 		},
+		{
+			name:     "context.Canceled is NOT transient",
+			err:      context.Canceled,
+			expected: false,
+		},
+		{
+			name:     "context.DeadlineExceeded is NOT transient",
+			err:      context.DeadlineExceeded,
+			expected: false,
+		},
+		{
+			name:     "wrapped context.Canceled is NOT transient",
+			err:      fmt.Errorf("query: %w", context.Canceled),
+			expected: false,
+		},
+		{
+			name:     "wrapped context.DeadlineExceeded is NOT transient",
+			err:      fmt.Errorf("query: %w", context.DeadlineExceeded),
+			expected: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2045,6 +2065,116 @@ func TestIsTransientError(t *testing.T) {
 			assert.Equal(t, tt.expected, result)
 		})
 	}
+}
+
+// Test that retryOperation returns context errors immediately without entering
+// the retry loop. Previously, ctx.Canceled was classified as transient, sending
+// retryOperation into a loop whose first select{} fired ctx.Done() and produced
+// the misleading "operation cancelled after 0 retries: context canceled" wrap.
+func TestRetryOperation_FirstAttemptCanceled_ReturnsCanceled(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx := context.Background()
+	callCount := 0
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return context.Canceled
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, 1, callCount, "context.Canceled must not be retried")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "operation cancelled after",
+		"context errors must surface directly, not wrapped in misleading retry message")
+}
+
+func TestRetryOperation_FirstAttemptDeadlineExceeded_ReturnsDeadlineExceeded(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx := context.Background()
+	callCount := 0
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return context.DeadlineExceeded
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, 1, callCount, "context.DeadlineExceeded must not be retried")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.NotContains(t, err.Error(), "operation cancelled after")
+}
+
+func TestRetryOperation_WrappedContextCanceled_ReturnsImmediately(t *testing.T) {
+	defer setTestRetryIntervals()()
+
+	ctx := context.Background()
+	callCount := 0
+	wrapped := fmt.Errorf("clickhouse exec: %w", context.Canceled)
+
+	err := retryOperation(ctx, func() error {
+		callCount++
+		return wrapped
+	})
+
+	assert.Error(t, err)
+	assert.Equal(t, 1, callCount, "wrapped context.Canceled must not be retried")
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestResolvePoolSettings_Defaults(t *testing.T) {
+	maxOpen, maxIdle, lifetime := ResolvePoolSettings(&ClickhouseConfig{})
+	assert.Equal(t, DefaultMaxOpenConns, maxOpen)
+	assert.Equal(t, DefaultMaxIdleConns, maxIdle)
+	assert.Equal(t, DefaultConnMaxLifetime, lifetime)
+}
+
+func TestResolvePoolSettings_NilConfig(t *testing.T) {
+	maxOpen, maxIdle, lifetime := ResolvePoolSettings(nil)
+	assert.Equal(t, DefaultMaxOpenConns, maxOpen)
+	assert.Equal(t, DefaultMaxIdleConns, maxIdle)
+	assert.Equal(t, DefaultConnMaxLifetime, lifetime)
+}
+
+func TestResolvePoolSettings_Overrides(t *testing.T) {
+	maxOpen, maxIdle, lifetime := ResolvePoolSettings(&ClickhouseConfig{
+		MaxOpenConns:    25,
+		MaxIdleConns:    7,
+		ConnMaxLifetime: 2 * time.Minute,
+	})
+	assert.Equal(t, 25, maxOpen)
+	assert.Equal(t, 7, maxIdle)
+	assert.Equal(t, 2*time.Minute, lifetime)
+}
+
+func TestResolvePoolSettings_NegativeFallsBackToDefaults(t *testing.T) {
+	maxOpen, maxIdle, lifetime := ResolvePoolSettings(&ClickhouseConfig{
+		MaxOpenConns:    -1,
+		MaxIdleConns:    -1,
+		ConnMaxLifetime: -1 * time.Second,
+	})
+	assert.Equal(t, DefaultMaxOpenConns, maxOpen)
+	assert.Equal(t, DefaultMaxIdleConns, maxIdle)
+	assert.Equal(t, DefaultConnMaxLifetime, lifetime)
+}
+
+func TestClickhouseLoadConfig_PoolEnvOverrides(t *testing.T) {
+	t.Setenv("CLICKHOUSE_HOSTNAME", "host")
+	t.Setenv("CLICKHOUSE_USERNAME", "user")
+	t.Setenv("CLICKHOUSE_PASSWORD", "pass")
+	t.Setenv("CLICKHOUSE_DATABASE", "db")
+	t.Setenv("CLICKHOUSE_PORT", "9440")
+	t.Setenv("CLICKHOUSE_SKIP_VERIFY", "false")
+	t.Setenv("CLICKHOUSE_MAX_OPEN_CONNS", "33")
+	t.Setenv("CLICKHOUSE_MAX_IDLE_CONNS", "11")
+	t.Setenv("CLICKHOUSE_CONN_MAX_LIFETIME", "90s")
+
+	cfg, err := ClickhouseLoadConfig()
+	require.NoError(t, err)
+	assert.Equal(t, 33, cfg.MaxOpenConns)
+	assert.Equal(t, 11, cfg.MaxIdleConns)
+	assert.Equal(t, 90*time.Second, cfg.ConnMaxLifetime)
 }
 
 func TestClickhouseSession_Ping_NilConnection(t *testing.T) {
