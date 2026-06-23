@@ -753,7 +753,12 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// if this write-back fails.
 	if s.pipelineConfig != nil {
 		colName := s.queryBuilder.StepStatusColumn(stepName)
-		if err := s.appendHistoryWithOverrides(ctx, correlationID, entry, StepStatusOverride{colName, status}); err != nil {
+		if err := s.appendHistoryWithOverrides(
+			ctx,
+			correlationID,
+			entry,
+			StepStatusOverride{colName, status},
+		); err != nil {
 			s.logger.Warn(
 				ctx,
 				"pipeline step history writeback failed after durable event insert; step status will self-heal on next Load but state_history audit entry for this transition is lost",
