@@ -1016,10 +1016,10 @@ func (s *ClickHouseStore) latestComponentStateStatus(
 	return StepStatus(statusStr), true, nil
 }
 
-// gateBypassSteps lists step names that bypass enforceTerminalMonotonicity.
-// Justification per step is documented inline. Adding a step here is a
-// security/correctness decision — require code review citing the specific
-// callsite that needs the bypass.
+// isGateBypassed reports whether the given step name bypasses
+// enforceTerminalMonotonicity. Justification per step is documented inline.
+// Adding a step here is a security/correctness decision — require code review
+// citing the specific callsite that needs the bypass.
 //
 // Defensive belt-and-braces: empirical 90d ClickHouse probe shows ZERO
 // terminal push_parsed rows landing under push_parsed in production today —
@@ -1027,13 +1027,22 @@ func (s *ClickHouseStore) latestComponentStateStatus(
 // path) that may write completed/failed under push_parsed before the dedup
 // lock would intercept. Keeping the bypass in code prevents an accidental
 // blockage if the upstream pattern changes.
-var gateBypassSteps = map[string]bool{
+//
+// Implemented as a function (not a package-level map) so the allow-list is
+// immutable at runtime — tests and unrelated packages cannot mutate it by
+// accident.
+func isGateBypassed(step string) bool {
+	switch step {
 	// push_parsed is reset to running by handlePushRetry (push.go:678) on
 	// duplicate push deduplication. The reset is intentional and the prior
 	// state MAY be terminal (completed) from the first push. No I5 exposure
 	// because handlePushRetry runs single-threaded behind the dedup_lock.go
 	// repo:sha lock — no concurrent writer can race against it.
-	"push_parsed": true,
+	case "push_parsed":
+		return true
+	default:
+		return false
+	}
 }
 
 // isRecoveryAllowed encodes the explicit allow-list of terminal → X transitions
@@ -1043,7 +1052,8 @@ var gateBypassSteps = map[string]bool{
 // Allow rules (precondition: prior is terminal):
 //
 //  1. prior == aborted AND incoming == pending
-//     → cascade-reset after resolved upstream failure (see executor.go:376,
+//     → cascade-reset after resolved upstream failure (see the cascade-reset
+//     loop in Client.checkPipelineCompletion in executor.go, and
 //     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
 //
 //  2. prior IN {failed, aborted, error, timeout, skipped} AND incoming == completed
@@ -1166,8 +1176,14 @@ func (s *ClickHouseStore) enforceTerminalMonotonicity(
 	if !gateEnabled() {
 		return nil
 	}
-	// Step-level bypass (defensive, see gateBypassSteps godoc).
-	if gateBypassSteps[stepName] {
+	// Step-level bypass (defensive, see isGateBypassed godoc).
+	//
+	// The componentName == "" guard enforces that the bypass only applies to
+	// pure pipeline-step writes (the case handlePushRetry actually exercises).
+	// push_parsed has no components today, but defense-in-depth: if a future
+	// drift in handlePushRetry or any other producer attempts a component-level
+	// write under push_parsed, the gate still fires.
+	if isGateBypassed(stepName) && componentName == "" {
 		return nil
 	}
 

@@ -451,15 +451,16 @@ func TestEnforceTerminalMonotonicity_PriorTerminal_IncomingTerminal_DifferentNon
 
 // TestEnforceTerminalMonotonicity_PushParsedBypass covers §B.15.
 // Seed terminal completed for push_parsed; expect the gate to ALLOW any
-// incoming status (including running) because push_parsed is on
-// gateBypassSteps. The CH pre-flight query MUST NOT be issued at all.
+// incoming status (including running) because push_parsed is bypassed by
+// isGateBypassed when componentName == "". The CH pre-flight query MUST NOT
+// be issued at all.
 func TestEnforceTerminalMonotonicity_PushParsedBypass(t *testing.T) {
 	session := &clickhousetest.MockSession{
 		// Configure the row to return "completed" so that IF the bypass were
 		// missing, the gate would refuse the running incoming. With the bypass
 		// in place, QueryRow must not be called at all.
 		QueryRowFunc: func(_ context.Context, _ string, _ ...any) driver.Row {
-			t.Fatal("gate must NOT issue QueryRow for push_parsed (gateBypassSteps short-circuit)")
+			t.Fatal("gate must NOT issue QueryRow for push_parsed (isGateBypassed short-circuit)")
 			return mockGateRow("completed")
 		},
 	}
@@ -474,6 +475,42 @@ func TestEnforceTerminalMonotonicity_PushParsedBypass(t *testing.T) {
 			)
 			if err != nil {
 				t.Errorf("push_parsed bypass: expected nil for any incoming, got %v", err)
+			}
+		})
+	}
+}
+
+// TestEnforceTerminalMonotonicity_PushParsedBypass_ComponentNameGated proves
+// that the bypass for push_parsed only applies when componentName == "".
+// push_parsed has no components today, but defense-in-depth: a component-level
+// write under push_parsed (e.g. future drift in handlePushRetry or any other
+// producer) MUST still go through the gate. Otherwise an attacker or
+// regression could silently overwrite a terminal component-level status by
+// routing the write through the push_parsed step name.
+func TestEnforceTerminalMonotonicity_PushParsedBypass_ComponentNameGated(t *testing.T) {
+	// Seed terminal "completed" so the gate would refuse a running incoming
+	// if it actually runs (i.e. bypass does NOT apply).
+	session := gateMockSession(string(StepStatusCompleted))
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+
+	err := store.enforceTerminalMonotonicity(
+		context.Background(), "corr-pushparsed-component", "push_parsed", "ui", StepStatusRunning,
+	)
+	if !errors.Is(err, ErrTerminalAlreadyExists) {
+		t.Fatalf("push_parsed with non-empty componentName must NOT be bypassed; expected ErrTerminalAlreadyExists, got %v", err)
+	}
+}
+
+// TestIsGateBypassed_PushParsed pins the allow-list. Tightening this list is a
+// security-relevant change and the test exists to make the diff visible in review.
+func TestIsGateBypassed_PushParsed(t *testing.T) {
+	if !isGateBypassed("push_parsed") {
+		t.Fatal("push_parsed must be on the gate-bypass allow-list")
+	}
+	for _, step := range []string{"build", "unit_tests", "dev_deploy", "", "PUSH_PARSED"} {
+		t.Run(step, func(t *testing.T) {
+			if isGateBypassed(step) {
+				t.Errorf("step %q must NOT be on the gate-bypass allow-list", step)
 			}
 		})
 	}
@@ -524,7 +561,8 @@ func TestEnforceTerminalMonotonicity_CHScanError_FailsOpen(t *testing.T) {
 
 // TestEnforceTerminalMonotonicity_CascadeReset_AbortedToPending_Allowed
 // — closes DA-v2 CRIT-V2-1. End-to-end proof that the cascade-reset path
-// (executor.go:377) is NOT blocked by the gate. Without the rule 1 cell in
+// (Client.checkPipelineCompletion in executor.go) is NOT blocked by the gate.
+// Without the rule 1 cell in
 // isRecoveryAllowed, this transition would fail and leave aborted steps
 // orphaned on resolved failures.
 func TestEnforceTerminalMonotonicity_CascadeReset_AbortedToPending_Allowed(t *testing.T) {

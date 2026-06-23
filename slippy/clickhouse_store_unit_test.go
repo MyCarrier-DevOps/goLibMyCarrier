@@ -1762,7 +1762,7 @@ func TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost(t *testing.T) {
 		t.Errorf("expected 2 ExecWithArgs calls (one per step), got %d", len(mockSession.ExecWithArgsCalls))
 	}
 	// QueryRow expected: 1 from the I5 terminal-monotonicity gate pre-flight for
-	// dev_deploy (push_parsed bypasses the gate via gateBypassSteps). No
+	// dev_deploy (push_parsed bypasses the gate via isGateBypassed). No
 	// routing_slips Load happens — UpdateStep remains a blind insert with the
 	// gate's argMax point-lookup against slip_component_states as the only read.
 	if len(mockSession.QueryRowCalls) != 1 {

@@ -21,7 +21,7 @@
 //   8.  PriorAborted_IncomingCompleted_Recovery — covered by allow-list rule 2.
 //   9.  CrossTerminalSwap_Refused              — failed → aborted → 409.
 //  10.  ComponentScope_Independent             — component-level row, gate isolates per (step, component).
-//  11.  PushParsedBypass_TerminalToRunning     — gateBypassSteps short-circuits push_parsed.
+//  11.  PushParsedBypass_TerminalToRunning     — isGateBypassed short-circuits push_parsed.
 //  12.  UpdateStepWithHistory_GatedPath        — gate runs from UpdateStepWithHistory entry.
 //  13.  SetComponentImageTag_Exempt            — §B.5 — image-tag path NOT gated.
 //  14.  ErrorPropagatesAsErrTerminalAlreadyExists — errors.Is sentinel check.
@@ -329,7 +329,7 @@ func TestI5_Option1_InsertComponentStateGate(t *testing.T) {
 		corrID := freshCorrID("opt1-11")
 		seedTerminal(t, corrID, "push_parsed", "", StepStatusCompleted)
 		// Without the bypass, this would refuse — but push_parsed is bypassed
-		// per gateBypassSteps to keep handlePushRetry working.
+		// per isGateBypassed to keep handlePushRetry working.
 		if err := store.UpdateStep(ctx, corrID, "push_parsed", "", StepStatusRunning); err != nil {
 			t.Fatalf("push_parsed bypass: completed → running must be allowed; got %v", err)
 		}
