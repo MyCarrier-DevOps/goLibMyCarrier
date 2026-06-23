@@ -424,35 +424,10 @@ func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, comm
 func (s *ClickHouseStore) LatestStepStatusFromEvents(
 	ctx context.Context, correlationID, step string,
 ) (StepStatus, bool, error) {
-	query := fmt.Sprintf(`
-		SELECT argMax(status, %s)
-		FROM %s.%s
-		WHERE correlation_id = ?
-		  AND step           = ?
-		  AND component      = ''
-		GROUP BY correlation_id
-	`, componentEventSortKeyNoImageTag, s.database, TableSlipComponentStates)
-
-	row := s.session.QueryRow(ctx, query, correlationID, step)
-	if row == nil {
-		return "", false, fmt.Errorf(
-			"LatestStepStatusFromEvents: query returned nil row for %s/%s",
-			correlationID, step,
-		)
-	}
-	var statusStr string
-	if err := row.Scan(&statusStr); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", false, nil
-		}
-		return "", false, fmt.Errorf("LatestStepStatusFromEvents: %w", err)
-	}
-	if statusStr == "" {
-		// argMax can yield empty string when the GROUP BY collapses to a single
-		// row whose status column is the zero value. Treat as "no signal".
-		return "", false, nil
-	}
-	return StepStatus(statusStr), true, nil
+	// Pipeline-level rows have component="" — delegate to the component-aware
+	// companion to avoid duplicating the argMax point-lookup and its scan/error
+	// handling. See latestComponentStateStatus.
+	return s.latestComponentStateStatus(ctx, correlationID, step, "")
 }
 
 // FindByCommits finds a slip matching any commit in the ordered list.

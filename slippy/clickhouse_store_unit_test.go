@@ -6223,22 +6223,29 @@ func TestLatestStepStatusFromEvents_QueryShape(t *testing.T) {
 	if !strings.Contains(capturedQuery, "argMax(status, ") {
 		t.Errorf("expected query to use argMax(status, …); got:\n%s", capturedQuery)
 	}
-	if !strings.Contains(capturedQuery, "component      = ''") {
-		t.Errorf("expected query to filter component=''; got:\n%s", capturedQuery)
+	// After the LatestStepStatusFromEvents → latestComponentStateStatus
+	// delegation refactor, the component filter is parameterized (`AND component
+	// = ?`) rather than literal. The pipeline-level invariant is preserved by
+	// passing "" as the component arg — asserted below in capturedArgs.
+	if !strings.Contains(capturedQuery, "component      = ?") {
+		t.Errorf("expected query to filter component via parameter; got:\n%s", capturedQuery)
 	}
 	if !strings.Contains(capturedQuery, "GROUP BY correlation_id") {
 		t.Errorf("expected GROUP BY correlation_id; got:\n%s", capturedQuery)
 	}
 
-	// Args order: correlationID, step.
-	if len(capturedArgs) < 2 {
-		t.Fatalf("expected at least 2 args, got %d", len(capturedArgs))
+	// Args order (post-delegation): correlationID, step, component="".
+	if len(capturedArgs) < 3 {
+		t.Fatalf("expected at least 3 args (corrID, step, component), got %d", len(capturedArgs))
 	}
 	if capturedArgs[0] != "corr-1" {
 		t.Errorf("expected first arg=corr-1, got %v", capturedArgs[0])
 	}
 	if capturedArgs[1] != "unit_tests" {
 		t.Errorf("expected second arg=unit_tests, got %v", capturedArgs[1])
+	}
+	if capturedArgs[2] != "" {
+		t.Errorf("expected third arg=\"\" (pipeline-level component), got %v", capturedArgs[2])
 	}
 }
 
