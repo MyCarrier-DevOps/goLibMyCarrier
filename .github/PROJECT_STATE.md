@@ -1453,21 +1453,22 @@ failed`) is REFUSED at library level for clean semantics; HTTP layer maps to
 ### Rollback flag matrix (`SLIPPY_I5_GATE_ENABLED`)
 
 ```text
-   GATE flag | Behavior                                | Use case
-   ----------+-----------------------------------------+-------------------------------
-   unset     | DEFAULT-ON (fail-safe) — gate enforces  | Production default
-             | matrix; returns 409 on refused          |
-             | transitions                             |
-   "false"   | Gate returns nil silently               | Rollback / explicit disable
-   "true"    | Gate enforces matrix; returns 409 on    | Explicit enable (equivalent
-             | refused transitions                     | to unset)
+   GATE flag             | Behavior                                | Use case
+   ----------------------+-----------------------------------------+-------------------------------
+   unset OR unparseable  | DEFAULT-ON (fail-safe) — gate enforces  | Production default;
+                         | matrix; returns 409 on refused          | unparseable values
+                         | transitions                             | fail-safe ON
+   "false" / "0" / "f"   | Gate returns nil silently               | Rollback / explicit disable
+   (any ParseBool-false) |                                         |
+   "true" / "1" / "t"    | Gate enforces matrix; returns 409 on    | Explicit enable (equivalent
+   (any ParseBool-true)  | refused transitions                     | to unset)
 ```
 
 `gateEnabled()` (clickhouse_store.go) treats `SLIPPY_I5_GATE_ENABLED` as a
-fail-safe boolean: only the explicit string `"false"` disables the gate; any
-other value, including unset, leaves it enforcing. Earlier drafts of this
-doc described `unset` as DEFAULT-OFF — that was wrong. The deployed default
-is ON.
+fail-safe boolean: only any `strconv.ParseBool`-false value (`false`, `0`,
+`False`, `f`, …) disables the gate; any other value, including unset or
+unparseable, leaves it enforcing. Earlier drafts of this doc described
+`unset` as DEFAULT-OFF — that was wrong. The deployed default is ON.
 
 Gate fails OPEN on transport/lookup errors (logged via `slog.WarnContext` with
 `correlation_id`, `step`, `component`, `error`). This prevents a CH outage

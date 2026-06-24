@@ -974,7 +974,7 @@ func (s *ClickHouseStore) latestComponentStateStatus(
 	row := s.session.QueryRow(ctx, query, correlationID, stepName, componentName)
 	if row == nil {
 		return "", false, fmt.Errorf(
-			"latestComponentStateStatus: query returned nil row for %s/%s/%s",
+			"latestComponentStateStatus: query returned nil row for %s/%s/component=%q",
 			correlationID, stepName, componentName,
 		)
 	}
@@ -1058,14 +1058,16 @@ func isGateBypassed(step string) bool {
 //     are legitimate retry paths, we keep them REFUSED. If a real workflow
 //     pattern surfaces them, narrow the allow-list to add them then.
 //
-//     Deliberate divergence from STATE_MACHINE_V3.md: SMV3 §lines 15,20
-//     groups {failed, error, timeout} as a single "primary failure" class
-//     and contemplates an "error → running" recovery transition. We
-//     diverge from the spec here on empirical grounds — the 90d production
-//     sweep above found zero error→running rows. Adding error (and
-//     symmetrically skipped) to Rule 3 is a one-line allow-list extension
-//     once observability surfaces a legitimate case. See ADO #82468 plan
-//     v3 §C.3 for the basis.
+//     Deliberate divergence from STATE_MACHINE_V3.md: SMV3 §lines 15, 20,
+//     47, 395 (glossary primary-failure class, the `failed → running →
+//     completed` recovery contract on line 47, and the symmetric recovery
+//     branch language on line 395) group {failed, error, timeout} as a
+//     single "primary failure" class and contemplate an "error → running"
+//     recovery transition. We diverge from the spec here on empirical
+//     grounds — the 90d production sweep above found zero error→running
+//     rows. Adding error (and symmetrically skipped) to Rule 3 is a
+//     one-line allow-list extension once observability surfaces a
+//     legitimate case. See ADO #82468 plan v3 §C.3 for the basis.
 //
 // REFUSE all other terminal → {terminal, non-terminal} transitions including:
 //   - completed → anything (completed is absolutely final).
