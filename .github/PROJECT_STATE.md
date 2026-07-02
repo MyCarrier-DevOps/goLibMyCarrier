@@ -1279,39 +1279,52 @@ documents the full three-tier architecture (lock + R1 overlay + this gate).
 
 ### Pre-fix bug (slip 436cc68c — production race)
 
+**Evidenced mechanism — single-request mixed-staleness write-back:**
+
 ```text
-                  Pod A (ci_runner_1)                 Pod B (ci_runner_2)
-                  -------------------                 -------------------
-   t0             POST /v1/.../complete (unit_tests)
-                    │
-                    │  store.UpdateStep(corrID,
-                    │       "unit_tests", "", COMPLETED)
-                    │    └─ insertComponentState(...)
-                    │         INSERT ... wait_for_async_insert=0
-                    │         (queued; not yet visible)
-   t1                                                  POST /v1/.../start (unit_tests)
-                                                          │  store.UpdateStep(corrID,
-                                                          │       "unit_tests", "",
-                                                          │       RUNNING)
-                                                          │    └─ insertComponentState(...)
-                                                          │         INSERT ... (queued)
-   t2             (Pod A INSERT flushes)
-   t3                                                  (Pod B INSERT flushes; same µs)
+   t0  POST /v1/.../complete (unit_tests)  ← one HTTP request, one pod
 
-   POST-flush slip_component_states (event log):
-     ts=t2  status=completed  (Pod A)
-     ts=t3  status=running    (Pod B)   <-- argMax winner!
+        ├─ insertAtomicHistoryUpdate(...)
+        │    INSERT correct row: version .524, unit_tests_status=completed  (Writer A)
+        │    (argMax winner at this point)
+        │
+        └─ hydrateAndPersist(...)
+             │
+             ├─ Load(corrID)                    ← mixed-staleness snapshot
+             │    routing_slips        read: FRESH  (state_history ends with "completed"
+             │                                        at 03:06:21.371963195)
+             │    slip_component_states read: STALE (status=running)
+             │
+             │  in-memory: slip.Steps["unit_tests"].Status     = running  (stale)
+             │             slip.Steps["unit_tests"].CompletedAt = 03:06:21.371963195 (fresh)
+             │
+             ├─ overlayPipelineStep(...)         ← bypassed
+             │    caller=completed, event-log=completed → equal-terminal branch
+             │    Guard 2: writtenAt(~.371962).After(CompletedAt(.371963195)) → false by ~1.2µs
+             │    → applied=false → no StepStatusOverride emitted
+             │
+             └─ Store().Update(slip) → insertAtomicUpdateWithVersions(...)
+                  INSERT stale row: version .688, unit_tests_status=running  (Writer B, +164 ms)
 
-   ROUTING TABLE
-     routing_slips.unit_tests_status = running   (terminal regression)
-     routing_slips.status            = in_progress   (slip stuck forever)
+   routing_slips argMax(version) winner: .688 → unit_tests_status=running
+   slip stuck permanently in_progress                              ← terminal regression
 ```
 
-**Root cause:** ClickHouse async-insert visibility race + no INSERT-time
-serialization. Two concurrent writers each read an empty/stale event log, both
-INSERT, and `argMax(ts)` deterministically picks the later (non-terminal) write
-as the "current" status — flipping a terminal `completed` step back to
-`running`.
+**Root cause:** ONE request whose `hydrateAndPersist` `Load` read a
+mixed-staleness snapshot — `routing_slips` FRESH + `slip_component_states`
+STALE. The overlay Guard 2 (`writtenAt.After(*step.CompletedAt)`) failed by
+~1.2 µs because `CompletedAt` was populated from the fresh `routing_slips`
+history-entry timestamp, not the second-granularity value assumed during the
+RCA. The stale in-memory `running` status was written back wholesale via
+`Update`/`insertAtomicUpdateWithVersions` — **a path the gate does NOT guard**.
+
+**Refuted variant (two-pod event-race):** An earlier narrative described two
+pods — one POSTing `/complete`, one POSTing `/start` — with `argMax` picking a
+later `running` INSERT as the winner. Trace evidence (single HTTP request,
+byte-identical `state_history` across both written rows, no concurrent `/start`
+entry in the event log) refuted this. See
+`standup-notes/2026/06/rca-stuck-slip-436cc68c-writer-race.md` §devils-advocate,
+Claim F: REFUTED.
 
 ### Layer 1 — `enforceTerminalMonotonicity` decision flow
 
@@ -1476,13 +1489,38 @@ from blocking all writes.
 
 ### Companion: slippy-api defense-in-depth
 
+**Layer-scope summary:**
+
+- **This gate (Layer 1)** is wired at `UpdateStep` / `UpdateStepWithHistory` →
+  `insertComponentState` — the **event-INSERT path only**. It closes the
+  *late-StartStep* and *terminal-regression event* class: a concurrent `/start`
+  INSERT arriving after a `/complete` INSERT is now refused with 409. It does
+  **not** guard `Update` / `insertAtomicUpdateWithVersions` or any
+  library-internal aggregate write-back (`updateAggregateStatusFromComponentStates*`).
+
+- **The evidenced 436cc68c aggregate-path variant** (single-request
+  mixed-staleness write-back through `hydrateAndPersist`) is not closed by this
+  gate. It is:
+  - **Narrowed** by the `wait_for_async_insert=1` (`w4ai`) commit-order
+    inversion asserted by slippy-api PR #39, which makes the cross-table
+    staleness inversion ~10–50× rarer.
+  - **Closed** by the slippy-api overlay pin (Layer 2, hardened per audit
+    `standup-notes/2026/07/i5-fable-audit.md §F`): when the event-log SELECT
+    returns `found` with no error, `overlayPipelineStep` must force-apply
+    `resolved = eventStatus` unconditionally, bypassing the
+    `writtenAt`/`CompletedAt` µs-race.
+
 The gate alone CANNOT serialize same-microsecond INSERTs (both writers may see
 prior=empty). slippy-api PR #39 adds:
 - TIER 1: per-correlationID Dragonfly lock (`withCorrIDLock`) — closes the
-  Load → mutate → Update race outside the library.
-- TIER 2: R1 overlay event-log-validated guard in `hydrateAndPersist`.
-- TIER 3 (this PR): goLib INSERT-time monotonicity gate — last-mile invariant
-  defense even if both TIERs above fail.
+  multi-writer aggregate write-back race (`Update`/`insertAtomicUpdateWithVersions`
+  concurrent with another writer).
+- TIER 2: R1 overlay event-log-validated guard in `hydrateAndPersist` — closes
+  the single-writer mixed-staleness variant (the evidenced 436cc68c mechanism)
+  when hardened per audit recommendation.
+- TIER 3 (this PR): goLib INSERT-time monotonicity gate — closes the
+  terminal-regression event class; last-mile event-path defense even if TIER 1
+  and TIER 2 above fail.
 
 ## Related
 
