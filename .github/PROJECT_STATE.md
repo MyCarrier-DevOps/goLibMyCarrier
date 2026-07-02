@@ -1268,3 +1268,264 @@ Discovered April 29, 2026. Full detail and fix status in `slippy/DISCREPANCIES.m
 - [ ] CLI tooling for slippy operations (manual slip inspection, cleanup)
 - [ ] Additional logger adapters beyond Zap
 - [ ] Implement `normalizeRepository()` for fork handling
+
+---
+
+## I5 race resolution — goLib monotonicity gate (Layer 1)
+
+ADO #82468 — terminal-monotonicity invariant enforced at the `slippy/clickhouse_store.go`
+INSERT boundary. This file documents the *library-layer* contribution; the slippy-api PR
+documents the full three-tier architecture (lock + R1 overlay + this gate).
+
+### Pre-fix bug (slip 436cc68c — production race)
+
+**Evidenced mechanism — single-request mixed-staleness write-back:**
+
+```text
+   t0  POST /v1/.../complete (unit_tests)  ← one HTTP request, one pod
+
+        ├─ insertAtomicHistoryUpdate(...)
+        │    INSERT correct row: version .524, unit_tests_status=completed  (Writer A)
+        │    (argMax winner at this point)
+        │
+        └─ hydrateAndPersist(...)
+             │
+             ├─ Load(corrID)                    ← mixed-staleness snapshot
+             │    routing_slips        read: FRESH  (state_history ends with "completed"
+             │                                        at 03:06:21.371963195)
+             │    slip_component_states read: STALE (status=running)
+             │
+             │  in-memory: slip.Steps["unit_tests"].Status     = running  (stale)
+             │             slip.Steps["unit_tests"].CompletedAt = 03:06:21.371963195 (fresh)
+             │
+             ├─ overlayPipelineStep(...)         ← bypassed
+             │    caller=completed, event-log=completed → equal-terminal branch
+             │    Guard 2: writtenAt(~.371962).After(CompletedAt(.371963195)) → false by ~1.2µs
+             │    → applied=false → no StepStatusOverride emitted
+             │
+             └─ Store().Update(slip) → insertAtomicUpdateWithVersions(...)
+                  INSERT stale row: version .688, unit_tests_status=running  (Writer B, +164 ms)
+
+   routing_slips argMax(version) winner: .688 → unit_tests_status=running
+   slip stuck permanently in_progress                              ← terminal regression
+```
+
+**Root cause:** ONE request whose `hydrateAndPersist` `Load` read a
+mixed-staleness snapshot — `routing_slips` FRESH + `slip_component_states`
+STALE. The overlay Guard 2 (`writtenAt.After(*step.CompletedAt)`) failed by
+~1.2 µs because `CompletedAt` was populated from the fresh `routing_slips`
+history-entry timestamp, not the second-granularity value assumed during the
+RCA. The stale in-memory `running` status was written back wholesale via
+`Update`/`insertAtomicUpdateWithVersions` — **a path the gate does NOT guard**.
+
+**Refuted variant (two-pod event-race):** An earlier narrative described two
+pods — one POSTing `/complete`, one POSTing `/start` — with `argMax` picking a
+later `running` INSERT as the winner. Trace evidence (single HTTP request,
+byte-identical `state_history` across both written rows, no concurrent `/start`
+entry in the event log) refuted this. See
+`standup-notes/2026/06/rca-stuck-slip-436cc68c-writer-race.md` §devils-advocate,
+Claim F: REFUTED.
+
+### Layer 1 — `enforceTerminalMonotonicity` decision flow
+
+Gate is invoked from `UpdateStep` (`clickhouse_store.go:612`) and
+`UpdateStepWithHistory` (`:673`) BEFORE `insertComponentState`. `SetComponentImageTag`
+(`:881`) is intentionally exempt (out-of-band metadata).
+
+```text
+                  enforceTerminalMonotonicity(corrID, step, component, incoming)
+                  ─────────────────────────────────────────────────────────────
+                                          │
+                          SLIPPY_I5_GATE_ENABLED ?
+                                          │
+                            ┌─────────────┴─────────────┐
+                           no                          yes
+                            │                            │
+                       return nil               gateBypassSteps[step] ?
+                       (rollback)                        │
+                                            ┌───────────┴───────────┐
+                                          yes (push_parsed)         no
+                                            │                       │
+                                       return nil          latestComponentStateStatus()
+                                       (§B.15 bypass)                │
+                                                         ┌──────────┴──────────┐
+                                                      err / not-found        found
+                                                         │                    │
+                                                  return nil           prior.IsTerminal() ?
+                                                  (first-write or fail-open)  │
+                                                                ┌─────────────┴─────────────┐
+                                                               no                          yes
+                                                                │                            │
+                                                          return nil          isRecoveryAllowed(prior, incoming) ?
+                                                          (non-terminal prior:                 │
+                                                          always allowed)        ┌────────────┴────────────┐
+                                                                                yes                       no
+                                                                                  │                        │
+                                                                            return nil         return ErrTerminalAlreadyExists
+                                                                            (cascade-reset    (caller maps to 409 in
+                                                                            or recovery)      slippy-api mapWriteError)
+```
+
+#### 81-cell allow-list matrix (StepStatus × StepStatus, full 9×9)
+
+Non-terminal: `pending`, `held`, `running`. Terminal: `completed`, `failed`,
+`error`, `aborted`, `timeout`, `skipped`.
+
+##### Non-terminal prior × all incoming (3 × 9 = 27 cells) — ALL ALLOW
+
+```text
+   prior \ incoming | pending | held | running | completed | failed | error | aborted | timeout | skipped
+   -----------------+---------+------+---------+-----------+--------+-------+---------+---------+--------
+   pending          | ALLOW   | ALLOW| ALLOW   | ALLOW     | ALLOW  | ALLOW | ALLOW   | ALLOW   | ALLOW
+   held             | ALLOW   | ALLOW| ALLOW   | ALLOW     | ALLOW  | ALLOW | ALLOW   | ALLOW   | ALLOW
+   running          | ALLOW   | ALLOW| ALLOW   | ALLOW     | ALLOW  | ALLOW | ALLOW   | ALLOW   | ALLOW
+```
+
+Rationale: non-terminal priors have no monotonicity invariant to violate.
+
+##### Terminal prior × non-terminal incoming (6 × 3 = 18 cells)
+
+```text
+   prior \ incoming | pending                 | held    | running
+   -----------------+-------------------------+---------+----------------------
+   completed        | REFUSE                  | REFUSE  | REFUSE
+   failed           | REFUSE                  | REFUSE  | ALLOW (Argo retry)
+   error            | REFUSE                  | REFUSE  | REFUSE (no prod data)
+   aborted          | ALLOW (cascade-reset)   | REFUSE  | REFUSE (use cascade)
+   timeout          | REFUSE                  | REFUSE  | ALLOW (Argo retry)
+   skipped          | REFUSE                  | REFUSE  | REFUSE (no prod data)
+```
+
+Terminal → non-terminal allowed cells:
+
+1. `aborted → pending` — cascade-reset after primary failure resolves
+   (`executor.go:377`,
+   `TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending`).
+2. `failed → running`, `timeout → running` — Argo workflow-step retry. Argo's
+   workflow-step-level `retryStrategy` re-runs the entire step (pre-job → main
+   → post-job). The pre-job container (Slippy CLI prejob) POSTs
+   `/v1/slips/{id}/steps/{name}/start` to slippy-api, which inserts through
+   this gate. Without these allows the gate returns 409 and Argo's
+   `retryStrategy.expression` (matches only `lastRetry.exitCode ∈ {143, 137,
+   -1}`) does NOT catch the 409 → the workflow step abandons → the slip
+   wedges at failed/timeout. Empirically validated against
+   `workflow-dev/workflows/templates/{auto-deployer.yaml, autotriggertests.yaml,
+   mc-env-tag-reset.yaml, offload-purge.yaml}`.
+
+`aborted → running` is INTENTIONALLY REFUSED: cascade-aborted steps must go
+through `aborted → pending` (rule 1) to re-enter the queue; a direct
+`aborted → running` bypasses the recovery contract.
+
+`error → running` and `skipped → running` are REFUSED based on production
+evidence: a 90-day window of `ci.slip_component_states` (54,473 rows, queried
+2026-06) shows ZERO occurrences of any terminal → running transition,
+confirming neither error nor skipped has a real retry-running pattern. If
+such a pattern surfaces, narrow the allow-list at that point.
+
+##### Terminal prior × terminal incoming (6 × 6 = 36 cells)
+
+```text
+   prior \ incoming | completed         | failed | aborted | error  | timeout | skipped
+   -----------------+-------------------+--------+---------+--------+---------+--------
+   completed        | REFUSE            | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   failed           | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   aborted          | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   error            | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   timeout          | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+   skipped          | ALLOW (recovery)  | REFUSE | REFUSE  | REFUSE | REFUSE  | REFUSE
+```
+
+`completed` is absolutely final. Same-terminal idempotency (e.g. `failed →
+failed`) is REFUSED at library level for clean semantics; HTTP layer maps to
+409 (slippy-api may upgrade to 204 idempotent in a follow-up).
+
+##### Allow-list summary (encoded in `isRecoveryAllowed`)
+
+```text
+   ALLOWED terminal-prior transitions:
+     1. aborted   → pending     (cascade-reset)
+     2. failed    → completed   (recovery)
+     3. aborted   → completed   (recovery)
+     4. error     → completed   (recovery)
+     5. timeout   → completed   (recovery)
+     6. skipped   → completed   (recovery)
+     7. failed    → running     (Argo workflow-step retry)
+     8. timeout   → running     (Argo workflow-step retry)
+
+   ALL OTHER terminal-prior transitions: REFUSE → ErrTerminalAlreadyExists
+
+   NOTE on rules 7-8: Argo's workflow-step retryStrategy re-runs pre-job →
+   main → post-job. Pre-job (Slippy CLI prejob) POSTs /start. Without
+   rules 7-8 the gate returns 409, Argo's retryStrategy.expression catches
+   only signal exit codes (143/137/-1), not 409, and the step abandons →
+   slip wedges. aborted/error/skipped → running remain REFUSED
+   (aborted uses cascade-reset; error/skipped have zero production
+   occurrences in a 90-day window).
+```
+
+### Rollback flag matrix (`SLIPPY_I5_GATE_ENABLED`)
+
+```text
+   GATE flag             | Behavior                                | Use case
+   ----------------------+-----------------------------------------+-------------------------------
+   unset OR unparseable  | DEFAULT-ON (fail-safe) — gate enforces  | Production default;
+                         | matrix; returns 409 on refused          | unparseable values
+                         | transitions                             | fail-safe ON
+   "false" / "0" / "f"   | Gate returns nil silently               | Rollback / explicit disable
+   (any ParseBool-false) |                                         |
+   "true" / "1" / "t"    | Gate enforces matrix; returns 409 on    | Explicit enable (equivalent
+   (any ParseBool-true)  | refused transitions                     | to unset)
+```
+
+`gateEnabled()` (clickhouse_store.go) treats `SLIPPY_I5_GATE_ENABLED` as a
+fail-safe boolean: only any `strconv.ParseBool`-false value (`false`, `0`,
+`False`, `f`, …) disables the gate; any other value, including unset or
+unparseable, leaves it enforcing. Earlier drafts of this doc described
+`unset` as DEFAULT-OFF — that was wrong. The deployed default is ON.
+
+Gate fails OPEN on transport/lookup errors (logged via `slog.WarnContext` with
+`correlation_id`, `step`, `component`, `error`). This prevents a CH outage
+from blocking all writes.
+
+### Companion: slippy-api defense-in-depth
+
+**Layer-scope summary:**
+
+- **This gate (Layer 1)** is wired at `UpdateStep` / `UpdateStepWithHistory` →
+  `insertComponentState` — the **event-INSERT path only**. It closes the
+  *late-StartStep* and *terminal-regression event* class: a concurrent `/start`
+  INSERT arriving after a `/complete` INSERT is now refused with 409. It does
+  **not** guard `Update` / `insertAtomicUpdateWithVersions` or any
+  library-internal aggregate write-back (`updateAggregateStatusFromComponentStates*`).
+
+- **The evidenced 436cc68c aggregate-path variant** (single-request
+  mixed-staleness write-back through `hydrateAndPersist`) is not closed by this
+  gate. It is:
+  - **Narrowed** by the `wait_for_async_insert=1` (`w4ai`) commit-order
+    inversion asserted by slippy-api PR #39, which makes the cross-table
+    staleness inversion ~10–50× rarer.
+  - **Closed** by the slippy-api overlay pin (Layer 2, hardened per audit
+    `standup-notes/2026/07/i5-fable-audit.md §F`): when the event-log SELECT
+    returns `found` with no error, `overlayPipelineStep` must force-apply
+    `resolved = eventStatus` unconditionally, bypassing the
+    `writtenAt`/`CompletedAt` µs-race.
+
+The gate alone CANNOT serialize same-microsecond INSERTs (both writers may see
+prior=empty). slippy-api PR #39 adds:
+- TIER 1: per-correlationID Dragonfly lock (`withCorrIDLock`) — closes the
+  multi-writer aggregate write-back race (`Update`/`insertAtomicUpdateWithVersions`
+  concurrent with another writer).
+- TIER 2: R1 overlay event-log-validated guard in `hydrateAndPersist` — closes
+  the single-writer mixed-staleness variant (the evidenced 436cc68c mechanism)
+  when hardened per audit recommendation.
+- TIER 3 (this PR): goLib INSERT-time monotonicity gate — closes the
+  terminal-regression event class; last-mile event-path defense even if TIER 1
+  and TIER 2 above fail.
+
+## Related
+
+- ADO #82468 — TMS infrastructure I5 stuck-slip class
+- goLibMyCarrier PR #72 (this PR) — Layer 1 gate
+- slippy-api PR #39 — Layer 2 lock + R1 overlay + wires Layer 1
+- Plan v3: `standup-notes/2026/06/resolve-i5-option1-stage2-plan-v3.md`
+- Production case: slip `436cc68c` (RCA in `standup-notes/2026/06/`)

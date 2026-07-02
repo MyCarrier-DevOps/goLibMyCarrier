@@ -1761,9 +1761,13 @@ func TestClickHouseStore_UpdateStep_ConcurrentStepsNeitherLost(t *testing.T) {
 	if len(mockSession.ExecWithArgsCalls) != 2 {
 		t.Errorf("expected 2 ExecWithArgs calls (one per step), got %d", len(mockSession.ExecWithArgsCalls))
 	}
-	// No routing_slips read (QueryRow) should have occurred — UpdateStep is a blind insert.
-	if len(mockSession.QueryRowCalls) != 0 {
-		t.Errorf("expected 0 QueryRow calls (no shared routing_slips load), got %d", len(mockSession.QueryRowCalls))
+	// QueryRow expected: 1 from the I5 terminal-monotonicity gate pre-flight for
+	// dev_deploy (push_parsed bypasses the gate via isGateBypassed). No
+	// routing_slips Load happens — UpdateStep remains a blind insert with the
+	// gate's argMax point-lookup against slip_component_states as the only read.
+	if len(mockSession.QueryRowCalls) != 1 {
+		t.Errorf("expected 1 QueryRow call (I5 gate pre-flight for dev_deploy; push_parsed bypassed), got %d",
+			len(mockSession.QueryRowCalls))
 	}
 
 	// Verify the two inserts target slip_component_states and carry the correct step names.
@@ -5140,7 +5144,7 @@ func TestClickHouseStore_UpdateSlipStatus(t *testing.T) {
 }
 
 // TestInsertAtomicStatusUpdate_WithStepOverride verifies that when insertAtomicStatusUpdate
-// receives a stepStatusOverride, the generated query replaces the verbatim DB column reference
+// receives a StepStatusOverride, the generated query replaces the verbatim DB column reference
 // with a literal "?" placeholder and the correct string value appears in the args.
 //
 // This is the fix for the stale-clone race (goLibMyCarrier-nl3): under ClickHouse async insert
@@ -5179,9 +5183,9 @@ func TestInsertAtomicStatusUpdate_WithStepOverride(t *testing.T) {
 
 		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-		override := stepStatusOverride{
-			columnName: "unit_tests_status",
-			status:     StepStatusFailed,
+		override := StepStatusOverride{
+			ColumnName: "unit_tests_status",
+			Status:     StepStatusFailed,
 		}
 		err := store.updateSlipStatusWithOverrides(
 			context.Background(), "corr-override-001", SlipStatusFailed, override,
@@ -5293,9 +5297,9 @@ func TestInsertAtomicStatusUpdate_WithStepOverride(t *testing.T) {
 
 		store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-		overrides := []stepStatusOverride{
-			{columnName: "unit_tests_status", status: StepStatusFailed},
-			{columnName: "dev_deploy_status", status: StepStatusAborted},
+		overrides := []StepStatusOverride{
+			{ColumnName: "unit_tests_status", Status: StepStatusFailed},
+			{ColumnName: "dev_deploy_status", Status: StepStatusAborted},
 		}
 		err := store.updateSlipStatusWithOverrides(
 			context.Background(), "corr-multi-001", SlipStatusFailed, overrides...,
@@ -5349,7 +5353,7 @@ func TestUpdateSlipStatusWithStepOverrides_ClientRouting(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		})
 
-		override := stepStatusOverride{columnName: "unit_tests_status", status: StepStatusFailed}
+		override := StepStatusOverride{ColumnName: "unit_tests_status", Status: StepStatusFailed}
 		err := client.updateSlipStatusWithStepOverrides(
 			context.Background(), corrID, SlipStatusFailed, override,
 		)
@@ -5385,7 +5389,7 @@ func TestBuildStepOverridesFromSlip(t *testing.T) {
 		}
 		byCol := make(map[string]StepStatus)
 		for _, o := range overrides {
-			byCol[o.columnName] = o.status
+			byCol[o.ColumnName] = o.Status
 		}
 		if byCol["unit_tests_status"] != StepStatusFailed {
 			t.Errorf("expected unit_tests_status=%q, got %q", StepStatusFailed, byCol["unit_tests_status"])
@@ -5425,11 +5429,11 @@ func TestBuildStepOverridesFromSlip(t *testing.T) {
 		if len(overrides) != 1 {
 			t.Fatalf("expected 1 override, got %d", len(overrides))
 		}
-		if overrides[0].columnName != "prod_steady_state_status" {
-			t.Errorf("expected column name prod_steady_state_status, got %s", overrides[0].columnName)
+		if overrides[0].ColumnName != "prod_steady_state_status" {
+			t.Errorf("expected column name prod_steady_state_status, got %s", overrides[0].ColumnName)
 		}
-		if overrides[0].status != StepStatusCompleted {
-			t.Errorf("expected status completed, got %s", overrides[0].status)
+		if overrides[0].Status != StepStatusCompleted {
+			t.Errorf("expected status completed, got %s", overrides[0].Status)
 		}
 	})
 }
@@ -6167,6 +6171,477 @@ func TestFilterActiveComponents_DirectUnit(t *testing.T) {
 		t.Errorf("expected all 2 active components kept, got %d", len(got))
 	}
 }
+
+// =============================================================================
+// I5 R2 / Option D — LatestStepStatusFromEvents and Update overrides
+// =============================================================================
+
+// TestLatestStepStatusFromEvents_QueryShape pins the SQL shape: must use argMax
+// with the no-image-tag sort-key constant and filter component=” for
+// pipeline-level rows.
+func TestLatestStepStatusFromEvents_QueryShape(t *testing.T) {
+	var capturedQuery string
+	var capturedArgs []interface{}
+
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			capturedQuery = query
+			capturedArgs = make([]interface{}, len(args))
+			copy(capturedArgs, args)
+			return &clickhousetest.MockRow{
+				ScanFunc: func(dest ...any) error {
+					if len(dest) > 0 {
+						if s, ok := dest[0].(*string); ok {
+							*s = string(StepStatusCompleted)
+						}
+					}
+					return nil
+				},
+			}
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	status, found, err := store.LatestStepStatusFromEvents(
+		context.Background(), "corr-1", "unit_tests",
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected found=true when scan succeeds with non-empty status")
+	}
+	if status != StepStatusCompleted {
+		t.Errorf("expected status=%q, got %q", StepStatusCompleted, status)
+	}
+
+	// Must reference the canonical sort-key constant — drift between this
+	// function and doLoadComponentStates would silently break ordering.
+	if !strings.Contains(capturedQuery, componentEventSortKeyNoImageTag) {
+		t.Errorf("expected query to use componentEventSortKeyNoImageTag; got:\n%s", capturedQuery)
+	}
+	if !strings.Contains(capturedQuery, "argMax(status, ") {
+		t.Errorf("expected query to use argMax(status, …); got:\n%s", capturedQuery)
+	}
+	// After the LatestStepStatusFromEvents → latestComponentStateStatus
+	// delegation refactor, the component filter is parameterized (`AND component
+	// = ?`) rather than literal. The pipeline-level invariant is preserved by
+	// passing "" as the component arg — asserted below in capturedArgs.
+	if !strings.Contains(capturedQuery, "component      = ?") {
+		t.Errorf("expected query to filter component via parameter; got:\n%s", capturedQuery)
+	}
+	if !strings.Contains(capturedQuery, "GROUP BY correlation_id") {
+		t.Errorf("expected GROUP BY correlation_id; got:\n%s", capturedQuery)
+	}
+
+	// Args order (post-delegation): correlationID, step, component="".
+	if len(capturedArgs) < 3 {
+		t.Fatalf("expected at least 3 args (corrID, step, component), got %d", len(capturedArgs))
+	}
+	if capturedArgs[0] != "corr-1" {
+		t.Errorf("expected first arg=corr-1, got %v", capturedArgs[0])
+	}
+	if capturedArgs[1] != "unit_tests" {
+		t.Errorf("expected second arg=unit_tests, got %v", capturedArgs[1])
+	}
+	if capturedArgs[2] != "" {
+		t.Errorf("expected third arg=\"\" (pipeline-level component), got %v", capturedArgs[2])
+	}
+}
+
+// TestLatestStepStatusFromEvents_NoRows verifies the (status, found, err) contract
+// when ClickHouse returns sql.ErrNoRows.
+func TestLatestStepStatusFromEvents_NoRows(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			return &clickhousetest.MockRow{
+				ScanFunc: func(dest ...any) error {
+					return sql.ErrNoRows
+				},
+			}
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	status, found, err := store.LatestStepStatusFromEvents(
+		context.Background(), "corr-empty", "unit_tests",
+	)
+	if err != nil {
+		t.Errorf("expected nil error on no-rows, got %v", err)
+	}
+	if found {
+		t.Errorf("expected found=false on no-rows, got found=true")
+	}
+	if status != "" {
+		t.Errorf("expected empty status on no-rows, got %q", status)
+	}
+}
+
+// TestLatestStepStatusFromEvents_EmptyStringTreatedAsNoSignal verifies that an
+// empty status string is treated as "no signal" (found=false) — defends the
+// caller's "fall through to overlay" branch from a degenerate argMax response.
+func TestLatestStepStatusFromEvents_EmptyStringTreatedAsNoSignal(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			return &clickhousetest.MockRow{
+				ScanFunc: func(dest ...any) error {
+					if len(dest) > 0 {
+						if s, ok := dest[0].(*string); ok {
+							*s = "" // degenerate
+						}
+					}
+					return nil
+				},
+			}
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	_, found, err := store.LatestStepStatusFromEvents(
+		context.Background(), "corr-degenerate", "unit_tests",
+	)
+	if err != nil {
+		t.Errorf("expected nil error, got %v", err)
+	}
+	if found {
+		t.Errorf("expected found=false for empty-string status (degenerate)")
+	}
+}
+
+// TestLatestStepStatusFromEvents_ErrorWrapped verifies that non-no-rows errors
+// surface as wrapped errors with the function name in the chain.
+func TestLatestStepStatusFromEvents_ErrorWrapped(t *testing.T) {
+	sentinel := errors.New("clickhouse boom")
+	mockSession := &clickhousetest.MockSession{
+		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
+			return &clickhousetest.MockRow{
+				ScanFunc: func(dest ...any) error { return sentinel },
+			}
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	status, found, err := store.LatestStepStatusFromEvents(
+		context.Background(), "corr-err", "unit_tests",
+	)
+	if err == nil {
+		t.Fatal("expected wrapped error, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("expected errors.Is(err, sentinel) — got %v", err)
+	}
+	if found {
+		t.Errorf("expected found=false on error")
+	}
+	if status != "" {
+		t.Errorf("expected empty status on error, got %q", status)
+	}
+}
+
+// TestComponentEventSortKey_SharedBetweenLoadAndLatest pins the contract that
+// doLoadComponentStates and LatestStepStatusFromEvents BOTH reference the same
+// package-level sort-key constant. Drift between the two would silently change
+// which event "wins" under same-microsecond concurrent writes — see Stage-2
+// risk #2.
+func TestComponentEventSortKey_SharedBetweenLoadAndLatest(t *testing.T) {
+	// This is a static-content assertion — we just verify the constants exist
+	// and are non-empty. Drift detection lives in the integration test, which
+	// runs both code paths against the same data.
+	if componentEventSortKeyWithImageTag == "" {
+		t.Error("componentEventSortKeyWithImageTag must be defined")
+	}
+	if componentEventSortKeyNoImageTag == "" {
+		t.Error("componentEventSortKeyNoImageTag must be defined")
+	}
+	// The no-image-tag variant must be a strict prefix of the relationship —
+	// status-ordinal multiplier is 1 in the no-image-tag case (status * 1)
+	// vs * 2 in the with-image-tag case. Loose sanity check:
+	if !strings.Contains(componentEventSortKeyNoImageTag, "toUInt64(toUnixTimestamp64Micro(timestamp))") {
+		t.Errorf("no-image-tag sort key missing microsecond cast: %q", componentEventSortKeyNoImageTag)
+	}
+	if !strings.Contains(componentEventSortKeyWithImageTag, "if(image_tag != ''") {
+		t.Errorf("with-image-tag sort key missing image_tag tiebreaker: %q", componentEventSortKeyWithImageTag)
+	}
+}
+
+// TestStepStatusColumnName_MatchesQueryBuilder pins the contract that the free
+// function and the SlipQueryBuilder method produce identical column names —
+// external callers (e.g. slippy-api) rely on the free function for override
+// construction without holding a SlipQueryBuilder reference.
+func TestStepStatusColumnName_MatchesQueryBuilder(t *testing.T) {
+	config := testPipelineConfig()
+	qb := NewSlipQueryBuilder(config, "ci")
+
+	for _, step := range config.Steps {
+		want := qb.StepStatusColumn(step.Name)
+		got := StepStatusColumnName(step.Name)
+		if got != want {
+			t.Errorf("step %q: free function returned %q, query builder returned %q", step.Name, got, want)
+		}
+	}
+}
+
+// TestUpdate_WithStepStatusOverride_UsesLiteralValue verifies that when Update
+// is called with an override for a step status column, the literal value passed
+// to the INSERT comes from the override, NOT from slip.Steps[name].Status.
+//
+// This is the core Option D contract for the I5 race fix.
+func TestUpdate_WithStepStatusOverride_UsesLiteralValue(t *testing.T) {
+	var capturedArgs []interface{}
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
+			capturedArgs = make([]interface{}, len(args))
+			copy(capturedArgs, args)
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	// Stale snapshot — Steps says running.
+	slip := &Slip{
+		CorrelationID: "corr-i5",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "deadbeef",
+		Status:        SlipStatusInProgress,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		Version:       1,
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusRunning},
+		},
+	}
+
+	err := store.Update(context.Background(), slip, StepStatusOverride{
+		ColumnName: "unit_tests_status",
+		Status:     StepStatusCompleted,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Search for "completed" in args and confirm "running" did NOT appear in
+	// the same position (we identify the override by checking exactly one
+	// "completed" placeholder is present for the unit_tests column).
+	gotCompleted := 0
+	gotRunningForOverride := false
+	for _, a := range capturedArgs {
+		if s, ok := a.(string); ok {
+			if s == string(StepStatusCompleted) {
+				gotCompleted++
+			}
+			// A "running" placeholder anywhere is possible for OTHER steps in
+			// the default Pending case, but unit_tests should NEVER carry
+			// running once the override is in play. Since the only step with
+			// Steps[]=running in this fixture is unit_tests itself, finding
+			// "running" anywhere means the override did not take.
+			if s == string(StepStatusRunning) {
+				gotRunningForOverride = true
+			}
+		}
+	}
+	if gotCompleted < 1 {
+		t.Errorf("expected at least one 'completed' literal in args (the override), got: %v", capturedArgs)
+	}
+	if gotRunningForOverride {
+		t.Errorf("override did NOT take — found 'running' in args; override should have replaced it. args=%v", capturedArgs)
+	}
+}
+
+// TestUpdate_WithoutOverride_PreservesExistingBehavior verifies that the zero
+// overrides path is byte-identical to pre-Option-D behavior — the literal
+// for unit_tests_status comes from slip.Steps[unit_tests].Status.
+func TestUpdate_WithoutOverride_PreservesExistingBehavior(t *testing.T) {
+	var capturedArgs []interface{}
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
+			capturedArgs = make([]interface{}, len(args))
+			copy(capturedArgs, args)
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	slip := &Slip{
+		CorrelationID: "corr-noverride",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "feedface",
+		Status:        SlipStatusInProgress,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		Version:       1,
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusCompleted},
+		},
+	}
+
+	if err := store.Update(context.Background(), slip); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	gotCompleted := 0
+	for _, a := range capturedArgs {
+		if s, ok := a.(string); ok && s == string(StepStatusCompleted) {
+			gotCompleted++
+		}
+	}
+	if gotCompleted < 1 {
+		t.Errorf("expected 'completed' literal from slip.Steps, got args=%v", capturedArgs)
+	}
+}
+
+// TestUpdate_StepDetailsJSON_ReflectsOverride verifies that the step_details
+// JSON emitted by Update includes the override status — the JSON parity
+// guarantee of Option D.
+func TestUpdate_StepDetailsJSON_ReflectsOverride(t *testing.T) {
+	var capturedArgs []interface{}
+	mockSession := &clickhousetest.MockSession{
+		ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
+			capturedArgs = make([]interface{}, len(args))
+			copy(capturedArgs, args)
+			return nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	startedAt := time.Now().Add(-time.Minute)
+	slip := &Slip{
+		CorrelationID: "corr-json",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "cafebabe",
+		Status:        SlipStatusInProgress,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+		Version:       1,
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusRunning, StartedAt: &startedAt},
+		},
+	}
+
+	err := store.Update(context.Background(), slip, StepStatusOverride{
+		ColumnName: "unit_tests_status",
+		Status:     StepStatusCompleted,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Find the step_details JSON in args (it's the only arg that parses as a
+	// JSON object with our step name as a key).
+	var found bool
+	for _, a := range capturedArgs {
+		s, ok := a.(string)
+		if !ok {
+			continue
+		}
+		if !strings.Contains(s, `"unit_tests"`) {
+			continue
+		}
+		var parsed map[string]map[string]interface{}
+		if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+			continue
+		}
+		stepObj, ok := parsed["unit_tests"]
+		if !ok {
+			continue
+		}
+		statusField, ok := stepObj["status"]
+		if !ok {
+			t.Errorf("step_details.unit_tests missing 'status' field; got: %v", stepObj)
+			found = true
+			break
+		}
+		if statusField != string(StepStatusCompleted) {
+			t.Errorf(
+				"step_details.unit_tests.status must reflect override (%q), got %v",
+				StepStatusCompleted, statusField,
+			)
+		} else {
+			found = true
+		}
+		break
+	}
+	if !found {
+		t.Errorf("did not locate step_details JSON in args: %v", capturedArgs)
+	}
+}
+
+// TestBuildStepDetails_NoOverride_EmitsInMemoryStatus verifies that even without
+// overrides, the new "status" field is emitted from slip.Steps[name].Status —
+// this is the additive side of the contract.
+func TestBuildStepDetails_NoOverride_EmitsInMemoryStatus(t *testing.T) {
+	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
+
+	slip := &Slip{
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusCompleted},
+		},
+	}
+	details := store.buildStepDetails(slip, nil)
+	utDetails, ok := details["unit_tests"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected unit_tests entry, got %v", details)
+	}
+	if utDetails["status"] != string(StepStatusCompleted) {
+		t.Errorf("expected status=completed from slip.Steps, got %v", utDetails["status"])
+	}
+}
+
+// TestBuildStepDetails_OverridePinsStatus verifies the override path pins the
+// status to the override value, ignoring slip.Steps[name].Status.
+func TestBuildStepDetails_OverridePinsStatus(t *testing.T) {
+	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
+
+	slip := &Slip{
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusRunning}, // stale
+		},
+	}
+	overrides := []StepStatusOverride{
+		{ColumnName: "unit_tests_status", Status: StepStatusFailed},
+	}
+	details := store.buildStepDetails(slip, overrides)
+	utDetails, ok := details["unit_tests"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected unit_tests entry, got %v", details)
+	}
+	if utDetails["status"] != string(StepStatusFailed) {
+		t.Errorf("expected status=failed (override), got %v", utDetails["status"])
+	}
+}
+
+// TestBuildStepDetails_OverrideForUnknownColumn_NoPanic verifies defensive
+// handling: an override with a malformed ColumnName (no _status suffix) is
+// silently skipped rather than corrupting the JSON.
+func TestBuildStepDetails_OverrideForUnknownColumn_NoPanic(t *testing.T) {
+	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
+
+	slip := &Slip{
+		Steps: map[string]Step{
+			"unit_tests": {Status: StepStatusCompleted},
+		},
+	}
+	// Malformed override — column does not end with "_status".
+	overrides := []StepStatusOverride{
+		{ColumnName: "garbage", Status: StepStatusFailed},
+	}
+	details := store.buildStepDetails(slip, overrides)
+	utDetails, ok := details["unit_tests"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected unit_tests entry, got %v", details)
+	}
+	// Fall back to slip.Steps since override didn't match.
+	if utDetails["status"] != string(StepStatusCompleted) {
+		t.Errorf("expected fallback to slip.Steps status=completed, got %v", utDetails["status"])
+	}
+}
+
+// Silence "unused" if some helpers aren't referenced elsewhere in tests above.
+var _ = sync.Mutex{}
+var _ = fmt.Sprintf
+var _ = chcol.NewJSON
 
 // TestUpdateStepWithHistory_WritebackErrorAfterEventInsert verifies the best-effort
 // writeback semantics: when insertComponentState succeeds but the subsequent aggregate

@@ -505,7 +505,7 @@ func TestStateMachine_I4_CompletedSlipIgnoresRecoveryAttempts(t *testing.T) {
 // A write-path bug can cause a stale clone of the prior row to overwrite the just-written
 // step status when the new row is not yet visible (ClickHouse async insert visibility gap
 // under VersionedCollapsingMergeTree without FINAL). The fix (bd issue goLibMyCarrier-nl3)
-// is to pass stepStatusOverride literals into insertAtomicStatusUpdate via
+// is to pass StepStatusOverride literals into insertAtomicStatusUpdate via
 // updateSlipStatusWithStepOverrides, so the INSERT SELECT uses the authoritative value
 // rather than cloning from a potentially-stale row.
 //
@@ -558,7 +558,7 @@ func TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride(t *testing.T) {
 	// FailStep writes prod_alert_gate=failed then calls checkPipelineCompletion.
 	// checkPipelineCompletion detects the primary failure and calls
 	// updateSlipStatusWithStepOverrides(ctx, corrID, SlipStatusFailed,
-	//   stepStatusOverride{columnName: "prod_alert_gate_status", status: failed}).
+	//   StepStatusOverride{ColumnName: "prod_alert_gate_status", Status: failed}).
 	// MockStore does not implement slipStatusOverrideWriter, so the fallback
 	// UpdateSlipStatus path fires — the contract under test is that slip.status
 	// ends up as failed and the step column value is preserved correctly.
