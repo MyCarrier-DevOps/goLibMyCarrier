@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -40,6 +42,36 @@ const (
 	// backoff sequence as aggregateConflictMaxRetries. History is best-effort; exhaustion
 	// returns nil rather than an error.
 	historyConflictMaxRetries = 5
+)
+
+// componentEventSortKey* are the canonical tiebreaker formulas used by every
+// argMax query against ci.slip_component_states. They are extracted to package
+// scope so that doLoadComponentStates AND LatestStepStatusFromEvents reference
+// the same string; drift between them would silently change which event row
+// "wins" on same-microsecond concurrent writes.
+//
+// The outer toUInt64(...) casts are REQUIRED. ClickHouse 25.x rejects argMax
+// with non-integral tiebreaker expressions.
+//
+// Formula with image_tag (used by doLoadComponentStates when the column is
+// present):
+//
+//	epoch_microseconds * 200 + status_ordinal * 2 + (image_tag != '' ? 1 : 0)
+//
+// Formula without image_tag (used by doLoadComponentStates when the column
+// has not been migrated yet, and by LatestStepStatusFromEvents which only
+// reads pipeline-level rows where image_tag is always empty):
+//
+//	epoch_microseconds * 100 + status_ordinal
+//
+// Tiebreak rules:
+//  1. Later timestamp wins (primary).
+//  2. Higher-value status wins on same-second ties: completed (4) > running (3).
+//  3. Row with image_tag set wins over row without, for same timestamp+status
+//     (with-image-tag variant only).
+const (
+	componentEventSortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 200 + toUInt64(toUInt8(status)) * 2 + if(image_tag != '', 1, 0)"
+	componentEventSortKeyNoImageTag   = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
 )
 
 // calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
@@ -374,6 +406,30 @@ func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, comm
 	return slip, nil
 }
 
+// LatestStepStatusFromEvents returns the latest pipeline-level status for a
+// given step from the event log (slip_component_states). It uses the same
+// argMax + sort-key formula as doLoadComponentStates so the two cannot drift.
+//
+// Pipeline-level rows are those with component=” and image_tag=” — the
+// no-image-tag sort-key variant is correct for these rows.
+//
+// Return contract:
+//
+//   - (status, true, nil)    — at least one event row exists for (corrID, step)
+//   - ("", false, nil)       — no event row yet (caller proceeds with overlay)
+//   - ("", false, err)       — query failure (caller fails-open: log and continue)
+//
+// This is the canonical source of event-log truth for slippy-api's
+// overlayPipelineStep guard — see ADO #82468 / R1 fix.
+func (s *ClickHouseStore) LatestStepStatusFromEvents(
+	ctx context.Context, correlationID, step string,
+) (StepStatus, bool, error) {
+	// Pipeline-level rows have component="" — delegate to the component-aware
+	// companion to avoid duplicating the argMax point-lookup and its scan/error
+	// handling. See latestComponentStateStatus.
+	return s.latestComponentStateStatus(ctx, correlationID, step, "")
+}
+
 // FindByCommits finds a slip matching any commit in the ordered list.
 // Returns the slip for the first (most recent) matching commit.
 func (s *ClickHouseStore) FindByCommits(
@@ -469,7 +525,18 @@ func (s *ClickHouseStore) FindAllByCommits(
 // - Later writes naturally have higher versions and supersede earlier ones
 // - This is not a "conflict" - it's the expected behavior for concurrent writes
 // - The write itself always succeeds; it may just be superseded by a later write
-func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
+// Update writes a new authoritative row for slip.
+//
+// Optional overrides pin specific <step>_status columns (and their step_details
+// JSON counterparts) to caller-supplied values, bypassing slip.Steps[name].Status
+// for those steps. This is used by slippy-api's hydrateAndPersist to ensure that
+// the step being written reflects event-log-validated truth even if Load returned
+// a stale snapshot under ClickHouse async-insert visibility lag (the I5 race).
+//
+// Zero overrides preserves the historical behavior — all step columns sourced
+// from slip.Steps[name].Status. Existing callers like AbandonSlip and PromoteSlip
+// continue to compile and execute identically.
+func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip, overrides ...StepStatusOverride) error {
 	// Update updated_at timestamp
 	slip.UpdatedAt = time.Now()
 	slip.Sign = 1
@@ -483,7 +550,7 @@ func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
 	}
 
 	// Insert both cancel row and new row atomically
-	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
+	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion, overrides...); err != nil {
 		return fmt.Errorf("failed to insert atomic update: %w", err)
 	}
 
@@ -516,6 +583,14 @@ func (s *ClickHouseStore) UpdateStep(
 	// the flushed row is already the correct, up-to-date value, so the subsequent Load
 	// inside the retry loop will hydrate the correct state.
 	insertedAt := time.Now()
+
+	// I5 (ADO #82468): INSERT-time terminal-monotonicity gate. Refuses writes
+	// that would overwrite a terminal status outside the recovery allow-list.
+	// See enforceTerminalMonotonicity for the matrix; CH pre-flight failures
+	// fail-OPEN with a structured WARN per §J error policy.
+	if err := s.enforceTerminalMonotonicity(ctx, correlationID, stepName, componentName, status); err != nil {
+		return err
+	}
 
 	// Write the step event to the conflict-free event-sourcing table.
 	// Pipeline-level steps use componentName="" as a sentinel value.
@@ -577,6 +652,14 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// the flushed row is already the correct, up-to-date value, so the subsequent Load
 	// inside the retry loop will hydrate the correct state.
 	insertedAt := time.Now()
+
+	// I5 (ADO #82468): INSERT-time terminal-monotonicity gate. Refuses writes
+	// that would overwrite a terminal status outside the recovery allow-list.
+	// See enforceTerminalMonotonicity for the matrix; CH pre-flight failures
+	// fail-OPEN with a structured WARN per §J error policy.
+	if err := s.enforceTerminalMonotonicity(ctx, correlationID, stepName, componentName, status); err != nil {
+		return err
+	}
 
 	// Store the step event in the conflict-free event-sourcing table.
 	// The message from the history entry is co-located in the event record.
@@ -645,8 +728,12 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// if this write-back fails.
 	if s.pipelineConfig != nil {
 		colName := s.queryBuilder.StepStatusColumn(stepName)
-		err := s.appendHistoryWithOverrides(ctx, correlationID, entry, stepStatusOverride{colName, status})
-		if err != nil {
+		if err := s.appendHistoryWithOverrides(
+			ctx,
+			correlationID,
+			entry,
+			StepStatusOverride{colName, status},
+		); err != nil {
 			s.logger.Warn(
 				ctx,
 				"pipeline step history writeback failed after durable event insert; step status will self-heal on next Load but state_history audit entry for this transition is lost",
@@ -855,6 +942,263 @@ func (s *ClickHouseStore) SetComponentImageTag(
 		StepStatus(currentStatus), "", imageTag)
 }
 
+// latestComponentStateStatus returns the most recent StepStatus for a
+// (correlation_id, step, component) tuple from slip_component_states, using
+// the same argMax tiebreaker formula as LatestStepStatusFromEvents.
+//
+// It is the internal companion to LatestStepStatusFromEvents that supports a
+// caller-supplied component name (the public method is hardcoded to
+// component=”). Used by enforceTerminalMonotonicity to detect prior terminal
+// states for both pipeline-level (component="") and component-level rows.
+//
+// Return contract:
+//   - (status, true, nil)    — at least one event row exists for the tuple
+//   - ("", false, nil)       — no event row yet
+//   - ("", false, err)       — query failure (caller MUST fail open per §J)
+//
+// Cost: sub-ms point lookup (argMax over the primary key prefix). The query
+// uses the no-image-tag sort key because the gate only cares about status
+// ordering, not image-tag presence.
+func (s *ClickHouseStore) latestComponentStateStatus(
+	ctx context.Context, correlationID, stepName, componentName string,
+) (StepStatus, bool, error) {
+	query := fmt.Sprintf(`
+		SELECT argMax(status, %s)
+		FROM %s.%s
+		WHERE correlation_id = ?
+		  AND step           = ?
+		  AND component      = ?
+		GROUP BY correlation_id
+	`, componentEventSortKeyNoImageTag, s.database, TableSlipComponentStates)
+
+	row := s.session.QueryRow(ctx, query, correlationID, stepName, componentName)
+	if row == nil {
+		return "", false, fmt.Errorf(
+			"latestComponentStateStatus: query returned nil row for %s/%s/component=%q",
+			correlationID, stepName, componentName,
+		)
+	}
+	var statusStr string
+	if err := row.Scan(&statusStr); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("latestComponentStateStatus: %w", err)
+	}
+	if statusStr == "" {
+		return "", false, nil
+	}
+	return StepStatus(statusStr), true, nil
+}
+
+// isGateBypassed reports whether the given step name bypasses
+// enforceTerminalMonotonicity. Justification per step is documented inline.
+// Adding a step here is a security/correctness decision — require code review
+// citing the specific callsite that needs the bypass.
+//
+// Defensive belt-and-braces: empirical 90d ClickHouse probe shows ZERO
+// terminal push_parsed rows landing under push_parsed in production today —
+// the bypass is reserved for a future consumer (or a regressed handlePushRetry
+// path) that may write completed/failed under push_parsed before the dedup
+// lock would intercept. Keeping the bypass in code prevents an accidental
+// blockage if the upstream pattern changes.
+//
+// Implemented as a function (not a package-level map) so the allow-list is
+// immutable at runtime — tests and unrelated packages cannot mutate it by
+// accident.
+func isGateBypassed(step string) bool {
+	switch step {
+	// push_parsed is reset to running by handlePushRetry (push.go:678) on
+	// duplicate push deduplication. The reset is intentional and the prior
+	// state MAY be terminal (completed) from the first push. No I5 exposure
+	// because handlePushRetry runs single-threaded behind the dedup_lock.go
+	// repo:sha lock — no concurrent writer can race against it.
+	case "push_parsed":
+		return true
+	default:
+		return false
+	}
+}
+
+// isRecoveryAllowed encodes the explicit allow-list of terminal → X transitions
+// permitted by the gate. Returns true only if the (prior, incoming) pair is
+// on the allow-list.
+//
+// Allow rules (precondition: prior is terminal):
+//
+//  1. prior == aborted AND incoming == pending
+//     → cascade-reset after resolved upstream failure (see the cascade-reset
+//     loop in Client.checkPipelineCompletion in executor.go, and
+//     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
+//
+//  2. prior IN {failed, aborted, error, timeout, skipped} AND incoming == completed
+//     → operator/automation recovery (see slippy-api TestCompleteStep_AllowsRecoveryFromFailed
+//     at slip_write_handler_test.go:678).
+//
+//  3. prior IN {failed, timeout} AND incoming == running
+//     → Argo workflow-step retry. Argo's workflow-step-level retryStrategy
+//     re-runs the entire step (pre-job → main → post-job). The pre-job
+//     container (Slippy CLI prejob) POSTs /v1/slips/{id}/steps/{name}/start
+//     to slippy-api, which insert-paths through this gate. Without this
+//     allow-list entry the gate returns ErrTerminalAlreadyExists → 409;
+//     Argo's retryStrategy.expression matches only `asInt(lastRetry.exitCode)
+//     in {143,137,-1}` (SIGTERM / SIGKILL / network) and does NOT catch
+//     409/exit 1, so the workflow step abandons permanently and the slip
+//     wedges at failed/timeout. failed→running is the most common retry
+//     path; timeout→running is the CI-typical retry-with-extension path.
+//
+//     aborted → running is INTENTIONALLY EXCLUDED: cascade-aborted steps
+//     must go through aborted → pending (cascade-reset) to re-enter the
+//     queue. A direct aborted → running bypasses the recovery contract.
+//
+//     error → running and skipped → running are INTENTIONALLY EXCLUDED:
+//     90d production data (ci.slip_component_states, 54,473 rows, queried
+//     2026-06) shows zero occurrences of any terminal → running transition,
+//     including error and skipped. With no empirical evidence that these
+//     are legitimate retry paths, we keep them REFUSED. If a real workflow
+//     pattern surfaces them, narrow the allow-list to add them then.
+//
+//     Deliberate divergence from STATE_MACHINE_V3.md: SMV3 §lines 15, 20,
+//     47, 395 (glossary primary-failure class, the `failed → running →
+//     completed` recovery contract on line 47, and the symmetric recovery
+//     branch language on line 395) group {failed, error, timeout} as a
+//     single "primary failure" class and contemplate an "error → running"
+//     recovery transition. We diverge from the spec here on empirical
+//     grounds — the 90d production sweep above found zero error→running
+//     rows. Adding error (and symmetrically skipped) to Rule 3 is a
+//     one-line allow-list extension once observability surfaces a
+//     legitimate case. See ADO #82468 plan v3 §C.3 for the basis.
+//
+// REFUSE all other terminal → {terminal, non-terminal} transitions including:
+//   - completed → anything (completed is absolutely final).
+//   - same-terminal idempotency (e.g. failed → failed) — HTTP layer handles idempotency.
+//   - cross-terminal label swaps (e.g. failed → aborted).
+//   - aborted → running (use aborted → pending cascade-reset instead).
+//   - error → running, skipped → running (no production evidence; see above).
+func isRecoveryAllowed(prior, incoming StepStatus) bool {
+	// Rule 1: aborted → pending cascade-reset.
+	if prior == StepStatusAborted && incoming == StepStatusPending {
+		return true
+	}
+	// Rule 2: recoverable-terminal → completed. Default arm of the switch is
+	// intentional — non-recoverable terminals (completed) and all
+	// non-terminals fall through to "refuse". Listed explicitly to satisfy
+	// the exhaustive lint check.
+	if incoming == StepStatusCompleted {
+		switch prior {
+		case StepStatusFailed, StepStatusAborted, StepStatusError,
+			StepStatusTimeout, StepStatusSkipped:
+			return true
+		case StepStatusCompleted, StepStatusPending, StepStatusHeld, StepStatusRunning:
+			// completed → completed: refuse same-terminal idempotency at lib level.
+			// pending/held/running: not terminal; this branch is dead because
+			// the gate only calls isRecoveryAllowed when prior is terminal.
+			return false
+		}
+	}
+	// Rule 3: Argo workflow-step retry (failed/timeout → running). See godoc
+	// above for full rationale. aborted/error/skipped → running remain REFUSED.
+	if incoming == StepStatusRunning {
+		switch prior {
+		case StepStatusFailed, StepStatusTimeout:
+			return true
+		case StepStatusAborted, StepStatusError, StepStatusSkipped,
+			StepStatusCompleted, StepStatusPending, StepStatusHeld, StepStatusRunning:
+			// aborted → running: must go through aborted → pending cascade-reset.
+			// error / skipped → running: zero production occurrences (90d, 2026-06).
+			// completed → running: completed is absolutely final.
+			// pending/held/running → running: dead branch (gate only calls
+			// isRecoveryAllowed when prior is terminal).
+			return false
+		}
+	}
+	return false
+}
+
+// slippyI5GateEnabledEnv is the env-var name for the gate kill switch.
+// Plan v3 §G.1 rollback contract: empty or unparseable → fail-safe ON;
+// only an explicit parseable-false value disables the gate.
+const slippyI5GateEnabledEnv = "SLIPPY_I5_GATE_ENABLED"
+
+// gateEnabled returns true unless the gate is explicitly disabled via the
+// SLIPPY_I5_GATE_ENABLED env var. Default ON for fail-safe; only
+// SLIPPY_I5_GATE_ENABLED=false (or 0, False, etc. per strconv.ParseBool)
+// disables. Unparseable values fail-safe ON.
+//
+// This is the documented Plan v3 §G.1 rollback path — symmetric with
+// SLIPPY_I5_LOCK_ENABLED on the slippy-api side.
+func gateEnabled() bool {
+	v := os.Getenv(slippyI5GateEnabledEnv)
+	if v == "" {
+		return true // default ON
+	}
+	on, err := strconv.ParseBool(v)
+	if err != nil {
+		return true // unparseable → fail-safe ON
+	}
+	return on
+}
+
+// enforceTerminalMonotonicity is the INSERT-time gate that prevents stale or
+// out-of-order writes from overwriting a terminal step status. Called from
+// UpdateStep and UpdateStepWithHistory BEFORE the slip_component_states INSERT.
+//
+// Returns:
+//   - nil:                          INSERT permitted (no prior, prior non-terminal,
+//     or transition on the recovery allow-list).
+//   - ErrTerminalAlreadyExists:     INSERT refused (gate hit).
+//   - nil + structured WARN log:    CH pre-flight failure (fail-OPEN per §J error
+//     policy — gate is defense-in-depth; primary
+//     race coverage lives in the per-corr-id lock).
+//
+// SetComponentImageTag is exempt (§B.5) because it preserves the current
+// status — it is metadata-only, not a status transition.
+func (s *ClickHouseStore) enforceTerminalMonotonicity(
+	ctx context.Context,
+	correlationID, stepName, componentName string,
+	incoming StepStatus,
+) error {
+	// Plan v3 §G.1 env-flag kill switch (rollback contract).
+	if !gateEnabled() {
+		return nil
+	}
+	// Step-level bypass (defensive, see isGateBypassed godoc).
+	//
+	// The componentName == "" guard enforces that the bypass only applies to
+	// pure pipeline-step writes (the case handlePushRetry actually exercises).
+	// push_parsed has no components today, but defense-in-depth: if a future
+	// drift in handlePushRetry or any other producer attempts a component-level
+	// write under push_parsed, the gate still fires.
+	if isGateBypassed(stepName) && componentName == "" {
+		return nil
+	}
+
+	prior, found, err := s.latestComponentStateStatus(ctx, correlationID, stepName, componentName)
+	if err != nil {
+		// Fail OPEN: log warn + continue. Gate is best-effort defense-in-depth;
+		// the per-corr-id lock (slippy-api scope) is the primary safety net.
+		// (nilerr lint exemption: the nil return is the intentional fail-open
+		// per plan v3 §J error policy — see enforceTerminalMonotonicity godoc.)
+		s.logger.Warn(ctx, "i5: terminal-monotonicity pre-flight failed; failing open",
+			map[string]interface{}{
+				"correlation_id": correlationID,
+				"step":           stepName,
+				"component":      componentName,
+				"error":          err.Error(),
+			})
+		return nil //nolint:nilerr // fail-open is the documented §J error policy
+	}
+	if !found || !prior.IsTerminal() {
+		// First write or prior non-terminal — always allow.
+		return nil
+	}
+	if isRecoveryAllowed(prior, incoming) {
+		return nil
+	}
+	// Prior is terminal; transition is NOT on the allow-list. Refuse.
+	return ErrTerminalAlreadyExists
+}
+
 // appendHistoryWithOverrides is the internal implementation of AppendHistory.
 // When overrides are provided, the named step-status columns are written with the
 // supplied literal values instead of being copied verbatim from the DB row.
@@ -866,7 +1210,7 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 	ctx context.Context,
 	correlationID string,
 	entry StateHistoryEntry,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	// Start tracing span for the retry operation
 	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
@@ -996,14 +1340,14 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 // UpdateSlipStatus immediately after appendHistoryWithOverrides: under ClickHouse async insert
 // visibility (VersionedCollapsingMergeTree without FINAL) the just-written step row may not yet
 // be visible, so the SELECT would copy the old (stale) step status into the new row. Passing the
-// same stepStatusOverride used by appendHistoryWithOverrides ensures the two operations agree on
+// same StepStatusOverride used by appendHistoryWithOverrides ensures the two operations agree on
 // the step value regardless of visibility lag.
 func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	ctx context.Context,
 	correlationID string,
 	newVersion uint64,
 	newStatus SlipStatus,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	stepColumns := s.queryBuilder.BuildStepColumns()
 	aggregateColumns := s.queryBuilder.BuildAggregateColumns()
@@ -1060,7 +1404,7 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
 
-	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
+	// Build step SELECT expressions. For columns that have a StepStatusOverride, replace
 	// the verbatim DB column reference with a literal (?) so the step-status value is
 	// updated atomically alongside the slip-status change. This mirrors the identical
 	// pattern in insertAtomicHistoryUpdate and fixes the stale-clone race described in
@@ -1073,7 +1417,7 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	} else {
 		overrideByCol := make(map[string]StepStatus, len(overrides))
 		for _, o := range overrides {
-			overrideByCol[o.columnName] = o.status
+			overrideByCol[o.ColumnName] = o.Status
 		}
 		stepSelectExprs := make([]string, 0, len(stepColumns))
 		stepOverrideArgs = make([]interface{}, 0, len(overrides))
@@ -1134,7 +1478,7 @@ func (s *ClickHouseStore) updateSlipStatusWithOverrides(
 	ctx context.Context,
 	correlationID string,
 	newStatus SlipStatus,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
@@ -1358,15 +1702,34 @@ func (s *ClickHouseStore) loadStateHistoryFromDB(ctx context.Context, correlatio
 	return string(jsonBytes), nil
 }
 
-// stepStatusOverride pairs a routing_slips step-status column name (e.g. "unit_tests_status")
-// with the literal value to write. When passed to insertAtomicHistoryUpdate the verbatim
-// DB column reference is replaced with a SQL literal so the step-status column is updated
-// atomically with the history entry. This is used by the pure-pipeline-step path in
-// UpdateStepWithHistory to persist the correct status in routing_slips without a separate
-// Load+Update round-trip.
-type stepStatusOverride struct {
-	columnName string
-	status     StepStatus
+// StepStatusOverride pairs a routing_slips step-status column name (e.g. "unit_tests_status")
+// with the literal value to write. When passed to insertAtomicHistoryUpdate,
+// insertAtomicStatusUpdate, or insertAtomicUpdateWithVersions, the verbatim DB column
+// reference is replaced with a SQL literal so the step-status column is updated atomically
+// with the surrounding write.
+//
+// This is the public hook by which callers (slippy-api's hydrateAndPersist) pin
+// event-log-validated step status for the step being written, defeating any stale
+// in-memory snapshot that Load may have returned under ClickHouse async-insert
+// visibility lag (the I5 race).
+//
+// ColumnName must be the underlying DB column (e.g. "unit_tests_status"), not the
+// raw step name. Use slippy.StepStatusColumnName(stepName) to construct it.
+type StepStatusOverride struct {
+	ColumnName string
+	Status     StepStatus
+}
+
+// StepStatusColumnName returns the routing_slips DB column name for a pipeline
+// step's status (e.g. "unit_tests" → "unit_tests_status"). It is the canonical
+// formula used by SlipQueryBuilder.StepStatusColumn and is exposed as a free
+// function so external callers (e.g. slippy-api's hydrateAndPersist) can
+// construct StepStatusOverride without holding a SlipQueryBuilder reference.
+//
+// The two must remain in lockstep — see the unit test in slippy/columns_test.go
+// (or this package's column_name_consistency_test.go) for the contract pin.
+func StepStatusColumnName(stepName string) string {
+	return stepName + "_status"
 }
 
 // insertAtomicHistoryUpdate cancels all active routing_slips rows for correlationID and inserts
@@ -1378,7 +1741,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	correlationID string,
 	newVersion uint64,
 	newStateHistoryJSON string,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
@@ -1446,7 +1809,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
 
-	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
+	// Build step SELECT expressions. For columns that have a StepStatusOverride, replace
 	// the verbatim DB column reference with a literal (?) so the step-status value is
 	// updated atomically alongside the history entry. This fixes the case where a pure
 	// pipeline step (e.g. unit_tests) would otherwise copy a stale "running" value from
@@ -1460,7 +1823,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	} else {
 		overrideByCol := make(map[string]StepStatus, len(overrides))
 		for _, o := range overrides {
-			overrideByCol[o.columnName] = o.status
+			overrideByCol[o.ColumnName] = o.Status
 		}
 		stepSelectExprs := make([]string, 0, len(stepColumns))
 		stepOverrideArgs = make([]interface{}, 0, len(overrides))
@@ -1534,8 +1897,8 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 		slip.Aggregates,
 	)
 
-	// Serialize step details (timing, actor, errors)
-	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	// Serialize step details (timing, actor, errors). Create path — no overrides.
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip, nil))
 	if err != nil {
 		return fmt.Errorf("failed to marshal step details: %w", err)
 	}
@@ -1644,6 +2007,7 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 	ctx context.Context,
 	slip *Slip,
 	_, newVersion uint64,
+	overrides ...StepStatusOverride,
 ) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
@@ -1652,12 +2016,33 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 	// Build dynamic column lists using query builder
 	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
 
+	// Apply optional per-step status overrides. For columns with overrides, the literal
+	// value comes from the override map; otherwise it comes from slip.Steps[name].Status
+	// via BuildStepColumnsAndValues. This is the Option D hook that lets slippy-api pin
+	// event-log-validated step status for the step being written, defeating any stale-Load
+	// race. The stepValues slice is mutated in place — its position must stay aligned with
+	// stepColumns for the placeholder fill below.
+	if len(overrides) > 0 {
+		overrideByCol := make(map[string]StepStatus, len(overrides))
+		for _, o := range overrides {
+			overrideByCol[o.ColumnName] = o.Status
+		}
+		for i, col := range stepColumns {
+			if overrideStatus, ok := overrideByCol[col]; ok {
+				stepValues[i] = string(overrideStatus)
+			}
+		}
+	}
+
 	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
 		slip.Aggregates,
 	)
 
-	// Serialize step details (timing, actor, errors)
-	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	// Serialize step details (timing, actor, errors). Pass overrides so that
+	// step_details.<stepName>.status mirrors the column literal for the same row —
+	// JSON parity with the <step>_status column is a load-bearing invariant of
+	// Option D (see ADO #82468 / Stage-2 plan §A.5).
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip, overrides))
 	if err != nil {
 		return fmt.Errorf("failed to marshal step details: %w", err)
 	}
@@ -1762,8 +2147,33 @@ func (s *ClickHouseStore) scanSlip(ctx context.Context, query string, args ...in
 }
 
 // buildStepDetails builds the step_details JSON from the slip.
-func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
+//
+// When overrides is non-empty, the per-step "status" field is sourced from the
+// override map (matched by column name via StepStatusColumnName) — this keeps
+// the JSON value in lockstep with the corresponding <step>_status column literal
+// emitted by insertAtomicUpdateWithVersions. For all other steps (and when
+// overrides is nil/empty) "status" reflects slip.Steps[name].Status.
+//
+// The status field is additive — pre-existing rows in routing_slips never had
+// step_details.<step>.status; downstream consumers reading specific named
+// fields are unaffected.
+func (s *ClickHouseStore) buildStepDetails(slip *Slip, overrides []StepStatusOverride) map[string]interface{} {
 	details := make(map[string]interface{})
+
+	// Index overrides by step name (not column name) for cheap lookup.
+	var overrideByStep map[string]StepStatus
+	if len(overrides) > 0 {
+		overrideByStep = make(map[string]StepStatus, len(overrides))
+		for _, o := range overrides {
+			// ColumnName is "<step>_status" — strip the suffix to recover the
+			// step name. Defensive: if a caller passes a column that does not
+			// match the convention, skip rather than write garbage.
+			const suffix = "_status"
+			if len(o.ColumnName) > len(suffix) && strings.HasSuffix(o.ColumnName, suffix) {
+				overrideByStep[o.ColumnName[:len(o.ColumnName)-len(suffix)]] = o.Status
+			}
+		}
+	}
 
 	for stepName, step := range slip.Steps {
 		stepDetail := make(map[string]interface{})
@@ -1782,6 +2192,19 @@ func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
 		}
 		if step.HeldReason != "" {
 			stepDetail["held_reason"] = step.HeldReason
+		}
+
+		// Status — override map first, else in-memory snapshot.
+		// We emit only when the status is non-empty to keep parity with the
+		// "non-default fields only" convention of the other fields above.
+		var status StepStatus
+		if overrideStatus, ok := overrideByStep[stepName]; ok {
+			status = overrideStatus
+		} else {
+			status = step.Status
+		}
+		if status != "" {
+			stepDetail["status"] = string(status)
 		}
 
 		if len(stepDetail) > 0 {
@@ -2625,21 +3048,9 @@ func (s *ClickHouseStore) doLoadComponentStates(
 	// whether the row carries an image_tag value. A single UInt64 avoids the nested-aggregate
 	// error that CH 25.x raises when tuple arguments are used inside argMax.
 	//
-	// Formula with image_tag (includeImageTag=true):
-	//   epoch_microseconds * 200 + status_ordinal * 2 + (image_tag != '' ? 1 : 0)
-	//
-	// Formula without image_tag (includeImageTag=false):
-	//   epoch_microseconds * 100 + status_ordinal
-	//
-	// Tiebreak rules:
-	//  1. Later timestamp wins (primary).
-	//  2. Higher-value status wins on same-second ties: completed (4) > running (3).
-	//  3. Row with image_tag set wins over row without, for same timestamp+status.
-	//     This ensures SetComponentImageTag rows (which carry the same status as the
-	//     preceding CompleteStep row) are not overwritten by the status-only row.
-	const sortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 200 + toUInt64(toUInt8(status)) * 2 + if(image_tag != '', 1, 0)"
-	const sortKeyNoImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
-
+	// The formulas live in package-level componentEventSortKey* constants so that
+	// LatestStepStatusFromEvents and this loader stay byte-identical — drift between
+	// the two would silently change which event row "wins" on same-microsecond writes.
 	var query string
 	if includeImageTag {
 		// image_tag gets a separate sort key that masks out rows where the tag is empty.
@@ -2648,7 +3059,7 @@ func (s *ClickHouseStore) doLoadComponentStates(
 		//   - rows with empty image_tag get sort_key=0 and always lose to any tagged row.
 		// This ensures SetComponentImageTag events survive even when a later CompleteStep event
 		// (which has a higher sort_key but no tag) comes in for the same component.
-		const imageTagSortKey = "if(image_tag != '', " + sortKeyWithImageTag + ", 0)"
+		imageTagSortKey := "if(image_tag != '', " + componentEventSortKeyWithImageTag + ", 0)"
 		query = fmt.Sprintf(`
 			SELECT
 				step,
@@ -2660,7 +3071,7 @@ func (s *ClickHouseStore) doLoadComponentStates(
 			FROM %s.%s
 			WHERE correlation_id = ?
 			GROUP BY step, component
-		`, sortKeyWithImageTag, sortKeyWithImageTag, imageTagSortKey, s.database, TableSlipComponentStates)
+		`, componentEventSortKeyWithImageTag, componentEventSortKeyWithImageTag, imageTagSortKey, s.database, TableSlipComponentStates)
 	} else {
 		query = fmt.Sprintf(`
 			SELECT
@@ -2672,7 +3083,7 @@ func (s *ClickHouseStore) doLoadComponentStates(
 			FROM %s.%s
 			WHERE correlation_id = ?
 			GROUP BY step, component
-		`, sortKeyNoImageTag, sortKeyNoImageTag, s.database, TableSlipComponentStates)
+		`, componentEventSortKeyNoImageTag, componentEventSortKeyNoImageTag, s.database, TableSlipComponentStates)
 	}
 
 	rows, err := s.session.QueryWithArgs(ctx, query, correlationID)
