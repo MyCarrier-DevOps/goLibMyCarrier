@@ -223,3 +223,139 @@ func TestI5V2_R2_CallerOverride_WinsOverArgMax(t *testing.T) {
 		t.Errorf("callerOverride: builds_completed=%v, expected completed", loaded.Steps["builds_completed"].Status)
 	}
 }
+
+// --- 436cc68c repro + SC-1 adversarial tests (DA blocker, ADO #83405) ---
+
+// TestI5_V2_436cc68c_Repro documents the race topology from commit 436cc68c where
+// a concurrent pipeline-level "completed" event could be missed by a stale aggregate
+// write-back that loaded the slip before the event arrived. Two subtests cover the
+// topology under pure-pipeline and aggregate-step configurations.
+//
+// Sequential simulation: exact concurrency cannot be reproduced in a single-threaded
+// integration test. These subtests verify the correct outcome that the R2 argMax derive
+// and monotonic-forward merge (Fix 2) produce. They anchor the behavior as a regression
+// guard for the case where a concurrent write-back could clobber the correct state.
+func TestI5_V2_436cc68c_Repro(t *testing.T) {
+	t.Run("pure_pipeline", func(t *testing.T) {
+		// Scenario: push_parsed is a pure pipeline step (no aggregate write-back).
+		// A stale aggregate write-back from a different step must not revert
+		// push_parsed to running after completed has been written.
+		ctx := context.Background()
+		store := i5V2SetupStore(ctx, t)
+		corrID := i5V2TestCorrelationID(t)
+		i5V2CreateSlip(ctx, t, store, corrID, "myorg/repo-436cc68c-pure")
+
+		// Step 1: write pipeline-level running for push_parsed (pure pipeline step).
+		// Pure pipeline steps only write to slip_component_states; routing_slips for
+		// push_parsed is not updated until the next aggregate write-back runs.
+		if err := store.UpdateStep(ctx, corrID, "push_parsed", "", StepStatusRunning); err != nil {
+			t.Fatalf("step1 push_parsed=running: %v", err)
+		}
+
+		// Step 2: write completed for push_parsed (simulates the concurrent flush).
+		if err := store.UpdateStep(ctx, corrID, "push_parsed", "", StepStatusCompleted); err != nil {
+			t.Fatalf("step2 push_parsed=completed: %v", err)
+		}
+
+		// Step 3: trigger aggregate write-back via a different step.
+		// updateWithOverrides R2-derives push_parsed=completed from slip_component_states
+		// (argMax tier 2 for pure pipeline steps) and writes it to routing_slips.
+		if err := store.UpdateStep(ctx, corrID, "builds_completed", "api", StepStatusCompleted); err != nil {
+			t.Fatalf("step3 builds_completed/api=completed: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, corrID)
+		if err != nil {
+			t.Fatalf("failed to load: %v", err)
+		}
+		if loaded.Steps["push_parsed"].Status != StepStatusCompleted {
+			t.Errorf("436cc68c/pure_pipeline: push_parsed=%v; expected completed — stale running must not land",
+				loaded.Steps["push_parsed"].Status)
+		}
+	})
+
+	t.Run("aggregate", func(t *testing.T) {
+		// Scenario: unit_tests_completed is an aggregate step. A concurrent pipeline-level
+		// completed event must not be clobbered by a stale write-back that sees running
+		// in its stale in-memory snapshot.
+		ctx := context.Background()
+		store := i5V2SetupStore(ctx, t)
+		corrID := i5V2TestCorrelationID(t)
+		i5V2CreateSlip(ctx, t, store, corrID, "myorg/repo-436cc68c-agg")
+
+		// Step 1: write pipeline-level running for unit_tests_completed (aggregate step).
+		if err := store.UpdateStep(ctx, corrID, "unit_tests_completed", "", StepStatusRunning); err != nil {
+			t.Fatalf("step1 unit_tests_completed=running: %v", err)
+		}
+
+		// Step 2: write pipeline-level completed (concurrent flush simulated sequentially).
+		// SC-3 allows terminal incoming; no gate block.
+		if err := store.UpdateStep(ctx, corrID, "unit_tests_completed", "", StepStatusCompleted); err != nil {
+			t.Fatalf("step2 unit_tests_completed=completed: %v", err)
+		}
+
+		// Step 3: trigger write-back via a different step.
+		// Monotonic-forward merge ensures unit_tests_completed stays completed even
+		// when the write-back's in-memory snapshot reflects an earlier state.
+		if err := store.UpdateStep(ctx, corrID, "builds_completed", "api", StepStatusCompleted); err != nil {
+			t.Fatalf("step3 builds_completed/api=completed: %v", err)
+		}
+
+		loaded, err := store.Load(ctx, corrID)
+		if err != nil {
+			t.Fatalf("failed to load: %v", err)
+		}
+		if loaded.Steps["unit_tests_completed"].Status != StepStatusCompleted {
+			t.Errorf("436cc68c/aggregate: unit_tests_completed=%v; expected completed",
+				loaded.Steps["unit_tests_completed"].Status)
+		}
+	})
+}
+
+// TestI5V2_R2_SC1_Adversarial verifies SC-1 preservation under monotonic-forward merge:
+// a stale pipeline-level "running" event (component="") for an aggregate step must NOT
+// override an in-memory rollup that says "completed" (in-memory terminal wins over
+// stale non-terminal derived value).
+//
+// Setup:
+//   1. pipeline-level builds_completed=running → slip_component_states component='' running
+//   2. component builds_completed/api=completed → rollup completed → routing_slips updated
+//
+// At this point routing_slips has builds_completed=completed, while slip_component_states
+// (component='') still has the older running event. The next write-back's R2 derive
+// returns running for builds_completed (argMax of component='' events). The monotonic merge
+// must choose in-memory completed (terminal) over derived running (non-terminal).
+func TestI5V2_R2_SC1_Adversarial(t *testing.T) {
+	ctx := context.Background()
+	store := i5V2SetupStore(ctx, t)
+	corrID := i5V2TestCorrelationID(t)
+	i5V2CreateSlip(ctx, t, store, corrID, "myorg/repo-sc1-adversarial")
+
+	// Step 1: stale pipeline-level running for builds_completed (aggregate step).
+	if err := store.UpdateStep(ctx, corrID, "builds_completed", "", StepStatusRunning); err != nil {
+		t.Fatalf("step1 builds_completed=running: %v", err)
+	}
+
+	// Step 2: component completed → rollup computes completed → routing_slips updated to completed.
+	if err := store.UpdateStep(ctx, corrID, "builds_completed", "api", StepStatusCompleted); err != nil {
+		t.Fatalf("step2 builds_completed/api=completed: %v", err)
+	}
+
+	// Step 3: trigger write-back for a different aggregate step.
+	// At this point routing_slips has builds_completed=completed (in-memory terminal);
+	// slip_component_states (component='') has builds_completed=running (derived non-terminal).
+	// Monotonic merge: in-memory terminal > derived non-terminal → IN-MEMORY wins.
+	// SC-1 invariant: fresh rollup must NOT be overwritten by stale pipeline-level running.
+	if err := store.UpdateStep(ctx, corrID, "unit_tests_completed", "api", StepStatusCompleted); err != nil {
+		t.Fatalf("step3 unit_tests_completed/api=completed: %v", err)
+	}
+
+	loaded, err := store.Load(ctx, corrID)
+	if err != nil {
+		t.Fatalf("failed to load: %v", err)
+	}
+	if loaded.Steps["builds_completed"].Status != StepStatusCompleted {
+		t.Errorf("SC-1 adversarial: builds_completed=%v; expected completed — in-memory terminal must win over stale derived running",
+			loaded.Steps["builds_completed"].Status)
+	}
+}

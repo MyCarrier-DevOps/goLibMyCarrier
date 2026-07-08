@@ -375,7 +375,10 @@ func TestClickHouseStore_Update(t *testing.T) {
 
 		// Create a mock row factory for getMaxVersion
 		// Post-insert verification: after insert, getMaxVersion should return our new version
+		// QueryWithArgsRows: empty MockRows for the derivePipelineStepStatuses call inside
+		// updateWithOverrides (delegated to by Update since SC-2).
 		mockSession := &clickhousetest.MockSession{
+			QueryWithArgsRows: &clickhousetest.MockRows{}, // empty — no derived steps
 			QueryRowFunc: func(ctx context.Context, query string, args ...any) ch.Row {
 				callCount++
 				return &clickhousetest.MockRow{
@@ -479,6 +482,7 @@ func TestClickHouseStore_Update(t *testing.T) {
 		// This test verifies that Update succeeds even when another "higher version" exists,
 		// because we no longer do post-insert verification.
 		mockSession := &clickhousetest.MockSession{
+			QueryWithArgsRows: &clickhousetest.MockRows{}, // empty — no derived steps (SC-2 delegation)
 			QueryRowFunc: func(ctx context.Context, query string, args ...any) ch.Row {
 				return &clickhousetest.MockRow{
 					ScanFunc: func(dest ...any) error {
@@ -2403,6 +2407,7 @@ func TestClickHouseStore_Update_UpdatesTimestamp(t *testing.T) {
 	// This prevents infinite retry loops in the post-insert verification
 	var lastInsertedVersion uint64
 	mockSession := &clickhousetest.MockSession{
+		QueryWithArgsRows: &clickhousetest.MockRows{}, // empty — no derived steps (SC-2 delegation)
 		QueryRowFunc: func(ctx context.Context, query string, args ...any) driver.Row {
 			return &clickhousetest.MockRow{
 				ScanFunc: func(dest ...any) error {

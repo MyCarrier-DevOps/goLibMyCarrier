@@ -987,12 +987,11 @@ func (s *ClickHouseStore) derivePipelineStepStatuses(
 //  2. argMaxDerived: middle tier — behaviour differs by step type:
 //     - Pure pipeline steps: argMax-derived replaces stale in-memory directly.
 //     - Aggregate steps: monotonic-forward merge (DA SC-1 gap, ADO #83405):
-//       • derived terminal  + inMemory non-terminal → DERIVED  (pipeline-level completed beats stale running)
-//       • inMemory terminal + derived  non-terminal → IN-MEMORY (rollup beats stale pipeline event)
-//       • both terminal                             → DERIVED  (argMax is authoritative ordering)
-//       • both non-terminal                        → IN-MEMORY (conservative; in-memory may reflect
-//                                                    fresh component events not yet pipeline-evented)
-//     - Aggregate step + no derived entry          → in-memory (rollup is authoritative)
+//     - derived terminal  + inMemory non-terminal → DERIVED  (fresh pipeline completed beats stale running)
+//     - inMemory terminal + derived  non-terminal → IN-MEMORY (rollup beats stale pipeline event)
+//     - both terminal                             → DERIVED   (argMax is authoritative ordering)
+//     - both non-terminal                         → IN-MEMORY (conservative; rollup may reflect fresh events)
+//     - Aggregate step + no derived entry         → in-memory (rollup is authoritative)
 //  3. inMemory: lowest; used when no argMax entry exists for the step.
 //
 // The returned map contains one entry per step found in inMemory.
@@ -2188,7 +2187,7 @@ func (s *ClickHouseStore) enforceTerminalFreshnessGate(
 	window := freshnessWindow()
 	const maxFreshnessWindow = 3600 * time.Second // Security M1: cap at 1 hour
 	if window > maxFreshnessWindow {
-		s.logger.Warn(ctx, "SLIPPY_I5_FRESHNESS_WINDOW_SECONDS exceeds maximum; clamped to 3600", map[string]interface{}{
+		s.logger.Warn(ctx, "SLIPPY_I5_FRESHNESS_WINDOW_SECONDS exceeds max; clamped to 3600s", map[string]interface{}{
 			"configured_s": int(window.Seconds()),
 			"clamped_s":    3600,
 		})
