@@ -986,10 +986,13 @@ func (s *ClickHouseStore) derivePipelineStepStatuses(
 //  1. callerOverride: highest; protects freshly-computed values (e.g. aggregate rollup).
 //  2. argMaxDerived: middle tier — behaviour differs by step type:
 //     - Pure pipeline steps: argMax-derived replaces stale in-memory directly.
-//     - Aggregate steps: monotonic-forward merge (DA SC-1 gap, ADO #83405):
-//     - derived terminal  + inMemory non-terminal → DERIVED  (fresh pipeline completed beats stale running)
+//     - Aggregate steps: rollup-authoritative merge (DA SC-1 gap, ADO #83405).
+//       The component ROLLUP (in-memory) is authoritative for aggregate steps;
+//       pipeline-level (component='') events are direct overrides, not rollups.
+//       A stale pipeline-level terminal must NOT clobber a fresh rollup terminal.
+//     - derived terminal  + inMemory non-terminal → DERIVED   (forward-progress: 436cc68c staleness signature)
 //     - inMemory terminal + derived  non-terminal → IN-MEMORY (rollup beats stale pipeline event)
-//     - both terminal                             → DERIVED   (argMax is authoritative ordering)
+//     - both terminal                             → IN-MEMORY (rollup authoritative; stale pipeline clobber prevented)
 //     - both non-terminal                         → IN-MEMORY (conservative; rollup may reflect fresh events)
 //     - Aggregate step + no derived entry         → in-memory (rollup is authoritative)
 //  3. inMemory: lowest; used when no argMax entry exists for the step.
@@ -1022,30 +1025,27 @@ func resolveEffectiveStepStatuses(
 				continue
 			}
 		} else {
-			// Aggregate step: monotonic-forward merge (DA SC-1 gap, ADO #83405).
-			// Blanket exclusion replaced so that a fresh pipeline-level terminal event
-			// (e.g. completed) beats a stale in-memory running value (closes 436cc68c
-			// for aggregate topology) while SC-1's core invariant is preserved when the
-			// in-memory rollup is already terminal.
+			// Aggregate step: rollup-authoritative merge (DA SC-1 gap, ADO #83405).
+			// The component ROLLUP (in-memory) is authoritative for aggregate steps.
+			// Pipeline-level (component='') events are direct overrides, NOT rollups.
+			// A stale pipeline-level terminal must never clobber a fresh failed rollup
+			// (DA delta blocker — 436cc68c correction).
+			//
+			// Derived wins ONLY on forward-progress: derived terminal + inMem non-terminal.
+			// All other cells fall back to in-memory (rollup authoritative).
 			if derived, ok := argMaxDerived[stepName]; ok {
 				inMem := stepData.Status
 				switch {
 				case derived.IsTerminal() && !inMem.IsTerminal():
-					// Fresh pipeline-level terminal beats stale in-memory non-terminal.
-					result[stepName] = derived
-					continue
-				case inMem.IsTerminal() && !derived.IsTerminal():
-					// Fresh in-memory rollup beats stale pipeline-level non-terminal (SC-1).
-					result[stepName] = inMem
-					continue
-				case derived.IsTerminal() && inMem.IsTerminal():
-					// Both terminal: argMax is authoritative ordering (derive ran after Load).
+					// Forward-progress: fresh pipeline-level terminal beats stale in-memory
+					// non-terminal. This is the exact 436cc68c staleness signature.
 					result[stepName] = derived
 					continue
 				default:
-					// Both non-terminal: in-memory rollup may reflect fresh component events
-					// not yet reflected in a pipeline-level event — use in-memory (conservative,
-					// self-heals on next derive cycle).
+					// All other cases (inMem-terminal/derived-non, both-terminal,
+					// both-non-terminal): in-memory rollup is authoritative.
+					// Prevents a stale pipeline-level completed from clobbering a fresh
+					// failed rollup (DA delta blocker).
 					result[stepName] = inMem
 					continue
 				}

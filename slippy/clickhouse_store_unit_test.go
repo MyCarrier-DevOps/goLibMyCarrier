@@ -6423,23 +6423,48 @@ func TestR2_ResolveEffectiveStepStatuses_AggregateStep_DerivedTerminal_InMemNonT
 	}
 }
 
-// TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothTerminal_DerivedWins verifies
-// monotonic merge case: both terminal → derived wins (argMax is authoritative ordering;
-// derive query ran after Load so it is at least as fresh).
-func TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothTerminal_DerivedWins(t *testing.T) {
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothTerminal_InMemWins verifies
+// rollup-authoritative merge case: both terminal → in-memory wins.
+// The component ROLLUP (in-memory) is authoritative for aggregate steps. A stale
+// pipeline-level terminal event must NOT clobber a fresh in-memory rollup terminal
+// (DA delta blocker — 436cc68c correction).
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothTerminal_InMemWins(t *testing.T) {
 	cfg := testPipelineConfig()
 	inMemory := makeTestSteps(map[string]StepStatus{
-		"builds": StepStatusFailed, // in-memory terminal
+		"builds": StepStatusFailed, // in-memory terminal (rollup from components)
 	})
 	argMaxDerived := map[string]StepStatus{
-		"builds": StepStatusCompleted, // derived terminal (different — argMax ordering wins)
+		"builds": StepStatusCompleted, // derived terminal (stale pipeline-level event — must NOT win)
 	}
 
 	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
 
-	// both terminal → derived wins.
-	if effective["builds"] != StepStatusCompleted {
-		t.Errorf("monotonic merge (both-terminal): expected completed (derived), got %v", effective["builds"])
+	// both terminal → in-memory rollup wins (rollup authoritative; stale pipeline clobber prevented).
+	if effective["builds"] != StepStatusFailed {
+		t.Errorf("rollup-authoritative (both-terminal): expected failed (in-memory rollup), got %v", effective["builds"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_DADeltaClobber verifies the exact
+// DA delta blocker scenario: a stale pipeline-level completed event must not clobber
+// a fresh failed rollup for an aggregate step.
+// derived=completed (stale pipeline event) + inMem=failed (rollup) → mem wins.
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_DADeltaClobber(t *testing.T) {
+	cfg := testPipelineConfig()
+	// Rollup computed fresh from component events → failed.
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"builds": StepStatusFailed,
+	})
+	// Stale pipeline-level completed event from a previous flush — must NOT win.
+	argMaxDerived := map[string]StepStatus{
+		"builds": StepStatusCompleted,
+	}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
+
+	// Rollup is authoritative: in-memory failed must survive.
+	if effective["builds"] != StepStatusFailed {
+		t.Errorf("DA delta clobber guard: expected failed (in-memory rollup), got %v (stale pipeline event must not win)", effective["builds"])
 	}
 }
 
