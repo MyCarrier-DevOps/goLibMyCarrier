@@ -984,9 +984,15 @@ func (s *ClickHouseStore) derivePipelineStepStatuses(
 
 // resolveEffectiveStepStatuses merges three status sources with strict precedence:
 //  1. callerOverride: highest; protects freshly-computed values (e.g. aggregate rollup).
-//  2. argMaxDerived: middle; replaces stale in-memory values for pure pipeline steps.
-//     Aggregate steps are excluded (SC-1): their status is computed from components,
-//     not from the event log directly.
+//  2. argMaxDerived: middle tier — behaviour differs by step type:
+//     - Pure pipeline steps: argMax-derived replaces stale in-memory directly.
+//     - Aggregate steps: monotonic-forward merge (DA SC-1 gap, ADO #83405):
+//       • derived terminal  + inMemory non-terminal → DERIVED  (pipeline-level completed beats stale running)
+//       • inMemory terminal + derived  non-terminal → IN-MEMORY (rollup beats stale pipeline event)
+//       • both terminal                             → DERIVED  (argMax is authoritative ordering)
+//       • both non-terminal                        → IN-MEMORY (conservative; in-memory may reflect
+//                                                    fresh component events not yet pipeline-evented)
+//     - Aggregate step + no derived entry          → in-memory (rollup is authoritative)
 //  3. inMemory: lowest; used when no argMax entry exists for the step.
 //
 // The returned map contains one entry per step found in inMemory.
@@ -1009,11 +1015,41 @@ func resolveEffectiveStepStatuses(
 			result[stepName] = st
 			continue
 		}
-		// Tier 2: argMax-derived, except aggregate steps (SC-1).
+		// Tier 2: argMax-derived.
 		if cfg == nil || !cfg.IsAggregateStep(stepName) {
+			// Pure pipeline step: argMax-derived directly replaces stale in-memory value.
 			if st, ok := argMaxDerived[stepName]; ok {
 				result[stepName] = st
 				continue
+			}
+		} else {
+			// Aggregate step: monotonic-forward merge (DA SC-1 gap, ADO #83405).
+			// Blanket exclusion replaced so that a fresh pipeline-level terminal event
+			// (e.g. completed) beats a stale in-memory running value (closes 436cc68c
+			// for aggregate topology) while SC-1's core invariant is preserved when the
+			// in-memory rollup is already terminal.
+			if derived, ok := argMaxDerived[stepName]; ok {
+				inMem := stepData.Status
+				switch {
+				case derived.IsTerminal() && !inMem.IsTerminal():
+					// Fresh pipeline-level terminal beats stale in-memory non-terminal.
+					result[stepName] = derived
+					continue
+				case inMem.IsTerminal() && !derived.IsTerminal():
+					// Fresh in-memory rollup beats stale pipeline-level non-terminal (SC-1).
+					result[stepName] = inMem
+					continue
+				case derived.IsTerminal() && inMem.IsTerminal():
+					// Both terminal: argMax is authoritative ordering (derive ran after Load).
+					result[stepName] = derived
+					continue
+				default:
+					// Both non-terminal: in-memory rollup may reflect fresh component events
+					// not yet reflected in a pipeline-level event — use in-memory (conservative,
+					// self-heals on next derive cycle).
+					result[stepName] = inMem
+					continue
+				}
 			}
 		}
 		// Tier 3: in-memory.

@@ -6369,31 +6369,92 @@ func TestR2_ResolveEffectiveStepStatuses_CoalesceDefaultPending(t *testing.T) {
 	}
 }
 
-// TestR2_ResolveEffectiveStepStatuses_AggregateStep_UsesInMemory verifies SC-1:
-// aggregate steps are excluded from argMax-derived tier 2 and always use in-memory
-// (or callerOverride if provided). This ensures the freshly-computed rollup is never
-// overwritten by a stale slip_component_states argMax for the aggregate step itself.
-func TestR2_ResolveEffectiveStepStatuses_AggregateStep_UsesInMemory(t *testing.T) {
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_InMemTerminal_DerivedNonTerminal verifies
+// monotonic merge case: inMemory terminal + derived non-terminal → in-memory wins (SC-1 core:
+// fresh rollup beats stale pipeline-level event).
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_InMemTerminal_DerivedNonTerminal(t *testing.T) {
 	cfg := testPipelineConfig() // "builds" and "unit_tests" are aggregate steps
 	inMemory := makeTestSteps(map[string]StepStatus{
-		"builds":      StepStatusCompleted, // just computed from components
+		"builds":      StepStatusCompleted, // rollup just computed from components (terminal)
 		"push_parsed": StepStatusCompleted,
 	})
-	// argMax-derived returns a stale "running" for the aggregate step.
+	// argMax-derived returns a stale "running" for the aggregate step (non-terminal).
 	argMaxDerived := map[string]StepStatus{
-		"builds":      StepStatusRunning, // stale argMax — must NOT win for aggregate
+		"builds":      StepStatusRunning, // stale pipeline-level event — must NOT win
 		"push_parsed": StepStatusCompleted,
 	}
 
 	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
 
-	// SC-1: "builds" is an aggregate step → argMax must be ignored → in-memory used.
+	// inMemory terminal + derived non-terminal → in-memory wins.
 	if effective["builds"] != StepStatusCompleted {
-		t.Errorf("SC-1 aggregate: expected completed (in-memory), got %v", effective["builds"])
+		t.Errorf("monotonic merge (inMem-terminal/derived-non): expected completed (in-memory), got %v", effective["builds"])
 	}
 	// pure pipeline step follows normal tier 2.
 	if effective["push_parsed"] != StepStatusCompleted {
 		t.Errorf("push_parsed: expected completed (argMax), got %v", effective["push_parsed"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_DerivedTerminal_InMemNonTerminal verifies
+// monotonic merge case: derived terminal + inMemory non-terminal → derived wins.
+// This closes 436cc68c for aggregate topology: a fresh pipeline-level completed event beats
+// a stale in-memory running value that was loaded before the concurrent flush.
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_DerivedTerminal_InMemNonTerminal(t *testing.T) {
+	cfg := testPipelineConfig()
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"builds": StepStatusRunning, // stale in-memory value from a pre-flush Load
+	})
+	// argMax-derived returns the fresh terminal from the concurrent pipeline-level event.
+	argMaxDerived := map[string]StepStatus{
+		"builds": StepStatusCompleted, // fresh pipeline-level completed — must win
+	}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
+
+	// derived terminal + inMemory non-terminal → derived wins.
+	if effective["builds"] != StepStatusCompleted {
+		t.Errorf("monotonic merge (derived-terminal/inMem-non): expected completed (derived), got %v", effective["builds"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothTerminal_DerivedWins verifies
+// monotonic merge case: both terminal → derived wins (argMax is authoritative ordering;
+// derive query ran after Load so it is at least as fresh).
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothTerminal_DerivedWins(t *testing.T) {
+	cfg := testPipelineConfig()
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"builds": StepStatusFailed, // in-memory terminal
+	})
+	argMaxDerived := map[string]StepStatus{
+		"builds": StepStatusCompleted, // derived terminal (different — argMax ordering wins)
+	}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
+
+	// both terminal → derived wins.
+	if effective["builds"] != StepStatusCompleted {
+		t.Errorf("monotonic merge (both-terminal): expected completed (derived), got %v", effective["builds"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothNonTerminal_InMemWins verifies
+// monotonic merge case: both non-terminal → in-memory wins (conservative; in-memory rollup
+// may reflect fresh component events not yet represented in a pipeline-level event).
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothNonTerminal_InMemWins(t *testing.T) {
+	cfg := testPipelineConfig()
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"builds": StepStatusRunning, // in-memory non-terminal (rollup from components)
+	})
+	argMaxDerived := map[string]StepStatus{
+		"builds": StepStatusPending, // derived non-terminal
+	}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
+
+	// both non-terminal → in-memory wins (conservative).
+	if effective["builds"] != StepStatusRunning {
+		t.Errorf("monotonic merge (both-non-terminal): expected running (in-memory), got %v", effective["builds"])
 	}
 }
 
