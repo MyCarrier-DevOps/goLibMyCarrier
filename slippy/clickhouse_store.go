@@ -987,9 +987,9 @@ func (s *ClickHouseStore) derivePipelineStepStatuses(
 //  2. argMaxDerived: middle tier — behaviour differs by step type:
 //     - Pure pipeline steps: argMax-derived replaces stale in-memory directly.
 //     - Aggregate steps: rollup-authoritative merge (DA SC-1 gap, ADO #83405).
-//       The component ROLLUP (in-memory) is authoritative for aggregate steps;
-//       pipeline-level (component='') events are direct overrides, not rollups.
-//       A stale pipeline-level terminal must NOT clobber a fresh rollup terminal.
+//     The component ROLLUP (in-memory) is authoritative for aggregate steps;
+//     pipeline-level (component=”) events are direct overrides, not rollups.
+//     A stale pipeline-level terminal must NOT clobber a fresh rollup terminal.
 //     - derived terminal  + inMemory non-terminal → DERIVED   (forward-progress: 436cc68c staleness signature)
 //     - inMemory terminal + derived  non-terminal → IN-MEMORY (rollup beats stale pipeline event)
 //     - both terminal                             → IN-MEMORY (rollup authoritative; stale pipeline clobber prevented)
