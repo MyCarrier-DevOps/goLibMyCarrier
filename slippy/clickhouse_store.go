@@ -534,28 +534,12 @@ func (s *ClickHouseStore) FindAllByCommits(
 // - Later writes naturally have higher versions and supersede earlier ones
 // - This is not a "conflict" - it's the expected behavior for concurrent writes
 // - The write itself always succeeds; it may just be superseded by a later write
+//
+// SC-2: Update delegates to updateWithOverrides so that AbandonSlip/PromoteSlip gain
+// R2 argMax derive automatically, closing the ungated stale write-back path that
+// existed when they called Update directly (cost: one extra point-scan per call).
 func (s *ClickHouseStore) Update(ctx context.Context, slip *Slip) error {
-	// Update updated_at timestamp
-	slip.UpdatedAt = time.Now()
-	slip.Sign = 1
-
-	// Store the old version for the cancel row
-	oldVersion := slip.Version
-
-	newVersion := s.nextVersion()
-	if newVersion <= oldVersion {
-		newVersion = oldVersion + 1
-	}
-
-	// Insert both cancel row and new row atomically
-	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
-		return fmt.Errorf("failed to insert atomic update: %w", err)
-	}
-
-	// Update the slip's version to the new value
-	slip.Version = newVersion
-
-	return nil
+	return s.updateWithOverrides(ctx, slip)
 }
 
 // UpdateStep updates a specific step's status.
