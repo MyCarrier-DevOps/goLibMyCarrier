@@ -2090,36 +2090,42 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 // preventing drift. On a ClickHouse empty-aggregate result (no matching rows) the
 // driver returns one row whose columns are zero-valued; rawStatus=="" detects this.
 //
-// Returns (status, eventTimestamp, found=true, nil) on success,
-// ("", zero, false, nil) when no event exists,
-// ("", zero, false, err) on CH error.
+// age_ms is computed server-side via dateDiff('millisecond', argMax(timestamp,...), now64(6))
+// so that the freshness gate is immune to clock skew between the client pod and the CH server.
+// The timestamp is still returned for logging / diagnostic purposes.
+//
+// Returns (status, eventTimestamp, age, found=true, nil) on success,
+// ("", zero, 0, false, nil) when no event exists,
+// ("", zero, 0, false, err) on CH error.
 func (s *ClickHouseStore) latestComponentStateRow(
 	ctx context.Context,
 	correlationID, step, component string,
-) (status StepStatus, eventTimestamp time.Time, found bool, err error) {
+) (status StepStatus, eventTimestamp time.Time, age time.Duration, found bool, err error) {
 	query := fmt.Sprintf(`
 		SELECT
-			argMax(status, %s)    AS latest_status,
-			argMax(timestamp, %s) AS latest_ts
+			argMax(status, %s)                                                   AS latest_status,
+			argMax(timestamp, %s)                                                AS latest_ts,
+			dateDiff('millisecond', argMax(timestamp, %s), now64(6))            AS age_ms
 		FROM %s.%s
 		WHERE correlation_id = ? AND step = ? AND component = ?
-	`, componentEventSortKeyNoImageTag, componentEventSortKeyNoImageTag,
+	`, componentEventSortKeyNoImageTag, componentEventSortKeyNoImageTag, componentEventSortKeyNoImageTag,
 		s.database, TableSlipComponentStates)
 
 	row := s.session.QueryRow(ctx, query, correlationID, step, component)
 	var rawStatus string
 	var ts time.Time
-	if scanErr := row.Scan(&rawStatus, &ts); scanErr != nil {
+	var ageMs int64
+	if scanErr := row.Scan(&rawStatus, &ts, &ageMs); scanErr != nil {
 		if errors.Is(scanErr, sql.ErrNoRows) {
-			return "", time.Time{}, false, nil
+			return "", time.Time{}, 0, false, nil
 		}
-		return "", time.Time{}, false, scanErr
+		return "", time.Time{}, 0, false, scanErr
 	}
 	// CH returns empty string on no-match aggregate; treat as not found.
 	if rawStatus == "" {
-		return "", time.Time{}, false, nil
+		return "", time.Time{}, 0, false, nil
 	}
-	return StepStatus(rawStatus), ts, true, nil
+	return StepStatus(rawStatus), ts, time.Duration(ageMs) * time.Millisecond, true, nil
 }
 
 // enforceTerminalFreshnessGate is the I5 v2 gate (ADO #83405).
@@ -2155,7 +2161,8 @@ func (s *ClickHouseStore) enforceTerminalFreshnessGate(
 		return nil
 	}
 	// Rule 4: query prior state; CH error → WARN + allow (fail-open).
-	priorStatus, eventTimestamp, found, queryErr := s.latestComponentStateRow(ctx, correlationID, step, component)
+	// age is server-computed (dateDiff on CH) so the comparison is immune to pod/CH clock skew.
+	priorStatus, eventTimestamp, age, found, queryErr := s.latestComponentStateRow(ctx, correlationID, step, component)
 	if queryErr != nil {
 		// Fail-open: a CH error here must not produce false-positive refusals.
 		s.logger.Warn(ctx, "I5 gate CH query error; failing open", map[string]interface{}{
@@ -2174,8 +2181,11 @@ func (s *ClickHouseStore) enforceTerminalFreshnessGate(
 	if priorStatus == StepStatusAborted && incoming == StepStatusPending {
 		return nil
 	}
-	// Rule 7: event is older than the freshness window → genuine re-run → allow.
-	if time.Since(eventTimestamp) > freshnessWindow() {
+	// Rule 7: server-computed age exceeds freshness window → genuine re-run → allow.
+	// Using server-side age (dateDiff on CH clock) eliminates pod↔CH clock-skew errors
+	// that caused false-positive refusals when the pod clock lagged behind the CH clock.
+	_ = eventTimestamp // retained for future diagnostic logging
+	if age > freshnessWindow() {
 		return nil
 	}
 	// Rule 8: refuse.

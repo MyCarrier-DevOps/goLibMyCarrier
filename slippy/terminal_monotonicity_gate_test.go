@@ -27,19 +27,23 @@ func gateTestStore(session *clickhousetest.MockSession) *ClickHouseStore {
 	return NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
 }
 
-// gateQueryRowForStatus returns a MockRow that scans (rawStatus, eventTimestamp).
+// gateQueryRowForStatus returns a MockRow that scans (rawStatus, eventTimestamp, age_ms).
 // Use rawStatus="" to simulate no-match (empty aggregate) from ClickHouse.
-func gateQueryRowForStatus(rawStatus string, eventTimestamp time.Time) *clickhousetest.MockRow {
+// age is the server-computed dateDiff value; pass 0 for tests that do not reach rule 7.
+func gateQueryRowForStatus(rawStatus string, eventTimestamp time.Time, age time.Duration) *clickhousetest.MockRow {
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			if len(dest) < 2 {
-				return fmt.Errorf("expected 2 scan destinations, got %d", len(dest))
+			if len(dest) < 3 {
+				return fmt.Errorf("expected 3 scan destinations, got %d", len(dest))
 			}
 			if ptr, ok := dest[0].(*string); ok {
 				*ptr = rawStatus
 			}
 			if ptr, ok := dest[1].(*time.Time); ok {
 				*ptr = eventTimestamp
+			}
+			if ptr, ok := dest[2].(*int64); ok {
+				*ptr = age.Milliseconds()
 			}
 			return nil
 		},
@@ -115,11 +119,11 @@ func TestFreshnessWindow_Zero_FallsBackToDefault(t *testing.T) {
 func TestLatestComponentStateRow_NotFound(t *testing.T) {
 	// CH returns empty aggregate (rawStatus="") → not found.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus("", time.Time{}),
+		QueryRowRow: gateQueryRowForStatus("", time.Time{}, 0),
 	}
 	store := gateTestStore(session)
 
-	_, _, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "push_parsed", "")
+	_, _, _, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "push_parsed", "")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -135,7 +139,7 @@ func TestLatestComponentStateRow_RowsError(t *testing.T) {
 	}
 	store := gateTestStore(session)
 
-	_, _, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "push_parsed", "")
+	_, _, _, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "push_parsed", "")
 	if err != nil {
 		t.Errorf("expected no error on sql.ErrNoRows, got %v", err)
 	}
@@ -151,7 +155,7 @@ func TestLatestComponentStateRow_CHError(t *testing.T) {
 	}
 	store := gateTestStore(session)
 
-	_, _, _, err := store.latestComponentStateRow(context.Background(), "corr-1", "build", "api")
+	_, _, _, _, err := store.latestComponentStateRow(context.Background(), "corr-1", "build", "api")
 	if !errors.Is(err, chErr) {
 		t.Errorf("expected wrapped chErr, got %v", err)
 	}
@@ -159,12 +163,13 @@ func TestLatestComponentStateRow_CHError(t *testing.T) {
 
 func TestLatestComponentStateRow_Found(t *testing.T) {
 	now := time.Now().Truncate(time.Millisecond)
+	const mockAge = 1500 * time.Millisecond // arbitrary; just verifies age is scanned and returned
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), now),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), now, mockAge),
 	}
 	store := gateTestStore(session)
 
-	status, ts, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "unit_tests", "")
+	status, ts, age, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "unit_tests", "")
 	if err != nil {
 		t.Errorf("expected no error, got %v", err)
 	}
@@ -178,6 +183,10 @@ func TestLatestComponentStateRow_Found(t *testing.T) {
 	if !ts.Equal(now) {
 		t.Errorf("expected ts %v, got %v", now, ts)
 	}
+	// Server-computed age must be propagated correctly.
+	if age != mockAge {
+		t.Errorf("expected age %v, got %v", mockAge, age)
+	}
 	// Verify the query targeted slip_component_states with the correct args.
 	if len(session.QueryRowCalls) != 1 {
 		t.Fatalf("expected 1 QueryRow call, got %d", len(session.QueryRowCalls))
@@ -189,6 +198,9 @@ func TestLatestComponentStateRow_Found(t *testing.T) {
 	if !strings.Contains(call.Query, componentEventSortKeyNoImageTag) {
 		t.Errorf("query should use componentEventSortKeyNoImageTag")
 	}
+	if !strings.Contains(call.Query, "dateDiff") {
+		t.Errorf("query should include server-side dateDiff for age_ms")
+	}
 }
 
 // --- enforceTerminalFreshnessGate --------------------------------------------------------
@@ -196,7 +208,7 @@ func TestLatestComponentStateRow_Found(t *testing.T) {
 func TestGate_NoPrior_Allows(t *testing.T) {
 	// No prior event (rawStatus="") → allow.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus("", time.Time{}),
+		QueryRowRow: gateQueryRowForStatus("", time.Time{}, 0),
 	}
 	store := gateTestStore(session)
 
@@ -211,7 +223,7 @@ func TestGate_NoPrior_Allows(t *testing.T) {
 func TestGate_PriorNonTerminal_Allows(t *testing.T) {
 	// Prior status is running (non-terminal) → allow incoming running.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusRunning), time.Now()),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusRunning), time.Now(), 0),
 	}
 	store := gateTestStore(session)
 
@@ -224,10 +236,10 @@ func TestGate_PriorNonTerminal_Allows(t *testing.T) {
 }
 
 func TestGate_Within4900ms_Refuses(t *testing.T) {
-	// Prior terminal 4.9 s ago, default 5 s window → refuse incoming running.
-	eventTime := time.Now().Add(-4900 * time.Millisecond)
+	// Server-computed age = 4.9 s < default 5 s window → refuse incoming running.
+	// Age is now returned directly from the mock (server-side dateDiff); no timestamp math needed.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 4900*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
@@ -241,10 +253,9 @@ func TestGate_Within4900ms_Refuses(t *testing.T) {
 }
 
 func TestGate_After5100ms_Allows(t *testing.T) {
-	// Prior terminal 5.1 s ago, default 5 s window → allow (window expired).
-	eventTime := time.Now().Add(-5100 * time.Millisecond)
+	// Server-computed age = 5.1 s > default 5 s window → allow (window expired).
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 5100*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
@@ -258,11 +269,9 @@ func TestGate_After5100ms_Allows(t *testing.T) {
 }
 
 func TestGate_NearBoundary_Refuses(t *testing.T) {
-	// Prior terminal 4.5 s ago with default 5 s window → still inside window → refuse.
-	// (Using 4.5 s instead of the exact boundary to avoid wall-clock race in test execution.)
-	eventTime := time.Now().Add(-4500 * time.Millisecond)
+	// Server-computed age = 4.5 s < default 5 s window → inside window → refuse.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 4500*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
@@ -276,10 +285,9 @@ func TestGate_NearBoundary_Refuses(t *testing.T) {
 }
 
 func TestGate_AbortedToPending_AlwaysAllow_Within(t *testing.T) {
-	// aborted → pending within window: cascade-reset exception → allow.
-	eventTime := time.Now().Add(-100 * time.Millisecond) // well within 5 s window
+	// aborted → pending: cascade-reset exception → allow (rule 6 fires before rule 7; age irrelevant).
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusAborted), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusAborted), time.Now(), 100*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
@@ -292,10 +300,9 @@ func TestGate_AbortedToPending_AlwaysAllow_Within(t *testing.T) {
 }
 
 func TestGate_AbortedToPending_AlwaysAllow_After(t *testing.T) {
-	// aborted → pending after window: always allow (exception is unconditional).
-	eventTime := time.Now().Add(-10 * time.Second)
+	// aborted → pending: exception is unconditional; rule 6 fires before rule 7 (age irrelevant).
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusAborted), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusAborted), time.Now(), 10*time.Second),
 	}
 	store := gateTestStore(session)
 
@@ -346,13 +353,12 @@ func TestGate_CHError_FailOpen(t *testing.T) {
 }
 
 func TestGate_CustomWindow_2s_Refuse(t *testing.T) {
-	// Custom 2 s window; prior terminal 1.9 s ago → refuse.
+	// Custom 2 s window; server-computed age = 1.9 s → refuse.
 	os.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
 	defer os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 
-	eventTime := time.Now().Add(-1900 * time.Millisecond)
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 1900*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
@@ -365,13 +371,12 @@ func TestGate_CustomWindow_2s_Refuse(t *testing.T) {
 }
 
 func TestGate_CustomWindow_2s_Allow(t *testing.T) {
-	// Custom 2 s window; prior terminal 2.1 s ago → allow (window expired).
+	// Custom 2 s window; server-computed age = 2.1 s → allow (window expired).
 	os.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
 	defer os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 
-	eventTime := time.Now().Add(-2100 * time.Millisecond)
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 2100*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
@@ -406,10 +411,10 @@ func TestGate_TerminalToTerminal_WithinWindow_Allows(t *testing.T) {
 	// SC-3: incoming terminal → always allow, regardless of prior terminal + window.
 	// This test documents that the plan's earlier row "TerminalToTerminal_WithinWindow_Refuses"
 	// is STALE (superseded by SC-3 resolution). The gate must ALLOW.
-	eventTime := time.Now().Add(-100 * time.Millisecond) // well within 5 s window
+	// Rule 3 short-circuits before CH query, so the mock row is never scanned.
 	session := &clickhousetest.MockSession{
-		// Return prior completed (terminal) within window.
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), eventTime),
+		// Return prior completed (terminal) — will not be reached due to SC-3 short-circuit.
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 100*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
@@ -429,9 +434,9 @@ func TestGate_TerminalToTerminal_WithinWindow_Allows(t *testing.T) {
 
 func TestGate_TerminalToTerminal_AfterWindow_Allows(t *testing.T) {
 	// SC-3: incoming terminal → always allow even after the window has expired.
-	eventTime := time.Now().Add(-10 * time.Second) // well after 5 s window
+	// Rule 3 short-circuits; age value not used.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), eventTime),
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 10*time.Second),
 	}
 	store := gateTestStore(session)
 
@@ -486,7 +491,7 @@ func TestGate_TerminalIncoming_NoQueryRowCall(t *testing.T) {
 func TestGate_NonTerminalIncoming_IssuedQueryRow(t *testing.T) {
 	// Return "no prior" from the gate query → allow.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus("", time.Time{}),
+		QueryRowRow: gateQueryRowForStatus("", time.Time{}, 0),
 	}
 	store := gateTestStore(session)
 
