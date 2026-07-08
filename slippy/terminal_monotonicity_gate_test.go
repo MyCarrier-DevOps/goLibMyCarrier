@@ -53,6 +53,8 @@ func gateQueryRowForStatus(rawStatus string, eventTimestamp time.Time, age time.
 // --- gateEnabled / freshnessWindow -------------------------------------------------------
 
 func TestGateEnabled_Default(t *testing.T) {
+	// sentinel+unset ensures auto-restore even if the env var was set before this test.
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
 	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	if !gateEnabled() {
 		t.Error("expected gate to be ON by default (fail-safe)")
@@ -60,30 +62,28 @@ func TestGateEnabled_Default(t *testing.T) {
 }
 
 func TestGateEnabled_ExplicitTrue(t *testing.T) {
-	os.Setenv("SLIPPY_I5_GATE_ENABLED", "true")
-	defer os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "true")
 	if !gateEnabled() {
 		t.Error("expected gate enabled when SLIPPY_I5_GATE_ENABLED=true")
 	}
 }
 
 func TestGateEnabled_ExplicitFalse(t *testing.T) {
-	os.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
-	defer os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
 	if gateEnabled() {
 		t.Error("expected gate disabled when SLIPPY_I5_GATE_ENABLED=false")
 	}
 }
 
 func TestGateEnabled_InvalidValue_FailSafeOn(t *testing.T) {
-	os.Setenv("SLIPPY_I5_GATE_ENABLED", "notabool")
-	defer os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "notabool")
 	if !gateEnabled() {
 		t.Error("expected gate to be ON (fail-safe) when env value is unparseable")
 	}
 }
 
 func TestFreshnessWindow_Default(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
 	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 	if got := freshnessWindow(); got != defaultFreshnessWindowSeconds*time.Second {
 		t.Errorf("expected default %v, got %v", defaultFreshnessWindowSeconds*time.Second, got)
@@ -91,24 +91,21 @@ func TestFreshnessWindow_Default(t *testing.T) {
 }
 
 func TestFreshnessWindow_Custom(t *testing.T) {
-	os.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "10")
-	defer os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "10")
 	if got := freshnessWindow(); got != 10*time.Second {
 		t.Errorf("expected 10s, got %v", got)
 	}
 }
 
 func TestFreshnessWindow_Invalid_FallsBackToDefault(t *testing.T) {
-	os.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "abc")
-	defer os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "abc")
 	if got := freshnessWindow(); got != defaultFreshnessWindowSeconds*time.Second {
 		t.Errorf("expected default on invalid value, got %v", got)
 	}
 }
 
 func TestFreshnessWindow_Zero_FallsBackToDefault(t *testing.T) {
-	os.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "0")
-	defer os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "0")
 	if got := freshnessWindow(); got != defaultFreshnessWindowSeconds*time.Second {
 		t.Errorf("expected default on zero value, got %v", got)
 	}
@@ -238,12 +235,13 @@ func TestGate_PriorNonTerminal_Allows(t *testing.T) {
 func TestGate_Within4900ms_Refuses(t *testing.T) {
 	// Server-computed age = 4.9 s < default 5 s window → refuse incoming running.
 	// Age is now returned directly from the mock (server-side dateDiff); no timestamp math needed.
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 4900*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
-	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
@@ -254,12 +252,13 @@ func TestGate_Within4900ms_Refuses(t *testing.T) {
 
 func TestGate_After5100ms_Allows(t *testing.T) {
 	// Server-computed age = 5.1 s > default 5 s window → allow (window expired).
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 5100*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
-	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
@@ -270,12 +269,13 @@ func TestGate_After5100ms_Allows(t *testing.T) {
 
 func TestGate_NearBoundary_Refuses(t *testing.T) {
 	// Server-computed age = 4.5 s < default 5 s window → inside window → refuse.
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 4500*time.Millisecond),
 	}
 	store := gateTestStore(session)
 
-	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
@@ -316,8 +316,7 @@ func TestGate_AbortedToPending_AlwaysAllow_After(t *testing.T) {
 
 func TestGate_GateDisabled_Allows(t *testing.T) {
 	// Gate disabled via env var → always allow, no CH call.
-	os.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
-	defer os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
 
 	// QueryRowRow intentionally left nil; any CH call would panic.
 	session := &clickhousetest.MockSession{}
@@ -343,6 +342,7 @@ func TestGate_CHError_FailOpen(t *testing.T) {
 	}
 	store := gateTestStore(session)
 
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
 	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
@@ -354,8 +354,7 @@ func TestGate_CHError_FailOpen(t *testing.T) {
 
 func TestGate_CustomWindow_2s_Refuse(t *testing.T) {
 	// Custom 2 s window; server-computed age = 1.9 s → refuse.
-	os.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
-	defer os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
 
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 1900*time.Millisecond),
@@ -372,8 +371,7 @@ func TestGate_CustomWindow_2s_Refuse(t *testing.T) {
 
 func TestGate_CustomWindow_2s_Allow(t *testing.T) {
 	// Custom 2 s window; server-computed age = 2.1 s → allow (window expired).
-	os.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
-	defer os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
 
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 2100*time.Millisecond),
@@ -390,10 +388,11 @@ func TestGate_CustomWindow_2s_Allow(t *testing.T) {
 
 func TestGate_PushParsedBypassed_WithinWindow(t *testing.T) {
 	// push_parsed with component="" is a bypass step → no CH call, always allowed.
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	session := &clickhousetest.MockSession{}
 	store := gateTestStore(session)
 
-	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "push_parsed", "", StepStatusRunning,
 	)
@@ -453,10 +452,11 @@ func TestGate_TerminalToTerminal_AfterWindow_Allows(t *testing.T) {
 // TestGate_BypassStep_NoQueryRowCall verifies that push_parsed with component=""
 // short-circuits before any CH query (rule 2).
 func TestGate_BypassStep_NoQueryRowCall(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	session := &clickhousetest.MockSession{}
 	store := gateTestStore(session)
 
-	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "push_parsed", "", StepStatusRunning,
 	)
@@ -471,10 +471,11 @@ func TestGate_BypassStep_NoQueryRowCall(t *testing.T) {
 // TestGate_TerminalIncoming_NoQueryRowCall verifies rule 3 (SC-3): terminal incoming
 // fires before the CH query, so QueryRow is never called.
 func TestGate_TerminalIncoming_NoQueryRowCall(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	session := &clickhousetest.MockSession{}
 	store := gateTestStore(session)
 
-	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "unit_tests", "", StepStatusCompleted,
 	)
@@ -490,12 +491,13 @@ func TestGate_TerminalIncoming_NoQueryRowCall(t *testing.T) {
 // status on a non-bypass step issues exactly one gate CH query.
 func TestGate_NonTerminalIncoming_IssuedQueryRow(t *testing.T) {
 	// Return "no prior" from the gate query → allow.
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus("", time.Time{}, 0),
 	}
 	store := gateTestStore(session)
 
-	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	err := store.enforceTerminalFreshnessGate(
 		context.Background(), "corr-1", "dev_deploy", "", StepStatusRunning,
 	)

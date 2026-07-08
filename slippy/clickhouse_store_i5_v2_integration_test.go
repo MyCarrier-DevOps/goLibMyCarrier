@@ -114,8 +114,8 @@ func TestI5V2_Gate_AfterWindow_Allows(t *testing.T) {
 		t.Fatalf("failed to write terminal status: %v", err)
 	}
 
-	// Wait for the 1-second window to expire.
-	time.Sleep(1100 * time.Millisecond)
+	// Wait for the 1-second window to expire (2 s gives CI flake margin on slow hosts).
+	time.Sleep(2 * time.Second)
 
 	// Non-terminal write after window expiry → allowed.
 	if err := store.UpdateStep(ctx, corrID, "dev_deploy", "", StepStatusRunning); err != nil {

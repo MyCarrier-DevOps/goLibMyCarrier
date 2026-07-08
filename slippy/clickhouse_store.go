@@ -2185,7 +2185,16 @@ func (s *ClickHouseStore) enforceTerminalFreshnessGate(
 	// Using server-side age (dateDiff on CH clock) eliminates pod↔CH clock-skew errors
 	// that caused false-positive refusals when the pod clock lagged behind the CH clock.
 	_ = eventTimestamp // retained for future diagnostic logging
-	if age > freshnessWindow() {
+	window := freshnessWindow()
+	const maxFreshnessWindow = 3600 * time.Second // Security M1: cap at 1 hour
+	if window > maxFreshnessWindow {
+		s.logger.Warn(ctx, "SLIPPY_I5_FRESHNESS_WINDOW_SECONDS exceeds maximum; clamped to 3600", map[string]interface{}{
+			"configured_s": int(window.Seconds()),
+			"clamped_s":    3600,
+		})
+		window = maxFreshnessWindow
+	}
+	if age > window {
 		return nil
 	}
 	// Rule 8: refuse.
