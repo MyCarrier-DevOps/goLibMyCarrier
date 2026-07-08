@@ -58,6 +58,37 @@ var (
 	// ErrMaxRetriesExceeded indicates the maximum number of retry attempts was reached.
 	// This occurs when a slip is not found after multiple retries.
 	ErrMaxRetriesExceeded = errors.New("maximum retry attempts exceeded")
+
+	// ErrTerminalAlreadyExists is returned by the terminal-freshness gate in
+	// UpdateStep / UpdateStepWithHistory when a non-terminal incoming status would
+	// overwrite a freshly-recorded terminal status in slip_component_states.
+	//
+	// The gate closes the I5 race (ADO #82468 / ADO #83405) by refusing
+	// non-terminal-over-terminal writes that arrive within the freshness window
+	// (default 5 s, configurable via SLIPPY_I5_FRESHNESS_WINDOW_SECONDS).
+	//
+	// The gate REFUSES:
+	//   - non-terminal incoming status when the prior recorded status is terminal
+	//     AND the prior event is younger than the freshness window.
+	//     Exception: aborted → pending is always allowed (cascade-reset path).
+	//
+	// The gate ALLOWS unconditionally (SC-3 / DA-reviewed):
+	//   - terminal incoming status — the race artifact class is exclusively
+	//     non-terminal-over-terminal; terminal→terminal preserves v1 recovery
+	//     semantics (failed → completed, etc.) with no timing probe needed.
+	//   - no prior event for the (correlation_id, step, component) tuple.
+	//   - prior non-terminal status.
+	//   - aborted → pending (cascade-reset exception).
+	//   - events older than the freshness window (genuine re-run / restart).
+	//   - push_parsed with component="" (bypass — push-retry resets terminal
+	//     within window without triggering the gate).
+	//   - gate disabled via SLIPPY_I5_GATE_ENABLED=false.
+	//
+	// Callers should map this sentinel to HTTP 409 Conflict at the API boundary:
+	//   errors.Is(err, slippy.ErrTerminalAlreadyExists)
+	// It propagates through SlipError / StepError via errors.Unwrap so that
+	// errors.Is continues to work at the outermost caller.
+	ErrTerminalAlreadyExists = errors.New("terminal status already recorded for step")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

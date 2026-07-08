@@ -42,6 +42,25 @@ const (
 	historyConflictMaxRetries = 5
 )
 
+// componentEventSortKeyWithImageTag is the argMax sort key for slip_component_states
+// when the image_tag column is present. It encodes timestamp, status ordinal, and whether
+// the row carries a non-empty image_tag into a single UInt64, avoiding the nested-aggregate
+// error raised by tuple arguments in ClickHouse 25.x.
+//
+// Formula: epoch_microseconds * 200 + status_ordinal * 2 + (image_tag != ” ? 1 : 0)
+//
+// Promoted from doLoadComponentStates function-local to package-level (I5 v2, ADO #83405)
+// so that latestComponentStateRow and the freshness gate use the same sort key as the
+// bulk-load path, eliminating drift.
+const componentEventSortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 200 + toUInt64(toUInt8(status)) * 2 + if(image_tag != '', 1, 0)"
+
+// componentEventSortKeyNoImageTag is the argMax sort key when the image_tag column is absent.
+//
+// Formula: epoch_microseconds * 100 + status_ordinal
+//
+// Promoted from doLoadComponentStates function-local to package-level (I5 v2, ADO #83405).
+const componentEventSortKeyNoImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
+
 // calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
 // Uses linear backoff: 5min for 1st retry, 10min for 2nd, 15min for 3rd.
 // Formula: slipNotFoundBaseDelay * retryNumber * time.Minute
@@ -2637,9 +2656,8 @@ func (s *ClickHouseStore) doLoadComponentStates(
 	//  3. Row with image_tag set wins over row without, for same timestamp+status.
 	//     This ensures SetComponentImageTag rows (which carry the same status as the
 	//     preceding CompleteStep row) are not overwritten by the status-only row.
-	const sortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 200 + toUInt64(toUInt8(status)) * 2 + if(image_tag != '', 1, 0)"
-	const sortKeyNoImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
-
+	// Use package-level sort-key constants to share the same formula with
+	// latestComponentStateRow and the I5 freshness gate (ADO #83405).
 	var query string
 	if includeImageTag {
 		// image_tag gets a separate sort key that masks out rows where the tag is empty.
@@ -2648,7 +2666,7 @@ func (s *ClickHouseStore) doLoadComponentStates(
 		//   - rows with empty image_tag get sort_key=0 and always lose to any tagged row.
 		// This ensures SetComponentImageTag events survive even when a later CompleteStep event
 		// (which has a higher sort_key but no tag) comes in for the same component.
-		const imageTagSortKey = "if(image_tag != '', " + sortKeyWithImageTag + ", 0)"
+		const imageTagSortKey = "if(image_tag != '', " + componentEventSortKeyWithImageTag + ", 0)"
 		query = fmt.Sprintf(`
 			SELECT
 				step,
@@ -2660,7 +2678,11 @@ func (s *ClickHouseStore) doLoadComponentStates(
 			FROM %s.%s
 			WHERE correlation_id = ?
 			GROUP BY step, component
-		`, sortKeyWithImageTag, sortKeyWithImageTag, imageTagSortKey, s.database, TableSlipComponentStates)
+		`,
+			componentEventSortKeyWithImageTag,
+			componentEventSortKeyWithImageTag,
+			imageTagSortKey,
+			s.database, TableSlipComponentStates)
 	} else {
 		query = fmt.Sprintf(`
 			SELECT
@@ -2672,7 +2694,7 @@ func (s *ClickHouseStore) doLoadComponentStates(
 			FROM %s.%s
 			WHERE correlation_id = ?
 			GROUP BY step, component
-		`, sortKeyNoImageTag, sortKeyNoImageTag, s.database, TableSlipComponentStates)
+		`, componentEventSortKeyNoImageTag, componentEventSortKeyNoImageTag, s.database, TableSlipComponentStates)
 	}
 
 	rows, err := s.session.QueryWithArgs(ctx, query, correlationID)
