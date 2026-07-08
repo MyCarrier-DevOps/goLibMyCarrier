@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -60,6 +62,50 @@ const componentEventSortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(times
 //
 // Promoted from doLoadComponentStates function-local to package-level (I5 v2, ADO #83405).
 const componentEventSortKeyNoImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
+
+// defaultFreshnessWindowSeconds is the default window for the I5 freshness gate.
+// Events younger than this threshold are considered "fresh" for terminal-monotonicity
+// enforcement. Configurable via SLIPPY_I5_FRESHNESS_WINDOW_SECONDS.
+const defaultFreshnessWindowSeconds = 5
+
+// gateBypassSteps lists step names whose pipeline-level writes (component="") bypass
+// the terminal-freshness gate. push_parsed is bypassed because push-webhook retries
+// legitimately reset a terminal push_parsed event to running within the freshness
+// window — this is safe-by-design, not a race artifact.
+var gateBypassSteps = map[string]bool{ //nolint:gochecknoglobals // Go cannot declare const maps; bypass steps are a fixed, small set
+	"push_parsed": true,
+}
+
+// gateEnabled returns true when the I5 terminal-freshness gate should enforce
+// terminal-monotonicity. Reads SLIPPY_I5_GATE_ENABLED (strconv.ParseBool).
+// Defaults to true (fail-safe ON) when the variable is absent or unparseable.
+func gateEnabled() bool {
+	val, ok := os.LookupEnv("SLIPPY_I5_GATE_ENABLED")
+	if !ok {
+		return true // fail-safe ON when unset
+	}
+	enabled, err := strconv.ParseBool(val)
+	if err != nil {
+		return true // fail-safe ON on invalid value
+	}
+	return enabled
+}
+
+// freshnessWindow returns the configured freshness window for the I5 gate.
+// Reads SLIPPY_I5_FRESHNESS_WINDOW_SECONDS (integer seconds). Defaults to
+// defaultFreshnessWindowSeconds (5 s) when the variable is absent, zero, or
+// unparseable.
+func freshnessWindow() time.Duration {
+	val := os.Getenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
+	if val == "" {
+		return defaultFreshnessWindowSeconds * time.Second
+	}
+	secs, err := strconv.Atoi(val)
+	if err != nil || secs <= 0 {
+		return defaultFreshnessWindowSeconds * time.Second
+	}
+	return time.Duration(secs) * time.Second
+}
 
 // calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
 // Uses linear backoff: 5min for 1st retry, 10min for 2nd, 15min for 3rd.
@@ -536,6 +582,12 @@ func (s *ClickHouseStore) UpdateStep(
 	// inside the retry loop will hydrate the correct state.
 	insertedAt := time.Now()
 
+	// I5 v2 freshness gate (ADO #83405): refuse non-terminal writes that would
+	// overwrite a freshly-recorded terminal status in slip_component_states.
+	if err := s.enforceTerminalFreshnessGate(ctx, correlationID, stepName, componentName, status); err != nil {
+		return err
+	}
+
 	// Write the step event to the conflict-free event-sourcing table.
 	// Pipeline-level steps use componentName="" as a sentinel value.
 	if err := s.insertComponentState(ctx, correlationID, stepName, componentName, status, "", ""); err != nil {
@@ -596,6 +648,12 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// the flushed row is already the correct, up-to-date value, so the subsequent Load
 	// inside the retry loop will hydrate the correct state.
 	insertedAt := time.Now()
+
+	// I5 v2 freshness gate (ADO #83405): refuse non-terminal writes that would
+	// overwrite a freshly-recorded terminal status in slip_component_states.
+	if err := s.enforceTerminalFreshnessGate(ctx, correlationID, stepName, componentName, status); err != nil {
+		return err
+	}
 
 	// Store the step event in the conflict-free event-sourcing table.
 	// The message from the history entry is co-located in the event record.
@@ -1848,6 +1906,105 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 		return StepStatusRunning
 	}
 	return StepStatusPending
+}
+
+// latestComponentStateRow queries slip_component_states for the argMax-winning
+// (status, timestamp) for the given (correlationID, step, component) tuple.
+//
+// The sort key is componentEventSortKeyNoImageTag — matching the bulk-load path and
+// preventing drift. On a ClickHouse empty-aggregate result (no matching rows) the
+// driver returns one row whose columns are zero-valued; rawStatus=="" detects this.
+//
+// Returns (status, eventTimestamp, found=true, nil) on success,
+// ("", zero, false, nil) when no event exists,
+// ("", zero, false, err) on CH error.
+func (s *ClickHouseStore) latestComponentStateRow(
+	ctx context.Context,
+	correlationID, step, component string,
+) (status StepStatus, eventTimestamp time.Time, found bool, err error) {
+	query := fmt.Sprintf(`
+		SELECT
+			argMax(status, %s)    AS latest_status,
+			argMax(timestamp, %s) AS latest_ts
+		FROM %s.%s
+		WHERE correlation_id = ? AND step = ? AND component = ?
+	`, componentEventSortKeyNoImageTag, componentEventSortKeyNoImageTag,
+		s.database, TableSlipComponentStates)
+
+	row := s.session.QueryRow(ctx, query, correlationID, step, component)
+	var rawStatus string
+	var ts time.Time
+	if scanErr := row.Scan(&rawStatus, &ts); scanErr != nil {
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			return "", time.Time{}, false, nil
+		}
+		return "", time.Time{}, false, scanErr
+	}
+	// CH returns empty string on no-match aggregate; treat as not found.
+	if rawStatus == "" {
+		return "", time.Time{}, false, nil
+	}
+	return StepStatus(rawStatus), ts, true, nil
+}
+
+// enforceTerminalFreshnessGate is the I5 v2 gate (ADO #83405).
+// It refuses non-terminal incoming status when the prior recorded status is
+// terminal and was written within the freshness window (default 5 s).
+//
+// 8-rule evaluation order (stop at first match):
+//  1. !gateEnabled()                          → allow
+//  2. bypass step + component=""              → allow
+//  3. incoming is terminal (SC-3)             → allow unconditionally
+//  4. CH query error                          → WARN + allow (fail-open)
+//  5. !found || prior non-terminal            → allow
+//  6. prior aborted + incoming pending        → allow (cascade-reset exception)
+//  7. event older than freshnessWindow        → allow (genuine re-run / restart)
+//  8. (default)                               → ErrTerminalAlreadyExists
+func (s *ClickHouseStore) enforceTerminalFreshnessGate(
+	ctx context.Context,
+	correlationID, step, component string,
+	incoming StepStatus,
+) error {
+	// Rule 1: gate disabled → allow.
+	if !gateEnabled() {
+		return nil
+	}
+	// Rule 2: bypass steps with pipeline-level (component="") writes → allow.
+	if gateBypassSteps[step] && component == "" {
+		return nil
+	}
+	// Rule 3 (SC-3): incoming terminal → always allow.
+	// The race artifact class is exclusively non-terminal-over-terminal.
+	// Terminal→terminal preserves v1 recovery semantics without a timing probe.
+	if incoming.IsTerminal() {
+		return nil
+	}
+	// Rule 4: query prior state; CH error → WARN + allow (fail-open).
+	priorStatus, eventTimestamp, found, queryErr := s.latestComponentStateRow(ctx, correlationID, step, component)
+	if queryErr != nil {
+		// Fail-open: a CH error here must not produce false-positive refusals.
+		s.logger.Warn(ctx, "I5 gate CH query error; failing open", map[string]interface{}{
+			"correlation_id": correlationID,
+			"step":           step,
+			"component":      component,
+			"error":          queryErr.Error(),
+		})
+		return nil //nolint:nilerr // intentional fail-open: gate is advisory, not authoritative
+	}
+	// Rule 5: no prior event, or prior is non-terminal → allow.
+	if !found || !priorStatus.IsTerminal() {
+		return nil
+	}
+	// Rule 6: aborted → pending cascade-reset exception → allow.
+	if priorStatus == StepStatusAborted && incoming == StepStatusPending {
+		return nil
+	}
+	// Rule 7: event is older than the freshness window → genuine re-run → allow.
+	if time.Since(eventTimestamp) > freshnessWindow() {
+		return nil
+	}
+	// Rule 8: refuse.
+	return ErrTerminalAlreadyExists
 }
 
 // insertComponentState inserts a new state into the event sourcing table.
