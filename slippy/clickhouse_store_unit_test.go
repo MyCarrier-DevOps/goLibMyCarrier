@@ -6285,3 +6285,273 @@ func TestUpdateStepWithHistory_WritebackErrorAfterEventInsert(t *testing.T) {
 		}
 	})
 }
+
+// --- R2 argMax-derived write-back unit tests (ADO #83405) --------------------------------
+//
+// These tests cover resolveEffectiveStepStatuses (pure function) and
+// derivePipelineStepStatuses (mocked CH query). They exercise the 3-tier precedence
+// (callerOverride > argMaxDerived > inMemory) and the SC-1 aggregate-step filter.
+
+// makeTestSteps builds a minimal map[string]Step for use in R2 tests.
+func makeTestSteps(statuses map[string]StepStatus) map[string]Step {
+	result := make(map[string]Step, len(statuses))
+	for name, status := range statuses {
+		result[name] = Step{Status: status}
+	}
+	return result
+}
+
+// TestR2_ResolveEffectiveStepStatuses_Override_WinsOverArgMax verifies that a
+// callerOverride (tier 1) takes precedence over the argMax-derived value.
+func TestR2_ResolveEffectiveStepStatuses_Override_WinsOverArgMax(t *testing.T) {
+	cfg := testPipelineConfig()
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"push_parsed": StepStatusPending,
+		"dev_deploy":  StepStatusPending,
+	})
+	argMaxDerived := map[string]StepStatus{
+		"push_parsed": StepStatusRunning, // argMax says running
+		"dev_deploy":  StepStatusPending,
+	}
+	override := r2StepOverride{step: "push_parsed", status: StepStatusCompleted}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived, override)
+
+	if effective["push_parsed"] != StepStatusCompleted {
+		t.Errorf("override tier 1: expected completed, got %v", effective["push_parsed"])
+	}
+	if effective["dev_deploy"] != StepStatusPending {
+		t.Errorf("dev_deploy: expected pending (no argMax entry, in-memory), got %v", effective["dev_deploy"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_ArgMax_ReplacesInMemoryStale verifies that
+// argMax-derived (tier 2) replaces a stale in-memory value when no callerOverride exists.
+func TestR2_ResolveEffectiveStepStatuses_ArgMax_ReplacesInMemoryStale(t *testing.T) {
+	cfg := testPipelineConfig()
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"push_parsed": StepStatusPending, // stale in-memory
+		"dev_deploy":  StepStatusPending,
+	})
+	argMaxDerived := map[string]StepStatus{
+		"push_parsed": StepStatusCompleted, // fresher value from CH
+	}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
+
+	if effective["push_parsed"] != StepStatusCompleted {
+		t.Errorf("argMax tier 2: expected completed, got %v", effective["push_parsed"])
+	}
+	// dev_deploy: no argMax entry → uses in-memory pending.
+	if effective["dev_deploy"] != StepStatusPending {
+		t.Errorf("dev_deploy: expected pending (no argMax), got %v", effective["dev_deploy"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_CoalesceDefaultPending verifies that when both
+// argMax and override are absent, the in-memory value (tier 3) is used.
+func TestR2_ResolveEffectiveStepStatuses_CoalesceDefaultPending(t *testing.T) {
+	cfg := testPipelineConfig()
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"push_parsed": StepStatusRunning,
+		"dev_deploy":  StepStatusPending,
+	})
+	// argMaxDerived is empty — no CH entries for any step.
+	argMaxDerived := map[string]StepStatus{}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
+
+	if effective["push_parsed"] != StepStatusRunning {
+		t.Errorf("coalesce tier 3: expected running (in-memory), got %v", effective["push_parsed"])
+	}
+	if effective["dev_deploy"] != StepStatusPending {
+		t.Errorf("coalesce tier 3: expected pending (in-memory), got %v", effective["dev_deploy"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_UsesInMemory verifies SC-1:
+// aggregate steps are excluded from argMax-derived tier 2 and always use in-memory
+// (or callerOverride if provided). This ensures the freshly-computed rollup is never
+// overwritten by a stale slip_component_states argMax for the aggregate step itself.
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_UsesInMemory(t *testing.T) {
+	cfg := testPipelineConfig() // "builds" and "unit_tests" are aggregate steps
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"builds":      StepStatusCompleted, // just computed from components
+		"push_parsed": StepStatusCompleted,
+	})
+	// argMax-derived returns a stale "running" for the aggregate step.
+	argMaxDerived := map[string]StepStatus{
+		"builds":      StepStatusRunning, // stale argMax — must NOT win for aggregate
+		"push_parsed": StepStatusCompleted,
+	}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived)
+
+	// SC-1: "builds" is an aggregate step → argMax must be ignored → in-memory used.
+	if effective["builds"] != StepStatusCompleted {
+		t.Errorf("SC-1 aggregate: expected completed (in-memory), got %v", effective["builds"])
+	}
+	// pure pipeline step follows normal tier 2.
+	if effective["push_parsed"] != StepStatusCompleted {
+		t.Errorf("push_parsed: expected completed (argMax), got %v", effective["push_parsed"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_AggregateStep_Override_Wins verifies that a
+// callerOverride (tier 1) STILL wins for aggregate steps even though tier 2 is excluded.
+func TestR2_ResolveEffectiveStepStatuses_AggregateStep_Override_Wins(t *testing.T) {
+	cfg := testPipelineConfig()
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"builds": StepStatusRunning, // in-memory before recompute
+	})
+	argMaxDerived := map[string]StepStatus{
+		"builds": StepStatusPending, // stale argMax
+	}
+	override := r2StepOverride{step: "builds", status: StepStatusCompleted}
+
+	effective := resolveEffectiveStepStatuses(cfg, inMemory, argMaxDerived, override)
+
+	if effective["builds"] != StepStatusCompleted {
+		t.Errorf("tier-1 override for aggregate: expected completed, got %v", effective["builds"])
+	}
+}
+
+// TestR2_ResolveEffectiveStepStatuses_NilConfig_TreatsAllAsNonAggregate verifies that
+// resolveEffectiveStepStatuses does not panic when cfg is nil and treats all steps as
+// non-aggregate (argMax-derived tier 2 applies to all).
+func TestR2_ResolveEffectiveStepStatuses_NilConfig_TreatsAllAsNonAggregate(t *testing.T) {
+	inMemory := makeTestSteps(map[string]StepStatus{
+		"builds": StepStatusPending,
+	})
+	argMaxDerived := map[string]StepStatus{
+		"builds": StepStatusCompleted,
+	}
+
+	effective := resolveEffectiveStepStatuses(nil, inMemory, argMaxDerived)
+
+	// nil cfg → no SC-1 filter → argMax applies even for would-be aggregate steps.
+	if effective["builds"] != StepStatusCompleted {
+		t.Errorf("nil cfg: expected argMax completed, got %v", effective["builds"])
+	}
+}
+
+// TestR2_DerivePipelineStepStatuses_ReturnsArgMaxStatuses verifies that
+// derivePipelineStepStatuses correctly queries slip_component_states and returns
+// step→status pairs from the argMax result set.
+func TestR2_DerivePipelineStepStatuses_ReturnsArgMaxStatuses(t *testing.T) {
+	type scanRow struct {
+		step   string
+		status string
+	}
+	rows := []scanRow{
+		{"push_parsed", string(StepStatusCompleted)},
+		{"dev_deploy", string(StepStatusRunning)},
+	}
+	rowIdx := 0
+
+	session := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(_ context.Context, query string, args ...any) (ch.Rows, error) {
+			if !strings.Contains(query, TableSlipComponentStates) {
+				return &clickhousetest.MockRows{}, nil
+			}
+			return &clickhousetest.MockRows{
+				NextFunc: func() bool {
+					return rowIdx < len(rows)
+				},
+				ScanFunc: func(dest ...any) error {
+					if rowIdx >= len(rows) {
+						return fmt.Errorf("no more rows")
+					}
+					r := rows[rowIdx]
+					rowIdx++
+					if len(dest) >= 2 {
+						if p, ok := dest[0].(*string); ok {
+							*p = r.step
+						}
+						if p, ok := dest[1].(*string); ok {
+							*p = r.status
+						}
+					}
+					return nil
+				},
+			}, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+
+	derived, err := store.derivePipelineStepStatuses(context.Background(), "corr-1")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if derived["push_parsed"] != StepStatusCompleted {
+		t.Errorf("push_parsed: expected completed, got %v", derived["push_parsed"])
+	}
+	if derived["dev_deploy"] != StepStatusRunning {
+		t.Errorf("dev_deploy: expected running, got %v", derived["dev_deploy"])
+	}
+	// Verify query targeted slip_component_states with component='' filter.
+	if len(session.QueryWithArgsCalls) != 1 {
+		t.Fatalf("expected 1 QueryWithArgs call, got %d", len(session.QueryWithArgsCalls))
+	}
+	call := session.QueryWithArgsCalls[0]
+	if !strings.Contains(call.Query, "component = ''") {
+		t.Errorf("query should filter component='' for pipeline steps, got: %s", call.Query)
+	}
+	if !strings.Contains(call.Query, componentEventSortKeyNoImageTag) {
+		t.Errorf("query should use componentEventSortKeyNoImageTag for argMax sort key")
+	}
+}
+
+// TestR2_DerivePipelineStepStatuses_EmptyStringStatus_Skipped verifies that rows
+// where argMax returns "" (CH empty-aggregate sentinel) are not added to the map.
+func TestR2_DerivePipelineStepStatuses_EmptyStringStatus_Skipped(t *testing.T) {
+	returned := false
+	session := &clickhousetest.MockSession{
+		QueryWithArgsFunc: func(_ context.Context, _ string, _ ...any) (ch.Rows, error) {
+			return &clickhousetest.MockRows{
+				NextFunc: func() bool {
+					if !returned {
+						returned = true
+						return true
+					}
+					return false
+				},
+				ScanFunc: func(dest ...any) error {
+					if len(dest) >= 2 {
+						if p, ok := dest[0].(*string); ok {
+							*p = "push_parsed"
+						}
+						if p, ok := dest[1].(*string); ok {
+							*p = "" // empty aggregate sentinel
+						}
+					}
+					return nil
+				},
+			}, nil
+		},
+	}
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+
+	derived, err := store.derivePipelineStepStatuses(context.Background(), "corr-1")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if _, ok := derived["push_parsed"]; ok {
+		t.Error("empty-string status should be excluded from derived map")
+	}
+}
+
+// TestR2_DerivePipelineStepStatuses_QueryError_ReturnsError verifies that a CH query
+// error propagates and callers can fail-open.
+func TestR2_DerivePipelineStepStatuses_QueryError_ReturnsError(t *testing.T) {
+	chErr := fmt.Errorf("simulated CH error")
+	session := &clickhousetest.MockSession{
+		QueryWithArgsErr: chErr,
+	}
+	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+
+	_, err := store.derivePipelineStepStatuses(context.Background(), "corr-1")
+	if !errors.Is(err, chErr) {
+		t.Errorf("expected wrapped chErr, got %v", err)
+	}
+}

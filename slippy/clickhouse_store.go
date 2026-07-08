@@ -932,6 +932,161 @@ func (s *ClickHouseStore) SetComponentImageTag(
 		StepStatus(currentStatus), "", imageTag)
 }
 
+// --- R2: argMax-derived write-back (ADO #83405) ------------------------------------------
+//
+// The aggregate write-back path (updateAggregateStatusFromComponentStates*) calls
+// Load, overlay, recompute, Update. Between Load and Update, concurrent UpdateStep
+// calls for pure pipeline steps may have written to slip_component_states without
+// updating routing_slips. When Update writes back, it re-stamps those steps with the
+// stale in-memory values from Load.
+//
+// R2 fix: before writing routing_slips, query slip_component_states for the argMax
+// status of all pure pipeline steps (component=''), then apply 3-tier precedence:
+//   callerOverride > argMaxDerived (non-aggregate, SC-1) > inMemory
+//
+// The gate (Commit 2) is separate: it blocks non-terminal-over-terminal writes at
+// insertComponentState time. R2 protects the routing_slips snapshot from going stale
+// due to lost concurrent updates.
+
+// r2StepOverride carries a caller-provided authoritative status for a single step
+// (keyed by step name, not DB column name). Used by the R2 aggregate write-back path
+// (updateWithOverrides) to protect freshly-computed aggregate statuses.
+// Contrast with stepStatusOverride (below) which uses the DB column name and is
+// specific to the insertAtomicHistoryUpdate path.
+type r2StepOverride struct {
+	step   string
+	status StepStatus
+}
+
+// derivePipelineStepStatuses queries slip_component_states for the argMax status of
+// each pure pipeline step (component=”) for the given correlationID.
+// Returns a map keyed by step name. Errors are caller-handled (fail-open recommended).
+// Aggregate steps MAY appear in the result; the caller MUST apply SC-1 filtering.
+func (s *ClickHouseStore) derivePipelineStepStatuses(
+	ctx context.Context,
+	correlationID string,
+) (result map[string]StepStatus, err error) {
+	query := fmt.Sprintf(
+		"SELECT step, argMax(status, %s) AS latest_status"+
+			" FROM %s.%s WHERE correlation_id = ? AND component = '' GROUP BY step",
+		componentEventSortKeyNoImageTag, s.database, TableSlipComponentStates,
+	)
+
+	rows, err := s.session.QueryWithArgs(ctx, query, correlationID)
+	if err != nil {
+		return nil, fmt.Errorf("derivePipelineStepStatuses: query: %w", err)
+	}
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && err == nil {
+			err = fmt.Errorf("derivePipelineStepStatuses: close rows: %w", closeErr)
+		}
+	}()
+
+	result = make(map[string]StepStatus)
+	for rows.Next() {
+		var step, rawStatus string
+		if scanErr := rows.Scan(&step, &rawStatus); scanErr != nil {
+			return nil, fmt.Errorf("derivePipelineStepStatuses: scan: %w", scanErr)
+		}
+		if rawStatus != "" {
+			result[step] = StepStatus(rawStatus)
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return nil, fmt.Errorf("derivePipelineStepStatuses: rows err: %w", rowsErr)
+	}
+	return result, nil
+}
+
+// resolveEffectiveStepStatuses merges three status sources with strict precedence:
+//  1. callerOverride: highest; protects freshly-computed values (e.g. aggregate rollup).
+//  2. argMaxDerived: middle; replaces stale in-memory values for pure pipeline steps.
+//     Aggregate steps are excluded (SC-1): their status is computed from components,
+//     not from the event log directly.
+//  3. inMemory: lowest; used when no argMax entry exists for the step.
+//
+// The returned map contains one entry per step found in inMemory.
+func resolveEffectiveStepStatuses(
+	cfg *PipelineConfig,
+	inMemory map[string]Step,
+	argMaxDerived map[string]StepStatus,
+	overrides ...r2StepOverride,
+) map[string]StepStatus {
+	// Build override index for O(1) lookup.
+	overrideIdx := make(map[string]StepStatus, len(overrides))
+	for _, o := range overrides {
+		overrideIdx[o.step] = o.status
+	}
+
+	result := make(map[string]StepStatus, len(inMemory))
+	for stepName, stepData := range inMemory {
+		// Tier 1: caller override.
+		if st, ok := overrideIdx[stepName]; ok {
+			result[stepName] = st
+			continue
+		}
+		// Tier 2: argMax-derived, except aggregate steps (SC-1).
+		if cfg == nil || !cfg.IsAggregateStep(stepName) {
+			if st, ok := argMaxDerived[stepName]; ok {
+				result[stepName] = st
+				continue
+			}
+		}
+		// Tier 3: in-memory.
+		result[stepName] = stepData.Status
+	}
+	return result
+}
+
+// updateWithOverrides is the R2 shared init path for the aggregate write-back.
+// Unlike Update(), it derives argMax step statuses from slip_component_states and
+// applies the 3-tier precedence (callerOverride > argMaxDerived > inMemory) to
+// slip.Steps before writing routing_slips.
+//
+// Errors from the derive step fail-open: in-memory values are used unchanged,
+// and a warning is logged. This prevents derive failures from blocking
+// aggregate status propagation.
+func (s *ClickHouseStore) updateWithOverrides(
+	ctx context.Context,
+	slip *Slip,
+	overrides ...r2StepOverride,
+) error {
+	slip.UpdatedAt = time.Now()
+	slip.Sign = 1
+	oldVersion := slip.Version
+	newVersion := s.nextVersion()
+	if newVersion <= oldVersion {
+		newVersion = oldVersion + 1
+	}
+
+	// R2 derive: get latest argMax statuses for pure pipeline steps.
+	// Fail-open on error: in-memory values used when derive cannot run.
+	var derived map[string]StepStatus
+	if d, deriveErr := s.derivePipelineStepStatuses(ctx, slip.CorrelationID); deriveErr != nil {
+		s.logger.Warn(ctx, "R2 derive failed; using in-memory step statuses", map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+			"error":          deriveErr.Error(),
+		})
+	} else {
+		derived = d
+	}
+
+	// Apply 3-tier precedence and patch slip.Steps.
+	effective := resolveEffectiveStepStatuses(s.pipelineConfig, slip.Steps, derived, overrides...)
+	for stepName, status := range effective {
+		if step, ok := slip.Steps[stepName]; ok && step.Status != status {
+			step.Status = status
+			slip.Steps[stepName] = step
+		}
+	}
+
+	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
+		return fmt.Errorf("failed to insert atomic update: %w", err)
+	}
+	slip.Version = newVersion
+	return nil
+}
+
 // appendHistoryWithOverrides is the internal implementation of AppendHistory.
 // When overrides are provided, the named step-status columns are written with the
 // supplied literal values instead of being copied verbatim from the DB row.
@@ -2180,10 +2335,16 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 			}
 		}
 
-		// The slip was already hydrated by Load(), so the step status should reflect
-		// the computed aggregate from all component states.
-		// Now persist this back to the database.
-		if err = s.Update(retrySpan.Context(), slip); err != nil {
+		// R2 write-back (ADO #83405): use updateWithOverrides to derive argMax statuses
+		// for pure pipeline steps from slip_component_states, then apply 3-tier precedence
+		// before writing routing_slips. The callerOverride pins the just-computed aggregate
+		// step status (tier 1) so the freshly-computed rollup always wins.
+		//
+		// SC-1 note: resolveEffectiveStepStatuses already excludes aggregate steps from
+		// argMax-derived results; the override here is belt-and-suspenders protection.
+		if err = s.updateWithOverrides(retrySpan.Context(), slip,
+			r2StepOverride{step: aggregateStepName, status: slip.Steps[aggregateStepName].Status},
+		); err != nil {
 			retrySpan.EndError(err)
 			return err
 		}
@@ -2336,10 +2497,12 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		// Append history entry to the same slip (atomic with aggregate update)
 		slip.StateHistory = append(slip.StateHistory, entry)
 
-		// The slip was already hydrated by Load(), so the step status should reflect
-		// the computed aggregate from all component states.
-		// Now persist this back to the database with the history entry.
-		if err = s.Update(retrySpan.Context(), slip); err != nil {
+		// R2 write-back (ADO #83405): use updateWithOverrides so concurrent pure-pipeline-step
+		// updates are not overwritten by the stale in-memory values from Load.
+		// The callerOverride pins the freshly-computed aggregate status (SC-1 belt-and-suspenders).
+		if err = s.updateWithOverrides(retrySpan.Context(), slip,
+			r2StepOverride{step: aggregateStepName, status: slip.Steps[aggregateStepName].Status},
+		); err != nil {
 			retrySpan.EndError(err)
 			return err
 		}
