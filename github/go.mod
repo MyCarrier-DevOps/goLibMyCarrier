@@ -1,6 +1,7 @@
 module github.com/MyCarrier-DevOps/goLibMyCarrier/github
 
 go 1.26
+toolchain go1.26.5
 
 require (
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.75

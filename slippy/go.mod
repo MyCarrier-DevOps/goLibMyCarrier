@@ -2,6 +2,8 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/slippy
 
 go 1.26
 
+toolchain go1.26.5
+
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.45.0
 	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.75
