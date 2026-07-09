@@ -112,6 +112,43 @@ func TestFreshnessWindow_Zero_FallsBackToDefault(t *testing.T) {
 	}
 }
 
+// TestFreshnessWindow_Overflow_ClampedNotNegative covers SF-4: a value large
+// enough that ms*time.Millisecond overflows int64 (producing a negative
+// duration and silently killing the gate) must be clamped to
+// maxFreshnessWindowMS instead of passed through raw.
+func TestFreshnessWindow_Overflow_ClampedNotNegative(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "10000000000000")
+	got := freshnessWindow()
+	if got < 0 {
+		t.Fatalf("freshnessWindow must never be negative, got %v", got)
+	}
+	if got != maxFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected clamp to %v (1h cap), got %v", maxFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+// TestFreshnessWindow_HugeButSubInt64_Clamped covers SF-4 for a value that is
+// large but does not itself overflow int64 as a raw integer — the overflow
+// only happens once multiplied by time.Millisecond. This must also clamp.
+func TestFreshnessWindow_HugeButSubInt64_Clamped(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "9999999999")
+	got := freshnessWindow()
+	if got != maxFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected clamp to %v (1h cap), got %v", maxFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+// TestFreshnessWindow_AtoiOverflow_FallsBackToDefault covers a value whose
+// Atoi parse itself overflows int64 (strconv.Atoi returns an error in that
+// case), which must fall back to the read-time default rather than clamp,
+// since the value never successfully parses.
+func TestFreshnessWindow_AtoiOverflow_FallsBackToDefault(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "99999999999999999999")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default on Atoi-overflow value, got %v", got)
+	}
+}
+
 // --- validateFreshnessWindowEnv ------------------------------------------------------------
 
 func TestValidateFreshnessWindowEnv_Unset(t *testing.T) {
@@ -161,6 +198,28 @@ func TestValidateFreshnessWindowEnv_Negative(t *testing.T) {
 	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "-5")
 	if err := validateFreshnessWindowEnv(); err == nil {
 		t.Error("expected error for -5")
+	}
+}
+
+// TestValidateFreshnessWindowEnv_Overflow covers SF-4: a value that parses as
+// a valid (huge) integer but would overflow int64 once multiplied by
+// time.Millisecond in freshnessWindow. Startup validation must reject it
+// (it's already above maxFreshnessWindowMS) so a misconfigured pod fails fast
+// instead of silently running with a dead gate.
+func TestValidateFreshnessWindowEnv_Overflow(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "10000000000000")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for 10000000000000 (would overflow int64 once *time.Millisecond)")
+	}
+}
+
+// TestValidateFreshnessWindowEnv_AtoiOverflow covers a value whose Atoi parse
+// itself overflows int64 (strconv.Atoi errors). Startup validation must
+// reject it via the non-integer error path.
+func TestValidateFreshnessWindowEnv_AtoiOverflow(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "99999999999999999999")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for a value whose Atoi parse overflows int64")
 	}
 }
 

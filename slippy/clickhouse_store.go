@@ -108,11 +108,19 @@ func gateEnabled() bool {
 // freshnessWindow returns the configured freshness window for the I5 gate.
 // Reads SLIPPY_I5_FRESHNESS_WINDOW_MS (integer milliseconds). Defaults to
 // defaultFreshnessWindowMS (750 ms) when the variable is absent, non-integer,
-// or <= 0.
+// or <= 0. Values above maxFreshnessWindowMS are clamped down to
+// maxFreshnessWindowMS rather than passed through raw.
 //
 // This is a defensive read-time fallback: in production paths, construction of
 // the ClickHouseStore already rejects invalid values via validateFreshnessWindowEnv,
 // so a misconfigured pod fails at startup rather than silently falling back here.
+// The clamp exists for the paths that skip that startup check (e.g.
+// NewClickHouseStoreFromSession/FromConn) or a post-start env mutation, since
+// freshnessWindow re-reads the env var on every call: without it, a huge value
+// (e.g. SLIPPY_I5_FRESHNESS_WINDOW_MS=10000000000000) would still pass the
+// Atoi/>0 checks here, and `time.Duration(ms) * time.Millisecond` overflows
+// int64 into a negative duration, silently killing the gate (age < window is
+// then always false).
 //
 // Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
 func freshnessWindow() time.Duration {
@@ -123,6 +131,13 @@ func freshnessWindow() time.Duration {
 	ms, err := strconv.Atoi(val)
 	if err != nil || ms <= 0 {
 		return defaultFreshnessWindowMS * time.Millisecond
+	}
+	// Defensive cap: prevents int64 overflow -> negative window -> dead gate.
+	// The FromConfig startup path already rejects values above this cap via
+	// validateFreshnessWindowEnv; this is the read-time backstop for paths
+	// that bypass that validation.
+	if ms > maxFreshnessWindowMS {
+		ms = maxFreshnessWindowMS
 	}
 	return time.Duration(ms) * time.Millisecond
 }
@@ -519,6 +534,12 @@ func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, comm
 
 // FindByCommits finds a slip matching any commit in the ordered list.
 // Returns the slip for the first (most recent) matching commit.
+//
+// This path deliberately skips captureWriteFingerprint, so the returned slip has
+// loadedWriteFingerprint == "" and D3 suppression is inactive for it: any write-back
+// built on a slip from this method always proceeds (fail-open), silently losing
+// suppression — a future write-back path built on FindByCommits should be aware of
+// this before assuming D3 protection applies.
 func (s *ClickHouseStore) FindByCommits(
 	ctx context.Context,
 	repository string,
@@ -556,6 +577,12 @@ func (s *ClickHouseStore) FindByCommits(
 
 // FindAllByCommits finds all slips matching any commit in the ordered list.
 // Returns slips ordered by commit priority (first matching commit's slip first).
+//
+// Like FindByCommits, this path deliberately skips captureWriteFingerprint, so
+// every returned slip has loadedWriteFingerprint == "" and D3 suppression is
+// inactive: any write-back built on a slip from this method always proceeds
+// (fail-open), silently losing suppression — a future write-back path built on
+// FindAllByCommits should be aware of this before assuming D3 protection applies.
 func (s *ClickHouseStore) FindAllByCommits(
 	ctx context.Context,
 	repository string,
@@ -1203,14 +1230,26 @@ func (s *ClickHouseStore) updateWithOverrides(
 	// final "completed" column transition is never written by THIS writer. This is
 	// safe because (a) prereq gates read slip_component_states events, not
 	// routing_slips columns, so pipeline flow is not blocked by a stale column; and
-	// (b) R2's fresh argMax derive (above, this same function) on the NEXT write
-	// from ANY component re-runs against slip_component_states and converges the
-	// column to "completed". Suppression MUST NOT exist without R2 derive-at-land-time
+	// (b) R2's fresh argMax derive (above, this same function) on the NEXT write that
+	// reaches updateWithOverrides re-runs against slip_component_states and converges
+	// the column to "completed". "Reaches updateWithOverrides" is narrower than "any
+	// component": only component-level writes (componentName != "") or aggregate-step
+	// pipeline-level writes call updateAggregateStatusFromComponentStates ->
+	// updateWithOverrides; a pure pipeline-step write (e.g. dev_deploy) goes through
+	// insertComponentState and never reaches this function, so it cannot self-heal a
+	// stuck aggregate column. Suppression MUST NOT exist without R2 derive-at-land-time
 	// — layering a dirty-check on top of the old stale-snapshot write path (without
 	// a fresh derive on every write) would make this edge a permanent data-loss bug
 	// instead of a transient, self-healing one.
 	//
-	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.
+	// N-way all-suppress wedge: until the Gap-B reconciler ships, if all N simultaneous
+	// completers suppress within the same async-flush window (each observing a sibling
+	// as still "running"), no writer converges the column and the wedge persists past a
+	// single "next write". This is detected by spec §7.2 Query 2 (routing_slips column
+	// vs. slip_component_states argMax mismatch) and healed by any subsequent qualifying
+	// write (component-level or aggregate-step) once one arrives.
+	//
+	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13, §7.2.
 	if slip.loadedWriteFingerprint != "" {
 		currentFP, fpErr := s.writeFingerprint(slip)
 		if fpErr != nil {

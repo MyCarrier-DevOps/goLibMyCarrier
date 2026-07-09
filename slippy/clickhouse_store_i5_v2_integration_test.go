@@ -460,13 +460,12 @@ func i5V2LoadRetry(ctx context.Context, t *testing.T, store *ClickHouseStore, co
 // updateWithOverrides' dirty-check doc (clickhouse_store.go, D3 block): suppression
 // fires whenever the resolved row matches what was just Loaded, regardless of history.
 //
-// PRODUCTION BUG FOUND WHILE WRITING THIS TEST (reported, not patched here per task
-// scope -- do not fix in this file):
+// PRODUCTION BUG FOUND WHILE WRITING THIS TEST, FIXED IN THE SAME PR:
 //
-// The final assertion in this test (real component transition -> exactly 1 new
-// routing_slips row, builds_completed_status advances past "pending") currently
-// FAILS. Root cause traced via zz_debug_* scratch tests during authoring (removed
-// before commit) and confirmed against git blame:
+// While authoring this test (683cbbd) the final assertion (real component
+// transition -> exactly 1 new routing_slips row, builds_completed_status advances
+// past "pending") failed. Root cause traced via zz_debug_* scratch tests during
+// authoring (removed before commit) and confirmed against git blame:
 //
 //  1. updateAggregateStatusFromComponentStates (clickhouse_store.go ~line 2563) calls
 //     s.Load(ctx, correlationID) *after* insertComponentState has already written the
@@ -475,31 +474,39 @@ func i5V2LoadRetry(ctx context.Context, t *testing.T, store *ClickHouseStore, co
 //     ~line 3145) OVERWRITES slip.Steps[aggregateStepName] with the status freshly
 //     computed from slip_component_states (i.e. the value the write-back is about to
 //     try to persist), BEFORE Load calls captureWriteFingerprint.
-//  3. captureWriteFingerprint (clickhouse_store.go ~line 2101) therefore captures a
+//  3. captureWriteFingerprint (clickhouse_store.go ~line 2101) therefore captured a
 //     fingerprint of the ALREADY-HYDRATED in-memory slip -- which already reflects the
 //     new event -- not a fingerprint of what is actually persisted in routing_slips.
 //  4. updateWithOverrides' R2 derive resolves the same value (it derives from the same
 //     slip_component_states rows), so writeFingerprint(effective) == the
-//     loadedWriteFingerprint captured in step 3, and D3 suppresses the INSERT --
+//     loadedWriteFingerprint captured in step 3, and D3 suppressed the INSERT --
 //     even though routing_slips itself was never updated with the new value.
 //
-// This reproduces on the FIRST ever UpdateStep call for a freshly-created slip (no
+// This reproduced on the FIRST ever UpdateStep call for a freshly-created slip (no
 // concurrency, no prior writes required): routing_slips.<step>_status for any
-// component-driven or aggregate step stays "pending" (its INSERT default) forever,
-// because every subsequent resolved value keeps matching the perpetually-fresh
-// hydrated baseline. This is broader than the documented BC-13 mutual-invisibility
+// component-driven or aggregate step stuck at "pending" (its INSERT default) forever,
+// because every subsequent resolved value kept matching the perpetually-fresh
+// hydrated baseline. This was broader than the documented BC-13 mutual-invisibility
 // edge (spec section 2 D3, section 4 BC-13), which describes an occasional missed
-// final transition that self-heals on the next writer; this bug suppresses nearly
-// every write-back unconditionally, and nothing about the "next writer" story applies
-// because the same bug reproduces on that next writer too (see
+// final transition that self-heals on the next writer; this bug suppressed nearly
+// every write-back unconditionally, and nothing about the "next writer" story applied
+// because the same bug reproduced on that next writer too (see
 // TestDebugStormRoutingSlipsStatus during investigation: 5 sequential real events
 // on one component left routing_slips.builds_completed_status stuck at "pending").
 //
-// Existing i5-v2 integration tests do not catch this because they all assert via
+// FIXED in f4a947a (same PR) by moving the captureWriteFingerprint call to run
+// BEFORE hydrateSlip in all three Load paths (Load, LoadByCommit, LoadLiveByCommit),
+// so the captured fingerprint reflects the persisted row, not the post-hydration
+// in-memory view. See TestD3Suppression_BaselineIsPersistedRow_NotHydratedView for
+// the direct regression test of that invariant.
+//
+// Existing i5-v2 integration tests did not catch this because they all assert via
 // store.Load(...), which re-hydrates from slip_component_states on every call and
 // therefore reports the correct value regardless of what is actually persisted in
-// routing_slips. This test is (to date) the first to assert against the raw
-// persisted row via direct SQL.
+// routing_slips. This test was (at the time) the first to assert against the raw
+// persisted row via direct SQL, which is why it caught the bug. With the fix in
+// place, this test is now expected to pass and serves as the deterministic
+// regression guard for the pre-hydration fingerprint-baseline invariant.
 func TestI5V2_Suppression_CollapseIdenticalWritebacks(t *testing.T) {
 	ctx := context.Background()
 	store := i5V2SetupStore(ctx, t)
@@ -738,17 +745,19 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 	// Retries tolerate the same transient container-warmup visibility gap documented
 	// on i5V2CountSign1Rows above.
 	//
-	// NOTE: see TestI5V2_Suppression_CollapseIdenticalWritebacks's doc comment for a
-	// production bug found while authoring this file, where D3's fingerprint baseline
-	// is captured from an already-hydrated in-memory slip rather than the persisted
-	// row, causing routing_slips.<step>_status to frequently stay stuck at "pending"
-	// for single-writer sequences. This assertion still passed empirically across the
-	// storm's 40 independent components/140 accepted events -- with that many
-	// components racing, at least one component's resolved rollup value ends up
-	// differing from whatever was hydrated at that writer's Load time often enough to
-	// produce a real write. This assertion is not proof the bug above is absent; it
-	// is a coarser, storm-scale signal and is retained because it still meaningfully
-	// verifies (c) below (write dampening) and gate-refusal accounting (a).
+	// NOTE: see TestI5V2_Suppression_CollapseIdenticalWritebacks's doc comment for the
+	// D3 fingerprint-baseline bug found while authoring this file (683cbbd) -- where the
+	// fingerprint was captured from an already-hydrated in-memory slip rather than the
+	// persisted row, causing routing_slips.<step>_status to frequently stay stuck at
+	// "pending" for single-writer sequences -- and its fix in f4a947a (same PR):
+	// captureWriteFingerprint now runs before hydrateSlip in all three Load paths. This
+	// assertion is a coarser, storm-scale signal (it does not by itself prove the
+	// pre-fix baseline bug is absent, since with 40 independent components racing, at
+	// least one component's resolved rollup value would likely differ from whatever was
+	// hydrated at that writer's Load time even without the fix) and is retained because
+	// it still meaningfully verifies (c) below (write dampening) and gate-refusal
+	// accounting (a); the deterministic regression guard for the fix itself is
+	// TestI5V2_Suppression_CollapseIdenticalWritebacks's raw-SQL assertion.
 	var rsStatus string
 	for attempt := 0; attempt < 5; attempt++ {
 		rsRow, err := store.Session().QueryWithArgs(ctx, `
@@ -797,9 +806,20 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 		t.Errorf("storm-replay: routing_slips.builds_completed_status is empty after storm settled")
 	}
 
-	// (c) Suppression must have dampened write volume: fewer sign=1 rows written
-	// than events fired for this correlation ID (the slip create row plus any
-	// accepted UpdateStep write-backs, minus everything D3 suppressed as no-change).
+	// (c) finalRowCount < totalEvents: fewer sign=1 rows written than events fired
+	// for this correlation ID. Honesty note (DA-verified, SF-2a): this gap is
+	// produced by D4 gate refusals (refusedCount, counted above), NOT by D3
+	// suppression. In a flip storm (running<->failed cycling) every gate-ACCEPTED
+	// event changes the resolved aggregate JSON for builds_completed, so the write
+	// fingerprint differs from the loaded baseline on every accepted write and D3
+	// never suppresses here — acceptedCount write-backs each produce a new row.
+	// D3's role under storms is preventing the BC-13 stuck-column (the aggregate
+	// column converging to the correct terminal value instead of getting wedged),
+	// not volume dampening; the volume dampening asserted below is entirely D4's
+	// doing (events it refuses never reach a write attempt at all). Do not "fix"
+	// the fingerprint to exclude the aggregate JSON to make D3 suppress more
+	// during storms — that was explicitly rejected in review: it would suppress
+	// legitimate metadata-only writes (data loss).
 	finalRowCount := i5V2CountSign1Rows(ctx, t, store, corrID)
 	t.Logf("storm-replay: events fired=%d, accepted=%d, refused=%d, final sign=1 routing_slips rows=%d",
 		totalEvents, acceptedCount, refusedCount, finalRowCount)
