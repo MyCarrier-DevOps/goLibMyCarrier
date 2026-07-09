@@ -373,6 +373,107 @@ func TestD3Suppression_RepeatedIdenticalUpdate_SecondSuppressed(t *testing.T) {
 	}
 }
 
+// TestD3Suppression_BaselineIsPersistedRow_NotHydratedView is the regression test
+// for the collapse-suppression bug documented in
+// TestI5V2_Suppression_CollapseIdenticalWritebacks
+// (clickhouse_store_i5_v2_integration_test.go): the D3 baseline must be the
+// fingerprint of the slip as scanned from the persisted routing_slips row, captured
+// BEFORE hydrateSlip/applyComponentStatesToAggregate mutates slip.Steps/Aggregates —
+// never a fingerprint of the already-hydrated/derived view.
+//
+// This stages the exact scenario: the persisted row's "builds" aggregate step is
+// still "running" (scan result, pre-hydration), but slip_component_states has since
+// advanced to "completed" for the sole active component — the value hydrateSlip
+// would derive. If captureWriteFingerprint were (incorrectly) called on the
+// post-hydration slip, the baseline would already read "completed", R2's derive at
+// write time would reproduce "completed", and the INSERT would be wrongly suppressed
+// forever (the exact bug). With the fix, the baseline is fingerprinted from the
+// pre-hydration (persisted-row) state, so it still reads "running"; R2's derive at
+// write time resolves "completed", the fingerprints differ, and the write proceeds.
+//
+// Scope note: this test locks in the SEMANTIC contract (baseline must reflect the
+// pre-hydration/persisted-row state, not the post-hydration/derived view) at the
+// writeFingerprint/updateWithOverrides unit level, using applyComponentStatesToAggregate
+// directly to model hydrateSlip's mutation without the JSON/chcol scan-mock scaffolding
+// a full Load()-level test would require. It does NOT exercise the actual Load/
+// LoadByCommit/LoadLiveByCommit call-site ordering (scanSlip -> captureWriteFingerprint
+// -> hydrateSlip) — that wiring is guarded end-to-end, deterministically, by
+// TestI5V2_Suppression_CollapseIdenticalWritebacks (integration test, real ClickHouse).
+func TestD3Suppression_BaselineIsPersistedRow_NotHydratedView(t *testing.T) {
+	derivedCompleted := []struct{ step, status string }{
+		{"api", string(StepStatusCompleted)},
+	}
+
+	t.Run("baseline captured pre-hydration => fingerprint mismatch => write proceeds", func(t *testing.T) {
+		// R2's derive-at-write-time resolves "completed" for the sole active component,
+		// modeling slip_component_states having already advanced.
+		store, session := newSuppressionTestStore(t, nil, derivedCompleted)
+
+		// Slip exactly as scanned from routing_slips: "builds" aggregate step still
+		// "running", matching what is actually persisted (pre-hydration state). This
+		// mirrors the corrected Load ordering: captureWriteFingerprint runs immediately
+		// after scanSlip, before hydrateSlip has a chance to mutate anything.
+		slip := baseSuppressionSlip()
+		fp, err := store.writeFingerprint(slip)
+		if err != nil {
+			t.Fatalf("writeFingerprint: %v", err)
+		}
+		slip.loadedWriteFingerprint = fp
+
+		// Now simulate hydrateSlip's mutation (applyComponentStatesToAggregate), which
+		// happens AFTER the baseline above was captured — exactly matching the corrected
+		// Load call ordering being tested here.
+		store.applyComponentStatesToAggregate(slip, "builds", "builds", map[string]componentStateRow{
+			"api": {Step: "builds", Component: "api", Status: string(StepStatusCompleted), Timestamp: time.Now()},
+		})
+		if slip.Steps["builds"].Status != StepStatusCompleted {
+			t.Fatalf("expected hydration to advance builds to completed, got %v", slip.Steps["builds"].Status)
+		}
+
+		// updateWithOverrides' R2 derive re-resolves "completed" from the same source;
+		// since the baseline was captured pre-hydration ("running"), the fingerprints
+		// must differ and the write must proceed.
+		if err := store.updateWithOverrides(context.Background(), slip); err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+
+		if len(session.ExecWithArgsCalls) != 1 {
+			t.Fatalf("expected 1 ExecWithArgs call (baseline=persisted-row must NOT match the "+
+				"resolved/derived value), got %d", len(session.ExecWithArgsCalls))
+		}
+	})
+
+	t.Run("persisted == derived == in-memory => suppressed", func(t *testing.T) {
+		// Inverse case: the persisted row already reflects "completed" (no lag), and R2's
+		// derive also resolves "completed" — baseline and resolved values match, so the
+		// write is correctly suppressed (BC-13 convergence semantics preserved).
+		store, session := newSuppressionTestStore(t, nil, derivedCompleted)
+
+		slip := baseSuppressionSlip()
+		step := slip.Steps["builds"]
+		step.Status = StepStatusCompleted
+		slip.Steps["builds"] = step
+		slip.Aggregates["builds"] = []ComponentStepData{
+			{Component: "api", Status: StepStatusCompleted},
+		}
+
+		fp, err := store.writeFingerprint(slip)
+		if err != nil {
+			t.Fatalf("writeFingerprint: %v", err)
+		}
+		slip.loadedWriteFingerprint = fp
+
+		if err := store.updateWithOverrides(context.Background(), slip); err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+
+		if len(session.ExecWithArgsCalls) != 0 {
+			t.Fatalf("expected 0 ExecWithArgs calls (persisted == derived == in-memory must "+
+				"suppress), got %d", len(session.ExecWithArgsCalls))
+		}
+	})
+}
+
 // TestD3Suppression_FingerprintError_FailOpenWrite documents the fail-open
 // contract for a fingerprint-computation error: writeFingerprint can only fail via
 // pipelineConfig being nil (JSON marshaling of the composed structures here cannot

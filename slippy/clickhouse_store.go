@@ -418,11 +418,13 @@ func (s *ClickHouseStore) Load(ctx context.Context, correlationID string) (*Slip
 		return nil, err
 	}
 
+	// Fingerprint the persisted row BEFORE hydration mutates it — see
+	// captureWriteFingerprint doc for why this ordering is load-bearing.
+	s.captureWriteFingerprint(ctx, slip)
+
 	if err := s.hydrateSlip(ctx, slip); err != nil {
 		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
 	}
-
-	s.captureWriteFingerprint(ctx, slip)
 
 	return slip, nil
 }
@@ -444,11 +446,13 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 		return nil, err
 	}
 
+	// Fingerprint the persisted row BEFORE hydration mutates it — see
+	// captureWriteFingerprint doc for why this ordering is load-bearing.
+	s.captureWriteFingerprint(ctx, slip)
+
 	if err := s.hydrateSlip(ctx, slip); err != nil {
 		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
 	}
-
-	s.captureWriteFingerprint(ctx, slip)
 
 	return slip, nil
 }
@@ -504,10 +508,12 @@ func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, comm
 	if err != nil {
 		return nil, err
 	}
+	// Fingerprint the persisted row BEFORE hydration mutates it — see
+	// captureWriteFingerprint doc for why this ordering is load-bearing.
+	s.captureWriteFingerprint(ctx, slip)
 	if err := s.hydrateSlip(ctx, slip); err != nil {
 		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
 	}
-	s.captureWriteFingerprint(ctx, slip)
 	return slip, nil
 }
 
@@ -2018,6 +2024,21 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 // values that insertAtomicUpdateWithVersions would otherwise (re-)write to
 // routing_slips, EXCLUDING columns that intentionally change on every call:
 //
+// IMPORTANT — baseline source: when called to establish the suppression baseline
+// (via captureWriteFingerprint), this MUST be evaluated against the slip as scanned
+// directly from the persisted routing_slips row — i.e. BEFORE hydrateSlip or any
+// other component-state-derived mutation (applyComponentStatesToAggregate) has
+// touched slip.Steps/slip.Aggregates. A hydrated/derived view must never be
+// fingerprinted as the baseline: hydrateSlip overwrites aggregate step columns with
+// values freshly re-derived from slip_component_states, which can differ from what
+// is actually persisted in routing_slips. If the baseline is captured post-hydration,
+// updateWithOverrides' R2 derive step (which recomputes the same values from the same
+// source) reproduces an identical fingerprint even when the persisted row is stale,
+// permanently suppressing the INSERT that would otherwise advance it. See the
+// collapse-test bug report/fix at clickhouse_store_i5_v2_integration_test.go
+// (TestI5V2_Suppression_CollapseIdenticalWritebacks, doc comment ~:462-501) for the
+// deterministic repro of this failure mode.
+//
 //   - INCLUDED: slip.Status (slip-level status); every per-step status column value,
 //     in pipeline-config step order (matches BuildStepColumnsAndValues); every
 //     aggregate JSON column value, in pipeline-config step order (matches
@@ -2092,6 +2113,19 @@ func (s *ClickHouseStore) writeFingerprint(slip *Slip) (string, error) {
 // captureWriteFingerprint computes the write-fingerprint for a freshly loaded slip
 // and stores it on slip.loadedWriteFingerprint so that a subsequent Update /
 // updateWithOverrides can detect a no-change write and suppress the INSERT (D3).
+//
+// CALLER CONTRACT — baseline = persisted routing_slips row, captured pre-hydration:
+// every call site (Load, LoadByCommit, LoadLiveByCommit) MUST invoke this
+// immediately after scanSlip succeeds and BEFORE hydrateSlip runs. hydrateSlip →
+// applyComponentStatesToAggregate overwrites slip.Steps/slip.Aggregates with values
+// derived from slip_component_states, which do not necessarily match what is
+// actually persisted in routing_slips. Fingerprinting the hydrated/derived view as
+// the baseline is a bug: updateWithOverrides' R2 derive step re-derives the same
+// values from the same source at write time, so the fingerprints trivially match and
+// the INSERT is suppressed forever — even when the persisted row is stale. Hydrated
+// views must never be fingerprinted as the baseline. See
+// TestI5V2_Suppression_CollapseIdenticalWritebacks
+// (clickhouse_store_i5_v2_integration_test.go) for the deterministic repro.
 //
 // On fingerprint-computation error, this logs a WARN and leaves the fingerprint
 // empty — an empty fingerprint disables suppression for this slip (fail-open to
