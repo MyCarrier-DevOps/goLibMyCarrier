@@ -422,6 +422,8 @@ func (s *ClickHouseStore) Load(ctx context.Context, correlationID string) (*Slip
 		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
 	}
 
+	s.captureWriteFingerprint(ctx, slip)
+
 	return slip, nil
 }
 
@@ -445,6 +447,8 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 	if err := s.hydrateSlip(ctx, slip); err != nil {
 		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
 	}
+
+	s.captureWriteFingerprint(ctx, slip)
 
 	return slip, nil
 }
@@ -503,6 +507,7 @@ func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, comm
 	if err := s.hydrateSlip(ctx, slip); err != nil {
 		return nil, fmt.Errorf("failed to hydrate slip with component states: %w", err)
 	}
+	s.captureWriteFingerprint(ctx, slip)
 	return slip, nil
 }
 
@@ -1065,6 +1070,8 @@ func (s *ClickHouseStore) derivePipelineStepStatuses(
 //  3. inMemory: lowest; used when no argMax entry exists for the step.
 //
 // The returned map contains one entry per step found in inMemory.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D2.
 func resolveEffectiveStepStatuses(
 	cfg *PipelineConfig,
 	inMemory map[string]Step,
@@ -1124,27 +1131,29 @@ func resolveEffectiveStepStatuses(
 	return result
 }
 
-// updateWithOverrides is the R2 shared init path for the aggregate write-back.
-// Unlike Update(), it derives argMax step statuses from slip_component_states and
-// applies the 3-tier precedence (callerOverride > argMaxDerived > inMemory) to
-// slip.Steps before writing routing_slips.
+// updateWithOverrides is the R2 (derive-at-land-time) / D3 (dirty-check write
+// suppression) shared init path for the aggregate write-back. Unlike a naive
+// Update(), it:
+//
+//  1. Derives argMax step statuses from slip_component_states at write time (R2) and
+//     applies the 3-tier precedence (callerOverride > argMaxDerived > inMemory) to
+//     slip.Steps before writing routing_slips — replacing the old
+//     Load-snapshot-then-recompute pattern that produced the 436cc68c race.
+//  2. After the effective statuses are resolved, compares the resulting row against
+//     the fingerprint captured at Load time (D3) and skips the INSERT entirely when
+//     nothing changed (see the dirty-check block below and writeFingerprint's
+//     godoc for exactly which columns are compared and why).
 //
 // Errors from the derive step fail-open: in-memory values are used unchanged,
 // and a warning is logged. This prevents derive failures from blocking
 // aggregate status propagation.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D2, D3.
 func (s *ClickHouseStore) updateWithOverrides(
 	ctx context.Context,
 	slip *Slip,
 	overrides ...r2StepOverride,
 ) error {
-	slip.UpdatedAt = time.Now()
-	slip.Sign = 1
-	oldVersion := slip.Version
-	newVersion := s.nextVersion()
-	if newVersion <= oldVersion {
-		newVersion = oldVersion + 1
-	}
-
 	// R2 derive: get latest argMax statuses for pure pipeline steps.
 	// Fail-open on error: in-memory values used when derive cannot run.
 	var derived map[string]StepStatus
@@ -1166,10 +1175,76 @@ func (s *ClickHouseStore) updateWithOverrides(
 		}
 	}
 
+	// D3 dirty-check write suppression: after R2 has resolved the effective column
+	// values, compare them (plus slip-level status, aggregate JSON, and step_details —
+	// see writeFingerprint) against the fingerprint captured when this slip was
+	// Loaded. If nothing tracked has changed, skip the INSERT (and the version bump)
+	// entirely: no-change echo rows are the primary fuel for the version-order
+	// collisions this fix targets (§1.2), and suppressing them collapses write volume
+	// from storm events (BC-12).
+	//
+	// slip.loadedWriteFingerprint == "" means this slip was never Loaded (e.g. a
+	// hand-built Slip passed straight to Update, or a fingerprint-computation error
+	// at Load time) — suppression is disabled and the write always proceeds
+	// (fail-open). A fingerprint error HERE also fails open: WARN + proceed with
+	// the write, since refusing to write on an internal marshaling error would be
+	// far worse than an extra no-op row.
+	//
+	// Missed-final-transition edge (BC-13, mutual-invisibility): the final
+	// completer's rollup may observe a sibling step as still "running" due to
+	// async-insert visibility lag. In that case the resolved values above will
+	// match the loaded row byte-for-byte, the write is suppressed here, and the
+	// final "completed" column transition is never written by THIS writer. This is
+	// safe because (a) prereq gates read slip_component_states events, not
+	// routing_slips columns, so pipeline flow is not blocked by a stale column; and
+	// (b) R2's fresh argMax derive (above, this same function) on the NEXT write
+	// from ANY component re-runs against slip_component_states and converges the
+	// column to "completed". Suppression MUST NOT exist without R2 derive-at-land-time
+	// — layering a dirty-check on top of the old stale-snapshot write path (without
+	// a fresh derive on every write) would make this edge a permanent data-loss bug
+	// instead of a transient, self-healing one.
+	//
+	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.
+	if slip.loadedWriteFingerprint != "" {
+		currentFP, fpErr := s.writeFingerprint(slip)
+		if fpErr != nil {
+			s.logger.Warn(ctx, "failed to compute write fingerprint; proceeding with write", map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"error":          fpErr.Error(),
+			})
+		} else if currentFP == slip.loadedWriteFingerprint {
+			s.logger.Debug(ctx, "write suppressed: no change since load", map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"suppressed":     true,
+			})
+			return nil
+		}
+	}
+
+	slip.UpdatedAt = time.Now()
+	slip.Sign = 1
+	oldVersion := slip.Version
+	newVersion := s.nextVersion()
+	if newVersion <= oldVersion {
+		newVersion = oldVersion + 1
+	}
+
 	if err := s.insertAtomicUpdateWithVersions(ctx, slip, oldVersion, newVersion); err != nil {
 		return fmt.Errorf("failed to insert atomic update: %w", err)
 	}
 	slip.Version = newVersion
+
+	// Refresh the fingerprint to the just-written row so an immediately-repeated
+	// identical Update() on this same in-memory slip is also suppressed.
+	if fp, fpErr := s.writeFingerprint(slip); fpErr == nil {
+		slip.loadedWriteFingerprint = fp
+	} else {
+		s.logger.Warn(ctx, "failed to refresh write fingerprint after insert", map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+			"error":          fpErr.Error(),
+		})
+	}
+
 	return nil
 }
 
@@ -1937,6 +2012,107 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 	}
 
 	return nil
+}
+
+// writeFingerprint computes a canonical, deterministic string over exactly the row
+// values that insertAtomicUpdateWithVersions would otherwise (re-)write to
+// routing_slips, EXCLUDING columns that intentionally change on every call:
+//
+//   - INCLUDED: slip.Status (slip-level status); every per-step status column value,
+//     in pipeline-config step order (matches BuildStepColumnsAndValues); every
+//     aggregate JSON column value, in pipeline-config step order (matches
+//     BuildAggregateColumnsAndValues); the serialized step_details JSON (matches
+//     buildStepDetails — map-keyed json.Marshal sorts keys, so this is deterministic
+//     without an explicit sort).
+//   - EXCLUDED: updated_at, state_history, version, sign, created_at, and the
+//     identity columns (correlation_id/repository/branch/commit_sha). updated_at and
+//     state_history change on every call by design — including them would make the
+//     fingerprint never match and defeat suppression entirely. Suppressing a write
+//     intentionally drops its would-be no-change state_history journal entry; this is
+//     expected and documented (spec §7.2: post-deploy journals are expected to be
+//     thinner — do not mistake this for missing data).
+//
+// Including the aggregate JSON columns and step_details is deliberately STRICTER than
+// the spec's stated minimum ("resolved step columns and slip-level status", §2 D3).
+// This means a write that changes only the `builds` aggregate JSON, or only a
+// step_details field (e.g. an error message or a started_at/completed_at timestamp),
+// is NEVER suppressed — comparing all tracked columns, not just status columns
+// (BC-07 spirit: SetComponentImageTag-style metadata-only writes must not be
+// silently dropped by the dirty-check).
+//
+// Returns an error only if step_details or aggregate JSON marshaling fails; callers
+// must fail open (treat write-suppression as disabled, proceed with the write) on
+// any error from this method.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.
+func (s *ClickHouseStore) writeFingerprint(slip *Slip) (string, error) {
+	if s.pipelineConfig == nil {
+		return "", fmt.Errorf("pipeline config is required to compute write fingerprint")
+	}
+
+	var b strings.Builder
+
+	b.WriteString("status=")
+	b.WriteString(string(slip.Status))
+	b.WriteByte('\n')
+
+	_, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
+	for _, v := range stepValues {
+		b.WriteString("step=")
+		if sv, ok := v.(string); ok {
+			b.WriteString(sv)
+		} else {
+			fmt.Fprintf(&b, "%v", v)
+		}
+		b.WriteByte('\n')
+	}
+
+	_, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(slip.Aggregates)
+	for _, v := range aggregateValues {
+		b.WriteString("agg=")
+		if sv, ok := v.(string); ok {
+			b.WriteString(sv)
+		} else {
+			fmt.Fprintf(&b, "%v", v)
+		}
+		b.WriteByte('\n')
+	}
+
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	if err != nil {
+		return "", fmt.Errorf("writeFingerprint: marshal step details: %w", err)
+	}
+	b.WriteString("step_details=")
+	b.Write(stepDetailsJSON)
+	b.WriteByte('\n')
+
+	return b.String(), nil
+}
+
+// captureWriteFingerprint computes the write-fingerprint for a freshly loaded slip
+// and stores it on slip.loadedWriteFingerprint so that a subsequent Update /
+// updateWithOverrides can detect a no-change write and suppress the INSERT (D3).
+//
+// On fingerprint-computation error, this logs a WARN and leaves the fingerprint
+// empty — an empty fingerprint disables suppression for this slip (fail-open to
+// writing), it never blocks the Load call itself.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3.
+func (s *ClickHouseStore) captureWriteFingerprint(ctx context.Context, slip *Slip) {
+	if slip == nil {
+		return
+	}
+	fp, err := s.writeFingerprint(slip)
+	if err != nil {
+		s.logger.Warn(ctx,
+			"failed to compute write fingerprint at load; suppression disabled for this slip",
+			map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"error":          err.Error(),
+			})
+		return
+	}
+	slip.loadedWriteFingerprint = fp
 }
 
 // insertAtomicUpdateWithVersions inserts cancel rows for all existing active rows and a new state row

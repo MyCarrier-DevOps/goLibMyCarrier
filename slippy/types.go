@@ -76,6 +76,19 @@ type Slip struct {
 	// Uses nanosecond timestamps (time.Now().UnixNano()) to ensure uniqueness across concurrent writers.
 	// This field is managed internally by the store and should not be set manually.
 	Version uint64 `json:"-" ch:"version"`
+
+	// loadedWriteFingerprint is the write-fingerprint (see ClickHouseStore.writeFingerprint)
+	// computed at Load/LoadByCommit/LoadLiveByCommit time. It captures the exact set of
+	// row values that updateWithOverrides would otherwise re-write, letting the dirty-check
+	// write-suppression (D3) detect a no-change write and skip the INSERT.
+	//
+	// Unexported and excluded from JSON/CH marshaling by construction (lowercase field,
+	// no struct tags) — it is a purely in-process cache-validation token, never persisted.
+	// Empty string means "no fingerprint captured" (e.g. a hand-built Slip that was never
+	// Loaded), which disables suppression for that slip — fail-open to writing.
+	//
+	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.
+	loadedWriteFingerprint string
 }
 
 // AncestryEntry records metadata about a prior slip in the ancestry chain.

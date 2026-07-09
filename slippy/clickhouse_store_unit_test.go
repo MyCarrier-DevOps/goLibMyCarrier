@@ -2826,13 +2826,19 @@ func TestClickHouseStore_UpdateAggregateStatus_ConflictRetry(t *testing.T) {
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	// "build" has an aggregate step "builds" in testPipelineConfig.
+	// insertedAt must be non-zero (time.Now(), not time.Time{}) so overlayComponentState's
+	// "newer than existing" check actually applies the overlay: createMockScanRow's fixture
+	// has no timestamps on its "api" component, so a zero insertedAt would overlay as a
+	// no-op (both timestamps compare zero) and the D3 dirty-check would correctly suppress
+	// the resulting no-change write, defeating this test's intent to exercise the INSERT
+	// conflict-retry path itself.
 	err := store.updateAggregateStatusFromComponentStates(
 		context.Background(),
 		"corr-conflict",
 		"build",
 		"api",
 		StepStatusCompleted,
-		time.Time{},
+		time.Now(),
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -2909,13 +2915,16 @@ func TestClickHouseStore_UpdateAggregateStatus_ConflictRetryExhausted(t *testing
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	// Should return nil even when all retries are exhausted.
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write before the conflict-retry path runs
+	// (see TestClickHouseStore_UpdateAggregateStatus_ConflictRetry for detail).
 	err := store.updateAggregateStatusFromComponentStates(
 		context.Background(),
 		"corr-exhausted",
 		"build",
 		"api",
 		StepStatusCompleted,
-		time.Time{},
+		time.Now(),
 	)
 	if err != nil {
 		t.Errorf("expected nil (best-effort outcome), got %v", err)
@@ -2954,8 +2963,10 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_NoConflict(t *testing.
 		Actor:     "ci",
 	}
 
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write (see TestClickHouseStore_UpdateAggregateStatus_ConflictRetry).
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-withhistory-ok", "builds", "api", StepStatusCompleted, time.Time{}, entry,
+		context.Background(), "corr-withhistory-ok", "builds", "api", StepStatusCompleted, time.Now(), entry,
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -3054,8 +3065,10 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetry(t *testi
 		Actor:     "ci",
 	}
 
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write (see TestClickHouseStore_UpdateAggregateStatus_ConflictRetry).
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-retry", "builds", "api", StepStatusCompleted, time.Time{}, entry,
+		context.Background(), "corr-wh-retry", "builds", "api", StepStatusCompleted, time.Now(), entry,
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -3148,8 +3161,10 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_ConflictRetryExhausted
 		Actor:     "ci",
 	}
 
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write (see TestClickHouseStore_UpdateAggregateStatus_ConflictRetry).
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-exhausted", "builds", "api", StepStatusCompleted, time.Time{}, entry,
+		context.Background(), "corr-wh-exhausted", "builds", "api", StepStatusCompleted, time.Now(), entry,
 	)
 	if err != nil {
 		t.Errorf("expected nil (best-effort outcome), got %v", err)
@@ -3175,8 +3190,10 @@ func TestClickHouseStore_UpdateAggregateStatus_NoConflict(t *testing.T) {
 	)
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write (see TestClickHouseStore_UpdateAggregateStatus_ConflictRetry).
 	err := store.updateAggregateStatusFromComponentStates(
-		context.Background(), "corr-no-conflict", "build", "api", StepStatusCompleted, time.Time{},
+		context.Background(), "corr-no-conflict", "build", "api", StepStatusCompleted, time.Now(),
 	)
 	if err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -3241,8 +3258,10 @@ func TestClickHouseStore_UpdateAggregateStatus_VersionCheckError(t *testing.T) {
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write (see TestClickHouseStore_UpdateAggregateStatus_ConflictRetry).
 	err := store.updateAggregateStatusFromComponentStates(
-		context.Background(), "corr-vcheck-err", "build", "api", StepStatusCompleted, time.Time{},
+		context.Background(), "corr-vcheck-err", "build", "api", StepStatusCompleted, time.Now(),
 	)
 	// loadVersionFromDB errors are non-fatal; function must return nil.
 	if err != nil {
@@ -3716,8 +3735,11 @@ func TestClickHouseStore_UpdateAggregateStatus_UpdateFails(t *testing.T) {
 	}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write before ExecWithArgs (and the injected
+	// failure) is reached.
 	err := store.updateAggregateStatusFromComponentStates(
-		context.Background(), "corr-update-fail", "build", "api", StepStatusCompleted, time.Time{},
+		context.Background(), "corr-update-fail", "build", "api", StepStatusCompleted, time.Now(),
 	)
 	if err == nil {
 		t.Fatal("expected error when Update fails, got nil")
@@ -3857,8 +3879,11 @@ func TestClickHouseStore_UpdateAggregateStatusWithHistory_UpdateFails(t *testing
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
 	entry := StateHistoryEntry{Step: "builds", Status: StepStatusCompleted}
+	// insertedAt must be non-zero so overlayComponentState applies a real change and the
+	// D3 dirty-check does not suppress the write before ExecWithArgs (and the injected
+	// failure) is reached.
 	err := store.updateAggregateStatusFromComponentStatesWithHistory(
-		context.Background(), "corr-wh-upd-fail", "builds", "api", StepStatusCompleted, time.Time{}, entry,
+		context.Background(), "corr-wh-upd-fail", "builds", "api", StepStatusCompleted, time.Now(), entry,
 	)
 	if err == nil {
 		t.Fatal("expected error when Update fails, got nil")
