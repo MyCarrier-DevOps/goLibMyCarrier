@@ -101,14 +101,14 @@ func TestI5V2_Gate_AfterWindow_Allows(t *testing.T) {
 	// Backdate the terminal event by querying and inserting a row older than the window.
 	// We achieve this by writing a terminal status directly to slip_component_states with
 	// a past timestamp. Use the store's session to bypass the gate for this setup row.
-	// NOTE: we set SLIPPY_I5_FRESHNESS_WINDOW_SECONDS=0 for the check so even a fresh row
-	// is "expired". Alternatively, sleep > defaultFreshnessWindowSeconds. For test speed,
-	// use a 0-second custom window via env; the gate skips (secs <=0 → default) so we rely
+	// NOTE: we set SLIPPY_I5_FRESHNESS_WINDOW_MS=0 for the check so even a fresh row
+	// is "expired". Alternatively, sleep > defaultFreshnessWindowMS. For test speed,
+	// use a 0 ms custom window via env; the gate skips (ms <=0 → default) so we rely
 	// on a direct slip_component_states insert with a past timestamp.
 	//
 	// Simplified approach for integration test: use the gate's custom-window env var with
-	// a 1-second window and sleep 1.1 seconds.
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "1")
+	// a 1000 ms (1 s) window and sleep 2 s for CI flake margin.
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "1000")
 
 	if err := store.UpdateStep(ctx, corrID, "dev_deploy", "", StepStatusCompleted); err != nil {
 		t.Fatalf("failed to write terminal status: %v", err)

@@ -3,7 +3,8 @@ package slippy
 // terminal_monotonicity_gate_test.go — unit tests for the I5 v2 freshness gate.
 //
 // Tests cover enforceTerminalFreshnessGate, latestComponentStateRow, gateEnabled,
-// and freshnessWindow as specified in the I5 v2 plan §Test Plan (ADO #83405).
+// freshnessWindow, and validateFreshnessWindowEnv as specified in the I5 v2 plan
+// §Test Plan (ADO #83405) and standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4.
 //
 // All tests are pure-unit (no Docker / ClickHouse required); CH interactions are
 // intercepted via the MockSession / MockRow fixtures from the clickhousetest package.
@@ -83,31 +84,83 @@ func TestGateEnabled_InvalidValue_FailSafeOn(t *testing.T) {
 }
 
 func TestFreshnessWindow_Default(t *testing.T) {
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
-	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
-	if got := freshnessWindow(); got != defaultFreshnessWindowSeconds*time.Second {
-		t.Errorf("expected default %v, got %v", defaultFreshnessWindowSeconds*time.Second, got)
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default %v, got %v", defaultFreshnessWindowMS*time.Millisecond, got)
 	}
 }
 
 func TestFreshnessWindow_Custom(t *testing.T) {
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "10")
-	if got := freshnessWindow(); got != 10*time.Second {
-		t.Errorf("expected 10s, got %v", got)
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "1500")
+	if got := freshnessWindow(); got != 1500*time.Millisecond {
+		t.Errorf("expected 1500ms, got %v", got)
 	}
 }
 
 func TestFreshnessWindow_Invalid_FallsBackToDefault(t *testing.T) {
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "abc")
-	if got := freshnessWindow(); got != defaultFreshnessWindowSeconds*time.Second {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "abc")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
 		t.Errorf("expected default on invalid value, got %v", got)
 	}
 }
 
 func TestFreshnessWindow_Zero_FallsBackToDefault(t *testing.T) {
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "0")
-	if got := freshnessWindow(); got != defaultFreshnessWindowSeconds*time.Second {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "0")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
 		t.Errorf("expected default on zero value, got %v", got)
+	}
+}
+
+// --- validateFreshnessWindowEnv ------------------------------------------------------------
+
+func TestValidateFreshnessWindowEnv_Unset(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+	if err := validateFreshnessWindowEnv(); err != nil {
+		t.Errorf("expected nil for unset env var, got %v", err)
+	}
+}
+
+func TestValidateFreshnessWindowEnv_Valid750(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "750")
+	if err := validateFreshnessWindowEnv(); err != nil {
+		t.Errorf("expected nil for 750, got %v", err)
+	}
+}
+
+func TestValidateFreshnessWindowEnv_ValidAtCap(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "3600000")
+	if err := validateFreshnessWindowEnv(); err != nil {
+		t.Errorf("expected nil for 3600000 (at cap), got %v", err)
+	}
+}
+
+func TestValidateFreshnessWindowEnv_AboveCap(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "3600001")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for 3600001 (above 1-hour cap)")
+	}
+}
+
+func TestValidateFreshnessWindowEnv_NonInteger(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "abc")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for non-integer value")
+	}
+}
+
+func TestValidateFreshnessWindowEnv_Zero(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "0")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for 0 (misconfiguration; use SLIPPY_I5_GATE_ENABLED=false to disable)")
+	}
+}
+
+func TestValidateFreshnessWindowEnv_Negative(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "-5")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for -5")
 	}
 }
 
@@ -232,55 +285,51 @@ func TestGate_PriorNonTerminal_Allows(t *testing.T) {
 	}
 }
 
-func TestGate_Within4900ms_Refuses(t *testing.T) {
-	// Server-computed age = 4.9 s < default 5 s window → refuse incoming running.
-	// Age is now returned directly from the mock (server-side dateDiff); no timestamp math needed.
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
-	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
-	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 4900*time.Millisecond),
-	}
-	store := gateTestStore(session)
+// TestGate_BoundaryTable exercises the new default 750 ms freshness window across
+// the ages called out in the spec (§2 D4, §6.1) plus the artifact-ceiling and
+// legitimate-restart-floor data points from the 90-day replay.
+//
+// NOTE (BC-11, spec §4): spec §6.1's test-plan sketch lists "0 ms → allow", but
+// BC-11 explicitly requires refusing the ~0 ms duplicate-write artifact, and the
+// gate's `age > window` rule refuses age == 0 for any positive window. BC-11 is
+// authoritative; this table documents that resolution via the age=0 → REFUSE case.
+func TestGate_BoundaryTable(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
 
-	err := store.enforceTerminalFreshnessGate(
-		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
-	)
-	if !errors.Is(err, ErrTerminalAlreadyExists) {
-		t.Errorf("Within4900ms_Refuses: expected ErrTerminalAlreadyExists, got %v", err)
+	cases := []struct {
+		name    string
+		ageMs   int64
+		refuses bool
+	}{
+		{"age_0ms_refuses_BC11", 0, true},
+		{"age_113ms_refuses", 113, true},
+		{"age_465ms_artifact_ceiling_refuses", 465, true},
+		{"age_740ms_refuses", 740, true},
+		{"age_760ms_allows", 760, false},
+		{"age_1700ms_legit_floor_allows", 1700, false},
 	}
-}
 
-func TestGate_After5100ms_Allows(t *testing.T) {
-	// Server-computed age = 5.1 s > default 5 s window → allow (window expired).
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
-	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
-	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 5100*time.Millisecond),
-	}
-	store := gateTestStore(session)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &clickhousetest.MockSession{
+				QueryRowRow: gateQueryRowForStatus(
+					string(StepStatusCompleted), time.Now(), time.Duration(tc.ageMs)*time.Millisecond,
+				),
+			}
+			store := gateTestStore(session)
 
-	err := store.enforceTerminalFreshnessGate(
-		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
-	)
-	if err != nil {
-		t.Errorf("After5100ms_Allows: expected nil, got %v", err)
-	}
-}
-
-func TestGate_NearBoundary_Refuses(t *testing.T) {
-	// Server-computed age = 4.5 s < default 5 s window → inside window → refuse.
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "__sentinel__")
-	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
-	session := &clickhousetest.MockSession{
-		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 4500*time.Millisecond),
-	}
-	store := gateTestStore(session)
-
-	err := store.enforceTerminalFreshnessGate(
-		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
-	)
-	if !errors.Is(err, ErrTerminalAlreadyExists) {
-		t.Errorf("NearBoundary_Refuses: expected ErrTerminalAlreadyExists, got %v", err)
+			err := store.enforceTerminalFreshnessGate(
+				context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
+			)
+			if tc.refuses {
+				if !errors.Is(err, ErrTerminalAlreadyExists) {
+					t.Errorf("age=%dms: expected ErrTerminalAlreadyExists, got %v", tc.ageMs, err)
+				}
+			} else if err != nil {
+				t.Errorf("age=%dms: expected nil, got %v", tc.ageMs, err)
+			}
+		})
 	}
 }
 
@@ -352,9 +401,9 @@ func TestGate_CHError_FailOpen(t *testing.T) {
 	}
 }
 
-func TestGate_CustomWindow_2s_Refuse(t *testing.T) {
-	// Custom 2 s window; server-computed age = 1.9 s → refuse.
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
+func TestGate_CustomWindow_2000ms_Refuse(t *testing.T) {
+	// Custom 2000 ms window; server-computed age = 1900 ms → refuse.
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "2000")
 
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 1900*time.Millisecond),
@@ -365,13 +414,13 @@ func TestGate_CustomWindow_2s_Refuse(t *testing.T) {
 		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
 	if !errors.Is(err, ErrTerminalAlreadyExists) {
-		t.Errorf("CustomWindow_2s_Refuse: expected ErrTerminalAlreadyExists, got %v", err)
+		t.Errorf("CustomWindow_2000ms_Refuse: expected ErrTerminalAlreadyExists, got %v", err)
 	}
 }
 
-func TestGate_CustomWindow_2s_Allow(t *testing.T) {
-	// Custom 2 s window; server-computed age = 2.1 s → allow (window expired).
-	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS", "2")
+func TestGate_CustomWindow_2000ms_Allow(t *testing.T) {
+	// Custom 2000 ms window; server-computed age = 2100 ms → allow (window expired).
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "2000")
 
 	session := &clickhousetest.MockSession{
 		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 2100*time.Millisecond),
@@ -382,7 +431,7 @@ func TestGate_CustomWindow_2s_Allow(t *testing.T) {
 		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
 	if err != nil {
-		t.Errorf("CustomWindow_2s_Allow: expected nil, got %v", err)
+		t.Errorf("CustomWindow_2000ms_Allow: expected nil, got %v", err)
 	}
 }
 
@@ -510,5 +559,36 @@ func TestGate_NonTerminalIncoming_IssuedQueryRow(t *testing.T) {
 	call := session.QueryRowCalls[0]
 	if !strings.Contains(call.Query, TableSlipComponentStates) {
 		t.Errorf("gate query should target %s, got: %s", TableSlipComponentStates, call.Query)
+	}
+}
+
+// --- NewClickHouseStoreFromConfig startup validation --------------------------------------
+
+// TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_TooLarge verifies that
+// constructing the store with an out-of-range SLIPPY_I5_FRESHNESS_WINDOW_MS fails
+// fast at startup, before any ClickHouse connection is attempted.
+func TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_TooLarge(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "9999999999")
+
+	_, err := NewClickHouseStoreFromConfig(nil, ClickHouseStoreOptions{})
+	if err == nil {
+		t.Fatal("expected error for SLIPPY_I5_FRESHNESS_WINDOW_MS=9999999999, got nil")
+	}
+	if !strings.Contains(err.Error(), "SLIPPY_I5_FRESHNESS_WINDOW_MS") {
+		t.Errorf("expected error to reference SLIPPY_I5_FRESHNESS_WINDOW_MS, got: %v", err)
+	}
+}
+
+// TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_NonInteger verifies that
+// constructing the store with a non-integer SLIPPY_I5_FRESHNESS_WINDOW_MS fails fast.
+func TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_NonInteger(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "abc")
+
+	_, err := NewClickHouseStoreFromConfig(nil, ClickHouseStoreOptions{})
+	if err == nil {
+		t.Fatal("expected error for SLIPPY_I5_FRESHNESS_WINDOW_MS=abc, got nil")
+	}
+	if !strings.Contains(err.Error(), "SLIPPY_I5_FRESHNESS_WINDOW_MS") {
+		t.Errorf("expected error to reference SLIPPY_I5_FRESHNESS_WINDOW_MS, got: %v", err)
 	}
 }

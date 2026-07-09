@@ -65,7 +65,9 @@ var (
 	//
 	// The gate closes the I5 race (ADO #82468 / ADO #83405) by refusing
 	// non-terminal-over-terminal writes that arrive within the freshness window
-	// (default 5 s, configurable via SLIPPY_I5_FRESHNESS_WINDOW_SECONDS).
+	// (default 750 ms, configurable via SLIPPY_I5_FRESHNESS_WINDOW_MS).
+	//
+	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
 	//
 	// The gate REFUSES:
 	//   - non-terminal incoming status when the prior recorded status is terminal

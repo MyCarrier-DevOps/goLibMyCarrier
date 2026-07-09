@@ -63,10 +63,24 @@ const componentEventSortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(times
 // Promoted from doLoadComponentStates function-local to package-level (I5 v2, ADO #83405).
 const componentEventSortKeyNoImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
 
-// defaultFreshnessWindowSeconds is the default window for the I5 freshness gate.
-// Events younger than this threshold are considered "fresh" for terminal-monotonicity
-// enforcement. Configurable via SLIPPY_I5_FRESHNESS_WINDOW_SECONDS.
-const defaultFreshnessWindowSeconds = 5
+// defaultFreshnessWindowMS is the default window (in milliseconds) for the I5
+// freshness gate. Events younger than this threshold are considered "fresh" for
+// terminal-monotonicity enforcement. Configurable via SLIPPY_I5_FRESHNESS_WINDOW_MS.
+//
+// 750 ms was derived from a 90-day production replay: the artifact ceiling
+// (spurious duplicate-write races) tops out at 465 ms, while the legitimate-restart
+// floor (genuine re-runs / re-cycles) starts at 1,700 ms. 750 ms bisects that gap.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
+const defaultFreshnessWindowMS = 750
+
+// maxFreshnessWindowMS is the maximum permitted freshness window, in milliseconds
+// (1 hour). Security M1: values above this are rejected at startup by
+// validateFreshnessWindowEnv, and clamped defensively at read-time by
+// freshnessWindow if they somehow reach that path.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
+const maxFreshnessWindowMS = 3600000
 
 // gateBypassSteps lists step names whose pipeline-level writes (component="") bypass
 // the terminal-freshness gate. push_parsed is bypassed because push-webhook retries
@@ -92,19 +106,65 @@ func gateEnabled() bool {
 }
 
 // freshnessWindow returns the configured freshness window for the I5 gate.
-// Reads SLIPPY_I5_FRESHNESS_WINDOW_SECONDS (integer seconds). Defaults to
-// defaultFreshnessWindowSeconds (5 s) when the variable is absent, zero, or
-// unparseable.
+// Reads SLIPPY_I5_FRESHNESS_WINDOW_MS (integer milliseconds). Defaults to
+// defaultFreshnessWindowMS (750 ms) when the variable is absent, non-integer,
+// or <= 0.
+//
+// This is a defensive read-time fallback: in production paths, construction of
+// the ClickHouseStore already rejects invalid values via validateFreshnessWindowEnv,
+// so a misconfigured pod fails at startup rather than silently falling back here.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
 func freshnessWindow() time.Duration {
-	val := os.Getenv("SLIPPY_I5_FRESHNESS_WINDOW_SECONDS")
+	val := os.Getenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
 	if val == "" {
-		return defaultFreshnessWindowSeconds * time.Second
+		return defaultFreshnessWindowMS * time.Millisecond
 	}
-	secs, err := strconv.Atoi(val)
-	if err != nil || secs <= 0 {
-		return defaultFreshnessWindowSeconds * time.Second
+	ms, err := strconv.Atoi(val)
+	if err != nil || ms <= 0 {
+		return defaultFreshnessWindowMS * time.Millisecond
 	}
-	return time.Duration(secs) * time.Second
+	return time.Duration(ms) * time.Millisecond
+}
+
+// validateFreshnessWindowEnv validates SLIPPY_I5_FRESHNESS_WINDOW_MS at startup.
+// It returns a descriptive error when the variable is set AND the value is
+// non-integer, <= 0, or exceeds maxFreshnessWindowMS (3,600,000 ms / 1 hour;
+// Security M1 cap). An unset variable is valid (the default applies).
+//
+// A <= 0 value is rejected as misconfiguration rather than silently disabling
+// the gate — to disable the I5 freshness gate, use SLIPPY_I5_GATE_ENABLED=false
+// instead.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
+func validateFreshnessWindowEnv() error {
+	val, ok := os.LookupEnv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+	if !ok || val == "" {
+		return nil
+	}
+	ms, err := strconv.Atoi(val)
+	if err != nil {
+		return fmt.Errorf(
+			"SLIPPY_I5_FRESHNESS_WINDOW_MS=%q is not a valid integer (milliseconds); "+
+				"unset it to use the default (%d ms), or set SLIPPY_I5_GATE_ENABLED=false to disable the gate",
+			val, defaultFreshnessWindowMS,
+		)
+	}
+	if ms <= 0 {
+		return fmt.Errorf(
+			"SLIPPY_I5_FRESHNESS_WINDOW_MS=%d must be a positive integer (milliseconds); "+
+				"to disable the I5 freshness gate, set SLIPPY_I5_GATE_ENABLED=false instead",
+			ms,
+		)
+	}
+	if ms > maxFreshnessWindowMS {
+		return fmt.Errorf(
+			"SLIPPY_I5_FRESHNESS_WINDOW_MS=%d exceeds the maximum allowed value of %d ms (1 hour); "+
+				"reduce the value, or set SLIPPY_I5_GATE_ENABLED=false to disable the gate",
+			ms, maxFreshnessWindowMS,
+		)
+	}
+	return nil
 }
 
 // calculateSlipNotFoundBackoff calculates the backoff duration for slip-not-found retries.
@@ -173,7 +233,14 @@ type ClickHouseStoreOptions struct {
 
 // NewClickHouseStoreFromConfig creates a new ClickHouse-backed slip store from config.
 // By default, this runs all pending migrations to ensure the schema is up to date.
+//
+// Validates SLIPPY_I5_FRESHNESS_WINDOW_MS at startup (see validateFreshnessWindowEnv)
+// so a misconfigured pod fails fast instead of silently falling back at read-time.
 func NewClickHouseStoreFromConfig(config *ch.ClickhouseConfig, opts ClickHouseStoreOptions) (*ClickHouseStore, error) {
+	if err := validateFreshnessWindowEnv(); err != nil {
+		return nil, fmt.Errorf("invalid I5 freshness gate configuration: %w", err)
+	}
+
 	ctx := context.Background()
 	startTime := time.Now()
 
@@ -2129,7 +2196,9 @@ func (s *ClickHouseStore) latestComponentStateRow(
 
 // enforceTerminalFreshnessGate is the I5 v2 gate (ADO #83405).
 // It refuses non-terminal incoming status when the prior recorded status is
-// terminal and was written within the freshness window (default 5 s).
+// terminal and was written within the freshness window (default 750 ms).
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
 //
 // 8-rule evaluation order (stop at first match):
 //  1. !gateEnabled()                          → allow
@@ -2183,15 +2252,21 @@ func (s *ClickHouseStore) enforceTerminalFreshnessGate(
 	// Rule 7: server-computed age exceeds freshness window → genuine re-run → allow.
 	// Using server-side age (dateDiff on CH clock) eliminates pod↔CH clock-skew errors
 	// that caused false-positive refusals when the pod clock lagged behind the CH clock.
+	//
+	// NOTE (BC-11, spec §4): spec §6.1's test-plan sketch lists "0 ms → allow" but BC-11
+	// explicitly requires refusing the ~0 ms duplicate-write artifact; the `age > window`
+	// comparison below refuses age == 0 (0 is not > window for any positive window).
+	// BC-11 is authoritative for this boundary; the §6.1 sketch is stale.
 	_ = eventTimestamp // retained for future diagnostic logging
 	window := freshnessWindow()
-	const maxFreshnessWindow = 3600 * time.Second // Security M1: cap at 1 hour
-	if window > maxFreshnessWindow {
-		s.logger.Warn(ctx, "SLIPPY_I5_FRESHNESS_WINDOW_SECONDS exceeds max; clamped to 3600s", map[string]interface{}{
-			"configured_s": int(window.Seconds()),
-			"clamped_s":    3600,
+	// Defensive read-time clamp; Security M1 cap (1 hour). Values above this are
+	// already rejected at startup by validateFreshnessWindowEnv in production paths.
+	if window > maxFreshnessWindowMS*time.Millisecond {
+		s.logger.Warn(ctx, "SLIPPY_I5_FRESHNESS_WINDOW_MS exceeds max; clamped to 3600000ms", map[string]interface{}{
+			"configured_ms": window.Milliseconds(),
+			"clamped_ms":    maxFreshnessWindowMS,
 		})
-		window = maxFreshnessWindow
+		window = maxFreshnessWindowMS * time.Millisecond
 	}
 	if age > window {
 		return nil
