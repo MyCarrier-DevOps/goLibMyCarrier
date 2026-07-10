@@ -8,7 +8,71 @@ import (
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse/clickhousetest"
+	golclogger "github.com/MyCarrier-DevOps/goLibMyCarrier/logger"
 )
+
+// capturedLogCall records a single logger invocation for assertions in the
+// D3-suppression state_history_lost tests below.
+type capturedLogCall struct {
+	level   string
+	message string
+	fields  map[string]interface{}
+}
+
+// capturingLogger is a minimal Logger implementation that records every call
+// instead of discarding it, so tests can assert on the exact message/fields
+// pair emitted by the suppression branch in updateWithOverrides.
+type capturingLogger struct {
+	calls []capturedLogCall
+}
+
+func (l *capturingLogger) Info(_ context.Context, message string, fields map[string]interface{}) {
+	l.calls = append(l.calls, capturedLogCall{level: "info", message: message, fields: fields})
+}
+
+func (l *capturingLogger) Debug(_ context.Context, message string, fields map[string]interface{}) {
+	l.calls = append(l.calls, capturedLogCall{level: "debug", message: message, fields: fields})
+}
+
+func (l *capturingLogger) Warn(_ context.Context, message string, fields map[string]interface{}) {
+	l.calls = append(l.calls, capturedLogCall{level: "warn", message: message, fields: fields})
+}
+
+func (l *capturingLogger) Warning(ctx context.Context, message string, fields map[string]interface{}) {
+	l.Warn(ctx, message, fields)
+}
+
+func (l *capturingLogger) Error(
+	_ context.Context, message string, err error, fields map[string]interface{},
+) {
+	if fields == nil {
+		fields = map[string]interface{}{}
+	}
+	if err != nil {
+		fields["error"] = err.Error()
+	}
+	l.calls = append(l.calls, capturedLogCall{level: "error", message: message, fields: fields})
+}
+
+func (l *capturingLogger) WithFields(map[string]interface{}) golclogger.Logger {
+	return l
+}
+
+var _ golclogger.Logger = (*capturingLogger)(nil)
+
+// callsWithField returns the subset of captured calls whose fields map has
+// the given key set to true.
+func (l *capturingLogger) callsWithField(key string) []capturedLogCall {
+	var out []capturedLogCall
+	for _, c := range l.calls {
+		if v, ok := c.fields[key]; ok {
+			if b, ok := v.(bool); ok && b {
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
 
 // --- D3 dirty-check write-suppression tests ---
 //
@@ -497,5 +561,122 @@ func TestD3Suppression_FingerprintError_FailOpenWrite(t *testing.T) {
 	if slip.loadedWriteFingerprint != "" {
 		t.Fatalf("expected loadedWriteFingerprint to remain empty on error, got %q",
 			slip.loadedWriteFingerprint)
+	}
+}
+
+// --- D3 suppression / state_history_lost Warn escalation tests ---
+//
+// When a D3 suppression fires (fingerprints match) AND slip.StateHistory grew
+// since the pre-hydration baseline was captured (loadedStateHistoryLen), the
+// appended journal entry is silently dropped by the suppressed write. These
+// tests assert the Warn-vs-Debug branch added to updateWithOverrides' D3
+// suppression path for that case, using a capturingLogger swapped onto the
+// store (store.logger is unexported/same-package, following the same
+// call-updateWithOverrides-directly pattern as the rest of this file).
+
+// TestD3Suppression_HistoryGrownSinceLoad_WarnsStateHistoryLost verifies that
+// when suppression fires and slip.StateHistory has grown past the baseline
+// captured at (simulated) Load time, updateWithOverrides logs at Warn with the
+// state_history_lost structured key instead of the routine Debug line.
+func TestD3Suppression_HistoryGrownSinceLoad_WarnsStateHistoryLost(t *testing.T) {
+	store, session := newSuppressionTestStore(t, nil, nil)
+	capLog := &capturingLogger{}
+	store.logger = capLog
+
+	slip := baseSuppressionSlip()
+	fp, err := store.writeFingerprint(slip)
+	if err != nil {
+		t.Fatalf("writeFingerprint: %v", err)
+	}
+	slip.loadedWriteFingerprint = fp
+	// Baseline captured pre-hydration at Load time, matching captureWriteFingerprint's
+	// contract: loadedStateHistoryLen == len(StateHistory) at that same point.
+	slip.loadedStateHistoryLen = len(slip.StateHistory)
+
+	// Simulate updateAggregateStatusFromComponentStatesWithHistory appending a
+	// journal entry to the same in-memory slip before calling updateWithOverrides
+	// (clickhouse_store.go ~:2860), with no other tracked field changing — so the
+	// fingerprint still matches the baseline and D3 suppression fires.
+	slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
+		Step:      "builds",
+		Component: "api",
+		Status:    StepStatusRunning,
+		Timestamp: time.Now(),
+		Actor:     "ci-bot",
+	})
+
+	if err := store.updateWithOverrides(context.Background(), slip); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+
+	// Suppression must still hold: no INSERT issued.
+	if len(session.ExecWithArgsCalls) != 0 {
+		t.Fatalf("expected 0 ExecWithArgs calls (suppression must still fire), got %d",
+			len(session.ExecWithArgsCalls))
+	}
+
+	warnCalls := capLog.callsWithField("state_history_lost")
+	if len(warnCalls) != 1 {
+		t.Fatalf("expected exactly 1 log call with state_history_lost=true, got %d (all calls: %+v)",
+			len(warnCalls), capLog.calls)
+	}
+	if warnCalls[0].level != "warn" {
+		t.Errorf("expected state_history_lost log at Warn level, got %q", warnCalls[0].level)
+	}
+	if cid, _ := warnCalls[0].fields["correlation_id"].(string); cid != slip.CorrelationID {
+		t.Errorf("expected correlation_id %q in Warn fields, got %q", slip.CorrelationID, cid)
+	}
+	if reason, _ := warnCalls[0].fields["reason"].(string); reason != "d3_suppression" {
+		t.Errorf("expected reason %q in Warn fields, got %q", "d3_suppression", reason)
+	}
+
+	// The routine Debug suppression line must NOT have also fired for this case.
+	for _, c := range capLog.calls {
+		if c.level == "debug" && c.message == "write suppressed: no change since load" {
+			t.Errorf("did not expect the routine Debug suppression line when history grew, got: %+v", c)
+		}
+	}
+}
+
+// TestD3Suppression_NoHistoryGrowth_NoStateHistoryLostWarn verifies that when
+// suppression fires and StateHistory did NOT grow since the baseline, the
+// routine Debug line is used and no state_history_lost Warn is emitted.
+func TestD3Suppression_NoHistoryGrowth_NoStateHistoryLostWarn(t *testing.T) {
+	store, session := newSuppressionTestStore(t, nil, nil)
+	capLog := &capturingLogger{}
+	store.logger = capLog
+
+	slip := baseSuppressionSlip()
+	fp, err := store.writeFingerprint(slip)
+	if err != nil {
+		t.Fatalf("writeFingerprint: %v", err)
+	}
+	slip.loadedWriteFingerprint = fp
+	slip.loadedStateHistoryLen = len(slip.StateHistory)
+
+	// No StateHistory mutation and no other tracked-field delta: suppression fires
+	// with loadedStateHistoryLen == len(StateHistory).
+	if err := store.updateWithOverrides(context.Background(), slip); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+
+	if len(session.ExecWithArgsCalls) != 0 {
+		t.Fatalf("expected 0 ExecWithArgs calls (suppression must fire), got %d",
+			len(session.ExecWithArgsCalls))
+	}
+
+	if warnCalls := capLog.callsWithField("state_history_lost"); len(warnCalls) != 0 {
+		t.Fatalf("expected 0 state_history_lost warn calls when history did not grow, got %d (%+v)",
+			len(warnCalls), warnCalls)
+	}
+
+	var sawDebug bool
+	for _, c := range capLog.calls {
+		if c.level == "debug" && c.message == "write suppressed: no change since load" {
+			sawDebug = true
+		}
+	}
+	if !sawDebug {
+		t.Errorf("expected the routine Debug suppression line to fire, calls: %+v", capLog.calls)
 	}
 }

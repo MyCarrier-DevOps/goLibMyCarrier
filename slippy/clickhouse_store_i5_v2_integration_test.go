@@ -610,6 +610,16 @@ func TestI5V2_Suppression_CollapseIdenticalWritebacks(t *testing.T) {
 // gate exists for (D4). ErrTerminalAlreadyExists from a same-component transition is
 // therefore EXPECTED and tolerated here: this test counts refusals rather than
 // treating them as failures.
+//
+// FU-1 (closed): the original version of this test only asserted that the settled
+// routing_slips.builds_completed_status was non-empty plus write-volume dampening,
+// which would pass even if the column were wedged at a stale value (e.g. stuck on
+// "running"). It now additionally recomputes the expected aggregate rollup directly
+// from slip_component_states (per-component argMax(status, timestamp), then the same
+// computeAggregateStatus precedence the library applies -- see clickhouse_store.go)
+// and asserts the persisted routing_slips column equals that independently-derived
+// value, giving a deterministic convergence-under-race check rather than a liveness-
+// only signal.
 func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 	ctx := context.Background()
 	if deadline, ok := t.Deadline(); ok {
@@ -804,6 +814,69 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 	// the component event stream: it must be non-empty and a recognized StepStatus.
 	if rsStatus == "" {
 		t.Errorf("storm-replay: routing_slips.builds_completed_status is empty after storm settled")
+	}
+
+	// FU-1: deterministic convergence-under-race assertion.
+	//
+	// The global argMax(status, sort_key) logged above (scsStatus) is a single
+	// highest-sort-key EVENT across all 40 components, not the library's aggregate
+	// ROLLUP -- those are not the same thing (e.g. one component argMax'ing to
+	// "running" after another has settled "failed" does not by itself determine the
+	// aggregate). The library never computes rsStatus that way; it derives it via
+	// computeAggregateStatus (clickhouse_store.go:2396-2427), which applies fixed
+	// precedence over the PER-COMPONENT settled statuses: any failure -> "failed";
+	// else all completed -> "completed"; else any running/completed -> "running";
+	// else "pending". Reproduce that here: pull each component's own argMax(status,
+	// timestamp) (same sort key the library uses, componentEventSortKeyNoImageTag)
+	// from slip_component_states, exclude the pipeline-level sentinel component ''
+	// (not applicable to this fixture -- UpdateStep is only ever called here with a
+	// non-empty ev.component -- but excluded for correctness/parity with the
+	// library's own component-step write path), then apply the identical precedence.
+	perCompRows, err := store.Session().QueryWithArgs(ctx, fmt.Sprintf(`
+		SELECT component, argMax(status, %s) AS latest_status
+		FROM ci_test.slip_component_states
+		WHERE correlation_id = ? AND step = 'builds_completed' AND component != ''
+		GROUP BY component
+	`, componentEventSortKeyNoImageTag), corrID)
+	if err != nil {
+		t.Fatalf("failed to query per-component argMax status: %v", err)
+	}
+	var perComponentStates []ComponentStepData
+	for perCompRows.Next() {
+		var comp, status string
+		if scanErr := perCompRows.Scan(&comp, &status); scanErr != nil {
+			perCompRows.Close()
+			t.Fatalf("failed to scan per-component argMax row: %v", scanErr)
+		}
+		perComponentStates = append(perComponentStates, ComponentStepData{
+			Component: comp,
+			Status:    StepStatus(status),
+		})
+	}
+	if err := perCompRows.Err(); err != nil {
+		perCompRows.Close()
+		t.Fatalf("per-component row iteration error: %v", err)
+	}
+	perCompRows.Close()
+
+	if len(perComponentStates) != numComponents {
+		t.Fatalf("storm-replay: expected settled state for all %d components, found %d",
+			numComponents, len(perComponentStates))
+	}
+
+	// Mirror computeAggregateStatus's exact precedence (clickhouse_store.go:2396-2427):
+	// any failure wins outright; else all-completed; else any running-or-completed
+	// means the aggregate is still "running" (in progress); else "pending".
+	expectedRollup := store.computeAggregateStatus(perComponentStates)
+
+	t.Logf("storm-replay: event-log-derived expected rollup (per-component argMax + computeAggregateStatus precedence) = %s", expectedRollup)
+
+	if rsStatus != string(expectedRollup) {
+		t.Errorf("storm-replay: routing_slips.builds_completed_status = %q, expected %q "+
+			"(deterministic rollup derived from per-component argMax(status, timestamp) over "+
+			"slip_component_states via computeAggregateStatus precedence) -- settled column did "+
+			"not converge to the event-log-derived value; this is the FU-1 gap this assertion closes",
+			rsStatus, expectedRollup)
 	}
 
 	// (c) finalRowCount < totalEvents: fewer sign=1 rows written than events fired

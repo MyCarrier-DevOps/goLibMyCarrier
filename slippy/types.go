@@ -89,6 +89,20 @@ type Slip struct {
 	//
 	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.
 	loadedWriteFingerprint string
+
+	// loadedStateHistoryLen is len(slip.StateHistory) captured at the same
+	// pre-hydration point as loadedWriteFingerprint (Load/LoadByCommit/
+	// LoadLiveByCommit, immediately after scanSlip). writeFingerprint
+	// deliberately excludes state_history, so D3 suppression cannot detect a
+	// StateHistory-only change on its own. Comparing len(slip.StateHistory)
+	// against this baseline in the suppression branch lets updateWithOverrides
+	// tell "history entry appended since Load, and the D3 write suppressing it
+	// would silently drop that journal entry" apart from "nothing changed" —
+	// escalating the former to a Warn instead of the routine Debug line.
+	//
+	// Unexported and excluded from JSON/CH marshaling by construction (lowercase
+	// field, no struct tags) — purely in-process, never persisted.
+	loadedStateHistoryLen int
 }
 
 // AncestryEntry records metadata about a prior slip in the ancestry chain.

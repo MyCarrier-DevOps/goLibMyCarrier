@@ -1258,10 +1258,29 @@ func (s *ClickHouseStore) updateWithOverrides(
 				"error":          fpErr.Error(),
 			})
 		} else if currentFP == slip.loadedWriteFingerprint {
-			s.logger.Debug(ctx, "write suppressed: no change since load", map[string]interface{}{
-				"correlation_id": slip.CorrelationID,
-				"suppressed":     true,
-			})
+			// writeFingerprint deliberately excludes state_history (see its doc
+			// comment), so a suppressed write is normally a true no-op. But if
+			// StateHistory grew since Load (e.g. updateAggregateStatusFromComponent-
+			// StatesWithHistory appended a journal entry onto this same in-memory
+			// slip before calling updateWithOverrides), suppression silently drops
+			// that appended entry — it is never written and never self-heals on the
+			// next Load. Escalate to Warn using the same "state_history_lost"
+			// structured key as the existing best-effort write-back Warn sites
+			// (~:785-795, :816-826) so this audit gap is observable the same way.
+			if len(slip.StateHistory) > slip.loadedStateHistoryLen {
+				s.logger.Warn(ctx, "write suppressed but state_history grew since load; appended audit entry is lost",
+					map[string]interface{}{
+						"correlation_id":     slip.CorrelationID,
+						"suppressed":         true,
+						"state_history_lost": true,
+						"reason":             "d3_suppression",
+					})
+			} else {
+				s.logger.Debug(ctx, "write suppressed: no change since load", map[string]interface{}{
+					"correlation_id": slip.CorrelationID,
+					"suppressed":     true,
+				})
+			}
 			return nil
 		}
 	}
@@ -1280,9 +1299,14 @@ func (s *ClickHouseStore) updateWithOverrides(
 	slip.Version = newVersion
 
 	// Refresh the fingerprint to the just-written row so an immediately-repeated
-	// identical Update() on this same in-memory slip is also suppressed.
+	// identical Update() on this same in-memory slip is also suppressed. Refresh
+	// loadedStateHistoryLen alongside it: this write just persisted (or at least
+	// attempted to persist, via the best-effort write-back paths) any StateHistory
+	// entries appended up to this point, so they must not be flagged as "lost" by
+	// a subsequent suppressed write.
 	if fp, fpErr := s.writeFingerprint(slip); fpErr == nil {
 		slip.loadedWriteFingerprint = fp
+		slip.loadedStateHistoryLen = len(slip.StateHistory)
 	} else {
 		s.logger.Warn(ctx, "failed to refresh write fingerprint after insert", map[string]interface{}{
 			"correlation_id": slip.CorrelationID,
@@ -2175,6 +2199,10 @@ func (s *ClickHouseStore) captureWriteFingerprint(ctx context.Context, slip *Sli
 	if slip == nil {
 		return
 	}
+	// Captured alongside the fingerprint (same pre-hydration point) so the D3
+	// suppression branch in updateWithOverrides can detect a StateHistory-only
+	// change — see loadedStateHistoryLen doc in types.go.
+	slip.loadedStateHistoryLen = len(slip.StateHistory)
 	fp, err := s.writeFingerprint(slip)
 	if err != nil {
 		s.logger.Warn(ctx,
@@ -2405,9 +2433,15 @@ func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepDa
 // preventing drift. On a ClickHouse empty-aggregate result (no matching rows) the
 // driver returns one row whose columns are zero-valued; rawStatus=="" detects this.
 //
-// age_ms is computed server-side via dateDiff('millisecond', argMax(timestamp,...), now64(6))
-// so that the freshness gate is immune to clock skew between the client pod and the CH server.
-// The timestamp is still returned for logging / diagnostic purposes.
+// age_ms is computed server-side via dateDiff('millisecond', argMax(timestamp,...), now64(6)).
+// `timestamp` is client(pod)-stamped (set by insertComponentState via time.Now()) while
+// now64(6) is evaluated on the CH server, so this makes the gate immune to pod↔pod clock
+// skew (both operands of every comparison never come from two different pods) but it still
+// carries the writer-pod↔CH-server NTP offset in every evaluation — it is NOT immune to
+// pod/CH clock skew in general. Under healthy NTP that residual offset is small (~tens of
+// ms) relative to the 750ms default freshness window; under degraded NTP the effective
+// window shifts (can under- or over-dampen the gate). The timestamp is still returned for
+// logging / diagnostic purposes.
 //
 // Returns (status, eventTimestamp, age, found=true, nil) on success,
 // ("", zero, 0, false, nil) when no event exists,
@@ -2478,7 +2512,9 @@ func (s *ClickHouseStore) enforceTerminalFreshnessGate(
 		return nil
 	}
 	// Rule 4: query prior state; CH error → WARN + allow (fail-open).
-	// age is server-computed (dateDiff on CH) so the comparison is immune to pod/CH clock skew.
+	// age is server-computed (dateDiff on CH) so it is immune to pod↔pod clock skew, but the
+	// writer-pod↔CH-server NTP offset is still present in every evaluation — see
+	// latestComponentStateRow's doc comment for the precise scope of this immunity.
 	priorStatus, eventTimestamp, age, found, queryErr := s.latestComponentStateRow(ctx, correlationID, step, component)
 	if queryErr != nil {
 		// Fail-open: a CH error here must not produce false-positive refusals.
@@ -2499,8 +2535,11 @@ func (s *ClickHouseStore) enforceTerminalFreshnessGate(
 		return nil
 	}
 	// Rule 7: server-computed age exceeds freshness window → genuine re-run → allow.
-	// Using server-side age (dateDiff on CH clock) eliminates pod↔CH clock-skew errors
-	// that caused false-positive refusals when the pod clock lagged behind the CH clock.
+	// Using server-side age (dateDiff on CH clock) eliminates pod↔pod clock-skew errors
+	// that caused false-positive refusals when one pod's clock lagged behind another's.
+	// It does NOT eliminate the writer-pod↔CH-server NTP offset, which is present in every
+	// evaluation (see latestComponentStateRow's doc comment) — under degraded NTP that
+	// residual offset can still shift the effective freshness window.
 	//
 	// NOTE (BC-11, spec §4): spec §6.1's test-plan sketch lists "0 ms → allow" but BC-11
 	// explicitly requires refusing the ~0 ms duplicate-write artifact; the `age > window`
