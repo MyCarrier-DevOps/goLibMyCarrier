@@ -45,15 +45,7 @@ type SlipStore interface {
 	// Update persists changes to an existing slip.
 	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
 	// so there are no version conflicts.
-	//
-	// Optional StepStatusOverride values pin specific <step>_status columns (and their
-	// step_details.<step>.status JSON counterpart) to caller-supplied truth, bypassing
-	// slip.Steps[name].Status for those steps. Zero overrides preserves the historical
-	// behavior — every step column is sourced from slip.Steps[name].Status — and is the
-	// expected mode for callers like AbandonSlip / PromoteSlip that do not transition
-	// individual step states. The override hook exists to defeat the stale-Load race in
-	// slippy-api's hydrateAndPersist (see goLibMyCarrier I5 fix / ADO #82468).
-	Update(ctx context.Context, slip *Slip, overrides ...StepStatusOverride) error
+	Update(ctx context.Context, slip *Slip) error
 
 	// UpdateStep updates a specific step's status
 	UpdateStep(ctx context.Context, correlationID, stepName, componentName string, status StepStatus) error
@@ -92,23 +84,6 @@ type SlipStore interface {
 		repository, branch, correlationID string,
 		maxDepth int,
 	) ([]AncestryEntry, error)
-
-	// LatestStepStatusFromEvents returns the latest pipeline-level (component="")
-	// status for the given step from the event log (slip_component_states),
-	// derived via the same argMax + sort-key formula used by hydrateSlip /
-	// loadComponentStates. Returns (status, true, nil) when at least one event
-	// row exists; returns ("", false, nil) when none exist (caller treats this
-	// as "no event yet, do not block"). Returns ("", false, err) on query
-	// failure — callers should treat this as fail-open (log + continue) so
-	// transient ClickHouse outages do not block CI traffic.
-	//
-	// This method exists to support the I5 race fix in slippy-api's
-	// overlayPipelineStep: callers need to know event-log truth for a step
-	// (not the in-memory snapshot from Load) when deciding whether to apply
-	// a non-terminal overlay on top of a terminal status.
-	LatestStepStatusFromEvents(
-		ctx context.Context, correlationID, step string,
-	) (StepStatus, bool, error)
 
 	// Close releases any resources held by the store
 	Close() error
