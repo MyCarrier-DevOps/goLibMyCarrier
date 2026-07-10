@@ -532,6 +532,30 @@ func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, comm
 	return slip, nil
 }
 
+// LatestStepStatusFromEvents returns the latest pipeline-level status for a
+// given step from the event log (slip_component_states). It uses the same
+// argMax + sort-key formula as doLoadComponentStates so the two cannot drift.
+//
+// Pipeline-level rows are those with component=” and image_tag=” — the
+// no-image-tag sort-key variant is correct for these rows.
+//
+// Return contract:
+//
+//   - (status, true, nil)    — at least one event row exists for (corrID, step)
+//   - ("", false, nil)       — no event row yet (caller proceeds with overlay)
+//   - ("", false, err)       — query failure (caller fails-open: log and continue)
+//
+// This is the canonical source of event-log truth for slippy-api's
+// overlayPipelineStep guard — see ADO #82468 / R1 fix.
+func (s *ClickHouseStore) LatestStepStatusFromEvents(
+	ctx context.Context, correlationID, step string,
+) (StepStatus, bool, error) {
+	// Pipeline-level rows have component="" — delegate to the component-aware
+	// companion to avoid duplicating the argMax point-lookup and its scan/error
+	// handling. See latestComponentStateStatus.
+	return s.latestComponentStateStatus(ctx, correlationID, step, "")
+}
+
 // FindByCommits finds a slip matching any commit in the ordered list.
 // Returns the slip for the first (most recent) matching commit.
 //
@@ -811,8 +835,12 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	// if this write-back fails.
 	if s.pipelineConfig != nil {
 		colName := s.queryBuilder.StepStatusColumn(stepName)
-		err := s.appendHistoryWithOverrides(ctx, correlationID, entry, stepStatusOverride{colName, status})
-		if err != nil {
+		if err := s.appendHistoryWithOverrides(
+			ctx,
+			correlationID,
+			entry,
+			StepStatusOverride{colName, status},
+		); err != nil {
 			s.logger.Warn(
 				ctx,
 				"pipeline step history writeback failed after durable event insert; step status will self-heal on next Load but state_history audit entry for this transition is lost",
@@ -1304,7 +1332,7 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 	ctx context.Context,
 	correlationID string,
 	entry StateHistoryEntry,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	// Start tracing span for the retry operation
 	retrySpan := startRetrySpan(ctx, "AppendHistory", correlationID)
@@ -1434,14 +1462,14 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 // UpdateSlipStatus immediately after appendHistoryWithOverrides: under ClickHouse async insert
 // visibility (VersionedCollapsingMergeTree without FINAL) the just-written step row may not yet
 // be visible, so the SELECT would copy the old (stale) step status into the new row. Passing the
-// same stepStatusOverride used by appendHistoryWithOverrides ensures the two operations agree on
+// same StepStatusOverride used by appendHistoryWithOverrides ensures the two operations agree on
 // the step value regardless of visibility lag.
 func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	ctx context.Context,
 	correlationID string,
 	newVersion uint64,
 	newStatus SlipStatus,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	stepColumns := s.queryBuilder.BuildStepColumns()
 	aggregateColumns := s.queryBuilder.BuildAggregateColumns()
@@ -1498,7 +1526,7 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
 
-	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
+	// Build step SELECT expressions. For columns that have a StepStatusOverride, replace
 	// the verbatim DB column reference with a literal (?) so the step-status value is
 	// updated atomically alongside the slip-status change. This mirrors the identical
 	// pattern in insertAtomicHistoryUpdate and fixes the stale-clone race described in
@@ -1511,7 +1539,7 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	} else {
 		overrideByCol := make(map[string]StepStatus, len(overrides))
 		for _, o := range overrides {
-			overrideByCol[o.columnName] = o.status
+			overrideByCol[o.ColumnName] = o.Status
 		}
 		stepSelectExprs := make([]string, 0, len(stepColumns))
 		stepOverrideArgs = make([]interface{}, 0, len(overrides))
@@ -1572,7 +1600,7 @@ func (s *ClickHouseStore) updateSlipStatusWithOverrides(
 	ctx context.Context,
 	correlationID string,
 	newStatus SlipStatus,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
@@ -1796,15 +1824,34 @@ func (s *ClickHouseStore) loadStateHistoryFromDB(ctx context.Context, correlatio
 	return string(jsonBytes), nil
 }
 
-// stepStatusOverride pairs a routing_slips step-status column name (e.g. "unit_tests_status")
-// with the literal value to write. When passed to insertAtomicHistoryUpdate the verbatim
-// DB column reference is replaced with a SQL literal so the step-status column is updated
-// atomically with the history entry. This is used by the pure-pipeline-step path in
-// UpdateStepWithHistory to persist the correct status in routing_slips without a separate
-// Load+Update round-trip.
-type stepStatusOverride struct {
-	columnName string
-	status     StepStatus
+// StepStatusOverride pairs a routing_slips step-status column name (e.g. "unit_tests_status")
+// with the literal value to write. When passed to insertAtomicHistoryUpdate,
+// insertAtomicStatusUpdate, or insertAtomicUpdateWithVersions, the verbatim DB column
+// reference is replaced with a SQL literal so the step-status column is updated atomically
+// with the surrounding write.
+//
+// This is the public hook by which callers (slippy-api's hydrateAndPersist) pin
+// event-log-validated step status for the step being written, defeating any stale
+// in-memory snapshot that Load may have returned under ClickHouse async-insert
+// visibility lag (the I5 race).
+//
+// ColumnName must be the underlying DB column (e.g. "unit_tests_status"), not the
+// raw step name. Use slippy.StepStatusColumnName(stepName) to construct it.
+type StepStatusOverride struct {
+	ColumnName string
+	Status     StepStatus
+}
+
+// StepStatusColumnName returns the routing_slips DB column name for a pipeline
+// step's status (e.g. "unit_tests" → "unit_tests_status"). It is the canonical
+// formula used by SlipQueryBuilder.StepStatusColumn and is exposed as a free
+// function so external callers (e.g. slippy-api's hydrateAndPersist) can
+// construct StepStatusOverride without holding a SlipQueryBuilder reference.
+//
+// The two must remain in lockstep — see the unit test in slippy/columns_test.go
+// (or this package's column_name_consistency_test.go) for the contract pin.
+func StepStatusColumnName(stepName string) string {
+	return stepName + "_status"
 }
 
 // insertAtomicHistoryUpdate cancels all active routing_slips rows for correlationID and inserts
@@ -1816,7 +1863,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	correlationID string,
 	newVersion uint64,
 	newStateHistoryJSON string,
-	overrides ...stepStatusOverride,
+	overrides ...StepStatusOverride,
 ) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
@@ -1884,7 +1931,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
 
-	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
+	// Build step SELECT expressions. For columns that have a StepStatusOverride, replace
 	// the verbatim DB column reference with a literal (?) so the step-status value is
 	// updated atomically alongside the history entry. This fixes the case where a pure
 	// pipeline step (e.g. unit_tests) would otherwise copy a stale "running" value from
@@ -1898,7 +1945,7 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	} else {
 		overrideByCol := make(map[string]StepStatus, len(overrides))
 		for _, o := range overrides {
-			overrideByCol[o.columnName] = o.status
+			overrideByCol[o.ColumnName] = o.Status
 		}
 		stepSelectExprs := make([]string, 0, len(stepColumns))
 		stepOverrideArgs = make([]interface{}, 0, len(overrides))
@@ -1972,8 +2019,8 @@ func (s *ClickHouseStore) insertRow(ctx context.Context, slip *Slip, version uin
 		slip.Aggregates,
 	)
 
-	// Serialize step details (timing, actor, errors)
-	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	// Serialize step details (timing, actor, errors). Create path — no overrides.
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip, nil))
 	if err != nil {
 		return fmt.Errorf("failed to marshal step details: %w", err)
 	}
@@ -2211,6 +2258,7 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 	ctx context.Context,
 	slip *Slip,
 	_, newVersion uint64,
+	overrides ...StepStatusOverride,
 ) error {
 	if s.pipelineConfig == nil {
 		return fmt.Errorf("pipeline config is required for store operations")
@@ -2219,12 +2267,33 @@ func (s *ClickHouseStore) insertAtomicUpdateWithVersions(
 	// Build dynamic column lists using query builder
 	stepColumns, _, stepValues := s.queryBuilder.BuildStepColumnsAndValues(slip.Steps)
 
+	// Apply optional per-step status overrides. For columns with overrides, the literal
+	// value comes from the override map; otherwise it comes from slip.Steps[name].Status
+	// via BuildStepColumnsAndValues. This is the Option D hook that lets slippy-api pin
+	// event-log-validated step status for the step being written, defeating any stale-Load
+	// race. The stepValues slice is mutated in place — its position must stay aligned with
+	// stepColumns for the placeholder fill below.
+	if len(overrides) > 0 {
+		overrideByCol := make(map[string]StepStatus, len(overrides))
+		for _, o := range overrides {
+			overrideByCol[o.ColumnName] = o.Status
+		}
+		for i, col := range stepColumns {
+			if overrideStatus, ok := overrideByCol[col]; ok {
+				stepValues[i] = string(overrideStatus)
+			}
+		}
+	}
+
 	aggregateColumns, _, aggregateValues := s.queryBuilder.BuildAggregateColumnsAndValues(
 		slip.Aggregates,
 	)
 
-	// Serialize step details (timing, actor, errors)
-	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip))
+	// Serialize step details (timing, actor, errors). Pass overrides so that
+	// step_details.<stepName>.status mirrors the column literal for the same row —
+	// JSON parity with the <step>_status column is a load-bearing invariant of
+	// Option D (see ADO #82468 / Stage-2 plan §A.5).
+	stepDetailsJSON, err := json.Marshal(s.buildStepDetails(slip, overrides))
 	if err != nil {
 		return fmt.Errorf("failed to marshal step details: %w", err)
 	}
@@ -2329,8 +2398,33 @@ func (s *ClickHouseStore) scanSlip(ctx context.Context, query string, args ...in
 }
 
 // buildStepDetails builds the step_details JSON from the slip.
-func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
+//
+// When overrides is non-empty, the per-step "status" field is sourced from the
+// override map (matched by column name via StepStatusColumnName) — this keeps
+// the JSON value in lockstep with the corresponding <step>_status column literal
+// emitted by insertAtomicUpdateWithVersions. For all other steps (and when
+// overrides is nil/empty) "status" reflects slip.Steps[name].Status.
+//
+// The status field is additive — pre-existing rows in routing_slips never had
+// step_details.<step>.status; downstream consumers reading specific named
+// fields are unaffected.
+func (s *ClickHouseStore) buildStepDetails(slip *Slip, overrides []StepStatusOverride) map[string]interface{} {
 	details := make(map[string]interface{})
+
+	// Index overrides by step name (not column name) for cheap lookup.
+	var overrideByStep map[string]StepStatus
+	if len(overrides) > 0 {
+		overrideByStep = make(map[string]StepStatus, len(overrides))
+		for _, o := range overrides {
+			// ColumnName is "<step>_status" — strip the suffix to recover the
+			// step name. Defensive: if a caller passes a column that does not
+			// match the convention, skip rather than write garbage.
+			const suffix = "_status"
+			if len(o.ColumnName) > len(suffix) && strings.HasSuffix(o.ColumnName, suffix) {
+				overrideByStep[o.ColumnName[:len(o.ColumnName)-len(suffix)]] = o.Status
+			}
+		}
+	}
 
 	for stepName, step := range slip.Steps {
 		stepDetail := make(map[string]interface{})
@@ -2349,6 +2443,19 @@ func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
 		}
 		if step.HeldReason != "" {
 			stepDetail["held_reason"] = step.HeldReason
+		}
+
+		// Status — override map first, else in-memory snapshot.
+		// We emit only when the status is non-empty to keep parity with the
+		// "non-default fields only" convention of the other fields above.
+		var status StepStatus
+		if overrideStatus, ok := overrideByStep[stepName]; ok {
+			status = overrideStatus
+		} else {
+			status = step.Status
+		}
+		if status != "" {
+			stepDetail["status"] = string(status)
 		}
 
 		if len(stepDetail) > 0 {

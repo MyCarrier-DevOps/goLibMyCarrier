@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -295,7 +294,7 @@ func TestE2E_FullPipelineFlow(t *testing.T) {
 	defer cancel()
 
 	// Disable ryuk for Podman compatibility
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	// Start ClickHouse container
 	container, err := setupE2EClickHouseContainer(ctx, t)
@@ -893,7 +892,7 @@ func TestE2E_ConcurrentWriteStressTest(t *testing.T) {
 	defer cancel()
 
 	// Disable ryuk for Podman compatibility
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	// Start ClickHouse container
 	container, err := setupE2EClickHouseContainer(ctx, t)
@@ -1121,7 +1120,7 @@ func TestE2E_PrerequisiteWaiting(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	container, err := setupE2EClickHouseContainer(ctx, t)
 	if err != nil {
@@ -1262,7 +1261,7 @@ func TestE2E_ReplacingMergeTreeCollapse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	container, err := setupE2EClickHouseContainer(ctx, t)
 	if err != nil {
@@ -1419,7 +1418,7 @@ func TestE2E_ComponentStateEventSourcing(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	container, err := setupE2EClickHouseContainer(ctx, t)
 	if err != nil {
@@ -1579,7 +1578,7 @@ func TestE2E_SlipStatusHistory(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	container, err := setupE2EClickHouseContainer(ctx, t)
 	if err != nil {
@@ -1717,7 +1716,7 @@ func TestE2E_JSONSchemaIntegrity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	container, err := setupE2EClickHouseContainer(ctx, t)
 	if err != nil {
@@ -2082,7 +2081,7 @@ func TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog(t *testing
 	defer cancel()
 
 	// Disable ryuk for Podman compatibility.
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	t.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 
 	// Start ClickHouse container shared across all sub-tests.
 	container, err := setupE2EClickHouseContainer(ctx, t)
