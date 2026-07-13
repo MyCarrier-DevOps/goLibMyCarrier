@@ -57,24 +57,19 @@ type MockStore struct {
 	CommitIndex map[string]string
 
 	// Call tracking
-	CreateCalls                     []CreateCall
-	LoadCalls                       []string
-	LoadByCommitCalls               []LoadByCommitCall
-	LoadLiveByCommitCalls           []LoadByCommitCall
-	FindByCommitsCalls              []FindByCommitsCall
-	FindAllByCommitsCalls           []FindAllByCommitsCall
-	UpdateCalls                     []UpdateCall
-	UpdateStepCalls                 []UpdateStepCall
-	UpdateComponentCalls            []UpdateComponentCall
-	AppendHistoryCalls              []AppendHistoryCall
-	SetImageTagCalls                []SetImageTagCall
-	UpdateSlipStatusCalls           []UpdateSlipStatusCall
-	LatestStepStatusFromEventsCalls []LatestStepStatusFromEventsCall
-	CloseCalls                      int
-
-	// LatestStepStatusFromEventsFn lets tests inject a custom response per (corrID, step).
-	// When nil, the default response is ("", false, nil) — no event yet.
-	LatestStepStatusFromEventsFn func(ctx context.Context, correlationID, step string) (slippy.StepStatus, bool, error)
+	CreateCalls           []CreateCall
+	LoadCalls             []string
+	LoadByCommitCalls     []LoadByCommitCall
+	LoadLiveByCommitCalls []LoadByCommitCall
+	FindByCommitsCalls    []FindByCommitsCall
+	FindAllByCommitsCalls []FindAllByCommitsCall
+	UpdateCalls           []UpdateCall
+	UpdateStepCalls       []UpdateStepCall
+	UpdateComponentCalls  []UpdateComponentCall
+	AppendHistoryCalls    []AppendHistoryCall
+	SetImageTagCalls      []SetImageTagCall
+	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	CloseCalls            int
 
 	// Ping tracking and error injection
 	PingCalls int
@@ -128,14 +123,7 @@ type FindAllByCommitsCall struct {
 
 // UpdateCall records an Update call.
 type UpdateCall struct {
-	Slip      *slippy.Slip
-	Overrides []slippy.StepStatusOverride
-}
-
-// LatestStepStatusFromEventsCall records a LatestStepStatusFromEvents call.
-type LatestStepStatusFromEventsCall struct {
-	CorrelationID string
-	Step          string
+	Slip *slippy.Slip
 }
 
 // UpdateStepCall records an UpdateStep call.
@@ -367,23 +355,12 @@ func (m *MockStore) FindAllByCommits(
 	return results, nil
 }
 
-// Update persists changes to an existing slip. The optional overrides are
-// recorded on the UpdateCall for assertion; they are NOT applied to the
-// in-memory slip. The override semantics are exercised by ClickHouseStore
-// integration tests, not this mock.
-func (m *MockStore) Update(
-	ctx context.Context, slip *slippy.Slip, overrides ...slippy.StepStatusOverride,
-) error {
+// Update persists changes to an existing slip.
+func (m *MockStore) Update(ctx context.Context, slip *slippy.Slip) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Snapshot overrides to break aliasing with the caller's slice.
-	var snapshot []slippy.StepStatusOverride
-	if len(overrides) > 0 {
-		snapshot = make([]slippy.StepStatusOverride, len(overrides))
-		copy(snapshot, overrides)
-	}
-	m.UpdateCalls = append(m.UpdateCalls, UpdateCall{Slip: slip, Overrides: snapshot})
+	m.UpdateCalls = append(m.UpdateCalls, UpdateCall{Slip: slip})
 
 	if m.UpdateError != nil {
 		return m.UpdateError
@@ -396,23 +373,6 @@ func (m *MockStore) Update(
 	m.Slips[slip.CorrelationID] = DeepCopySlip(slip)
 
 	return nil
-}
-
-// LatestStepStatusFromEvents returns the configured response or the default
-// ("", false, nil) when no function is set. Call is recorded for assertion.
-func (m *MockStore) LatestStepStatusFromEvents(
-	ctx context.Context, correlationID, step string,
-) (slippy.StepStatus, bool, error) {
-	m.mu.Lock()
-	m.LatestStepStatusFromEventsCalls = append(m.LatestStepStatusFromEventsCalls,
-		LatestStepStatusFromEventsCall{CorrelationID: correlationID, Step: step})
-	fn := m.LatestStepStatusFromEventsFn
-	m.mu.Unlock()
-
-	if fn != nil {
-		return fn(ctx, correlationID, step)
-	}
-	return "", false, nil
 }
 
 // UpdateStep updates a specific step's status.

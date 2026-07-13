@@ -20,22 +20,10 @@ import (
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
-// TestMain centralizes integration-test environment setup so that the env
-// mutation is visible to ALL test binaries linked from this package, while
-// keeping the per-test t.Setenv pattern available where it can scope a single
-// test's overrides (and is auto-restored on test exit).
-//
-// Replaces an earlier init() that called os.Setenv directly — init-time
-// mutation of process env is hard to reason about under `go test -count` and
-// trips lint rules (revive/forbidigo) that prefer t.Setenv at the test level.
-func TestMain(m *testing.M) {
-	// Disable ryuk (reaper) for Podman compatibility. Ryuk has issues
-	// connecting to the Docker socket inside Podman containers; disabling it
-	// is safe in CI/dev because testcontainers-go cleans up via container API.
-	if err := os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true"); err != nil {
-		panic(fmt.Sprintf("TestMain: failed to set TESTCONTAINERS_RYUK_DISABLED: %v", err))
-	}
-	os.Exit(m.Run())
+func init() {
+	// Disable ryuk (reaper) for Podman compatibility
+	// Ryuk has issues connecting to Docker socket inside Podman containers
+	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
 }
 
 // integrationTestPipelineConfig returns a pipeline config for integration tests.

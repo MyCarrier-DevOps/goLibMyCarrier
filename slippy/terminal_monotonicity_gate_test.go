@@ -1,637 +1,653 @@
 package slippy
 
+// terminal_monotonicity_gate_test.go — unit tests for the I5 v2 freshness gate.
+//
+// Tests cover enforceTerminalFreshnessGate, latestComponentStateRow, gateEnabled,
+// freshnessWindow, and validateFreshnessWindowEnv as specified in the I5 v2 plan
+// §Test Plan (ADO #83405) and standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4.
+//
+// All tests are pure-unit (no Docker / ClickHouse required); CH interactions are
+// intercepted via the MockSession / MockRow fixtures from the clickhousetest package.
+
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
-
-	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"time"
 
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse/clickhousetest"
 )
 
-// mockGateRow constructs a MockRow whose Scan populates a single string status.
-// Used to seed the prior status returned by the gate's argMax point-lookup
-// against slip_component_states.
-func mockGateRow(priorStatus string) *clickhousetest.MockRow {
+// gateTestStore builds a ClickHouseStore connected to a MockSession. The pipeline
+// config is testPipelineConfig() so that step/aggregate lookups work correctly.
+func gateTestStore(session *clickhousetest.MockSession) *ClickHouseStore {
+	return NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+}
+
+// gateQueryRowForStatus returns a MockRow that scans (rawStatus, eventTimestamp, age_ms).
+// Use rawStatus="" to simulate no-match (empty aggregate) from ClickHouse.
+// age is the server-computed dateDiff value; pass 0 for tests that do not reach rule 7.
+func gateQueryRowForStatus(rawStatus string, eventTimestamp time.Time, age time.Duration) *clickhousetest.MockRow {
 	return &clickhousetest.MockRow{
 		ScanFunc: func(dest ...any) error {
-			if len(dest) < 1 {
-				return fmt.Errorf("mockGateRow: expected 1 scan dest, got %d", len(dest))
+			if len(dest) < 3 {
+				return fmt.Errorf("expected 3 scan destinations, got %d", len(dest))
 			}
 			if ptr, ok := dest[0].(*string); ok {
-				*ptr = priorStatus
+				*ptr = rawStatus
+			}
+			if ptr, ok := dest[1].(*time.Time); ok {
+				*ptr = eventTimestamp
+			}
+			if ptr, ok := dest[2].(*int64); ok {
+				*ptr = age.Milliseconds()
 			}
 			return nil
 		},
 	}
 }
 
-// gateMockSession returns a MockSession whose QueryRow returns a row reporting
-// priorStatus as the argMax(status) result for the gate's pre-flight query.
-// Setting priorStatus to "" simulates "no prior row" (argMax returns empty).
-func gateMockSession(priorStatus string) *clickhousetest.MockSession {
-	return &clickhousetest.MockSession{
-		QueryRowRow: mockGateRow(priorStatus),
-	}
-}
+// --- gateEnabled / freshnessWindow -------------------------------------------------------
 
-// -----------------------------------------------------------------------------
-// gateEnabled — env-flag rollback contract (Plan v3 §G.1)
-// -----------------------------------------------------------------------------
-
-// TestGateEnabled_DefaultsOn verifies the fail-safe default: when the env var
-// is unset, the gate is ON. This is the production-default rollback contract.
-func TestGateEnabled_DefaultsOn(t *testing.T) {
-	t.Setenv("SLIPPY_I5_GATE_ENABLED", "")
-	// t.Setenv on empty string sets the var to ""; gateEnabled treats empty as default-ON.
+func TestGateEnabled_Default(t *testing.T) {
+	// sentinel+unset ensures auto-restore even if the env var was set before this test.
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
 	if !gateEnabled() {
-		t.Fatal("gateEnabled() must default ON when env is empty")
+		t.Error("expected gate to be ON by default (fail-safe)")
 	}
 }
 
-// TestGateEnabled_FalseEnvDisables verifies the explicit kill-switch path.
-func TestGateEnabled_FalseEnvDisables(t *testing.T) {
-	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
-	if gateEnabled() {
-		t.Fatal("gateEnabled() must return false when SLIPPY_I5_GATE_ENABLED=false")
-	}
-}
-
-// TestGateEnabled_TrueEnvEnables verifies explicit-on round-trips correctly.
-func TestGateEnabled_TrueEnvEnables(t *testing.T) {
+func TestGateEnabled_ExplicitTrue(t *testing.T) {
 	t.Setenv("SLIPPY_I5_GATE_ENABLED", "true")
 	if !gateEnabled() {
-		t.Fatal("gateEnabled() must return true when SLIPPY_I5_GATE_ENABLED=true")
+		t.Error("expected gate enabled when SLIPPY_I5_GATE_ENABLED=true")
 	}
 }
 
-// TestGateEnabled_UnparseableFailsSafe verifies an unparseable value is
-// treated as ON (fail-safe). A typo or accidental garbage value must NOT
-// silently disable the safety gate.
-func TestGateEnabled_UnparseableFailsSafe(t *testing.T) {
-	t.Setenv("SLIPPY_I5_GATE_ENABLED", "garbage")
+func TestGateEnabled_ExplicitFalse(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
+	if gateEnabled() {
+		t.Error("expected gate disabled when SLIPPY_I5_GATE_ENABLED=false")
+	}
+}
+
+func TestGateEnabled_InvalidValue_FailSafeOn(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "notabool")
 	if !gateEnabled() {
-		t.Fatal("gateEnabled() must fail-safe ON for unparseable env value")
+		t.Error("expected gate to be ON (fail-safe) when env value is unparseable")
 	}
 }
 
-// TestEnforceTerminalMonotonicity_GateDisabled_ReturnsNil proves the
-// short-circuit path: when the env-flag disables the gate, enforce returns
-// nil immediately and NEVER issues a CH pre-flight query — even if the prior
-// state would otherwise trip the gate.
-func TestEnforceTerminalMonotonicity_GateDisabled_ReturnsNil(t *testing.T) {
+func TestFreshnessWindow_Default(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default %v, got %v", defaultFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+func TestFreshnessWindow_Custom(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "1500")
+	if got := freshnessWindow(); got != 1500*time.Millisecond {
+		t.Errorf("expected 1500ms, got %v", got)
+	}
+}
+
+func TestFreshnessWindow_Invalid_FallsBackToDefault(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "abc")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default on invalid value, got %v", got)
+	}
+}
+
+func TestFreshnessWindow_Zero_FallsBackToDefault(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "0")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default on zero value, got %v", got)
+	}
+}
+
+// TestFreshnessWindow_Overflow_ClampedNotNegative covers SF-4: a value large
+// enough that ms*time.Millisecond overflows int64 (producing a negative
+// duration and silently killing the gate) must be clamped to
+// maxFreshnessWindowMS instead of passed through raw.
+func TestFreshnessWindow_Overflow_ClampedNotNegative(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "10000000000000")
+	got := freshnessWindow()
+	if got < 0 {
+		t.Fatalf("freshnessWindow must never be negative, got %v", got)
+	}
+	if got != maxFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected clamp to %v (1h cap), got %v", maxFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+// TestFreshnessWindow_HugeButSubInt64_Clamped covers SF-4 for a value that is
+// large but does not itself overflow int64 as a raw integer — the overflow
+// only happens once multiplied by time.Millisecond. This must also clamp.
+func TestFreshnessWindow_HugeButSubInt64_Clamped(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "9999999999")
+	got := freshnessWindow()
+	if got != maxFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected clamp to %v (1h cap), got %v", maxFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+// TestFreshnessWindow_AtoiOverflow_FallsBackToDefault covers a value whose
+// Atoi parse itself overflows int64 (strconv.Atoi returns an error in that
+// case), which must fall back to the read-time default rather than clamp,
+// since the value never successfully parses.
+func TestFreshnessWindow_AtoiOverflow_FallsBackToDefault(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "99999999999999999999")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default on Atoi-overflow value, got %v", got)
+	}
+}
+
+// --- validateFreshnessWindowEnv ------------------------------------------------------------
+
+func TestValidateFreshnessWindowEnv_Unset(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+	if err := validateFreshnessWindowEnv(); err != nil {
+		t.Errorf("expected nil for unset env var, got %v", err)
+	}
+}
+
+func TestValidateFreshnessWindowEnv_Valid750(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "750")
+	if err := validateFreshnessWindowEnv(); err != nil {
+		t.Errorf("expected nil for 750, got %v", err)
+	}
+}
+
+func TestValidateFreshnessWindowEnv_ValidAtCap(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "3600000")
+	if err := validateFreshnessWindowEnv(); err != nil {
+		t.Errorf("expected nil for 3600000 (at cap), got %v", err)
+	}
+}
+
+func TestValidateFreshnessWindowEnv_AboveCap(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "3600001")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for 3600001 (above 1-hour cap)")
+	}
+}
+
+func TestValidateFreshnessWindowEnv_NonInteger(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "abc")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for non-integer value")
+	}
+}
+
+func TestValidateFreshnessWindowEnv_Zero(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "0")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for 0 (misconfiguration; use SLIPPY_I5_GATE_ENABLED=false to disable)")
+	}
+}
+
+func TestValidateFreshnessWindowEnv_Negative(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "-5")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for -5")
+	}
+}
+
+// TestValidateFreshnessWindowEnv_Overflow covers SF-4: a value that parses as
+// a valid (huge) integer but would overflow int64 once multiplied by
+// time.Millisecond in freshnessWindow. Startup validation must reject it
+// (it's already above maxFreshnessWindowMS) so a misconfigured pod fails fast
+// instead of silently running with a dead gate.
+func TestValidateFreshnessWindowEnv_Overflow(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "10000000000000")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for 10000000000000 (would overflow int64 once *time.Millisecond)")
+	}
+}
+
+// TestValidateFreshnessWindowEnv_AtoiOverflow covers a value whose Atoi parse
+// itself overflows int64 (strconv.Atoi errors). Startup validation must
+// reject it via the non-integer error path.
+func TestValidateFreshnessWindowEnv_AtoiOverflow(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "99999999999999999999")
+	if err := validateFreshnessWindowEnv(); err == nil {
+		t.Error("expected error for a value whose Atoi parse overflows int64")
+	}
+}
+
+// --- latestComponentStateRow -------------------------------------------------------------
+
+func TestLatestComponentStateRow_NotFound(t *testing.T) {
+	// CH returns empty aggregate (rawStatus="") → not found.
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus("", time.Time{}, 0),
+	}
+	store := gateTestStore(session)
+
+	_, _, _, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "push_parsed", "")
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if found {
+		t.Error("expected found=false for empty aggregate result")
+	}
+}
+
+func TestLatestComponentStateRow_RowsError(t *testing.T) {
+	// CH scan returns sql.ErrNoRows → not found (not an error to the caller).
+	session := &clickhousetest.MockSession{
+		QueryRowRow: &clickhousetest.MockRow{ScanErr: sql.ErrNoRows},
+	}
+	store := gateTestStore(session)
+
+	_, _, _, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "push_parsed", "")
+	if err != nil {
+		t.Errorf("expected no error on sql.ErrNoRows, got %v", err)
+	}
+	if found {
+		t.Error("expected found=false on sql.ErrNoRows")
+	}
+}
+
+func TestLatestComponentStateRow_CHError(t *testing.T) {
+	chErr := errors.New("clickhouse error")
+	session := &clickhousetest.MockSession{
+		QueryRowRow: &clickhousetest.MockRow{ScanErr: chErr},
+	}
+	store := gateTestStore(session)
+
+	_, _, _, _, err := store.latestComponentStateRow(context.Background(), "corr-1", "build", "api")
+	if !errors.Is(err, chErr) {
+		t.Errorf("expected wrapped chErr, got %v", err)
+	}
+}
+
+func TestLatestComponentStateRow_Found(t *testing.T) {
+	now := time.Now().Truncate(time.Millisecond)
+	const mockAge = 1500 * time.Millisecond // arbitrary; just verifies age is scanned and returned
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), now, mockAge),
+	}
+	store := gateTestStore(session)
+
+	status, ts, age, found, err := store.latestComponentStateRow(context.Background(), "corr-1", "unit_tests", "")
+	if err != nil {
+		t.Errorf("expected no error, got %v", err)
+	}
+	if !found {
+		t.Error("expected found=true")
+	}
+	if status != StepStatusCompleted {
+		t.Errorf("expected completed, got %v", status)
+	}
+	// Timestamps compared to millisecond granularity.
+	if !ts.Equal(now) {
+		t.Errorf("expected ts %v, got %v", now, ts)
+	}
+	// Server-computed age must be propagated correctly.
+	if age != mockAge {
+		t.Errorf("expected age %v, got %v", mockAge, age)
+	}
+	// Verify the query targeted slip_component_states with the correct args.
+	if len(session.QueryRowCalls) != 1 {
+		t.Fatalf("expected 1 QueryRow call, got %d", len(session.QueryRowCalls))
+	}
+	call := session.QueryRowCalls[0]
+	if !strings.Contains(call.Query, TableSlipComponentStates) {
+		t.Errorf("query should target %s, got: %s", TableSlipComponentStates, call.Query)
+	}
+	if !strings.Contains(call.Query, componentEventSortKeyNoImageTag) {
+		t.Errorf("query should use componentEventSortKeyNoImageTag")
+	}
+	if !strings.Contains(call.Query, "dateDiff") {
+		t.Errorf("query should include server-side dateDiff for age_ms")
+	}
+}
+
+// --- enforceTerminalFreshnessGate --------------------------------------------------------
+
+func TestGate_NoPrior_Allows(t *testing.T) {
+	// No prior event (rawStatus="") → allow.
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus("", time.Time{}, 0),
+	}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Errorf("NoPrior_Allows: expected nil, got %v", err)
+	}
+}
+
+func TestGate_PriorNonTerminal_Allows(t *testing.T) {
+	// Prior status is running (non-terminal) → allow incoming running.
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusRunning), time.Now(), 0),
+	}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Errorf("PriorNonTerminal_Allows: expected nil, got %v", err)
+	}
+}
+
+// TestGate_BoundaryTable exercises the new default 750 ms freshness window across
+// the ages called out in the spec (§2 D4, §6.1) plus the artifact-ceiling and
+// legitimate-restart-floor data points from the 90-day replay.
+//
+// NOTE (BC-11, spec §4): spec §6.1's test-plan sketch lists "0 ms → allow", but
+// BC-11 explicitly requires refusing the ~0 ms duplicate-write artifact, and the
+// gate's `age > window` rule refuses age == 0 for any positive window. BC-11 is
+// authoritative; this table documents that resolution via the age=0 → REFUSE case.
+func TestGate_BoundaryTable(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+
+	cases := []struct {
+		name    string
+		ageMs   int64
+		refuses bool
+	}{
+		{"age_0ms_refuses_BC11", 0, true},
+		{"age_113ms_refuses", 113, true},
+		{"age_465ms_artifact_ceiling_refuses", 465, true},
+		{"age_740ms_refuses", 740, true},
+		{"age_760ms_allows", 760, false},
+		{"age_1700ms_legit_floor_allows", 1700, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := &clickhousetest.MockSession{
+				QueryRowRow: gateQueryRowForStatus(
+					string(StepStatusCompleted), time.Now(), time.Duration(tc.ageMs)*time.Millisecond,
+				),
+			}
+			store := gateTestStore(session)
+
+			err := store.enforceTerminalFreshnessGate(
+				context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
+			)
+			if tc.refuses {
+				if !errors.Is(err, ErrTerminalAlreadyExists) {
+					t.Errorf("age=%dms: expected ErrTerminalAlreadyExists, got %v", tc.ageMs, err)
+				}
+			} else if err != nil {
+				t.Errorf("age=%dms: expected nil, got %v", tc.ageMs, err)
+			}
+		})
+	}
+}
+
+func TestGate_AbortedToPending_AlwaysAllow_Within(t *testing.T) {
+	// aborted → pending: cascade-reset exception → allow (rule 6 fires before rule 7; age irrelevant).
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusAborted), time.Now(), 100*time.Millisecond),
+	}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "dev_deploy", "", StepStatusPending,
+	)
+	if err != nil {
+		t.Errorf("AbortedToPending_AlwaysAllow_Within: expected nil, got %v", err)
+	}
+}
+
+func TestGate_AbortedToPending_AlwaysAllow_After(t *testing.T) {
+	// aborted → pending: exception is unconditional; rule 6 fires before rule 7 (age irrelevant).
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusAborted), time.Now(), 10*time.Second),
+	}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "dev_deploy", "", StepStatusPending,
+	)
+	if err != nil {
+		t.Errorf("AbortedToPending_AlwaysAllow_After: expected nil, got %v", err)
+	}
+}
+
+func TestGate_GateDisabled_Allows(t *testing.T) {
+	// Gate disabled via env var → always allow, no CH call.
 	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
 
+	// QueryRowRow intentionally left nil; any CH call would panic.
+	session := &clickhousetest.MockSession{}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Errorf("GateDisabled_Allows: expected nil, got %v", err)
+	}
+	if len(session.QueryRowCalls) != 0 {
+		t.Errorf("GateDisabled_Allows: expected 0 QueryRow calls (gate disabled), got %d",
+			len(session.QueryRowCalls))
+	}
+}
+
+func TestGate_CHError_FailOpen(t *testing.T) {
+	// CH scan returns an unexpected error → gate fails open (WARN + nil).
+	chErr := errors.New("simulated CH error")
 	session := &clickhousetest.MockSession{
-		// If the short-circuit fails, the gate would issue a QueryRow and we'd
-		// fail the test loudly. Configure to t.Fatal on any query.
-		QueryRowFunc: func(_ context.Context, _ string, _ ...any) driver.Row {
-			t.Fatal("gate must NOT issue QueryRow when SLIPPY_I5_GATE_ENABLED=false")
-			return mockGateRow("completed")
-		},
+		QueryRowRow: &clickhousetest.MockRow{ScanErr: chErr},
 	}
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+	store := gateTestStore(session)
 
-	// Even with a hypothetical prior=completed (a refuse cell in normal mode),
-	// the disabled gate must allow the write.
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-gate-disabled", "dev_deploy", "", StepStatusRunning,
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
 	if err != nil {
-		t.Fatalf("disabled gate must return nil; got %v", err)
+		t.Errorf("CHError_FailOpen: expected nil (fail-open), got %v", err)
 	}
 }
 
-// -----------------------------------------------------------------------------
-// isRecoveryAllowed — predicate unit tests
-// -----------------------------------------------------------------------------
+func TestGate_CustomWindow_2000ms_Refuse(t *testing.T) {
+	// Custom 2000 ms window; server-computed age = 1900 ms → refuse.
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "2000")
 
-func TestIsRecoveryAllowed_AbortedToPending_True(t *testing.T) {
-	if !isRecoveryAllowed(StepStatusAborted, StepStatusPending) {
-		t.Fatal("aborted → pending must be allowed (cascade-reset rule 1)")
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 1900*time.Millisecond),
 	}
-}
+	store := gateTestStore(session)
 
-func TestIsRecoveryAllowed_RecoverableToCompleted_True(t *testing.T) {
-	cases := []StepStatus{
-		StepStatusFailed, StepStatusAborted, StepStatusError,
-		StepStatusTimeout, StepStatusSkipped,
-	}
-	for _, prior := range cases {
-		t.Run(string(prior), func(t *testing.T) {
-			if !isRecoveryAllowed(prior, StepStatusCompleted) {
-				t.Errorf("%s → completed must be allowed (recovery rule 2)", prior)
-			}
-		})
-	}
-}
-
-func TestIsRecoveryAllowed_CompletedAsPrior_AnythingRefused(t *testing.T) {
-	for _, incoming := range []StepStatus{
-		StepStatusPending, StepStatusHeld, StepStatusRunning,
-		StepStatusCompleted, StepStatusFailed, StepStatusAborted,
-		StepStatusError, StepStatusTimeout, StepStatusSkipped,
-	} {
-		t.Run(string(incoming), func(t *testing.T) {
-			if isRecoveryAllowed(StepStatusCompleted, incoming) {
-				t.Errorf("completed → %s must NOT be allowed (completed is final)", incoming)
-			}
-		})
-	}
-}
-
-func TestIsRecoveryAllowed_AbortedToNonPendingNonCompleted_Refused(t *testing.T) {
-	// held, running, failed, error, aborted, timeout, skipped all refused.
-	cases := []StepStatus{
-		StepStatusHeld, StepStatusRunning, StepStatusFailed,
-		StepStatusError, StepStatusAborted, StepStatusTimeout, StepStatusSkipped,
-	}
-	for _, incoming := range cases {
-		t.Run(string(incoming), func(t *testing.T) {
-			if isRecoveryAllowed(StepStatusAborted, incoming) {
-				t.Errorf("aborted → %s must NOT be allowed (only pending or completed)", incoming)
-			}
-		})
-	}
-}
-
-// -----------------------------------------------------------------------------
-// enforceTerminalMonotonicity — gate matrix tests
-// -----------------------------------------------------------------------------
-
-// TestEnforceTerminalMonotonicity_NoPriorAllow covers the "empty event log"
-// row of the §D matrix — no prior row exists for the tuple.
-func TestEnforceTerminalMonotonicity_NoPriorAllow(t *testing.T) {
-	session := gateMockSession("") // argMax returns "" → no prior signal
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-
-	for _, incoming := range []StepStatus{
-		StepStatusRunning, StepStatusCompleted, StepStatusFailed, StepStatusPending,
-	} {
-		t.Run(string(incoming), func(t *testing.T) {
-			err := store.enforceTerminalMonotonicity(
-				context.Background(), "corr-no-prior", "dev_deploy", "", incoming,
-			)
-			if err != nil {
-				t.Errorf("expected nil for no-prior gate; got %v", err)
-			}
-		})
-	}
-}
-
-// TestEnforceTerminalMonotonicity_PriorNonTerminal_AllowAnything covers the
-// non-terminal-prior rows of §D.1 (27 cells).
-func TestEnforceTerminalMonotonicity_PriorNonTerminal_AllowAnything(t *testing.T) {
-	priors := []StepStatus{StepStatusPending, StepStatusHeld, StepStatusRunning}
-	incomings := []StepStatus{
-		StepStatusPending, StepStatusHeld, StepStatusRunning,
-		StepStatusCompleted, StepStatusFailed, StepStatusError,
-		StepStatusAborted, StepStatusTimeout, StepStatusSkipped,
-	}
-	for _, prior := range priors {
-		for _, incoming := range incomings {
-			t.Run(fmt.Sprintf("%s_to_%s", prior, incoming), func(t *testing.T) {
-				session := gateMockSession(string(prior))
-				store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-				err := store.enforceTerminalMonotonicity(
-					context.Background(), "corr-nonterm-prior", "dev_deploy", "", incoming,
-				)
-				if err != nil {
-					t.Errorf("prior=%s incoming=%s: expected nil, got %v", prior, incoming, err)
-				}
-			})
-		}
-	}
-}
-
-// TestEnforceTerminalMonotonicity_RecoveryAllow covers the §D.4 recovery
-// allow-list arm of the gate. recoverable → completed, aborted → pending,
-// failed/timeout → running (Argo workflow-step retry).
-func TestEnforceTerminalMonotonicity_RecoveryAllow(t *testing.T) {
-	cases := []struct {
-		prior, incoming StepStatus
-	}{
-		{StepStatusFailed, StepStatusCompleted},
-		{StepStatusAborted, StepStatusCompleted},
-		{StepStatusError, StepStatusCompleted},
-		{StepStatusTimeout, StepStatusCompleted},
-		{StepStatusSkipped, StepStatusCompleted},
-		{StepStatusAborted, StepStatusPending}, // cascade-reset
-		{StepStatusFailed, StepStatusRunning},  // Argo workflow-step retry
-		{StepStatusTimeout, StepStatusRunning}, // Argo workflow-step retry
-	}
-	for _, c := range cases {
-		t.Run(fmt.Sprintf("%s_to_%s", c.prior, c.incoming), func(t *testing.T) {
-			session := gateMockSession(string(c.prior))
-			store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-			err := store.enforceTerminalMonotonicity(
-				context.Background(), "corr-recovery", "dev_deploy", "", c.incoming,
-			)
-			if err != nil {
-				t.Errorf("prior=%s incoming=%s: expected nil (recovery allowed), got %v",
-					c.prior, c.incoming, err)
-			}
-		})
-	}
-}
-
-// TestEnforceTerminalMonotonicity_PriorTerminal_IncomingNonTerminal_Refused covers
-// the §D.2 terminal × non-terminal sub-matrix EXCEPT the explicit allow-list
-// cells: aborted → pending (cascade-reset), failed → running and
-// timeout → running (Argo workflow-step retry). This is the I5 bug-class
-// hotspot — every other cell must refuse with ErrTerminalAlreadyExists.
-func TestEnforceTerminalMonotonicity_PriorTerminal_IncomingNonTerminal_Refused(t *testing.T) {
-	priors := []StepStatus{
-		StepStatusCompleted, StepStatusFailed, StepStatusError,
-		StepStatusAborted, StepStatusTimeout, StepStatusSkipped,
-	}
-	incomings := []StepStatus{StepStatusPending, StepStatusHeld, StepStatusRunning}
-	for _, prior := range priors {
-		for _, incoming := range incomings {
-			// Skip the explicit allow-list cells.
-			if prior == StepStatusAborted && incoming == StepStatusPending {
-				continue // cascade-reset
-			}
-			if (prior == StepStatusFailed || prior == StepStatusTimeout) && incoming == StepStatusRunning {
-				continue // Argo workflow-step retry
-			}
-			t.Run(fmt.Sprintf("%s_to_%s", prior, incoming), func(t *testing.T) {
-				session := gateMockSession(string(prior))
-				store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-				err := store.enforceTerminalMonotonicity(
-					context.Background(), "corr-block", "dev_deploy", "", incoming,
-				)
-				if !errors.Is(err, ErrTerminalAlreadyExists) {
-					t.Errorf("prior=%s incoming=%s: expected ErrTerminalAlreadyExists, got %v",
-						prior, incoming, err)
-				}
-			})
-		}
-	}
-}
-
-// -----------------------------------------------------------------------------
-// Argo workflow-step retry: failed/timeout → running ALLOWED (rule 3)
-// aborted/error/skipped → running REFUSED (intentional narrow allow-list)
-// -----------------------------------------------------------------------------
-
-// TestIsRecoveryAllowed_FailedToRunning_True proves the rule-3 predicate path
-// for the most common Argo workflow-step retry pattern (failed → running).
-// See isRecoveryAllowed godoc for the full Argo retryStrategy rationale.
-func TestIsRecoveryAllowed_FailedToRunning_True(t *testing.T) {
-	if !isRecoveryAllowed(StepStatusFailed, StepStatusRunning) {
-		t.Fatal("failed → running must be allowed (rule 3: Argo workflow-step retry)")
-	}
-}
-
-// TestIsRecoveryAllowed_TimeoutToRunning_True proves the rule-3 predicate path
-// for the CI-typical retry-with-extension pattern (timeout → running).
-func TestIsRecoveryAllowed_TimeoutToRunning_True(t *testing.T) {
-	if !isRecoveryAllowed(StepStatusTimeout, StepStatusRunning) {
-		t.Fatal("timeout → running must be allowed (rule 3: Argo workflow-step retry)")
-	}
-}
-
-// TestIsRecoveryAllowed_AbortedToRunning_False is the I5 §J risk #13
-// regression guard: cascade-aborted steps must NEVER re-enter via the running
-// path directly. They must go through aborted → pending (cascade-reset).
-func TestIsRecoveryAllowed_AbortedToRunning_False(t *testing.T) {
-	if isRecoveryAllowed(StepStatusAborted, StepStatusRunning) {
-		t.Fatal("aborted → running must NOT be allowed (use aborted → pending cascade-reset)")
-	}
-}
-
-// TestIsRecoveryAllowed_ErrorOrSkippedToRunning_False guards the intentional
-// narrow allow-list. 90d production data (queried 2026-06) shows zero
-// terminal → running transitions for error or skipped priors. If such a
-// pattern surfaces, narrow the allow-list at that point.
-func TestIsRecoveryAllowed_ErrorOrSkippedToRunning_False(t *testing.T) {
-	for _, prior := range []StepStatus{StepStatusError, StepStatusSkipped} {
-		t.Run(string(prior), func(t *testing.T) {
-			if isRecoveryAllowed(prior, StepStatusRunning) {
-				t.Errorf("%s → running must NOT be allowed (no production evidence)", prior)
-			}
-		})
-	}
-}
-
-// TestEnforceTerminalMonotonicity_FailedToRunning_Allowed exercises the
-// rule-3 allow-list through the enforcement gate (not just the predicate).
-// This proves the Argo workflow-step retry contract end-to-end at the
-// monotonicity-gate layer.
-func TestEnforceTerminalMonotonicity_FailedToRunning_Allowed(t *testing.T) {
-	session := gateMockSession(string(StepStatusFailed))
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-failed-retry", "dev_deploy", "", StepStatusRunning,
-	)
-	if err != nil {
-		t.Fatalf("failed → running (Argo retry) must be allowed; got %v", err)
-	}
-}
-
-// TestEnforceTerminalMonotonicity_TimeoutToRunning_Allowed exercises the
-// rule-3 allow-list for the timeout-retry path through the enforcement gate.
-func TestEnforceTerminalMonotonicity_TimeoutToRunning_Allowed(t *testing.T) {
-	session := gateMockSession(string(StepStatusTimeout))
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-timeout-retry", "dev_deploy", "", StepStatusRunning,
-	)
-	if err != nil {
-		t.Fatalf("timeout → running (Argo retry) must be allowed; got %v", err)
-	}
-}
-
-// TestEnforceTerminalMonotonicity_AbortedToRunning_Refused is the §J risk #13
-// regression test at the enforcement gate layer. If this ever flips to
-// allowed, the cascade-reset contract has been violated.
-func TestEnforceTerminalMonotonicity_AbortedToRunning_Refused(t *testing.T) {
-	session := gateMockSession(string(StepStatusAborted))
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-aborted-running", "dev_deploy", "", StepStatusRunning,
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
 	if !errors.Is(err, ErrTerminalAlreadyExists) {
-		t.Fatalf("§J risk #13: aborted → running MUST refuse with ErrTerminalAlreadyExists; got %v", err)
+		t.Errorf("CustomWindow_2000ms_Refuse: expected ErrTerminalAlreadyExists, got %v", err)
 	}
 }
 
-// TestEnforceTerminalMonotonicity_ErrorOrSkippedToRunning_Refused exercises
-// the intentional narrow-allow-list refusal at the gate layer. If real
-// workflow patterns surface error/skipped → running transitions, this test
-// is the place to widen the allow-list.
-func TestEnforceTerminalMonotonicity_ErrorOrSkippedToRunning_Refused(t *testing.T) {
-	for _, prior := range []StepStatus{StepStatusError, StepStatusSkipped} {
-		t.Run(string(prior), func(t *testing.T) {
-			session := gateMockSession(string(prior))
-			store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-			err := store.enforceTerminalMonotonicity(
-				context.Background(), "corr-narrow-allow", "dev_deploy", "", StepStatusRunning,
-			)
-			if !errors.Is(err, ErrTerminalAlreadyExists) {
-				t.Fatalf("%s → running must refuse with ErrTerminalAlreadyExists; got %v", prior, err)
-			}
-		})
-	}
-}
+func TestGate_CustomWindow_2000ms_Allow(t *testing.T) {
+	// Custom 2000 ms window; server-computed age = 2100 ms → allow (window expired).
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "2000")
 
-// TestEnforceTerminalMonotonicity_PriorTerminal_IncomingTerminal_Same_Refused
-// covers the §D.3 main-diagonal cells (e.g. failed → failed). At lib level we
-// refuse same-terminal — HTTP layer may convert to 204 idempotent.
-func TestEnforceTerminalMonotonicity_PriorTerminal_IncomingTerminal_Same_Refused(t *testing.T) {
-	terminals := []StepStatus{
-		StepStatusCompleted, StepStatusFailed, StepStatusError,
-		StepStatusAborted, StepStatusTimeout, StepStatusSkipped,
-	}
-	for _, s := range terminals {
-		t.Run(string(s), func(t *testing.T) {
-			session := gateMockSession(string(s))
-			store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-			err := store.enforceTerminalMonotonicity(
-				context.Background(), "corr-same-terminal", "dev_deploy", "", s,
-			)
-			// Same-terminal of {failed, aborted, error, timeout, skipped} → completed
-			// is the recovery case — not same. Only {completed → completed}, {failed → failed},
-			// etc. are same-terminal. recovery rule never fires for same-terminal where
-			// incoming != completed; for {completed→completed} the allow-list refuses (no rule
-			// matches because completed is not in the recoverable set).
-			//
-			// Exception per §D.3: {failed → completed}, {aborted → completed} etc. are recovery
-			// cells, not same-terminal — we filtered to incoming==prior above.
-			if !errors.Is(err, ErrTerminalAlreadyExists) {
-				t.Errorf("prior=%s incoming=%s (same-terminal): expected ErrTerminalAlreadyExists, got %v",
-					s, s, err)
-			}
-		})
-	}
-}
-
-// TestEnforceTerminalMonotonicity_PriorTerminal_IncomingTerminal_DifferentNonRecovery_Refused
-// covers §D.3 off-diagonal cells that are NOT in the recovery allow-list — e.g.
-// completed → failed (must refuse), failed → aborted (cross-terminal label swap).
-func TestEnforceTerminalMonotonicity_PriorTerminal_IncomingTerminal_DifferentNonRecovery_Refused(t *testing.T) {
-	cases := []struct {
-		prior, incoming StepStatus
-	}{
-		// completed → anything-terminal-other-than-completed is refused.
-		{StepStatusCompleted, StepStatusFailed},
-		{StepStatusCompleted, StepStatusAborted},
-		{StepStatusCompleted, StepStatusError},
-		{StepStatusCompleted, StepStatusTimeout},
-		{StepStatusCompleted, StepStatusSkipped},
-		// recoverable → recoverable cross-terminal swaps are refused.
-		{StepStatusFailed, StepStatusAborted},
-		{StepStatusFailed, StepStatusError},
-		{StepStatusFailed, StepStatusTimeout},
-		{StepStatusFailed, StepStatusSkipped},
-		{StepStatusAborted, StepStatusFailed},
-		{StepStatusAborted, StepStatusError},
-		{StepStatusError, StepStatusFailed},
-		{StepStatusError, StepStatusAborted},
-		{StepStatusTimeout, StepStatusFailed},
-		{StepStatusSkipped, StepStatusFailed},
-	}
-	for _, c := range cases {
-		t.Run(fmt.Sprintf("%s_to_%s", c.prior, c.incoming), func(t *testing.T) {
-			session := gateMockSession(string(c.prior))
-			store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-			err := store.enforceTerminalMonotonicity(
-				context.Background(), "corr-cross-terminal", "dev_deploy", "", c.incoming,
-			)
-			if !errors.Is(err, ErrTerminalAlreadyExists) {
-				t.Errorf("prior=%s incoming=%s: expected ErrTerminalAlreadyExists, got %v",
-					c.prior, c.incoming, err)
-			}
-		})
-	}
-}
-
-// TestEnforceTerminalMonotonicity_PushParsedBypass covers §B.15.
-// Seed terminal completed for push_parsed; expect the gate to ALLOW any
-// incoming status (including running) because push_parsed is bypassed by
-// isGateBypassed when componentName == "". The CH pre-flight query MUST NOT
-// be issued at all.
-func TestEnforceTerminalMonotonicity_PushParsedBypass(t *testing.T) {
 	session := &clickhousetest.MockSession{
-		// Configure the row to return "completed" so that IF the bypass were
-		// missing, the gate would refuse the running incoming. With the bypass
-		// in place, QueryRow must not be called at all.
-		QueryRowFunc: func(_ context.Context, _ string, _ ...any) driver.Row {
-			t.Fatal("gate must NOT issue QueryRow for push_parsed (isGateBypassed short-circuit)")
-			return mockGateRow("completed")
-		},
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusFailed), time.Now(), 2100*time.Millisecond),
 	}
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+	store := gateTestStore(session)
 
-	for _, incoming := range []StepStatus{
-		StepStatusRunning, StepStatusPending, StepStatusFailed, StepStatusCompleted,
-	} {
-		t.Run(string(incoming), func(t *testing.T) {
-			err := store.enforceTerminalMonotonicity(
-				context.Background(), "corr-pushparsed", "push_parsed", "", incoming,
-			)
-			if err != nil {
-				t.Errorf("push_parsed bypass: expected nil for any incoming, got %v", err)
-			}
-		})
-	}
-}
-
-// TestEnforceTerminalMonotonicity_PushParsedBypass_ComponentNameGated proves
-// that the bypass for push_parsed only applies when componentName == "".
-// push_parsed has no components today, but defense-in-depth: a component-level
-// write under push_parsed (e.g. future drift in handlePushRetry or any other
-// producer) MUST still go through the gate. Otherwise an attacker or
-// regression could silently overwrite a terminal component-level status by
-// routing the write through the push_parsed step name.
-func TestEnforceTerminalMonotonicity_PushParsedBypass_ComponentNameGated(t *testing.T) {
-	// Seed terminal "completed" so the gate would refuse a running incoming
-	// if it actually runs (i.e. bypass does NOT apply).
-	session := gateMockSession(string(StepStatusCompleted))
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-pushparsed-component", "push_parsed", "ui", StepStatusRunning,
-	)
-	if !errors.Is(err, ErrTerminalAlreadyExists) {
-		t.Fatalf("push_parsed with non-empty componentName must NOT be bypassed; expected ErrTerminalAlreadyExists, got %v", err)
-	}
-}
-
-// TestIsGateBypassed_PushParsed pins the allow-list. Tightening this list is a
-// security-relevant change and the test exists to make the diff visible in review.
-func TestIsGateBypassed_PushParsed(t *testing.T) {
-	if !isGateBypassed("push_parsed") {
-		t.Fatal("push_parsed must be on the gate-bypass allow-list")
-	}
-	for _, step := range []string{"build", "unit_tests", "dev_deploy", "", "PUSH_PARSED"} {
-		t.Run(step, func(t *testing.T) {
-			if isGateBypassed(step) {
-				t.Errorf("step %q must NOT be on the gate-bypass allow-list", step)
-			}
-		})
-	}
-}
-
-// TestEnforceTerminalMonotonicity_CHError_FailsOpen covers the §J error policy.
-// A CH transport error during pre-flight MUST fail-OPEN (return nil) so the
-// gate's CH availability degradation does not break legitimate writes. The
-// per-corr-id lock (slippy-api scope) remains the primary safety net.
-func TestEnforceTerminalMonotonicity_CHError_FailsOpen(t *testing.T) {
-	session := &clickhousetest.MockSession{
-		QueryRowFunc: func(_ context.Context, _ string, _ ...any) driver.Row {
-			// Returning nil triggers the "query returned nil row" branch in
-			// latestComponentStateStatus → fmt.Errorf — gate must catch and
-			// fail-open.
-			return nil
-		},
-	}
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-ch-broken", "dev_deploy", "", StepStatusCompleted,
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusRunning,
 	)
 	if err != nil {
-		t.Errorf("CH error must fail-OPEN; got %v", err)
+		t.Errorf("CustomWindow_2000ms_Allow: expected nil, got %v", err)
 	}
 }
 
-// TestEnforceTerminalMonotonicity_CHScanError_FailsOpen covers a Scan-level
-// CH transport failure (different code path from nil row).
-func TestEnforceTerminalMonotonicity_CHScanError_FailsOpen(t *testing.T) {
+func TestGate_PushParsedBypassed_WithinWindow(t *testing.T) {
+	// push_parsed with component="" is a bypass step → no CH call, always allowed.
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	session := &clickhousetest.MockSession{}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "push_parsed", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Errorf("PushParsedBypassed_WithinWindow: expected nil, got %v", err)
+	}
+	// No CH query should have been issued.
+	if len(session.QueryRowCalls) != 0 {
+		t.Errorf("PushParsedBypassed_WithinWindow: expected 0 QueryRow calls, got %d",
+			len(session.QueryRowCalls))
+	}
+}
+
+func TestGate_TerminalToTerminal_WithinWindow_Allows(t *testing.T) {
+	// SC-3: incoming terminal → always allow, regardless of prior terminal + window.
+	// This test documents that the plan's earlier row "TerminalToTerminal_WithinWindow_Refuses"
+	// is STALE (superseded by SC-3 resolution). The gate must ALLOW.
+	// Rule 3 short-circuits before CH query, so the mock row is never scanned.
 	session := &clickhousetest.MockSession{
-		QueryRowRow: &clickhousetest.MockRow{
-			ScanFunc: func(_ ...any) error {
-				return fmt.Errorf("simulated CH connection reset")
-			},
-		},
+		// Return prior completed (terminal) — will not be reached due to SC-3 short-circuit.
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 100*time.Millisecond),
 	}
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+	store := gateTestStore(session)
 
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-ch-scanerr", "dev_deploy", "", StepStatusCompleted,
+	// Incoming = failed (terminal) — rule 3 fires immediately, no CH call.
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusFailed,
 	)
 	if err != nil {
-		t.Errorf("Scan error must fail-OPEN; got %v", err)
+		t.Errorf("TerminalToTerminal_WithinWindow_Allows: expected nil (SC-3), got %v", err)
+	}
+	// No QueryRow call because rule 3 short-circuits before CH query.
+	if len(session.QueryRowCalls) != 0 {
+		t.Errorf("TerminalToTerminal_WithinWindow_Allows: expected 0 QueryRow calls (SC-3), got %d",
+			len(session.QueryRowCalls))
 	}
 }
 
-// TestEnforceTerminalMonotonicity_CascadeReset_AbortedToPending_Allowed
-// — closes DA-v2 CRIT-V2-1. End-to-end proof that the cascade-reset path
-// (Client.checkPipelineCompletion in executor.go) is NOT blocked by the gate.
-// Without the rule 1 cell in
-// isRecoveryAllowed, this transition would fail and leave aborted steps
-// orphaned on resolved failures.
-func TestEnforceTerminalMonotonicity_CascadeReset_AbortedToPending_Allowed(t *testing.T) {
-	session := gateMockSession(string(StepStatusAborted))
-	store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
+func TestGate_TerminalToTerminal_AfterWindow_Allows(t *testing.T) {
+	// SC-3: incoming terminal → always allow even after the window has expired.
+	// Rule 3 short-circuits; age value not used.
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus(string(StepStatusCompleted), time.Now(), 10*time.Second),
+	}
+	store := gateTestStore(session)
 
-	err := store.enforceTerminalMonotonicity(
-		context.Background(), "corr-cascade-reset", "dev_deploy", "", StepStatusPending,
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusCompleted,
 	)
 	if err != nil {
-		t.Fatalf("cascade-reset aborted → pending must be allowed (CRIT-V2-1 closure); got %v", err)
-	}
-
-	// Cross-check: rule must remain narrow. aborted → running and aborted → held
-	// MUST still be refused (regression guard against accidentally widening the
-	// allow-list — §J risk #13).
-	for _, incoming := range []StepStatus{StepStatusRunning, StepStatusHeld} {
-		t.Run(fmt.Sprintf("regression_guard_aborted_to_%s", incoming), func(t *testing.T) {
-			session := gateMockSession(string(StepStatusAborted))
-			store := NewClickHouseStoreFromSession(session, testPipelineConfig(), "ci")
-			err := store.enforceTerminalMonotonicity(
-				context.Background(), "corr-cascade-reset-narrow", "dev_deploy", "", incoming,
-			)
-			if !errors.Is(err, ErrTerminalAlreadyExists) {
-				t.Errorf("aborted → %s must STILL be refused (rule must remain narrow); got %v",
-					incoming, err)
-			}
-		})
+		t.Errorf("TerminalToTerminal_AfterWindow_Allows: expected nil (SC-3), got %v", err)
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Client wrapper sentinel preservation (§B.14)
-// -----------------------------------------------------------------------------
+// --- Gate call-count assertions (white-box via enforceTerminalFreshnessGate) ------------
 
-// stubStoreReturningErr is a SlipStore stub that returns the given error from
-// UpdateStepWithHistory. Used to verify that NewStepError wrapping does not
-// break errors.Is(err, ErrTerminalAlreadyExists) at the outermost caller.
-type stubStoreReturningErr struct {
-	SlipStore
-	err error
+// TestGate_BypassStep_NoQueryRowCall verifies that push_parsed with component=""
+// short-circuits before any CH query (rule 2).
+func TestGate_BypassStep_NoQueryRowCall(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	session := &clickhousetest.MockSession{}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "push_parsed", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Errorf("expected nil for bypass step, got %v", err)
+	}
+	if len(session.QueryRowCalls) != 0 {
+		t.Errorf("expected 0 QueryRow calls for bypass step, got %d", len(session.QueryRowCalls))
+	}
 }
 
-func (s *stubStoreReturningErr) UpdateStepWithHistory(
-	_ context.Context, _, _, _ string, _ StepStatus, _ StateHistoryEntry,
-) error {
-	return s.err
+// TestGate_TerminalIncoming_NoQueryRowCall verifies rule 3 (SC-3): terminal incoming
+// fires before the CH query, so QueryRow is never called.
+func TestGate_TerminalIncoming_NoQueryRowCall(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	session := &clickhousetest.MockSession{}
+	store := gateTestStore(session)
+
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "unit_tests", "", StepStatusCompleted,
+	)
+	if err != nil {
+		t.Errorf("expected nil for terminal incoming (rule 3), got %v", err)
+	}
+	if len(session.QueryRowCalls) != 0 {
+		t.Errorf("expected 0 QueryRow calls for terminal incoming (SC-3), got %d", len(session.QueryRowCalls))
+	}
 }
 
-// TestClient_StartStep_PreservesErrTerminalAlreadyExistsUnwrap proves that the
-// sentinel survives wrapping through Client.StartStep → UpdateStepWithStatus →
-// NewStepError. Without an Unwrap method on StepError, errors.Is would return
-// false at the caller and the slippy-api 409 mapping would silently break.
-func TestClient_StartStep_PreservesErrTerminalAlreadyExistsUnwrap(t *testing.T) {
-	store := &stubStoreReturningErr{err: ErrTerminalAlreadyExists}
-	client := NewClientWithDependencies(store, nil, Config{Database: "ci"})
+// TestGate_NonTerminalIncoming_IssuedQueryRow verifies that a non-terminal incoming
+// status on a non-bypass step issues exactly one gate CH query.
+func TestGate_NonTerminalIncoming_IssuedQueryRow(t *testing.T) {
+	// Return "no prior" from the gate query → allow.
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	session := &clickhousetest.MockSession{
+		QueryRowRow: gateQueryRowForStatus("", time.Time{}, 0),
+	}
+	store := gateTestStore(session)
 
-	err := client.StartStep(context.Background(), "corr-sentinel-unwrap", "dev_deploy", "")
+	err := store.enforceTerminalFreshnessGate(
+		context.Background(), "corr-1", "dev_deploy", "", StepStatusRunning,
+	)
+	if err != nil {
+		t.Errorf("expected nil (no prior → allow), got %v", err)
+	}
+	if len(session.QueryRowCalls) != 1 {
+		t.Errorf("expected exactly 1 gate QueryRow call, got %d", len(session.QueryRowCalls))
+	}
+	call := session.QueryRowCalls[0]
+	if !strings.Contains(call.Query, TableSlipComponentStates) {
+		t.Errorf("gate query should target %s, got: %s", TableSlipComponentStates, call.Query)
+	}
+}
+
+// --- NewClickHouseStoreFromConfig startup validation --------------------------------------
+
+// TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_TooLarge verifies that
+// constructing the store with an out-of-range SLIPPY_I5_FRESHNESS_WINDOW_MS fails
+// fast at startup, before any ClickHouse connection is attempted.
+func TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_TooLarge(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "9999999999")
+
+	_, err := NewClickHouseStoreFromConfig(nil, ClickHouseStoreOptions{})
 	if err == nil {
-		t.Fatal("expected error, got nil")
+		t.Fatal("expected error for SLIPPY_I5_FRESHNESS_WINDOW_MS=9999999999, got nil")
 	}
-	if !errors.Is(err, ErrTerminalAlreadyExists) {
-		t.Fatalf("errors.Is(err, ErrTerminalAlreadyExists) must hold through StepError wrap; got err=%v", err)
+	if !strings.Contains(err.Error(), "SLIPPY_I5_FRESHNESS_WINDOW_MS") {
+		t.Errorf("expected error to reference SLIPPY_I5_FRESHNESS_WINDOW_MS, got: %v", err)
 	}
+}
 
-	// Also assert that a non-sentinel error does NOT match (negative control).
-	store.err = errors.New("some other failure")
-	err = client.StartStep(context.Background(), "corr-sentinel-unwrap", "dev_deploy", "")
-	if errors.Is(err, ErrTerminalAlreadyExists) {
-		t.Fatal("errors.Is must NOT match an unrelated error")
+// TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_NonInteger verifies that
+// constructing the store with a non-integer SLIPPY_I5_FRESHNESS_WINDOW_MS fails fast.
+func TestNewClickHouseStoreFromConfig_InvalidFreshnessWindow_NonInteger(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "abc")
+
+	_, err := NewClickHouseStoreFromConfig(nil, ClickHouseStoreOptions{})
+	if err == nil {
+		t.Fatal("expected error for SLIPPY_I5_FRESHNESS_WINDOW_MS=abc, got nil")
+	}
+	if !strings.Contains(err.Error(), "SLIPPY_I5_FRESHNESS_WINDOW_MS") {
+		t.Errorf("expected error to reference SLIPPY_I5_FRESHNESS_WINDOW_MS, got: %v", err)
 	}
 }

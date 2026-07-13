@@ -679,9 +679,9 @@ func TestClient_InitializeSlipForPush_MobileApp(t *testing.T) {
 		Description: "Test pipeline config",
 		Steps: []StepConfig{
 			{
-				Name:       "builds",
+				Name:        "builds",
 				Description: "Builds completed",
-				Aggregates: "build", // First step IS an aggregate
+				Aggregates:  "build", // First step IS an aggregate
 			},
 			{Name: "unit_tests", Description: "Unit tests", Prerequisites: []string{"builds"}},
 		},

@@ -76,6 +76,33 @@ type Slip struct {
 	// Uses nanosecond timestamps (time.Now().UnixNano()) to ensure uniqueness across concurrent writers.
 	// This field is managed internally by the store and should not be set manually.
 	Version uint64 `json:"-" ch:"version"`
+
+	// loadedWriteFingerprint is the write-fingerprint (see ClickHouseStore.writeFingerprint)
+	// computed at Load/LoadByCommit/LoadLiveByCommit time. It captures the exact set of
+	// row values that updateWithOverrides would otherwise re-write, letting the dirty-check
+	// write-suppression (D3) detect a no-change write and skip the INSERT.
+	//
+	// Unexported and excluded from JSON/CH marshaling by construction (lowercase field,
+	// no struct tags) — it is a purely in-process cache-validation token, never persisted.
+	// Empty string means "no fingerprint captured" (e.g. a hand-built Slip that was never
+	// Loaded), which disables suppression for that slip — fail-open to writing.
+	//
+	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.
+	loadedWriteFingerprint string
+
+	// loadedStateHistoryLen is len(slip.StateHistory) captured at the same
+	// pre-hydration point as loadedWriteFingerprint (Load/LoadByCommit/
+	// LoadLiveByCommit, immediately after scanSlip). writeFingerprint
+	// deliberately excludes state_history, so D3 suppression cannot detect a
+	// StateHistory-only change on its own. Comparing len(slip.StateHistory)
+	// against this baseline in the suppression branch lets updateWithOverrides
+	// tell "history entry appended since Load, and the D3 write suppressing it
+	// would silently drop that journal entry" apart from "nothing changed" —
+	// escalating the former to a Warn instead of the routine Debug line.
+	//
+	// Unexported and excluded from JSON/CH marshaling by construction (lowercase
+	// field, no struct tags) — purely in-process, never persisted.
+	loadedStateHistoryLen int
 }
 
 // AncestryEntry records metadata about a prior slip in the ancestry chain.

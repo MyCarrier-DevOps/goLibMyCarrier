@@ -59,33 +59,37 @@ var (
 	// This occurs when a slip is not found after multiple retries.
 	ErrMaxRetriesExceeded = errors.New("maximum retry attempts exceeded")
 
-	// ErrTerminalAlreadyExists indicates that an INSERT into slip_component_states
-	// was refused because the (correlation_id, step, component) tuple already has a
-	// terminal status and the proposed transition is not on the recovery allow-list.
+	// ErrTerminalAlreadyExists is returned by the terminal-freshness gate in
+	// UpdateStep / UpdateStepWithHistory when a non-terminal incoming status would
+	// overwrite a freshly-recorded terminal status in slip_component_states.
 	//
-	// This sentinel is returned by the INSERT-time terminal-monotonicity gate that
-	// closes the I5 race (ADO #82468). The gate refuses:
-	//   - terminal → non-terminal (e.g. failed → running) — EXCEPT aborted → pending
-	//     (cascade-reset after upstream failure resolved, see the cascade-reset
-	//     loop in Client.checkPipelineCompletion in executor.go).
-	//   - terminal → same-terminal (e.g. failed → failed) — idempotency must be
-	//     handled at the HTTP layer (typically converted to 204 No Content).
-	//   - terminal → different-terminal (e.g. failed → aborted, completed → failed) —
-	//     cross-terminal label swaps are not legitimate state transitions.
+	// The gate closes the I5 race (ADO #82468 / ADO #83405) by refusing
+	// non-terminal-over-terminal writes that arrive within the freshness window
+	// (default 750 ms, configurable via SLIPPY_I5_FRESHNESS_WINDOW_MS).
 	//
-	// The gate ALLOWS:
-	//   - empty event log (first write) — no monotonicity invariant to violate.
-	//   - prior non-terminal → anything.
-	//   - prior aborted → pending (cascade-reset, see the cascade-reset loop in
-	//     Client.checkPipelineCompletion in executor.go and
-	//     TestCheckPipelineCompletion_resolved_failure_resets_cascade_aborted_steps_to_pending).
-	//   - prior {failed, aborted, error, timeout, skipped} → completed
-	//     (operator/automation recovery, see slippy-api TestCompleteStep_AllowsRecoveryFromFailed).
+	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
 	//
-	// Callers should map this sentinel to HTTP 409 Conflict at the API boundary
-	// (errors.Is(err, slippy.ErrTerminalAlreadyExists)). It propagates through
-	// SlipError / StepError via standard errors.Unwrap so that errors.Is at the
-	// outermost caller continues to work.
+	// The gate REFUSES:
+	//   - non-terminal incoming status when the prior recorded status is terminal
+	//     AND the prior event is younger than the freshness window.
+	//     Exception: aborted → pending is always allowed (cascade-reset path).
+	//
+	// The gate ALLOWS unconditionally (SC-3 / DA-reviewed):
+	//   - terminal incoming status — the race artifact class is exclusively
+	//     non-terminal-over-terminal; terminal→terminal preserves v1 recovery
+	//     semantics (failed → completed, etc.) with no timing probe needed.
+	//   - no prior event for the (correlation_id, step, component) tuple.
+	//   - prior non-terminal status.
+	//   - aborted → pending (cascade-reset exception).
+	//   - events older than the freshness window (genuine re-run / restart).
+	//   - push_parsed with component="" (bypass — push-retry resets terminal
+	//     within window without triggering the gate).
+	//   - gate disabled via SLIPPY_I5_GATE_ENABLED=false.
+	//
+	// Callers should map this sentinel to HTTP 409 Conflict at the API boundary:
+	//   errors.Is(err, slippy.ErrTerminalAlreadyExists)
+	// It propagates through SlipError / StepError via errors.Unwrap so that
+	// errors.Is continues to work at the outermost caller.
 	ErrTerminalAlreadyExists = errors.New("terminal status already recorded for step")
 )
 

@@ -86,24 +86,19 @@ type MockStore struct {
 	CommitIndex map[string]string
 
 	// Call tracking
-	CreateCalls                     []CreateCall
-	LoadCalls                       []string
-	LoadByCommitCalls               []LoadByCommitCall
-	LoadLiveByCommitCalls           []LoadByCommitCall
-	FindByCommitsCalls              []FindByCommitsCall
-	FindAllByCommitsCalls           []FindAllByCommitsCall
-	UpdateCalls                     []UpdateCall
-	UpdateStepCalls                 []UpdateStepCall
-	UpdateComponentCalls            []UpdateComponentCall
-	AppendHistoryCalls              []AppendHistoryCall
-	SetImageTagCalls                []SetImageTagCall
-	UpdateSlipStatusCalls           []UpdateSlipStatusCall
-	LatestStepStatusFromEventsCalls []LatestStepStatusFromEventsCall
-	CloseCalls                      int
-
-	// LatestStepStatusFromEventsFn lets tests inject a custom response per (corrID, step).
-	// When nil, the default response is ("", false, nil) — no event yet, do not block overlay.
-	LatestStepStatusFromEventsFn func(ctx context.Context, correlationID, step string) (StepStatus, bool, error)
+	CreateCalls           []CreateCall
+	LoadCalls             []string
+	LoadByCommitCalls     []LoadByCommitCall
+	LoadLiveByCommitCalls []LoadByCommitCall
+	FindByCommitsCalls    []FindByCommitsCall
+	FindAllByCommitsCalls []FindAllByCommitsCall
+	UpdateCalls           []UpdateCall
+	UpdateStepCalls       []UpdateStepCall
+	UpdateComponentCalls  []UpdateComponentCall
+	AppendHistoryCalls    []AppendHistoryCall
+	SetImageTagCalls      []SetImageTagCall
+	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	CloseCalls            int
 
 	// Ping tracking and error injection
 	PingCalls int
@@ -157,14 +152,7 @@ type FindAllByCommitsCall struct {
 
 // UpdateCall records an Update call.
 type UpdateCall struct {
-	Slip      *Slip
-	Overrides []StepStatusOverride
-}
-
-// LatestStepStatusFromEventsCall records a LatestStepStatusFromEvents call.
-type LatestStepStatusFromEventsCall struct {
-	CorrelationID string
-	Step          string
+	Slip *Slip
 }
 
 // UpdateStepCall records an UpdateStep call.
@@ -393,23 +381,12 @@ func (m *MockStore) FindAllByCommits(
 	return results, nil
 }
 
-// Update persists changes to an existing slip. The optional overrides argument
-// is recorded on the UpdateCall but not applied to the in-memory slip — the
-// mock validates the WIRING contract (caller passed the right overrides),
-// not the SQL-side override semantics (only the real ClickHouseStore does that).
-// Tests that need to assert override-aware behavior should use the integration
-// test suite with a real ClickHouse container.
-func (m *MockStore) Update(ctx context.Context, slip *Slip, overrides ...StepStatusOverride) error {
+// Update persists changes to an existing slip.
+func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Snapshot overrides to break aliasing with the caller's slice.
-	var snapshot []StepStatusOverride
-	if len(overrides) > 0 {
-		snapshot = make([]StepStatusOverride, len(overrides))
-		copy(snapshot, overrides)
-	}
-	m.UpdateCalls = append(m.UpdateCalls, UpdateCall{Slip: slip, Overrides: snapshot})
+	m.UpdateCalls = append(m.UpdateCalls, UpdateCall{Slip: slip})
 
 	if m.UpdateError != nil {
 		return m.UpdateError
@@ -421,24 +398,6 @@ func (m *MockStore) Update(ctx context.Context, slip *Slip, overrides ...StepSta
 
 	m.Slips[slip.CorrelationID] = deepCopySlip(slip)
 	return nil
-}
-
-// LatestStepStatusFromEvents returns the configured response (via
-// LatestStepStatusFromEventsFn) or the default ("", false, nil) when no
-// function is configured. The call is recorded for assertion in tests.
-func (m *MockStore) LatestStepStatusFromEvents(
-	ctx context.Context, correlationID, step string,
-) (StepStatus, bool, error) {
-	m.mu.Lock()
-	m.LatestStepStatusFromEventsCalls = append(m.LatestStepStatusFromEventsCalls,
-		LatestStepStatusFromEventsCall{CorrelationID: correlationID, Step: step})
-	fn := m.LatestStepStatusFromEventsFn
-	m.mu.Unlock()
-
-	if fn != nil {
-		return fn(ctx, correlationID, step)
-	}
-	return "", false, nil
 }
 
 // UpdateStep updates a specific step's status.

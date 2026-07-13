@@ -245,7 +245,7 @@ type slipStatusOverrideWriter interface {
 		ctx context.Context,
 		correlationID string,
 		status SlipStatus,
-		overrides ...StepStatusOverride,
+		overrides ...stepStatusOverride,
 	) error
 }
 
@@ -258,7 +258,7 @@ func (c *Client) updateSlipStatusWithStepOverrides(
 	ctx context.Context,
 	correlationID string,
 	status SlipStatus,
-	overrides ...StepStatusOverride,
+	overrides ...stepStatusOverride,
 ) error {
 	if w, ok := c.store.(slipStatusOverrideWriter); ok && len(overrides) > 0 {
 		if err := w.updateSlipStatusWithOverrides(ctx, correlationID, status, overrides...); err != nil {
@@ -407,23 +407,23 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 	return false, slip.Status, nil
 }
 
-// buildStepOverridesFromSlip constructs a slice of StepStatusOverride from the named steps
+// buildStepOverridesFromSlip constructs a slice of stepStatusOverride from the named steps
 // in the slip, looking up each step's column name from the client's query builder if available.
 // Steps not found in slip.Steps are silently skipped.
-func buildStepOverridesFromSlip(slip *Slip, stepNames []string) []StepStatusOverride {
+func buildStepOverridesFromSlip(slip *Slip, stepNames []string) []stepStatusOverride {
 	if len(stepNames) == 0 {
 		return nil
 	}
-	overrides := make([]StepStatusOverride, 0, len(stepNames))
+	overrides := make([]stepStatusOverride, 0, len(stepNames))
 	for _, name := range stepNames {
 		step, ok := slip.Steps[name]
 		if !ok {
 			continue
 		}
 		// Column name convention: <step_name>_status (matches QueryBuilder.StepStatusColumn).
-		overrides = append(overrides, StepStatusOverride{
-			ColumnName: name + "_status",
-			Status:     step.Status,
+		overrides = append(overrides, stepStatusOverride{
+			columnName: name + "_status",
+			status:     step.Status,
 		})
 	}
 	return overrides
