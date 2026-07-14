@@ -3306,10 +3306,15 @@ func TestClickHouseStore_UpdateStepWithHistory_PurePipelineStep(t *testing.T) {
 
 	// Expect: 1 ExecWithArgs for slip_component_states (insertComponentState)
 	// + 1 ExecWithArgs for the UNION ALL history update (insertAtomicHistoryUpdate).
+	//
+	// Note: the routing_slips history-update statement's CLONE_DERIVED CTE also *references*
+	// TableSlipComponentStates as its source table (argMax derive), so a bare substring check
+	// on TableSlipComponentStates would double-count it. Require the absence of "routing_slips"
+	// to identify the true insertComponentState INSERT (which never targets routing_slips).
 	componentStateInserts := 0
 	historyInserts := 0
 	for _, call := range mockSession.ExecWithArgsCalls {
-		if strings.Contains(call.Stmt, TableSlipComponentStates) {
+		if strings.Contains(call.Stmt, TableSlipComponentStates) && !strings.Contains(call.Stmt, "routing_slips") {
 			componentStateInserts++
 		}
 		if strings.Contains(call.Stmt, "INSERT INTO") && strings.Contains(call.Stmt, "routing_slips") {
@@ -3386,31 +3391,36 @@ func TestClickHouseStore_UpdateStepWithHistory_PurePipelineStep_StatusOverrideIn
 	// Args order for insertAtomicHistoryUpdate with 1 override (push_parsed_status):
 	//   [0] correlationID          (cancel WHERE)
 	//   [1] newVersion (uint64)    (cancel WHERE)
-	//   [2] newStateHistoryJSON    (new-row CAST(? AS JSON) literal)
-	//   [3] newVersion (uint64)    (new-row version literal)
-	//   [4] "completed"            (push_parsed_status override value)  ← THE FIX
-	//   [5] correlationID          (new-row WHERE)
-	const wantArgCount = 6
+	//   [2] correlationID          (CLONE_DERIVED CTE WHERE — dev_deploy is pure/unoverridden,
+	//                               so the derive CTE is always present in this pipeline config)
+	//   [3] newStateHistoryJSON    (new-row CAST(? AS JSON) literal)
+	//   [4] newVersion (uint64)    (new-row version literal)
+	//   [5] "completed"            (push_parsed_status override value)  ← THE FIX
+	//   [6] correlationID          (new-row WHERE)
+	const wantArgCount = 7
 	if len(historyArgs) != wantArgCount {
-		t.Fatalf("expected %d ExecWithArgs args (5 base + 1 step override), got %d: %v",
+		t.Fatalf("expected %d ExecWithArgs args (6 base + 1 step override), got %d: %v",
 			wantArgCount, len(historyArgs), historyArgs)
 	}
-	overrideArg, ok := historyArgs[4].(string)
+	overrideArg, ok := historyArgs[5].(string)
 	if !ok {
-		t.Fatalf("expected args[4] (step status override) to be string, got %T: %v",
-			historyArgs[4], historyArgs[4])
+		t.Fatalf("expected args[5] (step status override) to be string, got %T: %v",
+			historyArgs[5], historyArgs[5])
 	}
 	if overrideArg != string(StepStatusCompleted) {
-		t.Errorf("expected args[4] (step status override) = %q, got %q",
+		t.Errorf("expected args[5] (step status override) = %q, got %q",
 			string(StepStatusCompleted), overrideArg)
 	}
 }
 
 // TestClickHouseStore_AppendHistory_NoStatusColumnOverride verifies the contrasting case:
-// AppendHistory (public, no overrides) must NOT inject extra step-status args and must
-// NOT replace the step-status column reference with ? — the verbatim DB column value is
-// copied as-is. This ensures the override mechanism is scoped exclusively to
-// UpdateStepWithHistory's pure-pipeline-step path and does not affect other callers.
+// AppendHistory (public, no overrides) must NOT inject a step-status override literal ("?")
+// for push_parsed_status — no stepStatusOverride was supplied, so tier 1 (override) never
+// applies. Instead, push_parsed is a pure pipeline step, so tier 2/3 (CLONE_DERIVED argMax
+// precedence, coalescing to the verbatim cloned column when no event exists) kicks in. This
+// ensures the override mechanism itself is scoped exclusively to UpdateStepWithHistory's
+// pure-pipeline-step path and does not spuriously fire for other callers, while still getting
+// the CLONE_DERIVED staleness protection.
 func TestClickHouseStore_AppendHistory_NoStatusColumnOverride(t *testing.T) {
 	const corrID = "corr-appendhistory-no-override"
 	mockSession := createMockSessionForUpdates(corrID, "myorg/myrepo", "main", "abc123", SlipStatusInProgress, 1)
@@ -3434,22 +3444,25 @@ func TestClickHouseStore_AppendHistory_NoStatusColumnOverride(t *testing.T) {
 	}
 	call := mockSession.ExecWithArgsCalls[0]
 
-	// Without overrides, exactly 5 base args:
-	//   [0] correlationID, [1] newVersion, [2] newStateHistoryJSON, [3] newVersion, [4] correlationID.
-	// No extra step-status arg injected.
-	const wantArgCount = 5
+	// Without overrides, exactly 6 base args (testPipelineConfig has pure steps push_parsed
+	// and dev_deploy with no override, so the CLONE_DERIVED CTE is always present):
+	//   [0] correlationID, [1] newVersion, [2] correlationID (CTE WHERE),
+	//   [3] newStateHistoryJSON, [4] newVersion, [5] correlationID.
+	// No extra step-status override arg injected (no stepStatusOverride supplied).
+	const wantArgCount = 6
 	if len(call.Args) != wantArgCount {
 		t.Errorf("expected %d ExecWithArgs args (no override), got %d: %v",
 			wantArgCount, len(call.Args), call.Args)
 	}
 
-	// push_parsed_status must appear 3 times verbatim (INSERT column list + cancel SELECT +
-	// new-row SELECT), confirming the column is copied from DB and not replaced with ?.
+	// push_parsed_status must appear 3 times: INSERT column list + cancel SELECT (verbatim) +
+	// new-row SELECT (embedded once more as the coalesce(...) fallback inside the
+	// CLONE_DERIVED expression — not replaced by "?", confirming no override fired).
 	const colName = "push_parsed_status"
 	occurrences := strings.Count(call.Stmt, colName)
 	if occurrences != 3 {
 		t.Errorf(
-			"expected %q to appear 3 times in routing_slips INSERT (column list + cancel + new-row SELECT), got %d.\nQuery: %s",
+			"expected %q to appear 3 times in routing_slips INSERT (column list + cancel + new-row derive fallback), got %d.\nQuery: %s",
 			colName,
 			occurrences,
 			call.Stmt,
@@ -4516,10 +4529,12 @@ func TestClickHouseStore_AppendHistory_ConflictRetry(t *testing.T) {
 				mu.Lock()
 				execCallCount++
 				// Capture the version argument (state_history param + version param).
-				// In insertAtomicHistoryUpdate, args layout:
-				// [0]=correlationID, [1]=newVersion (cancel WHERE), [2]=newHistoryJSON, [3]=newVersion, [4]=correlationID
-				if len(args) >= 4 {
-					if v, ok := args[3].(uint64); ok {
+				// In insertAtomicHistoryUpdate, args layout (testPipelineConfig always has an
+				// unoverridden pure step, so the CLONE_DERIVED CTE is always present):
+				// [0]=correlationID, [1]=newVersion (cancel WHERE), [2]=correlationID (CTE WHERE),
+				// [3]=newHistoryJSON, [4]=newVersion, [5]=correlationID (final WHERE)
+				if len(args) >= 5 {
+					if v, ok := args[4].(uint64); ok {
 						lastInsertedVersion = v
 					}
 				}
@@ -5116,9 +5131,11 @@ func TestClickHouseStore_UpdateSlipStatus(t *testing.T) {
 				}
 			},
 			ExecWithArgsFunc: func(ctx context.Context, query string, args ...any) error {
-				// args order: correlationID, newVersion(cancel), status, newVersion(new row), correlationID
-				if len(args) >= 4 {
-					if v, ok := args[3].(uint64); ok {
+				// args order (testPipelineConfig always has an unoverridden pure step, so the
+				// CLONE_DERIVED CTE is always present): correlationID(cancel), newVersion(cancel),
+				// correlationID(CTE WHERE), status, newVersion(new row), correlationID(final WHERE).
+				if len(args) >= 5 {
+					if v, ok := args[4].(uint64); ok {
 						mu.Lock()
 						capturedNewVersion = v
 						mu.Unlock()
@@ -6303,10 +6320,12 @@ func TestUpdateStepWithHistory_WritebackErrorAfterEventInsert(t *testing.T) {
 			t.Errorf("expected nil when pure-pipeline writeback errors after durable event insert; got: %v", err)
 		}
 
-		// Confirm the event-log insert still executed.
+		// Confirm the event-log insert still executed. Exclude routing_slips writes: the
+		// CLONE_DERIVED CTE in insertAtomicHistoryUpdate also references TableSlipComponentStates
+		// as its argMax-derive source table, so a bare substring match would double-count it.
 		componentInserts := 0
 		for _, call := range base.ExecWithArgsCalls {
-			if strings.Contains(call.Stmt, TableSlipComponentStates) {
+			if strings.Contains(call.Stmt, TableSlipComponentStates) && !strings.Contains(call.Stmt, "routing_slips") {
 				componentInserts++
 			}
 		}
@@ -6418,7 +6437,10 @@ func TestR2_ResolveEffectiveStepStatuses_AggregateStep_InMemTerminal_DerivedNonT
 
 	// inMemory terminal + derived non-terminal → in-memory wins.
 	if effective["builds"] != StepStatusCompleted {
-		t.Errorf("monotonic merge (inMem-terminal/derived-non): expected completed (in-memory), got %v", effective["builds"])
+		t.Errorf(
+			"monotonic merge (inMem-terminal/derived-non): expected completed (in-memory), got %v",
+			effective["builds"],
+		)
 	}
 	// pure pipeline step follows normal tier 2.
 	if effective["push_parsed"] != StepStatusCompleted {
@@ -6444,7 +6466,10 @@ func TestR2_ResolveEffectiveStepStatuses_AggregateStep_DerivedTerminal_InMemNonT
 
 	// derived terminal + inMemory non-terminal → derived wins.
 	if effective["builds"] != StepStatusCompleted {
-		t.Errorf("monotonic merge (derived-terminal/inMem-non): expected completed (derived), got %v", effective["builds"])
+		t.Errorf(
+			"monotonic merge (derived-terminal/inMem-non): expected completed (derived), got %v",
+			effective["builds"],
+		)
 	}
 }
 
@@ -6466,7 +6491,10 @@ func TestR2_ResolveEffectiveStepStatuses_AggregateStep_BothTerminal_InMemWins(t 
 
 	// both terminal → in-memory rollup wins (rollup authoritative; stale pipeline clobber prevented).
 	if effective["builds"] != StepStatusFailed {
-		t.Errorf("rollup-authoritative (both-terminal): expected failed (in-memory rollup), got %v", effective["builds"])
+		t.Errorf(
+			"rollup-authoritative (both-terminal): expected failed (in-memory rollup), got %v",
+			effective["builds"],
+		)
 	}
 }
 
@@ -6489,7 +6517,10 @@ func TestR2_ResolveEffectiveStepStatuses_AggregateStep_DADeltaClobber(t *testing
 
 	// Rollup is authoritative: in-memory failed must survive.
 	if effective["builds"] != StepStatusFailed {
-		t.Errorf("DA delta clobber guard: expected failed (in-memory rollup), got %v (stale pipeline event must not win)", effective["builds"])
+		t.Errorf(
+			"DA delta clobber guard: expected failed (in-memory rollup), got %v (stale pipeline event must not win)",
+			effective["builds"],
+		)
 	}
 }
 

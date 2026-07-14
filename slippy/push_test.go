@@ -224,6 +224,25 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if !foundUpdateStep {
 			t.Error("expected push_parsed to be reset to running")
 		}
+
+		// bd mycarrier-5dv5 (F1): handlePushRetry must reset push_parsed and append the
+		// state_history entry via a single atomic UpdateStepWithHistory call, not two
+		// separate UpdateStep + AppendHistory calls. Two separate calls would let
+		// AppendHistory's CLONE_DERIVED derive CTE race the just-written push_parsed
+		// event under ClickHouse async-insert visibility lag, falling back to a stale
+		// clone of push_parsed_status instead of the explicit stepStatusOverride that
+		// UpdateStepWithHistory's pure-step branch passes to appendHistoryWithOverrides.
+		if store.UpdateStepWithHistoryCallCount != 1 {
+			t.Errorf("expected exactly 1 atomic UpdateStepWithHistory call for the push_parsed "+
+				"retry reset (override must be passed atomically, not via separate "+
+				"UpdateStep+AppendHistory calls), got %d", store.UpdateStepWithHistoryCallCount)
+		}
+		if len(store.UpdateStepCalls) != 1 {
+			t.Errorf("expected exactly 1 UpdateStepCalls entry, got %d", len(store.UpdateStepCalls))
+		}
+		if len(store.AppendHistoryCalls) != 1 {
+			t.Errorf("expected exactly 1 AppendHistoryCalls entry, got %d", len(store.AppendHistoryCalls))
+		}
 	})
 
 	t.Run("failed existing slip - supersedes and creates fresh", func(t *testing.T) {

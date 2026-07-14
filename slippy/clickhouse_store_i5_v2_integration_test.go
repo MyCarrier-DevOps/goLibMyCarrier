@@ -331,12 +331,12 @@ func TestI5_V2_436cc68c_Repro(t *testing.T) {
 // stale non-terminal derived value).
 //
 // Setup:
-//   1. pipeline-level builds_completed=running → slip_component_states component='' running
-//   2. component builds_completed/api=completed → rollup completed → routing_slips updated
+//  1. pipeline-level builds_completed=running → slip_component_states component=” running
+//  2. component builds_completed/api=completed → rollup completed → routing_slips updated
 //
 // At this point routing_slips has builds_completed=completed, while slip_component_states
-// (component='') still has the older running event. The next write-back's R2 derive
-// returns running for builds_completed (argMax of component='' events). The monotonic merge
+// (component=”) still has the older running event. The next write-back's R2 derive
+// returns running for builds_completed (argMax of component=” events). The monotonic merge
 // must choose in-memory completed (terminal) over derived running (non-terminal).
 func TestI5V2_R2_SC1_Adversarial(t *testing.T) {
 	ctx := context.Background()
@@ -368,8 +368,10 @@ func TestI5V2_R2_SC1_Adversarial(t *testing.T) {
 		t.Fatalf("failed to load: %v", err)
 	}
 	if loaded.Steps["builds_completed"].Status != StepStatusCompleted {
-		t.Errorf("SC-1 adversarial: builds_completed=%v; expected completed — in-memory terminal must win over stale derived running",
-			loaded.Steps["builds_completed"].Status)
+		t.Errorf(
+			"SC-1 adversarial: builds_completed=%v; expected completed — in-memory terminal must win over stale derived running",
+			loaded.Steps["builds_completed"].Status,
+		)
 	}
 }
 
@@ -538,8 +540,12 @@ func TestI5V2_Suppression_CollapseIdenticalWritebacks(t *testing.T) {
 	afterNoOps := i5V2CountSign1Rows(ctx, t, store, corrID)
 	t.Logf("sign=1 row count after %d no-op Load->Update cycles: %d", numCycles, afterNoOps)
 	if afterNoOps != baseline {
-		t.Errorf("suppression collapse: expected sign=1 row count to stay at %d after %d no-op cycles, got %d (D3 dirty-check failed to suppress)",
-			baseline, numCycles, afterNoOps)
+		t.Errorf(
+			"suppression collapse: expected sign=1 row count to stay at %d after %d no-op cycles, got %d (D3 dirty-check failed to suppress)",
+			baseline,
+			numCycles,
+			afterNoOps,
+		)
 	}
 
 	// Now make a real change through the normal API (a genuine component status
@@ -589,7 +595,10 @@ func TestI5V2_Suppression_CollapseIdenticalWritebacks(t *testing.T) {
 		t.Fatalf("failed to load slip after real change: %v", err)
 	}
 	if loaded.Steps["builds_completed"].Status != StepStatusCompleted {
-		t.Errorf("expected builds_completed=completed after real change, got %v", loaded.Steps["builds_completed"].Status)
+		t.Errorf(
+			"expected builds_completed=completed after real change, got %v",
+			loaded.Steps["builds_completed"].Status,
+		)
 	}
 }
 
@@ -657,7 +666,11 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 		StepStatusRunning,
 	}
 	if len(cyclePattern) != eventsPerComponent {
-		t.Fatalf("test setup error: cyclePattern length %d != eventsPerComponent %d", len(cyclePattern), eventsPerComponent)
+		t.Fatalf(
+			"test setup error: cyclePattern length %d != eventsPerComponent %d",
+			len(cyclePattern),
+			eventsPerComponent,
+		)
 	}
 
 	type event struct {
@@ -737,7 +750,10 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 	case <-done:
 		// storm settled within the test's own bounded context.
 	case <-ctx.Done():
-		t.Fatalf("storm-replay: context deadline exceeded before all workers finished (possible deadlock/hang): %v", ctx.Err())
+		t.Fatalf(
+			"storm-replay: context deadline exceeded before all workers finished (possible deadlock/hang): %v",
+			ctx.Err(),
+		)
 	}
 
 	if otherErrCount > 0 {
@@ -807,8 +823,11 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 	}
 	scsRow.Close()
 
-	t.Logf("storm-replay: routing_slips.builds_completed_status=%s (argMax over slip_component_states=%s across all components; last-writer-wins, not necessarily equal to a single component's status)",
-		rsStatus, scsStatus)
+	t.Logf(
+		"storm-replay: routing_slips.builds_completed_status=%s (argMax over slip_component_states=%s across all components; last-writer-wins, not necessarily equal to a single component's status)",
+		rsStatus,
+		scsStatus,
+	)
 
 	// The routing_slips column must be a status that R2 could plausibly derive from
 	// the component event stream: it must be non-empty and a recognized StepStatus.
@@ -869,7 +888,10 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 	// means the aggregate is still "running" (in progress); else "pending".
 	expectedRollup := store.computeAggregateStatus(perComponentStates)
 
-	t.Logf("storm-replay: event-log-derived expected rollup (per-component argMax + computeAggregateStatus precedence) = %s", expectedRollup)
+	t.Logf(
+		"storm-replay: event-log-derived expected rollup (per-component argMax + computeAggregateStatus precedence) = %s",
+		expectedRollup,
+	)
 
 	if rsStatus != string(expectedRollup) {
 		t.Errorf("storm-replay: routing_slips.builds_completed_status = %q, expected %q "+

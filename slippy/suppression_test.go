@@ -74,6 +74,18 @@ func (l *capturingLogger) callsWithField(key string) []capturedLogCall {
 	return out
 }
 
+// callsWithLevel returns the subset of captured calls at the given log level
+// (e.g. "warn", "info", "error").
+func (l *capturingLogger) callsWithLevel(level string) []capturedLogCall {
+	var out []capturedLogCall
+	for _, c := range l.calls {
+		if c.level == level {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // --- D3 dirty-check write-suppression tests ---
 //
 // Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.

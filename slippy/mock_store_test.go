@@ -100,6 +100,14 @@ type MockStore struct {
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
 	CloseCalls            int
 
+	// UpdateStepWithHistoryCallCount counts calls to the atomic UpdateStepWithHistory
+	// method specifically, separate from UpdateStepCalls/AppendHistoryCalls (which
+	// UpdateStepWithHistory also appends to, alongside the standalone UpdateStep/
+	// AppendHistory methods). This lets tests distinguish "one atomic call" from "two
+	// separate calls that happen to add up to the same UpdateStepCalls/AppendHistoryCalls
+	// counts" — see handlePushRetry's push_parsed reset (bd mycarrier-5dv5 F1).
+	UpdateStepWithHistoryCallCount int
+
 	// Ping tracking and error injection
 	PingCalls int
 	PingError error
@@ -541,6 +549,8 @@ func (m *MockStore) UpdateStepWithHistory(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.UpdateStepWithHistoryCallCount++
+
 	// Track both calls
 	m.UpdateStepCalls = append(m.UpdateStepCalls, UpdateStepCall{
 		CorrelationID: correlationID,
@@ -557,6 +567,17 @@ func (m *MockStore) UpdateStepWithHistory(
 		return m.UpdateStepError
 	}
 	if err, ok := m.UpdateStepErrorFor[correlationID]; ok {
+		return err
+	}
+	// UpdateStepWithHistory is the atomic combination of a step-status write and a
+	// state_history append, so it must also honor AppendHistoryError/AppendHistoryErrorFor
+	// the same way the standalone AppendHistory does — callers (e.g. handlePushRetry) that
+	// switched from separate UpdateStep+AppendHistory calls to this single atomic call
+	// still need to be able to simulate a history-append failure in tests.
+	if m.AppendHistoryError != nil {
+		return m.AppendHistoryError
+	}
+	if err, ok := m.AppendHistoryErrorFor[correlationID]; ok {
 		return err
 	}
 

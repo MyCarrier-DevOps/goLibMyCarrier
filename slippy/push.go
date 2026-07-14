@@ -719,14 +719,22 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 		Message:   "retry detected, resetting push_parsed",
 	}
 
-	if err := c.store.UpdateStep(ctx, slip.CorrelationID, "push_parsed", "", StepStatusRunning); err != nil {
-		return nil, fmt.Errorf("failed to reset push_parsed: %w", err)
-	}
-
-	if err := c.store.AppendHistory(ctx, slip.CorrelationID, entry); err != nil {
-		// Return the error - audit trail is important
-		return nil, fmt.Errorf("%w: retry push_parsed reset succeeded but history append failed: %s",
-			ErrHistoryAppendFailed, err.Error())
+	// Use UpdateStepWithHistory (not separate UpdateStep + AppendHistory calls) so the
+	// push_parsed status write and the history append happen atomically with the same
+	// caller-supplied stepStatusOverride that UpdateStepWithHistory's pure-step branch
+	// (see appendHistoryWithOverrides call in clickhouse_store.go) already uses to pin
+	// push_parsed_status = running. Two separate calls would let AppendHistory's derive
+	// CTE race the insertComponentState write UpdateStep just performed under ClickHouse
+	// async-insert visibility lag, falling back to a stale clone of push_parsed_status.
+	if err := c.store.UpdateStepWithHistory(
+		ctx,
+		slip.CorrelationID,
+		"push_parsed",
+		"",
+		StepStatusRunning,
+		entry,
+	); err != nil {
+		return nil, fmt.Errorf("%w: retry push_parsed reset failed: %s", ErrHistoryAppendFailed, err.Error())
 	}
 
 	// Reload to get updated slip
