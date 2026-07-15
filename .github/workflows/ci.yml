@@ -76,6 +76,36 @@ jobs:
           threshold-total: 75
           source-dir: ./${{ matrix.module }}
 
+  # Merge-gated deterministic regression suite for the CLONE_DERIVED stale-clone fix
+  # (bd mycarrier-5dv5). Scope is intentionally narrow: only the deterministic
+  # TestStaleCloneDerive_* cases in slippy/clickhouse_store_stale_clone_regression_integration_test.go
+  # run here. The broader integration suite (clickhouse_store_i5_v2_integration_test.go and other
+  # storm/race-style tests) has known pre-existing flakes tracked separately (bd mycarrier-m1uz) and
+  # is NOT run in this job — do not widen the -run filter without addressing that flakiness first.
+  #
+  # Runs directly on the ubuntu-latest VM (NOT inside a `container:` block, unlike some other CI
+  # jobs) because testcontainers-go needs direct access to the runner's Docker socket; ubuntu-latest
+  # ships Docker out of the box, so no additional setup is required.
+  #
+  # No `if:` restriction is applied — this job runs on the same push/pull_request trigger
+  # conditions (branches/paths) as the rest of the workflow, same as unit-tests, so it is
+  # required-by-default for any change that runs the workflow (enforce via branch protection
+  # required-status-checks using this job's name).
+  integration-test-slippy:
+    name: integration-test-slippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ^1.26
+          check-latest: true
+      - name: Run deterministic CLONE_DERIVED regression suite (TestStaleCloneDerive)
+        working-directory: slippy
+        run: |
+          go mod download
+          go test -tags integration -run 'TestStaleCloneDerive' -count=1 -timeout 10m ./...
+
   lint:
     name: lint-${{ matrix.module }}
     runs-on: ubuntu-latest

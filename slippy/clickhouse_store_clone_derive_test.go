@@ -476,15 +476,26 @@ func TestInsertAtomicStatusUpdate_AncestryRetry_PreservesDeriveAndOverrideOrder(
 			t.Errorf("attempt %d: expected CLONE_DERIVED CTE to survive the ancestry retry, stmt: %s", i, stmt)
 		}
 	}
+	// Full value-pin (mirrors TestInsertAtomicHistoryUpdate_ArgOrdering_OverrideAndDerive):
+	//   [0] correlationID (cancel WHERE)
+	//   [1] newVersion (cancel WHERE)
+	//   [2] correlationID (CTE WHERE)
+	//   [3] newStatus (status literal)
+	//   [4] newVersion (new-row literal)
+	//   [5] override value (push_parsed_status override)
+	//   [6] correlationID (final WHERE)
+	want := []interface{}{
+		"corr-ancestry-retry", uint64(7), "corr-ancestry-retry",
+		string(SlipStatusFailed), uint64(7), string(StepStatusFailed), "corr-ancestry-retry",
+	}
 	for i, args := range argSets {
-		// [0] correlationID(cancel), [1] newVersion(cancel), [2] correlationID(CTE),
-		// [3] newStatus, [4] newVersion(new-row), [5] override value, [6] correlationID(final)
-		if len(args) != 7 {
-			t.Fatalf("attempt %d: expected 7 args, got %d: %v", i, len(args), args)
+		if len(args) != len(want) {
+			t.Fatalf("attempt %d: expected %d args, got %d: %v", i, len(want), len(args), args)
 		}
-		if args[5] != string(StepStatusFailed) {
-			t.Errorf("attempt %d: expected override arg at index 5 to be %q, got %v",
-				i, string(StepStatusFailed), args[5])
+		for j, w := range want {
+			if args[j] != w {
+				t.Errorf("attempt %d: args[%d] = %v, want %v", i, j, args[j], w)
+			}
 		}
 	}
 }

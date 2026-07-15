@@ -49,6 +49,13 @@ var (
 
 	// ErrHistoryAppendFailed indicates appending to state history failed.
 	// The primary operation succeeded but audit trail is incomplete.
+	//
+	// Not returned by handlePushRetry (push.go): that call site routes through
+	// UpdateStepWithHistory, whose best-effort write-back semantics already Warn-log and
+	// swallow history-append failures internally — any error it does return there is a
+	// terminal-freshness gate rejection (ErrTerminalAlreadyExists) or an event-insert
+	// failure, not a history-append failure, so it is propagated via %w instead of this
+	// sentinel (bd mycarrier-5dv5 review fix).
 	ErrHistoryAppendFailed = errors.New("failed to append state history")
 
 	// ErrSlipStatusUpdateFailed indicates updating slip status failed.

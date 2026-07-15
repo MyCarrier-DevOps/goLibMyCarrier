@@ -1491,6 +1491,18 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 // The cancel-row SELECT (UNION ALL branch, sign flipped to -1) is NEVER touched by this derive
 // logic — cancel rows must mirror exactly the rows being cancelled, verbatim, always.
 //
+// Residual inversion window (tier 2): the argMax-derived middle tier introduces a rarer inverse
+// of the window this fix closes. If a sibling's freshly-overridden routing_slips row becomes
+// visible to this write's clone SELECT before that sibling's backing slip_component_states event
+// does, tier 2 re-derives the sibling's step column from the older event and can transiently
+// revert the override at this write's new version. This is strictly rarer than the stale-clone
+// window closed above (handlers write the slip_component_states event before the routing_slips
+// row, so the event is normally visible first, not after), carries an identical blast radius
+// (only the routing_slips snapshot column is affected; gates and pipeline flow read
+// slip_component_states directly, not this column), and self-heals on the next Load via
+// hydrateSlip. In short, this fix eliminates "re-seal permanently" for event-backed values, not
+// for every conceivable write-order interleaving.
+//
 // See TestRoutingSlipsWriterCanary (clickhouse_store_writer_canary_test.go) for the
 // FRESH_ROW / R2_DERIVED / CLONE_DERIVED writer-classification enforcement.
 

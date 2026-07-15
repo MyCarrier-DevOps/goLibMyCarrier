@@ -733,6 +733,12 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 	// this retry path — the audit entry for this transition is lost in that narrow window,
 	// status self-heals on next Load, and event insert / gate-check failures still fail
 	// the retry.
+	//
+	// Because history write-back failures are already swallowed inside UpdateStepWithHistory
+	// (Warn-logged, not returned), any error surfaced here is NOT a history-append failure —
+	// it is either the terminal-freshness gate rejecting the write (ErrTerminalAlreadyExists)
+	// or a genuine event-insert failure. Wrap with %w (not ErrHistoryAppendFailed) so the
+	// underlying error chain — including errors.Is(err, ErrTerminalAlreadyExists) — survives.
 	if err := c.store.UpdateStepWithHistory(
 		ctx,
 		slip.CorrelationID,
@@ -741,7 +747,7 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 		StepStatusRunning,
 		entry,
 	); err != nil {
-		return nil, fmt.Errorf("%w: retry push_parsed reset failed: %s", ErrHistoryAppendFailed, err.Error())
+		return nil, fmt.Errorf("retry push_parsed reset failed: %w", err)
 	}
 
 	// Reload to get updated slip
