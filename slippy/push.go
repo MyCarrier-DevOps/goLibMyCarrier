@@ -726,6 +726,13 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 	// push_parsed_status = running. Two separate calls would let AppendHistory's derive
 	// CTE race the insertComponentState write UpdateStep just performed under ClickHouse
 	// async-insert visibility lag, falling back to a stale clone of push_parsed_status.
+	//
+	// Routing through UpdateStepWithHistory also means this call adopts its best-effort
+	// history write-back semantics: a failed history write-back is Warn-logged and
+	// non-fatal, superseding a45e63c's hard-fail contract for standalone AppendHistory on
+	// this retry path — the audit entry for this transition is lost in that narrow window,
+	// status self-heals on next Load, and event insert / gate-check failures still fail
+	// the retry.
 	if err := c.store.UpdateStepWithHistory(
 		ctx,
 		slip.CorrelationID,

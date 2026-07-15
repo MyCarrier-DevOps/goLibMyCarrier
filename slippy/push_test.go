@@ -511,7 +511,14 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	t.Run("retry - history append error is non-fatal", func(t *testing.T) {
+	t.Run("retry - history write-back error is non-fatal", func(t *testing.T) {
+		// handlePushRetry routes through UpdateStepWithHistory, which adopts the real
+		// store's best-effort history write-back semantics (#75): the event/step-status
+		// write is already durable, so a history write-back failure is Warn-logged and
+		// swallowed, not propagated. The state_history audit entry for this transition is
+		// lost, but retry processing (and CreateSlipForPush) must still succeed. Event
+		// insert / gate-check failures (simulated by UpdateStepError, see the
+		// "retry - UpdateStep error" case above) still hard-fail.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
@@ -537,17 +544,15 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			CommitSHA:     "histerr123",
 		}
 
-		// Now returns error - history errors are no longer swallowed
 		result, err := client.CreateSlipForPush(ctx, opts)
-		if err == nil {
-			t.Fatal("expected error for history append failure")
+		if err != nil {
+			t.Fatalf("expected no error (history write-back failures are best-effort), got: %v", err)
 		}
-		if !errors.Is(err, ErrHistoryAppendFailed) {
-			t.Errorf("expected ErrHistoryAppendFailed, got: %v", err)
+		if result == nil {
+			t.Fatal("expected a slip to be returned")
 		}
-		// Result should be nil when there's an error
-		if result != nil {
-			t.Error("expected nil result on error")
+		if len(store.SwallowedHistoryErrors) != 1 {
+			t.Errorf("expected the history write-back failure to be recorded as swallowed, got %d", len(store.SwallowedHistoryErrors))
 		}
 	})
 }

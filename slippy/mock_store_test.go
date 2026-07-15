@@ -108,6 +108,13 @@ type MockStore struct {
 	// counts" — see handlePushRetry's push_parsed reset (bd mycarrier-5dv5 F1).
 	UpdateStepWithHistoryCallCount int
 
+	// SwallowedHistoryErrors records AppendHistoryError/AppendHistoryErrorFor errors that
+	// UpdateStepWithHistory swallowed (Warn + return nil) rather than propagated, mirroring
+	// the real store's best-effort history write-back semantics (clickhouse_store.go's
+	// pure-step branch, #75). Tests that need to observe a swallowed failure should assert
+	// against this field instead of expecting UpdateStepWithHistory to return the error.
+	SwallowedHistoryErrors []error
+
 	// Ping tracking and error injection
 	PingCalls int
 	PingError error
@@ -563,21 +570,13 @@ func (m *MockStore) UpdateStepWithHistory(
 		Entry:         entry,
 	})
 
+	// UpdateStepError/UpdateStepErrorFor simulate the event-insert/gate write failing.
+	// The real store's UpdateStepWithHistory hard-fails in this case (insertComponentState
+	// or gate-check error), so the mock must too.
 	if m.UpdateStepError != nil {
 		return m.UpdateStepError
 	}
 	if err, ok := m.UpdateStepErrorFor[correlationID]; ok {
-		return err
-	}
-	// UpdateStepWithHistory is the atomic combination of a step-status write and a
-	// state_history append, so it must also honor AppendHistoryError/AppendHistoryErrorFor
-	// the same way the standalone AppendHistory does — callers (e.g. handlePushRetry) that
-	// switched from separate UpdateStep+AppendHistory calls to this single atomic call
-	// still need to be able to simulate a history-append failure in tests.
-	if m.AppendHistoryError != nil {
-		return m.AppendHistoryError
-	}
-	if err, ok := m.AppendHistoryErrorFor[correlationID]; ok {
 		return err
 	}
 
@@ -593,6 +592,20 @@ func (m *MockStore) UpdateStepWithHistory(
 	step := slip.Steps[stepName]
 	step.Status = status
 	slip.Steps[stepName] = step
+
+	// AppendHistoryError/AppendHistoryErrorFor simulate the history write-back failing.
+	// The real store's pure-step branch (clickhouse_store.go) treats this as best-effort:
+	// the event/step-status write is already durable, so the history append error is
+	// Warn-logged and swallowed (return nil), not propagated. Mirror that here — record
+	// the swallowed error for tests that want to assert it happened, but do not return it.
+	if m.AppendHistoryError != nil {
+		m.SwallowedHistoryErrors = append(m.SwallowedHistoryErrors, m.AppendHistoryError)
+		return nil
+	}
+	if err, ok := m.AppendHistoryErrorFor[correlationID]; ok {
+		m.SwallowedHistoryErrors = append(m.SwallowedHistoryErrors, err)
+		return nil
+	}
 
 	// Append history
 	slip.StateHistory = append(slip.StateHistory, entry)
