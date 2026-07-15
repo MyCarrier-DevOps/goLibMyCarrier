@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1448,6 +1449,269 @@ func (s *ClickHouseStore) appendHistoryWithOverrides(
 	}
 }
 
+// --- CLONE_DERIVED step-column precedence (bd mycarrier-5dv5) -----------------------------
+//
+// insertAtomicStatusUpdate and insertAtomicHistoryUpdate (below) are CLONE_DERIVED writers:
+// they clone the current top routing_slips row via INSERT...SELECT and override only the
+// column(s) the caller is explicitly changing. Under ClickHouse async-insert cross-connection
+// visibility lag (VersionedCollapsingMergeTree, no FINAL), the clone SELECT can miss a sibling
+// handler's just-written step column and re-seal the stale value at a new highest version. If
+// the slip status is terminal at that point, nothing heals it (prereq gates read
+// slip_component_states, not this stale column, so pipeline flow itself is unaffected — but
+// the routing_slips snapshot itself stays wrong forever).
+//
+// Fix: for PURE pipeline step-status columns (non-aggregate; aggregate rollups are the R2
+// path's job, see resolveEffectiveStepStatuses / updateWithOverrides), replace the verbatim
+// clone reference with a 3-tier precedence expression, built server-side inside the same
+// INSERT...SELECT statement (no Load→compute→INSERT round-trip):
+//
+//  1. caller-supplied stepStatusOverride ("?" literal)                      — highest
+//  2. argMax-derived latest event for that step from slip_component_states  — middle
+//  3. verbatim cloned column value (fallback)                              — lowest
+//
+// Tier 3's fallback relies on ClickHouse returning NULL for the tier-2 scalar subquery when no
+// slip_component_states row matches (empty result set), which coalesce(...) then falls through
+// past to the tier-3 column reference — verified against a live ClickHouse 25.8 instance by
+// TestStaleCloneDerive_NoEvents_FallsBackToVerbatimClone. The "derived" CTE referenced by each
+// pure step's coalesce(...) expression is inlined once per new-row SELECT (per this file's
+// reference to the WITH clause built below), so this issues one scalar subquery per pure step
+// per write (P scalar subqueries, P = the pure-step count for this pipeline config) rather than
+// a single shared scan; this is accepted as correlation-bounded (each subquery is filtered to
+// one correlation_id), with a single-scan LEFT JOIN refactor tracked as a known follow-up.
+//
+// Tier 3 intentionally falls back to the CLONE's column value, NOT StepStatusPending. This is
+// a deliberate deviation from the BC-16 pending-coalesce convention used elsewhere in this
+// package: the clone-derive paths have no in-memory Slip to consult, so "no event yet for this
+// step" must mean "trust whatever the row we are cloning already had", not "reset to pending".
+//
+// Aggregate step-status columns are ALWAYS copied verbatim here, override or not (an override
+// on an aggregate column still wins via tier 1 — the R2 path is what handles aggregate argMax
+// derivation, see resolveEffectiveStepStatuses).
+//
+// The cancel-row SELECT (UNION ALL branch, sign flipped to -1) is NEVER touched by this derive
+// logic — cancel rows must mirror exactly the rows being cancelled, verbatim, always.
+//
+// Residual inversion window (tier 2): the argMax-derived middle tier introduces a rarer inverse
+// of the window this fix closes. If a sibling's freshly-overridden routing_slips row becomes
+// visible to this write's clone SELECT before that sibling's backing slip_component_states event
+// does, tier 2 re-derives the sibling's step column from the older event and can transiently
+// revert the override at this write's new version. This is strictly rarer than the stale-clone
+// window closed above (handlers write the slip_component_states event before the routing_slips
+// row, so the event is normally visible first, not after), carries an identical blast radius
+// (only the routing_slips snapshot column is affected; gates and pipeline flow read
+// slip_component_states directly, not this column), and self-heals on the next Load via
+// hydrateSlip. In short, this fix eliminates "re-seal permanently" for event-backed values, not
+// for every conceivable write-order interleaving.
+//
+// See TestRoutingSlipsWriterCanary (clickhouse_store_writer_canary_test.go) for the
+// FRESH_ROW / R2_DERIVED / CLONE_DERIVED writer-classification enforcement.
+
+// cloneStepColumnDerive holds the per-step-column SELECT expressions (and any extra literal
+// args they require) for a CLONE_DERIVED new-row SELECT, plus the WITH clause (if any) that
+// must be prefixed onto that SELECT's query text.
+type cloneStepColumnDerive struct {
+	// withClause is the "WITH derived AS (...) " CTE prefix for the new-row SELECT, or ""
+	// when no pure step in stepColumns needs deriving (fast path: no extra query text/arg).
+	withClause string
+	// exprs holds one SELECT expression per entry in stepColumns, in the same order: either
+	// "?" (override — arg supplied via overrideArgs), a verbatim column reference (aggregate
+	// step, or pure step with cfg unavailable), or a coalesce(...) derive expression (pure
+	// step, no override).
+	exprs []string
+	// overrideArgs holds the literal values for each "?" placeholder in exprs, in the same
+	// left-to-right order the placeholders appear.
+	overrideArgs []interface{}
+	// guardFallbacks lists step-status columns that fell back to a verbatim clone because
+	// the alignment guard or the non-identifier guard refused to derive them. This does NOT
+	// include aggregate-step columns (verbatim-by-design — aggregate rollups are the R2
+	// path's job) or the SQL-level tier-3 "no events yet" fallback (a normal, expected
+	// runtime outcome invisible to this Go function). A non-empty guardFallbacks means one
+	// of these two structural guards fired, which only happens if a code invariant broke
+	// (stepColumns/cfg.Steps index-alignment drifted, or a non-identifier step name reached
+	// here despite pipeline config validation) — silently disabling the CLONE_DERIVED
+	// stale-clone protection (bd mycarrier-5dv5) for that column. Callers log this.
+	guardFallbacks []cloneDeriveFallback
+}
+
+// cloneDeriveFallback records one step-status column that buildCloneStepColumnDerive
+// refused to derive due to a structural guard, and why.
+type cloneDeriveFallback struct {
+	column string
+	reason string
+}
+
+const (
+	cloneDeriveFallbackReasonAlignmentGuard     = "alignment_guard_mismatch"
+	cloneDeriveFallbackReasonNonIdentifierGuard = "non_identifier_step_name"
+)
+
+// sqlSingleQuoteEscapeReplacer escapes backslashes before single quotes. ClickHouse
+// single-quoted string literals honor BOTH backslash escapes and doubled ” quoting, so an
+// unescaped backslash immediately preceding a quote could change how the quote is interpreted
+// unless backslashes are neutralized first.
+var sqlSingleQuoteEscapeReplacer = strings.NewReplacer(`\`, `\\`, `'`, `''`)
+
+// sqlSingleQuoteEscape escapes a string for safe embedding as a single-quoted SQL string
+// literal, escaping backslashes first and then quotes (see sqlSingleQuoteEscapeReplacer).
+// Step names come from the operator-managed pipeline config, which is already spliced raw as
+// column identifiers elsewhere in this file (see StepStatusColumn and its callers) — so this
+// escaping is defense-in-depth, not a trust-boundary fix.
+func sqlSingleQuoteEscape(s string) string {
+	return sqlSingleQuoteEscapeReplacer.Replace(s)
+}
+
+// safeStepNameForDerivePattern matches step names that are safe to splice into a coalesce(...)
+// derive expression as both a quoted string literal and (via StepStatusColumn) a column-name
+// stem. Step names originate from the operator-managed pipeline config, not request-time input,
+// but a non-identifier step name is never legitimate anyway — the column-naming convention
+// (StepStatusColumn) requires it to form a valid ClickHouse identifier. Refusing to derive for
+// anything that doesn't match keeps this a local, defense-in-depth guard: it changes nothing for
+// any real pipeline config, and for a malformed one it falls back to the pre-fix verbatim clone
+// behavior instead of risking a broken query.
+var safeStepNameForDerivePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
+// buildCloneStepColumnDerive builds the CLONE_DERIVED new-row SELECT expressions for
+// insertAtomicStatusUpdate / insertAtomicHistoryUpdate. stepColumns and cfg.Steps MUST be
+// index-aligned (true for SlipQueryBuilder.BuildStepColumns, which iterates cfg.Steps in
+// order) — used to map each column back to its step name/aggregate classification.
+// stepStatusColumn must be the SAME naming function the query builder used to produce
+// stepColumns (SlipQueryBuilder.StepStatusColumn) — it is used as an alignment guard: if
+// stepColumns[i] doesn't actually match stepStatusColumn(cfg.Steps[i].Name), the index-alignment
+// assumption above doesn't hold for that entry, and the column falls back to a verbatim copy
+// rather than risking a derive expression keyed off the wrong step name.
+func buildCloneStepColumnDerive(
+	cfg *PipelineConfig,
+	database string,
+	stepColumns []string,
+	overrides []stepStatusOverride,
+	stepStatusColumn func(string) string,
+) cloneStepColumnDerive {
+	overrideByCol := make(map[string]StepStatus, len(overrides))
+	for _, o := range overrides {
+		overrideByCol[o.columnName] = o.status
+	}
+
+	exprs := make([]string, 0, len(stepColumns))
+	overrideArgs := make([]interface{}, 0, len(overrides))
+	var guardFallbacks []cloneDeriveFallback
+	needsDerive := false
+
+	for i, col := range stepColumns {
+		if overrideStatus, ok := overrideByCol[col]; ok {
+			exprs = append(exprs, "?")
+			overrideArgs = append(overrideArgs, string(overrideStatus))
+			continue
+		}
+
+		var stepName string
+		if cfg != nil && i < len(cfg.Steps) {
+			stepName = cfg.Steps[i].Name
+		}
+		if cfg == nil || stepName == "" || cfg.IsAggregateStep(stepName) {
+			// Aggregate step-status columns (and anything we can't map back to a step
+			// name) are copied verbatim — aggregate rollups are the R2 path's job.
+			exprs = append(exprs, col)
+			continue
+		}
+
+		// Alignment guard: confirm stepColumns[i] is actually the status column for
+		// stepName, using the same naming function the query builder used to produce
+		// stepColumns. A mismatch means the index-alignment assumption between
+		// stepColumns and cfg.Steps doesn't hold for this entry — fall back to a
+		// verbatim copy rather than deriving off a potentially wrong step name. This
+		// indicates a broken code invariant, so it is reported via guardFallbacks.
+		if stepStatusColumn == nil || stepStatusColumn(stepName) != col {
+			exprs = append(exprs, col)
+			guardFallbacks = append(guardFallbacks, cloneDeriveFallback{
+				column: col,
+				reason: cloneDeriveFallbackReasonAlignmentGuard,
+			})
+			continue
+		}
+
+		// Non-identifier step names are never legitimate (see
+		// safeStepNameForDerivePattern's doc comment) — refuse to derive for one and
+		// fall back to verbatim, preserving pre-fix behavior instead of risking a
+		// malformed query. This indicates a broken code invariant (pipeline config
+		// validation should have rejected this step name), so it is reported via
+		// guardFallbacks.
+		if !safeStepNameForDerivePattern.MatchString(stepName) {
+			exprs = append(exprs, col)
+			guardFallbacks = append(guardFallbacks, cloneDeriveFallback{
+				column: col,
+				reason: cloneDeriveFallbackReasonNonIdentifierGuard,
+			})
+			continue
+		}
+
+		needsDerive = true
+		exprs = append(exprs, fmt.Sprintf(
+			"coalesce((SELECT st FROM derived WHERE step = '%s'), %s)",
+			sqlSingleQuoteEscape(stepName), col,
+		))
+	}
+
+	var withClause string
+	if needsDerive {
+		// No HAVING here, unlike derivePipelineStepStatuses' Go-side "rawStatus == ''"
+		// guard: that guard filters out empty-string argMax results in Go because Go's
+		// zero value for string is "". slip_component_states.status is Enum8 with no
+		// '' member (see dynamic_migrations.go generateComponentStatesTableMigration);
+		// GROUP BY only emits a group when at least one row exists for that step, and
+		// every row's status is a non-empty Enum8 member, so argMax(status, ...) can
+		// never legitimately produce ''. A prior version of this query added a
+		// "HAVING st != ''" clause to mirror the Go guard, but comparing an Enum8
+		// column against the string literal '' is itself invalid for this enum type —
+		// ClickHouse rejects it at query-analysis time with error 691 ("Unknown
+		// element '' for enum"), failing the query outright (even with zero matching
+		// rows), rather than filtering as intended. Bd mycarrier-5dv5.
+		withClause = fmt.Sprintf(
+			"WITH derived AS (SELECT step, argMax(status, %s) AS st FROM %s.%s"+
+				" WHERE correlation_id = ? AND component = '' GROUP BY step) ",
+			componentEventSortKeyNoImageTag, database, TableSlipComponentStates,
+		)
+	}
+
+	return cloneStepColumnDerive{
+		withClause:     withClause,
+		exprs:          exprs,
+		overrideArgs:   overrideArgs,
+		guardFallbacks: guardFallbacks,
+	}
+}
+
+// logCloneDeriveGuardFallbacks emits a single Warn log when buildCloneStepColumnDerive
+// reports one or more guardFallbacks. A guard firing means a code invariant broke (see
+// cloneStepColumnDerive.guardFallbacks doc comment) and the CLONE_DERIVED stale-clone
+// protection (bd mycarrier-5dv5) is silently off for the affected column(s) — this makes
+// that otherwise-silent condition observable.
+func (s *ClickHouseStore) logCloneDeriveGuardFallbacks(
+	ctx context.Context,
+	correlationID string,
+	fallbacks []cloneDeriveFallback,
+) {
+	if len(fallbacks) == 0 {
+		return
+	}
+	columns := make([]string, len(fallbacks))
+	reasons := make([]string, len(fallbacks))
+	for i, fb := range fallbacks {
+		columns[i] = fb.column
+		reasons[i] = fb.reason
+	}
+	s.logger.Warn(
+		ctx,
+		"CLONE_DERIVED guard fell back to verbatim clone for step-status column(s); "+
+			"stale-clone protection is off for these columns until the underlying code "+
+			"invariant is restored",
+		map[string]interface{}{
+			"correlation_id": correlationID,
+			"columns":        columns,
+			"reasons":        reasons,
+		},
+	)
+}
+
 // insertAtomicStatusUpdate cancels all active routing_slips rows for correlationID and inserts
 // a new row that is identical to the latest active row except for status, updated_at, sign,
 // and version. All other columns (including state_history) are copied verbatim from the DB row,
@@ -1522,36 +1786,22 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
 
-	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
-	// the verbatim DB column reference with a literal (?) so the step-status value is
-	// updated atomically alongside the slip-status change. This mirrors the identical
-	// pattern in insertAtomicHistoryUpdate and fixes the stale-clone race described in
-	// the function comment above.
-	//
-	// Fast-path: the common case (no overrides) skips the map/slice allocations.
-	var stepOverrideArgs []interface{}
-	if len(overrides) == 0 {
-		newRowSelectCols = append(newRowSelectCols, stepColumns...)
-	} else {
-		overrideByCol := make(map[string]StepStatus, len(overrides))
-		for _, o := range overrides {
-			overrideByCol[o.columnName] = o.status
-		}
-		stepSelectExprs := make([]string, 0, len(stepColumns))
-		stepOverrideArgs = make([]interface{}, 0, len(overrides))
-		for _, col := range stepColumns {
-			if overrideStatus, ok := overrideByCol[col]; ok {
-				stepSelectExprs = append(stepSelectExprs, "?")
-				stepOverrideArgs = append(stepOverrideArgs, string(overrideStatus))
-				continue
-			}
-			stepSelectExprs = append(stepSelectExprs, col)
-		}
-		newRowSelectCols = append(newRowSelectCols, stepSelectExprs...)
-	}
+	// Build step SELECT expressions: caller overrides win (literal "?"), pure pipeline steps
+	// with no override get a CLONE_DERIVED argMax precedence expression, and aggregate steps
+	// (with no override) are copied verbatim. See buildCloneStepColumnDerive's doc comment
+	// (above insertAtomicStatusUpdate) for the full 3-tier precedence rationale.
+	derive := buildCloneStepColumnDerive(
+		s.pipelineConfig,
+		s.database,
+		stepColumns,
+		overrides,
+		s.queryBuilder.StepStatusColumn,
+	)
+	s.logCloneDeriveGuardFallbacks(ctx, correlationID, derive.guardFallbacks)
+	newRowSelectCols = append(newRowSelectCols, derive.exprs...)
 	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
 
-	newRowQuery := fmt.Sprintf(
+	newRowQuery := derive.withClause + fmt.Sprintf(
 		"SELECT %s FROM %s.%s WHERE %s = ? AND %s = 1 ORDER BY %s DESC LIMIT 1",
 		strings.Join(newRowSelectCols, ", "),
 		s.database, TableRoutingSlips,
@@ -1566,14 +1816,19 @@ func (s *ClickHouseStore) insertAtomicStatusUpdate(
 	`, s.database, TableRoutingSlips, strings.Join(allCols, ", "), cancelQuery, newRowQuery)
 
 	// Args order:
-	//   1. cancel-row WHERE:       correlationID, newVersion
-	//   2. new-row SELECT ?:       newStatus (status literal)
-	//   3. new-row SELECT ?:       newVersion (version literal)
-	//   4. new-row step overrides: one ? per override, in stepColumns order
-	//   5. new-row SELECT WHERE:   correlationID
-	execArgs := make([]interface{}, 0, 5+len(stepOverrideArgs))
-	execArgs = append(execArgs, correlationID, newVersion, string(newStatus), newVersion)
-	execArgs = append(execArgs, stepOverrideArgs...)
+	//   1. cancel-row WHERE:         correlationID, newVersion
+	//   2. derive CTE WHERE (opt.):  correlationID  — only present when derive.withClause != ""
+	//   3. new-row SELECT ?:         newStatus (status literal)
+	//   4. new-row SELECT ?:         newVersion (version literal)
+	//   5. new-row step overrides:   one ? per override, in stepColumns order
+	//   6. new-row SELECT WHERE:     correlationID
+	execArgs := make([]interface{}, 0, 6+len(derive.overrideArgs))
+	execArgs = append(execArgs, correlationID, newVersion)
+	if derive.withClause != "" {
+		execArgs = append(execArgs, correlationID)
+	}
+	execArgs = append(execArgs, string(newStatus), newVersion)
+	execArgs = append(execArgs, derive.overrideArgs...)
 	execArgs = append(execArgs, correlationID)
 
 	err := s.session.ExecWithArgs(ctx, query, execArgs...)
@@ -1908,37 +2163,25 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	}
 	newRowSelectCols = append(newRowSelectCols, "1", "?") // sign=1, version=newVersion
 
-	// Build step SELECT expressions. For columns that have a stepStatusOverride, replace
-	// the verbatim DB column reference with a literal (?) so the step-status value is
-	// updated atomically alongside the history entry. This fixes the case where a pure
-	// pipeline step (e.g. unit_tests) would otherwise copy a stale "running" value from
-	// the routing_slips row that was last written by the builds aggregate write-back.
-	//
-	// Fast-path: AppendHistory always calls with zero overrides, so skip the map/slice
-	// allocations entirely in that common case.
-	var stepOverrideArgs []interface{}
-	if len(overrides) == 0 {
-		newRowSelectCols = append(newRowSelectCols, stepColumns...)
-	} else {
-		overrideByCol := make(map[string]StepStatus, len(overrides))
-		for _, o := range overrides {
-			overrideByCol[o.columnName] = o.status
-		}
-		stepSelectExprs := make([]string, 0, len(stepColumns))
-		stepOverrideArgs = make([]interface{}, 0, len(overrides))
-		for _, col := range stepColumns {
-			if overrideStatus, ok := overrideByCol[col]; ok {
-				stepSelectExprs = append(stepSelectExprs, "?")
-				stepOverrideArgs = append(stepOverrideArgs, string(overrideStatus))
-				continue
-			}
-			stepSelectExprs = append(stepSelectExprs, col)
-		}
-		newRowSelectCols = append(newRowSelectCols, stepSelectExprs...)
-	}
+	// Build step SELECT expressions: caller overrides win (literal "?"), pure pipeline steps
+	// with no override get a CLONE_DERIVED argMax precedence expression, and aggregate steps
+	// (with no override) are copied verbatim. See buildCloneStepColumnDerive's doc comment
+	// (above insertAtomicStatusUpdate) for the full 3-tier precedence rationale. This closes
+	// the case where a pure pipeline step (e.g. unit_tests) would otherwise copy a stale
+	// "running" value from the routing_slips row last written by the builds aggregate
+	// write-back, or miss a sibling handler's just-written step under async-insert lag.
+	derive := buildCloneStepColumnDerive(
+		s.pipelineConfig,
+		s.database,
+		stepColumns,
+		overrides,
+		s.queryBuilder.StepStatusColumn,
+	)
+	s.logCloneDeriveGuardFallbacks(ctx, correlationID, derive.guardFallbacks)
+	newRowSelectCols = append(newRowSelectCols, derive.exprs...)
 	newRowSelectCols = append(newRowSelectCols, aggregateColumns...)
 
-	newRowQuery := fmt.Sprintf(
+	newRowQuery := derive.withClause + fmt.Sprintf(
 		"SELECT %s FROM %s.%s WHERE %s = ? AND %s = 1 ORDER BY %s DESC LIMIT 1",
 		strings.Join(newRowSelectCols, ", "),
 		s.database, TableRoutingSlips,
@@ -1953,14 +2196,19 @@ func (s *ClickHouseStore) insertAtomicHistoryUpdate(
 	`, s.database, TableRoutingSlips, strings.Join(allCols, ", "), cancelQuery, newRowQuery)
 
 	// Build the args slice in SELECT parameter order:
-	//   1. cancel-row WHERE:     correlationID, newVersion
-	//   2. new-row SELECT CAST:  newStateHistoryJSON  (state_history literal)
-	//   3. new-row SELECT ?:     newVersion           (version literal)
-	//   4. new-row step overrides in column order     (one ? per override)
-	//   5. new-row SELECT WHERE: correlationID
-	execArgs := make([]interface{}, 0, 5+len(stepOverrideArgs))
-	execArgs = append(execArgs, correlationID, newVersion, newStateHistoryJSON, newVersion)
-	execArgs = append(execArgs, stepOverrideArgs...)
+	//   1. cancel-row WHERE:         correlationID, newVersion
+	//   2. derive CTE WHERE (opt.):  correlationID  — only present when derive.withClause != ""
+	//   3. new-row SELECT CAST:      newStateHistoryJSON  (state_history literal)
+	//   4. new-row SELECT ?:         newVersion           (version literal)
+	//   5. new-row step overrides in column order         (one ? per override)
+	//   6. new-row SELECT WHERE:     correlationID
+	execArgs := make([]interface{}, 0, 6+len(derive.overrideArgs))
+	execArgs = append(execArgs, correlationID, newVersion)
+	if derive.withClause != "" {
+		execArgs = append(execArgs, correlationID)
+	}
+	execArgs = append(execArgs, newStateHistoryJSON, newVersion)
+	execArgs = append(execArgs, derive.overrideArgs...)
 	execArgs = append(execArgs, correlationID)
 
 	err := s.session.ExecWithArgs(ctx, query, execArgs...)

@@ -719,14 +719,35 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 		Message:   "retry detected, resetting push_parsed",
 	}
 
-	if err := c.store.UpdateStep(ctx, slip.CorrelationID, "push_parsed", "", StepStatusRunning); err != nil {
-		return nil, fmt.Errorf("failed to reset push_parsed: %w", err)
-	}
-
-	if err := c.store.AppendHistory(ctx, slip.CorrelationID, entry); err != nil {
-		// Return the error - audit trail is important
-		return nil, fmt.Errorf("%w: retry push_parsed reset succeeded but history append failed: %s",
-			ErrHistoryAppendFailed, err.Error())
+	// Use UpdateStepWithHistory (not separate UpdateStep + AppendHistory calls) so the
+	// push_parsed status write and the history append happen atomically with the same
+	// caller-supplied stepStatusOverride that UpdateStepWithHistory's pure-step branch
+	// (see appendHistoryWithOverrides call in clickhouse_store.go) already uses to pin
+	// push_parsed_status = running. Two separate calls would let AppendHistory's derive
+	// CTE race the insertComponentState write UpdateStep just performed under ClickHouse
+	// async-insert visibility lag, falling back to a stale clone of push_parsed_status.
+	//
+	// Routing through UpdateStepWithHistory also means this call adopts its best-effort
+	// history write-back semantics: a failed history write-back is Warn-logged and
+	// non-fatal, superseding a45e63c's hard-fail contract for standalone AppendHistory on
+	// this retry path — the audit entry for this transition is lost in that narrow window,
+	// status self-heals on next Load, and event insert / gate-check failures still fail
+	// the retry.
+	//
+	// Because history write-back failures are already swallowed inside UpdateStepWithHistory
+	// (Warn-logged, not returned), any error surfaced here is NOT a history-append failure —
+	// it is either the terminal-freshness gate rejecting the write (ErrTerminalAlreadyExists)
+	// or a genuine event-insert failure. Wrap with %w (not ErrHistoryAppendFailed) so the
+	// underlying error chain — including errors.Is(err, ErrTerminalAlreadyExists) — survives.
+	if err := c.store.UpdateStepWithHistory(
+		ctx,
+		slip.CorrelationID,
+		"push_parsed",
+		"",
+		StepStatusRunning,
+		entry,
+	); err != nil {
+		return nil, fmt.Errorf("retry push_parsed reset failed: %w", err)
 	}
 
 	// Reload to get updated slip

@@ -100,6 +100,21 @@ type MockStore struct {
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
 	CloseCalls            int
 
+	// UpdateStepWithHistoryCallCount counts calls to the atomic UpdateStepWithHistory
+	// method specifically, separate from UpdateStepCalls/AppendHistoryCalls (which
+	// UpdateStepWithHistory also appends to, alongside the standalone UpdateStep/
+	// AppendHistory methods). This lets tests distinguish "one atomic call" from "two
+	// separate calls that happen to add up to the same UpdateStepCalls/AppendHistoryCalls
+	// counts" — see handlePushRetry's push_parsed reset (bd mycarrier-5dv5 F1).
+	UpdateStepWithHistoryCallCount int
+
+	// SwallowedHistoryErrors records AppendHistoryError/AppendHistoryErrorFor errors that
+	// UpdateStepWithHistory swallowed (Warn + return nil) rather than propagated, mirroring
+	// the real store's best-effort history write-back semantics (clickhouse_store.go's
+	// pure-step branch, #75). Tests that need to observe a swallowed failure should assert
+	// against this field instead of expecting UpdateStepWithHistory to return the error.
+	SwallowedHistoryErrors []error
+
 	// Ping tracking and error injection
 	PingCalls int
 	PingError error
@@ -541,6 +556,8 @@ func (m *MockStore) UpdateStepWithHistory(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.UpdateStepWithHistoryCallCount++
+
 	// Track both calls
 	m.UpdateStepCalls = append(m.UpdateStepCalls, UpdateStepCall{
 		CorrelationID: correlationID,
@@ -553,6 +570,9 @@ func (m *MockStore) UpdateStepWithHistory(
 		Entry:         entry,
 	})
 
+	// UpdateStepError/UpdateStepErrorFor simulate the event-insert/gate write failing.
+	// The real store's UpdateStepWithHistory hard-fails in this case (insertComponentState
+	// or gate-check error), so the mock must too.
 	if m.UpdateStepError != nil {
 		return m.UpdateStepError
 	}
@@ -572,6 +592,20 @@ func (m *MockStore) UpdateStepWithHistory(
 	step := slip.Steps[stepName]
 	step.Status = status
 	slip.Steps[stepName] = step
+
+	// AppendHistoryError/AppendHistoryErrorFor simulate the history write-back failing.
+	// The real store's pure-step branch (clickhouse_store.go) treats this as best-effort:
+	// the event/step-status write is already durable, so the history append error is
+	// Warn-logged and swallowed (return nil), not propagated. Mirror that here — record
+	// the swallowed error for tests that want to assert it happened, but do not return it.
+	if m.AppendHistoryError != nil {
+		m.SwallowedHistoryErrors = append(m.SwallowedHistoryErrors, m.AppendHistoryError)
+		return nil
+	}
+	if err, ok := m.AppendHistoryErrorFor[correlationID]; ok {
+		m.SwallowedHistoryErrors = append(m.SwallowedHistoryErrors, err)
+		return nil
+	}
 
 	// Append history
 	slip.StateHistory = append(slip.StateHistory, entry)
