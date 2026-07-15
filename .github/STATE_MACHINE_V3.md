@@ -75,6 +75,23 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 
 **Accepted tradeoff — `handlePushRetry` best-effort history write-back (bd mycarrier-5dv5):** `handlePushRetry` (`push.go`) resets `push_parsed` on retry via `UpdateStepWithHistory` rather than separate `UpdateStep`/`AppendHistory` calls (see Rule 9's extension above), which also means it inherits `UpdateStepWithHistory`'s pure-step branch best-effort write-back semantics (#75): a failed history write-back is Warn-logged and non-fatal, superseding the previously hard-fail contract for standalone `AppendHistory` on this path (commit `a45e63c`). The `state_history` audit entry for the retry-reset transition is lost in that narrow window; `push_parsed_status` itself self-heals on next `Load`; event insert / gate-check failures still hard-fail the retry.
 
+**Known residual — tier-2 derive inversion window (accepted, documented, bd mycarrier-5dv5, PR #78 review thread):** For a non-overridden pure step, CLONE_DERIVED tier-2 (`argMax` over `slip_component_states`) beats the tier-3 cloned column whenever any event is visible to the derive SELECT. If a sibling's freshly-overridden `routing_slips` row becomes visible to the clone SELECT before that sibling's earlier-committed backing event does — cross-table visibility skew — tier-2 re-derives from the older visible event and can transiently revert the override at a new version.
+
+*Epistemic status:* PREDICTED, never observed — zero occurrences across two concurrent storms, failure-injection, and an A/B replay vs v1.3.95 (2026-07-15, bd mycarrier-5dv5); every version walk was checked for the clone-born-regression signature. Requires the storage layer to invert visibility against same-connection commit order (every writer commits the event before the row).
+
+*Severity:* low/cosmetic — snapshot column only; gates and pipeline flow read `slip_component_states` directly; `hydrateSlip` corrects every `Load`; heals on next write. Cannot recreate the "sealed forever" class (line 70 above) unless the event never becomes visible to any later write.
+
+*Lineage:* NOT introduced by CLONE_DERIVED — it is the inherent residual of the R2 "event log wins for pure steps" semantic ratified in PR #77 (`resolveEffectiveStepStatuses`: override > argMax > fallback); the same window has existed in the R2 aggregate write-back path since #77. CLONE_DERIVED extended the ratified semantic to the clone writers and documented the residual (PR #78 review thread, comment 3588778369-series/3588778389).
+
+*Fix ladder — REJECTED (MUST NOT be implemented; each breaks a ratified contract):*
+1. Monotonic "derive may never downgrade a terminal column" guard — violates the BC-17/BC-19 rerun idiom (a legit rerun IS a newer running event beating an older completed one; the guard cannot distinguish rerun from inversion).
+2. Row-columns-as-pseudo-events union (`argMax` over events ∪ row values @ version-time) — stale clones mint high versions, so stale values win the union, reintroducing the `74cd6676` bug wholesale.
+3. Event-timestamp vs row-version comparison — cannot disambiguate: in the original `74cd6676` wedge the FRESH event is also older than the stale clone row's version; row versions do not order content freshness.
+
+*Fix ladder — viable future fixes (tracked bd mycarrier-gzar):*
+1. Preferred: `SETTINGS select_sequential_consistency=1` on the derive read (CH Cloud SharedMergeTree) — removes the visibility skew at the root (event committed before row ⇒ visible whenever row is); needs a spike for INSERT...SELECT inner-read semantics + hot-path latency sign-off (same "conscious consequence" bar as R2's extra point-scan in #77).
+2. Fallback: per-step explicit-write provenance-map column joined into tier-2 evidence — closes the window without consistency costs but requires revising the D1 schema freeze.
+
 **Note on `aborted`:** cascade failures (`aborted`) are NOT primary failures — they do not independently drive `slip=failed` and are not counted in I1/I2/I3.
 **Note on `pending`/`held`:** non-terminal, do not block any transition including completion (I3).
 **Note on `skipped`:** terminal-success, treated as `completed`. Does not block I3.
