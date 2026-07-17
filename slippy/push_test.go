@@ -552,7 +552,10 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			t.Fatal("expected a slip to be returned")
 		}
 		if len(store.SwallowedHistoryErrors) != 1 {
-			t.Errorf("expected the history write-back failure to be recorded as swallowed, got %d", len(store.SwallowedHistoryErrors))
+			t.Errorf(
+				"expected the history write-back failure to be recorded as swallowed, got %d",
+				len(store.SwallowedHistoryErrors),
+			)
 		}
 	})
 }

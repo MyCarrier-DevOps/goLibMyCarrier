@@ -1,0 +1,31 @@
+lockfile_version: '1'
+generated_at: '2026-07-17T18:55:55.804290+00:00'
+apm_version: 0.13.0
+dependencies:
+- repo_url: MyCarrier-DevOps/apm_marketplace
+  host: github.com
+  resolved_commit: 3fab01d1132a03cc2542940ba84a38b06062969d
+  virtual_path: packages/go-devkit
+  is_virtual: true
+  package_type: marketplace_plugin
+  deployed_files:
+  - .agents/skills/go-tdd
+  - .claude/commands/go-preflight.md
+  - .claude/commands/go-repo-init.md
+  - .claude/commands/go-verify.md
+  - .claude/skills/go-tdd
+  - .github/hooks/go-devkit-hooks.json
+  - .github/prompts/go-preflight.prompt.md
+  - .github/prompts/go-repo-init.prompt.md
+  - .github/prompts/go-verify.prompt.md
+  deployed_file_hashes:
+    .claude/commands/go-preflight.md: sha256:b201894ff1f93d703293cef5cae0dab9f4f4c58e0d45840fd36121911464d429
+    .claude/commands/go-repo-init.md: sha256:65e274fa8f873e9272abe66778dbd15c7e31e73e5e37d989601ac8fb5d4ef11b
+    .claude/commands/go-verify.md: sha256:5c1e6267b0969fbcc1ef5788096d27e4f759a6af8a059606fec524da7ed45488
+    .github/hooks/go-devkit-hooks.json: sha256:79e9be9b323964a81b3ad3314bd2c55bd93fac79285e0f76ec20e2c5e6b9dcfd
+    .github/prompts/go-preflight.prompt.md: sha256:54b550746a6d63138020a2d5209ad065228abfcf7d0d96a61fa3e973eb2578ce
+    .github/prompts/go-repo-init.prompt.md: sha256:69f9d6a03c182003506cccfb8155ccba018b2fb7fd7f967feaa8b93fc05d86da
+    .github/prompts/go-verify.prompt.md: sha256:4f0fd3b3ac1f309d4c04bfc6d0ff38dd85b492f87722f3f9e4d821fc6543c605
+  content_hash: sha256:14ce57f933376d2d5a97a990730e0f7c049c5fc91fdbc9860854195f5c2a01ef
+  discovered_via: apm_marketplace
+  marketplace_plugin_name: go-devkit

@@ -46,3 +46,8 @@ bin/
 *.db
 .beads-credential-key
 **/.beads
+
+
+# APM dependencies
+apm_modules/
+.claude/settings.local.json

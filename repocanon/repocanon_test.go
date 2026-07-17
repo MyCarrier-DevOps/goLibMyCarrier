@@ -4,10 +4,10 @@ import "testing"
 
 func TestFromRaw(t *testing.T) {
 	tests := []struct {
-		name       string
-		input      string
-		wantSvc    string
-		wantRepo   string
+		name     string
+		input    string
+		wantSvc  string
+		wantRepo string
 	}{
 		{
 			name:     "live prod input (full GitHub name)",

@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - '**'
+      - '!.claude/**'
       - '!docs/**'
       - '!.github/**'
       - '!README.md'
@@ -18,6 +19,7 @@ on:
   pull_request:
     paths:
       - '**'
+      - '!.claude/**'
       - '!docs/**'
       - '!.github/**'
       - '!README.md'
@@ -26,6 +28,8 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
 jobs:
   # Discover all Go modules dynamically
   discover:
@@ -34,7 +38,7 @@ jobs:
     outputs:
       modules: ${{ steps.find-modules.outputs.modules }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Find Go modules
         id: find-modules
         run: |
@@ -56,8 +60,8 @@ jobs:
       actions: read
       pull-requests: write # needed for coverage comments
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ^1.26
           check-latest: true
@@ -95,8 +99,8 @@ jobs:
     name: integration-test-slippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ^1.26
           check-latest: true
@@ -115,8 +119,8 @@ jobs:
       matrix:
         module: ${{ fromJson(needs.discover.outputs.modules) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ^1.26
           check-latest: true
@@ -137,8 +141,8 @@ jobs:
       matrix:
         module: ${{ fromJson(needs.discover.outputs.modules) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: ^1.26
           check-latest: true
@@ -199,6 +203,8 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # needed to push tags and create GitHub releases
     needs:
       - discover
       - unit-tests-check
@@ -214,7 +220,7 @@ jobs:
       version: ${{ steps.release_version.outputs.version }}
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         ref: ${{ github.event.ref }}
         fetch-depth: 0
