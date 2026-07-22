@@ -6,9 +6,9 @@ toolchain go1.26.5
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.47.0
-	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.96
-	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.3.96
-	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.96
+	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.97
+	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.3.97
+	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.97
 	github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator v1.3.96
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pashagolub/pgxmock/v4 v4.9.0
@@ -43,7 +43,7 @@ require (
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-git/go-billy/v5 v5.9.0 // indirect
 	github.com/go-git/go-git/v5 v5.19.1 // indirect
-	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
@@ -106,13 +106,13 @@ require (
 
 require (
 	github.com/ClickHouse/ch-go v0.73.0 // indirect
-	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator v1.3.96
+	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator v1.3.97
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
 	github.com/go-faster/errors v0.7.1 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
+	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/paulmach/orb v0.13.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
