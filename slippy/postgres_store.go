@@ -286,9 +286,15 @@ func (s *PostgresStore) slipValues(slip *Slip, forCreate bool) ([]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal step_details for %s: %w", slip.CorrelationID, err)
 	}
+	// Marshal a nil history as [] (not JSON null) so the entries array is always a JSON
+	// array — appendHistoryTx concatenates onto it.
+	entries := slip.StateHistory
+	if entries == nil {
+		entries = []StateHistoryEntry{}
+	}
 	stateHistoryJSON, err := json.Marshal(struct {
 		Entries []StateHistoryEntry `json:"entries"`
-	}{Entries: slip.StateHistory})
+	}{Entries: entries})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal state_history for %s: %w", slip.CorrelationID, err)
 	}
