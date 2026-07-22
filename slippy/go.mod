@@ -9,7 +9,11 @@ require (
 	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.96
 	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.3.96
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.96
+	github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator v1.3.96
+	github.com/jackc/pgx/v5 v5.10.0
+	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.43.0
+	github.com/testcontainers/testcontainers-go/modules/postgres v0.43.0
 )
 
 require (
@@ -47,6 +51,9 @@ require (
 	github.com/google/go-github/v82 v82.0.0 // indirect
 	github.com/google/go-github/v88 v88.0.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
 	github.com/jferrl/go-githubauth v1.7.0 // indirect
 	github.com/kevinburke/ssh_config v1.6.0 // indirect
@@ -78,7 +85,6 @@ require (
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/spf13/viper v1.21.0 // indirect
-	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
@@ -91,6 +97,7 @@ require (
 	go.uber.org/zap v1.28.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/net v0.57.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
@@ -118,6 +125,8 @@ require (
 )
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator => ../clickhousemigrator
+
+replace github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator => ../postgresmigrator
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger
 
