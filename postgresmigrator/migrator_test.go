@@ -183,6 +183,40 @@ func colExists(t *testing.T, pool *pgxpool.Pool, table, col string) bool {
 	return n > 0
 }
 
+// TestMigrator_Integration_LegacySchemaVersionTableWithoutID reproduces the deploy-time
+// regression where a schema_version table created before the monotonic id column existed was
+// read (RunPostgresMigrations captures the start version before CreateTables adds the column)
+// and failed with 42703 "column \"id\" does not exist". GetSchemaVersion must fall back to
+// applied_at ordering, and CreateTables must then backfill the id column.
+func TestMigrator_Integration_LegacySchemaVersionTableWithoutID(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	_, err := pool.Exec(ctx, `CREATE TABLE legacy_schema_version (
+		version integer NOT NULL,
+		applied_at timestamptz NOT NULL DEFAULT now())`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		"INSERT INTO legacy_schema_version (version, applied_at) VALUES (3, now() - interval '1 hour'), (7, now())")
+	require.NoError(t, err)
+
+	m, err := NewMigrator(pool, NewStdLogger(false), WithTablePrefix("legacy"))
+	require.NoError(t, err)
+
+	// Regression: reading the version on a pre-id table must not error.
+	v, err := m.GetSchemaVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 7, v, "falls back to applied_at ordering when id is absent")
+	assert.False(t, colExists(t, pool, "legacy_schema_version", "id"))
+
+	// CreateTables backfills the id column; the version still reads correctly, now via id.
+	require.NoError(t, m.CreateTables(ctx))
+	assert.True(t, colExists(t, pool, "legacy_schema_version", "id"), "id column backfilled")
+	v, err = m.GetSchemaVersion(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 7, v)
+}
+
 func TestMigrator_Integration(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()

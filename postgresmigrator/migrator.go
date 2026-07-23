@@ -187,13 +187,27 @@ func (m *Migrator) GetSchemaVersion(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 
+	// Order by the monotonic id rather than applied_at (which ties at microsecond
+	// resolution and can move backward under clock skew; a down-migration also writes the
+	// older version with a newer applied_at). A version table created before the id column
+	// existed can still be read here before createSchemaVersionTable adds it — e.g.
+	// RunPostgresMigrations captures the start version before CreateTables runs — so fall
+	// back to applied_at when id is not present yet.
+	const hasIDQuery = `SELECT EXISTS (
+		SELECT 1 FROM pg_attribute
+		WHERE attrelid = to_regclass($1) AND attname = 'id' AND NOT attisdropped)`
+	orderBy := "applied_at"
+	var hasID bool
+	if err := m.conn.QueryRow(ctx, hasIDQuery, qualified).Scan(&hasID); err != nil {
+		return 0, fmt.Errorf("failed to check for %s.id column: %w", qualified, err)
+	}
+	if hasID {
+		orderBy = "id"
+	}
+
 	var version int
-	// Order by the monotonic id, not applied_at: applied_at is now() at transaction
-	// start, so concurrent-microsecond ties are unordered and a backward clock could
-	// surface a stale row; a down-migration also writes the older version with a newer
-	// applied_at. id increases strictly with insert order in every case.
 	err := m.conn.QueryRow(ctx,
-		fmt.Sprintf("SELECT version FROM %s ORDER BY id DESC LIMIT 1", qualified),
+		fmt.Sprintf("SELECT version FROM %s ORDER BY %s DESC LIMIT 1", qualified, orderBy),
 	).Scan(&version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
