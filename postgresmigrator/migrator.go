@@ -427,6 +427,9 @@ func (m *Migrator) applyMigrationWithTimeout(ctx context.Context, migration Migr
 	})
 
 	if err := m.inTx(mctx, func(tx pgx.Tx) error {
+		if err := uncapSessionTimeouts(mctx, tx); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(mctx, migration.UpSQL); err != nil {
 			return err
 		}
@@ -456,6 +459,9 @@ func (m *Migrator) revertMigration(ctx context.Context, migration Migration, pre
 	})
 
 	if err := m.inTx(mctx, func(tx pgx.Tx) error {
+		if err := uncapSessionTimeouts(mctx, tx); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(mctx, migration.DownSQL); err != nil {
 			return err
 		}
@@ -497,6 +503,23 @@ func (m *Migrator) inTx(ctx context.Context, fn func(pgx.Tx) error) (err error) 
 		return fmt.Errorf("commit transaction: %w", commitErr)
 	}
 	committed = true
+	return nil
+}
+
+// uncapSessionTimeouts disables the server-side statement/lock timeouts for the current
+// transaction. A migrator may run over a connection pool that caps those low for the app's
+// hot path (e.g. goLibMyCarrier/postgres defaults statement_timeout to 30s), which would kill
+// a long DDL — a non-CONCURRENTLY CREATE INDEX on a populated table, say — well before the
+// migrator's own per-migration deadline (migrationTimeout). SET LOCAL scopes the reset to this
+// transaction, so pooled connections are unaffected afterward; the migration is then bounded
+// solely by the migrator's context.
+func uncapSessionTimeouts(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return fmt.Errorf("reset statement_timeout: %w", err)
+	}
+	if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = 0"); err != nil {
+		return fmt.Errorf("reset lock_timeout: %w", err)
+	}
 	return nil
 }
 

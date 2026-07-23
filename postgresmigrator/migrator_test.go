@@ -217,6 +217,30 @@ func TestMigrator_Integration_LegacySchemaVersionTableWithoutID(t *testing.T) {
 	assert.Equal(t, 7, v)
 }
 
+// TestMigrator_Integration_UncapsTimeoutsDuringMigration verifies that each migration runs
+// with statement_timeout/lock_timeout reset to 0, so a pool that caps them low (as the app's
+// runtime pool does) cannot kill a long migration before the migrator's own budget.
+func TestMigrator_Integration_UncapsTimeoutsDuringMigration(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	migrations := []Migration{{
+		Version: 1, Name: "capture_timeouts",
+		UpSQL: "CREATE TABLE captured_timeouts AS SELECT " +
+			"current_setting('statement_timeout') AS stmt, current_setting('lock_timeout') AS lock",
+		DownSQL: "DROP TABLE IF EXISTS captured_timeouts",
+	}}
+	m, err := NewMigrator(pool, NewStdLogger(false), WithMigrations(migrations), WithTablePrefix("tmo"))
+	require.NoError(t, err)
+	require.NoError(t, m.CreateTables(ctx))
+
+	var stmt, lock string
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT stmt, lock FROM captured_timeouts").Scan(&stmt, &lock))
+	assert.Equal(t, "0", stmt, "statement_timeout uncapped inside the migration tx")
+	assert.Equal(t, "0", lock, "lock_timeout uncapped inside the migration tx")
+}
+
 func TestMigrator_Integration(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
