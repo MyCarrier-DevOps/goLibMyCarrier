@@ -5634,8 +5634,6 @@ func TestOverlayComponentState_PipelineLevelStep(t *testing.T) {
 // With the overlay, the just-inserted row is merged in-memory before Update, so the
 // correct aggregate (completed) is written.
 func TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace(t *testing.T) {
-	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
-
 	staleTimestamp := time.Now().Add(-100 * time.Millisecond)
 	insertedAt := time.Now()
 
@@ -5661,7 +5659,7 @@ func TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace(t *testing.T) 
 		{Component: "api", Status: StepStatusRunning},
 		{Component: "worker", Status: StepStatusRunning},
 	}
-	statusWithoutOverlay := store.computeAggregateStatus(activeWithoutOverlay)
+	statusWithoutOverlay := computeAggregateStatus(activeWithoutOverlay)
 	if statusWithoutOverlay != StepStatusRunning {
 		t.Errorf("pre-overlay: expected running aggregate, got %s", statusWithoutOverlay)
 	}
@@ -5680,7 +5678,7 @@ func TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace(t *testing.T) 
 		return all
 	}
 
-	statusOneComplete := store.computeAggregateStatus(collectActive(slip))
+	statusOneComplete := computeAggregateStatus(collectActive(slip))
 	if statusOneComplete != StepStatusRunning {
 		// aggregate still running — worker not finished yet. This is correct.
 		t.Errorf("one-complete: expected running (worker still running), got %s", statusOneComplete)
@@ -5689,7 +5687,7 @@ func TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace(t *testing.T) 
 	// Simulate worker also completing (second CompleteStep call, also with async lag).
 	overlayComponentState(slip, "build", "builds", "worker", StepStatusCompleted, insertedAt)
 
-	statusBothComplete := store.computeAggregateStatus(collectActive(slip))
+	statusBothComplete := computeAggregateStatus(collectActive(slip))
 	if statusBothComplete != StepStatusCompleted {
 		t.Errorf(
 			"both-complete: expected completed aggregate, got %s (this is the regression — without overlay, stuck as running)",
@@ -5704,8 +5702,6 @@ func TestUpdateAggregateStatusFromComponentStates_AsyncInsertRace(t *testing.T) 
 // remains stale (running) even when all components complete, causing Update() to write
 // builds_status=running to the routing_slips scalar column.
 func TestOverlayUpdatesStepsStatus_T1Regression(t *testing.T) {
-	store := NewClickHouseStoreFromSession(&clickhousetest.MockSession{}, testPipelineConfig(), "ci")
-
 	staleTimestamp := time.Now().Add(-100 * time.Millisecond)
 	insertedAt := time.Now()
 	staleStart := staleTimestamp
@@ -5733,7 +5729,7 @@ func TestOverlayUpdatesStepsStatus_T1Regression(t *testing.T) {
 	// This block mirrors the Fix T1 code in updateAggregateStatusFromComponentStates.
 	// Without this block, slip.Steps["builds"].Status stays StepStatusRunning.
 	if comps := slip.Aggregates[aggregateStepName]; len(comps) > 0 {
-		recomputedStatus := store.computeAggregateStatus(comps)
+		recomputedStatus := computeAggregateStatus(comps)
 		if step, ok := slip.Steps[aggregateStepName]; ok {
 			step.ApplyStatusTransition(recomputedStatus, insertedAt)
 			slip.Steps[aggregateStepName] = step

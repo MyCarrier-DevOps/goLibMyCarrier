@@ -886,7 +886,7 @@ func TestI5V2_StormReplay_Synthetic(t *testing.T) {
 	// Mirror computeAggregateStatus's exact precedence (clickhouse_store.go:2396-2427):
 	// any failure wins outright; else all-completed; else any running-or-completed
 	// means the aggregate is still "running" (in progress); else "pending".
-	expectedRollup := store.computeAggregateStatus(perComponentStates)
+	expectedRollup := computeAggregateStatus(perComponentStates)
 
 	t.Logf(
 		"storm-replay: event-log-derived expected rollup (per-component argMax + computeAggregateStatus precedence) = %s",

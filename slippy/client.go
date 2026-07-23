@@ -175,11 +175,10 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 		return nil
 	}
 
-	slip.Status = SlipStatusAbandoned
-
-	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
-	// so there are no version conflicts and Update always succeeds.
-	if err := c.store.Update(ctx, slip); err != nil {
+	// Abandon changes only the top-level status. Use the atomic status-only update rather
+	// than a Load+full-row Update, so a concurrent step/history write is not clobbered by
+	// this stale snapshot (last-write-wins). See SlipStore.UpdateSlipStatus.
+	if err := c.store.UpdateSlipStatus(ctx, correlationID, SlipStatusAbandoned); err != nil {
 		return NewSlipError("abandon", correlationID, err)
 	}
 
@@ -212,8 +211,12 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 	slip.Status = SlipStatusPromoted
 	slip.PromotedTo = promotedTo
 
-	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
-	// so there are no version conflicts and Update always succeeds.
+	// Unlike AbandonSlip, PromoteSlip is not (yet) on the atomic UpdateSlipStatus path: it also
+	// sets PromotedTo, which neither store persists today (no promoted_to column), so switching
+	// would be a no-op for that field in prod but would break the mock-backed tests that assert
+	// PromotedTo round-trips. Fixing this RMW is entangled with deciding whether to persist
+	// PromotedTo — tracked as a follow-up (DEVOPS-202). The full-row Update is at least
+	// serialized now, since PostgresStore.Update takes the per-slip lock.
 	if err := c.store.Update(ctx, slip); err != nil {
 		return NewSlipError("promote", correlationID, err)
 	}

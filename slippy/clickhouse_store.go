@@ -2635,45 +2635,6 @@ func (s *ClickHouseStore) buildStepDetails(slip *Slip) map[string]interface{} {
 	return details
 }
 
-// computeAggregateStatus determines the aggregate status from component statuses.
-// The aggregate is:
-// - "failed" if any component has failed
-// - "completed" if all components are completed
-// - "running" if any component is running OR completed (work is in progress)
-// - "pending" if all components are pending (no work has started)
-func (s *ClickHouseStore) computeAggregateStatus(componentData []ComponentStepData) StepStatus {
-	allCompleted := true
-	anyRunning := false
-	anyCompleted := false
-	anyFailed := false
-
-	for _, comp := range componentData {
-		if comp.Status.IsFailure() {
-			anyFailed = true
-		}
-		if comp.Status.IsSuccess() {
-			anyCompleted = true
-		} else {
-			allCompleted = false
-		}
-		if comp.Status.IsRunning() {
-			anyRunning = true
-		}
-	}
-
-	if anyFailed {
-		return StepStatusFailed
-	}
-	if allCompleted {
-		return StepStatusCompleted
-	}
-	// If any component is running or completed, the aggregate is "running" (in progress)
-	if anyRunning || anyCompleted {
-		return StepStatusRunning
-	}
-	return StepStatusPending
-}
-
 // latestComponentStateRow queries slip_component_states for the argMax-winning
 // (status, timestamp) for the given (correlationID, step, component) tuple.
 //
@@ -2977,7 +2938,7 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStates(
 		// components complete, one placeholder still pending), leaving builds_status stuck
 		// on "running" on feature-branch MC.*/ITM.* repos.
 		if active := filterActiveComponents(slip.Aggregates[aggregateStepName]); len(active) > 0 {
-			recomputedStatus := s.computeAggregateStatus(active)
+			recomputedStatus := computeAggregateStatus(active)
 			if step, ok := slip.Steps[aggregateStepName]; ok {
 				step.ApplyStatusTransition(recomputedStatus, insertedAt)
 				slip.Steps[aggregateStepName] = step
@@ -3136,7 +3097,7 @@ func (s *ClickHouseStore) updateAggregateStatusFromComponentStatesWithHistory(
 		// components complete, one placeholder still pending), leaving builds_status stuck
 		// on "running" on feature-branch MC.*/ITM.* repos.
 		if active := filterActiveComponents(slip.Aggregates[aggregateStepName]); len(active) > 0 {
-			recomputedStatus := s.computeAggregateStatus(active)
+			recomputedStatus := computeAggregateStatus(active)
 			if step, ok := slip.Steps[aggregateStepName]; ok {
 				step.ApplyStatusTransition(recomputedStatus, insertedAt)
 				slip.Steps[aggregateStepName] = step
@@ -3496,7 +3457,7 @@ func (s *ClickHouseStore) applyComponentStatesToAggregate(
 	// Active components are those with entries in the component_states table.
 	// This excludes original placeholder components that have different names
 	// from the actual workflow component names.
-	newStatus := s.computeAggregateStatus(activeComponents)
+	newStatus := computeAggregateStatus(activeComponents)
 
 	step, ok := slip.Steps[aggregateStepName]
 	if !ok {

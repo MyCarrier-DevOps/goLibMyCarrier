@@ -323,9 +323,9 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
 			StateHistory:  []StateHistoryEntry{},
 		})
-		// AbandonSlip internally does Load + Update; fail the Update so abandon errors.
-		// (Create is unaffected by UpdateError, so fresh-slip creation still succeeds.)
-		store.UpdateError = errors.New("clickhouse unavailable")
+		// AbandonSlip does Load + atomic UpdateSlipStatus; fail the status update so abandon
+		// errors. (Create is unaffected, so fresh-slip creation still succeeds.)
+		store.UpdateSlipStatusError = errors.New("clickhouse unavailable")
 
 		opts := PushOptions{
 			CorrelationID: "corr-retrigger-2",
@@ -835,12 +835,12 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Errorf("expected ancestor ID 'corr-ancestor-1', got '%s'", ancestry[0].CorrelationID)
 		}
 
-		// Verify ancestor was abandoned
-		if len(store.UpdateCalls) != 1 {
-			t.Fatalf("expected 1 Update call (abandon), got %d", len(store.UpdateCalls))
+		// Verify ancestor was abandoned (atomic status path)
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Fatalf("expected 1 UpdateSlipStatus call (abandon), got %d", len(store.UpdateSlipStatusCalls))
 		}
-		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
-			t.Errorf("expected ancestor to be abandoned, got status '%s'", store.UpdateCalls[0].Slip.Status)
+		if store.UpdateSlipStatusCalls[0].Status != SlipStatusAbandoned {
+			t.Errorf("expected ancestor to be abandoned, got status '%s'", store.UpdateSlipStatusCalls[0].Status)
 		}
 	})
 
@@ -900,8 +900,11 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 		}
 
 		// Verify no abandonment (ancestor was terminal)
-		if len(store.UpdateCalls) != 0 {
-			t.Errorf("expected 0 Update calls (ancestor was terminal), got %d", len(store.UpdateCalls))
+		if len(store.UpdateSlipStatusCalls) != 0 {
+			t.Errorf(
+				"expected 0 UpdateSlipStatus calls (ancestor was terminal), got %d",
+				len(store.UpdateSlipStatusCalls),
+			)
 		}
 	})
 
@@ -1167,10 +1170,10 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Errorf("expected ancestry entry 'corr-integration-1', got '%s'", ancestry[0].CorrelationID)
 		}
 
-		// No Update calls — integration slip must remain in_progress
-		if len(store.UpdateCalls) != 0 {
-			t.Errorf("expected 0 Update calls (cross-branch slip must not be touched), got %d: %v",
-				len(store.UpdateCalls), store.UpdateCalls)
+		// No abandon — integration slip must remain in_progress
+		if len(store.UpdateSlipStatusCalls) != 0 {
+			t.Errorf("expected 0 UpdateSlipStatus calls (cross-branch slip must not be touched), got %d: %v",
+				len(store.UpdateSlipStatusCalls), store.UpdateSlipStatusCalls)
 		}
 
 		// The integration slip is still in_progress in the store
@@ -1226,11 +1229,11 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 		}
 
 		// Same-branch slip MUST be abandoned
-		if len(store.UpdateCalls) != 1 {
-			t.Fatalf("expected 1 Update call (same-branch abandon), got %d", len(store.UpdateCalls))
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Fatalf("expected 1 UpdateSlipStatus call (same-branch abandon), got %d", len(store.UpdateSlipStatusCalls))
 		}
-		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
-			t.Errorf("expected SlipStatusAbandoned, got %q", store.UpdateCalls[0].Slip.Status)
+		if store.UpdateSlipStatusCalls[0].Status != SlipStatusAbandoned {
+			t.Errorf("expected SlipStatusAbandoned, got %q", store.UpdateSlipStatusCalls[0].Status)
 		}
 	})
 
@@ -1286,11 +1289,14 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 		}
 
 		// Only the same-branch (main) slip should have been abandoned.
-		if len(store.UpdateCalls) != 1 {
-			t.Fatalf("expected exactly 1 Update call (main-old-slip), got %d", len(store.UpdateCalls))
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Fatalf(
+				"expected exactly 1 UpdateSlipStatus call (main-old-slip), got %d",
+				len(store.UpdateSlipStatusCalls),
+			)
 		}
-		if store.UpdateCalls[0].Slip.CorrelationID != "corr-main-old" {
-			t.Errorf("expected 'corr-main-old' to be abandoned, got '%s'", store.UpdateCalls[0].Slip.CorrelationID)
+		if store.UpdateSlipStatusCalls[0].CorrelationID != "corr-main-old" {
+			t.Errorf("expected 'corr-main-old' to be abandoned, got '%s'", store.UpdateSlipStatusCalls[0].CorrelationID)
 		}
 
 		// Integration slip must remain untouched
@@ -1358,15 +1364,18 @@ func TestClient_resolveAndAbandonAncestors(t *testing.T) {
 			t.Fatalf("unexpected warnings: %v", warnings)
 		}
 
-		// Exactly one Update call — the same-branch slip must be abandoned
-		if len(store.UpdateCalls) != 1 {
-			t.Fatalf("expected 1 Update call (same-branch abandon), got %d", len(store.UpdateCalls))
+		// Exactly one abandon — the same-branch slip must be abandoned via the atomic path.
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Fatalf("expected 1 UpdateSlipStatus call (same-branch abandon), got %d", len(store.UpdateSlipStatusCalls))
 		}
-		if store.UpdateCalls[0].Slip.CorrelationID != "corr-main-older" {
-			t.Errorf("expected 'corr-main-older' to be abandoned, got '%s'", store.UpdateCalls[0].Slip.CorrelationID)
+		if store.UpdateSlipStatusCalls[0].CorrelationID != "corr-main-older" {
+			t.Errorf(
+				"expected 'corr-main-older' to be abandoned, got '%s'",
+				store.UpdateSlipStatusCalls[0].CorrelationID,
+			)
 		}
-		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
-			t.Errorf("expected SlipStatusAbandoned, got %q", store.UpdateCalls[0].Slip.Status)
+		if store.UpdateSlipStatusCalls[0].Status != SlipStatusAbandoned {
+			t.Errorf("expected SlipStatusAbandoned, got %q", store.UpdateSlipStatusCalls[0].Status)
 		}
 
 		// Cross-branch slip must remain untouched

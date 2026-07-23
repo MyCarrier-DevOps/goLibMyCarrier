@@ -397,12 +397,15 @@ func TestClient_AbandonSlip(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		// Verify the update was made
-		if len(store.UpdateCalls) != 1 {
-			t.Errorf("expected 1 Update call, got %d", len(store.UpdateCalls))
+		// Verify the update was routed through the atomic status-only path.
+		if len(store.UpdateSlipStatusCalls) != 1 {
+			t.Errorf("expected 1 UpdateSlipStatus call, got %d", len(store.UpdateSlipStatusCalls))
 		}
-		if store.UpdateCalls[0].Slip.Status != SlipStatusAbandoned {
-			t.Errorf("expected status Abandoned, got %s", store.UpdateCalls[0].Slip.Status)
+		if store.UpdateSlipStatusCalls[0].Status != SlipStatusAbandoned {
+			t.Errorf("expected status Abandoned, got %s", store.UpdateSlipStatusCalls[0].Status)
+		}
+		if len(store.UpdateCalls) != 0 {
+			t.Errorf("expected 0 full-row Update calls, got %d", len(store.UpdateCalls))
 		}
 	})
 
@@ -430,8 +433,8 @@ func TestClient_AbandonSlip(t *testing.T) {
 		}
 
 		// Should NOT have updated since already terminal
-		if len(store.UpdateCalls) != 0 {
-			t.Errorf("expected 0 Update calls for terminal slip, got %d", len(store.UpdateCalls))
+		if len(store.UpdateSlipStatusCalls) != 0 {
+			t.Errorf("expected 0 UpdateSlipStatus calls for terminal slip, got %d", len(store.UpdateSlipStatusCalls))
 		}
 	})
 
@@ -471,7 +474,7 @@ func TestClient_AbandonSlip(t *testing.T) {
 			Steps:         make(map[string]Step),
 		}
 		store.AddSlip(slip)
-		store.UpdateError = errors.New("database error")
+		store.UpdateSlipStatusError = errors.New("database error")
 
 		err := client.AbandonSlip(ctx, "corr-abandon-3", "corr-new-slip")
 		if err == nil {
