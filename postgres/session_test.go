@@ -31,6 +31,40 @@ func TestBuildDSN(t *testing.T) {
 	assert.Contains(t, dsn, "slippy_write")
 	assert.Contains(t, dsn, "p%40ss%20word")
 	assert.NotContains(t, dsn, "p@ss word")
+	assert.NotContains(t, dsn, "sslrootcert", "no CA path set -> no sslrootcert param")
+}
+
+func TestBuildDSN_WithSSLRootCert(t *testing.T) {
+	dsn := buildDSN(&PostgresConfig{
+		PgHostname:    "db.example.com",
+		PgUsername:    "u",
+		PgPassword:    "p",
+		PgDatabase:    "ci",
+		PgPort:        "5432",
+		PgSSLMode:     "verify-full",
+		PgSSLRootCert: "/etc/ssl/certs/azure-ca.pem",
+	})
+	assert.Contains(t, dsn, "sslmode=verify-full")
+	assert.Contains(t, dsn, "sslrootcert=%2Fetc%2Fssl%2Fcerts%2Fazure-ca.pem")
+}
+
+func TestBuildRuntimeParams(t *testing.T) {
+	t.Run("defaults as milliseconds", func(t *testing.T) {
+		p := buildRuntimeParams(nil)
+		assert.Equal(t, "30000", p["statement_timeout"])
+		assert.Equal(t, "10000", p["lock_timeout"])
+		assert.Equal(t, "60000", p["idle_in_transaction_session_timeout"])
+	})
+	t.Run("overrides honored", func(t *testing.T) {
+		p := buildRuntimeParams(&PostgresConfig{
+			StatementTimeout:       5 * time.Second,
+			LockTimeout:            2 * time.Second,
+			IdleInTxSessionTimeout: 20 * time.Second,
+		})
+		assert.Equal(t, "5000", p["statement_timeout"])
+		assert.Equal(t, "2000", p["lock_timeout"])
+		assert.Equal(t, "20000", p["idle_in_transaction_session_timeout"])
+	})
 }
 
 func TestIsTransientConnectError(t *testing.T) {

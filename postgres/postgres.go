@@ -22,8 +22,25 @@ const (
 	DefaultMinConns        int32         = 2
 	DefaultConnMaxLifetime time.Duration = 60 * time.Second
 
-	defaultPort    = "5432"
-	defaultSSLMode = "require" // Azure Database for PostgreSQL requires TLS by default.
+	// Server-side statement/lock/transaction timeouts, applied as connection
+	// startup parameters (see session.buildRuntimeParams). They cap the blast
+	// radius of a hung query or a transaction that acquires a per-slip FOR UPDATE
+	// lock and then stalls — without them one stuck transaction blocks every
+	// mutator for that slip indefinitely. Conservative for a control-plane store
+	// whose operations are sub-second; override per env when a workload needs more.
+	DefaultStatementTimeout       time.Duration = 30 * time.Second
+	DefaultLockTimeout            time.Duration = 10 * time.Second
+	DefaultIdleInTxSessionTimeout time.Duration = 60 * time.Second
+
+	defaultPort = "5432"
+	// verify-full is the most hardened sslmode: it encrypts AND authenticates the
+	// server (certificate chain + hostname), closing the MITM gap that plain
+	// "require" leaves open. Azure Database for PostgreSQL presents a publicly
+	// rooted certificate (DigiCert Global Root G2), so verify-full works against
+	// the system trust store with no extra config. A deployment whose runtime lacks
+	// that root, or that fronts PG with a private CA, sets POSTGRES_SSLROOTCERT to a
+	// CA bundle (or, as a last resort, POSTGRES_SSLMODE=require to opt back down).
+	defaultSSLMode = "verify-full"
 )
 
 // validSSLModes is the set of libpq/pgx sslmode values accepted by the driver.
@@ -51,10 +68,20 @@ type PostgresConfig struct {
 	PgDatabase string `mapstructure:"pgdatabase"`
 	PgPort     string `mapstructure:"pgport"`
 	PgSSLMode  string `mapstructure:"pgsslmode"`
+	// PgSSLRootCert is an optional path to a PEM CA bundle used to verify the
+	// server certificate. Leave empty to use the OS trust store (sufficient for
+	// Azure's publicly rooted certificate); set it when fronting PG with a private
+	// CA under sslmode verify-ca/verify-full.
+	PgSSLRootCert string `mapstructure:"pgsslrootcert"`
 
 	MaxConns        int32         `mapstructure:"maxconns"`
 	MinConns        int32         `mapstructure:"minconns"`
 	ConnMaxLifetime time.Duration `mapstructure:"connmaxlifetime"`
+
+	// Server-side timeouts (zero inherits the package default; see ResolveTimeouts).
+	StatementTimeout       time.Duration `mapstructure:"statementtimeout"`
+	LockTimeout            time.Duration `mapstructure:"locktimeout"`
+	IdleInTxSessionTimeout time.Duration `mapstructure:"idleintxsessiontimeout"`
 }
 
 // ResolvePoolSettings returns the pool values to use, substituting the package
@@ -77,6 +104,26 @@ func ResolvePoolSettings(cfg *PostgresConfig) (maxConns, minConns int32, lifetim
 	return maxConns, minConns, lifetime
 }
 
+// ResolveTimeouts returns the server-side timeouts to apply, substituting the
+// package defaults for any zero-valued field in cfg. Exported so callers and
+// tests can introspect what will actually be sent as connection parameters.
+func ResolveTimeouts(cfg *PostgresConfig) (statement, lock, idleInTx time.Duration) {
+	statement, lock, idleInTx = DefaultStatementTimeout, DefaultLockTimeout, DefaultIdleInTxSessionTimeout
+	if cfg == nil {
+		return statement, lock, idleInTx
+	}
+	if cfg.StatementTimeout > 0 {
+		statement = cfg.StatementTimeout
+	}
+	if cfg.LockTimeout > 0 {
+		lock = cfg.LockTimeout
+	}
+	if cfg.IdleInTxSessionTimeout > 0 {
+		idleInTx = cfg.IdleInTxSessionTimeout
+	}
+	return statement, lock, idleInTx
+}
+
 // PostgresLoadConfig loads configuration from POSTGRES_* environment variables
 // using an isolated viper instance (so it does not pollute global viper state).
 func PostgresLoadConfig() (*PostgresConfig, error) {
@@ -84,15 +131,19 @@ func PostgresLoadConfig() (*PostgresConfig, error) {
 	v.SetEnvPrefix("POSTGRES")
 
 	binds := map[string]string{
-		"pghostname":      "POSTGRES_HOSTNAME",
-		"pgusername":      "POSTGRES_USERNAME",
-		"pgpassword":      "POSTGRES_PASSWORD",
-		"pgdatabase":      "POSTGRES_DATABASE",
-		"pgport":          "POSTGRES_PORT",
-		"pgsslmode":       "POSTGRES_SSLMODE",
-		"maxconns":        "POSTGRES_MAX_CONNS",
-		"minconns":        "POSTGRES_MIN_CONNS",
-		"connmaxlifetime": "POSTGRES_CONN_MAX_LIFETIME",
+		"pghostname":             "POSTGRES_HOSTNAME",
+		"pgusername":             "POSTGRES_USERNAME",
+		"pgpassword":             "POSTGRES_PASSWORD",
+		"pgdatabase":             "POSTGRES_DATABASE",
+		"pgport":                 "POSTGRES_PORT",
+		"pgsslmode":              "POSTGRES_SSLMODE",
+		"pgsslrootcert":          "POSTGRES_SSLROOTCERT",
+		"maxconns":               "POSTGRES_MAX_CONNS",
+		"minconns":               "POSTGRES_MIN_CONNS",
+		"connmaxlifetime":        "POSTGRES_CONN_MAX_LIFETIME",
+		"statementtimeout":       "POSTGRES_STATEMENT_TIMEOUT",
+		"locktimeout":            "POSTGRES_LOCK_TIMEOUT",
+		"idleintxsessiontimeout": "POSTGRES_IDLE_IN_TX_SESSION_TIMEOUT",
 	}
 	for key, env := range binds {
 		if err := v.BindEnv(key, env); err != nil {
@@ -153,7 +204,7 @@ func PostgresValidateConfig(cfg *PostgresConfig) error {
 		return errors.New("postgres port is required (should default to 5432)")
 	}
 	if cfg.PgSSLMode == "" {
-		return errors.New("postgres sslmode is required (should default to require)")
+		return errors.New("postgres sslmode is required (should default to verify-full)")
 	}
 	if _, ok := validSSLModes[cfg.PgSSLMode]; !ok {
 		return fmt.Errorf(

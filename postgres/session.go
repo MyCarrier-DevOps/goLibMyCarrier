@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -35,8 +36,27 @@ func buildDSN(cfg *PostgresConfig) string {
 	}
 	q := url.Values{}
 	q.Set("sslmode", cfg.PgSSLMode)
+	if cfg.PgSSLRootCert != "" {
+		q.Set("sslrootcert", cfg.PgSSLRootCert)
+	}
 	u.RawQuery = q.Encode()
 	return u.String()
+}
+
+// buildRuntimeParams renders the server-side timeout GUCs as connection startup
+// parameters. Postgres reads a unitless timeout value as milliseconds.
+func buildRuntimeParams(cfg *PostgresConfig) map[string]string {
+	statement, lock, idleInTx := ResolveTimeouts(cfg)
+	return map[string]string{
+		"statement_timeout":                   millis(statement),
+		"lock_timeout":                        millis(lock),
+		"idle_in_transaction_session_timeout": millis(idleInTx),
+	}
+}
+
+// millis renders a duration as an integer millisecond string for a Postgres GUC.
+func millis(d time.Duration) string {
+	return strconv.FormatInt(d.Milliseconds(), 10)
 }
 
 // NewPostgresSession validates cfg, builds a pgx pool with the resolved pool
@@ -56,6 +76,15 @@ func NewPostgresSession(ctx context.Context, cfg *PostgresConfig) (*PostgresSess
 	poolCfg.MaxConns = maxConns
 	poolCfg.MinConns = minConns
 	poolCfg.MaxConnLifetime = lifetime
+
+	// Apply server-side timeouts as startup parameters so a hung query or a
+	// transaction that stalls while holding a per-slip FOR UPDATE lock is bounded.
+	if poolCfg.ConnConfig.RuntimeParams == nil {
+		poolCfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	for k, v := range buildRuntimeParams(cfg) {
+		poolCfg.ConnConfig.RuntimeParams[k] = v
+	}
 
 	var pool *pgxpool.Pool
 	connect := func() error {

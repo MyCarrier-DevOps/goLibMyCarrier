@@ -92,7 +92,32 @@ func TestPostgresLoadConfig_FromEnv(t *testing.T) {
 	assert.Equal(t, "hunter2", cfg.PgPassword)
 	assert.Equal(t, "ci_test", cfg.PgDatabase)
 	assert.Equal(t, "5432", cfg.PgPort, "port should default to 5432")
-	assert.Equal(t, "require", cfg.PgSSLMode, "sslmode should default to require")
+	assert.Equal(t, "verify-full", cfg.PgSSLMode, "sslmode should default to verify-full")
+}
+
+func TestResolveTimeouts(t *testing.T) {
+	t.Run("nil -> all defaults", func(t *testing.T) {
+		s, l, i := ResolveTimeouts(nil)
+		assert.Equal(t, DefaultStatementTimeout, s)
+		assert.Equal(t, DefaultLockTimeout, l)
+		assert.Equal(t, DefaultIdleInTxSessionTimeout, i)
+	})
+	t.Run("zero fields -> defaults", func(t *testing.T) {
+		s, l, i := ResolveTimeouts(&PostgresConfig{})
+		assert.Equal(t, DefaultStatementTimeout, s)
+		assert.Equal(t, DefaultLockTimeout, l)
+		assert.Equal(t, DefaultIdleInTxSessionTimeout, i)
+	})
+	t.Run("explicit values win", func(t *testing.T) {
+		s, l, i := ResolveTimeouts(&PostgresConfig{
+			StatementTimeout:       15 * time.Second,
+			LockTimeout:            3 * time.Second,
+			IdleInTxSessionTimeout: 45 * time.Second,
+		})
+		assert.Equal(t, 15*time.Second, s)
+		assert.Equal(t, 3*time.Second, l)
+		assert.Equal(t, 45*time.Second, i)
+	})
 }
 
 func TestPostgresLoadConfig_MissingRequired(t *testing.T) {
