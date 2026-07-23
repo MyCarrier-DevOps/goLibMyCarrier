@@ -215,8 +215,8 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 	// sets PromotedTo, which neither store persists today (no promoted_to column), so switching
 	// would be a no-op for that field in prod but would break the mock-backed tests that assert
 	// PromotedTo round-trips. Fixing this RMW is entangled with deciding whether to persist
-	// PromotedTo — tracked as a follow-up. The full-row Update is at least serialized now, since
-	// PostgresStore.Update takes the per-slip lock.
+	// PromotedTo — tracked as a follow-up (DEVOPS-202). The full-row Update is at least
+	// serialized now, since PostgresStore.Update takes the per-slip lock.
 	if err := c.store.Update(ctx, slip); err != nil {
 		return NewSlipError("promote", correlationID, err)
 	}
