@@ -111,6 +111,13 @@ func NewMigratorFromSession(session PoolProvider, logger Logger, opts ...Migrato
 }
 
 // CreateTables applies pending migrations, then runs the ensurers.
+//
+// Concurrency: this reads the current schema version and then applies migrations without a
+// session-level advisory lock, so it assumes a single migrator runs at a time — the intended
+// deployment is one pre-deploy Job (sync-wave/order:0). Because each migration commits inside
+// its own transaction and every step is idempotent (CREATE/ALTER ... IF [NOT] EXISTS), a
+// double-run is self-correcting rather than corrupting. If concurrent migrators ever become
+// possible, wrap this in pg_advisory_lock(<key>) so only one applies at a time.
 func (m *Migrator) CreateTables(ctx context.Context) error {
 	m.logger.Info(ctx, "Creating database tables", nil)
 
@@ -181,8 +188,12 @@ func (m *Migrator) GetSchemaVersion(ctx context.Context) (int, error) {
 	}
 
 	var version int
+	// Order by the monotonic id, not applied_at: applied_at is now() at transaction
+	// start, so concurrent-microsecond ties are unordered and a backward clock could
+	// surface a stale row; a down-migration also writes the older version with a newer
+	// applied_at. id increases strictly with insert order in every case.
 	err := m.conn.QueryRow(ctx,
-		fmt.Sprintf("SELECT version FROM %s ORDER BY applied_at DESC LIMIT 1", qualified),
+		fmt.Sprintf("SELECT version FROM %s ORDER BY id DESC LIMIT 1", qualified),
 	).Scan(&version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil
@@ -352,15 +363,29 @@ func (m *Migrator) migrateDown(ctx context.Context, currentVersion, targetVersio
 }
 
 func (m *Migrator) createSchemaVersionTable(ctx context.Context) error {
+	qualified := m.qualifiedTableName(m.schemaVersionTableName())
 	createSQL := fmt.Sprintf(`
 		CREATE TABLE IF NOT EXISTS %s (
+			id bigserial,
 			version integer NOT NULL,
 			applied_at timestamptz NOT NULL DEFAULT now()
-		)`, m.qualifiedTableName(m.schemaVersionTableName()))
-	if _, err := m.conn.Exec(ctx, createSQL); err != nil {
-		return fmt.Errorf("failed to create %s table: %w", m.schemaVersionTableName(), err)
-	}
-	return nil
+		)`, qualified)
+	// The ALTER backfills the monotonic id on version tables created before it existed, so
+	// GetSchemaVersion can order by a strictly increasing key rather than applied_at.
+	// Idempotent, and ADD COLUMN populates the sequence for any existing rows in physical
+	// (insert) order — matching their applied_at order for this append-only table.
+	alterSQL := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS id bigserial", qualified)
+	// CREATE + backfill run in one transaction (Postgres DDL is transactional) so the
+	// version table can never linger created-but-without-id.
+	return m.inTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, createSQL); err != nil {
+			return fmt.Errorf("failed to create %s table: %w", m.schemaVersionTableName(), err)
+		}
+		if _, err := tx.Exec(ctx, alterSQL); err != nil {
+			return fmt.Errorf("failed to add id column to %s: %w", m.schemaVersionTableName(), err)
+		}
+		return nil
+	})
 }
 
 // applyMigrationWithTimeout applies a single migration in a transaction (DDL +
@@ -433,20 +458,31 @@ func (m *Migrator) revertMigration(ctx context.Context, migration Migration, pre
 
 // inTx runs fn inside a transaction, committing on success and rolling back on
 // error.
-func (m *Migrator) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	tx, err := m.conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+func (m *Migrator) inTx(ctx context.Context, fn func(pgx.Tx) error) (err error) {
+	tx, beginErr := m.conn.Begin(ctx)
+	if beginErr != nil {
+		return fmt.Errorf("begin transaction: %w", beginErr)
 	}
-	if err := fn(tx); err != nil {
-		if rbErr := tx.Rollback(ctx); rbErr != nil {
-			return errors.Join(err, fmt.Errorf("rollback: %w", rbErr))
+	// Roll back on any early exit — including a panic in fn — so the transaction's
+	// connection is always released. Skipped after a successful commit; a genuine
+	// rollback failure is surfaced only when no earlier error already is.
+	committed := false
+	defer func() {
+		if committed {
+			return
 		}
-		return err
+		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) && err == nil {
+			err = fmt.Errorf("rollback: %w", rbErr)
+		}
+	}()
+
+	if fnErr := fn(tx); fnErr != nil {
+		return fnErr
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		return fmt.Errorf("commit transaction: %w", commitErr)
 	}
+	committed = true
 	return nil
 }
 
