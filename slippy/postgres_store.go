@@ -120,14 +120,24 @@ func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 	query := fmt.Sprintf("UPDATE routing_slips SET %s WHERE correlation_id = $%d",
 		strings.Join(sets, ", "), n)
 
-	tag, err := s.pool.Exec(ctx, query, args...)
-	if err != nil {
-		return fmt.Errorf("failed to update slip %s: %w", slip.CorrelationID, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrSlipNotFound
-	}
-	return nil
+	// Serialize this full-row overwrite against the per-slip FOR UPDATE lock the step
+	// mutators hold, so it can no longer interleave with a concurrent updateStepTx commit
+	// and silently clobber it. (Load-then-Update callers such as AbandonSlip/PromoteSlip
+	// still snapshot before this lock; where they change only status they should prefer the
+	// atomic UpdateSlipStatus rather than a full-row write.)
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		if err := lockSlip(ctx, tx, slip.CorrelationID); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("failed to update slip %s: %w", slip.CorrelationID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrSlipNotFound
+		}
+		return nil
+	})
 }
 
 // Load retrieves a slip by correlation ID.

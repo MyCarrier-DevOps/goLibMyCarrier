@@ -105,6 +105,41 @@ func TestPostgresStore_TerminalGuard_Integration(t *testing.T) {
 	assert.Equal(t, StepStatusPending, findComponent(got, "builds", "api").Status)
 }
 
+func TestPostgresStore_TerminalGuard_ExpiredWindowAllowsRerun_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+	mustCreate(t, store, "c1")
+
+	// A build fails (terminal). Backdate the stored row past the freshness window so the next
+	// write reads as a genuine re-run rather than an in-window stale duplicate.
+	require.NoError(t, store.UpdateComponentStatus(ctx, "c1", "api", "component_builds", StepStatusFailed))
+	_, err := pool.Exec(ctx,
+		"UPDATE slip_component_states SET updated_at = now() - interval '1 hour' WHERE correlation_id = $1", "c1")
+	require.NoError(t, err)
+
+	// failed -> running is now allowed (a real retry of a failed build); an in-window write
+	// would be rejected (see TestPostgresStore_TerminalGuard_Integration).
+	require.NoError(t, store.UpdateComponentStatus(ctx, "c1", "api", "component_builds", StepStatusRunning))
+	got, err := store.Load(ctx, "c1")
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusRunning, findComponent(got, "builds", "api").Status, "re-run past window allowed")
+}
+
+func TestPostgresStore_PushParsedBypassesGate_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+	mustCreate(t, store, "c1")
+
+	// push_parsed completes (terminal); a push-webhook retry then resets it to running
+	// immediately — inside the freshness window. The bypass allows it, where a normal step
+	// would be rejected as a stale demotion.
+	require.NoError(t, store.UpdateStep(ctx, "c1", "push_parsed", "", StepStatusCompleted))
+	require.NoError(t, store.UpdateStep(ctx, "c1", "push_parsed", "", StepStatusRunning))
+	got, err := store.Load(ctx, "c1")
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusRunning, got.Steps["push_parsed"].Status, "push_parsed re-push bypasses the gate")
+}
+
 func TestPostgresStore_History_Integration(t *testing.T) {
 	store, _, _ := newMigratedStore(t)
 	ctx := context.Background()

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -144,7 +145,8 @@ func (s *PostgresStore) updateStepTx(
 			return err
 		}
 		if !applied {
-			// The terminal guard rejected a non-terminal status overwriting a terminal one.
+			// The freshness guard rejected a non-terminal status overwriting a still-fresh
+			// terminal one (a stale duplicate/redelivery within the freshness window).
 			return ErrTerminalAlreadyExists
 		}
 
@@ -154,8 +156,15 @@ func (s *PostgresStore) updateStepTx(
 					return err
 				}
 			}
-		} else {
+		} else if s.config.GetStep(stepName) != nil && safeStepNameForDerivePattern.MatchString(stepName) {
 			// Pure pipeline step: the status column on routing_slips is authoritative.
+			// stepName arrives from unvalidated HTTP/CI input through the SlipStore
+			// interface, and is interpolated into the column identifier — so it is spliced
+			// in ONLY after confirming it is a configured step AND a bare identifier
+			// (^[A-Za-z0-9_]+$), which blocks SQL identifier injection. An unknown or
+			// unsafe step name skips this column write; its slip_component_states event was
+			// already recorded above, matching ClickHouse (which materializes only
+			// config-known columns rather than erroring on unknown steps).
 			col := stepName + "_status"
 			upd := fmt.Sprintf("UPDATE routing_slips SET %s = $1, updated_at = now() WHERE correlation_id = $2", col)
 			if _, err := tx.Exec(ctx, upd, string(status), correlationID); err != nil {
@@ -172,8 +181,17 @@ func (s *PostgresStore) updateStepTx(
 
 // upsertComponentState writes the current state for one (step, component), returning
 // whether the write was applied. It reports false (applied=false, err=nil) only when the
-// terminal-monotonicity guard rejected the write: a non-terminal status may not overwrite
-// a terminal one for the same step/component, except the aborted->pending retry reset.
+// I5 terminal-freshness guard rejected the write.
+//
+// The guard ports the ClickHouse enforceTerminalFreshnessGate semantics (same SLIPPY_I5_*
+// knobs) into the upsert's WHERE clause: a non-terminal status may not overwrite a terminal
+// one for the same step/component, but ONLY while the terminal is younger than the freshness
+// window (default 750ms) — the window that discriminates a stale duplicate/redelivery
+// (reject) from a genuine re-run written much later (allow). Additionally allowed: the gate
+// being disabled (SLIPPY_I5_GATE_ENABLED=false), a bypass step's pipeline-level write
+// (push_parsed, so push-webhook retries can reset it), an incoming terminal status, and the
+// aborted->pending cascade-reset. The age is computed entirely on the Postgres server clock
+// (now() vs the stored updated_at, both this one server), so it is immune to clock skew.
 // A non-empty image_tag is preserved when the incoming one is empty.
 func (s *PostgresStore) upsertComponentState(
 	ctx context.Context,
@@ -191,11 +209,24 @@ func (s *PostgresStore) upsertComponentState(
 			image_tag  = CASE WHEN EXCLUDED.image_tag <> '' THEN EXCLUDED.image_tag
 			                  ELSE slip_component_states.image_tag END,
 			updated_at = now()
-		WHERE NOT (slip_component_states.status IN (%s) AND EXCLUDED.status IN (%s))
+		WHERE NOT $8::boolean
+		   OR NOT (slip_component_states.status IN (%s)
+		           AND EXCLUDED.status IN (%s)
+		           AND now() - slip_component_states.updated_at <= $7 * interval '1 millisecond')
 		   OR (slip_component_states.status = 'aborted' AND EXCLUDED.status = 'pending')`,
 		terminalStepStatusesSQL, nonTerminalStepStatusesSQL)
 
-	tag, err := tx.Exec(ctx, q, correlationID, step, component, string(status), message, imageTag)
+	// guarded is false when the gate is disabled or this is a bypass step's pipeline-level
+	// write; then NOT $8 makes the WHERE always true (a plain upsert). Otherwise the terminal
+	// guard applies within the freshness window.
+	window := freshnessWindow()
+	if window > maxFreshnessWindowMS*time.Millisecond {
+		window = maxFreshnessWindowMS * time.Millisecond
+	}
+	guarded := gateEnabled() && (!gateBypassSteps[step] || component != "")
+
+	tag, err := tx.Exec(ctx, q, correlationID, step, component, string(status), message, imageTag,
+		window.Milliseconds(), guarded)
 	if err != nil {
 		return false, fmt.Errorf("failed to record component state %s/%s: %w", step, component, err)
 	}
@@ -260,9 +291,17 @@ func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, corre
 		return fmt.Errorf("failed to iterate component states for %s: %w", aggStep, err)
 	}
 
+	// No component has reported yet (e.g. a pipeline-level StartStep on the aggregate step
+	// before its components exist). Aggregating over an empty set would vacuously resolve to
+	// "completed" and could mis-gate a downstream prerequisite, so leave the aggregate at its
+	// current value. Matches the ClickHouse store, which only aggregates a non-empty set.
+	if len(active) == 0 {
+		return nil
+	}
+
 	// Status is computed over the active components only (excludes any config placeholders
 	// left in the items list), matching filterActiveComponents in the ClickHouse store.
-	status := pgComputeAggregateStatus(active)
+	status := computeAggregateStatus(active)
 
 	itemsJSON, err := json.Marshal(struct {
 		Items []ComponentStepData `json:"items"`
@@ -303,25 +342,45 @@ func (s *PostgresStore) aggregateStepAliases(aggStep string) []string {
 }
 
 // inTx runs fn inside a transaction, committing on success and rolling back on error.
-func (s *PostgresStore) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin transaction: %w", err)
+func (s *PostgresStore) inTx(ctx context.Context, fn func(pgx.Tx) error) (err error) {
+	tx, beginErr := s.pool.Begin(ctx)
+	if beginErr != nil {
+		return fmt.Errorf("begin transaction: %w", beginErr)
 	}
-	if err := fn(tx); err != nil {
-		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
-			return errors.Join(err, fmt.Errorf("rollback: %w", rbErr))
+	// Roll back on any early exit — including a panic in fn — so the transaction's pooled
+	// connection is always released. Skipped after a successful commit; a genuine rollback
+	// failure is surfaced (via the named return) only when no earlier error already is.
+	committed := false
+	defer func() {
+		if committed {
+			return
 		}
-		return err
+		if rbErr := tx.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) && err == nil {
+			err = fmt.Errorf("rollback: %w", rbErr)
+		}
+	}()
+
+	if fnErr := fn(tx); fnErr != nil {
+		return fnErr
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit transaction: %w", err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		return fmt.Errorf("commit transaction: %w", commitErr)
 	}
+	committed = true
 	return nil
 }
 
 // lockSlip takes a row lock on the slip (serializing concurrent updates) and confirms it
 // exists, returning ErrSlipNotFound otherwise.
+//
+// Ordering contract: a step/component update requires the slip's routing_slips row to be
+// already committed by Create. This is a deliberate change from the ClickHouse store, which
+// recorded the component event durably even before the slip existed and retried slip-creation
+// with backoff for ~30 minutes to absorb a producer/consumer race (a CI StartStep arriving
+// before pushhookparser's Create). Postgres Create is synchronous and committed, so that race
+// is rare; when it does occur the update returns ErrSlipNotFound and the caller relies on
+// Kafka at-least-once redelivery to retry once Create has landed, rather than the store
+// buffering the event. Producers must therefore create the slip before emitting step updates.
 func lockSlip(ctx context.Context, tx pgx.Tx, correlationID string) error {
 	var id string
 	err := tx.QueryRow(ctx,
@@ -361,39 +420,4 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 		return ErrSlipNotFound
 	}
 	return nil
-}
-
-// pgComputeAggregateStatus mirrors ClickHouseStore.computeAggregateStatus: any failed ->
-// failed; else all-success -> completed; else any running/completed -> running; else
-// pending. Empty input yields completed (matching the ClickHouse edge behavior).
-func pgComputeAggregateStatus(components []ComponentStepData) StepStatus {
-	allCompleted := true
-	anyRunning := false
-	anyCompleted := false
-	anyFailed := false
-
-	for _, comp := range components {
-		if comp.Status.IsFailure() {
-			anyFailed = true
-		}
-		if comp.Status.IsSuccess() {
-			anyCompleted = true
-		} else {
-			allCompleted = false
-		}
-		if comp.Status.IsRunning() {
-			anyRunning = true
-		}
-	}
-
-	switch {
-	case anyFailed:
-		return StepStatusFailed
-	case allCompleted:
-		return StepStatusCompleted
-	case anyRunning || anyCompleted:
-		return StepStatusRunning
-	default:
-		return StepStatusPending
-	}
 }

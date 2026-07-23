@@ -18,7 +18,7 @@ func expectLock(mock pgxmock.PgxPoolIface, id string) {
 		WillReturnRows(pgxmock.NewRows([]string{"correlation_id"}).AddRow(id))
 }
 
-func TestPgComputeAggregateStatus(t *testing.T) {
+func TestComputeAggregateStatus(t *testing.T) {
 	run := func(status StepStatus) ComponentStepData { return ComponentStepData{Status: status} }
 	tests := []struct {
 		name  string
@@ -34,7 +34,7 @@ func TestPgComputeAggregateStatus(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, pgComputeAggregateStatus(tt.comps))
+			assert.Equal(t, tt.want, computeAggregateStatus(tt.comps))
 		})
 	}
 }
@@ -62,7 +62,7 @@ func TestPostgresStore_UpdateStep_PipelineStep(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "unit_tests", "", "running", "", "").
+		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec("UPDATE routing_slips SET unit_tests_status").
 		WithArgs("running", "c1").
@@ -78,12 +78,49 @@ func TestPostgresStore_UpdateStep_TerminalGuardBlocks(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "unit_tests", "", "running", "", "").
+		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0)) // guard blocked
 	mock.ExpectRollback()
 
 	err := store.UpdateStep(context.Background(), "c1", "unit_tests", "", StepStatusRunning)
 	require.ErrorIs(t, err, ErrTerminalAlreadyExists)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_UpdateStep_PushParsedBypassesGate(t *testing.T) {
+	store, mock := newMockStore(t)
+	// push_parsed is a gate-bypass step: its pipeline-level (component="") write must pass
+	// guarded=false (the 8th upsert arg) so a legitimate push-webhook retry can reset a
+	// terminal push_parsed back to running regardless of the freshness window.
+	mock.ExpectBegin()
+	expectLock(mock, "c1")
+	mock.ExpectExec("INSERT INTO slip_component_states").
+		WithArgs("c1", "push_parsed", "", "running", "", "", pgxmock.AnyArg(), false).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec("UPDATE routing_slips SET push_parsed_status").
+		WithArgs("running", "c1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.UpdateStep(context.Background(), "c1", "push_parsed", "", StepStatusRunning))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_UpdateStep_NonBypassStepIsGuarded(t *testing.T) {
+	store, mock := newMockStore(t)
+	// A normal step's write passes guarded=true (8th arg), so the terminal-freshness guard
+	// in the upsert WHERE is active for it.
+	mock.ExpectBegin()
+	expectLock(mock, "c1")
+	mock.ExpectExec("INSERT INTO slip_component_states").
+		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), true).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec("UPDATE routing_slips SET unit_tests_status").
+		WithArgs("running", "c1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.UpdateStep(context.Background(), "c1", "unit_tests", "", StepStatusRunning))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -109,7 +146,7 @@ func TestPostgresStore_UpdateStep_ComponentAggregate(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "component_builds", "api", "running", "", "").
+		WithArgs("c1", "component_builds", "api", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	// recompute: read current items, read component rows, write back.
 	mock.ExpectQuery("SELECT builds FROM routing_slips").
@@ -131,12 +168,56 @@ func TestPostgresStore_UpdateStep_ComponentAggregate(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+func TestPostgresStore_UpdateStep_InjectionSafe_UnknownStepSkipsColumn(t *testing.T) {
+	store, mock := newMockStore(t)
+	// A crafted / unknown pipeline step name must never be spliced into a column identifier.
+	// The component-state event is still recorded, but no routing_slips column is written
+	// (matching ClickHouse, which materializes only config-known columns). If the guard
+	// regressed, the store would issue an UPDATE that pgxmock has no expectation for and the
+	// test would fail.
+	const evil = "unit_tests_status = 'skipped', builds_status"
+	mock.ExpectBegin()
+	expectLock(mock, "c1")
+	mock.ExpectExec("INSERT INTO slip_component_states").
+		WithArgs("c1", evil, "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	// Deliberately no "UPDATE routing_slips SET ..." expectation.
+	mock.ExpectCommit()
+
+	require.NoError(t, store.UpdateStep(context.Background(), "c1", evil, "", StepStatusRunning))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_UpdateStep_AggregateNoComponents_NotWritten(t *testing.T) {
+	store, mock := newMockStore(t)
+	// A pipeline-level StartStep on an aggregate step before any component reports leaves the
+	// active component set empty; the aggregate must be left untouched rather than resolving
+	// to a vacuous "completed". If the guard regressed, an UPDATE ... SET builds_status would
+	// be issued and fail against the unexpected expectation below.
+	mock.ExpectBegin()
+	expectLock(mock, "c1")
+	mock.ExpectExec("INSERT INTO slip_component_states").
+		WithArgs("c1", "builds", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery("SELECT builds FROM routing_slips").
+		WithArgs("c1").
+		WillReturnRows(pgxmock.NewRows([]string{"builds"}).AddRow([]byte(`{"items":[]}`)))
+	mock.ExpectQuery("FROM slip_component_states").
+		WithArgs("c1", pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"component", "status", "message", "image_tag", "updated_at"}))
+	// Deliberately no "UPDATE routing_slips SET builds_status": empty active set.
+	mock.ExpectCommit()
+
+	require.NoError(t, store.UpdateStep(context.Background(), "c1", "builds", "", StepStatusRunning))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresStore_UpdateStepWithHistory_Pipeline(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "unit_tests", "", "completed", "all green", "").
+		WithArgs("c1", "unit_tests", "", "completed", "all green", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec("UPDATE routing_slips SET unit_tests_status").
 		WithArgs("completed", "c1").

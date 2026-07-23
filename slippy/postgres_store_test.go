@@ -68,9 +68,12 @@ func TestPostgresStore_Create_Upsert(t *testing.T) {
 
 func TestPostgresStore_Update_NotFound(t *testing.T) {
 	store, mock := newMockStore(t)
-	mock.ExpectExec("UPDATE routing_slips SET").
-		WithArgs(anyArgs(len(store.slipColumns()))...).
-		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	// The lock probe finds no row, so Update never issues the UPDATE and the tx rolls back.
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT correlation_id FROM routing_slips WHERE correlation_id = .* FOR UPDATE").
+		WithArgs("missing").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
 
 	err := store.Update(context.Background(), &Slip{CorrelationID: "missing"})
 	require.ErrorIs(t, err, ErrSlipNotFound)
@@ -79,9 +82,15 @@ func TestPostgresStore_Update_NotFound(t *testing.T) {
 
 func TestPostgresStore_Update_OK(t *testing.T) {
 	store, mock := newMockStore(t)
+	// Update now serializes behind the per-slip FOR UPDATE lock inside a transaction.
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT correlation_id FROM routing_slips WHERE correlation_id = .* FOR UPDATE").
+		WithArgs("c1").
+		WillReturnRows(pgxmock.NewRows([]string{"correlation_id"}).AddRow("c1"))
 	mock.ExpectExec("UPDATE routing_slips SET").
 		WithArgs(anyArgs(len(store.slipColumns()))...).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
 
 	require.NoError(t, store.Update(context.Background(), &Slip{
 		CorrelationID: "c1", Status: SlipStatusInProgress,
