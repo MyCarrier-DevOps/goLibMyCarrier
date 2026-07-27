@@ -21,12 +21,14 @@ func staticClient(t *testing.T, serverURL string) *Client {
 }
 
 func TestSendToChannelSuccess(t *testing.T) {
-	var gotPath, gotAuth string
+	var gotPath, gotAuth, gotMethod, gotContentType string
 	var gotBody map[string]any
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
+		gotMethod = r.Method
+		gotContentType = r.Header.Get("Content-Type")
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &gotBody)
 		w.WriteHeader(http.StatusCreated)
@@ -49,10 +51,23 @@ func TestSendToChannelSuccess(t *testing.T) {
 	if gotAuth != "Bearer test-token" {
 		t.Errorf("auth = %q", gotAuth)
 	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want %q", gotMethod, http.MethodPost)
+	}
+	if gotContentType != "application/json" {
+		t.Errorf("Content-Type = %q, want %q", gotContentType, "application/json")
+	}
+	if gotBody["isGroup"] != true {
+		t.Errorf("isGroup = %v, want true", gotBody["isGroup"])
+	}
 	cd, _ := gotBody["channelData"].(map[string]any)
 	ch, _ := cd["channel"].(map[string]any)
 	if ch["id"] != "19:abc@thread.tacv2" {
 		t.Errorf("channel id not propagated: %v", gotBody["channelData"])
+	}
+	tenant, _ := cd["tenant"].(map[string]any)
+	if tenant["id"] != "tenant-1" {
+		t.Errorf("tenant id not propagated: %v", cd["tenant"])
 	}
 }
 
@@ -163,6 +178,22 @@ func TestWithHTTPClientOverride(t *testing.T) {
 	c2 := NewClient(cfg, WithTokenSource(ts), WithHTTPClient(nil))
 	if _, err := c2.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi")); err != nil {
 		t.Fatalf("unexpected error with nil WithHTTPClient override: %v", err)
+	}
+}
+
+func TestNewClientNilConfig(t *testing.T) {
+	c := NewClient(nil)
+	if c == nil {
+		t.Fatal("expected non-nil client for NewClient(nil)")
+	}
+	if c.serviceURL != strings.TrimRight(defaultServiceURL, "/") {
+		t.Errorf("serviceURL = %q, want default %q", c.serviceURL, defaultServiceURL)
+	}
+	if c.tokenSource == nil {
+		t.Error("expected a non-nil default token source")
+	}
+	if c.httpClient == nil || c.httpClient.Timeout != defaultTimeout {
+		t.Errorf("httpClient = %+v, want Timeout %v", c.httpClient, defaultTimeout)
 	}
 }
 

@@ -12,7 +12,8 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// defaultTimeout bounds a single request when no context deadline applies.
+// defaultTimeout bounds each HTTP call the client makes — the token fetch and
+// the send — when no shorter context deadline applies.
 const defaultTimeout = 30 * time.Second
 
 // Sender posts activities to Microsoft Teams via the Bot Connector. Client
@@ -53,15 +54,38 @@ func WithTokenSource(ts oauth2.TokenSource) Option {
 
 // NewClient builds a Client from a validated Config. It constructs a
 // client-credentials token source from the config unless WithTokenSource
-// overrides it.
+// overrides it. A nil cfg (or one with an empty ServiceURL) falls back to the
+// global Bot Connector URL.
+//
+// Token fetches are bounded by the client's HTTP timeout (defaultTimeout,
+// unless overridden via WithHTTPClient): the token source is built after
+// options are applied, with that http.Client injected via oauth2.HTTPClient.
+// Note the per-call ctx passed to SendToChannel governs only the send — it
+// does not bound a cached token's background refresh, since oauth2 bakes in
+// the context given at token-source construction time. This is an oauth2
+// design limitation, not something this package can change.
 func NewClient(cfg *Config, opts ...Option) *Client {
+	su := ""
+	if cfg != nil {
+		su = cfg.ServiceURL
+	}
+	if strings.TrimSpace(su) == "" {
+		su = defaultServiceURL
+	}
+
 	c := &Client{
-		serviceURL:  strings.TrimRight(strings.TrimSpace(cfg.ServiceURL), "/"),
-		tokenSource: newTokenSource(context.Background(), cfg),
-		httpClient:  &http.Client{Timeout: defaultTimeout},
+		serviceURL: strings.TrimRight(strings.TrimSpace(su), "/"),
+		httpClient: &http.Client{Timeout: defaultTimeout},
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.tokenSource == nil { // WithTokenSource may have set it
+		if cfg == nil {
+			cfg = &Config{}
+		}
+		ctx := context.WithValue(context.Background(), oauth2.HTTPClient, c.httpClient)
+		c.tokenSource = newTokenSource(ctx, cfg)
 	}
 	return c
 }
