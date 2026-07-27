@@ -22,9 +22,11 @@ func TestMockSenderRecordsCalls(t *testing.T) {
 
 func TestMockSenderFuncOverride(t *testing.T) {
 	want := errors.New("boom")
-	m := &MockSender{SendToChannelFunc: func(context.Context, string, string, teamsbot.Activity) (teamsbot.SendResult, error) {
-		return teamsbot.SendResult{}, want
-	}}
+	m := &MockSender{
+		SendToChannelFunc: func(context.Context, string, string, teamsbot.Activity) (teamsbot.SendResult, error) {
+			return teamsbot.SendResult{}, want
+		},
+	}
 	if _, err := m.SendToChannel(context.Background(), "c", "t", teamsbot.TextActivity("x")); !errors.Is(err, want) {
 		t.Fatalf("override not used: %v", err)
 	}

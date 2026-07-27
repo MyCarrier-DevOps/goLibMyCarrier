@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -55,5 +56,16 @@ func TestAPIErrorErrorString(t *testing.T) {
 	var target *APIError
 	if !errors.As(error(withCode), &target) {
 		t.Fatal("errors.As should match *APIError")
+	}
+}
+
+func TestAPIErrorErrorStringNoCode(t *testing.T) {
+	noCode := &APIError{Status: 500, Message: "boom"}
+	got := noCode.Error()
+	if !strings.Contains(got, "500") || !strings.Contains(got, "boom") {
+		t.Fatalf("error string = %q, want it to contain status and message", got)
+	}
+	if strings.Contains(got, "[") {
+		t.Fatalf("error string = %q, want no bracketed code when Code is empty", got)
 	}
 }

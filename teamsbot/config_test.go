@@ -70,3 +70,20 @@ func TestLoadConfigFromViperNil(t *testing.T) {
 		t.Fatalf("expected ErrNilViper, got %v", err)
 	}
 }
+
+func TestLoadConfigFromEnv(t *testing.T) {
+	t.Setenv("TEAMS_BOT_APP_ID", "env-app")
+	t.Setenv("TEAMS_BOT_APP_SECRET", "env-secret")
+	t.Setenv("TEAMS_BOT_TENANT_ID", "env-tenant")
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AppID != "env-app" || cfg.AppSecret != "env-secret" || cfg.TenantID != "env-tenant" {
+		t.Fatalf("got %+v", cfg)
+	}
+	if cfg.ServiceURL != defaultServiceURL {
+		t.Fatalf("ServiceURL = %q, want %q", cfg.ServiceURL, defaultServiceURL)
+	}
+}

@@ -23,7 +23,11 @@ type MockSender struct {
 }
 
 // SendToChannel records the call and delegates to SendToChannelFunc when set.
-func (m *MockSender) SendToChannel(ctx context.Context, channelID, tenantID string, act teamsbot.Activity) (teamsbot.SendResult, error) {
+func (m *MockSender) SendToChannel(
+	ctx context.Context,
+	channelID, tenantID string,
+	act teamsbot.Activity,
+) (teamsbot.SendResult, error) {
 	m.Calls = append(m.Calls, MockCall{ChannelID: channelID, TenantID: tenantID, Activity: act})
 	if m.SendToChannelFunc != nil {
 		return m.SendToChannelFunc(ctx, channelID, tenantID, act)

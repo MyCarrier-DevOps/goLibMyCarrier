@@ -83,3 +83,106 @@ func TestSendToChannelValidation(t *testing.T) {
 		t.Error("expected error for empty tenantID")
 	}
 }
+
+func TestNewClientFromEnvSuccess(t *testing.T) {
+	t.Setenv("TEAMS_BOT_APP_ID", "app")
+	t.Setenv("TEAMS_BOT_APP_SECRET", "secret")
+	t.Setenv("TEAMS_BOT_TENANT_ID", "tenant")
+
+	c, err := NewClientFromEnv()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if c == nil {
+		t.Fatal("expected non-nil client")
+	}
+}
+
+func TestNewClientFromEnvMissingEnv(t *testing.T) {
+	t.Setenv("TEAMS_BOT_APP_ID", "")
+	t.Setenv("TEAMS_BOT_APP_SECRET", "")
+	t.Setenv("TEAMS_BOT_TENANT_ID", "")
+
+	if _, err := NewClientFromEnv(); err == nil {
+		t.Fatal("expected error for missing required env vars")
+	}
+}
+
+// errTokenSource is a minimal oauth2.TokenSource whose Token() always fails, used
+// to exercise the token-acquisition error branch of SendToChannel.
+type errTokenSource struct{}
+
+func (errTokenSource) Token() (*oauth2.Token, error) {
+	return nil, errors.New("boom: token endpoint unreachable")
+}
+
+func TestSendToChannelTokenError(t *testing.T) {
+	cfg := &Config{AppID: "id", AppSecret: "s", TenantID: "t", ServiceURL: "http://unused.test"}
+	c := NewClient(cfg, WithTokenSource(errTokenSource{}))
+
+	_, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
+	if err == nil || !strings.Contains(err.Error(), "acquire token") {
+		t.Fatalf("want token acquisition error, got %v", err)
+	}
+}
+
+func TestSendToChannelDecodeError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("not json"))
+	}))
+	defer srv.Close()
+
+	c := staticClient(t, srv.URL)
+	_, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
+	if err == nil || !strings.Contains(err.Error(), "decode response") {
+		t.Fatalf("want decode error, got %v", err)
+	}
+}
+
+func TestWithHTTPClientOverride(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"conv-2","activityId":"act-2"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &Config{AppID: "id", AppSecret: "s", TenantID: "t", ServiceURL: srv.URL}
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "tok", TokenType: "Bearer"})
+
+	c := NewClient(cfg, WithTokenSource(ts), WithHTTPClient(&http.Client{}))
+	res, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res.ConversationID != "conv-2" || res.ActivityID != "act-2" {
+		t.Fatalf("got %+v", res)
+	}
+
+	// WithHTTPClient(nil) must be ignored, leaving the default client usable.
+	c2 := NewClient(cfg, WithTokenSource(ts), WithHTTPClient(nil))
+	if _, err := c2.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi")); err != nil {
+		t.Fatalf("unexpected error with nil WithHTTPClient override: %v", err)
+	}
+}
+
+func TestSendToChannelServiceURLTrim(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"conv-3","activityId":"act-3"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &Config{AppID: "id", AppSecret: "s", TenantID: "t", ServiceURL: srv.URL + "/"}
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "tok", TokenType: "Bearer"})
+	c := NewClient(cfg, WithTokenSource(ts))
+
+	if _, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi")); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPath != "/v3/conversations" {
+		t.Fatalf("path = %q, want %q (no double slash)", gotPath, "/v3/conversations")
+	}
+}
