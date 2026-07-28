@@ -1,12 +1,14 @@
 package teamsbot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -68,6 +70,22 @@ func TestSendToChannelSuccess(t *testing.T) {
 	tenant, _ := cd["tenant"].(map[string]any)
 	if tenant["id"] != "tenant-1" {
 		t.Errorf("tenant id not propagated: %v", cd["tenant"])
+	}
+
+	// The one thing this module exists to do: ship the Adaptive Card with the
+	// right content type so Teams renders it as a card, not raw JSON text.
+	activity, _ := gotBody["activity"].(map[string]any)
+	attachments, _ := activity["attachments"].([]any)
+	if len(attachments) != 1 {
+		t.Fatalf("activity.attachments = %v, want exactly 1", activity["attachments"])
+	}
+	attachment, _ := attachments[0].(map[string]any)
+	if attachment["contentType"] != AdaptiveCardContentType {
+		t.Errorf(
+			"activity.attachments[0].contentType = %v, want %q",
+			attachment["contentType"],
+			AdaptiveCardContentType,
+		)
 	}
 }
 
@@ -231,6 +249,19 @@ func TestSendToChannelAttachmentNoContent(t *testing.T) {
 	}
 }
 
+// countingTransport wraps an http.RoundTripper and counts invocations, letting
+// tests prove a specific transport instance was actually used to make requests
+// (not merely that some client somewhere succeeded).
+type countingTransport struct {
+	base  http.RoundTripper
+	calls int
+}
+
+func (t *countingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	t.calls++
+	return t.base.RoundTrip(req)
+}
+
 func TestWithHTTPClientOverride(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
@@ -241,13 +272,29 @@ func TestWithHTTPClientOverride(t *testing.T) {
 	cfg := &Config{AppID: "id", AppSecret: "s", TenantID: "t", ServiceURL: srv.URL}
 	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "tok", TokenType: "Bearer"})
 
-	c := NewClient(cfg, WithTokenSource(ts), WithHTTPClient(&http.Client{}))
+	custom := &countingTransport{base: http.DefaultTransport}
+	c := NewClient(cfg, WithTokenSource(ts), WithHTTPClient(&http.Client{Transport: custom}))
+
+	// Transport identity: the exact RoundTripper instance passed to
+	// WithHTTPClient must be the one wired into the client, not a copy or a
+	// fresh default. (We deliberately do not assert on Timeout — NewClient
+	// normalizes it as part of hardening.)
+	if c.httpClient.Transport != custom {
+		t.Fatalf("client.httpClient.Transport = %v, want the injected transport %v", c.httpClient.Transport, custom)
+	}
+
 	res, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if res.ConversationID != "conv-2" || res.ActivityID != "act-2" {
 		t.Fatalf("got %+v", res)
+	}
+	if custom.calls != 1 {
+		t.Fatalf(
+			"injected transport calls = %d, want 1 (the injected transport must actually carry the request)",
+			custom.calls,
+		)
 	}
 
 	// WithHTTPClient(nil) must be ignored, leaving the default client usable.
@@ -291,5 +338,97 @@ func TestSendToChannelServiceURLTrim(t *testing.T) {
 	}
 	if gotPath != "/v3/conversations" {
 		t.Fatalf("path = %q, want %q (no double slash)", gotPath, "/v3/conversations")
+	}
+}
+
+// TestNewClientServiceURLShapeError pins the behavior that NewClient (which has
+// no error return) defers a malformed ServiceURL to first use: construction
+// succeeds, but SendToChannel surfaces the shape-validation error instead of
+// silently sending to a bad URL. NewClient itself must not reach for the https
+// check (only ValidateServiceURLShape) — that stricter rule belongs to
+// LoadConfig's validateConfig — so http:// httptest servers keep working
+// elsewhere in this file.
+func TestNewClientServiceURLShapeError(t *testing.T) {
+	cfg := &Config{AppID: "id", AppSecret: "s", TenantID: "t", ServiceURL: "https://h/teams?x=1"}
+	c := NewClient(cfg)
+
+	_, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
+	if err == nil {
+		t.Fatal("expected a ServiceURL shape validation error")
+	}
+	if !strings.Contains(err.Error(), "query or fragment") {
+		t.Fatalf("err = %v, want the ValidateServiceURLShape query/fragment error", err)
+	}
+}
+
+// recordingRoundTripper captures the single request it receives (URL and body)
+// and returns a canned OAuth2 client-credentials token response, so tests can
+// inspect exactly what newTokenSource sent to the Entra ID token endpoint
+// without making a real network call.
+type recordingRoundTripper struct {
+	req  *http.Request
+	body []byte
+}
+
+func (rt *recordingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.req = req
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		rt.body = b
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body: io.NopCloser(
+			bytes.NewReader([]byte(`{"access_token":"tok-123","token_type":"Bearer","expires_in":3600}`)),
+		),
+	}
+	return resp, nil
+}
+
+// TestTokenSourceExchange pins the actual client-credentials exchange request:
+// the token endpoint URL is single-tenant, and the form body carries exactly
+// the fields the Bot Connector's Entra ID app registration expects.
+func TestTokenSourceExchange(t *testing.T) {
+	rt := &recordingRoundTripper{}
+	cfg := &Config{
+		AppID:      "app-id-1",
+		AppSecret:  "app-secret-1",
+		TenantID:   "tenant-xyz",
+		ServiceURL: "https://unused.test/teams",
+	}
+	c := NewClient(cfg, WithHTTPClient(&http.Client{Transport: rt}))
+
+	tok, err := c.tokenSource.Token()
+	if err != nil {
+		t.Fatalf("Token() unexpected error: %v", err)
+	}
+	if tok.AccessToken != "tok-123" {
+		t.Fatalf("AccessToken = %q, want %q", tok.AccessToken, "tok-123")
+	}
+
+	if rt.req == nil {
+		t.Fatal("expected the token endpoint to be called")
+	}
+	wantURL := "https://login.microsoftonline.com/tenant-xyz/oauth2/v2.0/token"
+	if got := rt.req.URL.String(); got != wantURL {
+		t.Errorf("token URL = %q, want %q", got, wantURL)
+	}
+
+	form, err := url.ParseQuery(string(rt.body))
+	if err != nil {
+		t.Fatalf("parse token request body: %v", err)
+	}
+	if got := form.Get("grant_type"); got != "client_credentials" {
+		t.Errorf("grant_type = %q, want %q", got, "client_credentials")
+	}
+	if got := form.Get("client_id"); got != "app-id-1" {
+		t.Errorf("client_id = %q, want %q", got, "app-id-1")
+	}
+	if got := form.Get("client_secret"); got != "app-secret-1" {
+		t.Errorf("client_secret = %q, want %q", got, "app-secret-1")
+	}
+	if got := form.Get("scope"); got != "https://api.botframework.com/.default" {
+		t.Errorf("scope = %q, want %q", got, "https://api.botframework.com/.default")
 	}
 }

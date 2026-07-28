@@ -3,6 +3,8 @@ package teamsbot
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 
 	"github.com/spf13/viper"
 )
@@ -19,33 +21,45 @@ var ErrNilViper = errors.New("viper instance cannot be nil")
 // Teams Bot Connector URL.
 type Config struct {
 	AppID      string `mapstructure:"app_id"`
-	AppSecret  string `mapstructure:"app_secret"`
+	AppSecret  string `mapstructure:"app_secret"  json:"-"`
 	TenantID   string `mapstructure:"tenant_id"`
 	ServiceURL string `mapstructure:"service_url"`
 }
 
-// LoadConfig loads the Teams bot config from environment variables:
+// String implements fmt.Stringer so printing a Config never discloses AppSecret.
+func (c Config) String() string {
+	return fmt.Sprintf("teamsbot.Config{AppID:%q, AppSecret:REDACTED, TenantID:%q, ServiceURL:%q}",
+		c.AppID, c.TenantID, c.ServiceURL)
+}
+
+// GoString implements fmt.GoStringer so %#v also redacts AppSecret.
+func (c Config) GoString() string { return c.String() }
+
+// LoadConfig loads the Teams bot config directly from environment variables:
 //   - TEAMS_BOT_APP_ID     -> AppID      (required)
 //   - TEAMS_BOT_APP_SECRET -> AppSecret  (required)
 //   - TEAMS_BOT_TENANT_ID  -> TenantID   (required)
 //   - TEAMS_SERVICE_URL    -> ServiceURL (optional; defaults to the global URL)
 //
-// It uses an isolated viper instance to avoid global-state pollution.
+// It reads with os.Getenv rather than viper: viper's AutomaticEnv() makes every
+// key in the struct ambiently overridable by any similarly-named environment
+// variable, which is a surprising and hard-to-audit source of misconfiguration.
+// LoadConfigFromViper remains the opt-in seam for callers that want to inject
+// config from a secret manager or other viper-backed source.
 func LoadConfig() (*Config, error) {
-	vp := viper.New()
-	binds := map[string]string{
-		"app_id":      "TEAMS_BOT_APP_ID",
-		"app_secret":  "TEAMS_BOT_APP_SECRET",
-		"tenant_id":   "TEAMS_BOT_TENANT_ID",
-		"service_url": "TEAMS_SERVICE_URL",
+	config := &Config{
+		AppID:      os.Getenv("TEAMS_BOT_APP_ID"),
+		AppSecret:  os.Getenv("TEAMS_BOT_APP_SECRET"),
+		TenantID:   os.Getenv("TEAMS_BOT_TENANT_ID"),
+		ServiceURL: os.Getenv("TEAMS_SERVICE_URL"),
 	}
-	for key, env := range binds {
-		if err := vp.BindEnv(key, env); err != nil {
-			return nil, fmt.Errorf("error binding %s: %w", env, err)
-		}
+	if config.ServiceURL == "" {
+		config.ServiceURL = defaultServiceURL
 	}
-	vp.AutomaticEnv()
-	return LoadConfigFromViper(vp)
+	if err := validateConfig(config); err != nil {
+		return nil, err
+	}
+	return config, nil
 }
 
 // LoadConfigFromViper loads config from a caller-provided viper instance. The
@@ -68,6 +82,21 @@ func LoadConfigFromViper(vp *viper.Viper) (*Config, error) {
 	return &config, nil
 }
 
+// ValidateServiceURLShape rejects values that cannot address the Bot Connector.
+func ValidateServiceURLShape(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("teamsbot: TEAMS_SERVICE_URL is not a valid URL: %w", err)
+	}
+	if !u.IsAbs() || u.Host == "" {
+		return fmt.Errorf("teamsbot: TEAMS_SERVICE_URL must be an absolute URL with a host, got %q", raw)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("teamsbot: TEAMS_SERVICE_URL must not carry a query or fragment, got %q", raw)
+	}
+	return nil
+}
+
 func validateConfig(config *Config) error {
 	if config.AppID == "" {
 		return fmt.Errorf("TEAMS_BOT_APP_ID is required")
@@ -77,6 +106,16 @@ func validateConfig(config *Config) error {
 	}
 	if config.TenantID == "" {
 		return fmt.Errorf("TEAMS_BOT_TENANT_ID is required")
+	}
+	if err := ValidateServiceURLShape(config.ServiceURL); err != nil {
+		return err
+	}
+	u, err := url.Parse(config.ServiceURL)
+	if err != nil {
+		return fmt.Errorf("teamsbot: TEAMS_SERVICE_URL is not a valid URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("teamsbot: TEAMS_SERVICE_URL must use https, got scheme %q", u.Scheme)
 	}
 	return nil
 }

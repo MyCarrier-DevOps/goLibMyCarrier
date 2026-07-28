@@ -36,6 +36,10 @@ type Client struct {
 	serviceURL  string
 	tokenSource oauth2.TokenSource
 	httpClient  *http.Client
+	// initErr is set at construction time when serviceURL fails shape
+	// validation. NewClient has no error return, so SendToChannel surfaces it
+	// on first use instead of the client silently sending to a bad URL.
+	initErr error
 }
 
 // Option customizes a Client at construction time.
@@ -85,6 +89,9 @@ func NewClient(cfg *Config, opts ...Option) *Client {
 		serviceURL: strings.TrimRight(strings.TrimSpace(su), "/"),
 		httpClient: &http.Client{Timeout: defaultTimeout},
 	}
+	if err := ValidateServiceURLShape(c.serviceURL); err != nil {
+		c.initErr = err
+	}
 	for _, opt := range opts {
 		opt(c)
 	}
@@ -125,6 +132,9 @@ func NewClientFromEnv(opts ...Option) (*Client, error) {
 // it returns an *APIError.
 func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, act Activity) (SendResult, error) {
 	var zero SendResult
+	if c.initErr != nil {
+		return zero, c.initErr
+	}
 	if strings.TrimSpace(channelID) == "" {
 		return zero, fmt.Errorf("teamsbot: channelID is required")
 	}
