@@ -155,6 +155,82 @@ func TestSendToChannelDecodeError(t *testing.T) {
 	}
 }
 
+func TestSendToChannelEmptyBodySuccess(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Some Bot Connector responses (e.g. 200/204) carry no body at all. That
+		// must not be treated as a decode failure — the status already confirmed
+		// the activity was accepted.
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	c := staticClient(t, srv.URL)
+	res, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
+	if err != nil {
+		t.Fatalf("unexpected error for empty 2xx body: %v", err)
+	}
+	if res.ConversationID != "" || res.ActivityID != "" {
+		t.Fatalf("got %+v, want zero SendResult", res)
+	}
+}
+
+func TestSendToChannelOversizedBodyError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// A JSON string value that never closes before the maxResponseBody cap:
+		// the LimitReader cuts it off mid-token, forcing io.ErrUnexpectedEOF
+		// rather than a clean io.EOF.
+		_, _ = w.Write([]byte(`{"id":"`))
+		_, _ = w.Write([]byte(strings.Repeat("x", maxResponseBody+10)))
+		_, _ = w.Write([]byte(`"}`))
+	}))
+	defer srv.Close()
+
+	c := staticClient(t, srv.URL)
+	_, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
+	if err == nil || !errors.Is(err, ErrBadResponse) {
+		t.Fatalf("want ErrBadResponse, got %v", err)
+	}
+}
+
+func TestSendToChannelRedirectNotFollowed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "http://example.invalid/other")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	c := staticClient(t, srv.URL)
+	_, err := c.SendToChannel(context.Background(), "19:abc", "t", TextActivity("hi"))
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("want *APIError, got %v", err)
+	}
+	if apiErr.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("status = %d, want %d (redirect must not be followed)", apiErr.Status, http.StatusTemporaryRedirect)
+	}
+}
+
+func TestSendToChannelAttachmentNoContent(t *testing.T) {
+	c := staticClient(t, "http://unused.test")
+
+	nilContent := Activity{
+		Type:        "message",
+		Attachments: []Attachment{{ContentType: AdaptiveCardContentType, Content: nil}},
+	}
+	if _, err := c.SendToChannel(context.Background(), "19:abc", "t", nilContent); err == nil {
+		t.Error("expected error for nil attachment content")
+	}
+
+	nullContent := Activity{
+		Type:        "message",
+		Attachments: []Attachment{{ContentType: AdaptiveCardContentType, Content: json.RawMessage("null")}},
+	}
+	if _, err := c.SendToChannel(context.Background(), "19:abc", "t", nullContent); err == nil {
+		t.Error("expected error for \"null\" attachment content")
+	}
+}
+
 func TestWithHTTPClientOverride(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)

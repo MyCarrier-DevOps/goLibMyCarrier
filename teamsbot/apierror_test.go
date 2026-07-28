@@ -46,6 +46,16 @@ func TestParseAPIError(t *testing.T) {
 			t.Fatalf("retryAfter = %d", e.RetryAfter)
 		}
 	})
+	t.Run("teams thread-blocked shape", func(t *testing.T) {
+		resp := respWith(t, http.StatusForbidden, `{"errorCode":209,"message":"Thread is locked."}`, "")
+		e := parseAPIError(resp)
+		if e.Code != "209" {
+			t.Fatalf("code = %q, want %q", e.Code, "209")
+		}
+		if e.Message != "Thread is locked." {
+			t.Fatalf("message = %q, want %q", e.Message, "Thread is locked.")
+		}
+	})
 }
 
 func TestAPIErrorErrorString(t *testing.T) {

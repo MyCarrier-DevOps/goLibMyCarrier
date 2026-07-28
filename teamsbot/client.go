@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +17,12 @@ import (
 // defaultTimeout bounds each HTTP call the client makes — the token fetch and
 // the send — when no shorter context deadline applies.
 const defaultTimeout = 30 * time.Second
+
+// maxResponseBody caps the success-path read. SendResult is two short IDs.
+const maxResponseBody = 1 << 20
+
+// ErrBadResponse marks a 2xx whose body could not be used.
+var ErrBadResponse = errors.New("teamsbot: decode response")
 
 // Sender posts activities to Microsoft Teams via the Bot Connector. Client
 // implements it; teamsbottest.MockSender is the test double.
@@ -80,6 +88,17 @@ func NewClient(cfg *Config, opts ...Option) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
+	// Harden whatever client we ended up with (default or WithHTTPClient) before
+	// the token source captures it, so the token fetch inherits the same bounds.
+	// Copied by value so we never mutate a client the caller may share.
+	hardened := *c.httpClient
+	if hardened.Timeout == 0 {
+		hardened.Timeout = defaultTimeout
+	}
+	hardened.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	c.httpClient = &hardened
 	if c.tokenSource == nil { // WithTokenSource may have set it
 		if cfg == nil {
 			cfg = &Config{}
@@ -111,6 +130,11 @@ func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, 
 	}
 	if strings.TrimSpace(tenantID) == "" {
 		return zero, fmt.Errorf("teamsbot: tenantID is required")
+	}
+	for i := range act.Attachments {
+		if c := bytes.TrimSpace(act.Attachments[i].Content); len(c) == 0 || string(c) == "null" {
+			return zero, fmt.Errorf("teamsbot: attachment %d has no content", i)
+		}
 	}
 
 	params := conversationParameters{
@@ -154,8 +178,17 @@ func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, 
 	}
 
 	var result SendResult
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return zero, fmt.Errorf("teamsbot: decode response: %w", err)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&result); err != nil {
+		switch {
+		case errors.Is(err, io.EOF):
+			// 200/204 with an empty body: the status already said the activity
+			// was accepted, so there is nothing to decode and nothing failed.
+			return result, nil
+		case errors.Is(err, io.ErrUnexpectedEOF):
+			return zero, fmt.Errorf("%w: body exceeds %d bytes", ErrBadResponse, maxResponseBody)
+		default:
+			return zero, fmt.Errorf("%w: %w", ErrBadResponse, err)
+		}
 	}
 	return result, nil
 }

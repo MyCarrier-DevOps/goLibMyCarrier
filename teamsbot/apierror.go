@@ -36,11 +36,15 @@ func (e *APIError) Error() string {
 }
 
 // botError is the Bot Connector error envelope: {"error":{"code","message"}}.
+// It also tolerates the Teams thread-blocked shape returned for some 403s:
+// {"errorCode":209,"message":"..."}.
 type botError struct {
 	Error struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+	ErrorCode int    `json:"errorCode"`
+	Message   string `json:"message"`
 }
 
 // parseAPIError builds an *APIError from a non-2xx response. It tolerates the
@@ -55,6 +59,12 @@ func parseAPIError(resp *http.Response) *APIError {
 	if json.Unmarshal(raw, &w) == nil {
 		apiErr.Code = w.Error.Code
 		apiErr.Message = w.Error.Message
+		if apiErr.Code == "" && w.ErrorCode != 0 {
+			apiErr.Code = strconv.Itoa(w.ErrorCode)
+		}
+		if apiErr.Message == "" {
+			apiErr.Message = strings.Join(strings.Fields(w.Message), " ")
+		}
 	}
 	if apiErr.Message == "" {
 		apiErr.Message = strings.TrimSpace(string(raw))
