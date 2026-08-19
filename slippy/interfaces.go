@@ -70,6 +70,13 @@ type SlipStore interface {
 	// column, preventing concurrent history appends from being lost under last-write-wins.
 	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
 
+	// DeleteSlip removes a routing slip row and its child rows
+	// (slip_component_states, slip_ancestry) for the given run. Used by the
+	// same-commit repave path (DEVOPS-231): a retrigger of an ended slip deletes
+	// the prior run and creates a fresh one under the new correlation_id.
+	// Deleting a missing slip is not an error (idempotent).
+	DeleteSlip(ctx context.Context, correlationID string) error
+
 	// SetComponentImageTag records the built container image tag for a component in the event log.
 	// stepName is the component step type (e.g. "build"); componentName is the service name.
 	SetComponentImageTag(ctx context.Context, correlationID, stepName, componentName, imageTag string) error

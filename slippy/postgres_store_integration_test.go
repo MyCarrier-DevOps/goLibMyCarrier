@@ -128,3 +128,36 @@ func TestPostgresStore_Ping_Integration(t *testing.T) {
 	store, _, _ := newMigratedStore(t)
 	require.NoError(t, store.Ping(context.Background()))
 }
+
+func TestPostgresStore_DeleteSlip_Cascades_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	slip := &Slip{
+		CorrelationID: "corr-delete-me",
+		Repository:    "owner/repo",
+		Branch:        "integration",
+		CommitSHA:     "sha-delete-cascade",
+		Status:        SlipStatusFailed,
+		Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+		StateHistory:  []StateHistoryEntry{},
+	}
+	require.NoError(t, store.Create(ctx, slip))
+	require.NoError(t, store.UpdateStep(ctx, "corr-delete-me", "builds", "api", StepStatusFailed))
+	require.NoError(t, store.InsertAncestryLink(ctx, slip, AncestryEntry{
+		CorrelationID: "corr-parent", CommitSHA: "sha-parent",
+		Repository: "owner/repo", Branch: "integration",
+		Status: SlipStatusCompleted, CreatedAt: time.Now(),
+	}))
+
+	require.NoError(t, store.DeleteSlip(ctx, "corr-delete-me"))
+
+	_, err := store.Load(ctx, "corr-delete-me")
+	assert.ErrorIs(t, err, ErrSlipNotFound)
+	for _, table := range []string{"slip_component_states", "slip_ancestry"} {
+		var n int
+		require.NoError(t, pool.QueryRow(ctx,
+			"SELECT count(*) FROM "+table+" WHERE correlation_id = $1", "corr-delete-me").Scan(&n))
+		assert.Zero(t, n, table+" rows must cascade away")
+	}
+}

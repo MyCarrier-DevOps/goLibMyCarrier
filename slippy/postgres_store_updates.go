@@ -421,3 +421,23 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 	}
 	return nil
 }
+
+// DeleteSlip removes the slip row and its children in one transaction. Children are
+// deleted explicitly so the method is correct both before and after the cascade FKs
+// of migration v5 exist (release A runs against the pre-FK schema). Reuses inTx (the
+// same begin/commit/rollback wrapper the other write paths in this file use) rather
+// than managing the transaction by hand.
+func (s *PostgresStore) DeleteSlip(ctx context.Context, correlationID string) error {
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		for _, stmt := range []string{
+			"DELETE FROM slip_component_states WHERE correlation_id = $1",
+			"DELETE FROM slip_ancestry WHERE correlation_id = $1",
+			"DELETE FROM routing_slips WHERE correlation_id = $1",
+		} {
+			if _, err := tx.Exec(ctx, stmt, correlationID); err != nil {
+				return fmt.Errorf("delete slip %s: %w", correlationID, err)
+			}
+		}
+		return nil
+	})
+}

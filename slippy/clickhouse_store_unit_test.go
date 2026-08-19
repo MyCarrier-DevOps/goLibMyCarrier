@@ -145,6 +145,22 @@ func TestClickHouseStore_Close(t *testing.T) {
 	})
 }
 
+// TestClickHouseStore_DeleteSlip verifies the ClickHouse store refuses DeleteSlip:
+// Postgres is the operational slip store (DEVOPS-127), and the repave path
+// (DEVOPS-231) must never run against ClickHouse.
+func TestClickHouseStore_DeleteSlip(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	err := store.DeleteSlip(context.Background(), "corr-1")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !strings.Contains(err.Error(), "corr-1") || !strings.Contains(err.Error(), "not supported") {
+		t.Errorf("expected error to name the correlation ID and say 'not supported', got %q", err.Error())
+	}
+}
+
 // TestClickHouseStore_Create tests the Create method.
 func TestClickHouseStore_Create(t *testing.T) {
 	t.Run("successful create", func(t *testing.T) {

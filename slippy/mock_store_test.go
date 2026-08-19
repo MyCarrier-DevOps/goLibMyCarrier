@@ -98,6 +98,7 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	DeleteSlipCalls       []string
 	CloseCalls            int
 
 	// UpdateStepWithHistoryCallCount counts calls to the atomic UpdateStepWithHistory
@@ -132,6 +133,7 @@ type MockStore struct {
 	AppendHistoryError    error
 	SetImageTagError      error
 	UpdateSlipStatusError error
+	DeleteSlipError       error
 	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
@@ -235,6 +237,22 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 	key := slip.Repository + ":" + slip.CommitSHA
 	m.CommitIndex[key] = slip.CorrelationID
 
+	return nil
+}
+
+// DeleteSlip removes the slip and its commit index entry (children live on the
+// Slip struct in the mock, so removing the slip removes everything).
+func (m *MockStore) DeleteSlip(ctx context.Context, correlationID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.DeleteSlipCalls = append(m.DeleteSlipCalls, correlationID)
+	if m.DeleteSlipError != nil {
+		return m.DeleteSlipError
+	}
+	if slip, ok := m.Slips[correlationID]; ok {
+		delete(m.CommitIndex, slip.Repository+":"+slip.CommitSHA)
+		delete(m.Slips, correlationID)
+	}
 	return nil
 }
 
