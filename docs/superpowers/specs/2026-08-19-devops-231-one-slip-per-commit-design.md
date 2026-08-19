@@ -155,6 +155,12 @@ Keep the status-based branching; change only the same-commit **ended** action:
   the existing ended slip (dedup → suppress) is harmless and preserves the real run's
   history. This also retires the shape that produced part of the 10 cross-branch
   duplicates.
+- **Empty-run guard trade-off (accepted):** tests-only repos
+  (`buildable=false` + `RunUnitTests=true` + `AllowSlipWithNoBuilds=true`) always
+  create slips with nil components, so a *webhook-redelivery* retrigger of such a repo
+  is guard-suppressed instead of repaved. Their retrigger capability is the rerun path
+  (retrigger-ci `scope=unit_tests`/`all`), which is unaffected. Regular build repos are
+  untouched — their retriggers carry components and repave normally.
 - **Cross-branch is not special**: repave uniformly; the fresh row carries the new
   push's branch. A fast-forward of an existing SHA onto another branch re-dispatches,
   exactly matching today's observable behavior (which mints a duplicate row instead).
