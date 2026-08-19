@@ -245,13 +245,15 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	t.Run("failed existing slip - supersedes and creates fresh", func(t *testing.T) {
+	t.Run("failed existing slip - repaves (delete + create fresh)", func(t *testing.T) {
 		// A prior pipeline for this EXACT commit ran and FAILED (non-terminal, stuck).
-		// A new push for the same commit (retrigger-ci replay, or webhook re-delivery of
-		// a failed run) must abandon the failed slip and create a FRESH slip with the
-		// caller's correlation ID — NOT reuse it via handlePushRetry. Reusing it returns
-		// a different correlation ID to the caller (slippy-api → pushhookparser), which
-		// reads that as a dedup and suppresses builds + unit tests (the retrigger bug).
+		// A new push for the same commit (webhook re-delivery or same-commit re-push)
+		// must repave: DELETE the failed slip and create a FRESH slip with the caller's
+		// correlation ID — NOT reuse it via handlePushRetry, and not merely abandon it,
+		// per DEVOPS-231's one-row-per-(repository, commit_sha) repave model
+		// (STATE_MACHINE_V3.md). Reusing it via retry returns a different correlation ID
+		// to the caller (slippy-api → pushhookparser), which reads that as a dedup and
+		// suppresses builds + unit tests (the retrigger bug).
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		config := testPipelineConfig()
@@ -290,13 +292,12 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.CreateCalls) != 1 {
 			t.Errorf("expected 1 Create call for fresh slip, got %d", len(store.CreateCalls))
 		}
-		// The old failed slip must be abandoned (terminal, excluded from future live lookups).
-		old, ok := store.Slips["corr-old-failed"]
-		if !ok {
-			t.Fatal("old slip missing from store")
+		// The old failed slip must be DELETED (repave), not abandoned — one row per commit.
+		if _, ok := store.Slips["corr-old-failed"]; ok {
+			t.Error("old failed slip must be deleted on repave, still present")
 		}
-		if old.Status != SlipStatusAbandoned {
-			t.Errorf("expected old failed slip to be abandoned, got %q", old.Status)
+		if len(store.DeleteSlipCalls) != 1 || store.DeleteSlipCalls[0] != "corr-old-failed" {
+			t.Errorf("expected DeleteSlip(corr-old-failed), got %v", store.DeleteSlipCalls)
 		}
 		// handlePushRetry (reset push_parsed -> running) must NOT run for a failed slip.
 		for _, call := range store.UpdateStepCalls {
@@ -306,8 +307,8 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	t.Run("failed existing slip - abandon error is non-fatal, still creates fresh", func(t *testing.T) {
-		// If abandoning the failed slip fails, slip creation must still proceed (with a
+	t.Run("failed existing slip - delete error is non-fatal, still creates fresh", func(t *testing.T) {
+		// If deleting the failed slip fails, slip creation must still proceed (with a
 		// recorded warning). Blocking here would re-introduce the "retrigger never builds"
 		// bug; a lingering failed row is shadowed by the newer slip (version DESC).
 		store := NewMockStore()
@@ -323,9 +324,8 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
 			StateHistory:  []StateHistoryEntry{},
 		})
-		// AbandonSlip does Load + atomic UpdateSlipStatus; fail the status update so abandon
-		// errors. (Create is unaffected, so fresh-slip creation still succeeds.)
-		store.UpdateSlipStatusError = errors.New("clickhouse unavailable")
+		// DeleteSlip errors; Create is unaffected, so fresh-slip creation still succeeds.
+		store.DeleteSlipError = errors.New("postgres unavailable")
 
 		opts := PushOptions{
 			CorrelationID: "corr-retrigger-2",

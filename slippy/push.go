@@ -142,14 +142,14 @@ type CreateSlipResult struct {
 // finds any existing slips for ancestor commits, and ensures they are
 // in a terminal state (abandoning non-terminal slips that are being superseded).
 //
-// Retry vs supersede vs new-slip behavior for the same commit SHA:
+// Retry vs repave vs new-slip behavior for the same commit SHA:
 //   - Existing slip is non-terminal AND in_progress/pending/compensating: retried via
 //     handlePushRetry (same correlation ID is reused) — the pipeline is still in flight,
 //     so re-dispatching would double-run work.
-//   - Existing slip is failed: the stuck slip is abandoned and a fresh slip is created
-//     with the new correlation ID from opts. A failed slip never advances without a step
-//     re-run, so a new push for the same commit (retrigger-ci replay, or webhook
-//     re-delivery of a failed run) is treated as a deliberate request to run CI again.
+//   - Existing slip is failed: the stuck slip is deleted (repaved) and a fresh slip is
+//     created with the new correlation ID from opts. A failed slip never advances without
+//     a step re-run, so a new push for the same commit (webhook re-delivery or a
+//     same-commit re-push) is treated as a deliberate request to run CI again.
 //   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
 //     stale and a fresh slip is created with the new correlation ID from opts. This
 //     prevents resurrecting superseded slips on webhook re-delivery or bot-commit races.
@@ -189,13 +189,13 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//
 		//   - failed: the prior pipeline is stuck. A failed slip never advances on its
 		//     own — it only recovers when its failed STEPS are re-run, which a fresh
-		//     push event does not do. So a new push for the same commit (a retrigger-ci
-		//     replay, or a webhook re-delivery of a failed run) is a deliberate request
-		//     to run CI again. Abandon the failed slip and fall through to fresh-slip
-		//     creation with the caller's correlation_id, so the caller sees a NEW slip
-		//     (not a dedup) and re-dispatches builds + unit tests. This is the
-		//     same-commit case of the "next push supersedes the old slip, creates a new
-		//     one" model (STATE_MACHINE_V3.md §"Pipeline termination without completing").
+		//     push event does not do. So a new push for the same commit (webhook
+		//     re-delivery, or a same-commit re-push of a failed run) is a deliberate
+		//     request to run CI again. Delete (repave) the failed slip and fall through
+		//     to fresh-slip creation with the caller's correlation_id, so the caller sees
+		//     a NEW slip (not a dedup) and re-dispatches builds + unit tests. This keeps
+		//     one row per (repository, commit_sha) rather than leaving a superseded row
+		//     behind (STATE_MACHINE_V3.md §"Pipeline termination without completing").
 		//
 		//   - any OTHER non-terminal slip status — in_progress in practice (the enum also
 		//     defines pending/compensating, which this pipeline does not use; see
@@ -215,19 +215,19 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			return result, nil
 		}
 
-		c.logger.Info(ctx, "Superseding failed slip for same commit (retrigger / re-run)", map[string]interface{}{
-			"superseded_id":     existingSlip.CorrelationID,
-			"superseded_commit": shortSHA(existingSlip.CommitSHA),
-			"superseded_status": string(existingSlip.Status),
-			"superseding_id":    opts.CorrelationID,
+		c.logger.Info(ctx, "Repaving ended slip for same commit (delete + recreate)", map[string]interface{}{
+			"repaved_id":     existingSlip.CorrelationID,
+			"repaved_commit": shortSHA(existingSlip.CommitSHA),
+			"repaved_status": string(existingSlip.Status),
+			"superseding_id": opts.CorrelationID,
 		})
-		if abandonErr := c.AbandonSlip(ctx, existingSlip.CorrelationID, opts.CorrelationID); abandonErr != nil {
-			// Non-fatal: record as a warning and still create the fresh slip. A
-			// lingering non-terminal failed row is shadowed by the newer slip
-			// (LoadLiveByCommit orders by version DESC), and blocking fresh-slip
-			// creation here would re-introduce the "retrigger never builds" bug.
+		if delErr := c.store.DeleteSlip(ctx, existingSlip.CorrelationID); delErr != nil {
+			// Non-fatal: record a warning and still create the fresh slip. Blocking
+			// creation here would re-introduce the "retrigger never builds" bug; if the
+			// stale row survives, the ErrDuplicateSlip backstop (and, post-migration,
+			// the unique index) converges on the next attempt.
 			result.Warnings = append(result.Warnings,
-				fmt.Errorf("failed to abandon superseded failed slip %s: %w", existingSlip.CorrelationID, abandonErr))
+				fmt.Errorf("failed to delete repaved slip %s: %w", existingSlip.CorrelationID, delErr))
 		}
 		// fall through to fresh-slip creation with opts.CorrelationID
 	}
