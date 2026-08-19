@@ -176,36 +176,30 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	//
 	// Exact-SHA intent: this lookup is keyed on the precise commit SHA being pushed,
 	// not on git ancestry — we want to detect "is there an in-flight slip for THIS
-	// commit?". LoadLiveByCommit filters out superseded-terminal statuses
-	// (abandoned/promoted/compensated) at the DB layer so webhook re-deliveries
-	// after the slip was superseded don't resurrect stale rows. The IsTerminal()
-	// guard below remains because LoadLiveByCommit does NOT filter 'completed',
-	// and a completed slip must still fall through to fresh-slip creation.
-	existingSlip, err := c.store.LoadLiveByCommit(ctx, opts.Repository, opts.CommitSHA)
-	if err == nil && existingSlip != nil && !existingSlip.Status.IsTerminal() {
-		// A live (non-terminal) slip already exists for this EXACT commit (existingSlip.Status
-		// is a SlipStatus, not a step status). What we do next depends on whether the prior
+	// commit?". The lookup is LoadByCommit (unfiltered) rather than LoadLiveByCommit
+	// because under one-row-per-commit ANY existing row for this (repo, sha) —
+	// including an abandoned/promoted/compensated row left over from a cross-commit
+	// supersede — must be repaved before Create, or the unique (repository,
+	// commit_sha) index rejects the insert. LoadLiveByCommit would filter those
+	// statuses out at the DB layer, so the code would never see them and the stale
+	// row would survive. LoadByCommit returns ErrSlipNotFound for a missing row
+	// exactly like LoadLiveByCommit did — the err == nil guard shape is unchanged.
+	existingSlip, err := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
+	if err == nil && existingSlip != nil {
+		// A slip already exists for this EXACT commit (existingSlip.Status is a
+		// SlipStatus, not a step status). What we do next depends on whether the prior
 		// pipeline can still make progress on its own:
 		//
-		//   - failed: the prior pipeline is stuck. A failed slip never advances on its
-		//     own — it only recovers when its failed STEPS are re-run, which a fresh
-		//     push event does not do. So a new push for the same commit (webhook
-		//     re-delivery, or a same-commit re-push of a failed run) is a deliberate
-		//     request to run CI again. Delete (repave) the failed slip and fall through
-		//     to fresh-slip creation with the caller's correlation_id, so the caller sees
-		//     a NEW slip (not a dedup) and re-dispatches builds + unit tests. This keeps
-		//     one row per (repository, commit_sha) rather than leaving a superseded row
-		//     behind (STATE_MACHINE_V3.md §"Pipeline termination without completing").
-		//
-		//   - any OTHER non-terminal slip status — in_progress in practice (the enum also
-		//     defines pending/compensating, which this pipeline does not use; see
-		//     STATE_MACHINE_V3.md): the prior pipeline is still in flight, or a concurrent
-		//     create just won the repo:sha race. Reuse the existing slip and reset
-		//     push_parsed via handlePushRetry — re-dispatching builds here would double-run
-		//     work that is already running. The caller (slippy-api → pushhookparser) detects
-		//     that the returned correlation_id differs from the one it sent and suppresses
+		//   - any live, non-terminal slip status OTHER than failed — in_progress in
+		//     practice (the enum also defines pending/compensating, which this
+		//     pipeline does not use; see STATE_MACHINE_V3.md): the prior pipeline is
+		//     still in flight, or a concurrent create just won the repo:sha race.
+		//     Reuse the existing slip and reset push_parsed via handlePushRetry —
+		//     re-dispatching builds here would double-run work that is already
+		//     running. The caller (slippy-api → pushhookparser) detects that the
+		//     returned correlation_id differs from the one it sent and suppresses
 		//     duplicate side-effects.
-		if existingSlip.Status != SlipStatusFailed {
+		if !existingSlip.Status.IsTerminal() && existingSlip.Status != SlipStatusFailed {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
 				return nil, retryErr
@@ -215,6 +209,22 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			return result, nil
 		}
 
+		//   - failed: the prior pipeline is stuck. A failed slip never advances on its
+		//     own — it only recovers when its failed STEPS are re-run, which a fresh
+		//     push event does not do. So a new push for the same commit (webhook
+		//     re-delivery, or a same-commit re-push of a failed run) is a deliberate
+		//     request to run CI again.
+		//
+		//   - terminal (abandoned, promoted, compensated, completed): stale or
+		//     superseded. Resurrecting it on webhook re-delivery or a bot-commit race
+		//     would be wrong, and under one-row-per-commit it must not be left behind
+		//     when the new row is inserted.
+		//
+		// Either way: delete (repave) the existing slip and fall through to
+		// fresh-slip creation with the caller's correlation_id, so the caller sees a
+		// NEW slip (not a dedup) and re-dispatches builds + unit tests. This keeps
+		// one row per (repository, commit_sha) rather than leaving a superseded row
+		// behind (STATE_MACHINE_V3.md §"Pipeline termination without completing").
 		c.logger.Info(ctx, "Repaving ended slip for same commit (delete + recreate)", map[string]interface{}{
 			"repaved_id":     existingSlip.CorrelationID,
 			"repaved_commit": shortSHA(existingSlip.CommitSHA),

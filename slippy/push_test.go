@@ -349,11 +349,14 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	t.Run("new slip for terminal existing slip", func(t *testing.T) {
+	t.Run("terminal existing slip - repaves (delete + create fresh)", func(t *testing.T) {
 		// When a terminal slip (abandoned, promoted, compensated, completed) already
 		// exists for the commit SHA, CreateSlipForPush must NOT call handlePushRetry.
-		// Instead it falls through and creates a fresh slip with the new correlation ID.
-		// This prevents webhook re-delivery or bot-commit races from resurrecting stale slips.
+		// Instead it repaves: delete the old row, then fall through and create a fresh
+		// slip with the new correlation ID. Under one-row-per-commit ANY existing row
+		// for the pushed SHA must be repaved before Create — this prevents webhook
+		// re-delivery or bot-commit races from resurrecting stale slips, and keeps the
+		// unique (repository, commit_sha) index from rejecting the insert.
 		for _, termStatus := range []SlipStatus{
 			SlipStatusAbandoned, SlipStatusPromoted, SlipStatusCompensated, SlipStatusCompleted,
 		} {
@@ -380,7 +383,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 					Repository:    "owner/repo",
 					Branch:        "main",
 					CommitSHA:     "terminal-commit-abc",
-					Components:    []ComponentDefinition{},
+					Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
 				}
 
 				result, err := client.CreateSlipForPush(ctx, opts)
@@ -404,42 +407,95 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 						t.Error("handlePushRetry must not be called for a terminal existing slip")
 					}
 				}
+
+				// One row per (repository, commit_sha): the old terminal slip must be
+				// repaved (deleted), not left behind.
+				if _, ok := store.Slips["corr-terminal-old"]; ok {
+					t.Errorf("[%s] old terminal slip must be deleted on repave (one row per commit)", termStatus)
+				}
+				if len(store.DeleteSlipCalls) != 1 {
+					t.Errorf("[%s] expected 1 DeleteSlip call, got %d", termStatus, len(store.DeleteSlipCalls))
+				}
 			})
 		}
 	})
 
-	t.Run("retry detection uses LoadLiveByCommit not LoadByCommit", func(t *testing.T) {
-		// Guard against accidental regression of the F1 migration. CreateSlipForPush's
-		// retry-detection lookup is exact-SHA intent and must route through
-		// LoadLiveByCommit so superseded-terminal slips (abandoned/promoted/compensated)
-		// are filtered at the DB layer rather than relying solely on the post-call
-		// IsTerminal() guard. The IsTerminal() guard still catches the 'completed'
-		// case since LoadLiveByCommit does not filter completed slips.
+	t.Run("retry detection uses unfiltered LoadByCommit (one row per commit)", func(t *testing.T) {
+		// DEVOPS-231 (one row per commit) reversed the F1-era invariant this guard
+		// used to protect: the retry-detection lookup must now route through
+		// unfiltered LoadByCommit, not LoadLiveByCommit. Under one-row-per-commit,
+		// ANY existing row for the pushed (repo, sha) — including an
+		// abandoned/promoted/compensated row left behind by a cross-commit
+		// supersede — must be found and repaved before Create, or the unique
+		// (repository, commit_sha) index rejects the insert. Live-only filtering
+		// (the old LoadLiveByCommit routing) would hide exactly those rows from the
+		// repave path, leaving them behind.
+		//
+		// This also re-proves the property the old guard actually protected: a
+		// superseded/abandoned same-SHA row is never resurrected via
+		// handlePushRetry. Under the new routing it's still never reused — it's
+		// repaved (deleted) instead of reset.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-abandoned-old",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "routing-check-sha",
+			Status:        SlipStatusAbandoned,
+			Steps:         map[string]Step{},
+			StateHistory:  []StateHistoryEntry{},
+		})
 
 		opts := PushOptions{
 			CorrelationID: "corr-routing-check",
 			Repository:    "owner/repo",
 			Branch:        "main",
 			CommitSHA:     "routing-check-sha",
-			Components:    []ComponentDefinition{},
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
 		}
 
-		_, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if len(store.LoadLiveByCommitCalls) != 1 {
-			t.Errorf("expected exactly 1 LoadLiveByCommit call, got %d", len(store.LoadLiveByCommitCalls))
+		// (a) LoadByCommit is the retained routing: exactly one lookup for the
+		// pushed (repo, sha).
+		if len(store.LoadByCommitCalls) != 1 {
+			t.Errorf("expected exactly 1 LoadByCommit call, got %d", len(store.LoadByCommitCalls))
+		} else if call := store.LoadByCommitCalls[0]; call.Repository != opts.Repository || call.CommitSHA != opts.CommitSHA {
+			t.Errorf("expected LoadByCommit(%q, %q), got LoadByCommit(%q, %q)",
+				opts.Repository, opts.CommitSHA, call.Repository, call.CommitSHA)
 		}
-		if len(store.LoadByCommitCalls) != 0 {
+
+		// (b) LoadLiveByCommit must no longer be consulted on this path.
+		if len(store.LoadLiveByCommitCalls) != 0 {
 			t.Errorf(
-				"expected 0 LoadByCommit calls (retry detection must use LoadLiveByCommit), got %d",
-				len(store.LoadByCommitCalls),
+				"expected 0 LoadLiveByCommit calls (retry detection must use unfiltered LoadByCommit), got %d",
+				len(store.LoadLiveByCommitCalls),
 			)
+		}
+
+		// (c) The abandoned same-SHA row must be repaved, not resurrected: the
+		// caller sees its NEW correlation_id, and the old row was deleted (one
+		// DeleteSlip call, gone from store.Slips) rather than reset via
+		// handlePushRetry (no push_parsed -> running UpdateStep call on the old id).
+		if result.Slip.CorrelationID != opts.CorrelationID {
+			t.Errorf("expected fresh slip %q, got %q", opts.CorrelationID, result.Slip.CorrelationID)
+		}
+		if _, ok := store.Slips["corr-abandoned-old"]; ok {
+			t.Error("abandoned same-SHA row must be repaved (deleted), not left behind")
+		}
+		if len(store.DeleteSlipCalls) != 1 {
+			t.Errorf("expected 1 DeleteSlip call for the abandoned row, got %d", len(store.DeleteSlipCalls))
+		}
+		for _, call := range store.UpdateStepCalls {
+			if call.CorrelationID == "corr-abandoned-old" && call.StepName == "push_parsed" && call.Status == StepStatusRunning {
+				t.Error("abandoned row must not be reused via handlePushRetry (no push_parsed reset on the old id)")
+			}
 		}
 	})
 
