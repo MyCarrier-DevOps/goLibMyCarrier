@@ -655,6 +655,83 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			)
 		}
 	})
+
+	t.Run("cross-branch ended slip - repaves onto the new branch", func(t *testing.T) {
+		// FF-merge shape: SHA built on feature branch, same SHA pushed to integration
+		// after the slip ended. One row per commit: the slip repaves onto the new
+		// branch and the caller re-dispatches (returned == sent).
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-feature-run",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-ff-merge",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-integration-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-ff-merge",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-integration-run" {
+			t.Errorf("expected repave with new id, got %q", result.Slip.CorrelationID)
+		}
+		if result.Slip.Branch != "integration" {
+			t.Errorf("branch must follow the current run, got %q", result.Slip.Branch)
+		}
+		if _, ok := store.Slips["corr-feature-run"]; ok {
+			t.Error("feature-branch run must be deleted (one row per commit)")
+		}
+	})
+
+	t.Run("cross-branch in-flight slip - reuses and keeps original branch", func(t *testing.T) {
+		// Same SHA pushed to a second branch while the first branch's slip is live:
+		// reuse (suppress), slip keeps the original branch. Pre-existing behavior.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-inflight",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-inflight",
+			Status:        SlipStatusInProgress,
+			Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-second-branch",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-inflight",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-inflight" {
+			t.Errorf("expected reuse of in-flight slip, got %q", result.Slip.CorrelationID)
+		}
+		if result.Slip.Branch != "feature/thing" {
+			t.Errorf("in-flight reuse must keep the original branch, got %q", result.Slip.Branch)
+		}
+		if len(store.DeleteSlipCalls) != 0 {
+			t.Error("in-flight slip must never be repaved")
+		}
+	})
 }
 
 func TestClient_InitializeSlipForPush(t *testing.T) {
