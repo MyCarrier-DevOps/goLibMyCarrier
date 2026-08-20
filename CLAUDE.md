@@ -91,7 +91,7 @@ make lint            # golangci-lint (NOT raw `golangci-lint run`)
 make test            # go test w/ race + count + coverage flags (NOT raw `go test ./...`)
 make fmt             # gofmt/goimports (NOT raw `gofmt -l`)
 make tidy            # go mod tidy across all modules
-make check-sec       # gosec scan (NOT raw `gosec ./...`)
+make check-sec       # govulncheck vulnerability scan (NOT raw `govulncheck ./...`)
 make check-coverage  # coverage threshold gate
 make mutation        # mutation-test lines changed vs MUTATION_BASE — diff-scoped pre-merge gate
 make mutation-all    # mutation-test a module in full — periodic audit, not a pre-merge gate
@@ -121,10 +121,11 @@ versioned packages, not a single service or binary. The root `go.mod`
 tracking; consumers import each package by its own module path
 (`.../goLibMyCarrier/slippy`, `.../goLibMyCarrier/clickhouse`, `.../goLibMyCarrier/logger`, …).
 
-There are 16 modules, each with its own `go.mod` (the root `.` plus the dirs in
+There are 18 modules, each with its own `go.mod` (the root `.` plus the dirs in
 the Makefile's `LIB_DIRS`): `argocdclient`, `auth`, `cievents`, `clickhouse`,
 `clickhousemigrator`, `github`, `kafka`, `logger`, `otel`, `pollyapi`,
-`repocanon`, `slippy`, `slippyapi`, `vault`, `yaml`. The `make` targets iterate
+`postgres`, `postgresmigrator`, `repocanon`, `slippy`, `slippyapi`, `teamsbot`,
+`vault`, `yaml`. The `make` targets iterate
 `LIB_DIRS`, and CI discovers modules dynamically (`find . -name go.mod`) and fans
 out per-module matrix jobs for test, lint, and vuln, then tags and releases every
 module at one shared version.
