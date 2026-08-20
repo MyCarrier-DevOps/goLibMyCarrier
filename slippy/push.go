@@ -259,7 +259,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			"repaved_status": string(existingSlip.Status),
 			"superseding_id": opts.CorrelationID,
 		})
-		if delErr := c.store.DeleteSlip(ctx, existingSlip.CorrelationID); delErr != nil {
+		if delErr := c.store.DeleteSlip(ctx, existingSlip.CorrelationID, opts.CorrelationID); delErr != nil {
 			// Non-fatal: record a warning and still create the fresh slip. Blocking
 			// creation here would re-introduce the "retrigger never builds" bug; if the
 			// stale row survives, the ErrDuplicateSlip backstop (and, post-migration,
@@ -367,7 +367,7 @@ func (c *Client) handleDuplicateSlipBackstop(
 		"repaved_status": string(conflicting.Status),
 		"superseding_id": opts.CorrelationID,
 	})
-	if delErr := c.store.DeleteSlip(ctx, conflicting.CorrelationID); delErr != nil {
+	if delErr := c.store.DeleteSlip(ctx, conflicting.CorrelationID, opts.CorrelationID); delErr != nil {
 		// Fatal here (unlike the non-fatal delete in the main repave block above):
 		// this backstop is already the last-resort convergence path, so there is
 		// nothing further to fall back on if the stale row survives and the retry

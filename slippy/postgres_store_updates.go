@@ -422,17 +422,93 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 	return nil
 }
 
-// DeleteSlip removes the slip row and its children in one transaction. Children are
-// deleted explicitly so the method is correct both before and after the cascade FKs
-// of migration v5 exist (release A runs against the pre-FK schema). Reuses inTx (the
-// same begin/commit/rollback wrapper the other write paths in this file use) rather
-// than managing the transaction by hand.
-func (s *PostgresStore) DeleteSlip(ctx context.Context, correlationID string) error {
+// deletableSlipStatusesSQL is the set of statuses DeleteSlip's guard treats as "ended" and
+// therefore safe to repave. Kept separate from the terminal-monotonicity guard's
+// terminalStepStatusesSQL/nonTerminalStepStatusesSQL above (those are STEP statuses;
+// this is the top-level SLIP status).
+const deletableSlipStatusesSQL = "'failed','completed','abandoned','promoted','compensated'"
+
+// DeleteSlip repaves an ended slip: it deletes the routing_slips row and its children
+// (slip_component_states, slip_ancestry) in one transaction, but only when the row is
+// actually ended (status IN failed/completed/abandoned/promoted/compensated). The delete
+// is status-guarded so a slip that recovered to live (e.g. failed -> in_progress via
+// executor.go's recovery branch) between the caller's snapshot-based repave decision and
+// this call is never destroyed out from under an in-flight run (TOCTOU fix, bd
+// DEVOPS-231 review).
+//
+// successorCorrelationID is the new run's correlation ID that is replacing the deleted
+// slip. Any OTHER slip whose slip_ancestry.parent_correlation_id points at correlationID
+// is repointed to successorCorrelationID — inside the same transaction, before the parent
+// row is removed — rather than left dangling, which would silently truncate its
+// ResolveAncestry walk at this hop. When successorCorrelationID is empty (no successor to
+// point at), those descendant links are deleted instead of repointed.
+//
+// Return values:
+//   - nil: the row was deleted (its status matched the ended set), or it did not exist to
+//     begin with (idempotent).
+//   - ErrSlipWentLive: the row exists but its status is no longer one of the ended
+//     statuses — it went live between the repave decision and this call. The row (and its
+//     children, and any descendant ancestry links) are left untouched; the caller must not
+//     create a fresh slip in this case.
+//   - any other error: an unexpected failure; the transaction is rolled back and no
+//     partial state is left behind.
+//
+// Children (and the descendant repoint/clear) are only committed because this all runs in
+// one transaction: if the guarded delete below is rejected, the fn returns a non-nil
+// error and inTx rolls back everything, including the descendant repoint issued earlier —
+// so a still-live slip's descendants are never repointed away from it. Children are
+// deleted explicitly (not via cascade FKs) so the method is correct both before and after
+// migration v5's cascade FKs exist (Phase A runs against the pre-FK schema).
+func (s *PostgresStore) DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error {
 	return s.inTx(ctx, func(tx pgx.Tx) error {
+		if successorCorrelationID != "" {
+			if _, err := tx.Exec(ctx,
+				"UPDATE slip_ancestry SET parent_correlation_id = $1 WHERE parent_correlation_id = $2",
+				successorCorrelationID, correlationID,
+			); err != nil {
+				return fmt.Errorf("repoint descendants of slip %s to %s: %w",
+					correlationID, successorCorrelationID, err)
+			}
+		} else {
+			if _, err := tx.Exec(ctx,
+				"DELETE FROM slip_ancestry WHERE parent_correlation_id = $1", correlationID,
+			); err != nil {
+				return fmt.Errorf("clear descendant ancestry links for slip %s: %w", correlationID, err)
+			}
+		}
+
+		tag, err := tx.Exec(ctx,
+			"DELETE FROM routing_slips WHERE correlation_id = $1 AND status IN ("+deletableSlipStatusesSQL+")",
+			correlationID,
+		)
+		if err != nil {
+			return fmt.Errorf("delete slip %s: %w", correlationID, err)
+		}
+
+		if tag.RowsAffected() == 0 {
+			// Either the guard rejected the delete (row exists, status no longer ended) or
+			// the row was already gone (idempotent no-op) — distinguish the two within this
+			// same transaction so the rollback (went-live) and commit (missing) cases stay
+			// separate.
+			var id string
+			checkErr := tx.QueryRow(ctx,
+				"SELECT correlation_id FROM routing_slips WHERE correlation_id = $1", correlationID,
+			).Scan(&id)
+			switch {
+			case checkErr == nil:
+				return fmt.Errorf("delete slip %s: %w", correlationID, ErrSlipWentLive)
+			case isNoRows(checkErr):
+				return nil
+			default:
+				return fmt.Errorf("checking existence of slip %s: %w", correlationID, checkErr)
+			}
+		}
+
+		// Only clean up children now that the parent delete actually removed the row —
+		// never orphan-clean a slip that was not, in fact, deleted.
 		for _, stmt := range []string{
 			"DELETE FROM slip_component_states WHERE correlation_id = $1",
 			"DELETE FROM slip_ancestry WHERE correlation_id = $1",
-			"DELETE FROM routing_slips WHERE correlation_id = $1",
 		} {
 			if _, err := tx.Exec(ctx, stmt, correlationID); err != nil {
 				return fmt.Errorf("delete slip %s: %w", correlationID, err)

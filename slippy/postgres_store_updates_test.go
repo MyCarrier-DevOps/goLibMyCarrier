@@ -302,3 +302,122 @@ func TestPostgresStore_SetComponentImageTag_NotFound(t *testing.T) {
 	assert.Contains(t, err.Error(), "not found")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
+
+// TestPostgresStore_DeleteSlip_EndedSlip_RepointsSuccessor pins the happy repave path: an
+// ended slip (status IN the ended set) is deleted, descendants pointing at it are
+// repointed to the successor BEFORE the parent row is removed, and children are cleaned up
+// only because the guarded delete actually removed the row.
+func TestPostgresStore_DeleteSlip_EndedSlip_RepointsSuccessor(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE slip_ancestry SET parent_correlation_id").
+		WithArgs("new-id", "old-id").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec("DELETE FROM slip_component_states").
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.DeleteSlip(context.Background(), "old-id", "new-id"))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_DeleteSlip_EndedSlip_NoSuccessor_ClearsDescendants covers the "no
+// successor" branch: with successorCorrelationID == "", descendant links are deleted
+// rather than repointed (there is nothing to point them at).
+func TestPostgresStore_DeleteSlip_EndedSlip_NoSuccessor_ClearsDescendants(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec("DELETE FROM slip_component_states").
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.DeleteSlip(context.Background(), "old-id", ""))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_DeleteSlip_LiveSlip_RejectedWithErrSlipWentLive pins the TOCTOU guard:
+// when the row still exists but its status is no longer ended (it recovered to live
+// between the caller's repave decision and this call), the delete must be rejected with
+// ErrSlipWentLive and the transaction rolled back — no children touched, no descendants
+// repointed.
+func TestPostgresStore_DeleteSlip_LiveSlip_RejectedWithErrSlipWentLive(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0)) // guard rejected: status no longer ended
+	mock.ExpectQuery(`SELECT correlation_id FROM routing_slips WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnRows(pgxmock.NewRows([]string{"correlation_id"}).AddRow("old-id"))
+	mock.ExpectRollback()
+
+	err := store.DeleteSlip(context.Background(), "old-id", "")
+	require.ErrorIs(t, err, ErrSlipWentLive)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_DeleteSlip_MissingSlip_ReturnsNil pins the pre-existing idempotent
+// case: deleting a slip that does not exist at all is not an error.
+func TestPostgresStore_DeleteSlip_MissingSlip_ReturnsNil(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
+		WithArgs("ghost").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("ghost").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectQuery(`SELECT correlation_id FROM routing_slips WHERE correlation_id = \$1`).
+		WithArgs("ghost").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectCommit()
+
+	require.NoError(t, store.DeleteSlip(context.Background(), "ghost", ""))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_DeleteSlip_StatusGuard_CoversEndedStatuses pins the exact ended-status
+// set the guard allows: failed, completed, abandoned, promoted, compensated.
+func TestPostgresStore_DeleteSlip_StatusGuard_CoversEndedStatuses(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
+	mock.ExpectExec(
+		`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN ` +
+			`\('failed','completed','abandoned','promoted','compensated'\)`,
+	).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec("DELETE FROM slip_component_states").
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.DeleteSlip(context.Background(), "old-id", ""))
+	require.NoError(t, mock.ExpectationsWereMet())
+}

@@ -70,7 +70,13 @@ type MockStore struct {
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
 	DeleteSlipCalls       []string
-	CloseCalls            int
+	// DeleteSlipSuccessorCalls parallels DeleteSlipCalls with the successorCorrelationID
+	// argument from the same call (empty string when none was passed). The in-memory
+	// mock has no slip_ancestry-equivalent table to repoint (InsertAncestryLink/
+	// ResolveAncestry are no-ops below), so it does not replicate PostgresStore's
+	// descendant-repoint behavior — this only records the argument for assertions.
+	DeleteSlipSuccessorCalls []string
+	CloseCalls               int
 
 	// Ping tracking and error injection
 	PingCalls int
@@ -203,12 +209,16 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 	return nil
 }
 
-// DeleteSlip removes the slip and its commit index entry (children live on the
-// Slip struct in the mock, so removing the slip removes everything).
-func (m *MockStore) DeleteSlip(ctx context.Context, correlationID string) error {
+// DeleteSlip removes the slip and its commit index entry (children live on the Slip
+// struct in the mock, so removing the slip removes everything). successorCorrelationID
+// is recorded in DeleteSlipSuccessorCalls but otherwise unused: the mock has no
+// slip_ancestry-equivalent table for descendants to be repointed away from (see
+// DeleteSlipSuccessorCalls's doc comment).
+func (m *MockStore) DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.DeleteSlipCalls = append(m.DeleteSlipCalls, correlationID)
+	m.DeleteSlipSuccessorCalls = append(m.DeleteSlipSuccessorCalls, successorCorrelationID)
 	if m.DeleteSlipError != nil {
 		return m.DeleteSlipError
 	}

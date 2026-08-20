@@ -154,10 +154,17 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 // LoadByCommit retrieves the slip for (repository, commitSHA).
 // Repository comparison is case-insensitive.
 func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
-	// one row per (repo, sha) — DEVOPS-231; LIMIT 1 is belt-and-braces for pre-cleanup data
+	// ORDER BY updated_at DESC is required, not decorative: Phase A (DEVOPS-231) ships
+	// ahead of the Phase B cleanup + uq_routing_slips_repo_sha unique index, so duplicate
+	// rows for the same (repository, commit_sha) can still exist in production today.
+	// Without an explicit order, Postgres gives LIMIT 1 no ordering guarantee, so this
+	// could nondeterministically return a stale duplicate (e.g. an old abandoned row)
+	// instead of the most-recently-updated one — and a caller that treats a stale row as
+	// "the" slip can repave a live pipeline out from under itself. Once Phase B lands
+	// there is one row per commit and this ordering costs nothing extra.
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
-			"LIMIT 1",
+			"ORDER BY updated_at DESC LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
@@ -165,11 +172,17 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 // LoadLiveByCommit returns the live slip for (repository, commitSHA),
 // excluding terminal-superseded statuses (abandoned, promoted, compensated).
 func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
-	// one row per (repo, sha) — DEVOPS-231; LIMIT 1 is belt-and-braces for pre-cleanup data
+	// ORDER BY updated_at DESC is required for the same reason as LoadByCommit: Phase A
+	// ships ahead of the Phase B cleanup + unique index, so duplicate rows can still
+	// exist today. The status filter alone does not close this gap either — it excludes
+	// abandoned/promoted/compensated but not a stale "completed" duplicate, which
+	// LIMIT 1 could otherwise surface ahead of the live in_progress row without an
+	// explicit order. Once Phase B lands there is one row per commit and this ordering
+	// costs nothing extra.
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"AND status NOT IN ('abandoned', 'promoted', 'compensated') "+
-			"LIMIT 1",
+			"ORDER BY updated_at DESC LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }

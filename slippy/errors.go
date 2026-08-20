@@ -103,6 +103,25 @@ var (
 	// unique index (uq_routing_slips_repo_sha). The push path treats it as "someone
 	// else holds the row" and routes to the repave/dedup backstop (DEVOPS-231).
 	ErrDuplicateSlip = errors.New("a slip already exists for this repository and commit")
+
+	// ErrSlipWentLive indicates DeleteSlip's status guard rejected a repave: the slip
+	// became live between the repave decision and the delete; do not repave. Concretely,
+	// the row still exists but its status is no longer one of the ended statuses
+	// (failed, completed, abandoned, promoted, compensated) that DeleteSlip requires —
+	// for example a failed slip can recover to in_progress via executor.go's recovery
+	// branch in the window between a caller's snapshot-based "this slip is ended" decision
+	// and the DeleteSlip call. The row is left untouched. Callers must not proceed to
+	// create a fresh slip in this case, since the existing slip is a live run.
+	ErrSlipWentLive = errors.New("slip went live between the repave decision and the delete")
+
+	// ErrDeleteSlipUnsupported indicates the store cannot repave (delete-and-recreate) a
+	// slip. The ClickHouse store returns this from DeleteSlip, wrapped with the
+	// correlation ID via %w, since it is not the operational slip store (DEVOPS-127) and
+	// implements no delete path. Callers should detect it with errors.Is and fall back to
+	// abandon semantics (mark the superseded slip abandoned) rather than treating it as a
+	// fatal, unrecoverable error.
+	ErrDeleteSlipUnsupported = errors.New(
+		"store does not support DeleteSlip; caller should fall back to abandon semantics")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

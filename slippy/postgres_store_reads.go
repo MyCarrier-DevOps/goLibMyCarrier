@@ -7,10 +7,14 @@ import (
 )
 
 // FindByCommits returns the slip matching the highest-priority commit in the ordered
-// list (earliest in the list wins). Pre-DEVOPS-231-cleanup duplicate rows for the same
-// commit are tie-broken by most-recent update; post-cleanup there is one row per commit
-// and no tie to break. Terminal-superseded statuses (abandoned, promoted, compensated)
-// are excluded. Returns ErrSlipNotFound when no live slip matches any commit.
+// list (earliest in the list wins). The secondary ORDER BY (s.updated_at DESC) is
+// required, not decorative: Phase A (DEVOPS-231) ships ahead of the Phase B cleanup +
+// uq_routing_slips_repo_sha unique index, so duplicate rows for the same commit can
+// still tie on commit priority today; this breaks that tie deterministically. Once
+// Phase B lands there is one row per commit and no same-commit tie to break, so the
+// ordering costs nothing extra. Terminal-superseded statuses (abandoned, promoted,
+// compensated) are excluded. Returns ErrSlipNotFound when no live slip matches any
+// commit.
 func (s *PostgresStore) FindByCommits(
 	ctx context.Context,
 	repository string,
@@ -21,10 +25,10 @@ func (s *PostgresStore) FindByCommits(
 	}
 
 	// c.priority orders across the distinct commits in the list. s.updated_at is a
-	// secondary key: pre-DEVOPS-231-cleanup duplicate rows for the same commit can
-	// still tie on c.priority, so this breaks that tie (belt-and-braces, same as
-	// LoadByCommit/LoadLiveByCommit); post-cleanup there's one row per commit and no
-	// same-commit tie to break.
+	// required secondary key while pre-Phase-B duplicate rows for the same commit can
+	// still tie on c.priority today (same reason as LoadByCommit/LoadLiveByCommit); once
+	// the Phase B cleanup + unique index land there is one row per commit and no
+	// same-commit tie to break, so the ordering costs nothing extra.
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s
@@ -46,10 +50,12 @@ func (s *PostgresStore) FindByCommits(
 }
 
 // FindAllByCommits returns every slip matching any commit in the ordered list, ordered by
-// commit priority (pre-DEVOPS-231-cleanup duplicate rows for the same commit are
-// secondarily ordered by most-recent update; post-cleanup there's one row per commit).
-// Unlike FindByCommits it does not exclude terminal-superseded statuses. An empty commit
-// list returns an empty result (not an error).
+// commit priority. The secondary ORDER BY (s.updated_at DESC) is required, not
+// decorative, for the same reason as FindByCommits: pre-Phase-B duplicate rows for the
+// same commit are secondarily ordered by most-recent update today; once Phase B lands
+// there's one row per commit and this ordering costs nothing extra. Unlike FindByCommits
+// it does not exclude terminal-superseded statuses. An empty commit list returns an
+// empty result (not an error).
 func (s *PostgresStore) FindAllByCommits(
 	ctx context.Context,
 	repository string,
@@ -60,10 +66,10 @@ func (s *PostgresStore) FindAllByCommits(
 	}
 
 	// c.priority orders across the distinct commits in the list. s.updated_at is a
-	// secondary key: pre-DEVOPS-231-cleanup duplicate rows for the same commit can
-	// still tie on c.priority, so this breaks that tie (belt-and-braces, same as
-	// LoadByCommit/LoadLiveByCommit); post-cleanup there's one row per commit and no
-	// same-commit tie to break.
+	// required secondary key while pre-Phase-B duplicate rows for the same commit can
+	// still tie on c.priority today (same reason as LoadByCommit/LoadLiveByCommit); once
+	// the Phase B cleanup + unique index land there is one row per commit and no
+	// same-commit tie to break, so the ordering costs nothing extra.
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s

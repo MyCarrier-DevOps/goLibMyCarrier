@@ -150,7 +150,7 @@ func TestPostgresStore_DeleteSlip_Cascades_Integration(t *testing.T) {
 		Status: SlipStatusCompleted, CreatedAt: time.Now(),
 	}))
 
-	require.NoError(t, store.DeleteSlip(ctx, "corr-delete-me"))
+	require.NoError(t, store.DeleteSlip(ctx, "corr-delete-me", ""))
 
 	_, err := store.Load(ctx, "corr-delete-me")
 	assert.ErrorIs(t, err, ErrSlipNotFound)
@@ -160,4 +160,75 @@ func TestPostgresStore_DeleteSlip_Cascades_Integration(t *testing.T) {
 			"SELECT count(*) FROM "+table+" WHERE correlation_id = $1", "corr-delete-me").Scan(&n))
 		assert.Zero(t, n, table+" rows must cascade away")
 	}
+}
+
+// TestPostgresStore_DeleteSlip_RepointsDescendants_Integration pins FIX 3 against a real
+// Postgres instance: another slip whose slip_ancestry row points at the repaved slip as
+// its parent must be repointed to the successor, not left dangling (a dangling link would
+// silently truncate that descendant's ResolveAncestry walk at this hop).
+func TestPostgresStore_DeleteSlip_RepointsDescendants_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	parent := &Slip{
+		CorrelationID: "corr-parent-repave",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-parent-repave",
+		Status:        SlipStatusFailed,
+	}
+	require.NoError(t, store.Create(ctx, parent))
+
+	child := &Slip{
+		CorrelationID: "corr-child-of-repaved",
+		Repository:    "owner/repo",
+		Branch:        "feature",
+		CommitSHA:     "sha-child-of-repaved",
+		Status:        SlipStatusInProgress,
+	}
+	require.NoError(t, store.Create(ctx, child))
+	require.NoError(t, store.InsertAncestryLink(ctx, child, AncestryEntry{
+		CorrelationID: parent.CorrelationID, CommitSHA: parent.CommitSHA,
+		Repository: parent.Repository, Branch: parent.Branch,
+		Status: SlipStatusFailed, CreatedAt: time.Now(),
+	}))
+
+	require.NoError(t, store.DeleteSlip(ctx, parent.CorrelationID, "corr-successor"))
+
+	_, err := store.Load(ctx, parent.CorrelationID)
+	assert.ErrorIs(t, err, ErrSlipNotFound, "the repaved slip itself must be gone")
+
+	var newParent string
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT parent_correlation_id FROM slip_ancestry WHERE repository = $1 AND branch = $2 AND correlation_id = $3",
+		child.Repository, child.Branch, child.CorrelationID).Scan(&newParent))
+	assert.Equal(t, "corr-successor", newParent, "descendant must be repointed to the successor, not dangling")
+}
+
+// TestPostgresStore_DeleteSlip_WentLive_Integration pins FIX 2's TOCTOU guard against a
+// real Postgres instance: a slip that recovers to live between the caller's repave
+// decision and the DeleteSlip call must be rejected, not destroyed.
+func TestPostgresStore_DeleteSlip_WentLive_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	slip := &Slip{
+		CorrelationID: "corr-went-live",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-went-live",
+		Status:        SlipStatusFailed,
+	}
+	require.NoError(t, store.Create(ctx, slip))
+
+	// Simulate executor.go's recovery branch: the failed slip recovers to in_progress
+	// after the caller already decided (from an earlier snapshot) to repave it.
+	require.NoError(t, store.UpdateSlipStatus(ctx, slip.CorrelationID, SlipStatusInProgress))
+
+	err := store.DeleteSlip(ctx, slip.CorrelationID, "corr-should-not-exist")
+	require.ErrorIs(t, err, ErrSlipWentLive)
+
+	got, loadErr := store.Load(ctx, slip.CorrelationID)
+	require.NoError(t, loadErr, "the now-live slip must survive the rejected delete")
+	assert.Equal(t, SlipStatusInProgress, got.Status)
 }

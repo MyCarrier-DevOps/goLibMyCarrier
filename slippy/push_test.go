@@ -948,7 +948,10 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			}
 		}
 		if !foundDelete {
-			t.Errorf("expected the ended conflicting row to be repaved, got DeleteSlip calls: %v", store.DeleteSlipCalls)
+			t.Errorf(
+				"expected the ended conflicting row to be repaved, got DeleteSlip calls: %v",
+				store.DeleteSlipCalls,
+			)
 		}
 		callerCreates := 0
 		for _, call := range store.CreateCalls {
@@ -1008,7 +1011,10 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			}
 		}
 		if !foundDelete {
-			t.Errorf("expected the failed conflicting row to be repaved, got DeleteSlip calls: %v", store.DeleteSlipCalls)
+			t.Errorf(
+				"expected the failed conflicting row to be repaved, got DeleteSlip calls: %v",
+				store.DeleteSlipCalls,
+			)
 		}
 		callerCreates := 0
 		for _, call := range store.CreateCalls {

@@ -132,12 +132,15 @@ func TestMockStore_DeleteSlip(t *testing.T) {
 		CommitSHA:     "commitdel",
 	})
 
-	if err := store.DeleteSlip(ctx, "test-delete"); err != nil {
+	if err := store.DeleteSlip(ctx, "test-delete", "successor-delete"); err != nil {
 		t.Fatalf("DeleteSlip failed: %v", err)
 	}
 
 	if len(store.DeleteSlipCalls) != 1 || store.DeleteSlipCalls[0] != "test-delete" {
 		t.Errorf("expected DeleteSlip call for test-delete, got %v", store.DeleteSlipCalls)
+	}
+	if len(store.DeleteSlipSuccessorCalls) != 1 || store.DeleteSlipSuccessorCalls[0] != "successor-delete" {
+		t.Errorf("expected successor-delete to be recorded, got %v", store.DeleteSlipSuccessorCalls)
 	}
 
 	// The slip itself is gone...
@@ -164,7 +167,7 @@ func TestMockStore_DeleteSlip_WithError(t *testing.T) {
 	testErr := errors.New("delete error")
 	store.DeleteSlipError = testErr
 
-	err := store.DeleteSlip(ctx, "test-delete-err")
+	err := store.DeleteSlip(ctx, "test-delete-err", "")
 	if !errors.Is(err, testErr) {
 		t.Errorf("expected DeleteSlipError, got %v", err)
 	}
@@ -182,7 +185,7 @@ func TestMockStore_DeleteSlip_Missing(t *testing.T) {
 	store := NewMockStore()
 
 	// Deleting an unknown slip is not an error (idempotent), matching PostgresStore.
-	if err := store.DeleteSlip(context.Background(), "never-existed"); err != nil {
+	if err := store.DeleteSlip(context.Background(), "never-existed", ""); err != nil {
 		t.Errorf("deleting a missing slip must be a no-op, got %v", err)
 	}
 }

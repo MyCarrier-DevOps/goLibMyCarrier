@@ -87,7 +87,7 @@ func TestMockStore_DeleteSlip(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "test-123", Repository: "owner/repo", CommitSHA: "abc123"})
 
-		err := store.DeleteSlip(ctx, "test-123")
+		err := store.DeleteSlip(ctx, "test-123", "successor-123")
 		if err != nil {
 			t.Fatalf("DeleteSlip failed: %v", err)
 		}
@@ -98,13 +98,16 @@ func TestMockStore_DeleteSlip(t *testing.T) {
 		if len(store.DeleteSlipCalls) != 1 || store.DeleteSlipCalls[0] != "test-123" {
 			t.Error("DeleteSlipCall not tracked")
 		}
+		if len(store.DeleteSlipSuccessorCalls) != 1 || store.DeleteSlipSuccessorCalls[0] != "successor-123" {
+			t.Error("DeleteSlipSuccessorCalls not tracked")
+		}
 	})
 
 	t.Run("returns error when DeleteSlipError is set", func(t *testing.T) {
 		store := NewMockStore()
 		store.DeleteSlipError = errors.New("delete failed")
 
-		err := store.DeleteSlip(ctx, "test")
+		err := store.DeleteSlip(ctx, "test", "")
 		if err == nil || err.Error() != "delete failed" {
 			t.Errorf("Expected 'delete failed', got %v", err)
 		}
