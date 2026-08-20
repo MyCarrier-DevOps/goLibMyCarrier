@@ -7,9 +7,10 @@ import (
 )
 
 // FindByCommits returns the slip matching the highest-priority commit in the ordered
-// list (earliest in the list wins; ties broken by most-recent update). Terminal-
-// superseded statuses (abandoned, promoted, compensated) are excluded. Returns
-// ErrSlipNotFound when no live slip matches any commit.
+// list (earliest in the list wins). Pre-DEVOPS-231-cleanup duplicate rows for the same
+// commit are tie-broken by most-recent update; post-cleanup there is one row per commit
+// and no tie to break. Terminal-superseded statuses (abandoned, promoted, compensated)
+// are excluded. Returns ErrSlipNotFound when no live slip matches any commit.
 func (s *PostgresStore) FindByCommits(
 	ctx context.Context,
 	repository string,
@@ -19,9 +20,11 @@ func (s *PostgresStore) FindByCommits(
 		return nil, "", fmt.Errorf("no commits provided")
 	}
 
-	// c.priority orders across the distinct commits in the list; s.updated_at no longer
-	// breaks same-commit ties (there are none post-DEVOPS-231) and only stabilizes
-	// output when multiple commits in the list each have their own single row.
+	// c.priority orders across the distinct commits in the list. s.updated_at is a
+	// secondary key: pre-DEVOPS-231-cleanup duplicate rows for the same commit can
+	// still tie on c.priority, so this breaks that tie (belt-and-braces, same as
+	// LoadByCommit/LoadLiveByCommit); post-cleanup there's one row per commit and no
+	// same-commit tie to break.
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s
@@ -43,8 +46,10 @@ func (s *PostgresStore) FindByCommits(
 }
 
 // FindAllByCommits returns every slip matching any commit in the ordered list, ordered by
-// commit priority then most-recent update. Unlike FindByCommits it does not exclude
-// terminal-superseded statuses. An empty commit list returns an empty result (not an error).
+// commit priority (pre-DEVOPS-231-cleanup duplicate rows for the same commit are
+// secondarily ordered by most-recent update; post-cleanup there's one row per commit).
+// Unlike FindByCommits it does not exclude terminal-superseded statuses. An empty commit
+// list returns an empty result (not an error).
 func (s *PostgresStore) FindAllByCommits(
 	ctx context.Context,
 	repository string,
@@ -54,9 +59,11 @@ func (s *PostgresStore) FindAllByCommits(
 		return nil, nil
 	}
 
-	// c.priority orders across the distinct commits in the list; s.updated_at no longer
-	// breaks same-commit ties (there are none post-DEVOPS-231) and only stabilizes
-	// output when multiple commits in the list each have their own single row.
+	// c.priority orders across the distinct commits in the list. s.updated_at is a
+	// secondary key: pre-DEVOPS-231-cleanup duplicate rows for the same commit can
+	// still tie on c.priority, so this breaks that tie (belt-and-braces, same as
+	// LoadByCommit/LoadLiveByCommit); post-cleanup there's one row per commit and no
+	// same-commit tie to break.
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s
