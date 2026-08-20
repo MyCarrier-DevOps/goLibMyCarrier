@@ -2,14 +2,15 @@
 
 This document provides guidance for AI-assisted development of the slippy routing slip library and its integrations.
 
-**State machine specification and validation instructions are in `.github/`:**
+**State machine specification and validation instructions are in the repo root's `.github/`
+(i.e. `<repo-root>/.github/`, not a `slippy/.github/`):**
 
 | File | Purpose |
 |------|---------|
 | `.github/STATE_MACHINE_V3.md` | Full specification: pipeline phases, consistency invariants (I1–I4), algorithm reference, validation checklist, and automated test coverage |
 | `.github/PROJECT_STATE.md` | Project history, known discrepancy table, and architectural decisions |
 
-**Before making any changes to this package, read `.github/STATE_MACHINE_V3.md` first.**
+**Before making any changes to this package, read the repo root's `.github/STATE_MACHINE_V3.md` first.**
 
 ---
 
@@ -19,7 +20,10 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ### Key Characteristics
 
-- **ClickHouse-backed persistence** for high-performance queries
+- **Postgres (`PostgresStore`) is the operational slip store** (since DEVOPS-127). `ClickHouseStore`
+  remains in the codebase and implements the same `SlipStore` interface, but is not the write path
+  for production slips — e.g. `ClickHouseStore.DeleteSlip` is explicitly unsupported
+  (`clickhouse_store.go`: `"not supported on the ClickHouse store; Postgres is the operational slip store"`).
 - **Dynamic schema** generated from JSON pipeline configuration
 - **Pre-job/Post-job execution model** - bookend operations around existing jobs (does NOT wrap job execution)
 - **Correlation ID** is the single canonical identifier for a slip throughout its lifecycle
@@ -213,11 +217,16 @@ correlationID := result.Slip.CorrelationID
 ### Step Updates (Post-Job)
 
 ```go
-// Update step status using correlation ID
-err := client.UpdateStepStatus(ctx, correlationID, "unit_tests", slippy.StepStatusSuccess)
+// Update step status using correlation ID (componentName is "" for a pure pipeline step)
+err := client.UpdateStepWithStatus(ctx, correlationID, "unit_tests", "", slippy.StepStatusCompleted, "unit tests passed")
 
-// Update component-specific status
-err := client.UpdateComponentStatus(ctx, correlationID, "api", "build", slippy.StepStatusSuccess)
+// Wrappers around UpdateStepWithStatus for common transitions
+err := client.CompleteStep(ctx, correlationID, "unit_tests", "")
+err := client.FailStep(ctx, correlationID, "unit_tests", "", "assertion failure in TestFoo")
+err := client.StartStep(ctx, correlationID, "unit_tests", "")
+
+// Update component-specific status (componentName is the component, e.g. "api")
+err := client.UpdateStepWithStatus(ctx, correlationID, "build", "api", slippy.StepStatusCompleted, "build succeeded")
 ```
 
 ### Prerequisite Checking
@@ -286,9 +295,11 @@ slippy/
 ├── interfaces.go       # SlipStore, GitHubAPI interfaces
 ├── push.go             # CreateSlipForPush
 ├── resolve.go          # ResolveSlip (ancestry resolution)
-├── status.go           # UpdateStepStatus, UpdateComponentStatus
+├── status.go           # SlipStatus/StepStatus/PrereqStatus enums + predicates (IsTerminal, IsSuccess, IsFailure) only
+├── steps.go            # UpdateStepWithStatus + wrappers (CompleteStep, FailStep, StartStep, ...)
+├── executor.go         # RunPreExecution/RunPostExecution; checkPipelineCompletion (pipeline-status derivation, recovery)
 ├── prereqs.go          # CheckPrerequisites, holds
-├── hold.go             # HoldForPrerequisites
+├── hold.go             # WaitForPrerequisites
 ├── migrations.go       # Schema migrations
 ├── dynamic_migrations.go # Pipeline-config-based migrations
 ├── pipeline_config.go  # Pipeline JSON parsing

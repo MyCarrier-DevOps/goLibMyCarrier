@@ -13,7 +13,7 @@
 **Step statuses:** `pending`, `held`, `running`, `completed`, `skipped`, `failed`, `error`, `timeout`, `aborted`.
 - `completed` / `skipped`: terminal-success.
 - `failed` / `error` / `timeout`: terminal primary failure.
-- `aborted`: terminal-cascade (upstream prereq failed). **Reversible** — auto-reset to `pending` by recovery branch in `checkPipelineCompletion` when last primary failure resolves (`executor.go:307-346`).
+- `aborted`: terminal-cascade (upstream prereq failed). **Reversible** — auto-reset to `pending` by recovery branch in `checkPipelineCompletion` when last primary failure resolves (`executor.go:365-405`).
 - Full table: see Step Status Reference below.
 
 **Glossary:**
@@ -100,6 +100,55 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 - `abandoned` - automatic when a newer push supersedes this branch (`AbandonSlip`, `client.go:170`)
 - `promoted` - automatic on PR squash-merge to another branch (`PromoteSlip`, `client.go:204`)
 - No operator abort tool exists. Both bypass `checkPipelineCompletion`.
+
+**Same-commit slip identity — repave (DEVOPS-231):**
+
+Slip identity is `(lower(repository), commit_sha)` — one row per commit. `correlation_id`
+remains the primary key and the child-row anchor, but identifies the *current run*, not
+the slip's identity; `branch` is likewise an attribute of the current run, not part of
+identity. A DB unique index (`uq_routing_slips_repo_sha`) enforces this at the storage
+layer as of migration v5 — a later, separately-gated migration; `CreateSlipForPush`
+(`push.go`) already implements the contract below ahead of that index landing.
+
+- **Same-commit ended push → repave.** A push for a commit SHA whose existing slip is
+  `in_progress`/`pending`/`compensating` is reused (`handlePushRetry`): the returned
+  slip keeps the existing `correlation_id`, which differs from the one the caller sent,
+  so the caller (pushhookparser) detects a dedup and suppresses re-dispatch. A push for
+  a SHA whose slip is `failed` or terminal
+  (`completed`/`abandoned`/`promoted`/`compensated`) instead **repaves**:
+  `DeleteSlip` removes the `routing_slips` row and explicitly deletes its
+  `slip_component_states`/`slip_ancestry` children in the same transaction (correct both
+  before and after migration v5's cascade FKs exist), then a fresh `Create` runs with the
+  new run's `correlation_id` — full re-dispatch (builds, unit tests, secret scan).
+- **Empty-run guard.** If the incoming push carries no components (e.g. branch
+  create/recreate at an existing SHA, or a components-less repo) and the existing slip
+  for that SHA is ended, `CreateSlipForPush` returns the existing slip instead of
+  repaving — nothing would be dispatched either way, so repaving would only destroy the
+  prior run's history for no benefit.
+- **Cross-commit supersede → abandon (unchanged).** A newer commit still `AbandonSlip`s
+  an in-flight older commit on the same branch (see above) — different `(repo, sha)`, so
+  this is untouched by the repave change; `abandoned` rows still exist, there is just
+  never a second row for the same commit.
+- **`branch` is a run attribute, not slip identity.** A fast-forward of an existing SHA
+  onto a different branch is not treated specially: it repaves the same `(repo, sha)`
+  row, and the fresh row carries the new push's `branch`. The re-dispatch is observably
+  the same as before this change, which instead minted a second row for the same SHA
+  under the old branch.
+- **Note:** rewritten-history force-pushes can strand a live slip on an orphaned SHA
+  (pre-existing; ancestry walks cannot see rewritten-away commits) — not addressed by
+  this change.
+
+**Terminology — two mutually exclusive retrigger mechanisms:**
+- **Push-shaped retrigger** ("webhook re-delivery" / "same-commit re-push"): any push
+  event for a SHA that already has a slip, handled by `CreateSlipForPush` above (repave,
+  retry-reuse, or the empty-run guard). This is the only create/repave path.
+- **`retrigger-ci`** (the operator workflow that resolves and re-dispatches an existing
+  slip's steps, `action:"rerun"`): reuses the existing `correlation_id` and re-runs
+  steps in place — a `failed` slip recovers via `checkPipelineCompletion`'s recovery
+  branch (`executor.go:365-405`), not via a new push. It never calls `CreateSlipForPush`
+  and so never creates or repaves a slip; selective (e.g. unit-tests-only) retrigger must
+  never be implemented as a filtered push replay, since repave would delete the build
+  state such a retrigger wants to keep.
 
 ---
 
@@ -238,7 +287,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 
 > **Note:** "downstream lazy-abort" means downstream step rows are NOT changed by FailStep. Each downstream step transitions to `aborted` only when its own `WaitForPrerequisites` call observes the failed prereq.
 
-> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch (`executor.go:307-346`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
+> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch (`executor.go:365-405`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
 
 ---
 
@@ -422,7 +471,7 @@ slip recovers from failed → in_progress when:
   slip.Status == failed at the moment checkPipelineCompletion fires
 
 On recovery:
-  cascade-aborted (`aborted`) steps → reset to `pending` automatically by `checkPipelineCompletion` recovery branch (`executor.go:307-346`). `aborted` is the ONLY reversible terminal step status; `failed`, `error`, `timeout`, `completed`, `skipped` are not auto-reset. Peer steps in `running`/`held`/`pending` are NEVER modified by FailStep — only the failing step's own row and `slip.status` change synchronously.
+  cascade-aborted (`aborted`) steps → reset to `pending` automatically by `checkPipelineCompletion` recovery branch (`executor.go:365-405`). `aborted` is the ONLY reversible terminal step status; `failed`, `error`, `timeout`, `completed`, `skipped` are not auto-reset. Peer steps in `running`/`held`/`pending` are NEVER modified by FailStep — only the failing step's own row and `slip.status` change synchronously.
   slip.status → in_progress
   External orchestrators (auto-deployer, Argo) must re-trigger the pending steps
 ```
@@ -542,7 +591,7 @@ checkPipelineCompletion(ctx, correlationID):
 | `failed` | Yes | - | ✅ primary | Primary failure |
 | `error` | Yes | - | ✅ primary | Primary failure |
 | `timeout` | Yes | - | ✅ primary | Primary failure |
-| `aborted` | Yes* | - | ✅ cascade | Cascade - upstream prereq failed. *Reversible: auto-reset to `pending` on recovery (`executor.go:307-346`). |
+| `aborted` | Yes* | - | ✅ cascade | Cascade - upstream prereq failed. *Reversible: auto-reset to `pending` on recovery (`executor.go:365-405`). |
 
 ---
 

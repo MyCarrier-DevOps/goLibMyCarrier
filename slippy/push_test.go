@@ -310,7 +310,8 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 	t.Run("failed existing slip - delete error is non-fatal, still creates fresh", func(t *testing.T) {
 		// If deleting the failed slip fails, slip creation must still proceed (with a
 		// recorded warning). Blocking here would re-introduce the "retrigger never builds"
-		// bug; a lingering failed row is shadowed by the newer slip (version DESC).
+		// bug; if the stale row survives, the ErrDuplicateSlip backstop (and, post-
+		// migration, the unique index) converges on the next repave attempt.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
@@ -337,7 +338,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 
 		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
-			t.Fatalf("unexpected error (abandon failure must be non-fatal): %v", err)
+			t.Fatalf("unexpected error (repave delete failure must be non-fatal): %v", err)
 		}
 		if result.Slip.CorrelationID != "corr-retrigger-2" {
 			t.Errorf("expected fresh slip 'corr-retrigger-2', got '%s'", result.Slip.CorrelationID)
@@ -346,7 +347,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			t.Errorf("expected 1 Create call, got %d", len(store.CreateCalls))
 		}
 		if len(result.Warnings) == 0 {
-			t.Error("expected a warning recorded for the failed abandon")
+			t.Error("expected a warning recorded for the failed repave delete")
 		}
 	})
 
