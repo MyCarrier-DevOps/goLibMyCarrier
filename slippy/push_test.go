@@ -540,6 +540,53 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.CreateCalls) != 0 {
 			t.Errorf("guard must not create, got %d Create calls", len(store.CreateCalls))
 		}
+		// Pins `len(existingSlip.Ancestry) > 0` (not e.g. `>= 0`) on the guard path:
+		// the reused slip here has no ancestry, so AncestryResolved must be false.
+		if result.AncestryResolved {
+			t.Error("expected AncestryResolved=false for a reused slip with no ancestry")
+		}
+	})
+
+	t.Run("ended slip + no components + ancestry - guard reuse reports AncestryResolved=true", func(t *testing.T) {
+		// Same empty-run guard as above, but the reused ended slip HAS ancestry.
+		// Pins the other side of `len(existingSlip.Ancestry) > 0`: a mutant widening
+		// this to `>= 0` would survive the no-ancestry case above (0 >= 0 is also
+		// true) but not this one only by coincidence of a different mutant; this
+		// case instead confirms the field tracks the reused slip's OWN ancestry
+		// (not e.g. always false, or always true) by requiring true here.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-real-run-ancestry",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-branch-create-ancestry",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+			Ancestry: []AncestryEntry{
+				{CorrelationID: "corr-ancestor", CommitSHA: "sha-ancestor", Status: SlipStatusCompleted},
+			},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-branch-create-ancestry",
+			Repository:    "owner/repo",
+			Branch:        "feature/new-branch",
+			CommitSHA:     "sha-branch-create-ancestry",
+			Components:    nil, // no work to dispatch
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-real-run-ancestry" {
+			t.Errorf("guard must return the existing run, got %q", result.Slip.CorrelationID)
+		}
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true for a reused slip that has ancestry")
+		}
 	})
 
 	t.Run("validation error", func(t *testing.T) {
@@ -842,6 +889,187 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 		if len(store.CreateCalls) != 1 {
 			t.Errorf("expected exactly one Create attempt (no retry after dedup), got %d", len(store.CreateCalls))
+		}
+	})
+
+	t.Run("duplicate-create backstop - ended conflicting row (completed) is repaved and retried", func(t *testing.T) {
+		// The ENDED counterpart to "duplicate-create backstop - live conflicting row is
+		// not deleted (dedup)" above: the conflicting row the BACKSTOP ITSELF finds (via
+		// its own LoadByCommit, not the caller's initial one) is terminal, so it must be
+		// repaved and Create retried - unlike the live case, which must dedup without
+		// deleting.
+		//
+		// SeedOnCreate (not AddSlip) is required here: AddSlip would make the row
+		// visible to the caller's INITIAL LoadByCommit, which would route through the
+		// normal repave block in CreateSlipForPush and delete it before Create is ever
+		// attempted - never exercising handleDuplicateSlipBackstop's own ended-row
+		// branch at all (see the NOTE on "repaves and retries once" above, which hits
+		// exactly that shape). SeedOnCreate instead makes the row appear at the moment
+		// Create is called, so only the backstop's LoadByCommit ever sees it.
+		//
+		// Kills mutants that survive today: replacing the live-check
+		// (`!conflicting.Status.IsTerminal() && conflicting.Status != SlipStatusFailed`)
+		// with `if true` (would treat this ended row as live: dedup onto the conflicting
+		// id, never delete, never retry), and dropping the `!conflicting.Status.IsTerminal()`
+		// half of the conjunction.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		conflicting := &Slip{
+			CorrelationID: "corr-conflict-completed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-caller-completed"] = conflicting
+		store.CreateErrorOnce["corr-caller-completed"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-completed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-completed" {
+			t.Errorf("expected the caller's own new slip (not the conflicting one), got %+v", result.Slip)
+		}
+		foundDelete := false
+		for _, deleted := range store.DeleteSlipCalls {
+			if deleted == "corr-conflict-completed" {
+				foundDelete = true
+			}
+		}
+		if !foundDelete {
+			t.Errorf("expected the ended conflicting row to be repaved, got DeleteSlip calls: %v", store.DeleteSlipCalls)
+		}
+		callerCreates := 0
+		for _, call := range store.CreateCalls {
+			if call.Slip.CorrelationID == "corr-caller-completed" {
+				callerCreates++
+			}
+		}
+		if callerCreates != 2 {
+			t.Errorf(
+				"expected exactly two Create attempts for the caller's id (failed first + successful retry), got %d",
+				callerCreates,
+			)
+		}
+	})
+
+	t.Run("duplicate-create backstop - ended conflicting row (failed) is repaved and retried", func(t *testing.T) {
+		// Same shape as the completed case above, but the conflicting row is
+		// SlipStatusFailed. Failed is non-terminal (IsTerminal()==false - a pipeline may
+		// still recover), so this specifically pins the `conflicting.Status !=
+		// SlipStatusFailed` half of the live-check conjunction: a mutant dropping just
+		// that half would see `!conflicting.Status.IsTerminal()` alone (true for
+		// failed) and wrongly treat this row as live, deduping onto it instead of
+		// repaving and retrying.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		conflicting := &Slip{
+			CorrelationID: "corr-conflict-failed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended-failed",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-caller-failed"] = conflicting
+		store.CreateErrorOnce["corr-caller-failed"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-failed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended-failed",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-failed" {
+			t.Errorf("expected the caller's own new slip (not the conflicting one), got %+v", result.Slip)
+		}
+		foundDelete := false
+		for _, deleted := range store.DeleteSlipCalls {
+			if deleted == "corr-conflict-failed" {
+				foundDelete = true
+			}
+		}
+		if !foundDelete {
+			t.Errorf("expected the failed conflicting row to be repaved, got DeleteSlip calls: %v", store.DeleteSlipCalls)
+		}
+		callerCreates := 0
+		for _, call := range store.CreateCalls {
+			if call.Slip.CorrelationID == "corr-caller-failed" {
+				callerCreates++
+			}
+		}
+		if callerCreates != 2 {
+			t.Errorf(
+				"expected exactly two Create attempts for the caller's id (failed first + successful retry), got %d",
+				callerCreates,
+			)
+		}
+	})
+
+	t.Run("duplicate-create backstop - LoadByCommit returns (nil, nil) falls through to retry", func(t *testing.T) {
+		// Defensive-path coverage for handleDuplicateSlipBackstop's
+		// `loadErr != nil || conflicting == nil` guard. No known real store returns
+		// (nil, nil) from LoadByCommit - a miss always carries ErrSlipNotFound - but the
+		// guard is written to be safe against it anyway (DEVOPS-231). A mutant flipping
+		// `||` to `&&` would fail this exact input: (nil error, nil slip) makes the
+		// `&&` false, so the code would fall through to `conflicting.Status` and panic
+		// on the nil pointer instead of falling through to the caller's single retry.
+		//
+		// LoadByCommitNilOnce only fires on a genuine CommitIndex miss, so it must not
+		// be consumed by the caller's initial LoadByCommit call. To arrange that, the
+		// initial call is made a HIT (a pre-existing ended row, driving the normal
+		// repave delete), so the flag survives untouched until the backstop's own
+		// LoadByCommit call - which, now that the row has just been deleted, IS a miss
+		// and gets (nil, nil).
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-ended-prior-nilnil",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-nilnil",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.CreateErrorOnce["corr-caller-nilnil"] = ErrDuplicateSlip
+		store.LoadByCommitNilOnce = true
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-nilnil",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-nilnil",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-nilnil" {
+			t.Errorf("expected the caller's own new slip after the fall-through retry, got %+v", result.Slip)
+		}
+		if store.LoadByCommitNilOnce {
+			t.Error("expected LoadByCommitNilOnce to have been consumed by the backstop's LoadByCommit call")
 		}
 	})
 }

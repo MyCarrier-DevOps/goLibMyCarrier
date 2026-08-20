@@ -110,6 +110,29 @@ func TestPostgresStore_Create_OtherPgErrorNotMapped(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// TestPostgresStore_Create_WrongCodeNotMapped confirms the mapping requires BOTH the
+// 23505 (unique_violation) code AND the uq_routing_slips_repo_sha constraint name - a
+// mutant that drops the `pgErr.Code == "23505"` half of the check (keeping only the
+// constraint-name comparison) would map this to ErrDuplicateSlip even though the code
+// here (23503, foreign_key_violation) is not a unique violation at all.
+func TestPostgresStore_Create_WrongCodeNotMapped(t *testing.T) {
+	store, mock := newMockStore(t)
+	pgErr := &pgconn.PgError{
+		Code:           "23503",
+		ConstraintName: "uq_routing_slips_repo_sha",
+		Message:        "foreign key violation",
+	}
+	mock.ExpectExec("INSERT INTO routing_slips .* ON CONFLICT \\(correlation_id\\) DO UPDATE SET").
+		WithArgs(anyArgs(len(store.slipColumns()))...).
+		WillReturnError(pgErr)
+
+	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
+	err := store.Create(context.Background(), slip)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrDuplicateSlip)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestPostgresStore_Update_NotFound(t *testing.T) {
 	store, mock := newMockStore(t)
 	// The lock probe finds no row, so Update never issues the UPDATE and the tx rolls back.

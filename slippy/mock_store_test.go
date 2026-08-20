@@ -161,6 +161,18 @@ type MockStore struct {
 	// backstop's subsequent LoadByCommit observe a row that was not there a moment
 	// ago.
 	SeedOnCreate map[string]*Slip
+
+	// LoadByCommitNilOnce forces the next LoadByCommit call that would otherwise miss
+	// (no CommitIndex entry, i.e. the real store's ErrSlipNotFound case) to instead
+	// return (nil, nil), then clears itself (one-shot). No known real store returns
+	// (nil, nil) from LoadByCommit - a miss always carries ErrSlipNotFound - but
+	// handleDuplicateSlipBackstop's `loadErr != nil || conflicting == nil` guard is
+	// written to be safe against it anyway (DEVOPS-231). This field lets a test force
+	// that exact response to pin the guard: a hit (existing row found) never consumes
+	// it, so pairing this with a fixture that repaves/deletes a row between the
+	// caller's initial LoadByCommit and the backstop's own LoadByCommit lets the
+	// backstop's call land on the (now-missing) row and observe (nil, nil).
+	LoadByCommitNilOnce bool
 }
 
 // CreateCall records a Create call.
@@ -315,14 +327,12 @@ func (m *MockStore) Load(ctx context.Context, correlationID string) (*Slip, erro
 // LoadByCommit retrieves a slip by repository and commit SHA.
 func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.LoadByCommitCalls = append(m.LoadByCommitCalls, LoadByCommitCall{
 		Repository: repository,
 		CommitSHA:  commitSHA,
 	})
-	m.mu.Unlock()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 
 	if m.LoadByCommitError != nil {
 		return nil, m.LoadByCommitError
@@ -331,6 +341,10 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 	key := repository + ":" + commitSHA
 	correlationID, ok := m.CommitIndex[key]
 	if !ok {
+		if m.LoadByCommitNilOnce {
+			m.LoadByCommitNilOnce = false
+			return nil, nil
+		}
 		return nil, ErrSlipNotFound
 	}
 
