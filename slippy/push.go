@@ -220,6 +220,21 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     would be wrong, and under one-row-per-commit it must not be left behind
 		//     when the new row is inserted.
 		//
+		if len(opts.Components) == 0 {
+			// Empty-run guard: nothing will be dispatched for this push (branch
+			// create/recreate at an existing SHA, or a components-less repo).
+			// Repaving would destroy the prior run's history for zero benefit.
+			// Return the existing slip; the caller sees returned != sent and
+			// suppresses side effects. Trade-off for tests-only repos: see spec §6.2.
+			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for componentless push", map[string]interface{}{
+				"existing_id": existingSlip.CorrelationID,
+				"commit":      shortSHA(existingSlip.CommitSHA),
+			})
+			result.Slip = existingSlip
+			result.AncestryResolved = len(existingSlip.Ancestry) > 0
+			return result, nil
+		}
+
 		// Either way: delete (repave) the existing slip and fall through to
 		// fresh-slip creation with the caller's correlation_id, so the caller sees a
 		// NEW slip (not a dedup) and re-dispatches builds + unit tests. This keeps

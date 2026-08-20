@@ -332,6 +332,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			Repository:    "owner/repo",
 			Branch:        "integration",
 			CommitSHA:     "failed-commit-abc",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
 		}
 
 		result, err := client.CreateSlipForPush(ctx, opts)
@@ -496,6 +497,46 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			if call.CorrelationID == "corr-abandoned-old" && call.StepName == "push_parsed" && call.Status == StepStatusRunning {
 				t.Error("abandoned row must not be reused via handlePushRetry (no push_parsed reset on the old id)")
 			}
+		}
+	})
+
+	t.Run("ended slip + no components - returns existing slip, no repave (empty-run guard)", func(t *testing.T) {
+		// Branch create/recreate at an existing SHA reaches CreateSlip with no
+		// components (AllowSlipWithNoBuilds repos). Nothing would be dispatched, so
+		// repaving would only destroy the real run's history. Return the existing
+		// ended slip as a dedup instead (caller sees returned != sent → suppress).
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-real-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-branch-create",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-branch-create",
+			Repository:    "owner/repo",
+			Branch:        "feature/new-branch",
+			CommitSHA:     "sha-branch-create",
+			Components:    nil, // no work to dispatch
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-real-run" {
+			t.Errorf("guard must return the existing run, got %q", result.Slip.CorrelationID)
+		}
+		if len(store.DeleteSlipCalls) != 0 {
+			t.Errorf("guard must not repave, got DeleteSlip calls: %v", store.DeleteSlipCalls)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("guard must not create, got %d Create calls", len(store.CreateCalls))
 		}
 	})
 
