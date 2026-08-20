@@ -179,6 +179,18 @@ type MockStore struct {
 	// caller's initial LoadByCommit and the backstop's own LoadByCommit lets the
 	// backstop's call land on the (now-missing) row and observe (nil, nil).
 	LoadByCommitNilOnce bool
+
+	// DeleteSlipWentLiveStatus simulates a slip transitioning to a live status in the
+	// window between a caller's repave decision (an earlier LoadByCommit/Load saw it
+	// ended) and the DeleteSlip call itself: when DeleteSlip is invoked for a
+	// correlation ID present in this map WHILE DeleteSlipError is set (e.g. to
+	// ErrSlipWentLive), the mock mutates the stored row's status to the mapped value
+	// before returning the injected error, then removes the entry (one-shot). This
+	// lets a subsequent Load (the caller's reload-after-ErrSlipWentLive) observe the
+	// new state instead of the stale decision-time snapshot - LoadByCommit and Load
+	// would otherwise always read the same never-mutated row (DEVOPS-231 review
+	// finding B1).
+	DeleteSlipWentLiveStatus map[string]SlipStatus
 }
 
 // CreateCall records a Create call.
@@ -301,6 +313,12 @@ func (m *MockStore) DeleteSlip(ctx context.Context, correlationID, successorCorr
 	m.DeleteSlipCalls = append(m.DeleteSlipCalls, correlationID)
 	m.DeleteSlipSuccessorCalls = append(m.DeleteSlipSuccessorCalls, successorCorrelationID)
 	if m.DeleteSlipError != nil {
+		if newStatus, ok := m.DeleteSlipWentLiveStatus[correlationID]; ok {
+			delete(m.DeleteSlipWentLiveStatus, correlationID)
+			if slip, exists := m.Slips[correlationID]; exists {
+				slip.Status = newStatus
+			}
+		}
 		return m.DeleteSlipError
 	}
 	if slip, ok := m.Slips[correlationID]; ok {

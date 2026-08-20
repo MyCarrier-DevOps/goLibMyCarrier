@@ -127,11 +127,25 @@ type CreateSlipResult struct {
 	// Callers can inspect these to decide if they should be treated as errors.
 	Warnings []error
 
-	// AncestryResolved indicates whether ancestry resolution completed without errors.
-	// True means the resolution attempt succeeded (whether or not ancestors exist).
-	// False means resolution failed (e.g., GitHub API error, missing installation).
-	// Note: A first commit has no ancestors, but AncestryResolved=true because
-	// the resolution attempt itself succeeded.
+	// AncestryResolved indicates whether ancestry resolution completed without errors,
+	// OR that no resolution was attempted or needed because the returned slip is
+	// pre-existing. Concretely, true means either:
+	//   - a fresh slip was created and its ancestry resolution attempt succeeded
+	//     (whether or not ancestors were found — a first commit has no ancestors, but
+	//     AncestryResolved=true because the resolution attempt itself succeeded); or
+	//   - the result is a dedup onto an already-loaded slip (the in-flight reuse path,
+	//     the empty-run guard, the went-live repave-abort path, and the duplicate-create
+	//     backstop's dedup path all set this true) — there is nothing to resolve for a
+	//     slip that was not freshly created, so "no resolution was needed" also counts
+	//     as resolved.
+	// False means a fresh slip WAS created but ancestry resolution failed for it (e.g.
+	// GitHub API error, missing installation).
+	//
+	// This is deliberately NOT computed from a loaded slip's own Ancestry field
+	// (e.g. `len(slip.Ancestry) > 0`): no store hydrates Slip.Ancestry on load in
+	// production (it is only populated by initializeSlipForPush for a freshly created
+	// slip), so that formula was unconditionally false for every dedup path and would
+	// misfire any alerting keyed off this field.
 	AncestryResolved bool
 }
 
@@ -143,8 +157,10 @@ type CreateSlipResult struct {
 // finds any existing slips for ancestor commits, and ensures they are
 // in a terminal state (abandoning non-terminal slips that are being superseded).
 //
-// Retry vs repave vs new-slip behavior for the same commit SHA:
-//   - Existing slip is non-terminal AND in_progress/pending/compensating: retried via
+// Retry vs repave vs new-slip behavior for the same commit SHA, decided by
+// SlipStatus.IsLive() (the single live-vs-ended predicate shared with
+// handleDuplicateSlipBackstop below — DEVOPS-231 review finding B5):
+//   - Existing slip IsLive() (pending/in_progress/compensating): retried via
 //     handlePushRetry (same correlation ID is reused) — the pipeline is still in flight,
 //     so re-dispatching would double-run work.
 //   - Existing slip is failed: the stuck slip is deleted (repaved) and a fresh slip is
@@ -157,15 +173,41 @@ type CreateSlipResult struct {
 //   - Existing slip is failed/terminal AND opts.Components is empty: the empty-run guard
 //     short-circuits the repave above and returns the existing (ended) slip as a dedup,
 //     since nothing would be dispatched and repaving would only destroy history for no
-//     benefit.
+//     benefit. handleDuplicateSlipBackstop applies the identical guard so the two paths
+//     converge on the same outcome for the same inputs.
+//   - The repave's DeleteSlip call can itself report that the decision is stale:
+//     ErrSlipWentLive means the slip became live again before the delete landed, so the
+//     repave is abandoned and treated like the IsLive() case above (dedup onto the
+//     reloaded slip, no fresh slip created — see repaveExistingSlip).
+//     ErrDeleteSlipUnsupported means the store cannot repave at all (the ClickHouse
+//     store, since Postgres is the operational store per DEVOPS-127); the fallback is
+//     the pre-DEVOPS-231 semantics — AbandonSlip the superseded slip — followed by
+//     fresh-slip creation as usual.
+//
+// Ancestry resolution (resolveAndAbandonAncestors, which makes multi-second GitHub API
+// calls) runs BEFORE the repave delete, and the delete runs immediately before Create:
+// this shrinks the window in which the commit has no slip at all — a crash or failure
+// between DeleteSlip and Create would otherwise leave the commit with no slip and the
+// prior run's history destroyed — to two adjacent store calls. This is a mitigation, not
+// a full fix: a transactional store-level Repave operation (delete-and-create as one
+// unit) is the complete fix and is tracked as a follow-up (DEVOPS-231).
 //
 // Even when no existing row is found for this commit, Create can still fail with
 // ErrDuplicateSlip: a concurrent push for the same commit can win the insert race between
 // our LoadByCommit and our Create (the Redis dedup lock is fail-open). A backstop loads the
 // conflicting row and applies the same live-vs-ended rule as above: a live conflicting slip
 // is deduped onto (never deleted - its pipeline may already be dispatched), an ended one is
-// deleted and Create is retried exactly once. This is a last-resort convergence path for a
-// future unique index on (repository, commit_sha) that does not exist in the schema yet.
+// deleted and Create is retried exactly once.
+//
+// Phase A (this PR) has NO convergence backstop for a repave delete that itself fails
+// (as opposed to the ErrDuplicateSlip race above, which the backstop DOES handle): without
+// the uq_routing_slips_repo_sha unique index (Phase B), a subsequent Create always succeeds
+// regardless of whether the stale row survives, since it only conflicts on correlation_id —
+// so ErrDuplicateSlip is unreachable via that path and the backstop never fires for it. A
+// failed repave delete simply leaves the stale ended row behind alongside the fresh row
+// until the Phase B migration adds the index and its cleanup runs; only once that index
+// exists does a subsequent Create for the same (repository, commit_sha) conflict and the
+// backstop become an active convergence path.
 //
 // The returned CreateSlipResult contains both the slip and any non-fatal errors
 // that occurred during processing (e.g., ancestry resolution failures).
@@ -198,27 +240,28 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	// row would survive. LoadByCommit returns ErrSlipNotFound for a missing row
 	// exactly like LoadLiveByCommit did — the err == nil guard shape is unchanged.
 	existingSlip, err := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
-	if err == nil && existingSlip != nil {
+	switch {
+	case err == nil && existingSlip != nil:
 		// A slip already exists for this EXACT commit (existingSlip.Status is a
 		// SlipStatus, not a step status). What we do next depends on whether the prior
 		// pipeline can still make progress on its own:
 		//
-		//   - any live, non-terminal slip status OTHER than failed — in_progress in
-		//     practice (the enum also defines pending/compensating, which this
-		//     pipeline does not use; see STATE_MACHINE_V3.md): the prior pipeline is
-		//     still in flight, or a concurrent create just won the repo:sha race.
-		//     Reuse the existing slip and reset push_parsed via handlePushRetry —
-		//     re-dispatching builds here would double-run work that is already
-		//     running. The caller (slippy-api → pushhookparser) detects that the
-		//     returned correlation_id differs from the one it sent and suppresses
-		//     duplicate side-effects.
-		if !existingSlip.Status.IsTerminal() && existingSlip.Status != SlipStatusFailed {
+		//   - IsLive() (pending/in_progress/compensating — in_progress in practice;
+		//     see STATE_MACHINE_V3.md): the prior pipeline is still in flight, or a
+		//     concurrent create just won the repo:sha race. Reuse the existing slip
+		//     and reset push_parsed via handlePushRetry — re-dispatching builds here
+		//     would double-run work that is already running. The caller
+		//     (slippy-api → pushhookparser) detects that the returned correlation_id
+		//     differs from the one it sent and suppresses duplicate side-effects.
+		if existingSlip.Status.IsLive() {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
 				return nil, retryErr
 			}
 			result.Slip = slip
-			result.AncestryResolved = len(slip.Ancestry) > 0
+			// Dedup onto a pre-existing slip: nothing was (or needed to be) resolved.
+			// See CreateSlipResult.AncestryResolved's doc.
+			result.AncestryResolved = true
 			return result, nil
 		}
 
@@ -244,36 +287,45 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 				"commit":      shortSHA(existingSlip.CommitSHA),
 			})
 			result.Slip = existingSlip
-			result.AncestryResolved = len(existingSlip.Ancestry) > 0
+			result.AncestryResolved = true
 			return result, nil
 		}
+		// Otherwise: existingSlip must be repaved. Deferred until immediately before
+		// Create (see repaveExistingSlip below) so ancestry resolution's multi-second
+		// GitHub API calls happen while the row still exists (see the doc comment on
+		// this function).
 
-		// Either way: delete (repave) the existing slip and fall through to
-		// fresh-slip creation with the caller's correlation_id, so the caller sees a
-		// NEW slip (not a dedup) and re-dispatches builds + unit tests. This keeps
-		// one row per (repository, commit_sha) rather than leaving a superseded row
-		// behind (STATE_MACHINE_V3.md §"Pipeline termination without completing").
-		c.logger.Info(ctx, "Repaving ended slip for same commit (delete + recreate)", map[string]interface{}{
-			"repaved_id":     existingSlip.CorrelationID,
-			"repaved_commit": shortSHA(existingSlip.CommitSHA),
-			"repaved_status": string(existingSlip.Status),
-			"superseding_id": opts.CorrelationID,
-		})
-		if delErr := c.store.DeleteSlip(ctx, existingSlip.CorrelationID, opts.CorrelationID); delErr != nil {
-			// Non-fatal: record a warning and still create the fresh slip. Blocking
-			// creation here would re-introduce the "retrigger never builds" bug; if the
-			// stale row survives, the ErrDuplicateSlip backstop (and, post-migration,
-			// the unique index) converges on the next attempt.
-			result.Warnings = append(result.Warnings,
-				fmt.Errorf("failed to delete repaved slip %s: %w", existingSlip.CorrelationID, delErr))
-		}
-		// fall through to fresh-slip creation with opts.CorrelationID
+	case errors.Is(err, ErrSlipNotFound):
+		existingSlip = nil // clean miss: no existing row, proceed to create
+
+	case err != nil:
+		// A real lookup failure (DB timeout, connection refused, ...) — NOT a clean
+		// miss. Proceeding as if no slip existed risks Create inserting a second row
+		// while a LIVE slip for this commit already exists, and the caller would fully
+		// re-dispatch a build that's already running. Failing the message (so Kafka
+		// redelivers) is safer than guessing.
+		return nil, fmt.Errorf("failed to load existing slip for %s@%s: %w",
+			opts.Repository, shortSHA(opts.CommitSHA), err)
 	}
 
-	// Resolve ancestry chain and abandon superseded slips
+	// Resolve ancestry chain and abandon superseded slips. Runs BEFORE the repave
+	// delete below — see the doc comment on this function for why.
 	ancestry, ancestryWarnings := c.resolveAndAbandonAncestors(ctx, opts)
 	result.Warnings = append(result.Warnings, ancestryWarnings...)
 	result.AncestryResolved = len(ancestry) > 0 || len(ancestryWarnings) == 0
+
+	// Repave: delete the existing row for this commit immediately before Create, so
+	// the window in which the commit has no slip is limited to these two adjacent
+	// store calls.
+	if existingSlip != nil {
+		dedupHandled, repaveErr := c.repaveExistingSlip(ctx, existingSlip, opts, result)
+		if repaveErr != nil {
+			return nil, repaveErr
+		}
+		if dedupHandled {
+			return result, nil
+		}
+	}
 
 	// Create new slip with full initialization including ancestry
 	slip := c.initializeSlipForPush(opts, ancestry)
@@ -323,15 +375,100 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	return result, nil
 }
 
+// repaveExistingSlip deletes existingSlip immediately before Create (see the reordering
+// rationale in CreateSlipForPush's doc comment), handling the two sentinel errors
+// DeleteSlip's status guard and the ClickHouse store can return.
+//
+// Returns handled=true when the caller should return result directly — the ErrSlipWentLive
+// case, where the repave is abandoned and result is populated with a dedup onto the
+// reloaded (now-live) slip. Returns a non-nil err only for a genuinely fatal condition
+// (failing to reload the slip after aborting on ErrSlipWentLive). Every other outcome,
+// including ErrDeleteSlipUnsupported and any other delete failure, is handled here and
+// recorded as a warning on result; the caller should fall through to fresh-slip creation
+// whenever handled is false and err is nil.
+func (c *Client) repaveExistingSlip(
+	ctx context.Context,
+	existingSlip *Slip,
+	opts PushOptions,
+	result *CreateSlipResult,
+) (handled bool, err error) {
+	// Either way (failed or terminal): delete (repave) the existing slip so the caller
+	// sees a NEW slip (not a dedup) and re-dispatches builds + unit tests. This keeps
+	// one row per (repository, commit_sha) rather than leaving a superseded row behind
+	// (STATE_MACHINE_V3.md §"Pipeline termination without completing").
+	c.logger.Info(ctx, "Repaving ended slip for same commit (delete + recreate)", map[string]interface{}{
+		"repaved_id":     existingSlip.CorrelationID,
+		"repaved_commit": shortSHA(existingSlip.CommitSHA),
+		"repaved_status": string(existingSlip.Status),
+		"superseding_id": opts.CorrelationID,
+	})
+
+	delErr := c.store.DeleteSlip(ctx, existingSlip.CorrelationID, opts.CorrelationID)
+	if delErr == nil {
+		return false, nil
+	}
+
+	if errors.Is(delErr, ErrSlipWentLive) {
+		// The repave decision is stale: the slip went live again between that decision
+		// and this delete (e.g. a failed slip recovering via executor.go's recovery
+		// branch). DeleteSlip's status guard refused to destroy it. Creating a fresh
+		// slip now would produce two competing live runs for the same commit - nothing
+		// at the DB level stops that pre-index (Phase B). Abandon the repave and treat
+		// this exactly like the IsLive() case in CreateSlipForPush: dedup onto the
+		// slip, reloaded so the returned copy reflects its current (live) state.
+		c.logger.Warn(ctx, "Repave aborted: slip went live between decision and delete", map[string]interface{}{
+			"correlation_id": existingSlip.CorrelationID,
+			"commit":         shortSHA(existingSlip.CommitSHA),
+		})
+		live, loadErr := c.store.Load(ctx, existingSlip.CorrelationID)
+		if loadErr != nil {
+			return false, fmt.Errorf(
+				"failed to reload slip %s after went-live repave abort: %w", existingSlip.CorrelationID, loadErr,
+			)
+		}
+		result.Slip = live
+		result.AncestryResolved = true
+		return true, nil
+	}
+
+	if errors.Is(delErr, ErrDeleteSlipUnsupported) {
+		// The store cannot repave at all (the ClickHouse store: Postgres is the
+		// operational slip store per DEVOPS-127, and NewClient still builds a
+		// ClickHouseStore unconditionally, so this fires on every same-commit push for
+		// a CH-backed client). Fall back to the pre-DEVOPS-231 semantics — abandon the
+		// superseded slip rather than repaving it — then still create the fresh slip.
+		if abandonErr := c.AbandonSlip(ctx, existingSlip.CorrelationID, opts.CorrelationID); abandonErr != nil {
+			result.Warnings = append(result.Warnings, fmt.Errorf(
+				"failed to abandon slip %s after unsupported repave: %w", existingSlip.CorrelationID, abandonErr,
+			))
+		}
+		result.Warnings = append(result.Warnings, fmt.Errorf(
+			"repave unsupported on this store, abandoned instead: %w", delErr,
+		))
+		return false, nil
+	}
+
+	// Any other delete failure: non-fatal. Blocking creation here would re-introduce
+	// the "retrigger never builds" bug. Phase A has NO convergence backstop for this -
+	// see the doc comment on CreateSlipForPush - so a failed delete simply leaves the
+	// stale ended row behind alongside the fresh row until the Phase B cleanup.
+	result.Warnings = append(result.Warnings,
+		fmt.Errorf("failed to delete repaved slip %s: %w", existingSlip.CorrelationID, delErr))
+	return false, nil
+}
+
 // handleDuplicateSlipBackstop handles an ErrDuplicateSlip from Create: another concurrent
 // push won the insert race for this (repository, commit_sha) between our caller's
 // LoadByCommit and its Create call. It loads the conflicting row and applies the same
-// live-is-sacrosanct rule as the main retry/repave logic in CreateSlipForPush: a live
-// conflicting slip is deduped onto (never deleted - its pipeline may already be
-// dispatched, and deleting it here would pull the rug out from under an in-flight run
-// while we dispatch a duplicate), an ended one is deleted so the caller can retry once.
+// live-vs-ended decision as the main retry/repave logic in CreateSlipForPush, via the
+// shared SlipStatus.IsLive() predicate (DEVOPS-231 review finding B5): a live conflicting
+// slip is deduped onto (never deleted - its pipeline may already be dispatched, and
+// deleting it here would pull the rug out from under an in-flight run while we dispatch a
+// duplicate); an ended one is either deduped onto (componentless push: the empty-run guard,
+// mirrored from the main path so identical inputs converge on identical outcomes through
+// either path) or deleted so the caller can retry once.
 //
-// Returns handled=true when the caller should return result directly (the dedup case;
+// Returns handled=true when the caller should return result directly (the dedup cases;
 // result.Slip and result.AncestryResolved are already populated on this path). Returns
 // handled=false when the caller should retry Create (either the conflicting row was
 // repaved, or no conflicting row was found/loadable - both mirror today's pre-fix
@@ -350,14 +487,29 @@ func (c *Client) handleDuplicateSlipBackstop(
 		return false, nil //nolint:nilerr // intentional fall-through, see comment above
 	}
 
-	if !conflicting.Status.IsTerminal() && conflicting.Status != SlipStatusFailed {
+	if conflicting.Status.IsLive() {
 		c.logger.Info(ctx, "Duplicate-create backstop: live conflicting slip, deduping", map[string]interface{}{
 			"conflicting_id": conflicting.CorrelationID,
 			"commit":         shortSHA(conflicting.CommitSHA),
 			"superseding_id": opts.CorrelationID,
 		})
 		result.Slip = conflicting
-		result.AncestryResolved = len(conflicting.Ancestry) > 0
+		result.AncestryResolved = true
+		return true, nil
+	}
+
+	if len(opts.Components) == 0 {
+		// Empty-run guard (mirrored from CreateSlipForPush's main path): nothing would
+		// be dispatched for this push, so repaving the conflicting row would only
+		// destroy its history for no benefit. Dedup onto it instead of deleting it.
+		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
+			map[string]interface{}{
+				"conflicting_id": conflicting.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+				"superseding_id": opts.CorrelationID,
+			})
+		result.Slip = conflicting
+		result.AncestryResolved = true
 		return true, nil
 	}
 

@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -243,6 +244,14 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.AppendHistoryCalls) != 1 {
 			t.Errorf("expected exactly 1 AppendHistoryCalls entry, got %d", len(store.AppendHistoryCalls))
 		}
+		// B6 (review fix): the in-flight reuse path dedups onto a pre-existing slip
+		// (existingSlip has no Ancestry set here), so AncestryResolved must be true -
+		// "no resolution was attempted or needed" - not `len(slip.Ancestry) > 0`,
+		// which is unconditionally false in production (no store hydrates Ancestry on
+		// load).
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true for the in-flight reuse dedup")
+		}
 	})
 
 	t.Run("failed existing slip - repaves (delete + create fresh)", func(t *testing.T) {
@@ -309,9 +318,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 
 	t.Run("failed existing slip - delete error is non-fatal, still creates fresh", func(t *testing.T) {
 		// If deleting the failed slip fails, slip creation must still proceed (with a
-		// recorded warning). Blocking here would re-introduce the "retrigger never builds"
-		// bug; if the stale row survives, the ErrDuplicateSlip backstop (and, post-
-		// migration, the unique index) converges on the next repave attempt.
+		// recorded warning). Blocking here would re-introduce the "retrigger never
+		// builds" bug. B7 (review fix): Phase A has NO convergence backstop for this -
+		// without the uq_routing_slips_repo_sha unique index (Phase B), Create always
+		// succeeds regardless of whether the stale row survives, so the stale row is
+		// simply left behind alongside the fresh one until the Phase B cleanup.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
@@ -540,20 +551,24 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.CreateCalls) != 0 {
 			t.Errorf("guard must not create, got %d Create calls", len(store.CreateCalls))
 		}
-		// Pins `len(existingSlip.Ancestry) > 0` (not e.g. `>= 0`) on the guard path:
-		// the reused slip here has no ancestry, so AncestryResolved must be false.
-		if result.AncestryResolved {
-			t.Error("expected AncestryResolved=false for a reused slip with no ancestry")
+		// B6 (review fix): AncestryResolved=true here means "no resolution was
+		// attempted or needed - the returned slip is pre-existing", NOT "the loaded
+		// slip happens to carry a populated Ancestry field". The reused slip here has
+		// no ancestry, and AncestryResolved must still be true: no store hydrates
+		// Slip.Ancestry on load in production, so `len(existingSlip.Ancestry) > 0`
+		// was unconditionally false in prod and misfired dedup-alert consumers on
+		// every guard hit.
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true (dedup: no resolution needed for a pre-existing slip)")
 		}
 	})
 
-	t.Run("ended slip + no components + ancestry - guard reuse reports AncestryResolved=true", func(t *testing.T) {
-		// Same empty-run guard as above, but the reused ended slip HAS ancestry.
-		// Pins the other side of `len(existingSlip.Ancestry) > 0`: a mutant widening
-		// this to `>= 0` would survive the no-ancestry case above (0 >= 0 is also
-		// true) but not this one only by coincidence of a different mutant; this
-		// case instead confirms the field tracks the reused slip's OWN ancestry
-		// (not e.g. always false, or always true) by requiring true here.
+	t.Run("ended slip + no components + ancestry - guard reuse still reports AncestryResolved=true", func(t *testing.T) {
+		// Same empty-run guard as above, but the reused ended slip HAS ancestry. This
+		// pins that AncestryResolved=true does NOT depend on the loaded slip's own
+		// Ancestry field one way or the other (see B6 above) - true in both the
+		// no-ancestry and has-ancestry cases, for the same reason (dedup onto a
+		// pre-existing slip, nothing was resolved).
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
@@ -586,6 +601,63 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 		if !result.AncestryResolved {
 			t.Error("expected AncestryResolved=true for a reused slip that has ancestry")
+		}
+	})
+
+	t.Run("empty-run guard with superseded-terminal row - abandoned/promoted can now escape as result.Slip", func(t *testing.T) {
+		// B8 (review fix): the empty-run guard was only ever exercised with a
+		// `completed` existing row. Before B5's fix, the backstop's live-vs-ended
+		// check was NOT applied consistently, but the MAIN path's guard already
+		// covered abandoned/promoted, they just were not asserted. Pin this
+		// explicitly for supersede-terminal statuses (abandoned - superseded by a
+		// direct push - and promoted - superseded via squash-merge PR): such a slip
+		// can now be returned as result.Slip from CreateSlipForPush, which could not
+		// happen before the guard existed (any terminal row used to always be
+		// repaved, never returned to the caller).
+		for _, termStatus := range []SlipStatus{SlipStatusAbandoned, SlipStatusPromoted} {
+			termStatus := termStatus
+			t.Run(string(termStatus), func(t *testing.T) {
+				store := NewMockStore()
+				github := NewMockGitHubAPI()
+				client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+				commitSHA := "sha-superseded-terminal-" + string(termStatus)
+				store.AddSlip(&Slip{
+					CorrelationID: "corr-superseded-terminal-" + string(termStatus),
+					Repository:    "owner/repo",
+					Branch:        "integration",
+					CommitSHA:     commitSHA,
+					Status:        termStatus,
+					Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+					StateHistory:  []StateHistoryEntry{},
+				})
+
+				result, err := client.CreateSlipForPush(ctx, PushOptions{
+					CorrelationID: "corr-branch-create-" + string(termStatus),
+					Repository:    "owner/repo",
+					Branch:        "feature/new-branch-" + string(termStatus),
+					CommitSHA:     commitSHA,
+					Components:    nil, // no work to dispatch
+				})
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if result.Slip == nil || result.Slip.CorrelationID != "corr-superseded-terminal-"+string(termStatus) {
+					t.Errorf("expected guard to return the existing %s slip, got %+v", termStatus, result.Slip)
+				}
+				if result.Slip.Status != termStatus {
+					t.Errorf("expected returned slip to keep status %s, got %s", termStatus, result.Slip.Status)
+				}
+				if len(store.DeleteSlipCalls) != 0 {
+					t.Errorf("[%s] guard must not repave, got DeleteSlip calls: %v", termStatus, store.DeleteSlipCalls)
+				}
+				if len(store.CreateCalls) != 0 {
+					t.Errorf("[%s] guard must not create, got %d Create calls", termStatus, len(store.CreateCalls))
+				}
+				if !result.AncestryResolved {
+					t.Errorf("[%s] expected AncestryResolved=true (dedup onto a pre-existing slip)", termStatus)
+				}
+			})
 		}
 	})
 
@@ -890,6 +962,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.CreateCalls) != 1 {
 			t.Errorf("expected exactly one Create attempt (no retry after dedup), got %d", len(store.CreateCalls))
 		}
+		// B6 (review fix): the backstop dedup path also dedups onto a pre-existing
+		// slip (winner has no Ancestry set), so AncestryResolved must be true here too.
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true for the backstop live-conflict dedup")
+		}
 	})
 
 	t.Run("duplicate-create backstop - ended conflicting row (completed) is repaved and retried", func(t *testing.T) {
@@ -1076,6 +1153,200 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 		if store.LoadByCommitNilOnce {
 			t.Error("expected LoadByCommitNilOnce to have been consumed by the backstop's LoadByCommit call")
+		}
+	})
+
+	t.Run("B1: repave delete returns ErrSlipWentLive - dedups onto the (reloaded) live slip, no create", func(t *testing.T) {
+		// The slip went live between the repave decision (existingSlip.Status was
+		// ended) and the DeleteSlip call (e.g. executor.go's recovery branch flipped
+		// it back to in_progress). DeleteSlip's status guard rejects the delete and
+		// returns ErrSlipWentLive. Creating a fresh slip here would produce two
+		// competing live runs for the same commit (nothing at the DB level stops that
+		// pre-index). The repave must be abandoned and treated exactly like the
+		// live-reuse case: dedup onto the slip, reloaded so the returned copy reflects
+		// its current (live) state.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-went-live",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-went-live",
+			Status:        SlipStatusFailed, // ended at decision time
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		// Simulate the slip transitioning to live in the window between the repave
+		// decision (the LoadByCommit above sees it as Failed/ended) and the
+		// DeleteSlip call: DeleteSlipWentLiveStatus mutates the stored row's status
+		// at the moment DeleteSlip is invoked, so the code's reload-after-error
+		// observes the new state rather than the stale decision-time snapshot.
+		store.DeleteSlipError = ErrSlipWentLive
+		store.DeleteSlipWentLiveStatus = map[string]SlipStatus{"corr-went-live": SlipStatusInProgress}
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-would-be-fresh",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-went-live",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-went-live" {
+			t.Errorf("expected dedup onto the now-live slip corr-went-live, got %+v", result.Slip)
+		}
+		if result.Slip.Status != SlipStatusInProgress {
+			t.Errorf("expected the returned slip to reflect its reloaded live status, got %s", result.Slip.Status)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("must not create a fresh slip when the existing one went live, got %d Create calls",
+				len(store.CreateCalls))
+		}
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true (dedup onto a pre-existing slip)")
+		}
+	})
+
+	t.Run("B2: repave delete returns ErrDeleteSlipUnsupported - falls back to AbandonSlip, fresh slip still created", func(t *testing.T) {
+		// ClickHouse-backed stores implement no delete path (DEVOPS-127: Postgres is
+		// the operational slip store). NewClient still builds a ClickHouseStore
+		// unconditionally, so a CH-backed client's repave attempts hit this on every
+		// same-commit push. The fallback restores the pre-DEVOPS-231 behavior:
+		// abandon the superseded slip instead of repaving it, then still create the
+		// fresh slip so the caller sees a new correlation_id and re-dispatches.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		config := testPipelineConfig()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-ch-old",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "ch-commit",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.DeleteSlipError = ErrDeleteSlipUnsupported
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-ch-new",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "ch-commit",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-ch-new" {
+			t.Errorf("expected the fresh slip to still be created, got %+v", result.Slip)
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected 1 Create call for the fresh slip, got %d", len(store.CreateCalls))
+		}
+		foundAbandon := false
+		for _, call := range store.UpdateSlipStatusCalls {
+			if call.CorrelationID == "corr-ch-old" && call.Status == SlipStatusAbandoned {
+				foundAbandon = true
+			}
+		}
+		if !foundAbandon {
+			t.Error("expected AbandonSlip fallback to mark the old slip abandoned")
+		}
+		// Exactly one warning is expected: AbandonSlip succeeds here (the old slip is
+		// Failed, not terminal), so no "failed to abandon" warning should be added -
+		// only the unconditional "repave unsupported" one. Pins that the abandon
+		// failure warning is gated on abandonErr != nil, not appended unconditionally.
+		if len(result.Warnings) != 1 {
+			t.Fatalf("expected exactly 1 warning (repave unsupported), got %d: %v", len(result.Warnings), result.Warnings)
+		}
+		if !strings.Contains(result.Warnings[0].Error(), "repave unsupported") {
+			t.Errorf("expected a warning recording that repave is unsupported on this store, got: %v", result.Warnings[0])
+		}
+	})
+
+	t.Run("B4: LoadByCommit fails with a non-not-found error - returns the error, does not create", func(t *testing.T) {
+		// A DB timeout or connection-refused error must not be treated as "no
+		// existing slip" - that would let Create insert a second row while a LIVE
+		// slip for this commit might already exist, and the caller would fully
+		// re-dispatch a build that's already running. Failing the message (so Kafka
+		// redelivers) is safer than guessing.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+		store.LoadByCommitError = errors.New("connection refused")
+
+		_, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-lookup-fail",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-lookup-fail",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err == nil {
+			t.Fatal("expected an error from the non-not-found LoadByCommit failure")
+		}
+		if !strings.Contains(err.Error(), "connection refused") {
+			t.Errorf("expected the underlying error to be wrapped, got: %v", err)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("expected no Create call on lookup failure, got %d", len(store.CreateCalls))
+		}
+	})
+
+	t.Run("B5: duplicate-create backstop applies the empty-run guard - dedups without deleting", func(t *testing.T) {
+		// The backstop used to omit the empty-run guard the main path applies,
+		// diverging on identical inputs: a componentless push racing into the
+		// backstop against an ended conflicting row would repave (delete) it, even
+		// though nothing would be dispatched and the main path would have returned
+		// the existing slip untouched. Fixed by applying the same guard at both
+		// sites.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		conflicting := &Slip{
+			CorrelationID: "corr-conflict-empty-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-empty-run",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-caller-empty"] = conflicting
+		store.CreateErrorOnce["corr-caller-empty"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-empty",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-empty-run",
+			Components:    nil, // componentless push
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-conflict-empty-run" {
+			t.Errorf("expected dedup onto the conflicting slip, got %+v", result.Slip)
+		}
+		for _, deleted := range store.DeleteSlipCalls {
+			if deleted == "corr-conflict-empty-run" {
+				t.Errorf("componentless push must not delete the conflicting slip, got DeleteSlip calls: %v",
+					store.DeleteSlipCalls)
+			}
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected exactly one Create attempt (no retry after dedup), got %d", len(store.CreateCalls))
+		}
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true (dedup onto a pre-existing slip)")
 		}
 	})
 }
