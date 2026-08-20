@@ -15,6 +15,16 @@ func pluralizeMock(name string) string {
 	return name + "s"
 }
 
+// commitIndexKey builds the CommitIndex lookup key for a repository/commit pair.
+// The repository is lowercased to mirror PostgresStore's case-insensitive
+// `lower(repository) = lower($1)` comparison (postgres_store.go); the commit SHA is
+// compared as-is, matching production. Every CommitIndex read or write in this file
+// must go through this helper so reads and writes stay in agreement (DEVOPS-231
+// review D1.1) - a partial fix (some sites lowercased, others not) is worse than none.
+func commitIndexKey(repository, commitSHA string) string {
+	return strings.ToLower(repository) + ":" + commitSHA
+}
+
 // deepCopySlip creates a deep copy of a Slip to prevent shared map/slice references.
 // This is used by MockStore to ensure test isolation.
 func deepCopySlip(slip *Slip) *Slip {
@@ -254,15 +264,16 @@ type SetImageTagCall struct {
 // NewMockStore creates a new MockStore with initialized maps.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		Slips:                   make(map[string]*Slip),
-		CommitIndex:             make(map[string]string),
-		CreateErrorFor:          make(map[string]error),
-		LoadErrorFor:            make(map[string]error),
-		UpdateStepErrorFor:      make(map[string]error),
-		UpdateComponentErrorFor: make(map[string]error),
-		AppendHistoryErrorFor:   make(map[string]error),
-		CreateErrorOnce:         make(map[string]error),
-		SeedOnCreate:            make(map[string]*Slip),
+		Slips:                    make(map[string]*Slip),
+		CommitIndex:              make(map[string]string),
+		CreateErrorFor:           make(map[string]error),
+		LoadErrorFor:             make(map[string]error),
+		UpdateStepErrorFor:       make(map[string]error),
+		UpdateComponentErrorFor:  make(map[string]error),
+		AppendHistoryErrorFor:    make(map[string]error),
+		CreateErrorOnce:          make(map[string]error),
+		SeedOnCreate:             make(map[string]*Slip),
+		DeleteSlipWentLiveStatus: make(map[string]SlipStatus),
 	}
 }
 
@@ -277,7 +288,7 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 		delete(m.SeedOnCreate, slip.CorrelationID)
 		seedCopy := deepCopySlip(seed)
 		m.Slips[seed.CorrelationID] = seedCopy
-		m.CommitIndex[seed.Repository+":"+seed.CommitSHA] = seed.CorrelationID
+		m.CommitIndex[commitIndexKey(seed.Repository, seed.CommitSHA)] = seed.CorrelationID
 	}
 
 	if m.CreateError != nil {
@@ -296,7 +307,7 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 	m.Slips[slip.CorrelationID] = slipCopy
 
 	// Index by commit for LoadByCommit
-	key := slip.Repository + ":" + slip.CommitSHA
+	key := commitIndexKey(slip.Repository, slip.CommitSHA)
 	m.CommitIndex[key] = slip.CorrelationID
 
 	return nil
@@ -322,7 +333,14 @@ func (m *MockStore) DeleteSlip(ctx context.Context, correlationID, successorCorr
 		return m.DeleteSlipError
 	}
 	if slip, ok := m.Slips[correlationID]; ok {
-		delete(m.CommitIndex, slip.Repository+":"+slip.CommitSHA)
+		// Only unmap the commit index entry if it still points at THIS slip. The mock's
+		// Create permits duplicate (repo, sha) rows and re-points the index at the
+		// newest one, so an older row's delete must not clear an index entry that has
+		// since moved on to a different, still-live row (DEVOPS-231 review D1.1).
+		key := commitIndexKey(slip.Repository, slip.CommitSHA)
+		if id, ok := m.CommitIndex[key]; ok && id == correlationID {
+			delete(m.CommitIndex, key)
+		}
 		delete(m.Slips, correlationID)
 	}
 	return nil
@@ -366,7 +384,7 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 		return nil, m.LoadByCommitError
 	}
 
-	key := repository + ":" + commitSHA
+	key := commitIndexKey(repository, commitSHA)
 	correlationID, ok := m.CommitIndex[key]
 	if !ok {
 		if m.LoadByCommitNilOnce {
@@ -401,7 +419,7 @@ func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA 
 		return nil, m.LoadLiveByCommitError
 	}
 
-	key := repository + ":" + commitSHA
+	key := commitIndexKey(repository, commitSHA)
 	correlationID, ok := m.CommitIndex[key]
 	if !ok {
 		return nil, ErrSlipNotFound
@@ -440,7 +458,7 @@ func (m *MockStore) FindByCommits(ctx context.Context, repository string, commit
 
 	// Find the first matching commit in order
 	for _, commit := range commits {
-		key := repository + ":" + commit
+		key := commitIndexKey(repository, commit)
 		if correlationID, ok := m.CommitIndex[key]; ok {
 			if slip, ok := m.Slips[correlationID]; ok {
 				return deepCopySlip(slip), commit, nil
@@ -474,7 +492,7 @@ func (m *MockStore) FindAllByCommits(
 	// Find all matching slips in commit order
 	var results []SlipWithCommit
 	for _, commit := range commits {
-		key := repository + ":" + commit
+		key := commitIndexKey(repository, commit)
 		if correlationID, ok := m.CommitIndex[key]; ok {
 			if slip, ok := m.Slips[correlationID]; ok {
 				results = append(results, SlipWithCommit{
@@ -831,7 +849,7 @@ func (m *MockStore) AddSlip(slip *Slip) {
 	slipCopy := deepCopySlip(slip)
 	m.Slips[slip.CorrelationID] = slipCopy
 
-	key := slip.Repository + ":" + slip.CommitSHA
+	key := commitIndexKey(slip.Repository, slip.CommitSHA)
 	m.CommitIndex[key] = slip.CorrelationID
 }
 

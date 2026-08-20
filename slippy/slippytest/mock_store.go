@@ -39,6 +39,16 @@ func pluralize(name string) string {
 	return name + "s"
 }
 
+// commitIndexKey builds the CommitIndex lookup key for a repository/commit pair. The
+// repository is lowercased to mirror PostgresStore's case-insensitive
+// `lower(repository) = lower($1)` comparison (postgres_store.go); the commit SHA is
+// compared as-is, matching production. Every CommitIndex read or write in this file
+// must go through this helper so reads and writes stay in agreement (DEVOPS-231
+// review D1.1) - a partial fix (some sites lowercased, others not) is worse than none.
+func commitIndexKey(repository, commitSHA string) string {
+	return strings.ToLower(repository) + ":" + commitSHA
+}
+
 // MockStore is an in-memory implementation of slippy.SlipStore for testing.
 //
 // It provides configurable behavior and tracking of method calls.
@@ -104,6 +114,17 @@ type MockStore struct {
 	UpdateStepErrorFor      map[string]error
 	UpdateComponentErrorFor map[string]error
 	AppendHistoryErrorFor   map[string]error
+
+	// DeleteSlipWentLiveStatus simulates a slip transitioning to a live status in the
+	// window between a caller's repave decision (an earlier LoadByCommit/Load saw it
+	// ended) and the DeleteSlip call itself: when DeleteSlip is invoked for a
+	// correlation ID present in this map WHILE DeleteSlipError is set (e.g. to
+	// slippy.ErrSlipWentLive), the mock mutates the stored row's status to the mapped
+	// value before returning the injected error, then removes the entry (one-shot).
+	// This lets a subsequent Load (the caller's reload-after-ErrSlipWentLive) observe
+	// the new state instead of the stale decision-time snapshot. Mirrors the internal
+	// slippy package's MockStore.DeleteSlipWentLiveStatus (DEVOPS-231 review D1.2).
+	DeleteSlipWentLiveStatus map[string]slippy.SlipStatus
 }
 
 // CreateCall records a Create call.
@@ -173,13 +194,14 @@ type UpdateSlipStatusCall struct {
 // NewMockStore creates a new MockStore with initialized maps.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		Slips:                   make(map[string]*slippy.Slip),
-		CommitIndex:             make(map[string]string),
-		CreateErrorFor:          make(map[string]error),
-		LoadErrorFor:            make(map[string]error),
-		UpdateStepErrorFor:      make(map[string]error),
-		UpdateComponentErrorFor: make(map[string]error),
-		AppendHistoryErrorFor:   make(map[string]error),
+		Slips:                    make(map[string]*slippy.Slip),
+		CommitIndex:              make(map[string]string),
+		CreateErrorFor:           make(map[string]error),
+		LoadErrorFor:             make(map[string]error),
+		UpdateStepErrorFor:       make(map[string]error),
+		UpdateComponentErrorFor:  make(map[string]error),
+		AppendHistoryErrorFor:    make(map[string]error),
+		DeleteSlipWentLiveStatus: make(map[string]slippy.SlipStatus),
 	}
 }
 
@@ -203,29 +225,57 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 	m.Slips[slip.CorrelationID] = slipCopy
 
 	// Index by commit for LoadByCommit
-	key := slip.Repository + ":" + slip.CommitSHA
+	key := commitIndexKey(slip.Repository, slip.CommitSHA)
 	m.CommitIndex[key] = slip.CorrelationID
 
 	return nil
 }
 
 // DeleteSlip removes the slip and its commit index entry (children live on the Slip
-// struct in the mock, so removing the slip removes everything). successorCorrelationID
-// is recorded in DeleteSlipSuccessorCalls but otherwise unused: the mock has no
-// slip_ancestry-equivalent table for descendants to be repointed away from (see
-// DeleteSlipSuccessorCalls's doc comment).
+// struct in the mock, so removing the slip removes everything), but ONLY when the
+// stored slip's status is no longer live - mirroring PostgresStore's ended-status
+// guard (slippy.SlipStore.DeleteSlip's contract in interfaces.go). A live slip
+// (Status.IsLive() true) is rejected with slippy.ErrSlipWentLive and left untouched,
+// so a downstream consumer's went-live handling is exercisable against this mock
+// exactly as it would be against Postgres (DEVOPS-231 review D1.2).
+//
+// successorCorrelationID is recorded in DeleteSlipSuccessorCalls but otherwise unused:
+// the mock has no slip_ancestry-equivalent table for descendants to be repointed away
+// from (see DeleteSlipSuccessorCalls's doc comment).
 func (m *MockStore) DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.DeleteSlipCalls = append(m.DeleteSlipCalls, correlationID)
 	m.DeleteSlipSuccessorCalls = append(m.DeleteSlipSuccessorCalls, successorCorrelationID)
 	if m.DeleteSlipError != nil {
+		if newStatus, ok := m.DeleteSlipWentLiveStatus[correlationID]; ok {
+			delete(m.DeleteSlipWentLiveStatus, correlationID)
+			if slip, exists := m.Slips[correlationID]; exists {
+				slip.Status = newStatus
+			}
+		}
 		return m.DeleteSlipError
 	}
-	if slip, ok := m.Slips[correlationID]; ok {
-		delete(m.CommitIndex, slip.Repository+":"+slip.CommitSHA)
-		delete(m.Slips, correlationID)
+
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		// Deleting a missing slip is not an error (idempotent), matching PostgresStore.
+		return nil
 	}
+
+	if slip.Status.IsLive() {
+		return slippy.ErrSlipWentLive
+	}
+
+	// Only unmap the commit index entry if it still points at THIS slip. Create
+	// permits duplicate (repo, sha) rows and re-points the index at the newest one, so
+	// an older row's delete must not clear an index entry that has since moved on to a
+	// different, still-live row (DEVOPS-231 review D1.1).
+	key := commitIndexKey(slip.Repository, slip.CommitSHA)
+	if id, idOK := m.CommitIndex[key]; idOK && id == correlationID {
+		delete(m.CommitIndex, key)
+	}
+	delete(m.Slips, correlationID)
 	return nil
 }
 
@@ -266,7 +316,7 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 		return nil, m.LoadByCommitError
 	}
 
-	key := repository + ":" + commitSHA
+	key := commitIndexKey(repository, commitSHA)
 	correlationID, ok := m.CommitIndex[key]
 	if !ok {
 		return nil, slippy.ErrSlipNotFound
@@ -295,7 +345,7 @@ func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA 
 		return nil, m.LoadLiveByCommitError
 	}
 
-	key := repository + ":" + commitSHA
+	key := commitIndexKey(repository, commitSHA)
 	correlationID, ok := m.CommitIndex[key]
 	if !ok {
 		return nil, slippy.ErrSlipNotFound
@@ -336,7 +386,7 @@ func (m *MockStore) FindByCommits(
 
 	// Find the first matching commit in order
 	for _, commit := range commits {
-		key := repository + ":" + commit
+		key := commitIndexKey(repository, commit)
 		if correlationID, ok := m.CommitIndex[key]; ok {
 			if slip, ok := m.Slips[correlationID]; ok {
 				return DeepCopySlip(slip), commit, nil
@@ -369,7 +419,7 @@ func (m *MockStore) FindAllByCommits(
 	// Find all matching commits in order
 	var results []slippy.SlipWithCommit
 	for _, commit := range commits {
-		key := repository + ":" + commit
+		key := commitIndexKey(repository, commit)
 		if correlationID, ok := m.CommitIndex[key]; ok {
 			if slip, ok := m.Slips[correlationID]; ok {
 				results = append(results, slippy.SlipWithCommit{
@@ -700,7 +750,7 @@ func (m *MockStore) AddSlip(slip *slippy.Slip) {
 	slipCopy := DeepCopySlip(slip)
 	m.Slips[slip.CorrelationID] = slipCopy
 
-	key := slip.Repository + ":" + slip.CommitSHA
+	key := commitIndexKey(slip.Repository, slip.CommitSHA)
 	m.CommitIndex[key] = slip.CorrelationID
 }
 

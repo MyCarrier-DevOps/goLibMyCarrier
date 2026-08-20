@@ -112,6 +112,70 @@ func TestMockStore_DeleteSlip(t *testing.T) {
 			t.Errorf("Expected 'delete failed', got %v", err)
 		}
 	})
+
+	t.Run("does not unmap the commit index when it no longer points at the deleted slip", func(t *testing.T) {
+		// The mock's Create permits duplicate (repo, sha) rows (unlike Postgres' unique
+		// index), and each Create re-points CommitIndex at the newest row. If a caller
+		// later deletes the OLDER row (a), the index by then points at the NEWER row
+		// (b) - deleting must not clear an index entry that no longer belongs to the
+		// slip being deleted, or b becomes unreachable via LoadByCommit even though it
+		// still exists (DEVOPS-231 review D1.1).
+		store := NewMockStore()
+
+		if err := store.Create(ctx, &Slip{
+			CorrelationID: "corr-a", Repository: "owner/repo", CommitSHA: "sha-shared",
+		}); err != nil {
+			t.Fatalf("Create corr-a failed: %v", err)
+		}
+		if err := store.Create(ctx, &Slip{
+			CorrelationID: "corr-b", Repository: "owner/repo", CommitSHA: "sha-shared",
+		}); err != nil {
+			t.Fatalf("Create corr-b failed: %v", err)
+		}
+
+		if err := store.DeleteSlip(ctx, "corr-a", ""); err != nil {
+			t.Fatalf("DeleteSlip(corr-a) failed: %v", err)
+		}
+
+		got, err := store.LoadByCommit(ctx, "owner/repo", "sha-shared")
+		if err != nil {
+			t.Fatalf("expected corr-b to remain findable by commit after corr-a's delete, got error: %v", err)
+		}
+		if got.CorrelationID != "corr-b" {
+			t.Errorf("expected corr-b, got %s", got.CorrelationID)
+		}
+	})
+
+	t.Run("commit index resolves repository lookups case-insensitively", func(t *testing.T) {
+		// PostgresStore compares `lower(repository) = lower($1)` (postgres_store.go), so
+		// a casing-variant delivery for the same repo must still resolve in the mock
+		// (DEVOPS-231 review D1.1).
+		store := NewMockStore()
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-case", Repository: "Owner/Repo", CommitSHA: "sha-case",
+		})
+
+		got, err := store.LoadByCommit(ctx, "owner/repo", "sha-case")
+		if err != nil {
+			t.Fatalf("expected case-insensitive repository match, got error: %v", err)
+		}
+		if got.CorrelationID != "corr-case" {
+			t.Errorf("expected corr-case, got %s", got.CorrelationID)
+		}
+	})
+}
+
+func TestMockStore_NewMockStore_InitializesDeleteSlipWentLiveStatus(t *testing.T) {
+	// NewMockStore initializes CreateErrorOnce and SeedOnCreate; DeleteSlipWentLiveStatus
+	// must follow the same idiom so `store.DeleteSlipWentLiveStatus["id"] = ...` does not
+	// panic with "assignment to entry in nil map" (DEVOPS-231 review D1.3).
+	store := NewMockStore()
+
+	store.DeleteSlipWentLiveStatus["corr-x"] = SlipStatusInProgress
+
+	if store.DeleteSlipWentLiveStatus["corr-x"] != SlipStatusInProgress {
+		t.Error("expected the assignment to be stored")
+	}
 }
 
 func TestMockStore_Load(t *testing.T) {

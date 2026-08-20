@@ -130,6 +130,10 @@ func TestMockStore_DeleteSlip(t *testing.T) {
 		CorrelationID: "test-delete",
 		Repository:    "test/repo",
 		CommitSHA:     "commitdel",
+		// DeleteSlip only ever removes an ended slip (D1.2's status guard); give the
+		// fixture a realistic ended status rather than the zero value, which
+		// SlipStatus.IsLive() treats as live.
+		Status: slippy.SlipStatusCompleted,
 	})
 
 	if err := store.DeleteSlip(ctx, "test-delete", "successor-delete"); err != nil {
@@ -187,6 +191,149 @@ func TestMockStore_DeleteSlip_Missing(t *testing.T) {
 	// Deleting an unknown slip is not an error (idempotent), matching PostgresStore.
 	if err := store.DeleteSlip(context.Background(), "never-existed", ""); err != nil {
 		t.Errorf("deleting a missing slip must be a no-op, got %v", err)
+	}
+}
+
+func TestMockStore_DeleteSlip_EndedSlip_Deletes(t *testing.T) {
+	// PostgresStore's DeleteSlip only ever removes a row whose status is "ended"
+	// (interfaces.go). An ended slip must be deleted with no error (DEVOPS-231 review
+	// D1.2).
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-ended",
+		Repository:    "owner/repo",
+		CommitSHA:     "sha-ended",
+		Status:        slippy.SlipStatusCompleted,
+	})
+
+	if err := store.DeleteSlip(ctx, "corr-ended", ""); err != nil {
+		t.Fatalf("expected ended slip to delete cleanly, got %v", err)
+	}
+	if _, err := store.Load(ctx, "corr-ended"); !errors.Is(err, slippy.ErrSlipNotFound) {
+		t.Errorf("expected ended slip to be gone, got %v", err)
+	}
+}
+
+func TestMockStore_DeleteSlip_LiveSlip_ReturnsErrSlipWentLive(t *testing.T) {
+	// The exported MockStore asserts `var _ slippy.SlipStore = (*MockStore)(nil)`, so a
+	// downstream consumer's went-live handling must be exercisable against it. Without
+	// this guard, the mock would let a caller delete a pending/in_progress slip - the
+	// exact operation PostgresStore refuses (DEVOPS-231 review D1.2).
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-live",
+		Repository:    "owner/repo",
+		CommitSHA:     "sha-live",
+		Status:        slippy.SlipStatusInProgress,
+	})
+
+	err := store.DeleteSlip(ctx, "corr-live", "")
+	if !errors.Is(err, slippy.ErrSlipWentLive) {
+		t.Fatalf("expected ErrSlipWentLive for a live slip, got %v", err)
+	}
+
+	// The live slip must survive the rejected delete.
+	if _, loadErr := store.Load(ctx, "corr-live"); loadErr != nil {
+		t.Errorf("live slip must survive a rejected delete, got %v", loadErr)
+	}
+	if _, byCommitErr := store.LoadByCommit(ctx, "owner/repo", "sha-live"); byCommitErr != nil {
+		t.Errorf("live slip's commit index entry must survive a rejected delete, got %v", byCommitErr)
+	}
+}
+
+func TestMockStore_DeleteSlip_WentLiveHook_MutatesStatusBeforeReturningError(t *testing.T) {
+	// Mirrors slippy's internal MockStore.DeleteSlipWentLiveStatus: simulates the slip
+	// transitioning to live in the window between the caller's repave decision and the
+	// DeleteSlip call itself, so a subsequent reload observes the new state rather than
+	// the stale decision-time snapshot (DEVOPS-231 review D1.2, review finding B1).
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-went-live",
+		Repository:    "owner/repo",
+		CommitSHA:     "sha-went-live",
+		Status:        slippy.SlipStatusFailed, // ended at decision time
+	})
+	store.DeleteSlipError = slippy.ErrSlipWentLive
+	store.DeleteSlipWentLiveStatus = map[string]slippy.SlipStatus{"corr-went-live": slippy.SlipStatusInProgress}
+
+	err := store.DeleteSlip(ctx, "corr-went-live", "")
+	if !errors.Is(err, slippy.ErrSlipWentLive) {
+		t.Fatalf("expected ErrSlipWentLive, got %v", err)
+	}
+
+	reloaded, loadErr := store.Load(ctx, "corr-went-live")
+	if loadErr != nil {
+		t.Fatalf("expected the slip to survive, got %v", loadErr)
+	}
+	if reloaded.Status != slippy.SlipStatusInProgress {
+		t.Errorf("expected the hook to mutate status to in_progress, got %s", reloaded.Status)
+	}
+	if len(store.DeleteSlipWentLiveStatus) != 0 {
+		t.Error("expected the one-shot hook entry to be cleared after firing")
+	}
+}
+
+func TestMockStore_DeleteSlip_DoesNotUnmapWhenIndexPointsElsewhere(t *testing.T) {
+	// Same fidelity gap as the internal mock: Create permits duplicate (repo, sha) rows
+	// and re-points CommitIndex at the newest one. Deleting an OLDER ended row must not
+	// clear an index entry that has since moved on to a different, still-live row
+	// (DEVOPS-231 review D1.1).
+	store := NewMockStore()
+	ctx := context.Background()
+
+	if err := store.Create(ctx, &slippy.Slip{
+		CorrelationID: "corr-a",
+		Repository:    "owner/repo",
+		CommitSHA:     "sha-shared",
+		Status:        slippy.SlipStatusCompleted,
+	}); err != nil {
+		t.Fatalf("Create corr-a failed: %v", err)
+	}
+	if err := store.Create(ctx, &slippy.Slip{
+		CorrelationID: "corr-b",
+		Repository:    "owner/repo",
+		CommitSHA:     "sha-shared",
+		Status:        slippy.SlipStatusInProgress,
+	}); err != nil {
+		t.Fatalf("Create corr-b failed: %v", err)
+	}
+
+	if err := store.DeleteSlip(ctx, "corr-a", ""); err != nil {
+		t.Fatalf("DeleteSlip(corr-a) failed: %v", err)
+	}
+
+	got, err := store.LoadByCommit(ctx, "owner/repo", "sha-shared")
+	if err != nil {
+		t.Fatalf("expected corr-b to remain findable by commit after corr-a's delete, got error: %v", err)
+	}
+	if got.CorrelationID != "corr-b" {
+		t.Errorf("expected corr-b, got %s", got.CorrelationID)
+	}
+}
+
+func TestMockStore_LoadByCommit_CaseInsensitiveRepository(t *testing.T) {
+	// PostgresStore compares `lower(repository) = lower($1)` (postgres_store.go), so a
+	// casing-variant delivery for the same repo must still resolve in the mock
+	// (DEVOPS-231 review D1.1).
+	store := NewMockStore()
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-case",
+		Repository:    "Owner/Repo",
+		CommitSHA:     "sha-case",
+	})
+
+	got, err := store.LoadByCommit(context.Background(), "owner/repo", "sha-case")
+	if err != nil {
+		t.Fatalf("expected case-insensitive repository match, got error: %v", err)
+	}
+	if got.CorrelationID != "corr-case" {
+		t.Errorf("expected corr-case, got %s", got.CorrelationID)
 	}
 }
 
