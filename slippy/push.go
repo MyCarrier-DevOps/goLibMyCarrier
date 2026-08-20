@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -266,7 +267,24 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	slip := c.initializeSlipForPush(opts, ancestry)
 
 	if err := c.store.Create(ctx, slip); err != nil {
-		return nil, fmt.Errorf("failed to create slip: %w", err)
+		if errors.Is(err, ErrDuplicateSlip) {
+			// Unique-index backstop (fail-open Redis race): another run holds the
+			// row. Load it, repave it, retry once. Still serialized by the repo:sha
+			// lock in the normal case; this is the last-resort convergence path.
+			conflicting, loadErr := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
+			if loadErr == nil && conflicting != nil {
+				if delErr := c.store.DeleteSlip(ctx, conflicting.CorrelationID); delErr != nil {
+					return nil, fmt.Errorf(
+						"failed to repave conflicting slip %s: %w", conflicting.CorrelationID, delErr,
+					)
+				}
+			}
+			if retryErr := c.store.Create(ctx, slip); retryErr != nil {
+				return nil, fmt.Errorf("failed to create slip after duplicate backstop: %w", retryErr)
+			}
+		} else {
+			return nil, fmt.Errorf("failed to create slip: %w", err)
+		}
 	}
 
 	// Write direct parent link to slip_ancestry table (O(1) per slip)

@@ -89,6 +89,10 @@ func (s *PostgresStore) Create(ctx context.Context, slip *Slip) error {
 		strings.Join(cols, ", "), strings.Join(placeholders, ", "), strings.Join(sets, ", "))
 
 	if _, err := s.pool.Exec(ctx, query, vals...); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_routing_slips_repo_sha" {
+			return fmt.Errorf("create slip %s: %w", slip.CorrelationID, ErrDuplicateSlip)
+		}
 		return fmt.Errorf("failed to create slip %s: %w", slip.CorrelationID, err)
 	}
 	return nil

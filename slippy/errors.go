@@ -98,6 +98,11 @@ var (
 	// It propagates through SlipError / StepError via errors.Unwrap so that
 	// errors.Is continues to work at the outermost caller.
 	ErrTerminalAlreadyExists = errors.New("terminal status already recorded for step")
+
+	// ErrDuplicateSlip indicates an insert conflicted with the one-row-per-commit
+	// unique index (uq_routing_slips_repo_sha). The push path treats it as "someone
+	// else holds the row" and routes to the repave/dedup backstop (DEVOPS-231).
+	ErrDuplicateSlip = errors.New("a slip already exists for this repository and commit")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

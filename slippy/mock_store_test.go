@@ -142,6 +142,14 @@ type MockStore struct {
 	UpdateStepErrorFor      map[string]error
 	UpdateComponentErrorFor map[string]error
 	AppendHistoryErrorFor   map[string]error
+
+	// CreateErrorOnce injects an error for a single Create call keyed by correlation
+	// ID, then clears itself: unlike CreateErrorFor (which fires on every attempt for
+	// that id), this fires exactly once and is removed on first use. This is needed to
+	// simulate "fail first, succeed on retry" races such as the ErrDuplicateSlip
+	// backstop (DEVOPS-231), where CreateErrorFor's every-attempt semantics can't
+	// express a create that succeeds on the backstop's retry.
+	CreateErrorOnce map[string]error
 }
 
 // CreateCall records a Create call.
@@ -212,6 +220,7 @@ func NewMockStore() *MockStore {
 		UpdateStepErrorFor:      make(map[string]error),
 		UpdateComponentErrorFor: make(map[string]error),
 		AppendHistoryErrorFor:   make(map[string]error),
+		CreateErrorOnce:         make(map[string]error),
 	}
 }
 
@@ -224,6 +233,10 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 
 	if m.CreateError != nil {
 		return m.CreateError
+	}
+	if err, ok := m.CreateErrorOnce[slip.CorrelationID]; ok {
+		delete(m.CreateErrorOnce, slip.CorrelationID)
+		return err
 	}
 	if err, ok := m.CreateErrorFor[slip.CorrelationID]; ok {
 		return err

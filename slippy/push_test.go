@@ -732,6 +732,59 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			t.Error("in-flight slip must never be repaved")
 		}
 	})
+
+	t.Run("duplicate-create backstop - repaves and retries once", func(t *testing.T) {
+		// Redis-lock fail-open race: two creates for the same new commit; the loser's
+		// INSERT hits the unique index (ErrDuplicateSlip). The backstop loads the
+		// winner row, repaves it, and retries the create once.
+		//
+		// NOTE: this arrangement FIRST hits Task 3's normal repave (an ended slip for
+		// sha-race already exists), which deletes the winner row and clears its commit
+		// index entry before Create is even attempted. That leaves nothing for the
+		// backstop's own LoadByCommit to find once the injected ErrDuplicateSlip fires,
+		// so the backstop retries Create directly without a second delete. What matters
+		// is the FINAL state: create succeeds, no error surfaces, and at least one
+		// repave/backstop delete happened along the way.
+		//
+		// CreateErrorFor fires on every attempt for an id, which can't express "fail
+		// first, succeed on retry" - use the one-shot CreateErrorOnce instead.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		// Winner row exists but is NOT indexed under the loser's lookup until Create
+		// is attempted: simulate by injecting the error on first Create only.
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-race-winner",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race",
+			Status:        SlipStatusCompleted, // ended by the time the retry lands
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.CreateErrorOnce["corr-race-loser"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-race-loser",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("backstop must recover, got error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-race-loser" {
+			t.Errorf("expected corr-race-loser to be created after backstop retry, got %+v", result.Slip)
+		}
+		if _, ok := store.Slips["corr-race-loser"]; !ok {
+			t.Error("expected corr-race-loser to be persisted after backstop retry")
+		}
+		if len(store.DeleteSlipCalls) < 1 {
+			t.Errorf("expected at least one repave/backstop delete, got %v", store.DeleteSlipCalls)
+		}
+	})
 }
 
 func TestClient_InitializeSlipForPush(t *testing.T) {

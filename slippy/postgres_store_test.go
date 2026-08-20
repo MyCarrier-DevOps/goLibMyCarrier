@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +64,49 @@ func TestPostgresStore_Create_Upsert(t *testing.T) {
 
 	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
 	require.NoError(t, store.Create(context.Background(), slip))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_Create_DuplicateMapsToSentinel pins the 23505 -> ErrDuplicateSlip
+// mapping (DEVOPS-231). Until migration v5 adds the uq_routing_slips_repo_sha unique
+// index, no production INSERT can actually trigger this constraint violation - this
+// test exercises the mapping in isolation via a fake pgconn.PgError so the backstop's
+// errors.Is(err, ErrDuplicateSlip) contract is verified ahead of the migration landing.
+func TestPostgresStore_Create_DuplicateMapsToSentinel(t *testing.T) {
+	store, mock := newMockStore(t)
+	pgErr := &pgconn.PgError{
+		Code:           "23505",
+		ConstraintName: "uq_routing_slips_repo_sha",
+		Message:        "duplicate key value violates unique constraint \"uq_routing_slips_repo_sha\"",
+	}
+	mock.ExpectExec("INSERT INTO routing_slips .* ON CONFLICT \\(correlation_id\\) DO UPDATE SET").
+		WithArgs(anyArgs(len(store.slipColumns()))...).
+		WillReturnError(pgErr)
+
+	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
+	err := store.Create(context.Background(), slip)
+	require.ErrorIs(t, err, ErrDuplicateSlip)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_Create_OtherPgErrorNotMapped confirms the mapping is narrow: a
+// unique violation on a different constraint, or any other Postgres error code, is
+// wrapped as a plain error rather than misreported as ErrDuplicateSlip.
+func TestPostgresStore_Create_OtherPgErrorNotMapped(t *testing.T) {
+	store, mock := newMockStore(t)
+	pgErr := &pgconn.PgError{
+		Code:           "23505",
+		ConstraintName: "routing_slips_pkey",
+		Message:        "duplicate key value violates unique constraint \"routing_slips_pkey\"",
+	}
+	mock.ExpectExec("INSERT INTO routing_slips .* ON CONFLICT \\(correlation_id\\) DO UPDATE SET").
+		WithArgs(anyArgs(len(store.slipColumns()))...).
+		WillReturnError(pgErr)
+
+	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
+	err := store.Create(context.Background(), slip)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrDuplicateSlip)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
