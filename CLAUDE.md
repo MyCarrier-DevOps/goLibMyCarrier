@@ -93,6 +93,8 @@ make fmt             # gofmt/goimports (NOT raw `gofmt -l`)
 make tidy            # go mod tidy across all modules
 make check-sec       # gosec scan (NOT raw `gosec ./...`)
 make check-coverage  # coverage threshold gate
+make mutation        # mutation-test lines changed vs MUTATION_BASE — diff-scoped pre-merge gate
+make mutation-all    # mutation-test a module in full — periodic audit, not a pre-merge gate
 make bump            # version bump helper
 ```
 
@@ -102,8 +104,8 @@ Available targets: `make help` (if defined) or `grep -E "^[a-z_-]+:" Makefile`.
 across all modules in `LIB_DIRS`. When you're working in one package, pass
 `PKG=<module>` to run just that one instead of the whole repo — e.g.
 `make test PKG=slippy`, `make lint PKG=clickhouse`, `make check-sec PKG=vault`.
-Only `lint`, `test`, and `check-sec` honor `PKG=`; `fmt`, `tidy`, and `bump`
-always run across all modules.
+Only `lint`, `test`, `check-sec`, `mutation`, and `mutation-all` honor `PKG=`;
+`fmt`, `tidy`, and `bump` always run across all modules.
 
 **Raw `go build ./...` / `go vet ./...` are acceptable for quick verification** but final gate before commit must run `make lint && make test`.
 
@@ -135,8 +137,9 @@ The go-devkit block above refers to an `APPLICATION` variable — that's the
 single-service Makefile pattern and **does not exist in this repo**. Because this
 is a multi-module library, the Makefile enumerates its modules in a **`LIB_DIRS`**
 variable instead, and every target (`lint`, `test`, `fmt`, `bump`, `tidy`,
-`check-sec`) loops over `LIB_DIRS` (the `lint`, `test`, and `check-sec` targets
-also accept `PKG=<module>` to scope to a single package — see Build & Test).
+`check-sec`, `mutation`, `mutation-all`) loops over `LIB_DIRS` (the `lint`,
+`test`, `check-sec`, `mutation`, and `mutation-all` targets also accept
+`PKG=<module>` to scope to a single package — see Build & Test).
 CI ignores `LIB_DIRS` and discovers modules dynamically via
 `find . -name go.mod`. When you add or remove a module, update `LIB_DIRS` in the
 Makefile — there is no `APPLICATION` line to touch.

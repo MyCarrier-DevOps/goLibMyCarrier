@@ -91,21 +91,29 @@ tidy:
 		fi; \
 	done
 
+.PHONY: install-govulncheck
+install-govulncheck:
+	@installed=$$(command -v govulncheck >/dev/null 2>&1 && govulncheck -version 2>&1); \
+	case "$$installed" in \
+		*$(GOVULNCHECK_VERSION)*) ;; \
+		*) go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ;; \
+	esac
+
 .PHONY: check-sec
-check-sec:
+check-sec: install-govulncheck
 	@if [ -z "$(PKG)" ]; then \
 		echo "Checking for known vulnerabilities in all modules..."; \
 		for dir in $(LIB_DIRS); do \
 			if [ -d "$$dir" ]; then \
 				echo "Checking $$dir module..."; \
-				(cd $$dir && go mod download && go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) && govulncheck -show verbose -test=false ./...) || exit 1; \
+				(cd $$dir && go mod download && govulncheck -show verbose -test=false ./...) || exit 1; \
 			else \
 				echo "Directory $$dir not found, skipping..."; \
 			fi; \
 		done; \
 	else \
 		echo "Checking $(PKG) module for known vulnerabilities..."; \
-		(cd $(PKG) && go mod download && go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) && govulncheck -test=false ./...) || exit 1; \
+		(cd $(PKG) && go mod download && govulncheck -test=false ./...) || exit 1; \
 	fi
 
 .PHONY: install-go-test-coverage
@@ -126,7 +134,11 @@ check-coverage: install-go-test-coverage
 # confirm the tool reports its mutants as SURVIVED, not killed.
 .PHONY: install-mutest
 install-mutest:
-	@command -v mutest >/dev/null 2>&1 || go install github.com/fchimpan/mutest@$(MUTEST_VERSION)
+	@installed=$$(command -v mutest >/dev/null 2>&1 && mutest -version 2>&1); \
+	case "$$installed" in \
+		*$(MUTEST_VERSION)*) ;; \
+		*) go install github.com/fchimpan/mutest@$(MUTEST_VERSION) ;; \
+	esac
 
 # Mutation-test only the lines changed vs MUTATION_BASE — the pre-merge gate.
 # Surviving mutants mean an assertion is missing; add tests rather than lowering

@@ -138,6 +138,43 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   (pre-existing; ancestry walks cannot see rewritten-away commits) — not addressed by
   this change.
 
+**Known sharp edges of repave:**
+
+- **In-flight peer steps.** `FailStep` (`steps.go`) never modifies peer steps, so a
+  slip can be `failed` (e.g. `unit_tests` failed) while another step (e.g. `build`)
+  still runs. Repaving deletes the `routing_slips` row those late writers target, so
+  their post-job `UpdateStepWithStatus` and any in-progress `WaitForPrerequisites`
+  poll (`hold.go`, which reloads the slip via `store.Load` each iteration) now fail
+  with `ErrSlipNotFound`, where pre-DEVOPS-231 abandon semantics left the row in
+  place to absorb them. This is deliberately NOT fixed by making not-found benign
+  across `steps.go`/`hold.go` — that would mask genuine not-found bugs repo-wide —
+  and is tracked as a follow-up. The status-guarded delete (`ErrSlipWentLive`) does
+  remove the worst case: a `failed` slip that recovers to `in_progress` before the
+  delete lands is no longer deletable, so a recovering run is never pulled out from
+  under itself.
+- **Deploy-event attachment.** A same-commit re-push repaves an ended slip whose
+  image may have already shipped, so a deploy event for that image now attaches to
+  the current (repaved) run for that `(repo, sha)` rather than the run that actually
+  built it — see `resolve.go`'s `LoadByCommit` comment for the updated contract.
+  This is a deliberate contract change, not a bug: refusing to repave any ended slip
+  that recorded an image tag would make re-pushing an already-built commit
+  non-repaveable, which is this PR's primary case.
+- **Empty-run guard consequences.** In a zero-component repo, a failed run cannot be
+  retriggered by re-pushing the same commit — the guard returns the existing (still
+  failed) slip and the caller suppresses re-dispatch. The guard's early return also
+  skips `resolveAndAbandonAncestors`, so an older in-flight slip on the same branch
+  that a fall-through push would otherwise have abandoned stays live. And because the
+  guard dedupes onto ANY ended status, a superseded-terminal slip
+  (`abandoned`/`promoted`/`compensated`) can now be returned from `CreateSlipForPush`
+  for a componentless push — previously impossible, since that function always
+  either reused a live slip or created a fresh one.
+- **No convergence backstop in Phase A.** Without the `uq_routing_slips_repo_sha`
+  unique index (Phase B), a subsequent `Create` for the same `(repository,
+  commit_sha)` never conflicts on anything but `correlation_id`, so `ErrDuplicateSlip`
+  is unreachable via a failed repave delete. A failed delete simply leaves the stale
+  ended row behind alongside the fresh row until the Phase B migration adds the index
+  and its cleanup runs.
+
 **Terminology — two mutually exclusive retrigger mechanisms:**
 - **Push-shaped retrigger** ("webhook re-delivery" / "same-commit re-push"): any push
   event for a SHA that already has a slip, handled by `CreateSlipForPush` above (repave,

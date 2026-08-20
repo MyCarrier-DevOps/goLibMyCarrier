@@ -14,6 +14,34 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ---
 
+## Breaking changes
+
+**DEVOPS-231 added `DeleteSlip` to the exported `SlipStore` interface:**
+
+```go
+DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error
+```
+
+This is a compile-breaking change for any downstream consumer with its own
+`SlipStore` implementation — a `var _ slippy.SlipStore = (*fakeStore)(nil)` assertion
+now fails with "missing method DeleteSlip" until that method is added. This was a
+deliberate choice: a reviewer suggested a narrower optional interface asserted at the
+call site instead, so existing implementers would not need to change; we rejected
+that in favor of compile-time conformance for the operational store, and this repo
+already has a documented process for exactly this situation — see the **Slippy Bump
+Checklist** in slippy-api's `CLAUDE.md` ("Check if `slippy.SlipStore` interface
+gained new methods — update `mockSlipStore`"). Since every module in this repo
+releases at one shared version, bumping the dependency in a downstream consumer means
+following that checklist, not working around the interface.
+
+Callers may also now observe two new sentinel errors from the repave path this method
+implements: `ErrSlipWentLive` (the delete was rejected because the slip went live
+between the repave decision and the call) and `ErrDeleteSlipUnsupported` (the store,
+e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
+abandon semantics). See `errors.go` for their full contracts.
+
+---
+
 ## Overview
 
 **Slippy** is a Go library that provides **routing slip** functionality for CI/CD pipeline orchestration. It tracks pipeline executions across stages, components, and steps, enabling intelligent hold/proceed decisions based on prerequisite completion.
