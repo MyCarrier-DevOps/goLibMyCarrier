@@ -398,7 +398,7 @@ func (m *MockRow) Scan(dest ...interface{}) error {
 
 		// Use reflection to set the value
 		dv := reflect.ValueOf(d)
-		if dv.Kind() != reflect.Ptr {
+		if dv.Kind() != reflect.Pointer {
 			continue
 		}
 
