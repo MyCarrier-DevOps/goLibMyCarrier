@@ -165,7 +165,9 @@ func TestPostgresStore_DeleteSlip_Cascades_Integration(t *testing.T) {
 // TestPostgresStore_DeleteSlip_RepointsDescendants_Integration pins FIX 3 against a real
 // Postgres instance: another slip whose slip_ancestry row points at the repaved slip as
 // its parent must be repointed to the successor, not left dangling (a dangling link would
-// silently truncate that descendant's ResolveAncestry walk at this hop).
+// silently truncate that descendant's ResolveAncestry walk at this hop). It also pins D2.2
+// (DEVOPS-231 review): the repoint clears parent_failed_step, since the deleted run's
+// failed step is unambiguously wrong once the id beside it names the successor run.
 func TestPostgresStore_DeleteSlip_RepointsDescendants_Integration(t *testing.T) {
 	store, pool, _ := newMigratedStore(t)
 	ctx := context.Background()
@@ -190,7 +192,7 @@ func TestPostgresStore_DeleteSlip_RepointsDescendants_Integration(t *testing.T) 
 	require.NoError(t, store.InsertAncestryLink(ctx, child, AncestryEntry{
 		CorrelationID: parent.CorrelationID, CommitSHA: parent.CommitSHA,
 		Repository: parent.Repository, Branch: parent.Branch,
-		Status: SlipStatusFailed, CreatedAt: time.Now(),
+		Status: SlipStatusFailed, FailedStep: "unit_tests", CreatedAt: time.Now(),
 	}))
 
 	require.NoError(t, store.DeleteSlip(ctx, parent.CorrelationID, "corr-successor"))
@@ -198,11 +200,14 @@ func TestPostgresStore_DeleteSlip_RepointsDescendants_Integration(t *testing.T) 
 	_, err := store.Load(ctx, parent.CorrelationID)
 	assert.ErrorIs(t, err, ErrSlipNotFound, "the repaved slip itself must be gone")
 
-	var newParent string
+	var newParent, failedStep string
 	require.NoError(t, pool.QueryRow(ctx,
-		"SELECT parent_correlation_id FROM slip_ancestry WHERE repository = $1 AND branch = $2 AND correlation_id = $3",
-		child.Repository, child.Branch, child.CorrelationID).Scan(&newParent))
+		"SELECT parent_correlation_id, parent_failed_step FROM slip_ancestry "+
+			"WHERE repository = $1 AND branch = $2 AND correlation_id = $3",
+		child.Repository, child.Branch, child.CorrelationID).Scan(&newParent, &failedStep))
 	assert.Equal(t, "corr-successor", newParent, "descendant must be repointed to the successor, not dangling")
+	assert.Empty(t, failedStep,
+		"parent_failed_step must be cleared on repoint: the pre-repave run's failed step is wrong for the successor")
 }
 
 // TestPostgresStore_DeleteSlip_WentLive_Integration pins FIX 2's TOCTOU guard against a

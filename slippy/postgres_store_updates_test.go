@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -304,18 +305,45 @@ func TestPostgresStore_SetComponentImageTag_NotFound(t *testing.T) {
 }
 
 // TestPostgresStore_DeleteSlip_EndedSlip_RepointsSuccessor pins the happy repave path: an
-// ended slip (status IN the ended set) is deleted, descendants pointing at it are
-// repointed to the successor BEFORE the parent row is removed, and children are cleaned up
-// only because the guarded delete actually removed the row.
+// ended slip (status IN the ended set) is deleted FIRST, and only because that guarded
+// delete actually removed the row are descendants pointing at it repointed to the
+// successor (clearing their stale parent_failed_step in the same UPDATE, D2.2) and this
+// slip's own children cleaned up (D2.1: nothing here runs before the delete confirms it
+// happened).
 func TestPostgresStore_DeleteSlip_EndedSlip_RepointsSuccessor(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
-	mock.ExpectExec("UPDATE slip_ancestry SET parent_correlation_id").
-		WithArgs("new-id", "old-id").
-		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
 	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec("UPDATE slip_ancestry SET parent_correlation_id").
+		WithArgs("new-id", "old-id").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
+	mock.ExpectExec("DELETE FROM slip_component_states").
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.DeleteSlip(context.Background(), "old-id", "new-id"))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_DeleteSlip_EndedSlip_RepointsSuccessor_ClearsFailedStep pins D2.2: the
+// repoint UPDATE also clears parent_failed_step, since the deleted run's failed step is
+// unambiguously wrong once the id beside it names the successor run instead.
+func TestPostgresStore_DeleteSlip_EndedSlip_RepointsSuccessor_ClearsFailedStep(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id = \$1, parent_failed_step = '' `+
+		`WHERE parent_correlation_id = \$2`).
+		WithArgs("new-id", "old-id").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -330,16 +358,17 @@ func TestPostgresStore_DeleteSlip_EndedSlip_RepointsSuccessor(t *testing.T) {
 
 // TestPostgresStore_DeleteSlip_EndedSlip_NoSuccessor_ClearsDescendants covers the "no
 // successor" branch: with successorCorrelationID == "", descendant links are deleted
-// rather than repointed (there is nothing to point them at).
+// rather than repointed (there is nothing to point them at) — and, per D2.1, only after
+// the guarded delete confirms the row was actually removed.
 func TestPostgresStore_DeleteSlip_EndedSlip_NoSuccessor_ClearsDescendants(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -356,13 +385,11 @@ func TestPostgresStore_DeleteSlip_EndedSlip_NoSuccessor_ClearsDescendants(t *tes
 // when the row still exists but its status is no longer ended (it recovered to live
 // between the caller's repave decision and this call), the delete must be rejected with
 // ErrSlipWentLive and the transaction rolled back — no children touched, no descendants
-// repointed.
+// repointed. Per D2.1/D2.2, the descendant statement is never even issued in this path:
+// it sits after the guarded delete, which never reports RowsAffected() > 0 here.
 func TestPostgresStore_DeleteSlip_LiveSlip_RejectedWithErrSlipWentLive(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 0)) // guard rejected: status no longer ended
@@ -377,13 +404,16 @@ func TestPostgresStore_DeleteSlip_LiveSlip_RejectedWithErrSlipWentLive(t *testin
 }
 
 // TestPostgresStore_DeleteSlip_MissingSlip_ReturnsNil pins the pre-existing idempotent
-// case: deleting a slip that does not exist at all is not an error.
+// case: deleting a slip that does not exist at all is not an error. Critically (D2.1,
+// DEVOPS-231 review), this must be a TRUE no-op: no descendant repoint/clear statement
+// may be issued at all, since that would commit a real mutation (erasing or repointing
+// other slips' ancestry links) under the guise of "nothing happened". pgxmock is in
+// strict ordered mode, so if the code issues the descendant statement before the guarded
+// delete confirms a row was actually removed, the first unexpected call below fails and
+// DeleteSlip surfaces that as an error instead of returning nil.
 func TestPostgresStore_DeleteSlip_MissingSlip_ReturnsNil(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
-		WithArgs("ghost").
-		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 		WithArgs("ghost").
 		WillReturnResult(pgxmock.NewResult("DELETE", 0))
@@ -401,15 +431,15 @@ func TestPostgresStore_DeleteSlip_MissingSlip_ReturnsNil(t *testing.T) {
 func TestPostgresStore_DeleteSlip_StatusGuard_CoversEndedStatuses(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec(
 		`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN ` +
 			`\('failed','completed','abandoned','promoted','compensated'\)`,
 	).
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE parent_correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 0))
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -420,4 +450,63 @@ func TestPostgresStore_DeleteSlip_StatusGuard_CoversEndedStatuses(t *testing.T) 
 
 	require.NoError(t, store.DeleteSlip(context.Background(), "old-id", ""))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// parseSQLStringSet parses a SQL "IN (...)" literal list of single-quoted strings (e.g.
+// deletableSlipStatusesSQL's "'failed','completed'") into a set of the unquoted values.
+// Used only by TestDeletableSlipStatusesSQL_MatchesIsLive so that test compares against
+// the real deletableSlipStatusesSQL constant's actual contents, not a second hardcoded
+// copy of the status list that could itself drift from the SQL.
+func parseSQLStringSet(sqlSet string) map[string]bool {
+	out := make(map[string]bool)
+	for _, part := range strings.Split(sqlSet, ",") {
+		part = strings.TrimSpace(part)
+		part = strings.Trim(part, "'")
+		out[part] = true
+	}
+	return out
+}
+
+// TestDeletableSlipStatusesSQL_MatchesIsLive asserts set equality between
+// deletableSlipStatusesSQL (DeleteSlip's guard, expressed in SQL) and SlipStatus.IsLive
+// (the repave decision predicate, expressed in Go) across every SlipStatus value —
+// enumerated explicitly, the same exhaustiveness style TestSlipStatus_IsLive already
+// uses, so a future ninth status forces a decision here too instead of silently drifting
+// (D2.3, DEVOPS-231 review): if IsLive() ever disagrees with this SQL constant,
+// CreateSlipForPush routes a push to repave but DeleteSlip's guard rejects the delete,
+// returning ErrSlipWentLive for a slip that never actually went live — permanently
+// wedging that commit's pushes onto the old, ended slip with no error surfaced anywhere.
+func TestDeletableSlipStatusesSQL_MatchesIsLive(t *testing.T) {
+	// Every SlipStatus value that exists today. Adding a ninth to the enum without adding
+	// it here (and to the assertions below) leaves it silently unchecked by this test —
+	// matching the enumeration style of TestSlipStatus_IsLive.
+	allStatuses := []SlipStatus{
+		SlipStatusPending,
+		SlipStatusInProgress,
+		SlipStatusCompleted,
+		SlipStatusFailed,
+		SlipStatusCompensating,
+		SlipStatusCompensated,
+		SlipStatusAbandoned,
+		SlipStatusPromoted,
+	}
+
+	sqlSet := parseSQLStringSet(deletableSlipStatusesSQL)
+
+	wantSet := make(map[string]bool, len(allStatuses))
+	for _, status := range allStatuses {
+		if !status.IsLive() {
+			wantSet[string(status)] = true
+		}
+	}
+
+	assert.Equal(t, wantSet, sqlSet,
+		"deletableSlipStatusesSQL must contain exactly the SlipStatus values where IsLive() is false")
+
+	for _, status := range allStatuses {
+		t.Run(string(status), func(t *testing.T) {
+			assert.Equal(t, !status.IsLive(), sqlSet[string(status)],
+				"deletableSlipStatusesSQL and SlipStatus(%q).IsLive() disagree", status)
+		})
+	}
 }

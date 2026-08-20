@@ -113,10 +113,24 @@ type AncestryEntry struct {
 	// CommitSHA is the git commit SHA of the ancestor slip
 	CommitSHA string `json:"commit_sha"`
 
-	// Status is the final status of the ancestor slip (failed, completed, abandoned)
+	// Status is the final status of the ancestor slip (failed, completed, abandoned) as of
+	// when this link was written. It is a denormalized snapshot, not a live read.
+	//
+	// This matters across a repave (DeleteSlip + Create under a new correlation ID,
+	// DEVOPS-231): when the ancestor referenced by CorrelationID is repaved, DeleteSlip
+	// repoints CorrelationID on this entry to the successor run, but it leaves Status as
+	// the PRE-repave run's status — the successor's current status is not knowable at
+	// repoint time (the successor's Create happens afterwards), so none is invented. After
+	// such a repave, CorrelationID and Status on this entry describe two different runs by
+	// construction, and nothing on the row signals that it happened. A consumer that needs
+	// the successor's live status must Load(CorrelationID) rather than trust this field.
 	Status SlipStatus `json:"status"`
 
-	// FailedStep is the step that failed (if Status is failed)
+	// FailedStep is the step that failed (if Status is failed). DeleteSlip's repoint
+	// clears this to "" when the ancestor is repaved and CorrelationID moves to a
+	// successor — the pre-repave run's failed step would otherwise sit next to an id for a
+	// different (successor) run, which is unambiguously wrong. See Status above for the
+	// same repoint's effect on the rest of this denormalized snapshot.
 	FailedStep string `json:"failed_step,omitempty"`
 
 	// CreatedAt is when the ancestor slip was created
