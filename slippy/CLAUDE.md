@@ -144,7 +144,19 @@ type SlipPushData struct {
 
 ## Environment Variables
 
-### Required for Slippy Operation
+**Postgres is the operational slip store (see Key Characteristics above), but slippy does
+NOT read Postgres connection settings itself.** `NewPostgresStore(pool, config, logger)`
+takes an already-built `*pgxpool.Pool` — the caller constructs and injects it. The tables
+below (`CLICKHOUSE_*`, `SLIPPY_*`) are consumed by `slippy.ConfigFromEnv()`/`NewClient`,
+the ClickHouse-backed path; they say nothing about how a deployment provisions Postgres.
+For that, see the sibling `goLibMyCarrier/postgres` module: it provides a
+`POSTGRES_*`-prefixed env config (`PostgresLoadConfig`: `POSTGRES_HOSTNAME`,
+`POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE`, `POSTGRES_PORT`,
+`POSTGRES_SSLMODE`, plus pool/timeout tunables) and a pooled session helper
+(`session.go`), mirroring this package's `clickhouse` config shape — the designed
+counterpart for building the pool a caller then passes to `NewPostgresStore`.
+
+### Required for Slippy Operation (ClickHouse-backed `NewClient` path only)
 
 | Variable | Description | Example |
 |----------|-------------|---------|
