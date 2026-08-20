@@ -15,6 +15,12 @@ LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafk
 # (`golangci-lint version` prints the Go it was built with).
 GOLANGCI_LINT_VERSION := v2.13.1
 GOVULNCHECK_VERSION   := v1.7.0
+GO_TEST_COVERAGE_VERSION := v2.19.0
+
+# Coverage floor. MUST match `threshold-total` in .github/workflows/ci.yml: CI enforces it
+# with the vladopajic/go-test-coverage action, and `make check-coverage` enforces the same
+# number locally so the two cannot disagree. `make doctor` verifies they still match.
+COVERAGE_THRESHOLD_TOTAL := 75
 
 # Mutation testing (mutest). Pinned so local and CI judge identically.
 MUTEST_VERSION     := v0.6.0
@@ -118,12 +124,53 @@ check-sec: install-govulncheck
 
 .PHONY: install-go-test-coverage
 install-go-test-coverage:
-	go install github.com/vladopajic/go-test-coverage/v2@latest
+	@if ! command -v go-test-coverage >/dev/null 2>&1 || \
+		! go-test-coverage --version 2>&1 | grep -q "$(GO_TEST_COVERAGE_VERSION)"; then \
+		echo "Installing go-test-coverage $(GO_TEST_COVERAGE_VERSION)..."; \
+		go install github.com/vladopajic/go-test-coverage/v2@$(GO_TEST_COVERAGE_VERSION); \
+	fi
 
+# Coverage gate, deliberately a mirror of the CI job rather than a second opinion:
+# same per-module scope, the same fixture-package exclusion (`go list ./... | grep -v test`),
+# and the same COVERAGE_THRESHOLD_TOTAL as ci.yml's `threshold-total`. It is therefore
+# meaningful to run before pushing — a pass here predicts a pass in CI.
+#
+# It does NOT reuse `make test`'s profile: `make test` covers every package including the
+# fixture ones (loggertest, slippytest, migratortest), which CI excludes, so its numbers are
+# a different measurement and would judge against the wrong denominator.
+#
+# Like CI, it fails if the tests fail — coverage is not evaluated on a red suite. The
+# postgres and postgresmigrator modules need a container runtime for their testcontainers
+# integration tests; on Rancher Desktop that means
+#   DOCKER_HOST=unix://$$HOME/.rd/docker.sock TESTCONTAINERS_RYUK_DISABLED=true make check-coverage
 .PHONY: check-coverage
 check-coverage: install-go-test-coverage
-	go test ./... -coverprofile=./cover.out -covermode=atomic -coverpkg=./...
-	${GOBIN}/go-test-coverage --config=./.testcoverage.yml
+	@if [ -z "$(PKG)" ]; then \
+		echo "Checking coverage for all modules (threshold-total $(COVERAGE_THRESHOLD_TOTAL)%)..."; \
+		for dir in $(LIB_DIRS); do \
+			if [ -d "$$dir" ]; then \
+				$(MAKE) --no-print-directory check-coverage-one PKG=$$dir || exit 1; \
+			else \
+				echo "Directory $$dir not found, skipping..."; \
+			fi; \
+		done; \
+	else \
+		$(MAKE) --no-print-directory check-coverage-one PKG=$(PKG); \
+	fi
+
+# Single-module coverage check. Not meant to be called directly — use `check-coverage`
+# (optionally with PKG=<module>), which handles the all-modules loop.
+.PHONY: check-coverage-one
+check-coverage-one:
+	@echo "Checking $(PKG) coverage (threshold-total $(COVERAGE_THRESHOLD_TOTAL)%)..."
+	@cd $(PKG) && go mod download && \
+		PKGS=$$(go list ./... | grep -v 'test' || echo "./...") && \
+		{ out=$$(go test -cover -coverprofile=../coverage-$(PKG).out -covermode=atomic $$PKGS 2>&1) \
+			|| { echo "$$out"; echo "check-coverage: $(PKG) tests failed — coverage not evaluated"; exit 1; }; } && \
+		go-test-coverage \
+			--profile=../coverage-$(PKG).out \
+			--source-dir=. \
+			--threshold-total=$(COVERAGE_THRESHOLD_TOTAL)
 
 # Mutation testing uses mutest, which mutates and runs the tests IN PLACE inside the
 # module directory. That matters here: several modules (slippy, slippyapi, ...) use
@@ -180,6 +227,79 @@ mutation-all: install-mutest
 		(cd $(PKG) && go mod download && mutest -threshold $(MUTATION_THRESHOLD) ./...); \
 	fi
 
+# Report where the local toolchain disagrees with what CI will use, and exit non-zero if it
+# does. This exists because of a real incident: when Go 1.27.0 shipped, every lint job broke
+# and the fix took two CI rounds because local gates were silently judging against different
+# tools than CI —
+#
+#   * GOROOT was exported to an older Go install, which OVERRIDES whichever `go` binary you
+#     invoke, so running a newer go directly still used the old compiler and produced a
+#     baffling `compile: version "goX" does not match go tool version "goY"` for every module;
+#   * a version manager shimmed golangci-lint AHEAD of $(go env GOPATH)/bin on PATH, so
+#     `make install-tools` installed the pinned version and it was then shadowed — the pin
+#     was inert locally.
+#
+# Net effect: local said clean, CI panicked. Anything this target reports is a reason your
+# local gate result does not predict CI's.
+.PHONY: doctor
+doctor:
+	@status=0; \
+	echo "== Go =="; \
+	echo "  go on PATH:          $$(command -v go || echo '(not found)')"; \
+	echo "  go version:          $$(go version 2>/dev/null || echo '(not found)')"; \
+	echo "  go env GOROOT:       $$(go env GOROOT 2>/dev/null)"; \
+	if [ -n "$$GOROOT" ]; then \
+		echo "  GOROOT (exported):   $$GOROOT"; \
+		if [ -x "$$GOROOT/bin/go" ] && \
+			[ "$$($$GOROOT/bin/go version 2>/dev/null)" != "$$(go version 2>/dev/null)" ]; then \
+			echo "  MISMATCH: GOROOT is exported and its toolchain ($$($$GOROOT/bin/go version)) differs"; \
+			echo "            from the go on PATH. GOROOT wins, so the go you invoke is NOT the"; \
+			echo "            compiler that runs. Unset GOROOT (or point your version manager at"; \
+			echo "            one version) before trusting any local gate."; \
+			status=1; \
+		fi; \
+	fi; \
+	ci_go=$$(grep -m1 -oE 'go-version: *[^ ]+' .github/workflows/ci.yml 2>/dev/null | awk '{print $$2}'); \
+	echo "  ci.yml go-version:   $$ci_go (with check-latest, so CI installs the newest matching)"; \
+	echo "== Pinned tools (Makefile vs installed) =="; \
+	for spec in "golangci-lint|$(GOLANGCI_LINT_VERSION)|version" \
+	            "govulncheck|$(GOVULNCHECK_VERSION)|-version" \
+	            "mutest|$(MUTEST_VERSION)|-version" \
+	            "go-test-coverage|$(GO_TEST_COVERAGE_VERSION)|--version"; do \
+		tool=$$(echo "$$spec" | cut -d'|' -f1); \
+		want=$$(echo "$$spec" | cut -d'|' -f2); \
+		flag=$$(echo "$$spec" | cut -d'|' -f3); \
+		path=$$(command -v $$tool 2>/dev/null); \
+		if [ -z "$$path" ]; then \
+			printf "  %-18s want %-10s NOT INSTALLED (run: make install-tools / make install-mutest)\n" "$$tool" "$$want"; \
+			continue; \
+		fi; \
+		got=$$($$tool $$flag 2>&1 | tr '\n' ' ' | sed 's/  */ /g'); \
+		if echo "$$got" | grep -q "$$want"; then \
+			printf "  %-18s want %-10s OK\n" "$$tool" "$$want"; \
+		else \
+			printf "  %-18s want %-10s MISMATCH: %s\n" "$$tool" "$$want" "$$(echo $$got | cut -c1-90)"; \
+			echo "                     resolved from: $$path"; \
+			status=1; \
+		fi; \
+	done; \
+	echo "== Coverage threshold (Makefile vs ci.yml) =="; \
+	ci_thr=$$(grep -m1 -oE 'threshold-total: *[0-9]+' .github/workflows/ci.yml 2>/dev/null | grep -oE '[0-9]+'); \
+	if [ "$$ci_thr" = "$(COVERAGE_THRESHOLD_TOTAL)" ]; then \
+		echo "  both $(COVERAGE_THRESHOLD_TOTAL)% OK"; \
+	else \
+		echo "  MISMATCH: Makefile $(COVERAGE_THRESHOLD_TOTAL)% vs ci.yml $$ci_thr% — local gate would"; \
+		echo "            not predict CI. Reconcile COVERAGE_THRESHOLD_TOTAL with ci.yml."; \
+		status=1; \
+	fi; \
+	echo; \
+	if [ $$status -ne 0 ]; then \
+		echo "doctor: local toolchain does not match CI (see MISMATCH above)."; \
+	else \
+		echo "doctor: local toolchain matches CI."; \
+	fi; \
+	exit $$status
+
 .PHONY: help
 help:
 	@echo "Targets (all accept PKG=<module> where noted):"
@@ -188,12 +308,14 @@ help:
 	@echo "  make fmt            - gofmt/goimports, all modules"
 	@echo "  make tidy           - go mod tidy, all modules"
 	@echo "  make check-sec      - govulncheck vuln scan    (PKG=)"
-	@echo "  make check-coverage - coverage threshold gate"
+	@echo "  make check-coverage - coverage gate, mirrors CI (PKG=)"
 	@echo "  make mutation       - mutation-test lines changed vs $(MUTATION_BASE) (PKG=)"
 	@echo "  make mutation-all   - mutation-test a module in full; periodic audit (PKG=)"
 	@echo "  make bump           - version bump helper"
+	@echo "  make doctor         - report local toolchain drift vs CI; non-zero on mismatch"
 	@echo ""
-	@echo "Pinned tools: golangci-lint $(GOLANGCI_LINT_VERSION), govulncheck $(GOVULNCHECK_VERSION), mutest $(MUTEST_VERSION)"
+	@echo "Pinned tools: golangci-lint $(GOLANGCI_LINT_VERSION), govulncheck $(GOVULNCHECK_VERSION), mutest $(MUTEST_VERSION), go-test-coverage $(GO_TEST_COVERAGE_VERSION)"
+	@echo "Coverage floor: $(COVERAGE_THRESHOLD_TOTAL)% (must match ci.yml threshold-total)"
 	@echo "Mutation vars: MUTATION_BASE=$(MUTATION_BASE) MUTATION_THRESHOLD=$(MUTATION_THRESHOLD)"
 
 .PHONY: install-tools
