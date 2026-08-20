@@ -787,6 +787,63 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			t.Errorf("expected at least one repave/backstop delete, got %v", store.DeleteSlipCalls)
 		}
 	})
+
+	t.Run("duplicate-create backstop - live conflicting row is not deleted (dedup)", func(t *testing.T) {
+		// The real race this backstop exists for: no existing row for this commit
+		// (both pushes see not-found on the initial LoadByCommit), both call Create.
+		// The winner's insert lands WHILE the loser's Create is in flight - a live
+		// (in_progress) row now exists that did not exist a moment ago - and the
+		// loser's insert hits the unique index (ErrDuplicateSlip).
+		//
+		// Unlike the subtest above (whose fixture seeds a TERMINAL winner that the
+		// normal repave block deletes before Create is ever attempted, so the
+		// backstop's LoadByCommit finds nothing), this fixture must make the winner
+		// row appear strictly BETWEEN the loser's initial LoadByCommit (must find
+		// nothing) and the backstop's LoadByCommit (must find the live winner).
+		// SeedOnCreate injects the winner at the moment Create is called, achieving
+		// exactly that ordering.
+		//
+		// The live winner's pipeline may already be dispatched under its
+		// correlation_id, so the backstop must treat it like the reuse branch does:
+		// dedup onto the winner, do NOT delete it, and do NOT retry Create.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		winner := &Slip{
+			CorrelationID: "corr-race-winner-live",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race-live",
+			Status:        SlipStatusInProgress, // still live - pipeline may be dispatched
+			Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-race-loser-live"] = winner
+		store.CreateErrorOnce["corr-race-loser-live"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-race-loser-live",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race-live",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-race-winner-live" {
+			t.Errorf("expected dedup onto the live winner corr-race-winner-live, got %+v", result.Slip)
+		}
+		for _, deleted := range store.DeleteSlipCalls {
+			if deleted == "corr-race-winner-live" {
+				t.Errorf("live conflicting slip must never be deleted, got DeleteSlip calls: %v", store.DeleteSlipCalls)
+			}
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected exactly one Create attempt (no retry after dedup), got %d", len(store.CreateCalls))
+		}
+	})
 }
 
 func TestClient_InitializeSlipForPush(t *testing.T) {

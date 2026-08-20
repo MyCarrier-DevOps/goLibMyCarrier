@@ -154,6 +154,18 @@ type CreateSlipResult struct {
 //   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
 //     stale and a fresh slip is created with the new correlation ID from opts. This
 //     prevents resurrecting superseded slips on webhook re-delivery or bot-commit races.
+//   - Existing slip is failed/terminal AND opts.Components is empty: the empty-run guard
+//     short-circuits the repave above and returns the existing (ended) slip as a dedup,
+//     since nothing would be dispatched and repaving would only destroy history for no
+//     benefit.
+//
+// Even when no existing row is found for this commit, Create can still fail with
+// ErrDuplicateSlip: a concurrent push for the same commit can win the insert race between
+// our LoadByCommit and our Create (the Redis dedup lock is fail-open). A backstop loads the
+// conflicting row and applies the same live-vs-ended rule as above: a live conflicting slip
+// is deduped onto (never deleted - its pipeline may already be dispatched), an ended one is
+// deleted and Create is retried exactly once. This is a last-resort convergence path for a
+// future unique index on (repository, commit_sha) that does not exist in the schema yet.
 //
 // The returned CreateSlipResult contains both the slip and any non-fatal errors
 // that occurred during processing (e.g., ancestry resolution failures).
@@ -267,23 +279,23 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	slip := c.initializeSlipForPush(opts, ancestry)
 
 	if err := c.store.Create(ctx, slip); err != nil {
-		if errors.Is(err, ErrDuplicateSlip) {
-			// Unique-index backstop (fail-open Redis race): another run holds the
-			// row. Load it, repave it, retry once. Still serialized by the repo:sha
-			// lock in the normal case; this is the last-resort convergence path.
-			conflicting, loadErr := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
-			if loadErr == nil && conflicting != nil {
-				if delErr := c.store.DeleteSlip(ctx, conflicting.CorrelationID); delErr != nil {
-					return nil, fmt.Errorf(
-						"failed to repave conflicting slip %s: %w", conflicting.CorrelationID, delErr,
-					)
-				}
-			}
-			if retryErr := c.store.Create(ctx, slip); retryErr != nil {
-				return nil, fmt.Errorf("failed to create slip after duplicate backstop: %w", retryErr)
-			}
-		} else {
+		if !errors.Is(err, ErrDuplicateSlip) {
 			return nil, fmt.Errorf("failed to create slip: %w", err)
+		}
+
+		// Unique-index backstop (fail-open Redis race): another run holds the row.
+		// This is the same no-existing-row race the reuse branch above handles for a
+		// row that was ALREADY there at lookup time - here, the winner's insert
+		// landed between our own now-stale LoadByCommit and our Create.
+		handled, backstopErr := c.handleDuplicateSlipBackstop(ctx, opts, result)
+		if backstopErr != nil {
+			return nil, backstopErr
+		}
+		if handled {
+			return result, nil
+		}
+		if retryErr := c.store.Create(ctx, slip); retryErr != nil {
+			return nil, fmt.Errorf("failed to create slip after duplicate backstop: %w", retryErr)
 		}
 	}
 
@@ -309,6 +321,62 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	})
 
 	return result, nil
+}
+
+// handleDuplicateSlipBackstop handles an ErrDuplicateSlip from Create: another concurrent
+// push won the insert race for this (repository, commit_sha) between our caller's
+// LoadByCommit and its Create call. It loads the conflicting row and applies the same
+// live-is-sacrosanct rule as the main retry/repave logic in CreateSlipForPush: a live
+// conflicting slip is deduped onto (never deleted - its pipeline may already be
+// dispatched, and deleting it here would pull the rug out from under an in-flight run
+// while we dispatch a duplicate), an ended one is deleted so the caller can retry once.
+//
+// Returns handled=true when the caller should return result directly (the dedup case;
+// result.Slip and result.AncestryResolved are already populated on this path). Returns
+// handled=false when the caller should retry Create (either the conflicting row was
+// repaved, or no conflicting row was found/loadable - both mirror today's pre-fix
+// behavior). Returns a non-nil err only on a fatal repave failure.
+func (c *Client) handleDuplicateSlipBackstop(
+	ctx context.Context,
+	opts PushOptions,
+	result *CreateSlipResult,
+) (handled bool, err error) {
+	conflicting, loadErr := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
+	if loadErr != nil || conflicting == nil {
+		// No conflicting row found, or the lookup itself failed: nothing to repave
+		// here, so fall through to the caller's single Create retry exactly like
+		// today's pre-fix behavior - the retry will surface the real Create error if
+		// the conflict is still present.
+		return false, nil //nolint:nilerr // intentional fall-through, see comment above
+	}
+
+	if !conflicting.Status.IsTerminal() && conflicting.Status != SlipStatusFailed {
+		c.logger.Info(ctx, "Duplicate-create backstop: live conflicting slip, deduping", map[string]interface{}{
+			"conflicting_id": conflicting.CorrelationID,
+			"commit":         shortSHA(conflicting.CommitSHA),
+			"superseding_id": opts.CorrelationID,
+		})
+		result.Slip = conflicting
+		result.AncestryResolved = len(conflicting.Ancestry) > 0
+		return true, nil
+	}
+
+	c.logger.Info(ctx, "Duplicate-create backstop: repaving ended conflicting slip", map[string]interface{}{
+		"repaved_id":     conflicting.CorrelationID,
+		"repaved_commit": shortSHA(conflicting.CommitSHA),
+		"repaved_status": string(conflicting.Status),
+		"superseding_id": opts.CorrelationID,
+	})
+	if delErr := c.store.DeleteSlip(ctx, conflicting.CorrelationID); delErr != nil {
+		// Fatal here (unlike the non-fatal delete in the main repave block above):
+		// this backstop is already the last-resort convergence path, so there is
+		// nothing further to fall back on if the stale row survives and the retry
+		// hits the same conflict again.
+		return false, fmt.Errorf(
+			"failed to repave conflicting slip %s: %w", conflicting.CorrelationID, delErr,
+		)
+	}
+	return false, nil
 }
 
 // resolveAndAbandonAncestors fetches commit ancestry from GitHub,

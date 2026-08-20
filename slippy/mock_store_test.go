@@ -150,6 +150,17 @@ type MockStore struct {
 	// backstop (DEVOPS-231), where CreateErrorFor's every-attempt semantics can't
 	// express a create that succeeds on the backstop's retry.
 	CreateErrorOnce map[string]error
+
+	// SeedOnCreate injects a slip into the store the moment Create is invoked for the
+	// matching correlation ID, then clears itself (one-shot, like CreateErrorOnce).
+	// This simulates a concurrent winner's insert landing BETWEEN our own initial
+	// LoadByCommit (which found nothing) and our own Create attempt - the exact
+	// no-existing-row race the ErrDuplicateSlip backstop exists for (DEVOPS-231).
+	// Pair it with CreateErrorOnce for the same correlation ID so the call both seeds
+	// the winner row and then reports the duplicate-key conflict, letting the
+	// backstop's subsequent LoadByCommit observe a row that was not there a moment
+	// ago.
+	SeedOnCreate map[string]*Slip
 }
 
 // CreateCall records a Create call.
@@ -221,6 +232,7 @@ func NewMockStore() *MockStore {
 		UpdateComponentErrorFor: make(map[string]error),
 		AppendHistoryErrorFor:   make(map[string]error),
 		CreateErrorOnce:         make(map[string]error),
+		SeedOnCreate:            make(map[string]*Slip),
 	}
 }
 
@@ -230,6 +242,13 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 	defer m.mu.Unlock()
 
 	m.CreateCalls = append(m.CreateCalls, CreateCall{Slip: slip})
+
+	if seed, ok := m.SeedOnCreate[slip.CorrelationID]; ok {
+		delete(m.SeedOnCreate, slip.CorrelationID)
+		seedCopy := deepCopySlip(seed)
+		m.Slips[seed.CorrelationID] = seedCopy
+		m.CommitIndex[seed.Repository+":"+seed.CommitSHA] = seed.CorrelationID
+	}
 
 	if m.CreateError != nil {
 		return m.CreateError
