@@ -495,7 +495,8 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			t.Errorf("expected 1 DeleteSlip call for the abandoned row, got %d", len(store.DeleteSlipCalls))
 		}
 		for _, call := range store.UpdateStepCalls {
-			if call.CorrelationID == "corr-abandoned-old" && call.StepName == "push_parsed" && call.Status == StepStatusRunning {
+			if call.CorrelationID == "corr-abandoned-old" && call.StepName == "push_parsed" &&
+				call.Status == StepStatusRunning {
 				t.Error("abandoned row must not be reused via handlePushRetry (no push_parsed reset on the old id)")
 			}
 		}
