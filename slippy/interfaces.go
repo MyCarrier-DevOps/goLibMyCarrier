@@ -23,13 +23,29 @@ type SlipStore interface {
 	// Load retrieves a slip by its correlation ID (the unique slip identifier)
 	Load(ctx context.Context, correlationID string) (*Slip, error)
 
-	// LoadByCommit retrieves a slip by repository and commit SHA
+	// LoadByCommit retrieves a slip by repository and commit SHA.
+	//
+	// Error contract (DEVOPS-231 review D3.5): a clean miss — no row exists for this
+	// (repository, commitSHA) — MUST return ErrSlipNotFound and a nil slip. Any other
+	// non-nil error is treated by CreateSlipForPush (push.go) as a hard failure of the
+	// push: it aborts and returns the error to the caller rather than proceeding as if
+	// no slip existed, so Kafka redelivers the message. A store that signals absence with
+	// a bespoke error (e.g. wrapping sql.ErrNoRows without translating it, or returning a
+	// generic error from a degraded/partial read such as a hydration failure) makes that
+	// miss look like a hard failure instead: the push then fails every redelivery forever
+	// and no slip is ever created for that commit. Implementations must translate any
+	// "no rows" condition to ErrSlipNotFound before returning, and must not use
+	// ErrSlipNotFound for anything other than a genuine clean miss.
 	LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error)
 
 	// LoadLiveByCommit returns the LIVE (non-terminal) slip for the exact (repository, commitSHA).
 	// Excludes status in {abandoned, promoted, compensated}. Returns ErrSlipNotFound when no live
 	// slip exists. Use for in-flight dedup paths that require exact-SHA semantics. For
 	// ancestry-aware lookups use FindByCommits/ResolveSlip.
+	//
+	// Error contract: identical to LoadByCommit above — a clean miss (no live row) MUST be
+	// ErrSlipNotFound; any other error is a hard failure to callers on the push path. See
+	// LoadByCommit's doc for the full rationale.
 	LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error)
 
 	// FindByCommits finds a slip matching any commit in the ordered list.
