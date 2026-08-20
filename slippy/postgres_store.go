@@ -151,23 +151,25 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 	return s.queryOne(ctx, query, correlationID)
 }
 
-// LoadByCommit retrieves the most recently updated slip for (repository, commitSHA).
+// LoadByCommit retrieves the slip for (repository, commitSHA).
 // Repository comparison is case-insensitive.
 func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
+	// one row per (repo, sha) — DEVOPS-231; LIMIT 1 is belt-and-braces for pre-cleanup data
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
-			"ORDER BY updated_at DESC LIMIT 1",
+			"LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
-// LoadLiveByCommit returns the most recent live slip for (repository, commitSHA),
+// LoadLiveByCommit returns the live slip for (repository, commitSHA),
 // excluding terminal-superseded statuses (abandoned, promoted, compensated).
 func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
+	// one row per (repo, sha) — DEVOPS-231; LIMIT 1 is belt-and-braces for pre-cleanup data
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"AND status NOT IN ('abandoned', 'promoted', 'compensated') "+
-			"ORDER BY updated_at DESC LIMIT 1",
+			"LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }

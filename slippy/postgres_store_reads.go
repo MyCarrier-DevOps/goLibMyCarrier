@@ -19,6 +19,9 @@ func (s *PostgresStore) FindByCommits(
 		return nil, "", fmt.Errorf("no commits provided")
 	}
 
+	// c.priority orders across the distinct commits in the list; s.updated_at no longer
+	// breaks same-commit ties (there are none post-DEVOPS-231) and only stabilizes
+	// output when multiple commits in the list each have their own single row.
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s
@@ -51,6 +54,9 @@ func (s *PostgresStore) FindAllByCommits(
 		return nil, nil
 	}
 
+	// c.priority orders across the distinct commits in the list; s.updated_at no longer
+	// breaks same-commit ties (there are none post-DEVOPS-231) and only stabilizes
+	// output when multiple commits in the list each have their own single row.
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s
