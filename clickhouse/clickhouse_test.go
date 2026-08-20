@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +80,26 @@ func (m *MockConn) Exec(ctx context.Context, query string, args ...interface{}) 
 
 func (m *MockConn) AsyncInsert(ctx context.Context, query string, wait bool, args ...interface{}) error {
 	mArgs := m.Called(ctx, query, wait, args)
+	return mArgs.Error(0)
+}
+
+// QueryFormat implements driver.Conn (clickhouse-go v2.48.0+).
+func (m *MockConn) QueryFormat(
+	ctx context.Context,
+	format string,
+	query string,
+	args ...interface{},
+) (io.ReadCloser, error) {
+	mArgs := m.Called(ctx, format, query, args)
+	if mArgs.Get(0) == nil {
+		return nil, mArgs.Error(1)
+	}
+	return mArgs.Get(0).(io.ReadCloser), mArgs.Error(1)
+}
+
+// InsertFormat implements driver.Conn (clickhouse-go v2.48.0+).
+func (m *MockConn) InsertFormat(ctx context.Context, format, query string, data io.Reader) error {
+	mArgs := m.Called(ctx, format, query, data)
 	return mArgs.Error(0)
 }
 

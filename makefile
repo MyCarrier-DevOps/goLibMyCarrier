@@ -4,6 +4,18 @@ GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafka logger otel pollyapi postgres postgresmigrator repocanon slippy slippyapi teamsbot vault yaml
 
+# Tool versions, pinned so local and CI judge identically. CI installs these via
+# `make install-tools` / `make check-sec`, so this file is the single source of truth.
+#
+# GOLANGCI_LINT_VERSION must be built with a Go >= the toolchain CI resolves
+# (ci.yml uses `go-version: ^1.26` + `check-latest`, so a new Go minor is picked up
+# automatically). A linter built with an older Go panics on the newer stdlib:
+# "file requires newer Go version go1.27 (application built with go1.26)". When Go
+# ships a new minor, bump this to a release whose notes list that version's support
+# (`golangci-lint version` prints the Go it was built with).
+GOLANGCI_LINT_VERSION := v2.13.1
+GOVULNCHECK_VERSION   := v1.7.0
+
 # Mutation testing (mutest). Pinned so local and CI judge identically.
 MUTEST_VERSION     := v0.6.0
 MUTATION_BASE      ?= origin/main
@@ -86,14 +98,14 @@ check-sec:
 		for dir in $(LIB_DIRS); do \
 			if [ -d "$$dir" ]; then \
 				echo "Checking $$dir module..."; \
-				(cd $$dir && go mod download && go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck -show verbose -test=false ./...) || exit 1; \
+				(cd $$dir && go mod download && go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) && govulncheck -show verbose -test=false ./...) || exit 1; \
 			else \
 				echo "Directory $$dir not found, skipping..."; \
 			fi; \
 		done; \
 	else \
 		echo "Checking $(PKG) module for known vulnerabilities..."; \
-		(cd $(PKG) && go mod download && go install golang.org/x/vuln/cmd/govulncheck@latest && govulncheck -test=false ./...) || exit 1; \
+		(cd $(PKG) && go mod download && go install golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) && govulncheck -test=false ./...) || exit 1; \
 	fi
 
 .PHONY: install-go-test-coverage
@@ -163,14 +175,15 @@ help:
 	@echo "  make test           - tests w/ race + coverage (PKG=)"
 	@echo "  make fmt            - gofmt/goimports, all modules"
 	@echo "  make tidy           - go mod tidy, all modules"
-	@echo "  make check-sec      - gosec scan               (PKG=)"
+	@echo "  make check-sec      - govulncheck vuln scan    (PKG=)"
 	@echo "  make check-coverage - coverage threshold gate"
 	@echo "  make mutation       - mutation-test lines changed vs $(MUTATION_BASE) (PKG=)"
 	@echo "  make mutation-all   - mutation-test a module in full; periodic audit (PKG=)"
 	@echo "  make bump           - version bump helper"
 	@echo ""
-	@echo "Vars: MUTATION_BASE=$(MUTATION_BASE) MUTATION_THRESHOLD=$(MUTATION_THRESHOLD) MUTEST_VERSION=$(MUTEST_VERSION)"
+	@echo "Pinned tools: golangci-lint $(GOLANGCI_LINT_VERSION), govulncheck $(GOVULNCHECK_VERSION), mutest $(MUTEST_VERSION)"
+	@echo "Mutation vars: MUTATION_BASE=$(MUTATION_BASE) MUTATION_THRESHOLD=$(MUTATION_THRESHOLD)"
 
 .PHONY: install-tools
 install-tools:
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b `go env GOPATH`/bin v2.10.1
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b `go env GOPATH`/bin $(GOLANGCI_LINT_VERSION)

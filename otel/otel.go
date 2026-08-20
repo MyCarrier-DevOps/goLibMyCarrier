@@ -776,17 +776,19 @@ func (l *OtelLogger) sendOtelLog(level LogLevel, message string) {
 	logRecord.SetTimestamp(time.Now())
 	logRecord.SetSeverity(severity)
 	logRecord.SetSeverityText(level.String())
-	logRecord.SetBody(otellog.StringValue(message))
+	// otel/log v0.21.0+ takes bodies and attributes as attribute.Value /
+	// attribute.KeyValue; the log package's own Value/KeyValue helpers are gone.
+	logRecord.SetBody(attribute.StringValue(message))
 
 	// Add service attributes
 	logRecord.AddAttributes(
-		otellog.String("service.name", l.appName),
-		otellog.String("service.version", l.appVersion),
+		attribute.String("service.name", l.appName),
+		attribute.String("service.version", l.appVersion),
 	)
 
 	// Add custom attributes
 	for k, v := range l.attributes {
-		logRecord.AddAttributes(otellog.String(k, fmt.Sprintf("%v", v)))
+		logRecord.AddAttributes(attribute.String(k, fmt.Sprintf("%v", v)))
 	}
 
 	// Build a minimal context for Emit. The SDK log bridge calls
