@@ -50,8 +50,9 @@ abandon semantics). See `errors.go` for their full contracts.
 
 - **Postgres (`PostgresStore`) is the operational slip store** (since DEVOPS-127). `ClickHouseStore`
   remains in the codebase and implements the same `SlipStore` interface, but is not the write path
-  for production slips — e.g. `ClickHouseStore.DeleteSlip` is explicitly unsupported
-  (`clickhouse_store.go`: `"not supported on the ClickHouse store; Postgres is the operational slip store"`).
+  for production slips — e.g. `ClickHouseStore.DeleteSlip` (`clickhouse_store.go`) unconditionally
+  returns an error wrapping the `ErrDeleteSlipUnsupported` sentinel (see `errors.go`), signaling
+  callers to fall back to abandon semantics instead of repave.
 - **Dynamic schema** generated from JSON pipeline configuration
 - **Pre-job/Post-job execution model** - bookend operations around existing jobs (does NOT wrap job execution)
 - **Correlation ID** is the single canonical identifier for a slip throughout its lifecycle
@@ -272,11 +273,11 @@ err := client.UpdateStepWithStatus(ctx, correlationID, "build", "api", slippy.St
 ### Prerequisite Checking
 
 ```go
-result, err := client.CheckPrerequisites(ctx, correlationID, "deploy_dev")
+result, err := client.CheckPrerequisites(ctx, slip, []string{"unit_tests"}, "")
 switch result.Status {
-case slippy.PrereqStatusReady:    // All prereqs complete
-case slippy.PrereqStatusWaiting:  // Some prereqs still running
-case slippy.PrereqStatusFailed:   // A prereq failed
+case slippy.PrereqStatusCompleted: // All prereqs complete
+case slippy.PrereqStatusRunning:   // Some prereqs still running
+case slippy.PrereqStatusFailed:    // A prereq failed
 }
 ```
 
@@ -336,20 +337,28 @@ slippy/
 ├── push.go             # CreateSlipForPush
 ├── resolve.go          # ResolveSlip (ancestry resolution)
 ├── status.go           # SlipStatus/StepStatus/PrereqStatus enums + predicates (IsTerminal, IsSuccess, IsFailure) only
+├── aggregate_status.go # computeAggregateStatus (component -> aggregate rollup shared by both stores)
 ├── steps.go            # UpdateStepWithStatus + wrappers (CompleteStep, FailStep, StartStep, ...)
+├── history.go          # AppendHistoryEntry (state history convenience wrapper)
 ├── executor.go         # RunPreExecution/RunPostExecution; checkPipelineCompletion (pipeline-status derivation, recovery)
 ├── prereqs.go          # CheckPrerequisites, holds
 ├── hold.go             # WaitForPrerequisites
-├── migrations.go       # Schema migrations
-├── dynamic_migrations.go # Pipeline-config-based migrations
+├── migrations.go       # ClickHouse migration options/orchestration
+├── dynamic_migrations.go # Pipeline-config-based ClickHouse migrations
+├── schema_migrations.go # Versioned core schema migrations (table, materialized views)
 ├── pipeline_config.go  # Pipeline JSON parsing
-├── clickhouse_store.go # ClickHouse SlipStore implementation
+├── clickhouse_store.go # ClickHouse SlipStore implementation (not the operational store; see Key Characteristics)
+├── postgres_store.go   # PostgresStore type + pgxPool interface (the operational SlipStore, DEVOPS-127)
+├── postgres_store_reads.go   # PostgresStore read methods (FindByCommits, LoadByCommit, ResolveAncestry, ...)
+├── postgres_store_updates.go # PostgresStore write methods (Update, DeleteSlip, ...) + SlipStore conformance assertion
+├── postgres_migrate.go   # Postgres schema-migration options and expected-table checks
+├── postgres_migrations.go # PostgresDynamicMigrationManager (Postgres counterpart of DynamicMigrationManager)
 ├── github.go           # GitHub API implementation
 ├── errors.go           # Custom error types
 ├── columns.go          # Dynamic column generation
 ├── query_builder.go    # SQL query building
 ├── scanner.go          # Row scanning utilities
-├── utils.go            # Helper functions
+├── tracing.go          # OpenTelemetry span helpers
 ├── logger.go           # Logger interface adapter
 ├── slippytest/         # Test utilities package
 └── *_test.go           # Test files

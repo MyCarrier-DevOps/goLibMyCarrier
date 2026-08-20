@@ -122,8 +122,8 @@ versioned packages, not a single service or binary. The root `go.mod`
 tracking; consumers import each package by its own module path
 (`.../goLibMyCarrier/slippy`, `.../goLibMyCarrier/clickhouse`, `.../goLibMyCarrier/logger`, …).
 
-There are 18 modules, each with its own `go.mod` (the root `.` plus the dirs in
-the Makefile's `LIB_DIRS`): `argocdclient`, `auth`, `cievents`, `clickhouse`,
+There are 19 modules, each with its own `go.mod`: the root `.` plus the 18 dirs
+in the Makefile's `LIB_DIRS`: `argocdclient`, `auth`, `cievents`, `clickhouse`,
 `clickhousemigrator`, `github`, `kafka`, `logger`, `otel`, `pollyapi`,
 `postgres`, `postgresmigrator`, `repocanon`, `slippy`, `slippyapi`, `teamsbot`,
 `vault`, `yaml`. The `make` targets iterate

@@ -103,6 +103,12 @@ type SlipStore interface {
 	// Returns ErrSlipWentLive if correlationID's row exists but its status is no longer
 	// ended (the repave decision is now stale; the caller must not create a fresh slip).
 	// Deleting a missing slip is not an error (idempotent).
+	//
+	// A store that cannot repave (delete-and-recreate) at all — e.g. ClickHouseStore,
+	// which is not the operational slip store (DEVOPS-127) — MUST return an error
+	// wrapping ErrDeleteSlipUnsupported rather than a plain error or nil. The push path
+	// detects that sentinel with errors.Is and falls back to abandon semantics (marking
+	// the superseded slip abandoned) instead of repaving it.
 	DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error
 
 	// SetComponentImageTag records the built container image tag for a component in the event log.

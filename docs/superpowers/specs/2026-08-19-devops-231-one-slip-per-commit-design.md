@@ -1,5 +1,19 @@
 # DEVOPS-231 — One slip per (repository, commit_sha): repave design
 
+> **⚠️ SUPERSEDED IN PART — review of PR #82 (goLibMyCarrier, DEVOPS-231) changed
+> several decisions this spec records as "approved." This document is kept as a
+> historical record of what was designed and approved at the time, NOT re-edited to
+> match what shipped. Concretely: §6.1's one-arg unguarded `DeleteSlip(ctx,
+> correlationID)` shipped instead as `DeleteSlip(ctx, correlationID,
+> successorCorrelationID)`, gained an ended-status guard (returns `ErrSlipWentLive` if
+> the slip is no longer ended), and repoints descendant `slip_ancestry` links to the
+> successor transactionally instead of leaving them dangling. §7's "accept dangling
+> `parent_correlation_id`, no repointing" stance was replaced by that repointing. §6.4's
+> instruction to drop the `ORDER BY updated_at DESC` tiebreak from `LoadByCommit`/
+> `LoadLiveByCommit` was reverted — it is retained (see inline notes below). Treat
+> `slippy/interfaces.go`, `slippy/postgres_store_updates.go`, and
+> `slippy/postgres_store.go` as the source of truth, not this document.
+
 **Status:** approved design, ready for implementation planning
 **Tickets:** [DEVOPS-231](https://linear.app/mycarrier/issue/DEVOPS-231) (this work),
 [DEVOPS-230](https://linear.app/mycarrier/issue/DEVOPS-230) (originating analysis, closed as duplicate)
@@ -51,6 +65,17 @@ with the new run's `correlation_id`.
   live pipelines for one commit.
 
 ## 3. Schema changes (goLibMyCarrier migration, Postgres)
+
+> **⚠️ Phase B implementation note (PR #82 review):** the "no cascade on
+> `slip_ancestry.parent_correlation_id`" call below still stands, but for a reason
+> beyond what was known when this was written. Shipped `DeleteSlip`
+> (`slippy/postgres_store_updates.go`) repoints descendant `slip_ancestry` rows'
+> `parent_correlation_id` to `successorCorrelationID` *before* the successor's
+> `routing_slips` row exists — `Create` is a separate, later call (§6.5). An FK from
+> `slip_ancestry.parent_correlation_id` to `routing_slips(correlation_id)` would reject
+> that repoint (the referenced row isn't there yet) and break every repave with a
+> descendant. If this column ever gains a real FK, the repoint-then-create ordering
+> must change first (e.g. defer the FK check, or create-then-repoint-then-delete).
 
 New versioned migration in `slippy/postgres_migrations.go` (current latest: v4 — the
 new work is the next version; confirm the number at implementation time). Order within
@@ -129,6 +154,17 @@ window; the cleanup between them guarantees the index build succeeds.
 
 ### 6.1 Store: `DeleteSlip`
 
+> **⚠️ SUPERSEDED (PR #82 review):** shipped as `DeleteSlip(ctx, correlationID,
+> successorCorrelationID string) error` — a third parameter beyond what's described
+> below. It also gained an ended-status guard (returns `ErrSlipWentLive` if the row's
+> status is no longer ended — the repave decision went stale) and transactionally
+> repoints any other slip's `slip_ancestry.parent_correlation_id` from `correlationID`
+> to `successorCorrelationID` (or deletes those links if `successorCorrelationID` is
+> empty) rather than leaving them dangling. `ClickHouseStore.DeleteSlip` returns an
+> error wrapping the `ErrDeleteSlipUnsupported` sentinel unconditionally, not a stub
+> delete. See `slippy/interfaces.go`'s `DeleteSlip` doc and
+> `slippy/postgres_store_updates.go` for the current contract.
+
 New `SlipStore` method: `DeleteSlip(ctx, correlationID)` — a single
 `DELETE FROM routing_slips WHERE correlation_id = $1`; children cascade. (ClickHouse
 store gets a stub or equivalent delete; Postgres is the operational store.)
@@ -181,6 +217,15 @@ push path always mints a fresh `uuid.New()` per Kafka message
 
 ### 6.4 Readers
 
+> **⚠️ SUPERSEDED (PR #82 review):** the "drop `ORDER BY updated_at DESC LIMIT 1`"
+> instruction below was reverted. Shipped `LoadByCommit`/`LoadLiveByCommit`
+> (`slippy/postgres_store.go`) keep the tiebreak: release A (Phase A) ships ahead of
+> the Phase B cleanup + unique index, so same-commit duplicate rows can still exist in
+> production when this code runs, and dropping the tiebreak made the pick among them
+> nondeterministic — reopening a stale-duplicate repave bug. `FindByCommits`/
+> `FindAllByCommits`'s `ORDER BY c.priority ASC, s.updated_at DESC` is unchanged for
+> the same reason.
+
 With ≤1 row per commit, drop `ORDER BY updated_at DESC LIMIT 1` from `LoadByCommit`
 and `LoadLiveByCommit`. **Keep** the `LoadByCommit` vs `LoadLiveByCommit` distinction —
 a commit's one row can still be `abandoned` (cross-commit supersede), so "the row" vs
@@ -189,6 +234,14 @@ a commit's one row can still be `abandoned` (cross-commit supersede), so "the ro
 commit becomes dead weight; cross-commit priority ordering stays).
 
 ### 6.5 Concurrency
+
+> **⚠️ Implementation note (PR #82 review):** `DeleteSlip` and `Create` are still two
+> separate calls, as described below, and the crash-leaves-no-row self-heal argument
+> still holds. But `DeleteSlip` itself is no longer a single bare `DELETE` — it now runs
+> its own delete + descendant-repoint sequence inside one transaction (§6.1), which is
+> the "single transactional … method" this paragraph anticipated as an optional
+> refinement, scoped to the delete side only. The delete-then-create pair across
+> `DeleteSlip`/`Create` remains non-transactional as designed here.
 
 The slippy-api `repo:sha` Redis lock (120s TTL, fail-open) remains the serializer for
 the read-decide-write sequence; the unique index is the backstop, not the concurrency
@@ -212,6 +265,16 @@ Two mutually exclusive mechanisms exist. This design touches only the second.
   auto-deploy, check-runs).
 - **Rule: selective retrigger must never be implemented as a filtered push replay** —
   repave would delete the build state a unit-tests-only rerun wants to keep.
+
+> **⚠️ SUPERSEDED (PR #82 review):** the "accept dangling `parent_correlation_id` /
+> no repointing" stance below was replaced. Shipped `DeleteSlip`
+> (`slippy/postgres_store_updates.go`) performs exactly the repoint this paragraph
+> describes as a future contingency — `UPDATE slip_ancestry SET parent_correlation_id
+> = $successor, parent_failed_step = '' WHERE parent_correlation_id = $deleted` — every
+> time a repave has a successor, transactionally, as part of the same `DeleteSlip`
+> call. When there is no successor (`successorCorrelationID == ""`), those descendant
+> links are deleted rather than left dangling. See `slippy/interfaces.go`'s
+> `DeleteSlip` doc for the current contract.
 
 `slip_ancestry` note: the table is write-only in production — its only reader
 (`Client.ResolveAncestry`) has zero callers; all live ancestry resolution is

@@ -1,5 +1,17 @@
 # DEVOPS-231 Slip Repave Implementation Plan (goLibMyCarrier)
 
+> **⚠️ SUPERSEDED IN PART — review of PR #82 (goLibMyCarrier, DEVOPS-231) changed
+> decisions this plan still records as-written. This document is kept as a historical
+> record of what was planned, NOT re-edited to match what shipped. Concretely:
+> Task 7's instruction to drop the `ORDER BY updated_at DESC` tiebreaks was reverted —
+> they are retained in `LoadByCommit`/`LoadLiveByCommit` because removing them made the
+> lookup nondeterministic against pre-cleanup duplicate rows. `DeleteSlip` shipped with
+> a third `successorCorrelationID` parameter, an ended-status guard (`ErrSlipWentLive`),
+> and transactional descendant repointing — not the one-arg unguarded, no-repointing
+> method described in Task 1 and the spec. Treat the current code
+> (`slippy/interfaces.go`, `slippy/postgres_store_updates.go`, `slippy/postgres_store.go`)
+> as the source of truth, not this plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** One `routing_slips` row per `(lower(repository), commit_sha)` — repave (delete + recreate) on same-commit ended retriggers, enforced by cascade FKs and a DB unique index.
@@ -661,6 +673,14 @@ git commit -m "feat(slippy): ErrDuplicateSlip backstop routes unique-index confl
 ```
 
 ### Task 7: Reader simplification
+
+> **⚠️ SUPERSEDED (PR #82 review):** Step 1 below — dropping the `ORDER BY
+> updated_at DESC` tiebreak — was reverted after this plan was written. The shipped
+> `LoadByCommit`/`LoadLiveByCommit` (`slippy/postgres_store.go`) keep the tiebreak: the
+> Phase A / Phase B split means release A still runs against pre-cleanup data where
+> same-commit duplicates exist, and an unordered pick among duplicates reopened a
+> stale-duplicate repave bug. Do not remove the `ORDER BY` clause; see the current code
+> for the up-to-date rationale comment.
 
 **Files:**
 - Modify: `slippy/postgres_store.go:152-169` (`LoadByCommit`, `LoadLiveByCommit`)
