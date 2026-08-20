@@ -4,6 +4,11 @@ GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafka logger otel pollyapi postgres postgresmigrator repocanon slippy slippyapi teamsbot vault yaml
 
+# Mutation testing (mutest). Pinned so local and CI judge identically.
+MUTEST_VERSION     := v0.6.0
+MUTATION_BASE      ?= origin/main
+MUTATION_THRESHOLD ?= 100
+
 .PHONY: lint
 lint: install-tools
 	@if [ -z "$(PKG)" ]; then \
@@ -99,6 +104,72 @@ install-go-test-coverage:
 check-coverage: install-go-test-coverage
 	go test ./... -coverprofile=./cover.out -covermode=atomic -coverpkg=./...
 	${GOBIN}/go-test-coverage --config=./.testcoverage.yml
+
+# Mutation testing uses mutest, which mutates and runs the tests IN PLACE inside the
+# module directory. That matters here: several modules (slippy, slippyapi, ...) use
+# relative `replace ... => ../<module>` directives, so any mutation tool that copies the
+# module elsewhere before testing cannot resolve them — every build fails, every mutant
+# is scored "killed", and the run reports a meaningless 100%. If you ever swap tools,
+# validate the replacement first: add a function whose only test asserts nothing and
+# confirm the tool reports its mutants as SURVIVED, not killed.
+.PHONY: install-mutest
+install-mutest:
+	@command -v mutest >/dev/null 2>&1 || go install github.com/fchimpan/mutest@$(MUTEST_VERSION)
+
+# Mutation-test only the lines changed vs MUTATION_BASE — the pre-merge gate.
+# Surviving mutants mean an assertion is missing; add tests rather than lowering
+# MUTATION_THRESHOLD. Scope to one module with PKG=<module>.
+.PHONY: mutation
+mutation: install-mutest
+	@if [ -z "$(PKG)" ]; then \
+		echo "Mutation testing code changed vs $(MUTATION_BASE) (threshold $(MUTATION_THRESHOLD)%)..."; \
+		for dir in $(LIB_DIRS); do \
+			if [ -d "$$dir" ]; then \
+				echo "Mutation testing $$dir module..."; \
+				(cd $$dir && go mod download && mutest -diff $(MUTATION_BASE) -threshold $(MUTATION_THRESHOLD) ./...) || exit 1; \
+			else \
+				echo "Directory $$dir not found, skipping..."; \
+			fi; \
+		done; \
+	else \
+		echo "Mutation testing $(PKG) module changed vs $(MUTATION_BASE) (threshold $(MUTATION_THRESHOLD)%)..."; \
+		(cd $(PKG) && go mod download && mutest -diff $(MUTATION_BASE) -threshold $(MUTATION_THRESHOLD) ./...); \
+	fi
+
+# Mutation-test a module in full, ignoring the diff — a periodic audit, not a pre-merge
+# gate. Expect survivors in legacy code, so pass an explicit threshold when auditing,
+# e.g. `make mutation-all PKG=slippy MUTATION_THRESHOLD=80`.
+.PHONY: mutation-all
+mutation-all: install-mutest
+	@if [ -z "$(PKG)" ]; then \
+		echo "Mutation testing all modules in full (threshold $(MUTATION_THRESHOLD)%)..."; \
+		for dir in $(LIB_DIRS); do \
+			if [ -d "$$dir" ]; then \
+				echo "Mutation testing $$dir module..."; \
+				(cd $$dir && go mod download && mutest -threshold $(MUTATION_THRESHOLD) ./...) || exit 1; \
+			else \
+				echo "Directory $$dir not found, skipping..."; \
+			fi; \
+		done; \
+	else \
+		echo "Mutation testing $(PKG) module in full (threshold $(MUTATION_THRESHOLD)%)..."; \
+		(cd $(PKG) && go mod download && mutest -threshold $(MUTATION_THRESHOLD) ./...); \
+	fi
+
+.PHONY: help
+help:
+	@echo "Targets (all accept PKG=<module> where noted):"
+	@echo "  make lint           - golangci-lint            (PKG=)"
+	@echo "  make test           - tests w/ race + coverage (PKG=)"
+	@echo "  make fmt            - gofmt/goimports, all modules"
+	@echo "  make tidy           - go mod tidy, all modules"
+	@echo "  make check-sec      - gosec scan               (PKG=)"
+	@echo "  make check-coverage - coverage threshold gate"
+	@echo "  make mutation       - mutation-test lines changed vs $(MUTATION_BASE) (PKG=)"
+	@echo "  make mutation-all   - mutation-test a module in full; periodic audit (PKG=)"
+	@echo "  make bump           - version bump helper"
+	@echo ""
+	@echo "Vars: MUTATION_BASE=$(MUTATION_BASE) MUTATION_THRESHOLD=$(MUTATION_THRESHOLD) MUTEST_VERSION=$(MUTEST_VERSION)"
 
 .PHONY: install-tools
 install-tools:

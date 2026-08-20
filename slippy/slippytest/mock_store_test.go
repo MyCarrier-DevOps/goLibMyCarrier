@@ -122,6 +122,71 @@ func TestMockStore_LoadByCommit(t *testing.T) {
 	}
 }
 
+func TestMockStore_DeleteSlip(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "test-delete",
+		Repository:    "test/repo",
+		CommitSHA:     "commitdel",
+	})
+
+	if err := store.DeleteSlip(ctx, "test-delete"); err != nil {
+		t.Fatalf("DeleteSlip failed: %v", err)
+	}
+
+	if len(store.DeleteSlipCalls) != 1 || store.DeleteSlipCalls[0] != "test-delete" {
+		t.Errorf("expected DeleteSlip call for test-delete, got %v", store.DeleteSlipCalls)
+	}
+
+	// The slip itself is gone...
+	if _, err := store.Load(ctx, "test-delete"); !errors.Is(err, slippy.ErrSlipNotFound) {
+		t.Errorf("expected ErrSlipNotFound after delete, got %v", err)
+	}
+
+	// ...and so is its commit index entry, so a by-commit lookup no longer resolves it.
+	if _, err := store.LoadByCommit(ctx, "test/repo", "commitdel"); !errors.Is(err, slippy.ErrSlipNotFound) {
+		t.Errorf("expected commit index entry to be cleaned up, got %v", err)
+	}
+}
+
+func TestMockStore_DeleteSlip_WithError(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "test-delete-err",
+		Repository:    "test/repo",
+		CommitSHA:     "commiterr",
+	})
+
+	testErr := errors.New("delete error")
+	store.DeleteSlipError = testErr
+
+	err := store.DeleteSlip(ctx, "test-delete-err")
+	if !errors.Is(err, testErr) {
+		t.Errorf("expected DeleteSlipError, got %v", err)
+	}
+
+	// The call is recorded even when it fails, and the slip survives.
+	if len(store.DeleteSlipCalls) != 1 {
+		t.Errorf("expected the failed call to still be recorded, got %v", store.DeleteSlipCalls)
+	}
+	if _, err := store.Load(ctx, "test-delete-err"); err != nil {
+		t.Errorf("slip must survive a failed delete, got %v", err)
+	}
+}
+
+func TestMockStore_DeleteSlip_Missing(t *testing.T) {
+	store := NewMockStore()
+
+	// Deleting an unknown slip is not an error (idempotent), matching PostgresStore.
+	if err := store.DeleteSlip(context.Background(), "never-existed"); err != nil {
+		t.Errorf("deleting a missing slip must be a no-op, got %v", err)
+	}
+}
+
 func TestMockStore_LoadByCommit_WithError(t *testing.T) {
 	store := NewMockStore()
 	ctx := context.Background()
