@@ -99,7 +99,52 @@ type PushOptions struct {
 
 	// Components defines the components to track
 	Components []ComponentDefinition
+
+	// Dispatch states whether this push will actually dispatch CI work, which the
+	// empty-run guard needs to know and cannot reliably infer. Leave it at its zero
+	// value (DispatchIntentUnspecified) to keep the legacy component-count inference;
+	// set it explicitly to make the guard correct. See DispatchIntent.
+	Dispatch DispatchIntent
 }
+
+// DispatchIntent is a caller's statement about whether a push will dispatch any CI work
+// (builds, unit tests, secret scan). The empty-run guard in CreateSlipForPush uses it to
+// decide whether repaving an ended slip for the same commit is worth destroying that run's
+// history: if nothing will be dispatched, the repave buys nothing and the guard dedups onto
+// the existing run instead.
+//
+// It exists because the guard's original inference — "len(Components) == 0 means nothing
+// will be dispatched" — is wrong for a repo that runs unit tests without builds
+// (buildable=false + RunUnitTests=true). pushhookparser nils out components whenever builds
+// are skipped, while still dispatching the unit-tester event, so the guard fired on pushes
+// that DID dispatch work. The consequence was a real functional hole: a failed unit-test run
+// on such a repo could not be retriggered by re-pushing the commit, because the guard
+// returned the old slip and the caller treats a returned id ≠ the id it sent as a duplicate
+// and suppresses every side effect — unit tests included.
+//
+// Component count is not recoverable as a signal here, because the same "zero components"
+// value legitimately means BOTH "branch create at an existing SHA, nothing to do" and
+// "tests-only repo, unit tests are about to run". Only the caller knows which.
+type DispatchIntent uint8
+
+const (
+	// DispatchIntentUnspecified means the caller has not stated its intent, so the guard
+	// falls back to inferring it from len(Components). This is the zero value on purpose:
+	// this library releases before its consumers (slippy-api, pushhookparser) adopt the
+	// field, and an un-updated caller must keep behaving exactly as it does today rather
+	// than silently changing semantics during the release window.
+	DispatchIntentUnspecified DispatchIntent = iota
+
+	// DispatchIntentSomething means this push WILL dispatch CI work, so an ended slip for
+	// the same commit should be repaved even when Components is empty. This is what a
+	// tests-only repo sends.
+	DispatchIntentSomething
+
+	// DispatchIntentNothing means this push will dispatch NO CI work, so an ended slip for
+	// the same commit must be left intact and deduped onto. Authoritative even when
+	// Components is non-empty.
+	DispatchIntentNothing
+)
 
 // Validate checks that all required fields are present.
 func (o PushOptions) Validate() error {
@@ -113,6 +158,48 @@ func (o PushOptions) Validate() error {
 		return fmt.Errorf("commit_sha is required")
 	}
 	return nil
+}
+
+// dispatchesNothing reports whether this push will dispatch no CI work at all, in which
+// case repaving an ended slip for the same commit would destroy that run's history for zero
+// benefit. An explicit Dispatch always wins; only DispatchIntentUnspecified falls back to
+// the legacy component-count inference.
+//
+// Both empty-run guards (CreateSlipForPush's and handleDuplicateSlipBackstop's mirror of it)
+// route through this one method, so the two cannot drift — they are documented as converging
+// on the same outcome for the same inputs, and previously that was two copies of the same
+// expression.
+// recognized reports whether this DispatchIntent is one the library acts on. An unrecognized
+// value is not rejected — dispatchesNothing falls back to the component-count inference for
+// it, deliberately, so a malformed value can never license destroying a prior run's history —
+// but the fallback is otherwise silent, and the guard's log line renders Dispatch verbatim.
+// Without this flag alongside it, that line reads as though the caller's stated intent decided
+// the outcome when in fact it was ignored. The domain is a string crossing two repo
+// boundaries (library → slippy-api → pushhookparser), so case and whitespace variants of the
+// valid values are reachable inputs, not hypotheticals.
+func (d DispatchIntent) recognized() bool {
+	switch d {
+	case DispatchIntentNothing, DispatchIntentSomething, DispatchIntentUnspecified:
+		return true
+	default:
+		return false
+	}
+}
+
+func (o PushOptions) dispatchesNothing() bool {
+	switch o.Dispatch {
+	case DispatchIntentNothing:
+		return true
+	case DispatchIntentSomething:
+		return false
+	case DispatchIntentUnspecified:
+		// Legacy inference, below.
+	default:
+		// An unrecognized value uses the legacy inference too. Falling back rather than
+		// returning false means an out-of-range value can never license destroying a
+		// prior run's history.
+	}
+	return len(o.Components) == 0
 }
 
 // CreateSlipResult contains the result of slip creation including any warnings.
@@ -186,10 +273,19 @@ type CreateSlipResult struct {
 // AllowSlipWithNoBuilds=true) dispatches unit tests with ZERO build components, because
 // pushhookparser nils components whenever !shouldBuild. The caller would see returned != sent,
 // suppress every side effect, and a failed unit-test run on those repos could not be
-// retriggered by re-pushing — for as long as it took slippy-api AND pushhookparser to adopt
-// DispatchIntent (DEVOPS-264). Component count is not a safe proxy for "dispatches nothing";
-// DispatchIntent is what answers it properly, and until callers pass it this keeps the
-// pre-adoption path byte-identical to the behaviour it replaced.
+// retriggered by re-pushing.
+//
+// DispatchIntent (DEVOPS-264) is the proper answer to "does this push dispatch anything", and
+// dispatchesNothing consults it below. But intent only helps once slippy-api AND
+// pushhookparser forward the field, and until then every real push from those repos arrives
+// with Dispatch unset and falls back to the component-count inference. The `failed` carve-out
+// is what makes the fix independent of that adoption order: it keeps the pre-adoption path
+// behaving as it did before the guard existed, rather than leaving those repos unable to
+// retrigger for the length of a three-repo rollout.
+//
+// The two terms are complementary, not redundant. Intent covers every status once adopted
+// (including a caller that declares Nothing while holding components); the carve-out covers
+// `failed` regardless of adoption. Removing either re-opens a real case.
 func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 	if existing == nil {
 		return false
@@ -213,7 +309,7 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 	if existing.Status == SlipStatusFailed {
 		return false
 	}
-	return len(opts.Components) == 0
+	return opts.dispatchesNothing()
 }
 
 // CreateSlipForPush creates a new routing slip for a git push event.
@@ -363,10 +459,23 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			// Repaving would destroy the prior run's history for zero benefit.
 			// Return the existing slip; the caller sees returned != sent and
 			// suppresses side effects.
-			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for componentless push", map[string]interface{}{
-				"existing_id": existingSlip.CorrelationID,
-				"commit":      shortSHA(existingSlip.CommitSHA),
-			})
+			//
+			// A caller that DOES dispatch work without build components — a tests-only
+			// repo (buildable=false + RunUnitTests=true) — must say so via
+			// PushOptions.Dispatch, or this guard suppresses the retrigger it wanted.
+			// See DispatchIntent for why component count cannot answer this.
+			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
+				map[string]interface{}{
+					"existing_id":     existingSlip.CorrelationID,
+					"commit":          shortSHA(existingSlip.CommitSHA),
+					"dispatch_intent": opts.Dispatch,
+					// Whether the value above was HONORED. An unrecognized Dispatch falls
+					// back to the component-count inference, so without this the line reads
+					// as though the caller's stated intent decided the outcome when it did
+					// not — see DispatchIntent.recognized.
+					"dispatch_intent_recognized": opts.Dispatch.recognized(),
+					"components":                 len(opts.Components),
+				})
 			result.Slip = existingSlip
 			result.AncestryResolved = true
 			return result, nil
@@ -940,14 +1049,17 @@ func (c *Client) handleDuplicateSlipBackstop(
 	}
 
 	if emptyRunGuardApplies(conflicting, opts) {
-		// Empty-run guard (mirrored from CreateSlipForPush's main path): nothing would
+		// Empty-run guard (mirrored from CreateSlipForPush's main path, and sharing its
+		// single emptyRunGuardApplies predicate so the two cannot drift): nothing would
 		// be dispatched for this push, so repaving the conflicting row would only
-		// destroy its history for no benefit. Dedup onto it instead of deleting it.
+		// destroy its history for no benefit. Dedup onto it instead of replacing it.
 		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
 			map[string]interface{}{
-				"conflicting_id": conflicting.CorrelationID,
-				"commit":         shortSHA(conflicting.CommitSHA),
-				"superseding_id": opts.CorrelationID,
+				"conflicting_id":             conflicting.CorrelationID,
+				"commit":                     shortSHA(conflicting.CommitSHA),
+				"superseding_id":             opts.CorrelationID,
+				"dispatch_intent":            opts.Dispatch,
+				"dispatch_intent_recognized": opts.Dispatch.recognized(),
 			})
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
