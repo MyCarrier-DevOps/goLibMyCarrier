@@ -214,6 +214,25 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   slip (`abandoned`/`promoted`/`compensated`) can be returned from `CreateSlipForPush`
   for a componentless push — previously impossible, since that function always either
   reused a live slip or created a fresh one.
+
+  **The guard no longer infers intent from component count alone.** It reads
+  `PushOptions.Dispatch` (`DispatchIntent`), because "zero components" legitimately means
+  both "branch create at an existing SHA, nothing to do" and "tests-only repo, unit tests
+  are about to run" — only the caller can tell them apart. The old inference broke the
+  second case concretely: `pushhookparser` nils out components whenever builds are skipped
+  (`if !shouldBuild { slipComponents = nil }`) while still dispatching the unit-tester
+  event, so the guard fired on a push that DID dispatch work, returned the old failed slip,
+  and the caller's `Deduplicated` branch short-circuited every side effect — unit tests
+  included. Five `MyCarrier-Engineering` repos carry the triggering combination
+  (`buildable=false` + `RunUnitTests=true` + `AllowSlipWithNoBuilds=true`).
+
+  `DispatchIntentUnspecified` is the zero value and keeps the legacy inference, because this
+  library releases before `slippy-api` and `pushhookparser` adopt the field. That is exactly
+  why the `failed` exclusion above is not redundant with intent: during the whole adoption
+  window every real push arrives `Unspecified`, so the exclusion is what carries the
+  tests-only retrigger. A *recognized* explicit intent is authoritative in both directions
+  and is consulted before the exclusion.
+
 - **An ended row may have work in flight against it (DEVOPS-285).** "Ended" includes
   `failed`, and the operator rerun flow adopts a failed slip's correlation ID and
   dispatches workflows *before* writing anything to slippy — so the row sits `failed`,
