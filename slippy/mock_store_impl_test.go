@@ -80,66 +80,147 @@ func TestMockStore_Create(t *testing.T) {
 	})
 }
 
-func TestMockStore_DeleteSlip(t *testing.T) {
+func TestMockStore_Repave(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("removes slip and records the call", func(t *testing.T) {
-		store := NewMockStore()
-		store.AddSlip(&Slip{CorrelationID: "test-123", Repository: "owner/repo", CommitSHA: "abc123"})
+	successor := func(id, repo, sha string) *Slip {
+		return &Slip{CorrelationID: id, Repository: repo, CommitSHA: sha, Status: SlipStatusPending}
+	}
 
-		err := store.DeleteSlip(ctx, "test-123", "successor-123")
+	t.Run("removes the superseded slip, creates the successor, and records the call", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&Slip{
+			CorrelationID: "test-123", Repository: "owner/repo", CommitSHA: "abc123",
+			Status: SlipStatusFailed,
+		})
+		parent := &AncestryEntry{CorrelationID: "parent-1", CommitSHA: "sha-parent"}
+
+		err := store.Repave(ctx, "test-123", successor("successor-123", "owner/repo", "abc123"), parent)
 		if err != nil {
-			t.Fatalf("DeleteSlip failed: %v", err)
+			t.Fatalf("Repave failed: %v", err)
 		}
 
 		if _, ok := store.Slips["test-123"]; ok {
-			t.Error("Slip not removed")
+			t.Error("superseded slip not removed")
 		}
-		if len(store.DeleteSlipCalls) != 1 || store.DeleteSlipCalls[0] != "test-123" {
-			t.Error("DeleteSlipCall not tracked")
+		if _, ok := store.Slips["successor-123"]; !ok {
+			t.Error("successor not created: Repave must persist both halves or neither")
 		}
-		if len(store.DeleteSlipSuccessorCalls) != 1 || store.DeleteSlipSuccessorCalls[0] != "successor-123" {
-			t.Error("DeleteSlipSuccessorCalls not tracked")
+		if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "test-123" {
+			t.Errorf("RepaveCalls not tracked: %v", store.RepaveCalls)
+		}
+		if len(store.RepaveSuccessorCalls) != 1 || store.RepaveSuccessorCalls[0] != "successor-123" {
+			t.Errorf("RepaveSuccessorCalls not tracked: %v", store.RepaveSuccessorCalls)
+		}
+		if len(store.RepaveParents) != 1 || store.RepaveParents[0] != parent {
+			t.Errorf("RepaveParents not tracked: %v", store.RepaveParents)
 		}
 	})
 
-	t.Run("returns error when DeleteSlipError is set", func(t *testing.T) {
+	t.Run("successor is findable by commit after the repave", func(t *testing.T) {
 		store := NewMockStore()
-		store.DeleteSlipError = errors.New("delete failed")
+		store.AddSlip(&Slip{
+			CorrelationID: "old", Repository: "owner/repo", CommitSHA: "sha-x", Status: SlipStatusFailed,
+		})
 
-		err := store.DeleteSlip(ctx, "test", "")
-		if err == nil || err.Error() != "delete failed" {
-			t.Errorf("Expected 'delete failed', got %v", err)
+		if err := store.Repave(ctx, "old", successor("new", "owner/repo", "sha-x"), nil); err != nil {
+			t.Fatalf("Repave failed: %v", err)
+		}
+
+		got, err := store.LoadByCommit(ctx, "owner/repo", "sha-x")
+		if err != nil {
+			t.Fatalf("expected the successor to be findable by commit, got error: %v", err)
+		}
+		if got.CorrelationID != "new" {
+			t.Errorf("expected the commit index to point at the successor, got %s", got.CorrelationID)
 		}
 	})
 
-	t.Run("does not unmap the commit index when it no longer points at the deleted slip", func(t *testing.T) {
+	t.Run("rejects a live superseded slip without creating the successor", func(t *testing.T) {
+		// The internal mock used to happily delete a live slip, which let push tests pass
+		// against behavior PostgresStore rejects. Both halves must be refused together.
+		store := NewMockStore()
+		store.AddSlip(&Slip{
+			CorrelationID: "live", Repository: "owner/repo", CommitSHA: "sha-live",
+			Status: SlipStatusInProgress,
+		})
+
+		err := store.Repave(ctx, "live", successor("new", "owner/repo", "sha-live"), nil)
+		if !errors.Is(err, ErrSlipWentLive) {
+			t.Fatalf("expected ErrSlipWentLive, got %v", err)
+		}
+		if _, ok := store.Slips["live"]; !ok {
+			t.Error("a live slip must survive a rejected repave")
+		}
+		if _, ok := store.Slips["new"]; ok {
+			t.Error("a rejected repave must not create the successor")
+		}
+	})
+
+	t.Run("creates the successor when the superseded slip is already gone", func(t *testing.T) {
+		store := NewMockStore()
+
+		if err := store.Repave(ctx, "ghost", successor("new", "owner/repo", "sha-g"), nil); err != nil {
+			t.Fatalf("a missing superseded slip is not an error: %v", err)
+		}
+		if _, ok := store.Slips["new"]; !ok {
+			t.Error("successor must still be created so a redelivery converges")
+		}
+	})
+
+	t.Run("returns error when RepaveError is set", func(t *testing.T) {
+		store := NewMockStore()
+		store.RepaveError = errors.New("repave failed")
+
+		err := store.Repave(ctx, "test", successor("new", "owner/repo", "sha"), nil)
+		if err == nil || err.Error() != "repave failed" {
+			t.Errorf("Expected 'repave failed', got %v", err)
+		}
+		if _, ok := store.Slips["new"]; ok {
+			t.Error("a failed repave must not create the successor")
+		}
+	})
+
+	t.Run("rejects a nil successor", func(t *testing.T) {
+		store := NewMockStore()
+
+		err := store.Repave(ctx, "test", nil, nil)
+		if !errors.Is(err, ErrInvalidConfiguration) {
+			t.Errorf("expected ErrInvalidConfiguration for a nil successor, got %v", err)
+		}
+	})
+
+	t.Run("does not unmap the commit index when it no longer points at the superseded slip", func(t *testing.T) {
 		// The mock's Create permits duplicate (repo, sha) rows (unlike Postgres' unique
 		// index), and each Create re-points CommitIndex at the newest row. If a caller
-		// later deletes the OLDER row (a), the index by then points at the NEWER row
-		// (b) - deleting must not clear an index entry that no longer belongs to the
-		// slip being deleted, or b becomes unreachable via LoadByCommit even though it
+		// later repaves the OLDER row (a), the index by then points at the NEWER row
+		// (b) - the removal must not clear an index entry that no longer belongs to the
+		// slip being superseded, or b becomes unreachable via LoadByCommit even though it
 		// still exists (DEVOPS-231 review D1.1).
 		store := NewMockStore()
 
 		if err := store.Create(ctx, &Slip{
 			CorrelationID: "corr-a", Repository: "owner/repo", CommitSHA: "sha-shared",
+			Status: SlipStatusFailed,
 		}); err != nil {
 			t.Fatalf("Create corr-a failed: %v", err)
 		}
 		if err := store.Create(ctx, &Slip{
 			CorrelationID: "corr-b", Repository: "owner/repo", CommitSHA: "sha-shared",
+			Status: SlipStatusFailed,
 		}); err != nil {
 			t.Fatalf("Create corr-b failed: %v", err)
 		}
 
-		if err := store.DeleteSlip(ctx, "corr-a", ""); err != nil {
-			t.Fatalf("DeleteSlip(corr-a) failed: %v", err)
+		// The successor lands on a different commit, so it cannot itself claim the shared
+		// index entry — isolating the question this subtest asks.
+		if err := store.Repave(ctx, "corr-a", successor("corr-c", "owner/repo", "sha-other"), nil); err != nil {
+			t.Fatalf("Repave(corr-a) failed: %v", err)
 		}
 
 		got, err := store.LoadByCommit(ctx, "owner/repo", "sha-shared")
 		if err != nil {
-			t.Fatalf("expected corr-b to remain findable by commit after corr-a's delete, got error: %v", err)
+			t.Fatalf("expected corr-b to remain findable by commit after corr-a's repave, got error: %v", err)
 		}
 		if got.CorrelationID != "corr-b" {
 			t.Errorf("expected corr-b, got %s", got.CorrelationID)
@@ -165,15 +246,15 @@ func TestMockStore_DeleteSlip(t *testing.T) {
 	})
 }
 
-func TestMockStore_NewMockStore_InitializesDeleteSlipWentLiveStatus(t *testing.T) {
-	// NewMockStore initializes CreateErrorOnce and SeedOnCreate; DeleteSlipWentLiveStatus
-	// must follow the same idiom so `store.DeleteSlipWentLiveStatus["id"] = ...` does not
+func TestMockStore_NewMockStore_InitializesRepaveWentLiveStatus(t *testing.T) {
+	// NewMockStore initializes CreateErrorOnce and SeedOnCreate; RepaveWentLiveStatus
+	// must follow the same idiom so `store.RepaveWentLiveStatus["id"] = ...` does not
 	// panic with "assignment to entry in nil map" (DEVOPS-231 review D1.3).
 	store := NewMockStore()
 
-	store.DeleteSlipWentLiveStatus["corr-x"] = SlipStatusInProgress
+	store.RepaveWentLiveStatus["corr-x"] = SlipStatusInProgress
 
-	if store.DeleteSlipWentLiveStatus["corr-x"] != SlipStatusInProgress {
+	if store.RepaveWentLiveStatus["corr-x"] != SlipStatusInProgress {
 		t.Error("expected the assignment to be stored")
 	}
 }

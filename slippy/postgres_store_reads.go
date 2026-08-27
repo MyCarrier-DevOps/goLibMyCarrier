@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // FindByCommits returns the slip matching the highest-priority commit in the ordered
@@ -101,7 +103,24 @@ func (s *PostgresStore) FindAllByCommits(
 // InsertAncestryLink writes (or updates) the direct-parent link for a slip. The row is
 // keyed by the child's (repository, branch, correlation_id); re-linking upserts.
 func (s *PostgresStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
-	const query = `
+	if _, err := s.pool.Exec(ctx, insertAncestryLinkSQL, ancestryLinkArgs(slip, parent)...); err != nil {
+		return fmt.Errorf("failed to insert ancestry link for %s: %w", slip.CorrelationID, err)
+	}
+	return nil
+}
+
+// insertAncestryLinkTx is InsertAncestryLink against an open transaction, so Repave can
+// write the successor's parent link in the same unit of work that removed the superseded
+// run. Shares insertAncestryLinkSQL/ancestryLinkArgs with the pool-based method above so
+// the two cannot drift.
+func insertAncestryLinkTx(ctx context.Context, tx pgx.Tx, slip *Slip, parent AncestryEntry) error {
+	if _, err := tx.Exec(ctx, insertAncestryLinkSQL, ancestryLinkArgs(slip, parent)...); err != nil {
+		return fmt.Errorf("failed to insert ancestry link for %s: %w", slip.CorrelationID, err)
+	}
+	return nil
+}
+
+const insertAncestryLinkSQL = `
 		INSERT INTO slip_ancestry (
 			repository, branch, correlation_id,
 			parent_correlation_id, parent_commit_sha, parent_status,
@@ -117,15 +136,14 @@ func (s *PostgresStore) InsertAncestryLink(ctx context.Context, slip *Slip, pare
 			parent_branch         = EXCLUDED.parent_branch,
 			created_at            = EXCLUDED.created_at`
 
-	if _, err := s.pool.Exec(ctx, query,
+// ancestryLinkArgs orders the insertAncestryLinkSQL bind arguments for one link.
+func ancestryLinkArgs(slip *Slip, parent AncestryEntry) []any {
+	return []any{
 		slip.Repository, slip.Branch, slip.CorrelationID,
 		parent.CorrelationID, parent.CommitSHA, string(parent.Status),
 		parent.FailedStep, parent.Repository, parent.Branch,
 		parent.CreatedAt,
-	); err != nil {
-		return fmt.Errorf("failed to insert ancestry link for %s: %w", slip.CorrelationID, err)
 	}
-	return nil
 }
 
 // ResolveAncestry walks parent links to reconstruct the full ancestry chain, ordered from

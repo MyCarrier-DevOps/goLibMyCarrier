@@ -86,30 +86,53 @@ type SlipStore interface {
 	// column, preventing concurrent history appends from being lost under last-write-wins.
 	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
 
-	// DeleteSlip repaves an ended slip: it removes the routing_slips row and its child
-	// rows (slip_component_states, slip_ancestry) for correlationID, but ONLY when the
-	// row's status is ended (failed, completed, abandoned, promoted, compensated) — a
-	// slip that has gone live again between the caller's repave decision and this call
-	// is never destroyed. Used by the same-commit repave path (DEVOPS-231): a retrigger
-	// of an ended slip deletes the prior run and creates a fresh one under
-	// successorCorrelationID, the new run's correlation ID.
+	// Repave atomically replaces one commit's ended run with a fresh one: it removes the
+	// routing_slips row for oldCorrelationID and its child rows (slip_component_states,
+	// slip_ancestry), then creates newSlip and writes newSlip's own direct-parent link —
+	// ALL AS ONE UNIT. Used by the same-commit repave path (DEVOPS-231): a retrigger of an
+	// ended slip supersedes the prior run with a new one under newSlip.CorrelationID.
 	//
-	// successorCorrelationID identifies the slip that supersedes the deleted one: any
-	// OTHER slip whose ancestry points at correlationID as its parent is repointed to
-	// successorCorrelationID rather than left dangling (a dangling parent link would
-	// silently truncate that descendant's ResolveAncestry walk). Pass "" when there is
-	// no successor to point at — those descendant links are deleted instead.
+	// Atomicity is the whole point of the method existing, and implementations MUST
+	// provide it. The delete and the create were previously two separate store calls, so
+	// a create failure after a committed delete left the commit with NO slip at all and
+	// no way back: the next redelivery found no row to repave and failed the same way.
+	// Any error from Repave therefore leaves the store exactly as it was.
 	//
-	// Returns ErrSlipWentLive if correlationID's row exists but its status is no longer
-	// ended (the repave decision is now stale; the caller must not create a fresh slip).
-	// Deleting a missing slip is not an error (idempotent).
+	// The delete half is status-guarded: it removes the row ONLY when its status is ended
+	// (failed, completed, abandoned, promoted, compensated), so a slip that has gone live
+	// again between the caller's repave decision and this call is never destroyed.
 	//
-	// A store that cannot repave (delete-and-recreate) at all — e.g. ClickHouseStore,
-	// which is not the operational slip store (DEVOPS-127) — MUST return an error
-	// wrapping ErrDeleteSlipUnsupported rather than a plain error or nil. The push path
-	// detects that sentinel with errors.Is and falls back to abandon semantics (marking
-	// the superseded slip abandoned) instead of repaving it.
-	DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error
+	// Descendant links: any OTHER slip whose ancestry points at oldCorrelationID as its
+	// parent is repointed to newSlip — id, branch and status all rewritten to describe
+	// the successor, and parent_failed_step cleared — rather than left dangling, which
+	// would silently truncate that descendant's ResolveAncestry walk. The repoint happens
+	// AFTER newSlip's row exists, so it never names a correlation ID that does not yet
+	// exist (which is also what lets Phase B put a foreign key on
+	// slip_ancestry.parent_correlation_id). Descendants are repointed only when this call
+	// actually removed the old row: a repave whose old row was already gone rewrites
+	// nothing, so a redelivery can never reassign an unrelated descendant's parent.
+	//
+	// parent is newSlip's direct-parent link, or nil when the caller resolved none. When
+	// it is nil and the superseded run had a parent link of its own, that link is carried
+	// forward to newSlip instead of being destroyed with the old row — otherwise a
+	// transient ancestry-resolution failure (e.g. a GitHub outage) would permanently
+	// delete a lineage hop rather than merely fail to extend it.
+	//
+	// Returns:
+	//   - nil: newSlip exists, and the superseded row is gone (removed here, or already
+	//     absent — an absent old row is not an error, so redelivery converges).
+	//   - ErrSlipWentLive: oldCorrelationID's row exists but is no longer ended. Nothing
+	//     is written and newSlip is NOT created; the caller must dedup onto the live run.
+	//   - ErrDuplicateSlip: newSlip collided with the one-row-per-commit unique index
+	//     (Phase B). Nothing is written; the caller routes to its dedup backstop.
+	//   - any other error: nothing is written.
+	//
+	// A store that cannot repave at all — e.g. ClickHouseStore, which is not the
+	// operational slip store (DEVOPS-127) — MUST return an error wrapping
+	// ErrRepaveUnsupported rather than a plain error or nil. The push path detects that
+	// sentinel with errors.Is and falls back to abandon semantics (marking the superseded
+	// slip abandoned, then creating the successor separately) instead of repaving.
+	Repave(ctx context.Context, oldCorrelationID string, newSlip *Slip, parent *AncestryEntry) error
 
 	// SetComponentImageTag records the built container image tag for a component in the event log.
 	// stepName is the component step type (e.g. "build"); componentName is the service name.

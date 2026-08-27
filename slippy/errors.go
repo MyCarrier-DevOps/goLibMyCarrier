@@ -104,24 +104,25 @@ var (
 	// else holds the row" and routes to the repave/dedup backstop (DEVOPS-231).
 	ErrDuplicateSlip = errors.New("a slip already exists for this repository and commit")
 
-	// ErrSlipWentLive indicates DeleteSlip's status guard rejected a repave: the slip
-	// became live between the repave decision and the delete; do not repave. Concretely,
+	// ErrSlipWentLive indicates Repave's status guard rejected a repave: the slip became
+	// live between the repave decision and the repave itself; do not repave. Concretely,
 	// the row still exists but its status is no longer one of the ended statuses
-	// (failed, completed, abandoned, promoted, compensated) that DeleteSlip requires —
-	// for example a failed slip can recover to in_progress via executor.go's recovery
-	// branch in the window between a caller's snapshot-based "this slip is ended" decision
-	// and the DeleteSlip call. The row is left untouched. Callers must not proceed to
-	// create a fresh slip in this case, since the existing slip is a live run.
-	ErrSlipWentLive = errors.New("slip went live between the repave decision and the delete")
+	// (failed, completed, abandoned, promoted, compensated) that Repave requires — for
+	// example a failed slip can recover to in_progress via executor.go's recovery branch
+	// in the window between a caller's snapshot-based "this slip is ended" decision and
+	// the Repave call. Nothing is written: the transaction rolls back, so the superseded
+	// row survives AND no successor is created. Callers must not treat the successor as
+	// existing in this case, since the row for that commit is a live run.
+	ErrSlipWentLive = errors.New("slip went live between the repave decision and the repave")
 
-	// ErrDeleteSlipUnsupported indicates the store cannot repave (delete-and-recreate) a
-	// slip. The ClickHouse store returns this from DeleteSlip, wrapped with the
-	// correlation ID via %w, since it is not the operational slip store (DEVOPS-127) and
-	// implements no delete path. Callers should detect it with errors.Is and fall back to
-	// abandon semantics (mark the superseded slip abandoned) rather than treating it as a
-	// fatal, unrecoverable error.
-	ErrDeleteSlipUnsupported = errors.New(
-		"store does not support DeleteSlip; caller should fall back to abandon semantics")
+	// ErrRepaveUnsupported indicates the store cannot repave (replace one commit's slip
+	// with a fresh run) at all. The ClickHouse store returns this from Repave, wrapped
+	// with the correlation ID via %w, since it is not the operational slip store
+	// (DEVOPS-127) and implements no delete path. Callers should detect it with errors.Is
+	// and fall back to abandon semantics (mark the superseded slip abandoned, then create
+	// the successor separately) rather than treating it as a fatal, unrecoverable error.
+	ErrRepaveUnsupported = errors.New(
+		"store does not support Repave; caller should fall back to abandon semantics")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

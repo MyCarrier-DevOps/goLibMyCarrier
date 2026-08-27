@@ -145,9 +145,9 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 			//
 			// Post-DEVOPS-231 contract update: same-commit repave changes what "the
 			// original build slip" means for a (repository, commit SHA) that has been
-			// re-pushed. A same-commit re-push of an ended slip deletes that row
-			// (DeleteSlip) and creates a fresh one under the new push's correlation ID
-			// (CreateSlipForPush), so LoadByCommit here resolves to whichever run
+			// re-pushed. A same-commit re-push of an ended slip replaces that row with a
+			// fresh one under the new push's correlation ID (Repave, driven by
+			// CreateSlipForPush), so LoadByCommit here resolves to whichever run
 			// currently holds that (repo, sha) — the repaved (current) run, not
 			// necessarily the run that actually produced the deployed image. A deploy
 			// event for an image built by a repaved run therefore attaches to the

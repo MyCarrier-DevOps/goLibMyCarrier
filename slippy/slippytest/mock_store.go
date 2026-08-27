@@ -79,14 +79,19 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
-	DeleteSlipCalls       []string
-	// DeleteSlipSuccessorCalls parallels DeleteSlipCalls with the successorCorrelationID
-	// argument from the same call (empty string when none was passed). The in-memory
-	// mock has no slip_ancestry-equivalent table to repoint (InsertAncestryLink/
-	// ResolveAncestry are no-ops below), so it does not replicate PostgresStore's
-	// descendant-repoint behavior — this only records the argument for assertions.
-	DeleteSlipSuccessorCalls []string
-	CloseCalls               int
+	RepaveCalls           []string
+	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
+	// the same call (empty string when a nil successor was passed). The in-memory mock has
+	// no slip_ancestry-equivalent table to repoint (InsertAncestryLink/ResolveAncestry are
+	// no-ops below), so it does not replicate PostgresStore's descendant-repoint behavior —
+	// this only records the argument for assertions.
+	RepaveSuccessorCalls []string
+	// RepaveParents parallels RepaveCalls with the parent link argument from the same call
+	// (nil when the caller resolved no ancestry). The mock cannot carry a superseded run's
+	// own link forward the way PostgresStore does — it has no ancestry table to read one
+	// from — so tests assert on what the caller passed in.
+	RepaveParents []*slippy.AncestryEntry
+	CloseCalls    int
 
 	// Ping tracking and error injection
 	PingCalls int
@@ -105,7 +110,7 @@ type MockStore struct {
 	AppendHistoryError    error
 	SetImageTagError      error
 	UpdateSlipStatusError error
-	DeleteSlipError       error
+	RepaveError           error
 	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
@@ -115,16 +120,20 @@ type MockStore struct {
 	UpdateComponentErrorFor map[string]error
 	AppendHistoryErrorFor   map[string]error
 
-	// DeleteSlipWentLiveStatus simulates a slip transitioning to a live status in the
-	// window between a caller's repave decision (an earlier LoadByCommit/Load saw it
-	// ended) and the DeleteSlip call itself: when DeleteSlip is invoked for a
-	// correlation ID present in this map WHILE DeleteSlipError is set (e.g. to
-	// slippy.ErrSlipWentLive), the mock mutates the stored row's status to the mapped
-	// value before returning the injected error, then removes the entry (one-shot).
-	// This lets a subsequent Load (the caller's reload-after-ErrSlipWentLive) observe
-	// the new state instead of the stale decision-time snapshot. Mirrors the internal
-	// slippy package's MockStore.DeleteSlipWentLiveStatus (DEVOPS-231 review D1.2).
-	DeleteSlipWentLiveStatus map[string]slippy.SlipStatus
+	// RepaveWentLiveStatus simulates a slip transitioning to a live status in the window
+	// between a caller's repave decision (an earlier LoadByCommit/Load saw it ended) and
+	// the Repave call itself: when Repave is invoked for a correlation ID present in this
+	// map WHILE RepaveError is set (e.g. to slippy.ErrSlipWentLive), the mock mutates the
+	// stored row's status to the mapped value before returning the injected error, then
+	// removes the entry (one-shot). This lets a subsequent Load (the caller's
+	// reload-after-ErrSlipWentLive) observe the new state instead of the stale
+	// decision-time snapshot. Mirrors the internal slippy package's
+	// MockStore.RepaveWentLiveStatus (DEVOPS-231 review D1.2).
+	//
+	// Note this is only needed to force the error path. Repave's own live guard already
+	// returns slippy.ErrSlipWentLive for a stored slip whose status IsLive(), so a test
+	// that can arrange the live status directly does not need this field at all.
+	RepaveWentLiveStatus map[string]slippy.SlipStatus
 }
 
 // CreateCall records a Create call.
@@ -194,14 +203,14 @@ type UpdateSlipStatusCall struct {
 // NewMockStore creates a new MockStore with initialized maps.
 func NewMockStore() *MockStore {
 	return &MockStore{
-		Slips:                    make(map[string]*slippy.Slip),
-		CommitIndex:              make(map[string]string),
-		CreateErrorFor:           make(map[string]error),
-		LoadErrorFor:             make(map[string]error),
-		UpdateStepErrorFor:       make(map[string]error),
-		UpdateComponentErrorFor:  make(map[string]error),
-		AppendHistoryErrorFor:    make(map[string]error),
-		DeleteSlipWentLiveStatus: make(map[string]slippy.SlipStatus),
+		Slips:                   make(map[string]*slippy.Slip),
+		CommitIndex:             make(map[string]string),
+		CreateErrorFor:          make(map[string]error),
+		LoadErrorFor:            make(map[string]error),
+		UpdateStepErrorFor:      make(map[string]error),
+		UpdateComponentErrorFor: make(map[string]error),
+		AppendHistoryErrorFor:   make(map[string]error),
+		RepaveWentLiveStatus:    make(map[string]slippy.SlipStatus),
 	}
 }
 
@@ -231,51 +240,72 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 	return nil
 }
 
-// DeleteSlip removes the slip and its commit index entry (children live on the Slip
-// struct in the mock, so removing the slip removes everything), but ONLY when the
-// stored slip's status is no longer live - mirroring PostgresStore's ended-status
-// guard (slippy.SlipStore.DeleteSlip's contract in interfaces.go). A live slip
-// (Status.IsLive() true) is rejected with slippy.ErrSlipWentLive and left untouched,
-// so a downstream consumer's went-live handling is exercisable against this mock
-// exactly as it would be against Postgres (DEVOPS-231 review D1.2).
+// Repave removes the superseded slip and its commit index entry (children live on the Slip
+// struct in the mock, so removing the slip removes everything) and stores newSlip in its
+// place. Modelling both halves is what makes this double faithful to
+// slippy.SlipStore.Repave: a caller never observes one without the other, so on any error
+// nothing here changes, and on success the superseded slip is gone AND the successor is
+// present.
 //
-// successorCorrelationID is recorded in DeleteSlipSuccessorCalls but otherwise unused:
-// the mock has no slip_ancestry-equivalent table for descendants to be repointed away
-// from (see DeleteSlipSuccessorCalls's doc comment).
-func (m *MockStore) DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error {
+// The removal happens ONLY when the stored slip's status is no longer live — mirroring
+// PostgresStore's ended-status guard. A live slip (Status.IsLive() true) is rejected with
+// slippy.ErrSlipWentLive, left untouched, and its successor is not created, so a downstream
+// consumer's went-live handling is exercisable against this mock exactly as it would be
+// against Postgres (DEVOPS-231 review D1.2).
+//
+// parent is recorded in RepaveParents but otherwise unused, and there are no descendant
+// links to repoint: the mock has no slip_ancestry-equivalent table (see
+// RepaveSuccessorCalls's doc comment).
+func (m *MockStore) Repave(
+	ctx context.Context,
+	oldCorrelationID string,
+	newSlip *slippy.Slip,
+	parent *slippy.AncestryEntry,
+) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.DeleteSlipCalls = append(m.DeleteSlipCalls, correlationID)
-	m.DeleteSlipSuccessorCalls = append(m.DeleteSlipSuccessorCalls, successorCorrelationID)
-	if m.DeleteSlipError != nil {
-		if newStatus, ok := m.DeleteSlipWentLiveStatus[correlationID]; ok {
-			delete(m.DeleteSlipWentLiveStatus, correlationID)
-			if slip, exists := m.Slips[correlationID]; exists {
+
+	m.RepaveCalls = append(m.RepaveCalls, oldCorrelationID)
+	successorID := ""
+	if newSlip != nil {
+		successorID = newSlip.CorrelationID
+	}
+	m.RepaveSuccessorCalls = append(m.RepaveSuccessorCalls, successorID)
+	m.RepaveParents = append(m.RepaveParents, parent)
+
+	if m.RepaveError != nil {
+		if newStatus, ok := m.RepaveWentLiveStatus[oldCorrelationID]; ok {
+			delete(m.RepaveWentLiveStatus, oldCorrelationID)
+			if slip, exists := m.Slips[oldCorrelationID]; exists {
 				slip.Status = newStatus
 			}
 		}
-		return m.DeleteSlipError
+		return m.RepaveError
 	}
 
-	slip, ok := m.Slips[correlationID]
-	if !ok {
-		// Deleting a missing slip is not an error (idempotent), matching PostgresStore.
-		return nil
+	if newSlip == nil {
+		return fmt.Errorf("%w: Repave requires a successor slip", slippy.ErrInvalidConfiguration)
 	}
 
-	if slip.Status.IsLive() {
-		return slippy.ErrSlipWentLive
+	if slip, ok := m.Slips[oldCorrelationID]; ok {
+		if slip.Status.IsLive() {
+			return slippy.ErrSlipWentLive
+		}
+		// Only unmap the commit index entry if it still points at THIS slip. Create
+		// permits duplicate (repo, sha) rows and re-points the index at the newest one, so
+		// an older row's removal must not clear an index entry that has since moved on to
+		// a different, still-live row (DEVOPS-231 review D1.1).
+		key := commitIndexKey(slip.Repository, slip.CommitSHA)
+		if id, idOK := m.CommitIndex[key]; idOK && id == oldCorrelationID {
+			delete(m.CommitIndex, key)
+		}
+		delete(m.Slips, oldCorrelationID)
 	}
 
-	// Only unmap the commit index entry if it still points at THIS slip. Create
-	// permits duplicate (repo, sha) rows and re-points the index at the newest one, so
-	// an older row's delete must not clear an index entry that has since moved on to a
-	// different, still-live row (DEVOPS-231 review D1.1).
-	key := commitIndexKey(slip.Repository, slip.CommitSHA)
-	if id, idOK := m.CommitIndex[key]; idOK && id == correlationID {
-		delete(m.CommitIndex, key)
-	}
-	delete(m.Slips, correlationID)
+	// A missing superseded row is not an error, matching PostgresStore: the successor is
+	// still created, so a redelivery converges rather than failing forever.
+	m.Slips[newSlip.CorrelationID] = DeepCopySlip(newSlip)
+	m.CommitIndex[commitIndexKey(newSlip.Repository, newSlip.CommitSHA)] = newSlip.CorrelationID
 	return nil
 }
 

@@ -914,13 +914,14 @@ func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, pa
 	)
 }
 
-// DeleteSlip is not supported on the ClickHouse store. Postgres is the operational
-// slip store (DEVOPS-127); the repave path (DEVOPS-231) must never run against
-// ClickHouse. Returns ErrDeleteSlipUnsupported wrapped with the correlation ID (rather
-// than a plain formatted error) so callers can detect it with errors.Is and fall back to
-// abandon semantics instead of silently losing the old AbandonSlip behavior.
-func (s *ClickHouseStore) DeleteSlip(_ context.Context, correlationID, _ string) error {
-	return fmt.Errorf("DeleteSlip(%s): %w", correlationID, ErrDeleteSlipUnsupported)
+// Repave is not supported on the ClickHouse store. Postgres is the operational slip store
+// (DEVOPS-127); the repave path (DEVOPS-231) must never run against ClickHouse, which has
+// no delete path and no transactions to make the replacement atomic. Returns
+// ErrRepaveUnsupported wrapped with the superseded correlation ID (rather than a plain
+// formatted error) so callers can detect it with errors.Is and fall back to abandon
+// semantics instead of silently losing the old AbandonSlip behavior.
+func (s *ClickHouseStore) Repave(_ context.Context, oldCorrelationID string, _ *Slip, _ *AncestryEntry) error {
+	return fmt.Errorf("Repave(%s): %w", oldCorrelationID, ErrRepaveUnsupported)
 }
 
 // ResolveAncestry walks the slip_ancestry table iteratively to reconstruct

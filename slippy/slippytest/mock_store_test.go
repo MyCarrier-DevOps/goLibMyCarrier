@@ -122,81 +122,126 @@ func TestMockStore_LoadByCommit(t *testing.T) {
 	}
 }
 
-func TestMockStore_DeleteSlip(t *testing.T) {
+// repaveSuccessorSlip builds the successor slip the Repave tests below replace a run with.
+func repaveSuccessorSlip(id, repo, branch, sha string) *slippy.Slip {
+	return &slippy.Slip{
+		CorrelationID: id,
+		Repository:    repo,
+		Branch:        branch,
+		CommitSHA:     sha,
+		Status:        slippy.SlipStatusPending,
+	}
+}
+
+func TestMockStore_Repave(t *testing.T) {
 	store := NewMockStore()
 	ctx := context.Background()
 
 	store.AddSlip(&slippy.Slip{
-		CorrelationID: "test-delete",
+		CorrelationID: "test-superseded",
 		Repository:    "test/repo",
+		Branch:        "main",
 		CommitSHA:     "commitdel",
-		// DeleteSlip only ever removes an ended slip (D1.2's status guard); give the
-		// fixture a realistic ended status rather than the zero value, which
-		// SlipStatus.IsLive() treats as live.
+		// Repave only ever removes an ended slip (D1.2's status guard); give the fixture a
+		// realistic ended status rather than the zero value, which SlipStatus.IsLive()
+		// treats as live.
 		Status: slippy.SlipStatusCompleted,
 	})
+	parent := &slippy.AncestryEntry{CorrelationID: "parent-1", CommitSHA: "sha-parent"}
 
-	if err := store.DeleteSlip(ctx, "test-delete", "successor-delete"); err != nil {
-		t.Fatalf("DeleteSlip failed: %v", err)
+	successor := repaveSuccessorSlip("test-successor", "test/repo", "main", "commitdel")
+	if err := store.Repave(ctx, "test-superseded", successor, parent); err != nil {
+		t.Fatalf("Repave failed: %v", err)
 	}
 
-	if len(store.DeleteSlipCalls) != 1 || store.DeleteSlipCalls[0] != "test-delete" {
-		t.Errorf("expected DeleteSlip call for test-delete, got %v", store.DeleteSlipCalls)
+	if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "test-superseded" {
+		t.Errorf("expected Repave call for test-superseded, got %v", store.RepaveCalls)
 	}
-	if len(store.DeleteSlipSuccessorCalls) != 1 || store.DeleteSlipSuccessorCalls[0] != "successor-delete" {
-		t.Errorf("expected successor-delete to be recorded, got %v", store.DeleteSlipSuccessorCalls)
+	if len(store.RepaveSuccessorCalls) != 1 || store.RepaveSuccessorCalls[0] != "test-successor" {
+		t.Errorf("expected test-successor to be recorded, got %v", store.RepaveSuccessorCalls)
 	}
-
-	// The slip itself is gone...
-	if _, err := store.Load(ctx, "test-delete"); !errors.Is(err, slippy.ErrSlipNotFound) {
-		t.Errorf("expected ErrSlipNotFound after delete, got %v", err)
+	if len(store.RepaveParents) != 1 || store.RepaveParents[0] != parent {
+		t.Errorf("expected the parent link to be recorded, got %v", store.RepaveParents)
 	}
 
-	// ...and so is its commit index entry, so a by-commit lookup no longer resolves it.
-	if _, err := store.LoadByCommit(ctx, "test/repo", "commitdel"); !errors.Is(err, slippy.ErrSlipNotFound) {
-		t.Errorf("expected commit index entry to be cleaned up, got %v", err)
+	// The superseded slip is gone...
+	if _, err := store.Load(ctx, "test-superseded"); !errors.Is(err, slippy.ErrSlipNotFound) {
+		t.Errorf("expected ErrSlipNotFound for the superseded run, got %v", err)
+	}
+
+	// ...and the successor took its place, including on the commit index.
+	if _, err := store.Load(ctx, "test-successor"); err != nil {
+		t.Errorf("expected the successor to exist after Repave, got %v", err)
+	}
+	got, err := store.LoadByCommit(ctx, "test/repo", "commitdel")
+	if err != nil {
+		t.Fatalf("expected the commit to resolve to the successor, got %v", err)
+	}
+	if got.CorrelationID != "test-successor" {
+		t.Errorf("expected the commit index to point at the successor, got %s", got.CorrelationID)
 	}
 }
 
-func TestMockStore_DeleteSlip_WithError(t *testing.T) {
+func TestMockStore_Repave_WithError(t *testing.T) {
 	store := NewMockStore()
 	ctx := context.Background()
 
 	store.AddSlip(&slippy.Slip{
-		CorrelationID: "test-delete-err",
+		CorrelationID: "test-repave-err",
 		Repository:    "test/repo",
 		CommitSHA:     "commiterr",
+		Status:        slippy.SlipStatusFailed,
 	})
 
-	testErr := errors.New("delete error")
-	store.DeleteSlipError = testErr
+	testErr := errors.New("repave error")
+	store.RepaveError = testErr
 
-	err := store.DeleteSlip(ctx, "test-delete-err", "")
+	successor := repaveSuccessorSlip("successor-err", "test/repo", "main", "commiterr")
+	err := store.Repave(ctx, "test-repave-err", successor, nil)
 	if !errors.Is(err, testErr) {
-		t.Errorf("expected DeleteSlipError, got %v", err)
+		t.Errorf("expected RepaveError, got %v", err)
 	}
 
-	// The call is recorded even when it fails, and the slip survives.
-	if len(store.DeleteSlipCalls) != 1 {
-		t.Errorf("expected the failed call to still be recorded, got %v", store.DeleteSlipCalls)
+	// The call is recorded even when it fails, the superseded slip survives, and — the
+	// point of atomicity — the successor was never created.
+	if len(store.RepaveCalls) != 1 {
+		t.Errorf("expected the failed call to still be recorded, got %v", store.RepaveCalls)
 	}
-	if _, err := store.Load(ctx, "test-delete-err"); err != nil {
-		t.Errorf("slip must survive a failed delete, got %v", err)
+	if _, loadErr := store.Load(ctx, "test-repave-err"); loadErr != nil {
+		t.Errorf("superseded slip must survive a failed repave, got %v", loadErr)
+	}
+	if _, successorErr := store.Load(ctx, "successor-err"); !errors.Is(successorErr, slippy.ErrSlipNotFound) {
+		t.Errorf("a failed repave must not create the successor, got %v", successorErr)
 	}
 }
 
-func TestMockStore_DeleteSlip_Missing(t *testing.T) {
+func TestMockStore_Repave_MissingSupersededSlip_StillCreatesSuccessor(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	// Repaving an unknown run is not an error (idempotent), matching PostgresStore — and
+	// the successor is still created so a redelivery converges.
+	successor := repaveSuccessorSlip("successor-ghost", "owner/repo", "main", "sha-ghost")
+	if err := store.Repave(ctx, "never-existed", successor, nil); err != nil {
+		t.Errorf("repaving a missing slip must not error, got %v", err)
+	}
+	if _, err := store.Load(ctx, "successor-ghost"); err != nil {
+		t.Errorf("expected the successor to be created anyway, got %v", err)
+	}
+}
+
+func TestMockStore_Repave_NilSuccessor_Rejected(t *testing.T) {
 	store := NewMockStore()
 
-	// Deleting an unknown slip is not an error (idempotent), matching PostgresStore.
-	if err := store.DeleteSlip(context.Background(), "never-existed", ""); err != nil {
-		t.Errorf("deleting a missing slip must be a no-op, got %v", err)
+	err := store.Repave(context.Background(), "whatever", nil, nil)
+	if !errors.Is(err, slippy.ErrInvalidConfiguration) {
+		t.Errorf("expected ErrInvalidConfiguration for a nil successor, got %v", err)
 	}
 }
 
-func TestMockStore_DeleteSlip_EndedSlip_Deletes(t *testing.T) {
-	// PostgresStore's DeleteSlip only ever removes a row whose status is "ended"
-	// (interfaces.go). An ended slip must be deleted with no error (DEVOPS-231 review
+func TestMockStore_Repave_EndedSlip_Replaces(t *testing.T) {
+	// PostgresStore's Repave only ever removes a row whose status is "ended"
+	// (interfaces.go). An ended slip must be replaced with no error (DEVOPS-231 review
 	// D1.2).
 	store := NewMockStore()
 	ctx := context.Background()
@@ -204,22 +249,27 @@ func TestMockStore_DeleteSlip_EndedSlip_Deletes(t *testing.T) {
 	store.AddSlip(&slippy.Slip{
 		CorrelationID: "corr-ended",
 		Repository:    "owner/repo",
+		Branch:        "main",
 		CommitSHA:     "sha-ended",
 		Status:        slippy.SlipStatusCompleted,
 	})
 
-	if err := store.DeleteSlip(ctx, "corr-ended", ""); err != nil {
-		t.Fatalf("expected ended slip to delete cleanly, got %v", err)
+	successor := repaveSuccessorSlip("corr-successor", "owner/repo", "main", "sha-ended")
+	if err := store.Repave(ctx, "corr-ended", successor, nil); err != nil {
+		t.Fatalf("expected ended slip to be replaced cleanly, got %v", err)
 	}
 	if _, err := store.Load(ctx, "corr-ended"); !errors.Is(err, slippy.ErrSlipNotFound) {
 		t.Errorf("expected ended slip to be gone, got %v", err)
 	}
+	if _, err := store.Load(ctx, "corr-successor"); err != nil {
+		t.Errorf("expected the successor to exist, got %v", err)
+	}
 }
 
-func TestMockStore_DeleteSlip_LiveSlip_ReturnsErrSlipWentLive(t *testing.T) {
+func TestMockStore_Repave_LiveSlip_ReturnsErrSlipWentLive(t *testing.T) {
 	// The exported MockStore asserts `var _ slippy.SlipStore = (*MockStore)(nil)`, so a
 	// downstream consumer's went-live handling must be exercisable against it. Without
-	// this guard, the mock would let a caller delete a pending/in_progress slip - the
+	// this guard, the mock would let a caller destroy a pending/in_progress slip - the
 	// exact operation PostgresStore refuses (DEVOPS-231 review D1.2).
 	store := NewMockStore()
 	ctx := context.Background()
@@ -227,28 +277,33 @@ func TestMockStore_DeleteSlip_LiveSlip_ReturnsErrSlipWentLive(t *testing.T) {
 	store.AddSlip(&slippy.Slip{
 		CorrelationID: "corr-live",
 		Repository:    "owner/repo",
+		Branch:        "main",
 		CommitSHA:     "sha-live",
 		Status:        slippy.SlipStatusInProgress,
 	})
 
-	err := store.DeleteSlip(ctx, "corr-live", "")
+	successor := repaveSuccessorSlip("corr-successor", "owner/repo", "main", "sha-live")
+	err := store.Repave(ctx, "corr-live", successor, nil)
 	if !errors.Is(err, slippy.ErrSlipWentLive) {
 		t.Fatalf("expected ErrSlipWentLive for a live slip, got %v", err)
 	}
 
-	// The live slip must survive the rejected delete.
+	// The live slip must survive the rejected repave, and no successor may appear.
 	if _, loadErr := store.Load(ctx, "corr-live"); loadErr != nil {
-		t.Errorf("live slip must survive a rejected delete, got %v", loadErr)
+		t.Errorf("live slip must survive a rejected repave, got %v", loadErr)
 	}
 	if _, byCommitErr := store.LoadByCommit(ctx, "owner/repo", "sha-live"); byCommitErr != nil {
-		t.Errorf("live slip's commit index entry must survive a rejected delete, got %v", byCommitErr)
+		t.Errorf("live slip's commit index entry must survive a rejected repave, got %v", byCommitErr)
+	}
+	if _, successorErr := store.Load(ctx, "corr-successor"); !errors.Is(successorErr, slippy.ErrSlipNotFound) {
+		t.Errorf("a rejected repave must not create the successor, got %v", successorErr)
 	}
 }
 
-func TestMockStore_DeleteSlip_WentLiveHook_MutatesStatusBeforeReturningError(t *testing.T) {
-	// Mirrors slippy's internal MockStore.DeleteSlipWentLiveStatus: simulates the slip
+func TestMockStore_Repave_WentLiveHook_MutatesStatusBeforeReturningError(t *testing.T) {
+	// Mirrors slippy's internal MockStore.RepaveWentLiveStatus: simulates the slip
 	// transitioning to live in the window between the caller's repave decision and the
-	// DeleteSlip call itself, so a subsequent reload observes the new state rather than
+	// Repave call itself, so a subsequent reload observes the new state rather than
 	// the stale decision-time snapshot (DEVOPS-231 review D1.2, review finding B1).
 	store := NewMockStore()
 	ctx := context.Background()
@@ -256,13 +311,15 @@ func TestMockStore_DeleteSlip_WentLiveHook_MutatesStatusBeforeReturningError(t *
 	store.AddSlip(&slippy.Slip{
 		CorrelationID: "corr-went-live",
 		Repository:    "owner/repo",
+		Branch:        "main",
 		CommitSHA:     "sha-went-live",
 		Status:        slippy.SlipStatusFailed, // ended at decision time
 	})
-	store.DeleteSlipError = slippy.ErrSlipWentLive
-	store.DeleteSlipWentLiveStatus = map[string]slippy.SlipStatus{"corr-went-live": slippy.SlipStatusInProgress}
+	store.RepaveError = slippy.ErrSlipWentLive
+	store.RepaveWentLiveStatus = map[string]slippy.SlipStatus{"corr-went-live": slippy.SlipStatusInProgress}
 
-	err := store.DeleteSlip(ctx, "corr-went-live", "")
+	successor := repaveSuccessorSlip("corr-successor", "owner/repo", "main", "sha-went-live")
+	err := store.Repave(ctx, "corr-went-live", successor, nil)
 	if !errors.Is(err, slippy.ErrSlipWentLive) {
 		t.Fatalf("expected ErrSlipWentLive, got %v", err)
 	}
@@ -274,14 +331,14 @@ func TestMockStore_DeleteSlip_WentLiveHook_MutatesStatusBeforeReturningError(t *
 	if reloaded.Status != slippy.SlipStatusInProgress {
 		t.Errorf("expected the hook to mutate status to in_progress, got %s", reloaded.Status)
 	}
-	if len(store.DeleteSlipWentLiveStatus) != 0 {
+	if len(store.RepaveWentLiveStatus) != 0 {
 		t.Error("expected the one-shot hook entry to be cleared after firing")
 	}
 }
 
-func TestMockStore_DeleteSlip_DoesNotUnmapWhenIndexPointsElsewhere(t *testing.T) {
+func TestMockStore_Repave_DoesNotUnmapWhenIndexPointsElsewhere(t *testing.T) {
 	// Same fidelity gap as the internal mock: Create permits duplicate (repo, sha) rows
-	// and re-points CommitIndex at the newest one. Deleting an OLDER ended row must not
+	// and re-points CommitIndex at the newest one. Superseding an OLDER ended row must not
 	// clear an index entry that has since moved on to a different, still-live row
 	// (DEVOPS-231 review D1.1).
 	store := NewMockStore()
@@ -304,13 +361,16 @@ func TestMockStore_DeleteSlip_DoesNotUnmapWhenIndexPointsElsewhere(t *testing.T)
 		t.Fatalf("Create corr-b failed: %v", err)
 	}
 
-	if err := store.DeleteSlip(ctx, "corr-a", ""); err != nil {
-		t.Fatalf("DeleteSlip(corr-a) failed: %v", err)
+	// The successor lands on a different commit, so it cannot itself claim the shared
+	// index entry — isolating the question this test asks.
+	successor := repaveSuccessorSlip("corr-c", "owner/repo", "main", "sha-other")
+	if err := store.Repave(ctx, "corr-a", successor, nil); err != nil {
+		t.Fatalf("Repave(corr-a) failed: %v", err)
 	}
 
 	got, err := store.LoadByCommit(ctx, "owner/repo", "sha-shared")
 	if err != nil {
-		t.Fatalf("expected corr-b to remain findable by commit after corr-a's delete, got error: %v", err)
+		t.Fatalf("expected corr-b to remain findable by commit after corr-a's repave, got error: %v", err)
 	}
 	if got.CorrelationID != "corr-b" {
 		t.Errorf("expected corr-b, got %s", got.CorrelationID)

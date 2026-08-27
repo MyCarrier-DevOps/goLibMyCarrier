@@ -67,33 +67,12 @@ func (s *PostgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx
 // Create upserts a slip. Matches ClickHouse last-write-wins (and the in-memory
 // reference store): an existing correlation_id is overwritten rather than rejected.
 func (s *PostgresStore) Create(ctx context.Context, slip *Slip) error {
-	cols := s.slipColumns()
-	vals, err := s.slipValues(slip, true)
+	query, vals, err := s.buildCreateQuery(slip)
 	if err != nil {
 		return err
 	}
-
-	placeholders := make([]string, len(cols))
-	for i := range cols {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
-
-	// ON CONFLICT DO UPDATE for every non-PK column (cols[0] is correlation_id).
-	sets := make([]string, 0, len(cols)-1)
-	for _, col := range cols[1:] {
-		sets = append(sets, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
-	}
-
-	query := fmt.Sprintf(
-		"INSERT INTO routing_slips (%s) VALUES (%s) ON CONFLICT (correlation_id) DO UPDATE SET %s",
-		strings.Join(cols, ", "), strings.Join(placeholders, ", "), strings.Join(sets, ", "))
-
 	if _, err := s.pool.Exec(ctx, query, vals...); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_routing_slips_repo_sha" {
-			return fmt.Errorf("create slip %s: %w", slip.CorrelationID, ErrDuplicateSlip)
-		}
-		return fmt.Errorf("failed to create slip %s: %w", slip.CorrelationID, err)
+		return mapCreateError(slip.CorrelationID, err)
 	}
 	return nil
 }
@@ -190,6 +169,56 @@ func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commit
 // slipColumns returns the ordered routing_slips column list: core columns, then each
 // step's status column, then each aggregate step's jsonb column. The order is shared by
 // SELECT, INSERT, and the scan destinations so they never drift.
+// createTx is Create against an open transaction. Repave uses it so the superseded row's
+// removal and the successor's insert commit or roll back together; both paths go through
+// buildCreateQuery/mapCreateError so a transactional create writes an identical row and
+// reports identical sentinels to a standalone one.
+func (s *PostgresStore) createTx(ctx context.Context, tx pgx.Tx, slip *Slip) error {
+	query, vals, err := s.buildCreateQuery(slip)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, query, vals...); err != nil {
+		return mapCreateError(slip.CorrelationID, err)
+	}
+	return nil
+}
+
+// buildCreateQuery builds the slip upsert statement and its ordered argument list.
+func (s *PostgresStore) buildCreateQuery(slip *Slip) (query string, args []any, err error) {
+	cols := s.slipColumns()
+	vals, err := s.slipValues(slip, true)
+	if err != nil {
+		return "", nil, err
+	}
+
+	placeholders := make([]string, len(cols))
+	for i := range cols {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	// ON CONFLICT DO UPDATE for every non-PK column (cols[0] is correlation_id).
+	sets := make([]string, 0, len(cols)-1)
+	for _, col := range cols[1:] {
+		sets = append(sets, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
+	}
+
+	return fmt.Sprintf(
+		"INSERT INTO routing_slips (%s) VALUES (%s) ON CONFLICT (correlation_id) DO UPDATE SET %s",
+		strings.Join(cols, ", "), strings.Join(placeholders, ", "), strings.Join(sets, ", ")), vals, nil
+}
+
+// mapCreateError translates a slip-insert failure into this package's sentinels: a
+// conflict on the one-row-per-commit unique index becomes ErrDuplicateSlip so callers can
+// route to their dedup backstop instead of treating it as a hard failure.
+func mapCreateError(correlationID string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_routing_slips_repo_sha" {
+		return fmt.Errorf("create slip %s: %w", correlationID, ErrDuplicateSlip)
+	}
+	return fmt.Errorf("failed to create slip %s: %w", correlationID, err)
+}
+
 func (s *PostgresStore) slipColumns() []string {
 	cols := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,

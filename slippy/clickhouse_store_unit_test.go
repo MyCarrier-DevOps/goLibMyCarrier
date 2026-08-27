@@ -145,25 +145,26 @@ func TestClickHouseStore_Close(t *testing.T) {
 	})
 }
 
-// TestClickHouseStore_DeleteSlip verifies the ClickHouse store refuses DeleteSlip:
-// Postgres is the operational slip store (DEVOPS-127), and the repave path
-// (DEVOPS-231) must never run against ClickHouse. The error must be the typed
-// ErrDeleteSlipUnsupported sentinel (wrapped with the correlation ID via %w) so callers
-// can detect it with errors.Is and fall back to abandon semantics, rather than a plain
-// formatted string only detectable by substring matching.
-func TestClickHouseStore_DeleteSlip(t *testing.T) {
+// TestClickHouseStore_Repave verifies the ClickHouse store refuses Repave: Postgres is the
+// operational slip store (DEVOPS-127), and the repave path (DEVOPS-231) must never run
+// against ClickHouse, which has neither a delete path nor the transaction Repave's
+// atomicity contract requires. The error must be the typed ErrRepaveUnsupported sentinel
+// (wrapped with the superseded correlation ID via %w) so callers can detect it with
+// errors.Is and fall back to abandon semantics, rather than a plain formatted string only
+// detectable by substring matching.
+func TestClickHouseStore_Repave(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	err := store.DeleteSlip(context.Background(), "corr-1", "successor-1")
+	err := store.Repave(context.Background(), "corr-1", &Slip{CorrelationID: "successor-1"}, nil)
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
-	if !errors.Is(err, ErrDeleteSlipUnsupported) {
-		t.Errorf("expected errors.Is(err, ErrDeleteSlipUnsupported) to hold, got %q", err.Error())
+	if !errors.Is(err, ErrRepaveUnsupported) {
+		t.Errorf("expected errors.Is(err, ErrRepaveUnsupported) to hold, got %q", err.Error())
 	}
 	if !strings.Contains(err.Error(), "corr-1") {
-		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
+		t.Errorf("expected error to name the superseded correlation ID, got %q", err.Error())
 	}
 }
 

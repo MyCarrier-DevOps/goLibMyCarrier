@@ -16,15 +16,15 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ## Breaking changes
 
-**DEVOPS-231 added `DeleteSlip` to the exported `SlipStore` interface:**
+**DEVOPS-231 added `Repave` to the exported `SlipStore` interface:**
 
 ```go
-DeleteSlip(ctx context.Context, correlationID, successorCorrelationID string) error
+Repave(ctx context.Context, oldCorrelationID string, newSlip *Slip, parent *AncestryEntry) error
 ```
 
 This is a compile-breaking change for any downstream consumer with its own
 `SlipStore` implementation — a `var _ slippy.SlipStore = (*fakeStore)(nil)` assertion
-now fails with "missing method DeleteSlip" until that method is added. This was a
+now fails with "missing method Repave" until that method is added. This was a
 deliberate choice: a reviewer suggested a narrower optional interface asserted at the
 call site instead, so existing implementers would not need to change; we rejected
 that in favor of compile-time conformance for the operational store, and this repo
@@ -34,11 +34,40 @@ gained new methods — update `mockSlipStore`"). Since every module in this repo
 releases at one shared version, bumping the dependency in a downstream consumer means
 following that checklist, not working around the interface.
 
-Callers may also now observe two new sentinel errors from the repave path this method
-implements: `ErrSlipWentLive` (the delete was rejected because the slip went live
-between the repave decision and the call) and `ErrDeleteSlipUnsupported` (the store,
-e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
-abandon semantics). See `errors.go` for their full contracts.
+**Why `Repave` and not a plain `DeleteSlip`.** An earlier iteration of this work added
+`DeleteSlip(ctx, correlationID, successorCorrelationID string) error` and left the push
+path to call `Create` afterwards. That shape was never released, and it had a defect that
+no amount of ordering could fix: once the delete committed, a failure in the following
+`Create` left the commit with **no slip at all**, and the next Kafka redelivery found no
+row to repave and failed identically — forever. The producible trigger is ordinary deploy
+ordering: `slipColumns()` derives the INSERT column list from the pipeline config, so a
+config deployed ahead of the migration that adds its step's `_status` column makes every
+insert fail with Postgres 42703. `Repave` makes the replacement atomic, so that failure
+rolls back instead of destroying the run. Implementations MUST provide that atomicity.
+
+Folding the create into the store also closed four other defects structurally rather than
+by documentation: the successor's row is inserted **before** any descendant is repointed
+onto it (so no descendant can name a correlation ID that has no row — and Phase B is free
+to add a foreign key on `slip_ancestry.parent_correlation_id`, which the old
+repoint-before-insert ordering made impossible); the superseded run's own parent link is
+carried forward when the caller resolved no ancestry, instead of being deleted and never
+replaced; the successor's identity is a `*Slip` the store itself writes rather than a
+caller-supplied ID string written into other slips' ancestry rows unvalidated; and the
+descendant repoint now rewrites `parent_branch` and `parent_status` alongside the id, so a
+cross-branch repave no longer truncates `ResolveAncestry` at that hop.
+
+**One behavioral reversal to be aware of:** a failed repave is now **fatal** to the push.
+The pre-`Repave` code logged a failed delete as a warning and created the slip anyway.
+That leniency only made sense while delete and create were separate calls; a failed
+`Repave` writes nothing, so there is no successor to report. The push fails, Kafka
+redelivers, and the redelivery converges because the superseded row is still there.
+
+Callers may also now observe two sentinel errors from this path: `ErrSlipWentLive` (the
+repave was rejected because the slip went live between the repave decision and the call —
+nothing was written, and the successor was NOT created) and `ErrRepaveUnsupported` (the
+store, e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
+abandon semantics, then create the successor separately). `Repave` can also return
+`ErrDuplicateSlip` once Phase B's unique index exists. See `errors.go` for full contracts.
 
 ---
 
@@ -50,9 +79,10 @@ abandon semantics). See `errors.go` for their full contracts.
 
 - **Postgres (`PostgresStore`) is the operational slip store** (since DEVOPS-127). `ClickHouseStore`
   remains in the codebase and implements the same `SlipStore` interface, but is not the write path
-  for production slips — e.g. `ClickHouseStore.DeleteSlip` (`clickhouse_store.go`) unconditionally
-  returns an error wrapping the `ErrDeleteSlipUnsupported` sentinel (see `errors.go`), signaling
-  callers to fall back to abandon semantics instead of repave.
+  for production slips — e.g. `ClickHouseStore.Repave` (`clickhouse_store.go`) unconditionally
+  returns an error wrapping the `ErrRepaveUnsupported` sentinel (see `errors.go`), signaling
+  callers to fall back to abandon semantics instead of repave. ClickHouse has neither a
+  delete path nor transactions, so it cannot offer `Repave`'s atomicity contract at all.
 - **Dynamic schema** generated from JSON pipeline configuration
 - **Pre-job/Post-job execution model** - bookend operations around existing jobs (does NOT wrap job execution)
 - **Correlation ID** is the single canonical identifier for a slip throughout its lifecycle
@@ -350,7 +380,7 @@ slippy/
 ├── clickhouse_store.go # ClickHouse SlipStore implementation (not the operational store; see Key Characteristics)
 ├── postgres_store.go   # PostgresStore type + pgxPool interface (the operational SlipStore, DEVOPS-127)
 ├── postgres_store_reads.go   # PostgresStore read methods (FindByCommits, LoadByCommit, ResolveAncestry, ...)
-├── postgres_store_updates.go # PostgresStore write methods (Update, DeleteSlip, ...) + SlipStore conformance assertion
+├── postgres_store_updates.go # PostgresStore write methods (Update, Repave, ...) + SlipStore conformance assertion
 ├── postgres_migrate.go   # Postgres schema-migration options and expected-table checks
 ├── postgres_migrations.go # PostgresDynamicMigrationManager (Postgres counterpart of DynamicMigrationManager)
 ├── github.go           # GitHub API implementation

@@ -115,11 +115,33 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   slip keeps the existing `correlation_id`, which differs from the one the caller sent,
   so the caller (pushhookparser) detects a dedup and suppresses re-dispatch. A push for
   a SHA whose slip is `failed` or terminal
-  (`completed`/`abandoned`/`promoted`/`compensated`) instead **repaves**:
-  `DeleteSlip` removes the `routing_slips` row and explicitly deletes its
-  `slip_component_states`/`slip_ancestry` children in the same transaction (correct both
-  before and after migration v5's cascade FKs exist), then a fresh `Create` runs with the
-  new run's `correlation_id` — full re-dispatch (builds, unit tests, secret scan).
+  (`completed`/`abandoned`/`promoted`/`compensated`) instead **repaves**: a single
+  `SlipStore.Repave` call removes the `routing_slips` row, explicitly deletes its
+  `slip_component_states`/`slip_ancestry` children (correct both before and after migration
+  v5's cascade FKs exist), inserts the fresh row under the new run's `correlation_id`,
+  repoints any descendant onto it, and writes the fresh run's own parent link — **all in
+  one transaction** — producing a full re-dispatch (builds, unit tests, secret scan).
+
+  The atomicity is the contract, not an implementation detail. When the delete and the
+  create were separate store calls, a create failure after a committed delete left the
+  commit with no slip at all and every redelivery reproduced it; the reachable trigger was
+  a pipeline config deployed ahead of the migration adding its step's column (Postgres
+  42703 on every insert). The statement order inside the transaction is also load-bearing:
+  the successor's row is inserted BEFORE any descendant is repointed onto it, which is what
+  keeps a descendant from naming a row that does not exist and what allows migration v5 to
+  add a foreign key on `slip_ancestry.parent_correlation_id` at all.
+
+  Two further guarantees follow from doing it in one place: if the push resolved no
+  ancestry (e.g. a GitHub outage), the superseded run's own parent link is **carried
+  forward** to the successor rather than deleted with it; and the descendant repoint
+  rewrites `parent_branch` and `parent_status` alongside the id, so a cross-branch repave
+  no longer truncates `ResolveAncestry` at that hop (it joins the next hop on the branch
+  recorded beside the parent id).
+
+  A failed `Repave` is fatal to the push: nothing was written, so there is no successor to
+  report, and failing lets Kafka redeliver against a store that still holds the superseded
+  row. A store that cannot repave at all (`ClickHouseStore`) returns `ErrRepaveUnsupported`
+  and the push path falls back to pre-DEVOPS-231 abandon-then-create semantics.
 - **Empty-run guard.** If the incoming push carries no components (e.g. branch
   create/recreate at an existing SHA, or a components-less repo) and the existing slip
   for that SHA is ended, `CreateSlipForPush` returns the existing slip instead of
@@ -148,10 +170,17 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   with `ErrSlipNotFound`, where pre-DEVOPS-231 abandon semantics left the row in
   place to absorb them. This is deliberately NOT fixed by making not-found benign
   across `steps.go`/`hold.go` — that would mask genuine not-found bugs repo-wide —
-  and is tracked as a follow-up. The status-guarded delete (`ErrSlipWentLive`) does
-  remove the worst case: a `failed` slip that recovers to `in_progress` before the
-  delete lands is no longer deletable, so a recovering run is never pulled out from
-  under itself.
+  and is tracked as **DEVOPS-277**, which decides between preserving a repaved run's
+  history (tombstone or soft-delete, either of which also lets a late writer tell
+  "repaved, stop quietly" from "genuinely missing") and accepting the loss explicitly.
+  The status-guarded removal (`ErrSlipWentLive`) does remove the worst case: a `failed`
+  slip that recovers to `in_progress` before the repave lands is refused, so a
+  recovering run is never pulled out from under itself.
+
+  Verified mitigating context: this fails **closed**. A destroyed `secret_scan` verdict
+  cannot become a deploy permission, because `AllPrerequisitesMet` requires every
+  prerequisite to be `IsSuccess()` and a fresh slip starts `pending`. The cost is
+  availability (a false-red post-job), not integrity.
 - **Deploy-event attachment.** A same-commit re-push repaves an ended slip whose
   image may have already shipped, so a deploy event for that image now attaches to
   the current (repaved) run for that `(repo, sha)` rather than the run that actually
@@ -168,12 +197,17 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   (`abandoned`/`promoted`/`compensated`) can now be returned from `CreateSlipForPush`
   for a componentless push — previously impossible, since that function always
   either reused a live slip or created a fresh one.
-- **No convergence backstop in Phase A.** Without the `uq_routing_slips_repo_sha`
-  unique index (Phase B), a subsequent `Create` for the same `(repository,
-  commit_sha)` never conflicts on anything but `correlation_id`, so `ErrDuplicateSlip`
-  is unreachable via a failed repave delete. A failed delete simply leaves the stale
-  ended row behind alongside the fresh row until the Phase B migration adds the index
-  and its cleanup runs.
+- **No duplicate detection in Phase A.** Without the `uq_routing_slips_repo_sha`
+  unique index (Phase B), an insert for the same `(repository, commit_sha)` never
+  conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
+  `handleDuplicateSlipBackstop` — is unreachable. A lost Redis-lock race (the dedup lock
+  is fail-open) silently inserts a second row for one commit with no detection at all,
+  until the Phase B migration adds the index and its cleanup runs.
+
+  What Phase A *does* have, since `Repave` became transactional, is convergence on repave
+  failure: nothing is written, the push fails, and the redelivery repaves the still-present
+  superseded row. The earlier delete-then-create shape had no such property — a failed
+  delete left a stale row beside a fresh one, and a failed create destroyed the run.
 
 **Terminology — two mutually exclusive retrigger mechanisms:**
 - **Push-shaped retrigger** ("webhook re-delivery" / "same-commit re-push"): any push
