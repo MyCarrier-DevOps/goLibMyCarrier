@@ -3013,6 +3013,94 @@ func TestClient_CreateSlipForPush_DuplicateBackstopFailurePaths(t *testing.T) {
 	})
 }
 
+// TestClient_CreateSlipForPush_RepaveDuplicateBackstop covers the repave path's own
+// ErrDuplicateSlip branch. It is dormant until Phase B's unique index exists, but it is
+// reachable after that through the concurrent same-commit push the feature exists for: two
+// pushes repave the same row, the loser's guarded delete finds the row already gone (the
+// winner committed), so the loser proceeds to insert its own successor and conflicts with
+// the winner's on uq_routing_slips_repo_sha. Both failure exits are exercised here so the
+// branch is not merely executed.
+func TestClient_CreateSlipForPush_RepaveDuplicateBackstop(t *testing.T) {
+	ctx := context.Background()
+
+	opts := PushOptions{
+		CorrelationID: "corr-loser",
+		Repository:    "owner/repo",
+		Branch:        "integration",
+		CommitSHA:     "sha-raced",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	}
+
+	// An ended row for the pushed commit, so the push takes the repave path rather than
+	// the plain-create path.
+	seedEndedRow := func(store *MockStore) {
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-superseded",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-raced",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+	}
+
+	t.Run("backstop failure propagates", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+		seedEndedRow(store)
+
+		// Every Repave reports the duplicate: the push's own, and the backstop's attempt on
+		// the conflicting row it finds. The latter is fatal inside the backstop, and that
+		// error must reach the caller rather than be swallowed.
+		store.RepaveError = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected the backstop's fatal repave failure to fail the push")
+		}
+		if !strings.Contains(err.Error(), "conflicting slip") {
+			t.Errorf("expected the backstop's error to propagate, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+	})
+
+	t.Run("retry after the backstop falls through also fails", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+		seedEndedRow(store)
+
+		store.RepaveError = ErrDuplicateSlip
+		// Force the backstop's own lookup (LoadByCommit call 2; call 1 is
+		// CreateSlipForPush's initial one) to find nothing, so the backstop falls through
+		// with handled=false instead of deduping — leaving the single retry, which fails.
+		store.LoadByCommitNilOnCall = 2
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected the failed post-backstop retry to fail the push")
+		}
+		if !strings.Contains(err.Error(), "after duplicate backstop") {
+			t.Errorf("expected the error to identify the post-backstop retry, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+		// Convergence: nothing was written, so the superseded row is still there for the
+		// redelivery to repave.
+		if _, ok := store.Slips["corr-superseded"]; !ok {
+			t.Error("the superseded row must survive so a redelivery can converge")
+		}
+		if _, ok := store.Slips["corr-loser"]; ok {
+			t.Error("no successor may be left behind")
+		}
+	})
+}
+
 // TestClient_CreateSlipForPush_LinkWriteRouting pins WHERE the successor's direct-parent
 // link is written, which the transactional Repave changes. On the fresh-create path the link
 // is a separate, best-effort store call; on the repave path it is handed to Repave so it

@@ -275,7 +275,8 @@ doctor:
 			continue; \
 		fi; \
 		got=$$($$tool $$flag 2>&1 | tr '\n' ' ' | sed 's/  */ /g'); \
-		if echo "$$got" | grep -q "$$want"; then \
+		want_bare=$$(echo "$$want" | sed 's/^v//'); \
+		if echo "$$got" | grep -qE "(^|[^0-9.])v?$$want_bare([^0-9.]|$$)"; then \
 			printf "  %-18s want %-10s OK\n" "$$tool" "$$want"; \
 		else \
 			printf "  %-18s want %-10s MISMATCH: %s\n" "$$tool" "$$want" "$$(echo $$got | cut -c1-90)"; \

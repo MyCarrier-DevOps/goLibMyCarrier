@@ -592,11 +592,15 @@ func (c *Client) repaveExistingSlip(
 		return c.createFreshSlip(ctx, opts, slip, parent, result)
 
 	case errors.Is(repaveErr, ErrDuplicateSlip):
-		// Dormant until Phase B, and even then near-unreachable on this path: the
-		// superseded row IS the row for this (repository, commit_sha), and Repave deletes
-		// it before inserting the successor inside the same transaction, so the unique
-		// index has nothing left to conflict with unless a third row exists. Routed to the
-		// same backstop as the create path anyway, for symmetry rather than for coverage.
+		// Dormant until Phase B's unique index exists, but genuinely reachable after that,
+		// via the concurrent same-commit push this whole feature is about. Two pushes for
+		// one commit both try to repave the same row: A's guarded delete takes the row lock
+		// and B blocks on it. When A commits (row deleted, A's successor inserted), B's
+		// delete matches zero rows and B's existence check — which looks up B's OWN
+		// oldCorrelationID — finds nothing, so B correctly reads it as "already gone" and
+		// proceeds to insert its own successor. That insert is what conflicts with A's
+		// successor on uq_routing_slips_repo_sha. Routed to the same backstop as the create
+		// path, which then dedups B onto A's run.
 		backstopHandled, backstopErr := c.handleDuplicateSlipBackstop(ctx, opts, slip, parent, result)
 		if backstopErr != nil {
 			return false, backstopErr
