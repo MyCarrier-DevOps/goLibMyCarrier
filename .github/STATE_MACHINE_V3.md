@@ -188,15 +188,29 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   This is a deliberate contract change, not a bug: refusing to repave any ended slip
   that recorded an image tag would make re-pushing an already-built commit
   non-repaveable, which is this PR's primary case.
-- **Empty-run guard consequences.** In a zero-component repo, a failed run cannot be
-  retriggered by re-pushing the same commit — the guard returns the existing (still
-  failed) slip and the caller suppresses re-dispatch. The guard's early return also
-  skips `resolveAndAbandonAncestors`, so an older in-flight slip on the same branch
-  that a fall-through push would otherwise have abandoned stays live. And because the
-  guard dedupes onto ANY ended status, a superseded-terminal slip
-  (`abandoned`/`promoted`/`compensated`) can now be returned from `CreateSlipForPush`
-  for a componentless push — previously impossible, since that function always
+- **Empty-run guard consequences.** The guard's early return skips
+  `resolveAndAbandonAncestors`, so an older in-flight slip on the same branch that a
+  fall-through push would otherwise have abandoned stays live. And because the guard
+  dedupes onto ANY ended status, a superseded-terminal slip
+  (`abandoned`/`promoted`/`compensated`) can be returned from `CreateSlipForPush`
+  for a non-dispatching push — previously impossible, since that function always
   either reused a live slip or created a fresh one.
+
+  **The guard no longer infers intent from component count.** It reads
+  `PushOptions.Dispatch` (`DispatchIntent`), because "zero components" legitimately means
+  both "branch create at an existing SHA, nothing to do" and "tests-only repo, unit tests
+  are about to run" — only the caller can tell them apart. The old inference broke the
+  second case concretely: `pushhookparser` nils out components whenever builds are skipped
+  (`if !shouldBuild { slipComponents = nil }`) while still dispatching the unit-tester
+  event, so the guard fired on a push that DID dispatch work, returned the old failed slip,
+  and the caller's `Deduplicated` branch short-circuited every side effect — unit tests
+  included. A failed unit-test run on such a repo therefore could not be retriggered by
+  re-pushing the commit. Five `MyCarrier-Engineering` repos carry the triggering
+  combination (`buildable=false` + `RunUnitTests=true` + `AllowSlipWithNoBuilds=true`).
+
+  `DispatchIntentUnspecified` is the zero value and keeps the legacy inference, because
+  this library releases before `slippy-api` and `pushhookparser` adopt the field; the fix
+  is only live once all three ship.
 - **No duplicate detection in Phase A.** Without the `uq_routing_slips_repo_sha`
   unique index (Phase B), an insert for the same `(repository, commit_sha)` never
   conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
