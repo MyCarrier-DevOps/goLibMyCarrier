@@ -125,7 +125,14 @@ type PushOptions struct {
 // Component count is not recoverable as a signal here, because the same "zero components"
 // value legitimately means BOTH "branch create at an existing SHA, nothing to do" and
 // "tests-only repo, unit tests are about to run". Only the caller knows which.
-type DispatchIntent uint8
+// It is a string type with a String() method, matching every other enum-like type in this
+// package (SlipStatus, StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). That is
+// not only convention: the two log fields this adds are rendered by zap, which matches
+// fmt.Stringer but does NOT match a named uint8 type — so a numeric enum would have printed
+// `dispatch_intent=0` on the one line an operator reads to explain why a run's history was
+// preserved or destroyed. Choosing the underlying type now matters because changing it after
+// release is breaking, while adding String() never is.
+type DispatchIntent string
 
 const (
 	// DispatchIntentUnspecified means the caller has not stated its intent, so the guard
@@ -133,18 +140,36 @@ const (
 	// this library releases before its consumers (slippy-api, pushhookparser) adopt the
 	// field, and an un-updated caller must keep behaving exactly as it does today rather
 	// than silently changing semantics during the release window.
-	DispatchIntentUnspecified DispatchIntent = iota
+	DispatchIntentUnspecified DispatchIntent = ""
 
 	// DispatchIntentSomething means this push WILL dispatch CI work, so an ended slip for
 	// the same commit should be repaved even when Components is empty. This is what a
 	// tests-only repo sends.
-	DispatchIntentSomething
+	//
+	// Sequencing note for an adopting consumer: setting this opts a zero-component push
+	// INTO the repave path, and therefore into the Phase A double-row race described in
+	// .github/STATE_MACHINE_V3.md — two concurrent same-commit pushes can both repave and
+	// both insert, because no unique index exists until Phase B. The component-count
+	// inference previously shielded these repos from that. It also opts the push into
+	// ancestry resolution and into a repave failure being fatal, where the guard's early
+	// return previously made it a no-op; see CreateSlipForPush.
+	DispatchIntentSomething DispatchIntent = "something"
 
 	// DispatchIntentNothing means this push will dispatch NO CI work, so an ended slip for
 	// the same commit must be left intact and deduped onto. Authoritative even when
-	// Components is non-empty.
-	DispatchIntentNothing
+	// Components is non-empty — in which case the fresh-create path also declines to seed
+	// component rows for work that will never report (see initializeSlipForPush).
+	DispatchIntentNothing DispatchIntent = "nothing"
 )
+
+// String names the zero value explicitly so a structured log field reads "unspecified"
+// rather than an empty value.
+func (d DispatchIntent) String() string {
+	if d == DispatchIntentUnspecified {
+		return "unspecified"
+	}
+	return string(d)
+}
 
 // Validate checks that all required fields are present.
 func (o PushOptions) Validate() error {
@@ -255,10 +280,16 @@ type CreateSlipResult struct {
 //     stale and repaved on the same terms as the failed case above — replaced, in one
 //     transaction, by a fresh slip under the new correlation ID from opts. This prevents
 //     resurrecting superseded slips on webhook re-delivery or bot-commit races.
-//   - Existing slip is failed/terminal AND opts.Components is empty: the empty-run guard
-//     short-circuits the repave above and returns the existing (ended) slip as a dedup,
-//     since nothing would be dispatched and repaving would only destroy history for no
-//     benefit. handleDuplicateSlipBackstop applies the identical guard so the two paths
+//   - Existing slip is failed/terminal AND this push will dispatch nothing: the empty-run
+//     guard short-circuits the repave above and returns the existing (ended) slip as a
+//     dedup, since nothing would be dispatched and repaving would only destroy history for
+//     no benefit. "Will dispatch nothing" is PushOptions.Dispatch when the caller states it
+//     (see DispatchIntent), falling back to len(opts.Components) == 0 only when it is
+//     DispatchIntentUnspecified — component count is neither necessary nor sufficient on
+//     its own, which is why the field exists. A caller that dispatches work without build
+//     components (a tests-only repo) MUST set DispatchIntentSomething or this guard
+//     suppresses the retrigger it wanted.
+//     handleDuplicateSlipBackstop applies the identical guard so the two paths
 //     converge on the same outcome for the same inputs.
 //   - The repave itself can report that the decision is stale:
 //     ErrSlipWentLive means the slip became live again before the repave landed, so the
@@ -374,8 +405,8 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     when the new row is inserted.
 		//
 		if opts.dispatchesNothing() {
-			// Empty-run guard: nothing will be dispatched for this push (branch
-			// create/recreate at an existing SHA, or a components-less repo).
+			// Empty-run guard: nothing will be dispatched for this push (a branch
+			// create/recreate at an existing SHA, or a repo with no work to run).
 			// Repaving would destroy the prior run's history for zero benefit.
 			// Return the existing slip; the caller sees returned != sent and
 			// suppresses side effects.
@@ -383,7 +414,9 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			// A caller that DOES dispatch work without build components — a tests-only
 			// repo (buildable=false + RunUnitTests=true) — must say so via
 			// PushOptions.Dispatch, or this guard suppresses the retrigger it wanted.
-			// See DispatchIntent for why component count cannot answer this.
+			// See DispatchIntent for why component count cannot answer this, and for what
+			// setting it opts such a push into: ancestry resolution, the repave path, and
+			// a repave failure being fatal — none of which this early return reaches.
 			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
 				map[string]interface{}{
 					"existing_id":     existingSlip.CorrelationID,
@@ -1493,11 +1526,22 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			// Column name is the step name (e.g., "builds_completed"), not the pluralized aggregate
 			if stepConfig.Aggregates != "" {
 				columnName := stepConfig.Name
-				componentData := make([]ComponentStepData, len(opts.Components))
-				for j, def := range opts.Components {
-					componentData[j] = ComponentStepData{
-						Component: def.Name,
-						Status:    StepStatusPending,
+				// A push that dispatches nothing tracks no components, even when the
+				// caller supplied some. Seeding pending rows nobody will ever advance
+				// would leave the aggregate pending forever — computeAggregateStatus
+				// resolves an EMPTY aggregate to completed (a vacuous all-completed) but
+				// an all-pending one stays pending. The slip would then stay IsLive(), so
+				// every later same-commit push takes handlePushRetry instead of repaving:
+				// the same unretriggerable hole DispatchIntent exists to close, reached
+				// through a different door.
+				var componentData []ComponentStepData
+				if !opts.dispatchesNothing() {
+					componentData = make([]ComponentStepData, len(opts.Components))
+					for j, def := range opts.Components {
+						componentData[j] = ComponentStepData{
+							Component: def.Name,
+							Status:    StepStatusPending,
+						}
 					}
 				}
 				aggregates[columnName] = componentData
