@@ -471,7 +471,10 @@ const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','
 //     knowable (unlike under the old two-call sequence) precisely because step 4 already
 //     inserted the successor in this same transaction.
 //  6. Insert the successor's own parent link: the caller's, or the one carried forward at
-//     step 2.
+//     step 2. This one statement runs inside a SAVEPOINT and is best-effort — a failure
+//     rolls back only the link and lets the replacement commit, because failing the whole
+//     repave over a lineage hop would permanently block CI for the commit. See
+//     insertAncestryLinkBestEffort.
 //
 // Steps 2, 3 and 5 are reached only when step 1 reported RowsAffected() > 0 — i.e. only
 // when this call itself removed the row. A repave whose superseded row was already gone
@@ -535,13 +538,82 @@ func (s *PostgresStore) Repave(
 			}
 		}
 
+		if removedOld {
+			// Record on the successor that it replaced a predecessor. Without this the
+			// successor row carries no evidence a prior run ever existed for this commit:
+			// the old row and its children are gone, and the only other link
+			// (supersededBy) lives in spans and log lines, not on any row. One history
+			// entry inside this same transaction makes the replacement visible to anyone
+			// reading the slip later, and costs one UPDATE on a row already locked here.
+			//
+			// This is NOT the history-preservation decision (DEVOPS-277) — the prior run's
+			// own state history is still destroyed. It only records that it happened.
+			if err := appendHistoryTx(ctx, tx, newSlip.CorrelationID, StateHistoryEntry{
+				Step:      "push_parsed",
+				Status:    StepStatusRunning,
+				Timestamp: time.Now(),
+				Actor:     "slippy",
+				Message: fmt.Sprintf("repaved %s for commit %s", oldCorrelationID,
+					shortSHA(newSlip.CommitSHA)),
+			}); err != nil {
+				return fmt.Errorf("repave %s: recording predecessor on successor: %w",
+					oldCorrelationID, err)
+			}
+		}
+
 		if link != nil {
-			if err := insertAncestryLinkTx(ctx, tx, newSlip, *link); err != nil {
+			if err := s.insertAncestryLinkBestEffort(ctx, tx, newSlip, *link); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+}
+
+// insertAncestryLinkBestEffort writes the successor's parent link inside a SAVEPOINT, so a
+// failure to write it rolls back only that statement and lets the replacement itself
+// commit. It returns an error only when the savepoint machinery itself fails.
+//
+// Why the link is not allowed to veto the replacement: it is the least important write in
+// the transaction, and failing it here would permanently block CI for the commit. The
+// failure is not transient — every redelivery meets the same superseded row and the same
+// failing insert — while slip_ancestry's only reader (Client.ResolveAncestry) has no
+// non-test caller in this repo today. Blocking a pipeline on a lineage hop nothing reads is
+// the wrong trade, and it would also make the repave path stricter than the fresh-create
+// path, where writeAncestryLink already treats the identical failure as a warning.
+//
+// The delete/create atomicity that motivates Repave is untouched: the savepoint scopes the
+// relaxation to this one statement.
+func (s *PostgresStore) insertAncestryLinkBestEffort(
+	ctx context.Context,
+	tx pgx.Tx,
+	slip *Slip,
+	parent AncestryEntry,
+) error {
+	sp, spErr := tx.Begin(ctx)
+	if spErr != nil {
+		return fmt.Errorf("repave %s: open ancestry-link savepoint: %w", slip.CorrelationID, spErr)
+	}
+
+	if linkErr := insertAncestryLinkTx(ctx, sp, slip, parent); linkErr != nil {
+		if rbErr := sp.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			return fmt.Errorf("repave %s: roll back ancestry-link savepoint: %w",
+				slip.CorrelationID, rbErr)
+		}
+		s.logger.Warn(ctx, "Repave committed without the successor's ancestry link",
+			map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"parent_id":      parent.CorrelationID,
+				"error":          linkErr.Error(),
+			})
+		return nil
+	}
+
+	if commitErr := sp.Commit(ctx); commitErr != nil {
+		return fmt.Errorf("repave %s: release ancestry-link savepoint: %w",
+			slip.CorrelationID, commitErr)
+	}
+	return nil
 }
 
 // removeSupersededSlipTx runs Repave's guarded delete of the superseded row and reports

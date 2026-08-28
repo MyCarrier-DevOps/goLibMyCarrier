@@ -4,6 +4,7 @@ package slippy
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -192,6 +193,98 @@ func TestPostgresStore_Repave_ReplacesRowAndChildren_Integration(t *testing.T) {
 		successor.CorrelationID).Scan(&linkedParent))
 	assert.Equal(t, "corr-fresh-parent", linkedParent,
 		"the caller-supplied parent link must be written for the successor")
+}
+
+// TestPostgresStore_Repave_RecordsPredecessorOnSuccessor_Integration pins the audit entry.
+// After a repave the superseded row and its children are gone, so without this the
+// successor carries no evidence a prior run for this commit ever existed — the only other
+// link is a span attribute and a log line, neither of which is on any row.
+func TestPostgresStore_Repave_RecordsPredecessorOnSuccessor_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	old := &Slip{
+		CorrelationID: "corr-audit-old",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-audit",
+		Status:        SlipStatusFailed,
+	}
+	require.NoError(t, store.Create(ctx, old))
+
+	successor := &Slip{
+		CorrelationID: "corr-audit-new",
+		Repository:    old.Repository,
+		Branch:        old.Branch,
+		CommitSHA:     old.CommitSHA,
+		Status:        SlipStatusPending,
+		StateHistory:  []StateHistoryEntry{},
+	}
+	require.NoError(t, store.Repave(ctx, old.CorrelationID, successor, nil))
+
+	got, err := store.Load(ctx, successor.CorrelationID)
+	require.NoError(t, err)
+
+	var found bool
+	for _, e := range got.StateHistory {
+		if strings.Contains(e.Message, old.CorrelationID) {
+			found = true
+		}
+	}
+	assert.True(t, found,
+		"the successor's history must name the run it replaced, got %+v", got.StateHistory)
+}
+
+// TestPostgresStore_Repave_LinkFailureDoesNotVetoReplacement_Integration pins the SAVEPOINT
+// against real Postgres: a link write that violates a constraint must roll back only itself,
+// leaving the replacement committed. Without the savepoint the failed statement aborts the
+// whole transaction, and Postgres refuses every subsequent statement in it.
+//
+// The failure is induced with an over-long parent_status: slip_ancestry.parent_status is the
+// slip_status enum, so a value outside it is rejected by the type itself.
+func TestPostgresStore_Repave_LinkFailureDoesNotVetoReplacement_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	old := &Slip{
+		CorrelationID: "corr-sp-old",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-savepoint",
+		Status:        SlipStatusFailed,
+	}
+	require.NoError(t, store.Create(ctx, old))
+
+	successor := &Slip{
+		CorrelationID: "corr-sp-new",
+		Repository:    old.Repository,
+		Branch:        old.Branch,
+		CommitSHA:     old.CommitSHA,
+		Status:        SlipStatusPending,
+	}
+	// parent_status is the slip_status enum; "not-a-status" cannot be cast to it.
+	badParent := &AncestryEntry{
+		CorrelationID: "corr-sp-parent",
+		CommitSHA:     "sha-sp-parent",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		Status:        SlipStatus("not-a-status"),
+		CreatedAt:     time.Now(),
+	}
+
+	require.NoError(t, store.Repave(ctx, old.CorrelationID, successor, badParent),
+		"a failing link write must not fail the repave")
+
+	_, oldErr := store.Load(ctx, old.CorrelationID)
+	assert.ErrorIs(t, oldErr, ErrSlipNotFound, "the replacement must still have committed")
+	_, newErr := store.Load(ctx, successor.CorrelationID)
+	require.NoError(t, newErr, "the successor must exist despite the link failure")
+
+	var links int
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT count(*) FROM slip_ancestry WHERE correlation_id = $1",
+		successor.CorrelationID).Scan(&links))
+	assert.Zero(t, links, "only the link itself should have been rolled back")
 }
 
 // TestPostgresStore_Repave_CarriesForwardParentLink_Integration pins the TR-4 fix: when

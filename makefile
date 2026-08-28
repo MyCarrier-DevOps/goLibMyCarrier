@@ -187,7 +187,12 @@ install-mutest:
 		*) go install github.com/fchimpan/mutest@$(MUTEST_VERSION) ;; \
 	esac
 
-# Mutation-test only the lines changed vs MUTATION_BASE — the pre-merge gate.
+# Mutation-test only the lines changed vs MUTATION_BASE.
+#
+# Run this locally before opening a PR: no workflow in .github/ invokes it, so it is a
+# convention rather than an enforced gate. Wiring it into CI was considered and declined
+# for now — mutation runs are slow and the 100% threshold would block on pre-existing
+# survivors the moment it ran unscoped.
 # Surviving mutants mean an assertion is missing; add tests rather than lowering
 # MUTATION_THRESHOLD. Scope to one module with PKG=<module>.
 .PHONY: mutation

@@ -317,6 +317,15 @@ func repaveSuccessor() *Slip {
 	}
 }
 
+// expectRepavePredecessorHistory expects the state-history entry Repave records on the
+// successor naming the run it replaced. Only issued when the repave actually removed a
+// predecessor.
+func expectRepavePredecessorHistory(mock pgxmock.PgxPoolIface) *pgxmock.ExpectedExec {
+	return mock.ExpectExec(`UPDATE routing_slips SET`).
+		WithArgs(pgxmock.AnyArg(), "new-id").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+}
+
 // expectRepaveSuccessorInsert expects the successor's routing_slips upsert.
 func expectRepaveSuccessorInsert(store *PostgresStore, mock pgxmock.PgxPoolIface) *pgxmock.ExpectedExec {
 	return mock.ExpectExec(`INSERT INTO routing_slips .* ON CONFLICT \(correlation_id\) DO UPDATE SET`).
@@ -351,9 +360,14 @@ func TestPostgresStore_Repave_EndedSlip_OrdersStatementsForAtomicReplacement(t *
 		`parent_status = \$3, parent_failed_step = '' WHERE parent_correlation_id = \$4`).
 		WithArgs("new-id", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
+	expectRepavePredecessorHistory(mock)
+	// The link write is wrapped in a SAVEPOINT (nested Begin/Commit) so that it alone can
+	// fail without vetoing the replacement — see insertAncestryLinkBestEffort.
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO slip_ancestry`).
 		WithArgs(anyArgs(10)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
 	mock.ExpectCommit()
 
 	parent := &AncestryEntry{CorrelationID: "parent-id", CommitSHA: "sha-parent", Status: SlipStatusCompleted}
@@ -388,6 +402,7 @@ func TestPostgresStore_Repave_RepointRewritesFullParentSnapshot(t *testing.T) {
 		`parent_status = \$3, parent_failed_step = '' WHERE parent_correlation_id = \$4`).
 		WithArgs("new-id", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	expectRepavePredecessorHistory(mock)
 	mock.ExpectCommit()
 
 	require.NoError(t, store.Repave(context.Background(), "old-id", repaveSuccessor(), nil))
@@ -422,12 +437,16 @@ func TestPostgresStore_Repave_CarriesForwardParentLinkWhenCallerHasNone(t *testi
 	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
 		WithArgs("new-id", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	expectRepavePredecessorHistory(mock)
 	// The carried link is re-inserted for the successor: same parent id and SHA, but keyed
-	// on the successor's own (repository, branch, correlation_id).
+	// on the successor's own (repository, branch, correlation_id). Wrapped in the
+	// best-effort SAVEPOINT (nested Begin/Commit) like every link write.
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO slip_ancestry`).
 		WithArgs("owner/repo", "release", "new-id",
 			"carried-parent", "sha-carried", "completed", "", "owner/repo", "main", created).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
 	mock.ExpectCommit()
 
 	require.NoError(t, store.Repave(context.Background(), "old-id", repaveSuccessor(), nil))
@@ -494,11 +513,16 @@ func TestPostgresStore_Repave_SuccessorDuplicateMapsToSentinel(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestPostgresStore_Repave_RollsBackWhenLinkInsertFails pins the deliberate strictness of the
-// repave path: unlike the fresh-create path (where a link failure is only a warning), a link
-// failure inside a repave rolls the whole replacement back. Leaving a successor with a
-// permanently missing parent hop is worse than failing the push and letting Kafka redeliver.
-func TestPostgresStore_Repave_RollsBackWhenLinkInsertFails(t *testing.T) {
+// TestPostgresStore_Repave_LinkFailureDoesNotVetoTheReplacement pins the SAVEPOINT around
+// the successor's ancestry-link write. The link is the least important statement in the
+// transaction, and letting it fail the whole repave would permanently block CI for that
+// commit — not transiently, since every redelivery meets the same superseded row and the
+// same failing insert, while slip_ancestry has no non-test reader in this repo.
+//
+// So: the link rolls back to the savepoint, and the replacement still commits. That keeps
+// the delete/create atomicity Repave exists for while matching the fresh-create path, which
+// already treats an identical failure as a warning.
+func TestPostgresStore_Repave_LinkFailureDoesNotVetoTheReplacement(t *testing.T) {
 	store, mock := newMockStore(t)
 
 	mock.ExpectBegin()
@@ -515,15 +539,52 @@ func TestPostgresStore_Repave_RollsBackWhenLinkInsertFails(t *testing.T) {
 	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
 		WithArgs("new-id", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	expectRepavePredecessorHistory(mock)
+	// SAVEPOINT, failing link insert, ROLLBACK TO SAVEPOINT — then the outer transaction
+	// still commits, which is the whole point of this test.
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO slip_ancestry`).
 		WithArgs(anyArgs(10)...).
 		WillReturnError(errors.New("ancestry table unavailable"))
 	mock.ExpectRollback()
+	mock.ExpectCommit()
 
 	parent := &AncestryEntry{CorrelationID: "parent-id", CommitSHA: "sha-parent", Status: SlipStatusCompleted}
 	err := store.Repave(context.Background(), "old-id", repaveSuccessor(), parent)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "ancestry table unavailable")
+	require.NoError(t, err, "a link failure must not fail the repave")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_Repave_LinkSavepointReleasedOnSuccess pins the happy half of the
+// savepoint: when the link write succeeds the savepoint is released rather than left open,
+// so the link is actually part of the committed transaction.
+func TestPostgresStore_Repave_LinkSavepointReleasedOnSuccess(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectBegin()
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec("DELETE FROM slip_component_states").
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
+		WithArgs("new-id", "release", "pending", "old-id").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	expectRepavePredecessorHistory(mock)
+	mock.ExpectBegin()
+	mock.ExpectExec(`INSERT INTO slip_ancestry`).
+		WithArgs(anyArgs(10)...).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+	mock.ExpectCommit()
+
+	parent := &AncestryEntry{CorrelationID: "parent-id", CommitSHA: "sha-parent", Status: SlipStatusCompleted}
+	require.NoError(t, store.Repave(context.Background(), "old-id", repaveSuccessor(), parent))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -720,6 +781,7 @@ func TestPostgresStore_Repave_StatusGuard_CoversEndedStatuses(t *testing.T) {
 	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
 		WithArgs("new-id", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	expectRepavePredecessorHistory(mock)
 	mock.ExpectCommit()
 
 	require.NoError(t, store.Repave(context.Background(), "old-id", repaveSuccessor(), nil))

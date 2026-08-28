@@ -166,9 +166,6 @@ func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commit
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
-// slipColumns returns the ordered routing_slips column list: core columns, then each
-// step's status column, then each aggregate step's jsonb column. The order is shared by
-// SELECT, INSERT, and the scan destinations so they never drift.
 // createTx is Create against an open transaction. Repave uses it so the superseded row's
 // removal and the successor's insert commit or roll back together; both paths go through
 // buildCreateQuery/mapCreateError so a transactional create writes an identical row and
@@ -219,6 +216,9 @@ func mapCreateError(correlationID string, err error) error {
 	return fmt.Errorf("failed to create slip %s: %w", correlationID, err)
 }
 
+// slipColumns returns the ordered routing_slips column list: core columns, then each
+// step's status column, then each aggregate step's jsonb column. The order is shared by
+// SELECT, INSERT, and the scan destinations so they never drift.
 func (s *PostgresStore) slipColumns() []string {
 	cols := []string{
 		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,

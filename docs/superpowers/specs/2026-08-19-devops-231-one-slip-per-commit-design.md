@@ -3,12 +3,27 @@
 > **⚠️ SUPERSEDED IN PART — review of PR #82 (goLibMyCarrier, DEVOPS-231) changed
 > several decisions this spec records as "approved." This document is kept as a
 > historical record of what was designed and approved at the time, NOT re-edited to
-> match what shipped. Concretely: §6.1's one-arg unguarded `DeleteSlip(ctx,
-> correlationID)` shipped instead as `DeleteSlip(ctx, correlationID,
-> successorCorrelationID)`, gained an ended-status guard (returns `ErrSlipWentLive` if
-> the slip is no longer ended), and repoints descendant `slip_ancestry` links to the
-> successor transactionally instead of leaving them dangling. §7's "accept dangling
-> `parent_correlation_id`, no repointing" stance was replaced by that repointing. §6.4's
+> match what shipped.
+>
+> **`DeleteSlip` does not exist at all.** It was replaced, before release, by
+> `Repave(ctx, oldCorrelationID string, newSlip *Slip, parent *AncestryEntry) error`,
+> which performs the guarded removal, the child cleanup, the successor's insert, the
+> descendant repoint and the successor's ancestry link as ONE transaction. Every
+> `DeleteSlip` signature, sentinel and cross-reference below is historical — including
+> `ErrDeleteSlipUnsupported`, now `ErrRepaveUnsupported`. Four specific claims in this
+> document are false at head and are NOT corrected in place: §6.1's signature, §6.5's
+> "remains non-transactional as designed here", §6.5's no-successor mode (`Repave`
+> rejects a nil successor), and §7's "the table is write-only in production / dangling
+> `parent_correlation_id` is accepted; no repointing" (`Repave` reads that column on
+> every repave and repoints it). Treat `slippy/interfaces.go`,
+> `slippy/postgres_store_updates.go` and `slippy/push.go` as the source of truth.
+>
+> Concretely, the earlier round of changes: §6.1's one-arg unguarded `DeleteSlip(ctx,
+> correlationID)` gained a successor argument and an ended-status guard (returns
+> `ErrSlipWentLive` if the slip is no longer ended), and repoints descendant
+> `slip_ancestry` links to the successor transactionally instead of leaving them
+> dangling. §7's "accept dangling `parent_correlation_id`, no repointing" stance was
+> replaced by that repointing. §6.4's
 > instruction to drop the `ORDER BY updated_at DESC` tiebreak from `LoadByCommit`/
 > `LoadLiveByCommit` was reverted — it is retained (see inline notes below). Treat
 > `slippy/interfaces.go`, `slippy/postgres_store_updates.go`, and
@@ -67,15 +82,20 @@ with the new run's `correlation_id`.
 ## 3. Schema changes (goLibMyCarrier migration, Postgres)
 
 > **⚠️ Phase B implementation note (PR #82 review):** the "no cascade on
-> `slip_ancestry.parent_correlation_id`" call below still stands, but for a reason
-> beyond what was known when this was written. Shipped `DeleteSlip`
-> (`slippy/postgres_store_updates.go`) repoints descendant `slip_ancestry` rows'
-> `parent_correlation_id` to `successorCorrelationID` *before* the successor's
-> `routing_slips` row exists — `Create` is a separate, later call (§6.5). An FK from
-> `slip_ancestry.parent_correlation_id` to `routing_slips(correlation_id)` would reject
-> that repoint (the referenced row isn't there yet) and break every repave with a
-> descendant. If this column ever gains a real FK, the repoint-then-create ordering
-> must change first (e.g. defer the FK check, or create-then-repoint-then-delete).
+> **REVERSED — the "no FK on `slip_ancestry.parent_correlation_id`" reasoning below is
+> obsolete.** This banner previously said an FK there was impossible because the repoint
+> ran *before* the successor's row existed. `Repave` inverts that ordering: it inserts the
+> successor (`createTx`) and only then repoints descendants onto it, in one transaction —
+> so the referenced row always exists at repoint time and such an FK is now structurally
+> **viable**. Phase B still does not add one, deliberately and for a different reason:
+> deleting a parent run must not cascade away a child's lineage row. Phase B's two FKs are
+> both on `correlation_id` (the owning run). Anyone revisiting this should evaluate the FK
+> on its merits, not decline it on the ordering argument, which no longer applies.
+>
+> One caveat if that FK is ever added: `Repave`'s repoint would satisfy it, but the
+> child-side link write on the fresh-create path would not — `writeAncestryLink` runs as a
+> bare `pool.Exec` after its own `Create`, so a concurrent repave committing in that window
+> would turn the insert into a `23503` that the push path only warn-logs.
 
 New versioned migration in `slippy/postgres_migrations.go` (current latest: v4 — the
 new work is the next version; confirm the number at implementation time). Order within

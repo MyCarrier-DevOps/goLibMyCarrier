@@ -134,18 +134,23 @@ type CreateSlipResult struct {
 	//     (whether or not ancestors were found — a first commit has no ancestors, but
 	//     AncestryResolved=true because the resolution attempt itself succeeded); or
 	//   - the result is a dedup onto an already-loaded slip where NO resolution was ever
-	//     attempted before the dedup: the in-flight IsLive() reuse path, the empty-run
-	//     guard, and the duplicate-create backstop's dedup paths all set this true
-	//     unconditionally, since there is nothing to resolve for a slip that was not
-	//     freshly created — "no resolution was needed" also counts as resolved.
+	//     attempted before the dedup: the in-flight IsLive() reuse path and the empty-run
+	//     guard both set this true unconditionally, since there is nothing to resolve for
+	//     a slip that was not freshly created — "no resolution was needed" also counts as
+	//     resolved. Both return before resolveAndAbandonAncestors runs at all.
+	//   - the duplicate-create backstop deduped onto a CONFLICTING slip — i.e. it returns
+	//     someone else's run as result.Slip (the live-conflicting and empty-run-guard
+	//     branches). Resolution did run for this push before the backstop was reached, but
+	//     the returned slip is not the one it resolved for, so the "nothing to resolve for
+	//     a pre-existing slip" reading applies to what the caller actually receives.
 	// False means a fresh slip WAS created but ancestry resolution failed for it (e.g.
 	// GitHub API error, missing installation).
 	//
-	// The went-live repave-abort path (repaveExistingSlip's ErrSlipWentLive branch) is
-	// deliberately NOT in the "nothing attempted" bucket above (DEVOPS-231 review D3.2):
-	// resolveAndAbandonAncestors always runs before the repave delete is attempted, so by
-	// the time a went-live abort is detected this field already holds the value that
-	// attempt computed. That path preserves the existing value rather than forcing it
+	// The two went-live abort paths — repaveExistingSlip's and the duplicate-create
+	// backstop's — are deliberately NOT in the "nothing attempted" bucket above
+	// (DEVOPS-231 review D3.2): resolveAndAbandonAncestors always runs before either is
+	// reached, so by the time a went-live abort is detected this field already holds the
+	// value that attempt computed. Both preserve the existing value rather than forcing it
 	// true — forcing true would clobber a legitimate false (resolution ran and failed,
 	// with the failure recorded in Warnings) with a value that contradicts Warnings'
 	// contents and could misfire alerting keyed on this field.
@@ -177,8 +182,9 @@ type CreateSlipResult struct {
 //     a step re-run, so a new push for the same commit (webhook re-delivery or a
 //     same-commit re-push) is treated as a deliberate request to run CI again.
 //   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
-//     stale and a fresh slip is created with the new correlation ID from opts. This
-//     prevents resurrecting superseded slips on webhook re-delivery or bot-commit races.
+//     stale and repaved on the same terms as the failed case above — replaced, in one
+//     transaction, by a fresh slip under the new correlation ID from opts. This prevents
+//     resurrecting superseded slips on webhook re-delivery or bot-commit races.
 //   - Existing slip is failed/terminal AND opts.Components is empty: the empty-run guard
 //     short-circuits the repave above and returns the existing (ended) slip as a dedup,
 //     since nothing would be dispatched and repaving would only destroy history for no
@@ -412,9 +418,12 @@ func (c *Client) persistSlipForPush(
 // row to repave: a first push for this commit, or a store that cannot repave at all.
 //
 // A link failure here is a warning rather than a push failure — the slip exists and CI can
-// run; only the lineage hop is missing. The repave path deliberately does NOT share that
-// leniency: there the link is written inside the transaction, so a link failure rolls the
-// whole replacement back rather than leaving a successor with a missing parent forever.
+// run; only the lineage hop is missing. The repave path reaches the same outcome by a
+// different mechanism: there the link is written inside the repave transaction, but under a
+// SAVEPOINT, so a link failure rolls back only that statement and the replacement still
+// commits (see PostgresStore.insertAncestryLinkBestEffort). The one asymmetry left is where
+// the failure surfaces — this path records a result.Warning the caller can inspect, while
+// the repave path can only log, since SlipStore.Repave returns a bare error.
 func (c *Client) createFreshSlip(
 	ctx context.Context,
 	opts PushOptions,
@@ -616,8 +625,15 @@ func (c *Client) repaveExistingSlip(
 
 	default:
 		// Fatal — see this function's doc comment for why this is no longer a warning.
-		// Nothing was written, so there is no successor to fall through to; failing the
+		// The STORE wrote nothing, so there is no successor to fall through to; failing the
 		// push lets Kafka redeliver against a store that still holds the superseded row.
+		//
+		// "Nothing was written" is true of the repave, NOT of the push: by this point
+		// resolveAndAbandonAncestors has already committed AbandonSlip/PromoteSlip status
+		// flips on ancestor slips, on behalf of a successor that now will not exist. Those
+		// flips are persisted and are not undone by redelivery — the same carve-out the
+		// went-live branch above documents. A redelivery re-creates the successor but never
+		// un-abandons the ancestor.
 		return false, fmt.Errorf("failed to repave slip %s: %w", existingSlip.CorrelationID, repaveErr)
 	}
 }
@@ -794,7 +810,13 @@ func (c *Client) handleDuplicateSlipBackstop(
 			)
 		}
 		result.Slip = live
-		result.AncestryResolved = true
+		// Do NOT force AncestryResolved = true here (D3.2), for the same reason
+		// repaveExistingSlip's went-live branch does not: resolveAndAbandonAncestors
+		// already ran for this push — this function is only ever reached through
+		// persistSlipForPush, which runs after it — and set the accurate outcome.
+		// Forcing true would clobber a legitimate false whose failure is already
+		// recorded in result.Warnings, producing AncestryResolved=true sitting next to
+		// an ancestry error during a GitHub outage.
 		return true, nil
 
 	case errors.Is(repaveErr, ErrRepaveUnsupported):
