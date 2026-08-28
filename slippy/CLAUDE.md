@@ -77,19 +77,6 @@ That leniency only made sense while delete and create were separate calls; a fai
 `Repave` writes nothing, so there is no successor to report. The push fails, Kafka
 redelivers, and the redelivery converges because the superseded row is still there.
 
-**DEVOPS-264 added `PushOptions.Dispatch` (`DispatchIntent`).** This one is *not* breaking:
-the zero value, `DispatchIntentUnspecified`, preserves the previous behavior exactly, so an
-un-updated caller is unaffected. Setting it is how a caller fixes the tests-only retrigger
-hole — the empty-run guard used to infer "this push dispatches nothing" from
-`len(Components) == 0`, which is wrong for a repo running unit tests without builds
-(`buildable=false` + `RunUnitTests=true`), because pushhookparser nils out components
-whenever builds are skipped while still dispatching unit tests. The guard then returned the
-old slip, the caller read `returned != sent` as a duplicate, and suppressed everything
-including the unit tests it wanted to re-run. Set `DispatchIntentSomething` when work will
-dispatch, `DispatchIntentNothing` when it will not; see `DispatchIntent` for why component
-count cannot answer this. The fix is only live once slippy-api and pushhookparser also pass
-it through.
-
 Callers may also now observe two sentinel errors from this path: `ErrSlipWentLive` (the
 repave was rejected because the slip went live between the repave decision and the call —
 nothing was written, and the successor was NOT created) and `ErrRepaveUnsupported` (the
@@ -105,6 +92,22 @@ workspace imports `slippytest` today, so nothing is known to break — but the f
 exported, and any caller that seeded `store.CommitIndex[...]` alongside `AddSlip` fails to
 compile after this bump. The fix is to delete the line: seeding the slip is sufficient, and
 always was.
+
+
+### Not breaking: `PushOptions.Dispatch` (DEVOPS-264)
+
+**DEVOPS-264 added `PushOptions.Dispatch` (`DispatchIntent`).** This one is *not* breaking:
+the zero value, `DispatchIntentUnspecified`, preserves the previous behavior exactly, so an
+un-updated caller is unaffected. Setting it is how a caller fixes the tests-only retrigger
+hole — the empty-run guard used to infer "this push dispatches nothing" from
+`len(Components) == 0`, which is wrong for a repo running unit tests without builds
+(`buildable=false` + `RunUnitTests=true`), because pushhookparser nils out components
+whenever builds are skipped while still dispatching unit tests. The guard then returned the
+old slip, the caller read `returned != sent` as a duplicate, and suppressed everything
+including the unit tests it wanted to re-run. Set `DispatchIntentSomething` when work will
+dispatch, `DispatchIntentNothing` when it will not; see `DispatchIntent` for why component
+count cannot answer this. The fix is only live once slippy-api and pushhookparser also pass
+it through.
 
 ---
 
@@ -309,6 +312,9 @@ slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
         {Name: "api", DockerfilePath: "src/MC.Api"},
         {Name: "worker", DockerfilePath: "src/MC.Worker"},
     },
+    // Optional; unset keeps the legacy len(Components) inference. Set it when
+    // component count would be misleading — see slippy.DispatchIntent.
+    Dispatch: slippy.DispatchIntentSomething, // or DispatchIntentNothing
 })
 ```
 
