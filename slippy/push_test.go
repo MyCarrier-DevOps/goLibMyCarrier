@@ -731,6 +731,12 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		// components (AllowSlipWithNoBuilds repos). Nothing would be dispatched, so
 		// repaving would only destroy the real run's history. Return the existing
 		// ended slip as a dedup instead (caller sees returned != sent → suppress).
+		//
+		// This also pins the back-compat property the rollout depends on: Dispatch is
+		// left at its zero value here, so it doubles as the DispatchIntentUnspecified
+		// case. goLib releases before slippy-api and pushhookparser adopt the field, and
+		// a caller that sets nothing must behave exactly as it does today. The predicate
+		// itself is covered directly by TestPushOptions_dispatchesNothing.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
@@ -776,24 +782,23 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	// The four subtests below pin the empty-run guard's decision across both the
-	// pre-adoption and post-adoption worlds, because the guard changes hands twice.
+	// TestClient_CreateSlipForPush's dispatch-intent subtests pin the fix for the
+	// tests-only-repo retrigger hole (DEVOPS-264): the empty-run guard used to infer "this
+	// push dispatches nothing" from len(Components) == 0, which is wrong for a repo that
+	// runs unit tests without builds, so a failed run there could not be retriggered by
+	// re-pushing the commit.
 	//
-	// DEVOPS-231 introduced the guard inferring "this push dispatches nothing" from
-	// len(Components) == 0. That inference is wrong for a repo with buildable=false +
-	// RunUnitTests=true: pushhookparser nils out components whenever builds are skipped
-	// (pushparser.go, `if !shouldBuild { slipComponents = nil }`) while still dispatching the
-	// unit-tester event, so the guard fires on a push that DOES dispatch work. Five
-	// MyCarrier-Engineering repos carry that combination (buildable=false + RunUnitTests=true
-	// + AllowSlipWithNoBuilds=true).
+	// The mechanism, the affected repo set, and the quoted pushhookparser line all live in
+	// one place — DispatchIntent's godoc in push.go. They are facts about ANOTHER
+	// repository's config and source, so nothing here can observe them going stale;
+	// duplicating them would just rot in two places at once.
 	//
-	// Two things fix it, and both are needed. DEVOPS-264 (this PR) makes intent explicit, so
-	// a caller that dispatches work without build components can say so — but that only helps
-	// once slippy-api AND pushhookparser forward the field. Until then, every real push from
-	// those repos still arrives with Dispatch unset, which is why DEVOPS-231 also excludes
-	// `failed` from the guard outright: that keeps the pre-adoption path behaving exactly as
-	// it did before the guard existed, rather than leaving those repos unable to retrigger a
-	// failed unit-test run for the length of a three-repo rollout.
+	// One fact that IS local and does belong here: DEVOPS-231's guard also excludes `failed`
+	// outright, independently of intent. That is what covers the rollout window, during which
+	// every real push from those repos still arrives with Dispatch unset. The two terms are
+	// complementary — intent covers every status once adopted, the carve-out covers `failed`
+	// regardless of adoption — so both are exercised below.
+
 	t.Run("failed slip + no components, dispatch unset - retriggers via the failed carve-out",
 		func(t *testing.T) {
 			// The PRE-adoption shape: a real tests-only-repo push during the rollout window.
@@ -964,46 +969,6 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 				t.Errorf("aggregate %q resolves to %q; a no-dispatch push must leave it vacuously completed",
 					name, got)
 			}
-		}
-	})
-
-	t.Run("unspecified dispatch intent keeps the legacy component inference", func(t *testing.T) {
-		// Back-compat is load-bearing for the rollout: goLib releases BEFORE slippy-api and
-		// pushhookparser adopt the field, so a caller that sets nothing must behave exactly
-		// as it does today (zero components => guard fires) for the statuses the carve-out
-		// does not claim. Without this, the release window would silently change behavior
-		// for every existing caller.
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
-
-		store.AddSlip(&Slip{
-			CorrelationID: "corr-legacy-run",
-			Repository:    "owner/repo",
-			Branch:        "integration",
-			CommitSHA:     "sha-legacy",
-			Status:        SlipStatusCompleted,
-			Steps:         map[string]Step{},
-			StateHistory:  []StateHistoryEntry{},
-		})
-
-		result, err := client.CreateSlipForPush(ctx, PushOptions{
-			CorrelationID: "corr-legacy-push",
-			Repository:    "owner/repo",
-			Branch:        "integration",
-			CommitSHA:     "sha-legacy",
-			Components:    nil,
-			// Dispatch deliberately left at its zero value.
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.Slip.CorrelationID != "corr-legacy-run" {
-			t.Errorf("unspecified intent must fall back to the component inference, got %q",
-				result.Slip.CorrelationID)
-		}
-		if len(store.RepaveCalls) != 0 {
-			t.Errorf("guard must not repave under legacy inference, got %v", store.RepaveCalls)
 		}
 	})
 
