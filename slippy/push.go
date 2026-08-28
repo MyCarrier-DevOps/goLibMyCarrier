@@ -125,6 +125,17 @@ type PushOptions struct {
 // Component count is not recoverable as a signal here, because the same "zero components"
 // value legitimately means BOTH "branch create at an existing SHA, nothing to do" and
 // "tests-only repo, unit tests are about to run". Only the caller knows which.
+//
+// The two point-in-time facts behind that, recorded here and deliberately nowhere else in
+// this repo — they describe another repository's source and config, so nothing here can
+// notice them going stale:
+//   - the pushhookparser line is `if !shouldBuild { slipComponents = nil }`, in
+//     pkg/parser/pushparser.go, which runs even when shouldRunUnitTests is true;
+//   - as of 2026-08-28, five MyCarrier-Engineering repos carry the triggering combination
+//     (buildable=false + RunUnitTests=true + AllowSlipWithNoBuilds=true). The third
+//     property is required: shouldCreateSlip is `shouldBuild || allowSlipWithNoBuilds` and
+//     does not include shouldRunUnitTests, so without it no slip is created at all.
+//
 // It is a string type with a String() method, matching every other enum-like type in this
 // package (SlipStatus, StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). That is
 // not only convention: the two log fields this adds are rendered by zap, which matches
@@ -187,8 +198,10 @@ func (o PushOptions) Validate() error {
 
 // dispatchesNothing reports whether this push will dispatch no CI work at all, in which
 // case repaving an ended slip for the same commit would destroy that run's history for zero
-// benefit. An explicit Dispatch always wins; only DispatchIntentUnspecified falls back to
-// the legacy component-count inference.
+// benefit. A RECOGNIZED explicit Dispatch wins; DispatchIntentUnspecified and any
+// unrecognized value both fall back to the legacy component-count inference — a caller
+// therefore does not need to pre-validate its enum value to get safe behavior, but it does
+// need to send a recognized one to get intent honored.
 //
 // Both empty-run guards (CreateSlipForPush's and handleDuplicateSlipBackstop's mirror of it)
 // route through this one method, so the two cannot drift — they are documented as converging

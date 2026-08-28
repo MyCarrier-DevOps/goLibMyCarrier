@@ -63,6 +63,15 @@ That leniency only made sense while delete and create were separate calls; a fai
 `Repave` writes nothing, so there is no successor to report. The push fails, Kafka
 redelivers, and the redelivery converges because the superseded row is still there.
 
+Callers may also now observe two sentinel errors from this path: `ErrSlipWentLive` (the
+repave was rejected because the slip went live between the repave decision and the call —
+nothing was written, and the successor was NOT created) and `ErrRepaveUnsupported` (the
+store, e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
+abandon semantics, then create the successor separately). `Repave` can also return
+`ErrDuplicateSlip` once Phase B's unique index exists. See `errors.go` for full contracts.
+
+### Not breaking: `PushOptions.Dispatch` (DEVOPS-264)
+
 **DEVOPS-264 added `PushOptions.Dispatch` (`DispatchIntent`).** This one is *not* breaking:
 the zero value, `DispatchIntentUnspecified`, preserves the previous behavior exactly, so an
 un-updated caller is unaffected. Setting it is how a caller fixes the tests-only retrigger
@@ -75,13 +84,6 @@ including the unit tests it wanted to re-run. Set `DispatchIntentSomething` when
 dispatch, `DispatchIntentNothing` when it will not; see `DispatchIntent` for why component
 count cannot answer this. The fix is only live once slippy-api and pushhookparser also pass
 it through.
-
-Callers may also now observe two sentinel errors from this path: `ErrSlipWentLive` (the
-repave was rejected because the slip went live between the repave decision and the call —
-nothing was written, and the successor was NOT created) and `ErrRepaveUnsupported` (the
-store, e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
-abandon semantics, then create the successor separately). `Repave` can also return
-`ErrDuplicateSlip` once Phase B's unique index exists. See `errors.go` for full contracts.
 
 ---
 
@@ -285,6 +287,9 @@ slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
         {Name: "api", DockerfilePath: "src/MC.Api"},
         {Name: "worker", DockerfilePath: "src/MC.Worker"},
     },
+    // Optional; unset keeps the legacy len(Components) inference. Set it when
+    // component count would be misleading — see slippy.DispatchIntent.
+    Dispatch: slippy.DispatchIntentSomething, // or DispatchIntentNothing
 })
 ```
 
