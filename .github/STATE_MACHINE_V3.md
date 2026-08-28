@@ -142,11 +142,24 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   report, and failing lets Kafka redeliver against a store that still holds the superseded
   row. A store that cannot repave at all (`ClickHouseStore`) returns `ErrRepaveUnsupported`
   and the push path falls back to pre-DEVOPS-231 abandon-then-create semantics.
-- **Empty-run guard.** If the incoming push carries no components (e.g. branch
-  create/recreate at an existing SHA, or a components-less repo) and the existing slip
+- **Empty-run guard.** If the incoming push will dispatch nothing and the existing slip
   for that SHA is ended, `CreateSlipForPush` returns the existing slip instead of
   repaving — nothing would be dispatched either way, so repaving would only destroy the
   prior run's history for no benefit.
+
+  "Will dispatch nothing" is `PushOptions.Dispatch` (`DispatchIntent`) when the caller
+  states it, falling back to `len(Components) == 0` only when it is
+  `DispatchIntentUnspecified`. Component count is neither necessary nor sufficient on its
+  own: a tests-only repo (`buildable=false` + `RunUnitTests=true`) dispatches unit tests
+  with zero build components, and a caller may declare `DispatchIntentNothing` while
+  carrying components. See "the guard no longer infers intent from component count" below
+  for the failure this fixed, and `DispatchIntent` in `push.go` for what setting it opts a
+  componentless push into.
+
+  A consequence that outlives the rollout: a genuinely zero-work repo correctly sends
+  `DispatchIntentNothing`, the guard correctly fires, and a failed run there still cannot
+  be retriggered by re-pushing the same commit. That is the guard working as designed, not
+  the bug below.
 - **Cross-commit supersede → abandon (unchanged).** A newer commit still `AbandonSlip`s
   an in-flight older commit on the same branch (see above) — different `(repo, sha)`, so
   this is untouched by the repave change; `abandoned` rows still exist, there is just
