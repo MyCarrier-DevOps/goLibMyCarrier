@@ -151,20 +151,36 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   report, and failing lets Kafka redeliver against a store that still holds the superseded
   row. A store that cannot repave at all (`ClickHouseStore`) returns `ErrRepaveUnsupported`
   and the push path falls back to pre-DEVOPS-231 abandon-then-create semantics.
-- **Empty-run guard.** If the incoming push carries no components (e.g. branch
-  create/recreate at an existing SHA, or a components-less repo), the existing slip for
-  that SHA is TERMINAL — **not `failed`**, see below — and the push does **not** carry
-  that row's own `correlation_id`, `CreateSlipForPush` returns the existing slip instead
-  of repaving; nothing would be dispatched either way, so repaving would only destroy the
-  prior run's history for no benefit.
+- **Empty-run guard.** If the incoming push will dispatch nothing, the existing slip for
+  that SHA is ended, and the push does **not** carry that row's own `correlation_id`,
+  `CreateSlipForPush` returns the existing slip instead of repaving — nothing would be
+  dispatched either way, so repaving would only destroy the prior run's history for no
+  benefit.
 
-  Both exclusions are load-bearing and both are easy to miss because "ended" in this
+  "Will dispatch nothing" is `PushOptions.Dispatch` (`DispatchIntent`) when the caller
+  states it, falling back to `len(Components) == 0` only when it is
+  `DispatchIntentUnspecified` or unrecognized. Component count is neither necessary nor
+  sufficient on its own: a tests-only repo (`buildable=false` + `RunUnitTests=true`)
+  dispatches unit tests with zero build components, and a caller may declare
+  `DispatchIntentNothing` while carrying components. See "the guard no longer infers intent
+  from component count" below, and `DispatchIntent` in `push.go`.
+
+  Two exclusions sit alongside that, and both are easy to miss because "ended" in this
   document includes `failed`:
-  - **`failed` is excluded** so a componentless re-push can still retrigger a stuck run
-    (`push.go`, `emptyRunGuardApplies`). See "known sharp edges" below.
-  - **A self-correlation push is excluded** — when the existing row already carries this
-    push's `correlation_id`, returning it would mean `returned == sent`, which the caller
-    protocol reads as "this is your slip, proceed" rather than as a dedup.
+  - **`failed` is excluded from the INFERENCE only.** With `Dispatch` unset or
+    unrecognized, the guard never claims a `failed` slip, so a componentless re-push can
+    still retrigger a stuck run. A **recognized** explicit intent is authoritative in both
+    directions and is consulted *before* this exclusion, so `DispatchIntentNothing` on a
+    `failed` slip DOES dedup — deliberately, since repaving there would destroy the failed
+    run's history and seed a successor with no components that nothing could ever advance.
+  - **A self-correlation push is excluded**, unconditionally. When the existing row already
+    carries this push's `correlation_id`, returning it would mean `returned == sent`, which
+    the caller protocol reads as "this is your slip, proceed" rather than as a dedup.
+
+  A consequence that outlives the rollout: a genuinely zero-work repo correctly sends
+  `DispatchIntentNothing`, the guard correctly fires, and a failed run there still cannot
+  be retriggered by re-pushing the same commit. That is the guard working as designed, not
+  the bug below.
 - **Cross-commit supersede → abandon (unchanged).** A newer commit still `AbandonSlip`s
   an in-flight older commit on the same branch (see above) — different `(repo, sha)`, so
   this is untouched by the repave change; `abandoned` rows still exist, there is just
