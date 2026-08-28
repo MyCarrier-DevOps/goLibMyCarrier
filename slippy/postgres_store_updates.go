@@ -429,9 +429,11 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 //
 // This must always equal exactly the SlipStatus values for which IsLive() is false — the
 // SQL guard below and the Go predicate are two independent encodings of the same "is this
-// slip ended" decision, and TestRepaveableSlipStatusesSQL_MatchesIsLive (in
-// postgres_store_updates_test.go) parses this constant and asserts that equality across
-// every SlipStatus value. If they ever drift (e.g. a ninth status added to IsTerminal/
+// slip ended" decision. TestRepaveableSlipStatusesSQL_MatchesIsLive (in
+// postgres_store_updates_test.go) parses this constant and asserts that equality across a
+// hand-maintained list of SlipStatus values, not across the enum itself — what actually
+// stops a new status slipping through unnoticed is the `exhaustive` linter, which fails
+// IsTerminal's switch until the new constant is placed in one of its explicit case lists. If they ever drift (e.g. a ninth status added to IsTerminal/
 // IsLive but not here), the guarded DELETE below stops matching a status CreateSlipForPush
 // still treats as ended: RowsAffected() comes back 0, the existence check finds the row,
 // and Repave returns ErrSlipWentLive for a slip that never actually went live — wedging

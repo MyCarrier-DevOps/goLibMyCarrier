@@ -325,6 +325,15 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	case errors.Is(err, ErrSlipNotFound):
 		existingSlip = nil // clean miss: no existing row, proceed to create
 
+	case err == nil:
+		// (nil, nil): no store returns this — a miss always carries ErrSlipNotFound — but
+		// the arm is explicit so this switch is total rather than relying on control
+		// falling off the end. The outcome is the same as a clean miss, and it must stay
+		// that way: routing it to the error arm below would hard-fail every push for the
+		// commit, which is far more expensive than treating an unexpected-but-empty
+		// result as "nothing here".
+		existingSlip = nil
+
 	case err != nil:
 		// A real lookup failure (DB timeout, connection refused, ...) — NOT a clean
 		// miss. Proceeding as if no slip existed risks Create inserting a second row
