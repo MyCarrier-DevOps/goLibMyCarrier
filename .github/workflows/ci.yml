@@ -104,11 +104,22 @@ jobs:
         with:
           go-version: ^1.26
           check-latest: true
-      - name: Run deterministic CLONE_DERIVED regression suite (TestStaleCloneDerive)
+      # Named rather than run-everything on purpose: the ClickHouse integration tests in
+      # this package are known-flaky and reproduce on main, so an unfiltered run would be
+      # a coin flip. Add deterministic suites here by name as they land.
+      #
+      # TestPostgresStore_Repave is included because it is the only thing that exercises
+      # Repave's SQL against a real schema. The pgxmock suite pins statement order and
+      # rollback, but only a real Postgres can catch the things that matter most here:
+      # that a failed statement actually aborts the transaction, that the SAVEPOINT around
+      # the ancestry link really scopes its rollback, and that the enum and column names
+      # in the repoint exist.
+      - name: Run deterministic integration suites (CLONE_DERIVED, Postgres repave)
         working-directory: slippy
         run: |
           go mod download
-          go test -tags integration -run 'TestStaleCloneDerive' -count=1 -timeout 10m ./...
+          go test -tags integration -run 'TestStaleCloneDerive|TestPostgresStore_Repave' \
+            -count=1 -timeout 10m ./...
 
   lint:
     name: lint-${{ matrix.module }}

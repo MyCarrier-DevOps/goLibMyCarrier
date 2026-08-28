@@ -426,12 +426,15 @@ func TestPostgresStore_Repave_RepointsDescendants_Integration(t *testing.T) {
 	_, err := store.Load(ctx, old.CorrelationID)
 	assert.ErrorIs(t, err, ErrSlipNotFound, "the repaved slip itself must be gone")
 
-	var newParent, failedStep, parentBranch, parentStatus string
+	var newParent, failedStep, parentBranch, parentStatus, parentRepo string
 	require.NoError(t, pool.QueryRow(ctx,
-		"SELECT parent_correlation_id, parent_failed_step, parent_branch, parent_status "+
-			"FROM slip_ancestry WHERE repository = $1 AND branch = $2 AND correlation_id = $3",
+		"SELECT parent_correlation_id, parent_failed_step, parent_branch, parent_status, "+
+			"parent_repository FROM slip_ancestry "+
+			"WHERE repository = $1 AND branch = $2 AND correlation_id = $3",
 		child.Repository, child.Branch, child.CorrelationID).
-		Scan(&newParent, &failedStep, &parentBranch, &parentStatus))
+		Scan(&newParent, &failedStep, &parentBranch, &parentStatus, &parentRepo))
+	assert.Equal(t, successor.Repository, parentRepo,
+		"parent_repository is a ResolveAncestry join key too, and it is not case-folded")
 	assert.Equal(t, successor.CorrelationID, newParent,
 		"descendant must be repointed to the successor, not dangling")
 	assert.Empty(t, failedStep,

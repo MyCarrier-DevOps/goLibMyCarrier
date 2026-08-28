@@ -356,9 +356,10 @@ func TestPostgresStore_Repave_EndedSlip_OrdersStatementsForAtomicReplacement(t *
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id = \$1, parent_branch = \$2, `+
-		`parent_status = \$3, parent_failed_step = '' WHERE parent_correlation_id = \$4`).
-		WithArgs("new-id", "release", "pending", "old-id").
+	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id = \$1, parent_repository = \$2, `+
+		`parent_branch = \$3, parent_status = \$4, parent_failed_step = '' `+
+		`WHERE parent_correlation_id = \$5`).
+		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
 	expectRepavePredecessorHistory(mock)
 	// The link write is wrapped in a SAVEPOINT (nested Begin/Commit) so that it alone can
@@ -398,9 +399,10 @@ func TestPostgresStore_Repave_RepointRewritesFullParentSnapshot(t *testing.T) {
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id = \$1, parent_branch = \$2, `+
-		`parent_status = \$3, parent_failed_step = '' WHERE parent_correlation_id = \$4`).
-		WithArgs("new-id", "release", "pending", "old-id").
+	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id = \$1, parent_repository = \$2, `+
+		`parent_branch = \$3, parent_status = \$4, parent_failed_step = '' `+
+		`WHERE parent_correlation_id = \$5`).
+		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	expectRepavePredecessorHistory(mock)
 	mock.ExpectCommit()
@@ -435,7 +437,7 @@ func TestPostgresStore_Repave_CarriesForwardParentLinkWhenCallerHasNone(t *testi
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
-		WithArgs("new-id", "release", "pending", "old-id").
+		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	expectRepavePredecessorHistory(mock)
 	// The carried link is re-inserted for the successor: same parent id and SHA, but keyed
@@ -537,7 +539,7 @@ func TestPostgresStore_Repave_LinkFailureDoesNotVetoTheReplacement(t *testing.T)
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
-		WithArgs("new-id", "release", "pending", "old-id").
+		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	expectRepavePredecessorHistory(mock)
 	// SAVEPOINT, failing link insert, ROLLBACK TO SAVEPOINT — then the outer transaction
@@ -573,7 +575,7 @@ func TestPostgresStore_Repave_LinkSavepointReleasedOnSuccess(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
-		WithArgs("new-id", "release", "pending", "old-id").
+		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	expectRepavePredecessorHistory(mock)
 	mock.ExpectBegin()
@@ -643,6 +645,29 @@ func TestPostgresStore_Repave_NilSuccessor_Rejected(t *testing.T) {
 	err := store.Repave(context.Background(), "old-id", nil, nil)
 	require.ErrorIs(t, err, ErrInvalidConfiguration)
 	require.NoError(t, mock.ExpectationsWereMet(), "no transaction may be opened for a nil successor")
+}
+
+// TestPostgresStore_Repave_SelfRepave_Rejected pins the same-ID guard. Without it the
+// transaction runs to completion with no error — delete the row, delete its children,
+// re-insert it fresh — so an ended run's state history and component rows are destroyed and
+// replaced by a pending run under the SAME correlation ID. Nothing afterwards can tell that
+// apart from a no-op: the success log's repaved_id and superseding_id are identical, and the
+// fresh row's seeded history is byte-identical to a first-time create.
+//
+// It is reachable rather than theoretical: a caller retrying within one delivery reuses its
+// correlation ID, so a retry after a partially-observed failure can present the same id on
+// both sides. Rejecting beats no-oping, because a caller in this state has a bug worth
+// surfacing.
+func TestPostgresStore_Repave_SelfRepave_Rejected(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	successor := repaveSuccessor()
+	err := store.Repave(context.Background(), successor.CorrelationID, successor, nil)
+
+	require.ErrorIs(t, err, ErrInvalidConfiguration)
+	assert.Contains(t, err.Error(), successor.CorrelationID)
+	require.NoError(t, mock.ExpectationsWereMet(),
+		"no transaction may be opened for a self-repave")
 }
 
 // TestPostgresStore_Repave_CarryForwardReadFailureAborts pins that a failed carry-forward
@@ -733,7 +758,7 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 					WillReturnResult(pgxmock.NewResult("DELETE", 1))
 				expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 				mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
-					WithArgs("new-id", "release", "pending", "old-id").
+					WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
 					WillReturnError(boom)
 			},
 		},
@@ -779,7 +804,7 @@ func TestPostgresStore_Repave_StatusGuard_CoversEndedStatuses(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
-		WithArgs("new-id", "release", "pending", "old-id").
+		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
 	expectRepavePredecessorHistory(mock)
 	mock.ExpectCommit()

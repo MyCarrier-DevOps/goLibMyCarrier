@@ -326,4 +326,9 @@ help:
 
 .PHONY: install-tools
 install-tools:
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b `go env GOPATH`/bin $(GOLANGCI_LINT_VERSION)
+	# The installer is fetched at the SAME tag as the binary it installs, not from HEAD.
+	# HEAD is a mutable ref, so piping it to sh executes whatever that branch contains at
+	# fetch time. The script already verifies the tarball it downloads
+	# (golangci-lint-<version>-checksums.txt + sha256), so pinning the tag closes the one
+	# unverified link left in the chain: the script that does the verifying.
+	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh | sh -s -- -b `go env GOPATH`/bin $(GOLANGCI_LINT_VERSION)

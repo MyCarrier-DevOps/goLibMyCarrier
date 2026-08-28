@@ -463,11 +463,15 @@ const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','
 //     ever pointing at a phantom, and what lets Phase B add a foreign key on
 //     slip_ancestry.parent_correlation_id at all.
 //  5. Repoint descendants of the superseded run onto the successor, rewriting the whole
-//     denormalized snapshot that describes the parent: id, branch and status now name the
-//     successor, and parent_failed_step is cleared. parent_branch matters as much as the
-//     id — ResolveAncestry's next hop joins on (repository, branch, correlation_id) using
-//     the branch recorded beside the parent id, so a stale parent_branch truncated the walk
-//     for exactly the cross-branch repave this feature supports. parent_status is now
+//     denormalized snapshot that describes the parent: id, repository, branch and status
+//     now name the successor, and parent_failed_step is cleared. All three of id,
+//     repository and branch are ResolveAncestry join keys — its next hop selects on
+//     (repository, branch, correlation_id) using the values recorded beside the parent id,
+//     and none of them is case-folded — so leaving any one describing the deleted run
+//     truncates the walk at exactly the hop this repoint exists to preserve. That bites
+//     for repository via casing (LoadByCommit matches lower(repository), so webhook
+//     casing variance is real and expected) as well as via a genuine repo change.
+//     parent_status is now
 //     knowable (unlike under the old two-call sequence) precisely because step 4 already
 //     inserted the successor in this same transaction.
 //  6. Insert the successor's own parent link: the caller's, or the one carried forward at
@@ -488,6 +492,21 @@ func (s *PostgresStore) Repave(
 ) error {
 	if newSlip == nil {
 		return fmt.Errorf("%w: Repave requires a successor slip", ErrInvalidConfiguration)
+	}
+	if oldCorrelationID == newSlip.CorrelationID {
+		// Self-repave: nothing distinguishes "replaced" from "untouched" afterwards, so
+		// this can only destroy data silently. Without the guard the transaction runs to
+		// completion with no error — delete the row, delete its children, re-insert it
+		// fresh — leaving an ended run's state history and component rows replaced by a
+		// pending run under the SAME correlation ID, with a success log whose repaved_id
+		// and superseding_id are identical and therefore indistinguishable from a no-op.
+		//
+		// It is reachable: a caller that retries within one delivery reuses its
+		// correlation ID, so a retry after a partially-observed failure can present the
+		// same id on both sides. Rejecting is strictly better than the alternative of
+		// treating it as a no-op, because a caller in this state has a bug worth seeing.
+		return fmt.Errorf("%w: Repave successor %s is the slip being repaved",
+			ErrInvalidConfiguration, newSlip.CorrelationID)
 	}
 
 	return s.inTx(ctx, func(tx pgx.Tx) error {
@@ -529,9 +548,11 @@ func (s *PostgresStore) Repave(
 
 		if removedOld {
 			if _, err := tx.Exec(ctx,
-				"UPDATE slip_ancestry SET parent_correlation_id = $1, parent_branch = $2, "+
-					"parent_status = $3, parent_failed_step = '' WHERE parent_correlation_id = $4",
-				newSlip.CorrelationID, newSlip.Branch, string(newSlip.Status), oldCorrelationID,
+				"UPDATE slip_ancestry SET parent_correlation_id = $1, parent_repository = $2, "+
+					"parent_branch = $3, parent_status = $4, parent_failed_step = '' "+
+					"WHERE parent_correlation_id = $5",
+				newSlip.CorrelationID, newSlip.Repository, newSlip.Branch,
+				string(newSlip.Status), oldCorrelationID,
 			); err != nil {
 				return fmt.Errorf("repave %s: repointing descendants to %s: %w",
 					oldCorrelationID, newSlip.CorrelationID, err)
@@ -659,9 +680,16 @@ func removeSupersededSlipTx(ctx context.Context, tx pgx.Tx, correlationID string
 // found distinguishes "this run has no parent link" (found=false, a normal state for a
 // root commit) from a read failure, so the caller can treat only the latter as fatal.
 //
-// The ORDER BY is not decorative: slip_ancestry's primary key is (repository, branch,
-// correlation_id), so a single correlation ID can in principle carry more than one row, and
-// the newest link is the one that describes the run's current parent.
+// LIMIT 1 with no ORDER BY is deliberate. slip_ancestry's primary key is (repository,
+// branch, correlation_id), so a single correlation ID could in principle carry more than one
+// row — but a run's (repository, branch) never changes after creation, so in practice there
+// is exactly one link row per correlation_id and there is no tiebreak to make.
+//
+// Specifically NOT ordered by created_at: that column holds the ANCESTOR's creation time
+// (ancestryLinkArgs binds parent.CreatedAt, and the upsert re-stamps it), not the link's
+// write time, so it cannot express link recency. Ordering by it would install an invariant
+// the schema does not support. Ordering properly would need a real linked_at column and a
+// new versioned migration, which this change deliberately does not ship.
 func loadOwnAncestryLinkTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -671,7 +699,7 @@ func loadOwnAncestryLinkTx(
 	err = tx.QueryRow(ctx,
 		"SELECT parent_correlation_id, parent_commit_sha, parent_status, parent_failed_step, "+
 			"parent_repository, parent_branch, created_at FROM slip_ancestry "+
-			"WHERE correlation_id = $1 ORDER BY created_at DESC LIMIT 1",
+			"WHERE correlation_id = $1 LIMIT 1",
 		correlationID,
 	).Scan(
 		&entry.CorrelationID, &entry.CommitSHA, &status, &entry.FailedStep,

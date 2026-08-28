@@ -118,6 +118,16 @@ type SlipStore interface {
 	// transient ancestry-resolution failure (e.g. a GitHub outage) would permanently
 	// delete a lineage hop rather than merely fail to extend it.
 	//
+	// newSlip.CorrelationID must differ from oldCorrelationID. Passing the same value is
+	// rejected rather than treated as a no-op: it would otherwise destroy an ended run's
+	// history and children and re-insert it fresh under an unchanged ID, which no log line
+	// or row can distinguish from nothing having happened.
+	//
+	// Note the successor insert is an UPSERT on correlation_id (unchanged from Create), so
+	// a newSlip.CorrelationID that already belongs to some OTHER run overwrites that run's
+	// row wholesale rather than failing. Callers mint correlation IDs per push and so do
+	// not collide in practice, but nothing in this method enforces it.
+	//
 	// Returns:
 	//   - nil: newSlip exists, and the superseded row is gone (removed here, or already
 	//     absent — an absent old row is not an error, so redelivery converges).
