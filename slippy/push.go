@@ -136,6 +136,14 @@ type PushOptions struct {
 //     property is required: shouldCreateSlip is `shouldBuild || allowSlipWithNoBuilds` and
 //     does not include shouldRunUnitTests, so without it no slip is created at all.
 //
+// Adoption order across the three repos, and the one rule that matters: this library
+// releases first, then slippy-api forwards the field, then pushhookparser sets it. The
+// middle hop must FORWARD the origin's intent and must never re-derive it — deriving
+// Dispatch from len(components) in slippy-api would re-encode the exact inference this type
+// exists to remove, except as an EXPLICIT value that beats the DispatchIntentUnspecified
+// fallback and therefore cannot be corrected by any later release of this library. Only the
+// component that knows whether work will actually dispatch may set this.
+//
 // It is a string type with a String() method, matching every other enum-like type in this
 // package (SlipStatus, StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). That is
 // not only convention: the two log fields this adds are rendered by zap, which matches
