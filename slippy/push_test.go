@@ -951,6 +951,49 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	t.Run("dispatch intent Nothing seeds no components on the fresh-create path", func(t *testing.T) {
+		// The guards only run when an ended row already exists. On the fresh-create path
+		// there is no guard, so a Nothing push carrying components used to seed pending
+		// aggregate rows nobody would ever advance: computeAggregateStatus keeps an
+		// all-pending aggregate pending forever (an EMPTY one resolves to completed), the
+		// slip stays IsLive(), and every later same-commit push takes handlePushRetry
+		// instead of repaving — reintroducing the unretriggerable hole DispatchIntent
+		// exists to close, through a different door.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-nothing-with-components",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-nothing-fresh",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			Dispatch:      DispatchIntentNothing,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for name, comps := range result.Slip.Aggregates {
+			if len(comps) != 0 {
+				t.Errorf("aggregate %q seeded %d components for a push that dispatches nothing: %+v",
+					name, len(comps), comps)
+			}
+		}
+
+		// Pin the mechanism rather than the downstream symptom: an empty aggregate is a
+		// vacuous all-completed, so the pipeline can reach a terminal state and the slip
+		// stops being live. An all-pending aggregate resolves to pending and never
+		// advances, which is what wedged the slip. (The wedge itself needs a running
+		// executor to observe, so it is not assertable from here.)
+		for name, comps := range result.Slip.Aggregates {
+			if got := computeAggregateStatus(comps); got != StepStatusCompleted {
+				t.Errorf("aggregate %q resolves to %q; a no-dispatch push must leave it vacuously completed",
+					name, got)
+			}
+		}
+	})
+
 	t.Run("unspecified dispatch intent keeps the legacy component inference", func(t *testing.T) {
 		// Back-compat is load-bearing for the rollout: goLib releases BEFORE slippy-api and
 		// pushhookparser adopt the field, so a caller that sets nothing must behave exactly
@@ -3478,6 +3521,32 @@ func TestClient_CreateSlipForPush_DuplicateBackstopFailurePaths(t *testing.T) {
 	})
 }
 
+// TestDispatchIntent_String pins how the two new log fields render. The zero value is the
+// case that matters: without an explicit name it would log as an empty string, on the one
+// line an operator reads to explain why a run's history was preserved or destroyed.
+func TestDispatchIntent_String(t *testing.T) {
+	tests := []struct {
+		intent DispatchIntent
+		want   string
+	}{
+		{DispatchIntentUnspecified, "unspecified"},
+		{DispatchIntentSomething, "something"},
+		{DispatchIntentNothing, "nothing"},
+		{DispatchIntent("garbage"), "garbage"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			if got := tc.intent.String(); got != tc.want {
+				t.Errorf("String() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// The type must satisfy fmt.Stringer for zap to use it: zap matches fmt.Stringer but
+	// would otherwise reflect a named string type, which is the drift this guards.
+	var _ fmt.Stringer = DispatchIntentSomething
+}
+
 // TestPushOptions_dispatchesNothing is the table-driven contract for the single predicate
 // both empty-run guards share. Keeping it in one place is the point: the guard used to be
 // two copies of `len(opts.Components) == 0` in CreateSlipForPush and
@@ -3515,12 +3584,12 @@ func TestPushOptions_dispatchesNothing(t *testing.T) {
 		},
 		{
 			name:     "out-of-range value falls back to the inference rather than assuming work runs",
-			dispatch: DispatchIntent(99), components: nil, want: true,
+			dispatch: DispatchIntent("garbage"), components: nil, want: true,
 			why: "a garbage value must never license destroying a prior run's history",
 		},
 		{
 			name:     "out-of-range value with components infers work",
-			dispatch: DispatchIntent(99), components: withComponents, want: false,
+			dispatch: DispatchIntent("garbage"), components: withComponents, want: false,
 			why: "the fallback is the inference, not a hardcoded answer",
 		},
 	}
