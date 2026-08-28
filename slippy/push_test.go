@@ -540,6 +540,12 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		// components (AllowSlipWithNoBuilds repos). Nothing would be dispatched, so
 		// repaving would only destroy the real run's history. Return the existing
 		// ended slip as a dedup instead (caller sees returned != sent → suppress).
+		//
+		// This also pins the back-compat property the rollout depends on: Dispatch is
+		// left at its zero value here, so it doubles as the DispatchIntentUnspecified
+		// case. goLib releases before slippy-api and pushhookparser adopt the field, and
+		// a caller that sets nothing must behave exactly as it does today. The predicate
+		// itself is covered directly by TestPushOptions_dispatchesNothing.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
@@ -586,18 +592,15 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 	})
 
 	// TestClient_CreateSlipForPush's dispatch-intent subtests pin the fix for the
-	// tests-only-repo retrigger hole (DEVOPS-264). The empty-run guard used to infer "this
-	// push dispatches nothing" from len(Components) == 0. That inference is wrong for a
-	// repo with buildable=false + RunUnitTests=true: pushhookparser nils out components
-	// whenever builds are skipped (pushparser.go, `if !shouldBuild { slipComponents = nil }`)
-	// while still dispatching the unit-tester event, so the guard fired on a push that DOES
-	// dispatch work. The result was that a failed unit-test run on such a repo could not be
-	// retriggered by re-pushing the commit: the guard returned the old failed slip, the
-	// caller saw returned != sent and short-circuited every side effect including unit tests.
+	// tests-only-repo retrigger hole (DEVOPS-264): the empty-run guard used to infer "this
+	// push dispatches nothing" from len(Components) == 0, which is wrong for a repo that
+	// runs unit tests without builds, so a failed run there could not be retriggered by
+	// re-pushing the commit.
 	//
-	// Five MyCarrier-Engineering repos carry the triggering combination today
-	// (buildable=false + RunUnitTests=true + AllowSlipWithNoBuilds=true), so this is a live
-	// hole rather than a theoretical one.
+	// The mechanism, the affected repo set, and the quoted pushhookparser line all live in
+	// one place — DispatchIntent's godoc in push.go. They are facts about ANOTHER
+	// repository's config and source, so nothing here can observe them going stale;
+	// duplicating them would just rot in two places at once.
 	t.Run("ended slip + no components but dispatch intent says work WILL run - repaves", func(t *testing.T) {
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
@@ -713,45 +716,6 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 				t.Errorf("aggregate %q resolves to %q; a no-dispatch push must leave it vacuously completed",
 					name, got)
 			}
-		}
-	})
-
-	t.Run("unspecified dispatch intent keeps the legacy component inference", func(t *testing.T) {
-		// Back-compat is load-bearing for the rollout: goLib releases BEFORE slippy-api and
-		// pushhookparser adopt the field, so a caller that sets nothing must behave exactly
-		// as it does today (zero components => guard fires). Without this, the release
-		// window would silently change behavior for every existing caller.
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
-
-		store.AddSlip(&Slip{
-			CorrelationID: "corr-legacy-run",
-			Repository:    "owner/repo",
-			Branch:        "integration",
-			CommitSHA:     "sha-legacy",
-			Status:        SlipStatusCompleted,
-			Steps:         map[string]Step{},
-			StateHistory:  []StateHistoryEntry{},
-		})
-
-		result, err := client.CreateSlipForPush(ctx, PushOptions{
-			CorrelationID: "corr-legacy-push",
-			Repository:    "owner/repo",
-			Branch:        "integration",
-			CommitSHA:     "sha-legacy",
-			Components:    nil,
-			// Dispatch deliberately left at its zero value.
-		})
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if result.Slip.CorrelationID != "corr-legacy-run" {
-			t.Errorf("unspecified intent must fall back to the component inference, got %q",
-				result.Slip.CorrelationID)
-		}
-		if len(store.RepaveCalls) != 0 {
-			t.Errorf("guard must not repave under legacy inference, got %v", store.RepaveCalls)
 		}
 	})
 

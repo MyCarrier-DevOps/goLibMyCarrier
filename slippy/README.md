@@ -547,6 +547,12 @@ slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
         {Name: "api", DockerfilePath: "services/api"},
         {Name: "worker", DockerfilePath: "services/worker"},
     },
+    // State whether this push will dispatch any CI work. Optional: leaving it unset
+    // keeps the legacy behaviour of inferring it from len(Components). Set it when
+    // component count would be misleading — most importantly a repo that runs unit
+    // tests with no build components, where the inference otherwise suppresses the
+    // retrigger of a failed run. See slippy.DispatchIntent.
+    Dispatch: slippy.DispatchIntentSomething, // or DispatchIntentNothing
 })
 
 // Mark push parsing as complete
