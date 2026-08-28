@@ -217,12 +217,15 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   both "branch create at an existing SHA, nothing to do" and "tests-only repo, unit tests
   are about to run" — only the caller can tell them apart. The old inference broke the
   second case concretely: `pushhookparser` nils out components whenever builds are skipped
-  (`if !shouldBuild { slipComponents = nil }`) while still dispatching the unit-tester
-  event, so the guard fired on a push that DID dispatch work, returned the old failed slip,
-  and the caller's `Deduplicated` branch short-circuited every side effect — unit tests
-  included. A failed unit-test run on such a repo therefore could not be retriggered by
-  re-pushing the commit. Five `MyCarrier-Engineering` repos carry the triggering
-  combination (`buildable=false` + `RunUnitTests=true` + `AllowSlipWithNoBuilds=true`).
+  while still dispatching the unit-tester event, so the guard fired on a push that DID
+  dispatch work, returned the old failed slip, and the caller's `Deduplicated` branch
+  short-circuited every side effect — unit tests included. A failed unit-test run on such a
+  repo therefore could not be retriggered by re-pushing the commit.
+
+  The affected repo set and the quoted `pushhookparser` source line are deliberately NOT
+  repeated here — they are point-in-time facts about another repository, so nothing in this
+  repo can notice them going stale. `DispatchIntent`'s godoc in `slippy/push.go` is the
+  single place that records them.
 
   `DispatchIntentUnspecified` is the zero value and keeps the legacy inference, because
   this library releases before `slippy-api` and `pushhookparser` adopt the field; the fix
