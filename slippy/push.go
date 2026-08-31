@@ -144,8 +144,9 @@ type PushOptions struct {
 // fallback and therefore cannot be corrected by any later release of this library. Only the
 // component that knows whether work will actually dispatch may set this.
 //
-// It is a string type with a String() method, matching every other enum-like type in this
-// package (SlipStatus, StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). That is
+// It is a string type, like every other enum-like type in this package (SlipStatus,
+// StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). It also carries a String()
+// method, as SlipStatus, StepStatus and PrereqStatus do; the other two do not. That is
 // not only convention: the two log fields this adds are rendered by zap, which matches
 // fmt.Stringer but does NOT match a named uint8 type — so a numeric enum would have printed
 // `dispatch_intent=0` on the one line an operator reads to explain why a run's history was
@@ -172,6 +173,15 @@ const (
 	// inference previously shielded these repos from that. It also opts the push into
 	// ancestry resolution and into a repave failure being fatal, where the guard's early
 	// return previously made it a no-op; see CreateSlipForPush.
+	//
+	// One class of that fatality does not converge on redelivery: ErrInvalidConfiguration
+	// (today, a self-repave where the caller presents its own correlation ID as the row to
+	// supersede). The superseded row does survive, so the usual "Kafka redelivers against a
+	// store that still holds the row" argument applies to the row — but the offending value
+	// is the caller's own input and is stable across attempts, so every redelivery is
+	// rejected identically. Setting this field is what makes a zero-component push able to
+	// reach store.Repave at all, so it is also what exposes such a caller to that class;
+	// repaveExistingSlip gives it an explicit arm rather than letting it read as transient.
 	DispatchIntentSomething DispatchIntent = "something"
 
 	// DispatchIntentNothing means this push will dispatch NO CI work, so an ended slip for
@@ -369,34 +379,45 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 // Retry vs repave vs new-slip behavior for the same commit SHA, decided by
 // SlipStatus.IsLive() (the single live-vs-ended predicate shared with
 // handleDuplicateSlipBackstop below — DEVOPS-231 review finding B5):
+//
 //   - Existing slip IsLive() (pending/in_progress/compensating): retried via
 //     handlePushRetry (same correlation ID is reused) — the pipeline is still in flight,
 //     so re-dispatching would double-run work.
+//
 //   - Existing slip is failed: the stuck slip is repaved — replaced, in one transaction,
 //     by a fresh slip under the new correlation ID from opts. A failed slip never advances without
 //     a step re-run, so a new push for the same commit (webhook re-delivery or a
 //     same-commit re-push) is treated as a deliberate request to run CI again.
+//
 //   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
 //     stale and repaved on the same terms as the failed case above — replaced, in one
 //     transaction, by a fresh slip under the new correlation ID from opts. This prevents
 //     resurrecting superseded slips on webhook re-delivery or bot-commit races.
+//
 //   - Existing slip is TERMINAL (not failed), this push will dispatch nothing, AND the push
 //     does not carry the existing row's own correlation ID: the empty-run guard
 //     short-circuits the repave above and returns the existing (ended) slip as a dedup,
 //     since nothing would be dispatched and repaving would only destroy history for no
-//     benefit. All three conditions matter. `failed` is excluded so a re-push can retrigger
-//     a stuck run. The self-correlation exclusion exists because the guard's contract is
-//     that the caller sees returned != sent and suppresses its side effects — when they are
-//     equal the caller would dispatch against the very slip it was handed.
+//     benefit.
+//
+//     All three conditions matter. `failed` is excluded, regardless of intent, so a re-push
+//     can retrigger a stuck run — see emptyRunGuardApplies for why that carve-out exists
+//     independently of the Dispatch field. The self-correlation exclusion exists because the
+//     guard's contract is that the caller sees returned != sent and suppresses its side
+//     effects; when they are equal the caller would instead dispatch against the very slip
+//     it was handed.
 //
 //     "Will dispatch nothing" is PushOptions.Dispatch when the caller states a RECOGNIZED
 //     value (see DispatchIntent); DispatchIntentUnspecified and any unrecognized value both
 //     fall back to len(opts.Components) == 0 — component count is neither necessary nor
-//     sufficient on its own, which is why the field exists. A caller that dispatches work
+//     sufficient on its own, which is why the field exists. That distinction matters to a
+//     consumer author: a mis-cased or mis-serialized value crossing the slippy-api JSON
+//     boundary is silently ignored rather than honored. A caller that dispatches work
 //     without build components (a tests-only repo) MUST set DispatchIntentSomething, or,
 //     pre-adoption, rely on the `failed` exclusion.
 //     handleDuplicateSlipBackstop applies the identical guard so the two paths
 //     converge on the same outcome for the same inputs.
+//
 //   - The repave itself can report that the decision is stale:
 //     ErrSlipWentLive means the slip became live again before the repave landed, so the
 //     repave is abandoned and treated like the IsLive() case above: dedup onto the
@@ -1801,10 +1822,31 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			if i == 0 {
 				firstStep = stepConfig.Name
 				// Only auto-run first step if it's NOT an aggregate step,
-				// OR if it's an aggregate but has components to process.
+				// OR if it's an aggregate that will actually have components to process.
 				// This prevents mobile apps (zero-component slips) from getting stuck.
+				//
+				// THIS is the gate that decides whether the run can make progress — it sets
+				// the step to running with a StartedAt — so it is the one that must honour
+				// dispatch intent. The aggregate-contents gate below decides only what the
+				// aggregate holds. Component count alone is the wrong question here for the
+				// same reason it is wrong for the empty-run guard: a caller declaring
+				// DispatchIntentNothing while holding components (a combination
+				// DispatchIntent's godoc declares supported and authoritative) would mark an
+				// aggregate step running over an aggregate that the gate below leaves EMPTY.
+				// Nothing could then advance it — applyComponentStatesToAggregate returns
+				// early when no component has reported, and recomputeAggregate returns early
+				// on an empty active set — and the wedge is unrecoverable by any later push,
+				// because handlePushRetry only resets push_parsed, which is not a step in an
+				// aggregate-first config. It also propagates: getPrereqStatus reads this
+				// step's status, and the deploy steps list it as a prerequisite.
+				//
+				// The conjunction is deliberate. Replacing the count with !dispatchesNothing()
+				// alone would flip the tests-only shape (Something + zero components) from
+				// pending to running with an empty aggregate — wedging the very repos
+				// DEVOPS-264 exists to unblock. Both terms are required: work is dispatched
+				// AND there are components to track it.
 				isAggregateStep := stepConfig.Aggregates != ""
-				hasComponents := len(opts.Components) > 0
+				hasComponents := len(opts.Components) > 0 && !opts.dispatchesNothing()
 				if !isAggregateStep || hasComponents {
 					step.Status = StepStatusRunning
 					step.StartedAt = &now
@@ -1818,21 +1860,32 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			if stepConfig.Aggregates != "" {
 				columnName := stepConfig.Name
 				// A push that dispatches nothing tracks no components, even when the
-				// caller supplied some. Seeding pending rows nobody will ever advance
-				// would leave the aggregate pending forever — computeAggregateStatus
-				// resolves an EMPTY aggregate to completed (a vacuous all-completed) but
-				// an all-pending one stays pending. The slip would then stay IsLive(), so
-				// every later same-commit push takes handlePushRetry instead of repaving:
-				// the same unretriggerable hole DispatchIntent exists to close, reached
-				// through a different door.
-				var componentData []ComponentStepData
+				// caller supplied some: pending rows for work that will never report
+				// misrepresent the run's contents to anything reading Aggregates. This is a
+				// data-accuracy change only.
+				//
+				// It does NOT decide whether such a slip can make progress, and an earlier
+				// version of this comment claimed a causal chain that the code does not have.
+				// Neither store derives an aggregate step's status from these seeded rows —
+				// both aggregate only over components that have actually reported
+				// (filterActiveComponents in clickhouse_store.go, and the len(active) == 0
+				// early return in postgres_store_updates.go's recomputeAggregate) — and
+				// checkPipelineCompletion never reads Aggregates at all, so an empty
+				// aggregate cannot end or extend a slip. Progress is decided by the
+				// hasComponents gate above.
+				//
+				// Built with make(..., 0, len) + append rather than a nil slice so the
+				// in-memory struct CreateSlipForPush returns serializes the same as the one
+				// Load reconstructs: both store write paths normalize nil to [], so a nil
+				// here would marshal as null on the create side and [] on the load side.
+				// This also keeps every path consistent, including Nothing-with-components.
+				componentData := make([]ComponentStepData, 0, len(opts.Components))
 				if !opts.dispatchesNothing() {
-					componentData = make([]ComponentStepData, len(opts.Components))
-					for j, def := range opts.Components {
-						componentData[j] = ComponentStepData{
+					for _, def := range opts.Components {
+						componentData = append(componentData, ComponentStepData{
 							Component: def.Name,
 							Status:    StepStatusPending,
-						}
+						})
 					}
 				}
 				aggregates[columnName] = componentData

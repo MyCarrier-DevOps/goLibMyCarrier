@@ -158,24 +158,34 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   benefit.
 
   "Will dispatch nothing" is `PushOptions.Dispatch` (`DispatchIntent`) when the caller
-  states it, falling back to `len(Components) == 0` only when it is
-  `DispatchIntentUnspecified` or unrecognized. Component count is neither necessary nor
-  sufficient on its own: a tests-only repo (`buildable=false` + `RunUnitTests=true`)
-  dispatches unit tests with zero build components, and a caller may declare
-  `DispatchIntentNothing` while carrying components. See "the guard no longer infers intent
-  from component count" below, and `DispatchIntent` in `push.go`.
+  states a *recognized* value; `DispatchIntentUnspecified` and any unrecognized value both
+  fall back to `len(Components) == 0`. `Validate()` deliberately never rejects an
+  unrecognized value — a safe degradation is preferable to a hard push failure — so an
+  explicit-but-mis-serialized intent (wrong casing crossing the slippy-api JSON boundary,
+  say) is silently ignored rather than honored. The guard's log line carries
+  `dispatch_intent_honored` alongside the value so that is visible rather than inferred.
+
+  Component count is neither necessary nor sufficient on its own: a tests-only repo
+  (`buildable=false` + `RunUnitTests=true`) dispatches unit tests with zero build
+  components, and a caller may declare `DispatchIntentNothing` while carrying components.
 
   Two exclusions sit alongside that, and both are easy to miss because "ended" in this
   document includes `failed`:
   - **`failed` is excluded from the INFERENCE only.** With `Dispatch` unset or
     unrecognized, the guard never claims a `failed` slip, so a componentless re-push can
-    still retrigger a stuck run. A **recognized** explicit intent is authoritative in both
+    still retrigger a stuck run — the carve-out that covers the window before `slippy-api`
+    and `pushhookparser` forward the field, during which every real push arrives
+    `DispatchIntentUnspecified`. A **recognized** explicit intent is authoritative in both
     directions and is consulted *before* this exclusion, so `DispatchIntentNothing` on a
     `failed` slip DOES dedup — deliberately, since repaving there would destroy the failed
     run's history and seed a successor with no components that nothing could ever advance.
   - **A self-correlation push is excluded**, unconditionally. When the existing row already
     carries this push's `correlation_id`, returning it would mean `returned == sent`, which
     the caller protocol reads as "this is your slip, proceed" rather than as a dedup.
+
+  See "the guard no longer infers intent from component count" below for the failure this
+  fixed, and `DispatchIntent` in `push.go` for what setting it opts a componentless push
+  into.
 
   A consequence that outlives the rollout: a genuinely zero-work repo correctly sends
   `DispatchIntentNothing`, the guard correctly fires, and a failed run there still cannot
