@@ -210,18 +210,23 @@ func TestPostgresStore_Load_Hydrates(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestPostgresStore_LoadByCommit_OrdersByUpdatedAtDesc pins the ORDER BY updated_at DESC
-// restored ahead of LIMIT 1 (bd DEVOPS-231 review fix). Phase A (this branch) ships before
-// the Phase B cleanup + uq_routing_slips_repo_sha unique index, so duplicate rows per
-// (repository, commit_sha) can still exist in production; without an explicit order,
-// Postgres gives LIMIT 1 no ordering guarantee and this could nondeterministically return
-// a stale duplicate instead of the most-recently-updated row.
-func TestPostgresStore_LoadByCommit_OrdersByUpdatedAtDesc(t *testing.T) {
+// TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc pins both ORDER BY terms.
+// Phase A (this branch) ships before the Phase B cleanup + uq_routing_slips_repo_sha unique
+// index, so duplicate rows per (repository, commit_sha) can still exist in production, and
+// without an explicit order Postgres gives LIMIT 1 no ordering guarantee at all.
+//
+// The live-first term is the one that changes an outcome: CreateSlipForPush dedupes onto a
+// live row but REPAVES anything else, so returning a more-recently-updated ended duplicate
+// ahead of a stalled live row re-dispatches a pipeline that is still running. The behavioural
+// proof is in postgres_store_integration_test.go against real rows; this test pins the SQL so
+// the terms cannot be dropped or reordered silently.
+func TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
 	store, mock := newMockStore(t)
 	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
 	mock.ExpectQuery(
 		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
-			`ORDER BY updated_at DESC LIMIT 1`,
+			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
+			`updated_at DESC LIMIT 1`,
 	).WithArgs("owner/repo", "sha1").WillReturnRows(rows)
 
 	slip, err := store.LoadByCommit(context.Background(), "owner/repo", "sha1")
@@ -230,17 +235,18 @@ func TestPostgresStore_LoadByCommit_OrdersByUpdatedAtDesc(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestPostgresStore_LoadLiveByCommit_OrdersByUpdatedAtDesc is the LoadLiveByCommit
-// counterpart of TestPostgresStore_LoadByCommit_OrdersByUpdatedAtDesc: the status filter
-// alone does not close the nondeterminism gap (it doesn't exclude a stale "completed"
-// duplicate), so the ORDER BY must be present alongside it.
-func TestPostgresStore_LoadLiveByCommit_OrdersByUpdatedAtDesc(t *testing.T) {
+// TestPostgresStore_LoadLiveByCommit_OrdersLiveFirstThenUpdatedAtDesc is the
+// LoadLiveByCommit counterpart. Its status filter is not a substitute for the ordering: it
+// excludes abandoned/promoted/compensated but not 'completed' or 'failed', so a completed
+// duplicate can still surface ahead of the live row on updated_at DESC alone.
+func TestPostgresStore_LoadLiveByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
 	store, mock := newMockStore(t)
 	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
 	mock.ExpectQuery(
 		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
 			`AND status NOT IN \('abandoned', 'promoted', 'compensated'\) `+
-			`ORDER BY updated_at DESC LIMIT 1`,
+			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
+			`updated_at DESC LIMIT 1`,
 	).WithArgs("owner/repo", "sha1").WillReturnRows(rows)
 
 	slip, err := store.LoadLiveByCommit(context.Background(), "owner/repo", "sha1")

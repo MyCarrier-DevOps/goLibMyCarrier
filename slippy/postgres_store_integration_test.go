@@ -125,6 +125,106 @@ func TestPostgresStore_LoadLiveByCommit_Integration(t *testing.T) {
 	assert.Equal(t, SlipStatusAbandoned, still.Status)
 }
 
+// TestPostgresStore_LoadByCommit_PrefersLiveOverNewerEndedDuplicate_Integration pins the
+// ordering that decides whether a duplicate-row commit repaves a running pipeline out from
+// under itself.
+//
+// Phase A ships ahead of the Phase B cleanup and uq_routing_slips_repo_sha, so two rows can
+// still share a (repository, commit_sha) — 73 such pairs existed in production when this
+// branch was written. CreateSlipForPush routes entirely on the status of whichever row this
+// returns: IsLive() dedupes onto it and suppresses the caller's side effects, anything else
+// repaves it and re-dispatches the whole pipeline under a fresh correlation ID.
+//
+// "Most recently updated" is the wrong tiebreak for that decision. A duplicate abandoned
+// after the live row's last step write is genuinely the newest row, so updated_at DESC alone
+// hands back the ended one — and the caller then repaves and re-dispatches builds, unit tests
+// and auto-deploy while the other pipeline is still running. LoadLiveByCommit, which this
+// lookup replaced, filtered the ended row out and could not make that mistake.
+//
+// Live rows must therefore sort ahead of ended ones, with updated_at DESC breaking ties
+// inside each group. This test seeds exactly the inversion: a stalled in_progress row whose
+// updated_at is older than an abandoned duplicate's.
+func TestPostgresStore_LoadByCommit_PrefersLiveOverNewerEndedDuplicate_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	// Two rows for the same commit: a stalled live run, and a duplicate that ended later.
+	require.NoError(t, store.Create(ctx, &Slip{
+		CorrelationID: "live-stalled", Repository: "r", Branch: "b", CommitSHA: "sha",
+		Status: SlipStatusInProgress,
+	}))
+	require.NoError(t, store.Create(ctx, &Slip{
+		CorrelationID: "ended-newer", Repository: "r", Branch: "b", CommitSHA: "sha",
+		Status: SlipStatusAbandoned,
+	}))
+
+	// Force the inversion deterministically rather than relying on insert order: the live
+	// row is the stale one. Without live-first ordering, updated_at DESC returns
+	// "ended-newer" and the caller repaves a running pipeline.
+	_, err := pool.Exec(ctx,
+		`UPDATE routing_slips SET updated_at = now() - interval '1 hour' WHERE correlation_id = $1`,
+		"live-stalled")
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`UPDATE routing_slips SET updated_at = now() WHERE correlation_id = $1`, "ended-newer")
+	require.NoError(t, err)
+
+	got, err := store.LoadByCommit(ctx, "r", "sha")
+	require.NoError(t, err)
+	assert.Equal(t, "live-stalled", got.CorrelationID,
+		"a live row must win over a more-recently-updated ended duplicate, or CreateSlipForPush "+
+			"repaves and re-dispatches while that run is still in flight")
+
+	// Second half of the ordering: once nothing live remains, updated_at DESC still decides.
+	// An ended row must stay reachable — that is the whole reason this lookup is unfiltered,
+	// since a leftover row has to be repaved before the successor can be inserted under
+	// Phase B's unique index. Both timestamps are set in SQL rather than through Update,
+	// which stamps updated_at from the Go clock; comparing that against Postgres now()
+	// would make the assertion depend on host-vs-container clock skew.
+	_, err = pool.Exec(ctx,
+		`UPDATE routing_slips SET status = 'completed', updated_at = now() - interval '2 hours'
+		 WHERE correlation_id = $1`, "live-stalled")
+	require.NoError(t, err)
+
+	got, err = store.LoadByCommit(ctx, "r", "sha")
+	require.NoError(t, err)
+	assert.Equal(t, "ended-newer", got.CorrelationID,
+		"with no live row left, the newest ended row wins so the successor repaves the "+
+			"most recent state rather than an older duplicate")
+}
+
+// TestPostgresStore_LoadLiveByCommit_PrefersLiveOverNewerEndedDuplicate_Integration is the
+// LoadLiveByCommit counterpart. Its status filter excludes abandoned/promoted/compensated but
+// NOT completed or failed, so a completed duplicate touched after the live row's last write
+// surfaces ahead of it on updated_at DESC alone — the same inversion, through the narrower
+// hole its own doc comment already names.
+func TestPostgresStore_LoadLiveByCommit_PrefersLiveOverNewerEndedDuplicate_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.Create(ctx, &Slip{
+		CorrelationID: "live-stalled", Repository: "r", Branch: "b", CommitSHA: "sha",
+		Status: SlipStatusInProgress,
+	}))
+	require.NoError(t, store.Create(ctx, &Slip{
+		CorrelationID: "completed-newer", Repository: "r", Branch: "b", CommitSHA: "sha",
+		Status: SlipStatusCompleted,
+	}))
+
+	_, err := pool.Exec(ctx,
+		`UPDATE routing_slips SET updated_at = now() - interval '1 hour' WHERE correlation_id = $1`,
+		"live-stalled")
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx,
+		`UPDATE routing_slips SET updated_at = now() WHERE correlation_id = $1`, "completed-newer")
+	require.NoError(t, err)
+
+	got, err := store.LoadLiveByCommit(ctx, "r", "sha")
+	require.NoError(t, err)
+	assert.Equal(t, "live-stalled", got.CorrelationID,
+		"the status filter does not exclude 'completed', so ordering has to carry this case")
+}
+
 func TestPostgresStore_Ping_Integration(t *testing.T) {
 	store, _, _ := newMigratedStore(t)
 	require.NoError(t, store.Ping(context.Background()))
@@ -327,6 +427,78 @@ func TestPostgresStore_Repave_CarriesForwardParentLink_Integration(t *testing.T)
 	assert.Equal(t, "corr-carried-parent", carried,
 		"the superseded run's own parent link must be carried forward when the caller supplies none")
 	assert.Equal(t, "sha-carried-parent", carriedSHA)
+}
+
+// TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration is the
+// Phase-B-shaped version of the carry-forward test above, and it exists because the v4
+// version cannot fail for the reason that matters.
+//
+// Phase B adds `fk_ancestry_slip FOREIGN KEY (correlation_id) REFERENCES
+// routing_slips(correlation_id) ON DELETE CASCADE`. ON DELETE CASCADE is an AFTER ROW
+// trigger, so for a non-deferrable constraint it fires at end of statement — meaning the
+// superseded run's slip_ancestry rows are gone the moment Repave's guarded DELETE of the
+// routing_slips row completes, and are gone to every LATER statement in the same
+// transaction. If the carry-forward read runs after that delete it finds nothing: no hop
+// carried forward, no error, no warning.
+//
+// The failure lands exactly where it is least visible. The carry-forward only runs when the
+// caller resolved no ancestry of its own, i.e. during a GitHub outage — so the lineage hop
+// would be destroyed precisely in the degraded case the mechanism was written for, and never
+// in the healthy case where someone would notice. And no ordinary test would catch it: CI
+// migrates to v4, the FK arrives in v5, so the suite stays green right up until the migration
+// ships.
+//
+// This test therefore installs the future FK itself rather than waiting for the migration.
+// It is the only thing that pins the read/delete ordering against the constraint that makes
+// the ordering matter, so whoever writes the v5 migration inherits a test that already
+// covers it instead of a comment claiming the code is v5-safe.
+func TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	// Install Phase B's cascade FK verbatim (design.md §3). Only the slip_ancestry one is
+	// needed here; the component-states FK cascades a table this test does not read.
+	_, err := pool.Exec(ctx, `ALTER TABLE slip_ancestry
+		ADD CONSTRAINT fk_ancestry_slip
+		FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id) ON DELETE CASCADE`)
+	require.NoError(t, err, "Phase B's FK must be installable against the v4 schema")
+
+	old := &Slip{
+		CorrelationID: "corr-cascade-old",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-cascade",
+		Status:        SlipStatusFailed,
+	}
+	require.NoError(t, store.Create(ctx, old))
+	require.NoError(t, store.InsertAncestryLink(ctx, old, AncestryEntry{
+		CorrelationID: "corr-cascade-parent", CommitSHA: "sha-cascade-parent",
+		Repository: "owner/repo", Branch: "main",
+		Status: SlipStatusCompleted, FailedStep: "", CreatedAt: time.Now(),
+	}))
+
+	successor := &Slip{
+		CorrelationID: "corr-cascade-new",
+		Repository:    old.Repository,
+		Branch:        old.Branch,
+		CommitSHA:     old.CommitSHA,
+		Status:        SlipStatusPending,
+	}
+
+	// parent == nil: the caller resolved nothing, so the carry-forward read is the only
+	// thing that can preserve the hop.
+	require.NoError(t, store.Repave(ctx, old.CorrelationID, successor, nil))
+
+	var carried, carriedSHA string
+	require.NoError(t, pool.QueryRow(ctx,
+		"SELECT parent_correlation_id, parent_commit_sha FROM slip_ancestry WHERE correlation_id = $1",
+		successor.CorrelationID).Scan(&carried, &carriedSHA),
+		"the carried-forward link must exist; a missing row here means the cascade ate it "+
+			"before the read ran")
+	assert.Equal(t, "corr-cascade-parent", carried,
+		"the carry-forward read must run BEFORE the guarded DELETE, or Phase B's cascade "+
+			"removes the row it reads and the lineage hop is silently lost")
+	assert.Equal(t, "sha-cascade-parent", carriedSHA)
 }
 
 // TestPostgresStore_Repave_MissingOldRow_Integration pins the idempotent path: a repave

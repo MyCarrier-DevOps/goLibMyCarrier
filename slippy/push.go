@@ -138,22 +138,23 @@ type CreateSlipResult struct {
 	//     guard both set this true unconditionally, since there is nothing to resolve for
 	//     a slip that was not freshly created — "no resolution was needed" also counts as
 	//     resolved. Both return before resolveAndAbandonAncestors runs at all.
-	//   - the duplicate-create backstop deduped onto a CONFLICTING slip — i.e. it returns
-	//     someone else's run as result.Slip (the live-conflicting and empty-run-guard
-	//     branches). Resolution did run for this push before the backstop was reached, but
-	//     the returned slip is not the one it resolved for, so the "nothing to resolve for
-	//     a pre-existing slip" reading applies to what the caller actually receives.
-	// False means a fresh slip WAS created but ancestry resolution failed for it (e.g.
-	// GitHub API error, missing installation).
+	// False means ancestry resolution ran for this push and failed (e.g. GitHub API error,
+	// missing installation).
 	//
-	// The two went-live abort paths — repaveExistingSlip's and the duplicate-create
-	// backstop's — are deliberately NOT in the "nothing attempted" bucket above
-	// (DEVOPS-231 review D3.2): resolveAndAbandonAncestors always runs before either is
-	// reached, so by the time a went-live abort is detected this field already holds the
-	// value that attempt computed. Both preserve the existing value rather than forcing it
-	// true — forcing true would clobber a legitimate false (resolution ran and failed,
-	// with the failure recorded in Warnings) with a value that contradicts Warnings'
-	// contents and could misfire alerting keyed on this field.
+	// The rule is that this field describes THIS push's resolution attempt, wherever an
+	// attempt happened — not the provenance of the slip being returned. The two bullets above
+	// are the only unconditional-true sites, and they qualify solely because both return
+	// before resolveAndAbandonAncestors runs at all.
+	//
+	// Every path reached AFTER that call therefore preserves the computed value rather than
+	// forcing true: both went-live aborts (repaveExistingSlip's and the duplicate-create
+	// backstop's) and both backstop dedup branches (live-conflicting and empty-run guard).
+	// "The returned slip is not the one we resolved for" is NOT a discriminator — the
+	// backstop's ended-conflict repave branch also returns a reloaded conflicting row, and it
+	// preserves the value too. Forcing true on any of them would clobber a legitimate false
+	// whose failure is already recorded in Warnings, producing AncestryResolved=true sitting
+	// next to an ancestry error during a GitHub outage and misfiring alerting keyed on this
+	// field (DEVOPS-231 review D3.2).
 	//
 	// This is deliberately NOT computed from a loaded slip's own Ancestry field
 	// (e.g. `len(slip.Ancestry) > 0`): no store hydrates Slip.Ancestry on load in
@@ -161,6 +162,42 @@ type CreateSlipResult struct {
 	// slip), so that formula was unconditionally false for every dedup path and would
 	// misfire any alerting keyed off this field.
 	AncestryResolved bool
+}
+
+// emptyRunGuardApplies reports whether a same-commit push onto an already-ended slip should
+// reuse that slip instead of repaving it. Both guard sites — CreateSlipForPush's main path
+// and handleDuplicateSlipBackstop — call this so the two cannot drift.
+//
+// The guard exists because repave DELETES the superseded row: for a push that dispatches
+// nothing (a branch create/recreate at an existing SHA), replacing the row destroys the real
+// run's history and buys nothing, so returning the existing slip as a dedup is strictly
+// better.
+//
+// `failed` is excluded, and that exclusion is load-bearing rather than a nicety. The guard is
+// new in DEVOPS-231, and before it existed a same-commit push onto a failed slip ALWAYS
+// abandoned it and created a fresh slip under the caller's correlation ID — component count
+// was never consulted, and the reason was recorded in the code it replaced: "blocking
+// fresh-slip creation here would re-introduce the 'retrigger never builds' bug". A failed
+// slip never advances on its own (only re-running its failed STEPS recovers it, which a push
+// event does not do), so a new push for that commit is a deliberate request to run CI again.
+//
+// Letting the guard claim those pushes would regress against that baseline for exactly the
+// repos least able to absorb it. A tests-only repo (buildable=false + RunUnitTests=true +
+// AllowSlipWithNoBuilds=true) dispatches unit tests with ZERO build components, because
+// pushhookparser nils components whenever !shouldBuild. The caller would see returned != sent,
+// suppress every side effect, and a failed unit-test run on those repos could not be
+// retriggered by re-pushing — for as long as it took slippy-api AND pushhookparser to adopt
+// DispatchIntent (DEVOPS-264). Component count is not a safe proxy for "dispatches nothing";
+// DispatchIntent is what answers it properly, and until callers pass it this keeps the
+// pre-adoption path byte-identical to the behaviour it replaced.
+func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
+	if existing == nil {
+		return false
+	}
+	if existing.Status == SlipStatusFailed {
+		return false
+	}
+	return len(opts.Components) == 0
 }
 
 // CreateSlipForPush creates a new routing slip for a git push event.
@@ -303,12 +340,12 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     would be wrong, and under one-row-per-commit it must not be left behind
 		//     when the new row is inserted.
 		//
-		if len(opts.Components) == 0 {
+		if emptyRunGuardApplies(existingSlip, opts) {
 			// Empty-run guard: nothing will be dispatched for this push (branch
 			// create/recreate at an existing SHA, or a components-less repo).
 			// Repaving would destroy the prior run's history for zero benefit.
 			// Return the existing slip; the caller sees returned != sent and
-			// suppresses side effects. Trade-off for tests-only repos: see spec §6.2.
+			// suppresses side effects.
 			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for componentless push", map[string]interface{}{
 				"existing_id": existingSlip.CorrelationID,
 				"commit":      shortSHA(existingSlip.CommitSHA),
@@ -755,11 +792,13 @@ func (c *Client) handleDuplicateSlipBackstop(
 			"superseding_id": opts.CorrelationID,
 		})
 		result.Slip = conflicting
-		result.AncestryResolved = true
+		// AncestryResolved is deliberately NOT forced true here (see its doc):
+		// resolveAndAbandonAncestors already ran for this push, so the field holds that
+		// attempt's real outcome. Forcing true would contradict result.Warnings.
 		return true, nil
 	}
 
-	if len(opts.Components) == 0 {
+	if emptyRunGuardApplies(conflicting, opts) {
 		// Empty-run guard (mirrored from CreateSlipForPush's main path): nothing would
 		// be dispatched for this push, so repaving the conflicting row would only
 		// destroy its history for no benefit. Dedup onto it instead of deleting it.
@@ -770,7 +809,7 @@ func (c *Client) handleDuplicateSlipBackstop(
 				"superseding_id": opts.CorrelationID,
 			})
 		result.Slip = conflicting
-		result.AncestryResolved = true
+		// Same as the live-conflict branch above: preserve the computed value.
 		return true, nil
 	}
 

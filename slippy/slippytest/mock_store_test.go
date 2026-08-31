@@ -3,6 +3,7 @@ package slippytest
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -236,6 +237,109 @@ func TestMockStore_Repave_NilSuccessor_Rejected(t *testing.T) {
 	err := store.Repave(context.Background(), "whatever", nil, nil)
 	if !errors.Is(err, slippy.ErrInvalidConfiguration) {
 		t.Errorf("expected ErrInvalidConfiguration for a nil successor, got %v", err)
+	}
+}
+
+// TestMockStore_Repave_SelfRepave_Rejected mirrors PostgresStore's self-repave rejection,
+// which SlipStore.Repave states as a hard precondition ("newSlip.CorrelationID must differ
+// from oldCorrelationID").
+//
+// This double is the exported, consumer-facing one, so a gap here is worse than a gap in an
+// in-package mock: without the guard the double deletes and re-inserts the SAME map key,
+// silently reproducing exactly the history destruction the real store now refuses — and a
+// downstream test asserting "my caller never self-repaves" would pass against this mock while
+// failing against Postgres. It is the same argument the live-status guard's own doc already
+// makes about itself ("it is not decorative").
+func TestMockStore_Repave_SelfRepave_Rejected(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-same",
+		Repository:    "test/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self",
+		Status:        slippy.SlipStatusCompleted,
+		StateHistory:  []slippy.StateHistoryEntry{{Step: "builds", Actor: "ci"}},
+	})
+
+	successor := repaveSuccessorSlip("corr-same", "test/repo", "main", "sha-self")
+	err := store.Repave(ctx, "corr-same", successor, nil)
+	if !errors.Is(err, slippy.ErrInvalidConfiguration) {
+		t.Errorf("expected ErrInvalidConfiguration for a self-repave, got %v", err)
+	}
+
+	// Rejected means untouched: the predecessor's history must survive intact, since
+	// destroying it is the whole hazard the guard exists to prevent.
+	stored, loadErr := store.Load(ctx, "corr-same")
+	if loadErr != nil {
+		t.Fatalf("the slip must be left in place after a rejected self-repave, got %v", loadErr)
+	}
+	if stored.Status != slippy.SlipStatusCompleted {
+		t.Errorf("status must be untouched, got %q", stored.Status)
+	}
+	if len(stored.StateHistory) != 1 {
+		t.Errorf("expected the predecessor's history to survive, got %d entries", len(stored.StateHistory))
+	}
+}
+
+// TestMockStore_Repave_RecordsPredecessorOnSuccessor mirrors the state-history entry
+// PostgresStore.Repave appends to the successor naming the run it replaced. Without it, a
+// consumer writing "the successor records the run it replaced" gets a green test here and a
+// false negative against the real store.
+func TestMockStore_Repave_RecordsPredecessorOnSuccessor(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-old",
+		Repository:    "test/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-hist",
+		Status:        slippy.SlipStatusFailed,
+	})
+
+	successor := repaveSuccessorSlip("corr-new", "test/repo", "main", "sha-hist")
+	if err := store.Repave(ctx, "corr-old", successor, nil); err != nil {
+		t.Fatalf("Repave failed: %v", err)
+	}
+
+	stored, err := store.Load(ctx, "corr-new")
+	if err != nil {
+		t.Fatalf("expected the successor to exist, got %v", err)
+	}
+	var found bool
+	for _, entry := range stored.StateHistory {
+		if strings.Contains(entry.Message, "corr-old") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the successor must carry a history entry naming the run it replaced, got %+v",
+			stored.StateHistory)
+	}
+}
+
+// TestMockStore_Repave_MissingSupersededSlip_RecordsNoPredecessor pins the other half: the
+// marker is written only when a predecessor was actually removed, matching the real store's
+// removedOld gate. Inventing one for a repave that replaced nothing would be a false record.
+func TestMockStore_Repave_MissingSupersededSlip_RecordsNoPredecessor(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	successor := repaveSuccessorSlip("corr-new", "test/repo", "main", "sha-ghost")
+	if err := store.Repave(ctx, "corr-absent", successor, nil); err != nil {
+		t.Fatalf("Repave failed: %v", err)
+	}
+
+	stored, err := store.Load(ctx, "corr-new")
+	if err != nil {
+		t.Fatalf("expected the successor to exist, got %v", err)
+	}
+	for _, entry := range stored.StateHistory {
+		if strings.Contains(entry.Message, "repaved") {
+			t.Errorf("no predecessor was removed, so no repave marker may be written, got %+v", entry)
+		}
 	}
 }
 

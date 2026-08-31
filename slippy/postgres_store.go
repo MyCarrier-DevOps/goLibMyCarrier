@@ -133,17 +133,29 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 // LoadByCommit retrieves the slip for (repository, commitSHA).
 // Repository comparison is case-insensitive.
 func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
-	// ORDER BY updated_at DESC is required, not decorative: Phase A (DEVOPS-231) ships
-	// ahead of the Phase B cleanup + uq_routing_slips_repo_sha unique index, so duplicate
-	// rows for the same (repository, commit_sha) can still exist in production today.
-	// Without an explicit order, Postgres gives LIMIT 1 no ordering guarantee, so this
-	// could nondeterministically return a stale duplicate (e.g. an old abandoned row)
-	// instead of the most-recently-updated one — and a caller that treats a stale row as
-	// "the" slip can repave a live pipeline out from under itself. Once Phase B lands
-	// there is one row per commit and this ordering costs nothing extra.
+	// Both ORDER BY terms are required, not decorative: Phase A (DEVOPS-231) ships ahead of
+	// the Phase B cleanup + uq_routing_slips_repo_sha unique index, so duplicate rows for the
+	// same (repository, commit_sha) can still exist in production today. Without an explicit
+	// order, Postgres gives LIMIT 1 no ordering guarantee at all.
+	//
+	// Live rows sort FIRST, and that term is the load-bearing one. CreateSlipForPush routes
+	// entirely on this row's status: IsLive() dedupes onto it and suppresses the caller's side
+	// effects, anything else repaves it and re-dispatches the pipeline under a fresh
+	// correlation ID. "Most recently updated" is the wrong answer to that question, because a
+	// duplicate abandoned after the live row's last step write is genuinely the newest row —
+	// so updated_at DESC alone hands back the ended one and the caller repaves a pipeline
+	// that is still running. LoadLiveByCommit, which this lookup replaced (see the comment in
+	// CreateSlipForPush for why it had to), filtered ended rows out and could not make that
+	// mistake; ordering is how this one keeps the same property while staying unfiltered.
+	//
+	// The status list is repaveableSlipStatusesSQL rather than a second hand-written set, so
+	// TestRepaveableSlipStatusesSQL_MatchesIsLive covers this ordering's notion of "live" too.
+	// updated_at DESC then breaks ties within each group: among ended rows the newest is the
+	// one worth repaving. Once Phase B lands there is one row per commit and both terms cost
+	// nothing extra.
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
-			"ORDER BY updated_at DESC LIMIT 1",
+			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
@@ -151,17 +163,15 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 // LoadLiveByCommit returns the live slip for (repository, commitSHA),
 // excluding terminal-superseded statuses (abandoned, promoted, compensated).
 func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
-	// ORDER BY updated_at DESC is required for the same reason as LoadByCommit: Phase A
-	// ships ahead of the Phase B cleanup + unique index, so duplicate rows can still
-	// exist today. The status filter alone does not close this gap either — it excludes
-	// abandoned/promoted/compensated but not a stale "completed" duplicate, which
-	// LIMIT 1 could otherwise surface ahead of the live in_progress row without an
-	// explicit order. Once Phase B lands there is one row per commit and this ordering
-	// costs nothing extra.
+	// Ordered live-first then updated_at DESC for the same reason as LoadByCommit, and the
+	// status filter is not a substitute for it: the filter excludes abandoned/promoted/
+	// compensated but NOT 'completed' or 'failed', so a completed duplicate touched after the
+	// live row's last write surfaces ahead of it on updated_at DESC alone. Phase A can still
+	// hold duplicate rows per (repository, commit_sha), so that inversion is reachable today.
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"AND status NOT IN ('abandoned', 'promoted', 'compensated') "+
-			"ORDER BY updated_at DESC LIMIT 1",
+			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }

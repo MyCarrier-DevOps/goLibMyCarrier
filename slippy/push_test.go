@@ -584,6 +584,67 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	t.Run("failed slip + no components - retriggers, the empty-run guard must not apply", func(t *testing.T) {
+		// The empty-run guard is introduced by this branch, so it must not narrow what a
+		// push could do before it existed. On the merge base a same-commit push onto a
+		// FAILED slip always abandoned it and created a fresh slip under the caller's
+		// correlation ID — component count was never consulted — and the code said why:
+		// "blocking fresh-slip creation here would re-introduce the 'retrigger never
+		// builds' bug". A failed slip never advances on its own, so a new push for the
+		// same commit is a deliberate request to run CI again.
+		//
+		// Component count cannot stand in for "this push dispatches nothing" here. A
+		// tests-only repo (buildable=false + RunUnitTests=true + AllowSlipWithNoBuilds)
+		// dispatches unit tests with zero build components: pushhookparser nils components
+		// whenever !shouldBuild while still dispatching those tests. If the guard claimed
+		// this push, the caller would see returned != sent, suppress everything, and a
+		// failed unit-test run on those repos could never be retriggered by re-pushing —
+		// a regression against the merge base that would last until slippy-api AND
+		// pushhookparser both adopt DispatchIntent (DEVOPS-264).
+		//
+		// So the guard covers the ENDED statuses it was written for (a branch
+		// create/recreate at an existing SHA, whose slip is normally completed) and
+		// leaves `failed` to repave. DispatchIntent makes the same decision precisely
+		// once callers pass it; this keeps the pre-adoption path identical to the base.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-failed-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retrigger",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-retrigger",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retrigger",
+			Components:    nil, // tests-only repo: unit tests dispatch, no build components
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-retrigger" {
+			t.Errorf("a failed slip must be replaced by a fresh slip under the caller's id "+
+				"(so the caller sees returned == sent and re-dispatches), got %q",
+				result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 1 {
+			t.Errorf("expected exactly 1 Repave call for the failed slip, got %v", store.RepaveCalls)
+		} else if store.RepaveCalls[0] != "corr-failed-run" {
+			t.Errorf("expected the failed slip to be repaved, got %q", store.RepaveCalls[0])
+		}
+		if _, ok := store.Slips["corr-failed-run"]; ok {
+			t.Error("the failed run must be replaced, not left behind")
+		}
+	})
+
 	t.Run(
 		"ended slip + no components + ancestry - guard reuse still reports AncestryResolved=true",
 		func(t *testing.T) {
@@ -992,10 +1053,68 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 		// B6 (review fix): the backstop dedup path also dedups onto a pre-existing
 		// slip (winner has no Ancestry set), so AncestryResolved must be true here too.
+		// Note this holds because resolveAndAbandonAncestors SUCCEEDED (the GitHub mock is
+		// healthy) and set it true on its own — not because the backstop forces it. The
+		// subtest below covers the case where resolution failed.
 		if !result.AncestryResolved {
 			t.Error("expected AncestryResolved=true for the backstop live-conflict dedup")
 		}
 	})
+
+	t.Run("duplicate-create backstop - dedup must not force AncestryResolved over a real failure",
+		func(t *testing.T) {
+			// AncestryResolved describes THIS push's resolution attempt, wherever an attempt
+			// happened — not the provenance of the slip being returned. The backstop runs
+			// AFTER resolveAndAbandonAncestors, so by the time it dedups, the field already
+			// holds that attempt's real outcome.
+			//
+			// Forcing true here would clobber a legitimate false whose failure is already
+			// recorded in result.Warnings, producing AncestryResolved=true sitting next to an
+			// ancestry error during a GitHub outage — a self-contradictory result that would
+			// misfire any alerting keyed on the field. That is the same reasoning the two
+			// went-live abort paths already state (D3.2); it applies identically here.
+			//
+			// The "returns someone else's slip, so nothing needed resolving" reading does not
+			// discriminate: the ended-conflict repave branch below also returns a reloaded
+			// conflicting row and deliberately preserves the computed value.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			github.GetCommitAncestryError = errors.New("github is down")
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			winner := &Slip{
+				CorrelationID: "corr-outage-winner",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-outage",
+				Status:        SlipStatusInProgress,
+				Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+				StateHistory:  []StateHistoryEntry{},
+			}
+			store.SeedOnCreate["corr-outage-loser"] = winner
+			store.CreateErrorOnce["corr-outage-loser"] = ErrDuplicateSlip
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-outage-loser",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-outage",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-outage-winner" {
+				t.Fatalf("expected dedup onto the live winner, got %+v", result.Slip)
+			}
+			if len(result.Warnings) == 0 {
+				t.Fatal("expected the ancestry failure to be recorded as a warning")
+			}
+			if result.AncestryResolved {
+				t.Errorf("AncestryResolved must stay false when resolution failed for this push; "+
+					"true alongside %d warning(s) contradicts them", len(result.Warnings))
+			}
+		})
 
 	t.Run("duplicate-create backstop - ended conflicting row (completed) is repaved and retried", func(t *testing.T) {
 		// The ENDED counterpart to "duplicate-create backstop - live conflicting row is

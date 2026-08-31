@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -320,16 +321,87 @@ func repaveSuccessor() *Slip {
 // expectRepavePredecessorHistory expects the state-history entry Repave records on the
 // successor naming the run it replaced. Only issued when the repave actually removed a
 // predecessor.
+//
+// Matched on the jsonb_set/state_history shape rather than a bare `UPDATE routing_slips SET`,
+// and on the entry payload rather than pgxmock.AnyArg(): the loose form could not tell this
+// statement apart from any other two-argument update to that table, so a helper named for
+// the predecessor history asserted nothing about either. The payload predicate is what pins
+// the content — that the entry names the superseded run — which otherwise only
+// postgres_store_integration_test.go covers, in a single Docker-dependent job.
 func expectRepavePredecessorHistory(mock pgxmock.PgxPoolIface) *pgxmock.ExpectedExec {
-	return mock.ExpectExec(`UPDATE routing_slips SET`).
-		WithArgs(pgxmock.AnyArg(), "new-id").
+	return mock.ExpectExec(`UPDATE routing_slips SET\s+state_history = jsonb_set\(`).
+		WithArgs(repavePredecessorEntry{}, "new-id").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+}
+
+// repavePredecessorEntry is a pgxmock.Argument matching the marshalled history entry Repave
+// records on its successor. It asserts the entry actually names the superseded run, which is
+// the only thing that makes this statement identifiable as the predecessor marker.
+type repavePredecessorEntry struct{}
+
+func (repavePredecessorEntry) Match(v interface{}) bool {
+	payload, ok := v.(string)
+	if !ok {
+		return false
+	}
+	var entries []StateHistoryEntry
+	if err := json.Unmarshal([]byte(payload), &entries); err != nil || len(entries) != 1 {
+		return false
+	}
+	return strings.Contains(entries[0].Message, "old-id")
 }
 
 // expectRepaveSuccessorInsert expects the successor's routing_slips upsert.
 func expectRepaveSuccessorInsert(store *PostgresStore, mock pgxmock.PgxPoolIface) *pgxmock.ExpectedExec {
 	return mock.ExpectExec(`INSERT INTO routing_slips .* ON CONFLICT \(correlation_id\) DO UPDATE SET`).
 		WithArgs(anyArgs(len(store.slipColumns()))...)
+}
+
+// repaveLinkParent is the caller-supplied ancestry entry used wherever a test needs Repave's
+// link write — and therefore its savepoint — to be reachable.
+func repaveLinkParent() *AncestryEntry {
+	return &AncestryEntry{CorrelationID: "parent-id", CommitSHA: "sha-parent", Status: SlipStatusCompleted}
+}
+
+// repaveCarriedLinkRow builds a row in loadOwnAncestryLinkTx's exact column order, for tests
+// that need the carry-forward read to FIND something.
+func repaveCarriedLinkRow(parentID string) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{
+		"parent_correlation_id", "parent_commit_sha", "parent_status", "parent_failed_step",
+		"parent_repository", "parent_branch", "created_at",
+	}).AddRow(parentID, "sha-"+parentID, "completed", "", "owner/repo", "main", time.Now())
+}
+
+// queueRepaveThroughRepoint queues every statement Repave issues from the top of the
+// transaction through the descendant repoint, all succeeding, for a repave called with a nil
+// parent. Callers append the statement they want to fail.
+//
+// The carry-forward read comes FIRST, ahead of the guarded delete: Phase B's cascade FK on
+// slip_ancestry.correlation_id would otherwise remove the row it reads at end of the delete
+// statement. Anything that reorders those two fails here, which is the point.
+func queueRepaveThroughRepoint(store *PostgresStore, mock pgxmock.PgxPoolIface, parent *AncestryEntry) {
+	// The carry-forward read is issued only when the caller supplied no parent — Repave
+	// skips it otherwise, so queuing it unconditionally would leave an unmatched expectation.
+	if parent == nil {
+		mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
+			WithArgs("old-id").
+			WillReturnError(pgx.ErrNoRows)
+	}
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec("DELETE FROM slip_component_states").
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
+	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id = \$1, parent_repository = \$2, `+
+		`parent_branch = \$3, parent_status = \$4, parent_failed_step = '' `+
+		`WHERE parent_correlation_id = \$5`).
+		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 2))
 }
 
 // TestPostgresStore_Repave_EndedSlip_OrdersStatementsForAtomicReplacement pins the whole
@@ -386,12 +458,12 @@ func TestPostgresStore_Repave_RepointRewritesFullParentSnapshot(t *testing.T) {
 	store, mock := newMockStore(t)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
 		WithArgs("old-id").
 		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -420,15 +492,15 @@ func TestPostgresStore_Repave_CarriesForwardParentLinkWhenCallerHasNone(t *testi
 	created := time.Now()
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
 		WithArgs("old-id").
 		WillReturnRows(pgxmock.NewRows([]string{
 			"parent_correlation_id", "parent_commit_sha", "parent_status", "parent_failed_step",
 			"parent_repository", "parent_branch", "created_at",
 		}).AddRow("carried-parent", "sha-carried", "completed", "", "owner/repo", "main", created))
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -462,12 +534,12 @@ func TestPostgresStore_Repave_RollsBackWhenSuccessorInsertFails(t *testing.T) {
 	store, mock := newMockStore(t)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
 		WithArgs("old-id").
 		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -492,12 +564,12 @@ func TestPostgresStore_Repave_SuccessorDuplicateMapsToSentinel(t *testing.T) {
 	store, mock := newMockStore(t)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
 		WithArgs("old-id").
 		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+		WithArgs("old-id").
+		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -557,48 +629,22 @@ func TestPostgresStore_Repave_LinkFailureDoesNotVetoTheReplacement(t *testing.T)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// TestPostgresStore_Repave_LinkSavepointReleasedOnSuccess pins the happy half of the
-// savepoint: when the link write succeeds the savepoint is released rather than left open,
-// so the link is actually part of the committed transaction.
-func TestPostgresStore_Repave_LinkSavepointReleasedOnSuccess(t *testing.T) {
-	store, mock := newMockStore(t)
-
-	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
-	mock.ExpectExec("DELETE FROM slip_component_states").
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
-	mock.ExpectExec(`DELETE FROM slip_ancestry WHERE correlation_id = \$1`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
-	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectExec(`UPDATE slip_ancestry SET parent_correlation_id`).
-		WithArgs("new-id", "owner/repo", "release", "pending", "old-id").
-		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
-	expectRepavePredecessorHistory(mock)
-	mock.ExpectBegin()
-	mock.ExpectExec(`INSERT INTO slip_ancestry`).
-		WithArgs(anyArgs(10)...).
-		WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectCommit()
-	mock.ExpectCommit()
-
-	parent := &AncestryEntry{CorrelationID: "parent-id", CommitSHA: "sha-parent", Status: SlipStatusCompleted}
-	require.NoError(t, store.Repave(context.Background(), "old-id", repaveSuccessor(), parent))
-	require.NoError(t, mock.ExpectationsWereMet())
-}
-
 // TestPostgresStore_Repave_LiveSlip_RejectedWithErrSlipWentLive pins the TOCTOU guard: when
 // the row still exists but its status is no longer ended (it recovered to live between the
 // caller's repave decision and this call), the repave must be rejected with ErrSlipWentLive
 // and rolled back — nothing deleted, nothing repointed, and critically NO successor created,
 // since that would leave two competing live runs for one commit. Strict ordered mode means
 // any statement past the existence check would fail this test.
+//
+// The carry-forward SELECT precedes the guarded delete (it has to, so Phase B's cascade
+// cannot remove the row it reads), so it is the one statement that does run on this path —
+// harmlessly, since the rejection happens before anything is written.
 func TestPostgresStore_Repave_LiveSlip_RejectedWithErrSlipWentLive(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 0)) // guard rejected: status no longer ended
@@ -614,14 +660,23 @@ func TestPostgresStore_Repave_LiveSlip_RejectedWithErrSlipWentLive(t *testing.T)
 
 // TestPostgresStore_Repave_MissingSupersededRow_StillCreatesSuccessor pins the idempotent
 // path. Two things must both hold: the successor IS created (so a Kafka redelivery of a push
-// whose superseded row is already gone converges instead of failing forever), and NOTHING
-// else is written — no carry-forward read, no child deletes, no descendant repoint — because
-// this call did not remove the row and so has no licence to rewrite unrelated ancestry
-// (D2.1, DEVOPS-231 review). pgxmock's strict ordering enforces the second half: any extra
-// statement fails the test.
+// whose superseded row is already gone converges instead of failing forever), and nothing is
+// WRITTEN beyond it — no child deletes, no descendant repoint, no carried-forward link —
+// because this call did not remove the row and so has no licence to rewrite unrelated
+// ancestry (D2.1, DEVOPS-231 review). pgxmock's strict ordering enforces the second half:
+// any extra statement fails the test.
+//
+// The carry-forward SELECT does still run, ahead of the guarded delete, because it has to be
+// ordered before Phase B's cascade can eat the row it reads. That is the wasted round-trip
+// the ordering costs on this path. What matters is that its result is discarded: the
+// assignment is gated on removedOld, so no link is written for a repave that replaced
+// nothing.
 func TestPostgresStore_Repave_MissingSupersededRow_StillCreatesSuccessor(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("ghost").
+		WillReturnRows(repaveCarriedLinkRow("stale-parent"))
 	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 		WithArgs("ghost").
 		WillReturnResult(pgxmock.NewResult("DELETE", 0))
@@ -677,9 +732,6 @@ func TestPostgresStore_Repave_CarryForwardReadFailureAborts(t *testing.T) {
 	store, mock := newMockStore(t)
 
 	mock.ExpectBegin()
-	mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-		WithArgs("old-id").
-		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
 		WithArgs("old-id").
 		WillReturnError(errors.New("ancestry read failed"))
@@ -701,6 +753,10 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 	tests := []struct {
 		name       string
 		wantErrMsg string
+		// parent is passed to Repave. A non-nil parent is what makes the link write (and
+		// therefore its savepoint) reachable at all; with nil, Repave has no link to insert
+		// once the carry-forward read comes up empty.
+		parent *AncestryEntry
 		// queue expects statements up to and including the failing one.
 		queue func(store *PostgresStore, mock pgxmock.PgxPoolIface)
 	}{
@@ -708,6 +764,9 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 			name:       "guarded delete of the superseded row",
 			wantErrMsg: "deleting superseded row",
 			queue: func(_ *PostgresStore, mock pgxmock.PgxPoolIface) {
+				mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
+					WithArgs("old-id").
+					WillReturnError(pgx.ErrNoRows)
 				mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 					WithArgs("old-id").
 					WillReturnError(boom)
@@ -717,6 +776,9 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 			name:       "existence check after the delete matched nothing",
 			wantErrMsg: "checking superseded row",
 			queue: func(_ *PostgresStore, mock pgxmock.PgxPoolIface) {
+				mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
+					WithArgs("old-id").
+					WillReturnError(pgx.ErrNoRows)
 				mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
 					WithArgs("old-id").
 					WillReturnResult(pgxmock.NewResult("DELETE", 0))
@@ -729,12 +791,12 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 			name:       "deleting the superseded run's children",
 			wantErrMsg: "deleting superseded children",
 			queue: func(_ *PostgresStore, mock pgxmock.PgxPoolIface) {
-				mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-					WithArgs("old-id").
-					WillReturnResult(pgxmock.NewResult("DELETE", 1))
 				mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
 					WithArgs("old-id").
 					WillReturnError(pgx.ErrNoRows)
+				mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+					WithArgs("old-id").
+					WillReturnResult(pgxmock.NewResult("DELETE", 1))
 				mock.ExpectExec("DELETE FROM slip_component_states").
 					WithArgs("old-id").
 					WillReturnError(boom)
@@ -744,12 +806,12 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 			name:       "repointing descendants onto the successor",
 			wantErrMsg: "repointing descendants",
 			queue: func(store *PostgresStore, mock pgxmock.PgxPoolIface) {
-				mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
-					WithArgs("old-id").
-					WillReturnResult(pgxmock.NewResult("DELETE", 1))
 				mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
 					WithArgs("old-id").
 					WillReturnError(pgx.ErrNoRows)
+				mock.ExpectExec(`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN`).
+					WithArgs("old-id").
+					WillReturnResult(pgxmock.NewResult("DELETE", 1))
 				mock.ExpectExec("DELETE FROM slip_component_states").
 					WithArgs("old-id").
 					WillReturnResult(pgxmock.NewResult("DELETE", 1))
@@ -762,6 +824,62 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 					WillReturnError(boom)
 			},
 		},
+		{
+			// A new UPDATE routing_slips issued inside a transaction that already holds the
+			// delete lock. Untested until now: the case table stopped at the repoint, so
+			// every statement this delta added after it was unreached.
+			name:       "recording the predecessor on the successor",
+			wantErrMsg: "recording predecessor on successor",
+			parent:     repaveLinkParent(),
+			queue: func(store *PostgresStore, mock pgxmock.PgxPoolIface) {
+				queueRepaveThroughRepoint(store, mock, repaveLinkParent())
+				expectRepavePredecessorHistory(mock).WillReturnError(boom)
+			},
+		},
+		{
+			name:       "opening the ancestry-link savepoint",
+			wantErrMsg: "open ancestry-link savepoint",
+			parent:     repaveLinkParent(),
+			queue: func(store *PostgresStore, mock pgxmock.PgxPoolIface) {
+				queueRepaveThroughRepoint(store, mock, repaveLinkParent())
+				expectRepavePredecessorHistory(mock)
+				// tx.Begin on an open pgx.Tx issues SAVEPOINT; pgxmock models it as a
+				// nested Begin.
+				mock.ExpectBegin().WillReturnError(boom)
+			},
+		},
+		{
+			// The one genuinely non-obvious branch in this group: the
+			// !errors.Is(rbErr, pgx.ErrTxClosed) condition is what decides whether a link
+			// failure stays scoped to its savepoint or leaves the outer transaction
+			// unusable. A non-ErrTxClosed rollback failure must propagate.
+			name:       "rolling back the ancestry-link savepoint",
+			wantErrMsg: "roll back ancestry-link savepoint",
+			parent:     repaveLinkParent(),
+			queue: func(store *PostgresStore, mock pgxmock.PgxPoolIface) {
+				queueRepaveThroughRepoint(store, mock, repaveLinkParent())
+				expectRepavePredecessorHistory(mock)
+				mock.ExpectBegin()
+				mock.ExpectExec(`INSERT INTO slip_ancestry`).
+					WithArgs(anyArgs(10)...).
+					WillReturnError(errors.New("link insert failed"))
+				mock.ExpectRollback().WillReturnError(boom)
+			},
+		},
+		{
+			name:       "releasing the ancestry-link savepoint",
+			wantErrMsg: "release ancestry-link savepoint",
+			parent:     repaveLinkParent(),
+			queue: func(store *PostgresStore, mock pgxmock.PgxPoolIface) {
+				queueRepaveThroughRepoint(store, mock, repaveLinkParent())
+				expectRepavePredecessorHistory(mock)
+				mock.ExpectBegin()
+				mock.ExpectExec(`INSERT INTO slip_ancestry`).
+					WithArgs(anyArgs(10)...).
+					WillReturnResult(pgxmock.NewResult("INSERT", 1))
+				mock.ExpectCommit().WillReturnError(boom)
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -771,7 +889,7 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 			tc.queue(store, mock)
 			mock.ExpectRollback()
 
-			err := store.Repave(context.Background(), "old-id", repaveSuccessor(), nil)
+			err := store.Repave(context.Background(), "old-id", repaveSuccessor(), tc.parent)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.wantErrMsg,
 				"the error should name the statement that failed, for operator triage")
@@ -787,15 +905,15 @@ func TestPostgresStore_Repave_RollsBackOnEveryStatementFailure(t *testing.T) {
 func TestPostgresStore_Repave_StatusGuard_CoversEndedStatuses(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
+		WithArgs("old-id").
+		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectExec(
 		`DELETE FROM routing_slips WHERE correlation_id = \$1 AND status IN ` +
 			`\('failed','completed','abandoned','promoted','compensated'\)`,
 	).
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
-	mock.ExpectQuery(`SELECT parent_correlation_id, .* FROM slip_ancestry WHERE correlation_id = \$1`).
-		WithArgs("old-id").
-		WillReturnError(pgx.ErrNoRows)
 	mock.ExpectExec("DELETE FROM slip_component_states").
 		WithArgs("old-id").
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))

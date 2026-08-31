@@ -324,11 +324,39 @@ help:
 	@echo "Coverage floor: $(COVERAGE_THRESHOLD_TOTAL)% (must match ci.yml threshold-total)"
 	@echo "Mutation vars: MUTATION_BASE=$(MUTATION_BASE) MUTATION_THRESHOLD=$(MUTATION_THRESHOLD)"
 
+# install-tools installs golangci-lint at the pinned version, skipping the download when it
+# is already present.
+#
+# The installer is fetched at the SAME tag as the binary it installs, not from HEAD. HEAD is a
+# mutable ref, so piping it to sh executes whatever that branch contains at fetch time. The
+# script already verifies the tarball it downloads (golangci-lint-<version>-checksums.txt +
+# sha256), so pinning the tag closes the one unverified link left in the chain: the script that
+# does the verifying.
+#
+# The already-installed short-circuit matters for the same reason, and matches what
+# install-mutest and install-govulncheck already do. `lint` depends on this target, and CI runs
+# `make install-tools` inside the per-module lint matrix — 19 modules — so without the check
+# that is 19 fetch-and-pipe-to-sh executions per push. Fewer curl | sh runs is a smaller
+# window as well as a faster build.
+#
+# The version comparison reuses `doctor`'s word-boundary regex rather than a substring match:
+# a plain `case *2.13.1*` would accept 2.13.10 as satisfying a 2.13.1 pin.
+#
+# The check reads the binary PATH resolves, because that is the one `lint` will actually run,
+# while the install writes to `go env GOPATH`/bin. Those are the same thing in CI (setup-go
+# puts GOPATH/bin on PATH) but can diverge locally — e.g. a mise-shimmed golangci-lint ahead
+# of GOPATH/bin, which is a real drift this repo has hit. When they diverge, this target can
+# report "already installed" while GOPATH/bin holds something else, or reinstall on every run
+# without ever changing what lint uses. `make doctor` is what reports that; it prints the
+# resolved path alongside the wanted version precisely so the divergence is visible.
 .PHONY: install-tools
 install-tools:
-	# The installer is fetched at the SAME tag as the binary it installs, not from HEAD.
-	# HEAD is a mutable ref, so piping it to sh executes whatever that branch contains at
-	# fetch time. The script already verifies the tarball it downloads
-	# (golangci-lint-<version>-checksums.txt + sha256), so pinning the tag closes the one
-	# unverified link left in the chain: the script that does the verifying.
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh | sh -s -- -b `go env GOPATH`/bin $(GOLANGCI_LINT_VERSION)
+	@want_bare=$$(echo "$(GOLANGCI_LINT_VERSION)" | sed 's/^v//'); \
+	if command -v golangci-lint >/dev/null 2>&1 && \
+	   golangci-lint version 2>&1 | grep -qE "(^|[^0-9.])v?$$want_bare([^0-9.]|$$)"; then \
+		echo "golangci-lint $(GOLANGCI_LINT_VERSION) already installed ($$(command -v golangci-lint)), skipping download"; \
+	else \
+		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
+		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh \
+			| sh -s -- -b `go env GOPATH`/bin $(GOLANGCI_LINT_VERSION); \
+	fi

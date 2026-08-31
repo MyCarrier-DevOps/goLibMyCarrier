@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // pluralizeMock converts a singular step name to its plural form for column naming.
@@ -378,12 +379,23 @@ func (m *MockStore) Repave(
 		return fmt.Errorf("%w: Repave requires a successor slip", ErrInvalidConfiguration)
 	}
 
+	// Mirrors PostgresStore's self-repave rejection (SlipStore.Repave: "newSlip
+	// .CorrelationID must differ from oldCorrelationID"). Same argument as the live guard
+	// below: without it this double deletes and re-inserts the same map key, silently
+	// destroying an ended run's history exactly as the real store now refuses to.
+	if oldCorrelationID == newSlip.CorrelationID {
+		return fmt.Errorf("%w: Repave successor %s is the slip being repaved",
+			ErrInvalidConfiguration, newSlip.CorrelationID)
+	}
+
+	removedOld := false
 	if slip, ok := m.Slips[oldCorrelationID]; ok {
 		if slip.Status.IsLive() {
 			// Went live between the caller's repave decision and this call: the
 			// superseded run survives and the successor is NOT created.
 			return ErrSlipWentLive
 		}
+		removedOld = true
 		// Only unmap the commit index entry if it still points at THIS slip. The mock's
 		// Create permits duplicate (repo, sha) rows and re-points the index at the
 		// newest one, so an older row's removal must not clear an index entry that has
@@ -397,7 +409,19 @@ func (m *MockStore) Repave(
 
 	// A missing superseded row is not an error: the successor is still created, so a
 	// redelivery converges rather than failing forever.
-	m.Slips[newSlip.CorrelationID] = deepCopySlip(newSlip)
+	stored := deepCopySlip(newSlip)
+	if removedOld {
+		// Mirrors the predecessor marker PostgresStore.Repave appends to the successor, gated
+		// on removedOld the same way so a repave that replaced nothing records nothing.
+		stored.StateHistory = append(stored.StateHistory, StateHistoryEntry{
+			Step:      "push_parsed",
+			Status:    StepStatusRunning,
+			Timestamp: time.Now(),
+			Actor:     "slippy-library",
+			Message:   fmt.Sprintf("repaved %s for commit %s", oldCorrelationID, shortSHA(newSlip.CommitSHA)),
+		})
+	}
+	m.Slips[newSlip.CorrelationID] = stored
 	m.CommitIndex[commitIndexKey(newSlip.Repository, newSlip.CommitSHA)] = newSlip.CorrelationID
 	return nil
 }

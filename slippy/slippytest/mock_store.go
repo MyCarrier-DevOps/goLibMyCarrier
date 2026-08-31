@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/slippy"
 )
@@ -287,10 +288,22 @@ func (m *MockStore) Repave(
 		return fmt.Errorf("%w: Repave requires a successor slip", slippy.ErrInvalidConfiguration)
 	}
 
+	// Mirrors PostgresStore's self-repave rejection (slippy.SlipStore.Repave: "newSlip
+	// .CorrelationID must differ from oldCorrelationID"). It is not decorative, for the same
+	// reason the live guard below is not: without it this double deletes and re-inserts the
+	// same map key, silently destroying an ended run's state history exactly as the real store
+	// now refuses to — so a consumer's test would pass here and fail against Postgres.
+	if oldCorrelationID == newSlip.CorrelationID {
+		return fmt.Errorf("%w: Repave successor %s is the slip being repaved",
+			slippy.ErrInvalidConfiguration, newSlip.CorrelationID)
+	}
+
+	removedOld := false
 	if slip, ok := m.Slips[oldCorrelationID]; ok {
 		if slip.Status.IsLive() {
 			return slippy.ErrSlipWentLive
 		}
+		removedOld = true
 		// Only unmap the commit index entry if it still points at THIS slip. Create
 		// permits duplicate (repo, sha) rows and re-points the index at the newest one, so
 		// an older row's removal must not clear an index entry that has since moved on to
@@ -304,7 +317,28 @@ func (m *MockStore) Repave(
 
 	// A missing superseded row is not an error, matching PostgresStore: the successor is
 	// still created, so a redelivery converges rather than failing forever.
-	m.Slips[newSlip.CorrelationID] = DeepCopySlip(newSlip)
+	stored := DeepCopySlip(newSlip)
+	if removedOld {
+		// Mirrors the state-history entry PostgresStore.Repave appends to the successor so
+		// the replacement is visible on the row afterwards — without it the successor carries
+		// no evidence a prior run existed for this commit, since the old row is gone. Gated
+		// on removedOld exactly as the real store gates it, so a repave that replaced nothing
+		// does not record a predecessor it never had.
+		//
+		// The message names the predecessor's correlation ID, which is the property consumers
+		// can assert on. The precise rendering is the store's business — PostgresStore
+		// abbreviates the commit SHA using an unexported helper — so this deliberately does
+		// not try to be byte-identical.
+		stored.StateHistory = append(stored.StateHistory, slippy.StateHistoryEntry{
+			Step:      "push_parsed",
+			Status:    slippy.StepStatusRunning,
+			Timestamp: time.Now(),
+			Actor:     "slippy-library",
+			Message: fmt.Sprintf("repaved %s for commit %s", oldCorrelationID,
+				newSlip.CommitSHA),
+		})
+	}
+	m.Slips[newSlip.CorrelationID] = stored
 	m.CommitIndex[commitIndexKey(newSlip.Repository, newSlip.CommitSHA)] = newSlip.CorrelationID
 	return nil
 }

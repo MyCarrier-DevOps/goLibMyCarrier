@@ -512,6 +512,40 @@ func (s *PostgresStore) Repave(
 	}
 
 	return s.inTx(ctx, func(tx pgx.Tx) error {
+		// Read the superseded run's own ancestry link BEFORE the guarded DELETE below, not
+		// after. This ordering is required by Phase B and is invisible without it.
+		//
+		// Phase B adds fk_ancestry_slip (correlation_id) REFERENCES routing_slips
+		// ON DELETE CASCADE. A cascade is an AFTER ROW trigger, so for a non-deferrable
+		// constraint it fires at end of statement: the moment the guarded DELETE of the
+		// routing_slips row completes, this run's slip_ancestry rows are gone — and gone to
+		// every later statement in this same transaction. Read after the delete and the
+		// lookup returns nothing, with no error and no warning.
+		//
+		// The consequence lands where nobody would see it. The carry-forward only runs when
+		// the caller resolved no ancestry of its own (a GitHub outage), so the lineage hop
+		// would be destroyed in exactly the degraded case the mechanism exists for, and
+		// never in the healthy case. Nor would the suite catch it: CI migrates to v4 and the
+		// FK arrives in v5, so everything stays green until the migration ships.
+		// TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration
+		// installs that FK itself so the ordering is pinned now rather than on trust.
+		//
+		// Reading before the DELETE means reading without the row lock the DELETE takes,
+		// and that introduces no new race: two concurrent repaves of the same old ID read
+		// the same link and carry the same value forward (idempotent), and the guarded
+		// DELETE still decides which one wins. The only cost is one wasted round-trip on
+		// the paths where the delete then finds nothing.
+		var carried AncestryEntry
+		var carriedFound bool
+		if parent == nil {
+			var carryErr error
+			carried, carriedFound, carryErr = loadOwnAncestryLinkTx(ctx, tx, oldCorrelationID)
+			if carryErr != nil {
+				return fmt.Errorf("repave %s: reading superseded ancestry link: %w",
+					oldCorrelationID, carryErr)
+			}
+		}
+
 		removedOld, err := removeSupersededSlipTx(ctx, tx, oldCorrelationID)
 		if err != nil {
 			return err
@@ -519,18 +553,12 @@ func (s *PostgresStore) Repave(
 
 		link := parent
 		if removedOld {
-			if link == nil {
+			if link == nil && carriedFound {
 				// The caller resolved no ancestry (e.g. a GitHub outage). Carry the
 				// superseded run's own parent link forward rather than destroying the
-				// lineage hop along with its row.
-				carried, found, carryErr := loadOwnAncestryLinkTx(ctx, tx, oldCorrelationID)
-				if carryErr != nil {
-					return fmt.Errorf("repave %s: reading superseded ancestry link: %w",
-						oldCorrelationID, carryErr)
-				}
-				if found {
-					link = &carried
-				}
+				// lineage hop along with its row. Gated on removedOld so a repave that
+				// found no old row to replace does not invent a parent for the successor.
+				link = &carried
 			}
 
 			for _, stmt := range []string{
@@ -575,7 +603,12 @@ func (s *PostgresStore) Repave(
 				Step:      "push_parsed",
 				Status:    StepStatusRunning,
 				Timestamp: time.Now(),
-				Actor:     "slippy",
+				// "slippy-library" matches every other library-emitted history entry
+				// (history.go, push.go, steps.go). It was "slippy" here, which made this
+				// entry distinguishable by Actor purely by accident — worth avoiding,
+				// because a consumer would then be relying on a typo. A repave is
+				// identified by the Message, as the integration test does.
+				Actor: "slippy-library",
 				Message: fmt.Sprintf("repaved %s for commit %s", oldCorrelationID,
 					shortSHA(newSlip.CommitSHA)),
 			}); err != nil {
