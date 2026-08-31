@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -959,11 +960,15 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 	t.Run("dispatch intent Nothing seeds no components on the fresh-create path", func(t *testing.T) {
 		// The guards only run when an ended row already exists. On the fresh-create path
 		// there is no guard, so a Nothing push carrying components used to seed pending
-		// aggregate rows nobody would ever advance: computeAggregateStatus keeps an
-		// all-pending aggregate pending forever (an EMPTY one resolves to completed), the
-		// slip stays IsLive(), and every later same-commit push takes handlePushRetry
-		// instead of repaving — reintroducing the unretriggerable hole DispatchIntent
-		// exists to close, through a different door.
+		// aggregate rows for work that will never report — misrepresenting the run's
+		// contents to anything reading Aggregates.
+		//
+		// This is a data-accuracy property, not a liveness one. An earlier version of this
+		// comment claimed the seeded rows kept the slip IsLive() and so forced later pushes
+		// down handlePushRetry; that chain does not exist. Neither store feeds these rows to
+		// computeAggregateStatus, and checkPipelineCompletion never reads Aggregates at all.
+		// The liveness hazard lives in initializeSlipForPush's hasComponents gate, which is
+		// covered separately.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
@@ -986,17 +991,20 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			}
 		}
 
-		// Pin the mechanism rather than the downstream symptom: an empty aggregate is a
-		// vacuous all-completed, so the pipeline can reach a terminal state and the slip
-		// stops being live. An all-pending aggregate resolves to pending and never
-		// advances, which is what wedged the slip. (The wedge itself needs a running
-		// executor to observe, so it is not assertable from here.)
-		for name, comps := range result.Slip.Aggregates {
-			if got := computeAggregateStatus(comps); got != StepStatusCompleted {
-				t.Errorf("aggregate %q resolves to %q; a no-dispatch push must leave it vacuously completed",
-					name, got)
-			}
-		}
+		// Deliberately NOT asserted here: computeAggregateStatus over these (now empty)
+		// slices. computeAggregateStatus([]) is unconditionally StepStatusCompleted — the
+		// allCompleted flag starts true and the loop body never runs — so such an assertion
+		// could only fail when the len(comps) != 0 check above already has. It would add no
+		// detection.
+		//
+		// It would also pin a mechanism the code does not have, which is worse than adding
+		// nothing: neither store feeds these seeded rows to computeAggregateStatus (both
+		// aggregate only over components that have actually reported), and
+		// checkPipelineCompletion never reads Aggregates at all — it terminates on
+		// Steps["prod_steady_state"] or a primary step failure. So an empty aggregate cannot
+		// end a slip or stop it being live. What this fix actually buys is data accuracy;
+		// what prevents the wedge is the hasComponents gate in initializeSlipForPush, which
+		// TestClient_InitializeSlipForPush_NothingIntentDoesNotStartAggregateStep covers.
 	})
 
 	t.Run(
@@ -2542,6 +2550,188 @@ func TestClient_InitializeSlipForPush_MobileApp(t *testing.T) {
 	}
 	if len(slip.Aggregates["builds"]) != 0 {
 		t.Errorf("expected 0 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
+	}
+}
+
+// aggregateFirstTestConfig builds a pipeline whose FIRST step is an aggregate, matching the
+// shape slippy/default.json ships (step 0 is `builds` with `aggregates: "build"`). The
+// zero-component-aggregate gate only exists for this shape, so it is the only config that can
+// exercise it.
+func aggregateFirstTestConfig() *PipelineConfig {
+	config := &PipelineConfig{
+		Version: "1",
+		Name:    "aggregate-first",
+		Steps: []StepConfig{
+			{Name: "builds", Description: "Builds completed", Aggregates: "build"},
+			{Name: "unit_tests", Description: "Unit tests", Prerequisites: []string{"builds"}},
+		},
+	}
+	config.stepsByName = make(map[string]*StepConfig)
+	config.aggregateMap = make(map[string]string)
+	config.gateSteps = make([]string, 0)
+	for i := range config.Steps {
+		step := &config.Steps[i]
+		step.order = i
+		config.stepsByName[step.Name] = step
+		if step.Aggregates != "" {
+			config.aggregateMap[step.Aggregates] = step.Name
+		}
+	}
+	return config
+}
+
+// TestClient_InitializeSlipForPush_NothingIntentDoesNotStartAggregateStep pins that
+// DispatchIntentNothing suppresses the auto-run of an aggregate first step, not just the
+// seeding of its component rows.
+//
+// initializeSlipForPush answers "does this push have work?" twice, and the two answers must
+// agree. One decides the aggregate's CONTENTS; the other — the `hasComponents` gate here —
+// decides whether step 0 is marked `running` with a StartedAt. Only the second can wedge a
+// slip, so it is the one that matters.
+//
+// With intent honoured for contents but not for the gate, a Nothing push carrying components
+// marks `builds` running over an aggregate that is now EMPTY, and nothing can ever advance it:
+// applyComponentStatesToAggregate returns early when no component reported, and
+// recomputeAggregate returns early on an empty active set. The wedge is then unrecoverable by
+// any later push, because handlePushRetry only ever resets `push_parsed` — which is not a step
+// in this config — so its status write is skipped entirely and the stuck step is untouched. It
+// also propagates: getPrereqStatus reads Steps[prereq].Status, and both deploy steps list
+// `builds` as a prerequisite, so both gate on `running` indefinitely.
+//
+// Not reachable in production today — no caller sets Dispatch yet, and pushhookparser empties
+// components exactly when nothing builds — but DispatchIntentNothing's own godoc declares the
+// with-components combination supported and authoritative, so adoption arms it.
+func TestClient_InitializeSlipForPush_NothingIntentDoesNotStartAggregateStep(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	slip := client.initializeSlipForPush(PushOptions{
+		CorrelationID: "corr-nothing-with-components",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-nothing",
+		// Components present, but the caller states authoritatively that nothing dispatches.
+		Components: []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		Dispatch:   DispatchIntentNothing,
+	}, nil)
+
+	if got := slip.Steps["builds"].Status; got != StepStatusPending {
+		t.Errorf("an aggregate first step must not be marked running when the push dispatches "+
+			"nothing: its aggregate is empty, so no component write can ever advance it "+
+			"(got %q)", got)
+	}
+	if slip.Steps["builds"].StartedAt != nil {
+		t.Error("expected StartedAt to be nil for a step that was never really started")
+	}
+	if len(slip.Aggregates["builds"]) != 0 {
+		t.Errorf("a non-dispatching push tracks no components, got %d", len(slip.Aggregates["builds"]))
+	}
+}
+
+// TestClient_InitializeSlipForPush_AggregatesSerializeAsEmptyArrayNotNull pins that the
+// in-memory slip CreateSlipForPush hands back serializes the same way as the one Load
+// reconstructs.
+//
+// Both store write paths normalize a nil component slice to [] before persisting, so the
+// COLUMN is unaffected either way — the asymmetry is between the struct returned on the
+// create side and the struct rebuilt on the load side, which would marshal as null and []
+// respectively. Slip.Aggregates is a tagged JSON field on a struct this library hands to
+// consumers, and slippy-api is the documented next hop, so a type that changes shape
+// depending on which side produced it is a trap even with no in-repo consumer today.
+//
+// Asserted on the legacy shape (Dispatch unset, no components) because that is the path this
+// PR promises is inert, and on the Nothing-with-components shape because that is the one the
+// gate deliberately empties.
+func TestClient_InitializeSlipForPush_AggregatesSerializeAsEmptyArrayNotNull(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	cases := []struct {
+		name string
+		opts PushOptions
+	}{
+		{
+			name: "legacy: dispatch unset, no components",
+			opts: PushOptions{
+				CorrelationID: "corr-shape-legacy", Repository: "owner/repo",
+				Branch: "main", CommitSHA: "sha-shape-1",
+			},
+		},
+		{
+			name: "nothing intent with components supplied",
+			opts: PushOptions{
+				CorrelationID: "corr-shape-nothing", Repository: "owner/repo",
+				Branch: "main", CommitSHA: "sha-shape-2",
+				Components: []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+				Dispatch:   DispatchIntentNothing,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			slip := client.initializeSlipForPush(tc.opts, nil)
+			if slip.Aggregates["builds"] == nil {
+				t.Fatal("expected a non-nil empty slice so this marshals as [] rather than null")
+			}
+			encoded, err := json.Marshal(slip.Aggregates)
+			if err != nil {
+				t.Fatalf("marshal failed: %v", err)
+			}
+			if strings.Contains(string(encoded), "null") {
+				t.Errorf("aggregates must not serialize any member as null, got %s", encoded)
+			}
+		})
+	}
+}
+
+// TestClient_InitializeSlipForPush_SomethingIntentStartsAggregateStepWithoutComponents pins
+// the other direction, and is why the gate takes a conjunction rather than being replaced by
+// !dispatchesNothing() outright. A tests-only repo declares Something with ZERO components;
+// that must NOT mark the aggregate step running, because its aggregate would be empty and
+// wedge exactly as above — which is the very repo shape DEVOPS-264 exists to unblock.
+func TestClient_InitializeSlipForPush_SomethingIntentStartsAggregateStepWithoutComponents(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	slip := client.initializeSlipForPush(PushOptions{
+		CorrelationID: "corr-something-no-components",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-something",
+		Components:    nil,
+		Dispatch:      DispatchIntentSomething,
+	}, nil)
+
+	if got := slip.Steps["builds"].Status; got != StepStatusPending {
+		t.Errorf("Something with zero components must still leave an aggregate first step "+
+			"pending — its aggregate is empty either way (got %q)", got)
+	}
+}
+
+// TestClient_InitializeSlipForPush_AggregateStepStartsWithComponents pins the positive case,
+// so the two tests above cannot be satisfied by a gate that never starts anything.
+func TestClient_InitializeSlipForPush_AggregateStepStartsWithComponents(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	slip := client.initializeSlipForPush(PushOptions{
+		CorrelationID: "corr-real-build",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-real",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		Dispatch:      DispatchIntentSomething,
+	}, nil)
+
+	if got := slip.Steps["builds"].Status; got != StepStatusRunning {
+		t.Errorf("a real build push must start the aggregate step, got %q", got)
+	}
+	if slip.Steps["builds"].StartedAt == nil {
+		t.Error("expected StartedAt to be set for a genuinely started step")
+	}
+	if len(slip.Aggregates["builds"]) != 1 {
+		t.Errorf("expected the component to be tracked, got %d", len(slip.Aggregates["builds"]))
 	}
 }
 
