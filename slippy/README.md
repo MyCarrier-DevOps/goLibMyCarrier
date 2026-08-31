@@ -552,7 +552,7 @@ slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
     // component count would be misleading — most importantly a repo that runs unit
     // tests with no build components, where the inference otherwise suppresses the
     // retrigger of a failed run. See slippy.DispatchIntent.
-    Dispatch: slippy.DispatchIntentSomething, // or DispatchIntentNothing
+    Dispatch: dispatchIntentForThisPush, // MUST be computed per push, never a constant
 })
 
 // Mark push parsing as complete
