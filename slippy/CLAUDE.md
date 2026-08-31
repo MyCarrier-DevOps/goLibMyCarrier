@@ -47,9 +47,10 @@ rolls back instead of destroying the run. Implementations MUST provide that atom
 
 Folding the create into the store also closed four other defects structurally rather than
 by documentation: the successor's row is inserted **before** any descendant is repointed
-onto it (so no descendant can name a correlation ID that has no row — and Phase B is free
-to add a foreign key on `slip_ancestry.parent_correlation_id`, which the old
-repoint-before-insert ordering made impossible); the superseded run's own parent link is
+onto it (so no descendant can name a correlation ID that has no row — necessary but not
+sufficient for a foreign key on `slip_ancestry.parent_correlation_id`, since the guarded
+DELETE still removes the referenced row while descendants point at it; Phase B adds no such
+FK, and both of its FKs are on `correlation_id`); the superseded run's own parent link is
 carried forward when the caller resolved no ancestry, instead of being deleted and never
 replaced; the successor's identity is a `*Slip` the store itself writes rather than a
 caller-supplied ID string written into other slips' ancestry rows unvalidated; and the

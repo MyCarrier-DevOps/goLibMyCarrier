@@ -431,10 +431,16 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 // SQL guard below and the Go predicate are two independent encodings of the same "is this
 // slip ended" decision. TestRepaveableSlipStatusesSQL_MatchesIsLive (in
 // postgres_store_updates_test.go) parses this constant and asserts that equality across a
-// hand-maintained list of SlipStatus values, not across the enum itself — what actually
-// stops a new status slipping through unnoticed is the `exhaustive` linter, which fails
-// IsTerminal's switch until the new constant is placed in one of its explicit case lists. If they ever drift (e.g. a ninth status added to IsTerminal/
-// IsLive but not here), the guarded DELETE below stops matching a status CreateSlipForPush
+// hand-maintained list of SlipStatus values, not across the enum itself.
+//
+// Nothing mechanically prevents drift. The `exhaustive` linter forces a VISIT to IsTerminal's
+// switch when a status is added — it fails until the new constant appears in one of that
+// switch's explicit case lists — but nothing there points at a SQL constant in a different
+// file, and nothing points at the test's hand-maintained slice either. A ninth SlipStatus
+// added to IsTerminal, omitted from both, is lint-clean and test-green. So: exhaustive forces
+// the visit, it does not stop the drift.
+//
+// If they do drift, the guarded DELETE below stops matching a status CreateSlipForPush
 // still treats as ended: RowsAffected() comes back 0, the existence check finds the row,
 // and Repave returns ErrSlipWentLive for a slip that never actually went live — wedging
 // every push for that commit onto the old, ended slip with no error surfaced anywhere
@@ -454,38 +460,53 @@ const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','
 //
 // Statement order inside the transaction, and why each position is load-bearing:
 //
-//  1. Guarded DELETE of the superseded row (status IN the ended set). Runs first so the
-//     went-live rejection happens before anything is written.
-//  2. Read the superseded run's OWN parent link — before step 3 deletes it — so it can be
-//     carried forward when the caller resolved no ancestry of its own.
-//  3. Delete the superseded run's children explicitly (not via cascade FKs), so this is
-//     correct both before and after migration v5's cascade FKs exist.
+//  1. Read the superseded run's OWN parent link, so it can be carried forward when the
+//     caller resolved no ancestry of its own. This runs FIRST, ahead of the guarded DELETE,
+//     because migration v5's fk_ancestry_slip (correlation_id → routing_slips, ON DELETE
+//     CASCADE) removes the row this reads at the end of that DELETE's statement. Reading
+//     afterwards returns nothing, with no error — and only on the GitHub-outage path the
+//     carry-forward exists for. The result is used only if step 2 actually removed a row.
+//  2. Guarded DELETE of the superseded row (status IN the ended set). The went-live
+//     rejection happens here, before anything is written.
+//  3. Delete the superseded run's children explicitly rather than relying on cascade FKs,
+//     so this step is correct both before and after v5 adds them. Note that v5-safety is a
+//     property of THIS step — it is not a property of the transaction as a whole, which is
+//     what step 1 exists to handle.
 //  4. Insert the successor. This must precede step 5: the repoint names the successor's
 //     correlation ID, so the row has to exist first — that is what keeps a descendant from
-//     ever pointing at a phantom, and what lets Phase B add a foreign key on
-//     slip_ancestry.parent_correlation_id at all.
+//     ever pointing at a phantom. It is necessary but NOT sufficient for a foreign key on
+//     slip_ancestry.parent_correlation_id: the guarded DELETE in step 2 still removes the
+//     referenced row while descendants point at it, so a plain NOT DEFERRABLE FK would raise
+//     23503 there on every repave with a descendant. Phase B adds no such FK — both of its
+//     FKs are on correlation_id.
 //  5. Repoint descendants of the superseded run onto the successor, rewriting the whole
 //     denormalized snapshot that describes the parent: id, repository, branch and status
 //     now name the successor, and parent_failed_step is cleared. All three of id,
 //     repository and branch are ResolveAncestry join keys — its next hop selects on
 //     (repository, branch, correlation_id) using the values recorded beside the parent id,
 //     and none of them is case-folded — so leaving any one describing the deleted run
-//     truncates the walk at exactly the hop this repoint exists to preserve. That bites
-//     for repository via casing (LoadByCommit matches lower(repository), so webhook
-//     casing variance is real and expected) as well as via a genuine repo change.
-//     parent_status is now
-//     knowable (unlike under the old two-call sequence) precisely because step 4 already
-//     inserted the successor in this same transaction.
-//  6. Insert the successor's own parent link: the caller's, or the one carried forward at
-//     step 2. This one statement runs inside a SAVEPOINT and is best-effort — a failure
+//     truncates the walk at exactly the hop this repoint exists to preserve. That bites for
+//     repository via casing (LoadByCommit matches lower(repository), so webhook casing
+//     variance is real and expected) as well as via a genuine repo change. parent_status is
+//     knowable at all (unlike under the old two-call sequence) precisely because step 4
+//     already inserted the successor in this same transaction.
+//  6. Append a state-history entry on the SUCCESSOR naming the run it replaced. Without it
+//     the successor row carries no evidence a prior run existed for this commit: the old row
+//     and its children are gone, and the only other record of the supersession lives in
+//     spans and log lines rather than on any row. Costs one UPDATE on a row this
+//     transaction already holds. This is NOT history preservation (DEVOPS-277) — the prior
+//     run's own state history is still destroyed; it only records that it happened.
+//  7. Insert the successor's own parent link: the caller's, or the one carried forward at
+//     step 1. This one statement runs inside a SAVEPOINT and is best-effort — a failure
 //     rolls back only the link and lets the replacement commit, because failing the whole
 //     repave over a lineage hop would permanently block CI for the commit. See
 //     insertAncestryLinkBestEffort.
 //
-// Steps 2, 3 and 5 are reached only when step 1 reported RowsAffected() > 0 — i.e. only
-// when this call itself removed the row. A repave whose superseded row was already gone
-// still creates the successor (so redelivery converges) but rewrites nothing else, so it
-// can never reassign an unrelated descendant's parent (D2.1, DEVOPS-231 review).
+// Steps 3, 5 and 6 are reached only when step 2 reported RowsAffected() > 0 — i.e. only when
+// this call itself removed the row — and step 1's result is discarded under the same
+// condition. A repave whose superseded row was already gone still creates the successor (so
+// redelivery converges) but rewrites nothing else, so it can never reassign an unrelated
+// descendant's parent (D2.1, DEVOPS-231 review).
 func (s *PostgresStore) Repave(
 	ctx context.Context,
 	oldCorrelationID string,

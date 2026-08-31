@@ -547,9 +547,15 @@ func (c *Client) writeAncestryLink(
 // The phantom-successor window that the pre-Repave code documented here is closed rather
 // than described: the store now inserts the successor BEFORE repointing any descendant onto
 // it, inside one transaction, so no descendant can end up pointing at a correlation ID that
-// never comes into existence — and Phase B is free to put a foreign key on
-// slip_ancestry.parent_correlation_id, which the old repoint-before-insert ordering would
-// have made impossible.
+// never comes into existence.
+//
+// That ordering is necessary but NOT sufficient for a foreign key on
+// slip_ancestry.parent_correlation_id, which an earlier version of this comment claimed it
+// enabled. Repave's FIRST statement is still the guarded DELETE of the old row, and it runs
+// while descendants still carry parent_correlation_id = old — so a plain (NOT DEFERRABLE, NO
+// ACTION) FK would raise 23503 at the end of that statement for every repave that has a
+// descendant, i.e. exactly the case the repoint serves. Phase B deliberately adds no such FK;
+// both of its FKs are on correlation_id.
 func (c *Client) repaveExistingSlip(
 	ctx context.Context,
 	existingSlip *Slip,
@@ -668,6 +674,33 @@ func (c *Client) repaveExistingSlip(
 				existingSlip.CorrelationID, retryErr)
 		}
 		return false, nil
+
+	case errors.Is(repaveErr, ErrInvalidConfiguration):
+		// A precondition the store refuses on its inputs, not a state it can be retried
+		// out of — today that is the self-repave rejection (oldCorrelationID ==
+		// newSlip.CorrelationID). It is called out separately from the fatal default below
+		// because the default's stated reason for being fatal INVERTS here: the default
+		// argues that failing the push "lets Kafka redeliver against a store that still
+		// holds the superseded row", i.e. that redelivery converges. This one cannot. The
+		// row does survive, but every redelivery presents the identical inputs and is
+		// rejected identically — the offending value is the caller's own correlation ID,
+		// which is stable within a delivery. So the push fails, redelivers, and fails
+		// again with no path to success.
+		//
+		// Still fatal rather than degraded: a caller that presented its own correlation ID
+		// as the row to supersede has a bug, and quietly proceeding would either destroy
+		// history (the very thing the store's guard refuses) or return a slip whose status
+		// contradicts what the caller thinks it created. Logged at Error rather than left
+		// to the default's generic path so the non-converging class is visible in triage
+		// instead of looking like a transient store failure being retried.
+		c.logger.Error(ctx, "Repave rejected on its inputs; redelivery cannot clear this",
+			repaveErr,
+			map[string]interface{}{
+				"existing_id":    existingSlip.CorrelationID,
+				"superseding_id": opts.CorrelationID,
+				"commit":         shortSHA(opts.CommitSHA),
+			})
+		return false, fmt.Errorf("failed to repave slip %s: %w", existingSlip.CorrelationID, repaveErr)
 
 	default:
 		// Fatal — see this function's doc comment for why this is no longer a warning.
@@ -873,6 +906,23 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// caller retry its insert once (handled=false).
 		c.abandonSupersededSlipForUnsupportedRepave(ctx, conflicting, opts, result, "Duplicate-create backstop repave")
 		return false, nil
+
+	case errors.Is(repaveErr, ErrInvalidConfiguration):
+		// Same non-converging class as repaveExistingSlip's arm for this sentinel: the store
+		// refused the inputs, and redelivery presents identical inputs. Called out here too
+		// so the backstop does not report it through a default arm whose reasoning assumes
+		// a retry can eventually succeed.
+		c.logger.Error(ctx, "Duplicate-create backstop: repave rejected on its inputs; "+
+			"redelivery cannot clear this",
+			repaveErr,
+			map[string]interface{}{
+				"conflicting_id": conflicting.CorrelationID,
+				"superseding_id": opts.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+			})
+		return false, fmt.Errorf(
+			"failed to repave conflicting slip %s: %w", conflicting.CorrelationID, repaveErr,
+		)
 
 	default:
 		// Fatal: this backstop is already the last-resort convergence path, so there is

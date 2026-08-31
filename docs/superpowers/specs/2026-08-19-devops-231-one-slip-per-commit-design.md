@@ -82,15 +82,28 @@ with the new run's `correlation_id`.
 ## 3. Schema changes (goLibMyCarrier migration, Postgres)
 
 > **⚠️ Phase B implementation note (PR #82 review):** the "no cascade on
-> **REVERSED — the "no FK on `slip_ancestry.parent_correlation_id`" reasoning below is
-> obsolete.** This banner previously said an FK there was impossible because the repoint
-> ran *before* the successor's row existed. `Repave` inverts that ordering: it inserts the
-> successor (`createTx`) and only then repoints descendants onto it, in one transaction —
-> so the referenced row always exists at repoint time and such an FK is now structurally
-> **viable**. Phase B still does not add one, deliberately and for a different reason:
-> deleting a parent run must not cascade away a child's lineage row. Phase B's two FKs are
-> both on `correlation_id` (the owning run). Anyone revisiting this should evaluate the FK
-> on its merits, not decline it on the ordering argument, which no longer applies.
+> **PARTLY REVERSED — the "no FK on `slip_ancestry.parent_correlation_id`" reasoning below
+> is obsolete, but the conclusion still stands.** This banner previously said such an FK was
+> impossible because the repoint ran *before* the successor's row existed. `Repave` inverts
+> that ordering: it inserts the successor (`createTx`) and only then repoints descendants
+> onto it, in one transaction — so the referenced row always exists at repoint time.
+>
+> **That removes one of two blockers, not both.** `Repave`'s *first* statement is still the
+> guarded `DELETE` of the old `routing_slips` row, and it runs while descendants'
+> `slip_ancestry` rows still carry `parent_correlation_id = old`. A referential check for
+> `NO ACTION` (the default) is an AFTER ROW trigger, and for a NOT DEFERRABLE constraint it
+> fires at end of statement — so a plain FK would raise `23503` on **every repave that has a
+> descendant**, which is precisely the case the repoint exists to serve. Such an FK would
+> need `DEFERRABLE INITIALLY DEFERRED` (moving the check to COMMIT, by which time the
+> repoint has landed) or a `Repave` reordered to insert → repoint → delete.
+>
+> `ON DELETE SET NULL` is not an escape: `slip_ancestry.parent_correlation_id` is
+> `text NOT NULL`. `ON DELETE CASCADE` is the behaviour §3 already declines — deleting a
+> parent run must not cascade away a child's lineage row.
+>
+> Phase B adds no such FK; its two FKs are both on `correlation_id` (the owning run). Anyone
+> revisiting this should evaluate it on the two constraints above rather than on the
+> ordering argument alone, which no longer applies on its own.
 >
 > One caveat if that FK is ever added: `Repave`'s repoint would satisfy it, but the
 > child-side link write on the fresh-create path would not — `writeAncestryLink` runs as a

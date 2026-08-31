@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -375,6 +376,60 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 		if len(store.CreateCalls) != 0 {
 			t.Errorf("a failed repave must not fall through to Create, got %d calls", len(store.CreateCalls))
+		}
+	})
+
+	t.Run("repave rejected on its inputs - fatal, and named as non-converging", func(t *testing.T) {
+		// ErrInvalidConfiguration gets its own arm rather than landing in the fatal
+		// default, because the default's justification for being fatal inverts for it.
+		// The default reasons that failing the push "lets Kafka redeliver against a store
+		// that still holds the superseded row" — i.e. that redelivery converges. This
+		// sentinel cannot converge: the store refused the INPUTS (today, a self-repave
+		// where oldCorrelationID == newSlip.CorrelationID), the correlation ID is stable
+		// within a delivery, so every redelivery is rejected identically.
+		//
+		// Fatal is still right — a caller in this state has a bug worth surfacing, and
+		// degrading would either destroy history or return a slip whose status contradicts
+		// what the caller thinks it created. What the arm buys is that the sentinel is
+		// wrapped and logged as its own class instead of looking like a transient store
+		// failure that a retry might clear.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-badinput",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-badinput",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.RepaveError = fmt.Errorf("%w: Repave successor corr-badinput is the slip being repaved",
+			ErrInvalidConfiguration)
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-badinput-push",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-badinput",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err == nil {
+			t.Fatal("a repave rejected on its inputs must fail the push")
+		}
+		if !errors.Is(err, ErrInvalidConfiguration) {
+			t.Errorf("the sentinel must survive wrapping so callers can classify it, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("no successor may be created, got %d Create calls", len(store.CreateCalls))
+		}
+		if _, ok := store.Slips["corr-badinput"]; !ok {
+			t.Error("the superseded row must be left untouched")
 		}
 	})
 

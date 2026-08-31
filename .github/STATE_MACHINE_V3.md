@@ -128,8 +128,11 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   a pipeline config deployed ahead of the migration adding its step's column (Postgres
   42703 on every insert). The statement order inside the transaction is also load-bearing:
   the successor's row is inserted BEFORE any descendant is repointed onto it, which is what
-  keeps a descendant from naming a row that does not exist and what allows migration v5 to
-  add a foreign key on `slip_ancestry.parent_correlation_id` at all.
+  keeps a descendant from naming a row that does not exist. That is necessary but not
+  sufficient for a foreign key on `slip_ancestry.parent_correlation_id`: the guarded `DELETE`
+  still runs first, while descendants reference the row it removes, so a plain NOT DEFERRABLE
+  FK would raise `23503` on every repave with a descendant. Migration v5 adds no such FK —
+  both of its FKs are on `correlation_id`.
 
   Two further guarantees follow from doing it in one place: if the push resolved no
   ancestry (e.g. a GitHub outage), the superseded run's own parent link is **carried

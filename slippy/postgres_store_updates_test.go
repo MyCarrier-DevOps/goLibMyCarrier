@@ -408,11 +408,15 @@ func queueRepaveThroughRepoint(store *PostgresStore, mock pgxmock.PgxPoolIface, 
 // happy path AND its ordering, which is the substance of the fix. pgxmock runs in strict
 // ordered mode, so this test fails if any statement moves:
 //
-//	guarded delete -> superseded children -> SUCCESSOR INSERT -> descendant repoint -> link
+//	carry-forward read -> guarded delete -> superseded children -> SUCCESSOR INSERT ->
+//	descendant repoint -> predecessor history -> link (in a SAVEPOINT)
 //
-// The successor insert sitting BEFORE the repoint is the load-bearing part: it is what
-// stops a descendant from ever naming a correlation ID that has no row, and what makes a
-// Phase B foreign key on slip_ancestry.parent_correlation_id possible at all.
+// Two positions are load-bearing. The carry-forward read comes FIRST because migration v5's
+// fk_ancestry_slip cascades at the end of the guarded delete's statement, so reading after it
+// would silently find nothing. And the successor insert sits BEFORE the repoint, which is what
+// stops a descendant from ever naming a correlation ID that has no row — necessary but not
+// sufficient for a Phase B foreign key on slip_ancestry.parent_correlation_id, since the
+// guarded delete still removes the referenced row while descendants point at it.
 func TestPostgresStore_Repave_EndedSlip_OrdersStatementsForAtomicReplacement(t *testing.T) {
 	store, mock := newMockStore(t)
 	successor := repaveSuccessor()
