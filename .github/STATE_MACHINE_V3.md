@@ -154,11 +154,20 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   prior run's history for no benefit.
 
   "Will dispatch nothing" is `PushOptions.Dispatch` (`DispatchIntent`) when the caller
-  states it, falling back to `len(Components) == 0` only when it is
-  `DispatchIntentUnspecified`. Component count is neither necessary nor sufficient on its
-  own: a tests-only repo (`buildable=false` + `RunUnitTests=true`) dispatches unit tests
-  with zero build components, and a caller may declare `DispatchIntentNothing` while
-  carrying components. See "the guard no longer infers intent from component count" below
+  states a *recognized* value; `DispatchIntentUnspecified` and any unrecognized value both
+  fall back to `len(Components) == 0`. `Validate()` deliberately never rejects an
+  unrecognized value — a safe degradation is preferable to a hard push failure — so an
+  explicit-but-mis-serialized intent (wrong casing crossing the slippy-api JSON boundary,
+  say) is silently ignored rather than honored. The guard's log line carries
+  `dispatch_intent_recognized` alongside the value so that is visible rather than inferred.
+
+  Component count is neither necessary nor sufficient on its own: a tests-only repo
+  (`buildable=false` + `RunUnitTests=true`) dispatches unit tests with zero build
+  components, and a caller may declare `DispatchIntentNothing` while carrying components.
+
+  Independently of intent, the guard never claims a `failed` slip. That carve-out is what
+  covers the window before `slippy-api` and `pushhookparser` forward the field, during which
+  every real push still arrives `DispatchIntentUnspecified`. See "the guard no longer infers intent from component count" below
   for the failure this fixed, and `DispatchIntent` in `push.go` for what setting it opts a
   componentless push into.
 
