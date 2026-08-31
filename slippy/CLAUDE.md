@@ -289,7 +289,7 @@ slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
     },
     // Optional; unset keeps the legacy len(Components) inference. Set it when
     // component count would be misleading — see slippy.DispatchIntent.
-    Dispatch: slippy.DispatchIntentSomething, // or DispatchIntentNothing
+    Dispatch: dispatchIntentForThisPush, // MUST be computed per push, never a constant
 })
 ```
 
