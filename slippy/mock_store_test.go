@@ -924,6 +924,17 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.UpdateSlipStatusCalls = nil
+	m.RepaveCalls = nil
+	m.RepaveSuccessorCalls = nil
+	m.RepaveParents = nil
+	m.AncestryLinkCalls = nil
+	// One-shot hooks. An unspent SeedOnCreate entry surviving Reset would seed a phantom
+	// conflicting row into the next scenario's supposedly fresh store — the hardest kind of
+	// cross-test contamination to diagnose, because the store looks clean.
+	m.RepaveWentLiveStatus = make(map[string]SlipStatus)
+	m.CreateErrorOnce = make(map[string]error)
+	m.SeedOnCreate = make(map[string]*Slip)
+	m.LoadByCommitNilOnCall = 0
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }

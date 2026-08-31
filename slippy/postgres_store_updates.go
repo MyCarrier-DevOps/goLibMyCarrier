@@ -598,12 +598,25 @@ func (s *PostgresStore) Repave(
 		}
 
 		if removedOld {
+			// parent_commit_sha and created_at are in the SET list for the reason the
+			// "whole denormalized snapshot" claim requires: every column here describes the
+			// parent, and leaving any of them naming the deleted run reproduces the
+			// inconsistency the repoint exists to remove — an id and the fields beside it
+			// describing two different runs.
+			//
+			// parent_commit_sha is a no-op for a same-commit repave, which is all any
+			// in-repo caller performs, but SlipStore.Repave never requires
+			// newSlip.CommitSHA to equal the superseded row's. A future cross-commit
+			// repave would otherwise leave a descendant's AncestryEntry.CommitSHA naming a
+			// commit whose run no longer exists. created_at is stale even for the
+			// same-commit case, since the link now describes a different run.
 			if _, err := tx.Exec(ctx,
 				"UPDATE slip_ancestry SET parent_correlation_id = $1, parent_repository = $2, "+
-					"parent_branch = $3, parent_status = $4, parent_failed_step = '' "+
-					"WHERE parent_correlation_id = $5",
+					"parent_branch = $3, parent_status = $4, parent_commit_sha = $5, "+
+					"created_at = now(), parent_failed_step = '' "+
+					"WHERE parent_correlation_id = $6",
 				newSlip.CorrelationID, newSlip.Repository, newSlip.Branch,
-				string(newSlip.Status), oldCorrelationID,
+				string(newSlip.Status), newSlip.CommitSHA, oldCorrelationID,
 			); err != nil {
 				return fmt.Errorf("repave %s: repointing descendants to %s: %w",
 					oldCorrelationID, newSlip.CorrelationID, err)
@@ -674,8 +687,13 @@ func (s *PostgresStore) insertAncestryLinkBestEffort(
 
 	if linkErr := insertAncestryLinkTx(ctx, sp, slip, parent); linkErr != nil {
 		if rbErr := sp.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			// Join rather than wrap only rbErr: a context cancellation or a dead connection
+			// during the link insert fails BOTH statements, and returning the rollback error
+			// alone discards the root cause — the Warn below, which carries linkErr, is not
+			// reached on this path. An operator debugging repeated repave failures under
+			// redelivery would chase the rollback instead of the insert.
 			return fmt.Errorf("repave %s: roll back ancestry-link savepoint: %w",
-				slip.CorrelationID, rbErr)
+				slip.CorrelationID, errors.Join(rbErr, linkErr))
 		}
 		s.logger.Warn(ctx, "Repave committed without the successor's ancestry link",
 			map[string]interface{}{

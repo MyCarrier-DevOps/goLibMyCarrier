@@ -57,6 +57,18 @@ caller-supplied ID string written into other slips' ancestry rows unvalidated; a
 descendant repoint now rewrites `parent_branch` and `parent_status` alongside the id, so a
 cross-branch repave no longer truncates `ResolveAncestry` at that hop.
 
+**Consumer-visible contract change: `CreateSlipResult.AncestryResolved`.** It used to be
+computed as `len(slip.Ancestry) > 0` on the dedup paths, and no store hydrates `Slip.Ancestry`
+on load in production — so in practice it was **always false** for every dedup. It now
+describes this push's ancestry-resolution attempt, which means it is `true` on the reuse and
+empty-run-guard paths (nothing needed resolving) and preserves the computed value everywhere
+resolution actually ran. The new value is the correct one; the old formula was a bug. But
+slippy-api forwards this field verbatim in its `POST /v1/slips` response and as a span
+attribute, so **any dashboard or alert keyed on `ancestry_resolved` changes meaning across
+this version bump** and should be checked. Note also that slippy-api computes the same
+condemned `len(Ancestry) > 0` formula on one of its own paths, so the two dedup-reporting
+sites will disagree until that is updated too.
+
 **One behavioral reversal to be aware of:** a failed repave is now **fatal** to the push.
 The pre-`Repave` code logged a failed delete as a warning and created the slip anyway.
 That leniency only made sense while delete and create were separate calls; a failed

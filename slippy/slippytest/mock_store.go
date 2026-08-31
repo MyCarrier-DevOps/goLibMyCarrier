@@ -241,6 +241,20 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 	return nil
 }
 
+// LIMITATION worth knowing before writing a test against this double: CommitIndex holds one
+// correlation ID per (repository, commit SHA), so this store cannot represent the Phase A
+// duplicate-row shapes that PostgresStore's lookups now order around. Seed a live row A and
+// an ended row B for one commit and the index points only at B — so LoadLiveByCommit filters
+// it and reports ErrSlipNotFound, where real Postgres returns A (per-row status filter, live
+// first, then updated_at DESC).
+//
+// So the ended-shadows-live hazard cannot be exercised here. It is covered against real rows
+// instead, in postgres_store_integration_test.go
+// (TestPostgresStore_LoadByCommit_PrefersLiveOverNewerEndedDuplicate_Integration and its
+// LoadLiveByCommit counterpart), which seed exactly that pair. A consumer wanting to test
+// their own handling of it needs the same — this double will report the wrong answer
+// confidently, which is worse than reporting none.
+
 // Repave removes the superseded slip and its commit index entry (children live on the Slip
 // struct in the mock, so removing the slip removes everything) and stores newSlip in its
 // place. Modelling both halves is what makes this double faithful to
@@ -801,6 +815,16 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.UpdateSlipStatusCalls = nil
+	// Repave state. Omitted before, which broke this method's own "clears all stored data
+	// and call tracking" contract: a consumer that Resets between scenarios kept stale
+	// repave records, so len(RepaveCalls) assertions passed or failed on the previous
+	// scenario's calls. This is published API, so the bug was theirs to hit, not ours.
+	m.RepaveCalls = nil
+	m.RepaveSuccessorCalls = nil
+	m.RepaveParents = nil
+	// RepaveWentLiveStatus is a one-shot hook: an entry that never fired would otherwise
+	// survive Reset and mutate a later scenario's slip.
+	m.RepaveWentLiveStatus = make(map[string]slippy.SlipStatus)
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }

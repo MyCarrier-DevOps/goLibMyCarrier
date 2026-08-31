@@ -379,6 +379,81 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	t.Run("same-correlation retry on an ended slip converges instead of dead-lettering", func(t *testing.T) {
+		// A caller retrying WITHIN one delivery reuses its correlation ID, so the id it
+		// presents as the successor can be the id already on the row. pushhookparser's
+		// bounded retry does exactly this.
+		//
+		// The sequence that reaches it: attempt 1 creates the slip and dispatches, then fails
+		// later in the handler (a check-run write, say); the dispatched build fails fast, so
+		// the slip is `failed` by the time attempt 2 runs. Attempt 2's LoadByCommit finds an
+		// ENDED row whose correlation_id equals opts.CorrelationID.
+		//
+		// Routing that to Repave cannot work — the store rejects a self-repave, correctly,
+		// because it can only destroy history under an unchanged id. But the rejection is
+		// non-converging: every retry presents the identical input, so the push fails
+		// identically and the message dead-letters. Before this branch existed, the same
+		// retry SUCCEEDED, because Create is an upsert on correlation_id and abandon+create
+		// simply rewrote the row.
+		//
+		// So a same-correlation push takes the plain create path: the upsert rewrites the row
+		// in place, resetting it to a live status, and the caller sees returned == sent and
+		// re-dispatches. That restores the pre-Repave outcome exactly rather than inventing
+		// new semantics for it.
+		//
+		// Note what this deliberately does NOT do: it is not routed to handlePushRetry, which
+		// would return the ended row with only push_parsed reset — the caller would then see
+		// returned == sent, dispatch anyway, and report against a slip whose top-level status
+		// is still `failed`. The upsert is what makes the returned slip genuinely live.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-same-delivery",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retry",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-same-delivery", // SAME id as the row: an in-delivery retry
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retry",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("a same-correlation retry must converge, not fail: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-same-delivery" {
+			t.Fatalf("expected the slip under the caller's own id, got %+v", result.Slip)
+		}
+		if !result.Slip.Status.IsLive() {
+			t.Errorf("the row must be reset to a LIVE status so the re-dispatched run can "+
+				"report against it — a returned slip still carrying the failed status is "+
+				"the outcome routing this to handlePushRetry would have produced (got %q)",
+				result.Slip.Status)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("no repave may be attempted for a self-referential id, got %v", store.RepaveCalls)
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected exactly one Create (the upsert), got %d", len(store.CreateCalls))
+		}
+		stored, loadErr := store.Load(ctx, "corr-same-delivery")
+		if loadErr != nil {
+			t.Fatalf("the row must still exist after the reset: %v", loadErr)
+		}
+		if !stored.Status.IsLive() {
+			t.Errorf("the persisted row must be reset too, not just the returned copy, "+
+				"got %q", stored.Status)
+		}
+	})
+
 	t.Run("repave rejected on its inputs - fatal, and named as non-converging", func(t *testing.T) {
 		// ErrInvalidConfiguration gets its own arm rather than landing in the fatal
 		// default, because the default's justification for being fatal inverts for it.

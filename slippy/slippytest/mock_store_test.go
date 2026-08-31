@@ -7,6 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/slippy"
 )
 
@@ -1017,4 +1020,38 @@ func TestPluralize(t *testing.T) {
 			t.Errorf("pluralize(%s) = %s, expected %s", tt.input, result, tt.expected)
 		}
 	}
+}
+
+// TestMockStore_Reset_ClearsRepaveState pins Reset's own contract — "clears all stored data
+// and call tracking" — against the state DEVOPS-231 added.
+//
+// This is published API, so a gap here is a bug a consumer hits rather than one we hit: a
+// test that Resets between scenarios would keep the previous scenario's repave records, so
+// len(RepaveCalls) assertions pass or fail on the wrong calls. The one-shot hook matters more
+// than the counters — an unspent RepaveWentLiveStatus entry surviving Reset would mutate a
+// later scenario's slip, in a store that looks clean.
+func TestMockStore_Reset_ClearsRepaveState(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-old", Repository: "test/repo", Branch: "main",
+		CommitSHA: "sha-reset", Status: slippy.SlipStatusCompleted,
+	})
+	require.NoError(t, store.Repave(ctx, "corr-old",
+		repaveSuccessorSlip("corr-new", "test/repo", "main", "sha-reset"),
+		&slippy.AncestryEntry{CorrelationID: "parent-1"}))
+	store.RepaveWentLiveStatus["corr-unspent"] = slippy.SlipStatusInProgress
+
+	require.NotEmpty(t, store.RepaveCalls, "precondition: the call was recorded")
+
+	store.Reset()
+
+	assert.Empty(t, store.RepaveCalls, "RepaveCalls must not survive Reset")
+	assert.Empty(t, store.RepaveSuccessorCalls, "RepaveSuccessorCalls must not survive Reset")
+	assert.Empty(t, store.RepaveParents, "RepaveParents must not survive Reset")
+	assert.Empty(t, store.RepaveWentLiveStatus,
+		"an unspent one-shot hook must not leak into the next scenario")
+	assert.Empty(t, store.Slips, "stored slips must not survive Reset")
+	assert.Empty(t, store.CommitIndex, "the commit index must not survive Reset")
 }

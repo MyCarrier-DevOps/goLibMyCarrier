@@ -443,6 +443,8 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 //   - no existing row for this commit: a plain Create plus a best-effort ancestry link.
 //   - an existing ended row: a Repave, which removes that row and writes slip and its link
 //     as ONE transaction, so the commit is never left with no slip at all.
+//   - an existing ended row that IS this push's own slip: a plain Create, because Repave
+//     cannot express it and rejects it. See below.
 //
 // Returns handled=true when result is already populated and the caller should return it
 // as-is (the dedup outcomes); handled=false means slip itself is now persisted.
@@ -457,6 +459,46 @@ func (c *Client) persistSlipForPush(
 	if existingSlip == nil {
 		return c.createFreshSlip(ctx, opts, slip, parent, result)
 	}
+
+	// Self-referential ids: the ended row we found IS the one this push is writing. Route to
+	// the plain create path, which upserts on correlation_id and so rewrites the row in place
+	// — resetting it to a live status — rather than asking the store to supersede a row with
+	// itself.
+	//
+	// This is reachable and not exotic. A caller retrying WITHIN one delivery reuses its
+	// correlation ID (pushhookparser's bounded retry does), so: attempt 1 creates the slip and
+	// dispatches, then fails later in the handler; the dispatched build fails fast; attempt 2
+	// finds an ENDED row carrying its own id.
+	//
+	// Handling it here rather than letting Repave reject it is a convergence requirement, not
+	// a nicety. SlipStore.Repave refuses a self-repave — correctly, since under an unchanged
+	// id it can only destroy history indistinguishably from a no-op — and that refusal is
+	// non-converging: the offending value is the caller's own id, stable across attempts, so
+	// every redelivery fails identically and the message dead-letters. Before Repave existed
+	// this same retry succeeded, because Create has always been an upsert and abandon+create
+	// simply rewrote the row. This restores that outcome rather than inventing a new one.
+	//
+	// Deliberately NOT routed to handlePushRetry, which was the other candidate: that returns
+	// the existing row with only push_parsed reset, so the caller would see returned == sent,
+	// dispatch, and then report against a slip whose top-level status is still failed. The
+	// upsert is what makes the returned slip genuinely live.
+	//
+	// Caveat, unchanged from the pre-Repave behaviour this matches: the row is rewritten but
+	// its slip_component_states children are not deleted, so the new attempt inherits the
+	// previous attempt's component rows under the same id. That is the same inheritance the
+	// upsert-collision note on SlipStore.Repave describes, reached deliberately here rather
+	// than by accident, and clearing them would need a store operation the interface does not
+	// have.
+	if existingSlip.CorrelationID == opts.CorrelationID {
+		c.logger.Info(ctx, "Same-correlation push for an ended slip: resetting it in place",
+			map[string]interface{}{
+				"correlation_id": opts.CorrelationID,
+				"commit":         shortSHA(opts.CommitSHA),
+				"prior_status":   string(existingSlip.Status),
+			})
+		return c.createFreshSlip(ctx, opts, slip, parent, result)
+	}
+
 	return c.repaveExistingSlip(ctx, existingSlip, opts, slip, parent, result)
 }
 
@@ -810,12 +852,27 @@ func (c *Client) handleDuplicateSlipBackstop(
 	result *CreateSlipResult,
 ) (handled bool, err error) {
 	conflicting, loadErr := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
-	if loadErr != nil || conflicting == nil {
-		// No conflicting row found, or the lookup itself failed: nothing to repave
-		// here, so fall through to the caller's single Create retry exactly like
-		// today's pre-fix behavior - the retry will surface the real Create error if
-		// the conflict is still present.
-		return false, nil //nolint:nilerr // intentional fall-through, see comment above
+	switch {
+	case loadErr != nil && !errors.Is(loadErr, ErrSlipNotFound):
+		// A REAL lookup failure — a DB timeout, a connection refused — not a clean miss.
+		// Treating it as "no conflicting row" would route it to a blind Create retry, and a
+		// sentinel from that retry (ErrSlipWentLive, say) then surfaces as fatal rather than
+		// being deduped. Fail the push instead and let Kafka redeliver against a store that
+		// can answer, which is the same choice CreateSlipForPush's own initial lookup makes
+		// for the same reason.
+		return false, fmt.Errorf("duplicate backstop: failed to load conflicting slip for %s@%s: %w",
+			opts.Repository, shortSHA(opts.CommitSHA), loadErr)
+
+	case loadErr != nil, conflicting == nil:
+		// A clean miss (ErrSlipNotFound), or the (nil, nil) shape no store returns. The
+		// winner's row is not visible to us, so there is nothing to repave or dedup onto:
+		// fall through to the caller's single Create retry, which will surface the real
+		// Create error if the conflict is still present.
+		//
+		//nolint:nilerr // ErrSlipNotFound is an absence signal, not a failure: the arm above
+		// already returned for every non-ErrSlipNotFound error, so the only error reaching
+		// here means "no such row", which is exactly the condition this fall-through is for.
+		return false, nil
 	}
 
 	if conflicting.Status.IsLive() {
