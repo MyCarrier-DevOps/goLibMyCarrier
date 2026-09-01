@@ -32,10 +32,16 @@ func TestMockStore_Create(t *testing.T) {
 			t.Error("Slip not stored")
 		}
 
-		// Verify commit index was updated
-		indexKey := slip.Repository + ":" + slip.CommitSHA
-		if store.CommitIndex[indexKey] != slip.CorrelationID {
-			t.Error("CommitIndex not updated")
+		// Verify the commit resolves to it. There is no commit index to inspect - the
+		// lookups derive their answer from the stored rows - so this asserts the behaviour
+		// the index existed to provide.
+		found, err := store.LoadByCommit(ctx, slip.Repository, slip.CommitSHA)
+		if err != nil {
+			t.Fatalf("LoadByCommit after Create failed: %v", err)
+		}
+		if found.CorrelationID != slip.CorrelationID {
+			t.Errorf("expected commit to resolve to %s, got %s",
+				slip.CorrelationID, found.CorrelationID)
 		}
 
 		// Verify call was tracked
@@ -190,13 +196,12 @@ func TestMockStore_Repave(t *testing.T) {
 		}
 	})
 
-	t.Run("does not unmap the commit index when it no longer points at the superseded slip", func(t *testing.T) {
+	t.Run("keeps a duplicate row for the same commit reachable after repaving the other", func(t *testing.T) {
 		// The mock's Create permits duplicate (repo, sha) rows (unlike Postgres' unique
-		// index), and each Create re-points CommitIndex at the newest row. If a caller
-		// later repaves the OLDER row (a), the index by then points at the NEWER row
-		// (b) - the removal must not clear an index entry that no longer belongs to the
-		// slip being superseded, or b becomes unreachable via LoadByCommit even though it
-		// still exists (DEVOPS-231 review D1.1).
+		// index). Repaving the OLDER row (a) must leave the newer row (b) reachable via
+		// LoadByCommit - it still exists, so it must still resolve (DEVOPS-231 review D1.1).
+		// This used to be a claim about which row a commit index named; the lookups now
+		// derive the answer from the stored rows, so it is a claim about the answer itself.
 		store := NewMockStore()
 
 		if err := store.Create(ctx, &Slip{
@@ -672,9 +677,6 @@ func TestMockStore_Reset(t *testing.T) {
 		if len(store.Slips) != 0 {
 			t.Error("Slips not cleared")
 		}
-		if len(store.CommitIndex) != 0 {
-			t.Error("CommitIndex not cleared")
-		}
 		if len(store.LoadCalls) != 0 {
 			t.Error("LoadCalls not cleared")
 		}
@@ -735,4 +737,129 @@ func TestMockStore_ThreadSafety(t *testing.T) {
 			t.Errorf("Expected 50 CreateCalls, got %d", len(store.CreateCalls))
 		}
 	})
+}
+
+// TestMockStore_CommitLookups_DuplicateRowsPerCommit pins this mock's commit lookups against
+// the duplicate-row shape Phase A can hold: more than one routing_slips row per
+// (repository, commit_sha), which PostgresStore orders live-first then updated_at DESC.
+//
+// This mock is the one push_test.go runs against, so the fidelity matters more here than in the
+// exported fixture: if the double resolves a commit to an ended row while a live run for that
+// commit still exists, a push test greenlights re-dispatching against a pipeline that is still
+// running. The exported fixture carries the same table (slippytest/mock_store_test.go); the two
+// mocks are separate implementations, so both need it.
+func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
+	const (
+		repo = "owner/repo"
+		sha  = "deadbeef"
+	)
+	ctx := context.Background()
+	newer := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	older := newer.Add(-1 * time.Hour)
+
+	seed := func(id string, status SlipStatus, updated time.Time) *Slip {
+		return &Slip{
+			CorrelationID: id, Repository: repo, CommitSHA: sha,
+			Status: status, UpdatedAt: updated,
+		}
+	}
+
+	tests := []struct {
+		name         string
+		rows         []*Slip
+		wantByCommit string
+		wantLive     string // "" means ErrSlipNotFound
+	}{
+		{
+			name:         "live row is not shadowed by a newer completed duplicate",
+			rows:         []*Slip{seed("live", SlipStatusPending, older), seed("ended", SlipStatusCompleted, newer)},
+			wantByCommit: "live", wantLive: "live",
+		},
+		{
+			name:         "live row is not shadowed by a newer abandoned duplicate",
+			rows:         []*Slip{seed("live", SlipStatusInProgress, older), seed("ended", SlipStatusAbandoned, newer)},
+			wantByCommit: "live", wantLive: "live",
+		},
+		{
+			name:         "compensating counts as live",
+			rows:         []*Slip{seed("live", SlipStatusCompensating, older), seed("ended", SlipStatusFailed, newer)},
+			wantByCommit: "live", wantLive: "live",
+		},
+		{
+			// Makes LoadLiveByCommit's per-row filter load-bearing: an excluded row sorts
+			// first, with a non-excluded row behind it.
+			name: "an excluded row sorting first must not hide a non-excluded row behind it",
+			rows: []*Slip{
+				seed("completed", SlipStatusCompleted, older),
+				seed("abandoned", SlipStatusAbandoned, newer),
+			},
+			wantByCommit: "abandoned",
+			wantLive:     "completed",
+		},
+		{
+			name: "no live row: newest ended row wins",
+			rows: []*Slip{
+				seed("old-ended", SlipStatusCompleted, older),
+				seed("new-ended", SlipStatusFailed, newer),
+			},
+			wantByCommit: "new-ended",
+			wantLive:     "new-ended",
+		},
+		{
+			name: "every row excluded from the live lookup reports not found",
+			rows: []*Slip{
+				seed("abandoned", SlipStatusAbandoned, older),
+				seed("promoted", SlipStatusPromoted, newer),
+			},
+			wantByCommit: "promoted",
+			wantLive:     "",
+		},
+		{
+			name:         "single row behaves exactly as before",
+			rows:         []*Slip{seed("only", SlipStatusCompleted, newer)},
+			wantByCommit: "only", wantLive: "only",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockStore()
+			for _, row := range tt.rows {
+				store.AddSlip(row)
+			}
+
+			got, err := store.LoadByCommit(ctx, repo, sha)
+			if err != nil {
+				t.Fatalf("LoadByCommit failed: %v", err)
+			}
+			if got.CorrelationID != tt.wantByCommit {
+				t.Errorf("LoadByCommit picked the wrong duplicate: want %s, got %s",
+					tt.wantByCommit, got.CorrelationID)
+			}
+
+			gotLive, err := store.LoadLiveByCommit(ctx, repo, sha)
+			switch {
+			case tt.wantLive == "":
+				if !errors.Is(err, ErrSlipNotFound) {
+					t.Errorf("expected ErrSlipNotFound from LoadLiveByCommit, got %v", err)
+				}
+			case err != nil:
+				t.Fatalf("LoadLiveByCommit failed: %v", err)
+			case gotLive.CorrelationID != tt.wantLive:
+				t.Errorf("LoadLiveByCommit picked the wrong duplicate: want %s, got %s",
+					tt.wantLive, gotLive.CorrelationID)
+			}
+
+			// FindByCommits resolves a commit to a slip too, so it must agree rather than
+			// keeping a second, differently-ordered answer.
+			found, matched, err := store.FindByCommits(ctx, repo, []string{sha})
+			if err != nil {
+				t.Fatalf("FindByCommits failed: %v", err)
+			}
+			if matched != sha || found.CorrelationID != tt.wantByCommit {
+				t.Errorf("FindByCommits disagreed with LoadByCommit: want %s, got %s",
+					tt.wantByCommit, found.CorrelationID)
+			}
+		})
+	}
 }

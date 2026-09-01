@@ -3778,7 +3778,6 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-feature"] = featureSlip
-		store.CommitIndex["owner/repo:feature-commit-sha"] = "corr-feature"
 
 		// Set up PR head commit lookup and its ancestry
 		github.SetPRHeadCommit("owner", "repo", 42, "feature-commit-sha")
@@ -3826,7 +3825,6 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-feature"] = featureSlip
-		store.CommitIndex["owner/repo:earlier-commit-sha"] = "corr-feature"
 
 		// PR head is a non-slip commit (e.g., docs change) that comes after the slip commit
 		github.SetPRHeadCommit("owner", "repo", 99, "docs-commit-sha")
@@ -3934,7 +3932,6 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-feature"] = featureSlip
-		store.CommitIndex["owner/repo:feature-sha"] = "corr-feature"
 
 		// First PR (#100) not found (use ErrorFor to be specific)
 		github.GetPRHeadCommitErrorFor = map[string]error{
@@ -3984,7 +3981,6 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 				Status:        SlipStatusCompleted,
 			}
 			store.Slips["corr-self"] = selfSlip
-			store.CommitIndex["owner/repo:sha-x"] = "corr-self"
 
 			github.SetPRHeadCommit("owner", "repo", 7, "sha-x") // FF merge: PR head == pushed commit
 			github.SetAncestry("owner", "repo", "sha-x", []string{"sha-x"})
@@ -4407,7 +4403,6 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			CreatedAt:     time.Now().Add(-1 * time.Hour),
 		}
 		store.Slips["corr-feature-branch"] = featureSlip
-		store.CommitIndex["owner/repo:feature-head-sha"] = "corr-feature-branch"
 
 		// Set up PR head commit lookup (no git ancestry - simulates squash merge)
 		github.SetPRHeadCommit("owner", "repo", 77, "feature-head-sha")
@@ -4473,7 +4468,6 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			CreatedAt:     time.Now().Add(-1 * time.Hour),
 		}
 		store.Slips["corr-ancestor"] = ancestorSlip
-		store.CommitIndex["owner/repo:parent-sha"] = "corr-ancestor"
 
 		// Set up git ancestry
 		github.SetAncestry("owner", "repo", "child-sha", []string{"child-sha", "parent-sha"})

@@ -443,11 +443,12 @@ func TestMockStore_Repave_WentLiveHook_MutatesStatusBeforeReturningError(t *test
 	}
 }
 
-func TestMockStore_Repave_DoesNotUnmapWhenIndexPointsElsewhere(t *testing.T) {
-	// Same fidelity gap as the internal mock: Create permits duplicate (repo, sha) rows
-	// and re-points CommitIndex at the newest one. Superseding an OLDER ended row must not
-	// clear an index entry that has since moved on to a different, still-live row
-	// (DEVOPS-231 review D1.1).
+func TestMockStore_Repave_KeepsSiblingRowFindableWhenSuccessorMovesCommit(t *testing.T) {
+	// Create permits duplicate (repo, sha) rows, so superseding an OLDER ended row must leave
+	// the commit resolving to the still-live sibling (DEVOPS-231 review D1.1). The successor
+	// lands on a DIFFERENT commit here, which is what separates this from
+	// TestMockStore_Repave_LeavesOtherRowsForTheSameCommitAlone: nothing the repave writes can
+	// compete for sha-shared, so the only way corr-b stops resolving is if Repave removed it.
 	store := NewMockStore()
 	ctx := context.Background()
 
@@ -468,8 +469,7 @@ func TestMockStore_Repave_DoesNotUnmapWhenIndexPointsElsewhere(t *testing.T) {
 		t.Fatalf("Create corr-b failed: %v", err)
 	}
 
-	// The successor lands on a different commit, so it cannot itself claim the shared
-	// index entry — isolating the question this test asks.
+	// The successor lands on a different commit, isolating the question this test asks.
 	successor := repaveSuccessorSlip("corr-c", "owner/repo", "main", "sha-other")
 	if err := store.Repave(ctx, "corr-a", successor, nil); err != nil {
 		t.Fatalf("Repave(corr-a) failed: %v", err)
@@ -1053,59 +1053,71 @@ func TestMockStore_Reset_ClearsRepaveState(t *testing.T) {
 	assert.Empty(t, store.RepaveWentLiveStatus,
 		"an unspent one-shot hook must not leak into the next scenario")
 	assert.Empty(t, store.Slips, "stored slips must not survive Reset")
-	assert.Empty(t, store.CommitIndex, "the commit index must not survive Reset")
+
+	// Slips is the only commit-lookup state there is, so an empty map is the whole claim -
+	// asserted through the lookup as well, since that is what a consumer actually calls.
+	_, err := store.LoadByCommit(ctx, "test/repo", "sha-reset")
+	assert.ErrorIs(t, err, slippy.ErrSlipNotFound, "the commit must not resolve after Reset")
 }
 
-// TestMockStore_Repave_DoesNotStealIndexFromALiveSlip pins that the successor claims the
-// commit index only when the index is not already pointing at a different run.
+// TestMockStore_Repave_LeavesOtherRowsForTheSameCommitAlone pins that Repave touches only the
+// row it supersedes, even when another row shares the commit.
 //
-// The guard that declines to CLEAR a moved-on index entry is worthless if the write that
-// follows reassigns it anyway — and it did, because the successor carries the same
-// (repository, commit SHA). The shape: ended slip A and live slip C share a commit, the index
-// points at C, and Repave(A, B) left the index on C and then set it to B, making the live run
-// invisible to LoadByCommit.
+// This replaces a pair of tests that asserted which correlation ID a commit index pointed at
+// after a repave. There is no index any more - the commit lookups derive their answer from the
+// stored rows - so the index-stealing hazard those tests guarded is unrepresentable, and the
+// claim worth keeping is the one about blast radius: a repave must not delete, hide or mutate a
+// sibling row.
 //
-// That is the case this PR taught PostgresStore.LoadByCommit to get right via live-first
-// ordering, so a divergence here would greenlight a consumer's push test that re-dispatches
-// against a pipeline still running in production — the exact failure the double exists to
-// prevent.
-func TestMockStore_Repave_DoesNotStealIndexFromALiveSlip(t *testing.T) {
+// Note what is deliberately NOT asserted: that the still-live sibling always wins the lookup.
+// With two live rows the store orders on updated_at, and real Postgres breaks an exact tie
+// arbitrarily - so this seeds distinct timestamps and asserts the ordering that follows from
+// them, rather than a guarantee neither store makes.
+func TestMockStore_Repave_LeavesOtherRowsForTheSameCommitAlone(t *testing.T) {
 	store := NewMockStore()
 	ctx := context.Background()
 
-	// Ended slip A, then live slip C for the same commit. Create re-points the index at the
-	// newest row, so it now names C.
+	newest := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+	// Ended slip A and live slip C share a commit - a duplicate-row shape Phase A can hold.
 	store.AddSlip(&slippy.Slip{
 		CorrelationID: "corr-A", Repository: "test/repo", Branch: "main",
 		CommitSHA: "sha-shared", Status: slippy.SlipStatusCompleted,
+		UpdatedAt: newest.Add(-2 * time.Hour),
 	})
 	require.NoError(t, store.Create(ctx, &slippy.Slip{
 		CorrelationID: "corr-C", Repository: "test/repo", Branch: "main",
 		CommitSHA: "sha-shared", Status: slippy.SlipStatusInProgress,
+		UpdatedAt: newest,
 	}))
-	require.Equal(t, "corr-C", store.CommitIndex["test/repo:sha-shared"],
-		"precondition: the index has moved on to the live run")
 
-	require.NoError(t, store.Repave(ctx, "corr-A",
-		repaveSuccessorSlip("corr-B", "test/repo", "main", "sha-shared"), nil))
+	successor := repaveSuccessorSlip("corr-B", "test/repo", "main", "sha-shared")
+	successor.UpdatedAt = newest.Add(-1 * time.Hour)
+	require.NoError(t, store.Repave(ctx, "corr-A", successor, nil))
 
-	assert.Equal(t, "corr-C", store.CommitIndex["test/repo:sha-shared"],
-		"the successor must not steal an index entry pointing at a different, still-live run")
+	// The superseded row is gone and the successor exists.
+	_, err := store.Load(ctx, "corr-A")
+	assert.ErrorIs(t, err, slippy.ErrSlipNotFound, "the superseded row must be removed")
+	_, err = store.Load(ctx, "corr-B")
+	assert.NoError(t, err, "the successor must be stored")
 
+	// The sibling is untouched - still present, still live, status not rewritten.
+	sibling, err := store.Load(ctx, "corr-C")
+	require.NoError(t, err, "a repave must not remove a sibling row for the same commit")
+	assert.Equal(t, slippy.SlipStatusInProgress, sibling.Status,
+		"a repave must not mutate a sibling row for the same commit")
+
+	// Both survivors are live, so updated_at decides: corr-C is the newer of the two.
 	got, err := store.LoadByCommit(ctx, "test/repo", "sha-shared")
 	require.NoError(t, err)
 	assert.Equal(t, "corr-C", got.CorrelationID,
-		"LoadByCommit must still find the live run, not the successor")
-
-	// The successor is still stored and reachable by ID — only the index is left alone.
-	_, err = store.Load(ctx, "corr-B")
-	assert.NoError(t, err, "the successor must exist regardless of the index decision")
+		"the newer of two live rows wins the commit lookup")
 }
 
-// TestMockStore_Repave_ClaimsIndexWhenItPointsAtTheSupersededRun is the complement: the
-// ordinary case must still hand the index to the successor, or the fix above would break
-// every normal repave.
-func TestMockStore_Repave_ClaimsIndexWhenItPointsAtTheSupersededRun(t *testing.T) {
+// TestMockStore_Repave_SuccessorBecomesTheCommitsSlip is the ordinary case: with no sibling
+// row, the commit resolves to the successor afterwards. Without this the test above could pass
+// against a Repave that stored the successor somewhere the lookups never read.
+func TestMockStore_Repave_SuccessorBecomesTheCommitsSlip(t *testing.T) {
 	store := NewMockStore()
 	ctx := context.Background()
 
@@ -1113,11 +1125,184 @@ func TestMockStore_Repave_ClaimsIndexWhenItPointsAtTheSupersededRun(t *testing.T
 		CorrelationID: "corr-old", Repository: "test/repo", Branch: "main",
 		CommitSHA: "sha-only", Status: slippy.SlipStatusFailed,
 	})
-	require.Equal(t, "corr-old", store.CommitIndex["test/repo:sha-only"])
-
 	require.NoError(t, store.Repave(ctx, "corr-old",
 		repaveSuccessorSlip("corr-new", "test/repo", "main", "sha-only"), nil))
 
-	assert.Equal(t, "corr-new", store.CommitIndex["test/repo:sha-only"],
-		"the successor takes the index when it was pointing at the run being replaced")
+	got, err := store.LoadByCommit(ctx, "test/repo", "sha-only")
+	require.NoError(t, err)
+	assert.Equal(t, "corr-new", got.CorrelationID,
+		"the commit must resolve to the successor once the superseded row is gone")
+
+	live, err := store.LoadLiveByCommit(ctx, "test/repo", "sha-only")
+	require.NoError(t, err)
+	assert.Equal(t, "corr-new", live.CorrelationID, "the successor is live and must be visible")
+}
+
+// TestMockStore_CommitLookups_DuplicateRowsPerCommit pins the double's commit lookups against
+// the shape Phase A can genuinely hold: more than one routing_slips row per
+// (repository, commit_sha). PostgresStore orders those live-first then updated_at DESC, and
+// LoadLiveByCommit applies its status filter per row rather than to an already-chosen row.
+// A double that returns the newest row instead reports the wrong answer confidently, which is
+// worse for a consumer than reporting none — so these cases are the fixture's contract.
+func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
+	const (
+		repo = "owner/repo"
+		sha  = "deadbeef"
+	)
+	newer := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	older := newer.Add(-1 * time.Hour)
+
+	seed := func(correlationID, repository string, status slippy.SlipStatus, updated time.Time) *slippy.Slip {
+		return &slippy.Slip{
+			CorrelationID: correlationID,
+			Repository:    repository,
+			CommitSHA:     sha,
+			Status:        status,
+			UpdatedAt:     updated,
+		}
+	}
+
+	tests := []struct {
+		name string
+		// rows are seeded in slice order, so a fixture that keeps a last-writer-wins index
+		// resolves the commit to the final entry.
+		rows         []*slippy.Slip
+		queryRepo    string
+		wantByCommit string // correlation ID, or "" for ErrSlipNotFound
+		wantLive     string
+	}{
+		{
+			name: "live row is not shadowed by a newer completed duplicate",
+			rows: []*slippy.Slip{
+				seed("live", repo, slippy.SlipStatusPending, older),
+				seed("ended", repo, slippy.SlipStatusCompleted, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "live",
+			wantLive:     "live",
+		},
+		{
+			name: "live row is not shadowed by a newer abandoned duplicate",
+			rows: []*slippy.Slip{
+				seed("live", repo, slippy.SlipStatusInProgress, older),
+				seed("ended", repo, slippy.SlipStatusAbandoned, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "live",
+			wantLive:     "live",
+		},
+		{
+			name: "compensating counts as live",
+			rows: []*slippy.Slip{
+				seed("live", repo, slippy.SlipStatusCompensating, older),
+				seed("ended", repo, slippy.SlipStatusFailed, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "live",
+			wantLive:     "live",
+		},
+		{
+			name: "no live row: newest ended row wins, and failed stays visible to live lookup",
+			rows: []*slippy.Slip{
+				seed("old-ended", repo, slippy.SlipStatusCompleted, older),
+				seed("new-ended", repo, slippy.SlipStatusFailed, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "new-ended",
+			wantLive:     "new-ended",
+		},
+		{
+			// The case that makes LoadLiveByCommit's per-row filter load-bearing: an EXCLUDED
+			// row sorts first (no live row, and it has the newest updated_at) with a
+			// non-excluded row behind it. Filtering an already-chosen row reports not found
+			// here, hiding a completed slip the store would have returned.
+			name: "an excluded row sorting first must not hide a non-excluded row behind it",
+			rows: []*slippy.Slip{
+				seed("completed", repo, slippy.SlipStatusCompleted, older),
+				seed("abandoned", repo, slippy.SlipStatusAbandoned, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "abandoned",
+			wantLive:     "completed",
+		},
+		{
+			name: "every row excluded from the live lookup reports not found",
+			rows: []*slippy.Slip{
+				seed("abandoned", repo, slippy.SlipStatusAbandoned, older),
+				seed("promoted", repo, slippy.SlipStatusPromoted, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "promoted",
+			wantLive:     "",
+		},
+		{
+			name: "two live rows: newest updated_at wins",
+			rows: []*slippy.Slip{
+				seed("older-live", repo, slippy.SlipStatusPending, older),
+				seed("newer-live", repo, slippy.SlipStatusInProgress, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "newer-live",
+			wantLive:     "newer-live",
+		},
+		{
+			name: "repository match stays case-insensitive across duplicates",
+			rows: []*slippy.Slip{
+				seed("live", "Owner/Repo", slippy.SlipStatusPending, older),
+				seed("ended", "OWNER/REPO", slippy.SlipStatusCompleted, newer),
+			},
+			queryRepo:    "owner/repo",
+			wantByCommit: "live",
+			wantLive:     "live",
+		},
+		{
+			name: "single row behaves exactly as before",
+			rows: []*slippy.Slip{
+				seed("only", repo, slippy.SlipStatusCompleted, newer),
+			},
+			queryRepo:    repo,
+			wantByCommit: "only",
+			wantLive:     "only",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockStore()
+			for _, row := range tt.rows {
+				store.AddSlip(row)
+			}
+			ctx := context.Background()
+
+			got, err := store.LoadByCommit(ctx, tt.queryRepo, sha)
+			if tt.wantByCommit == "" {
+				require.ErrorIs(t, err, slippy.ErrSlipNotFound)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantByCommit, got.CorrelationID, "LoadByCommit picked the wrong duplicate")
+			}
+
+			gotLive, err := store.LoadLiveByCommit(ctx, tt.queryRepo, sha)
+			if tt.wantLive == "" {
+				require.ErrorIs(t, err, slippy.ErrSlipNotFound)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, tt.wantLive, gotLive.CorrelationID, "LoadLiveByCommit picked the wrong duplicate")
+			}
+
+			// FindByCommits and FindAllByCommits resolve a commit to a slip too, so they must
+			// agree with LoadByCommit rather than keeping a second, differently-ordered answer.
+			found, matched, err := store.FindByCommits(ctx, tt.queryRepo, []string{sha})
+			require.NoError(t, err)
+			require.NotNil(t, found)
+			assert.Equal(t, sha, matched)
+			assert.Equal(t, tt.wantByCommit, found.CorrelationID, "FindByCommits disagreed with LoadByCommit")
+
+			all, err := store.FindAllByCommits(ctx, tt.queryRepo, []string{sha})
+			require.NoError(t, err)
+			require.Len(t, all, 1, "FindAllByCommits returns one slip per matched commit")
+			assert.Equal(t, tt.wantByCommit, all[0].Slip.CorrelationID,
+				"FindAllByCommits disagreed with LoadByCommit")
+		})
+	}
 }

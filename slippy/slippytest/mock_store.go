@@ -24,6 +24,7 @@ package slippytest
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,13 +41,13 @@ func pluralize(name string) string {
 	return name + "s"
 }
 
-// commitIndexKey builds the CommitIndex lookup key for a repository/commit pair. The
-// repository is lowercased to mirror PostgresStore's case-insensitive
-// `lower(repository) = lower($1)` comparison (postgres_store.go); the commit SHA is
-// compared as-is, matching production. Every CommitIndex read or write in this file
-// must go through this helper so reads and writes stay in agreement (DEVOPS-231
-// review D1.1) - a partial fix (some sites lowercased, others not) is worse than none.
-func commitIndexKey(repository, commitSHA string) string {
+// commitKey builds the commit-identity key for a repository/commit pair. The repository is
+// lowercased to mirror PostgresStore's case-insensitive `lower(repository) = lower($1)`
+// comparison (postgres_store.go); the commit SHA is compared as-is, matching production.
+// Every commit comparison in this file goes through this helper so no call site can disagree
+// with another about which rows share a commit - a partial fix (some sites lowercased, others
+// not) is worse than none.
+func commitKey(repository, commitSHA string) string {
 	return strings.ToLower(repository) + ":" + commitSHA
 }
 
@@ -63,9 +64,6 @@ type MockStore struct {
 
 	// Storage maps correlation_id -> Slip
 	Slips map[string]*slippy.Slip
-
-	// CommitIndex maps "repo:commit" -> correlation_id for LoadByCommit
-	CommitIndex map[string]string
 
 	// Call tracking
 	CreateCalls           []CreateCall
@@ -205,7 +203,6 @@ type UpdateSlipStatusCall struct {
 func NewMockStore() *MockStore {
 	return &MockStore{
 		Slips:                   make(map[string]*slippy.Slip),
-		CommitIndex:             make(map[string]string),
 		CreateErrorFor:          make(map[string]error),
 		LoadErrorFor:            make(map[string]error),
 		UpdateStepErrorFor:      make(map[string]error),
@@ -234,26 +231,8 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 	slipCopy := DeepCopySlip(slip)
 	m.Slips[slip.CorrelationID] = slipCopy
 
-	// Index by commit for LoadByCommit
-	key := commitIndexKey(slip.Repository, slip.CommitSHA)
-	m.CommitIndex[key] = slip.CorrelationID
-
 	return nil
 }
-
-// LIMITATION worth knowing before writing a test against this double: CommitIndex holds one
-// correlation ID per (repository, commit SHA), so this store cannot represent the Phase A
-// duplicate-row shapes that PostgresStore's lookups now order around. Seed a live row A and
-// an ended row B for one commit and the index points only at B — so LoadLiveByCommit filters
-// it and reports ErrSlipNotFound, where real Postgres returns A (per-row status filter, live
-// first, then updated_at DESC).
-//
-// So the ended-shadows-live hazard cannot be exercised here. It is covered against real rows
-// instead, in postgres_store_integration_test.go
-// (TestPostgresStore_LoadByCommit_PrefersLiveOverNewerEndedDuplicate_Integration and its
-// LoadLiveByCommit counterpart), which seed exactly that pair. A consumer wanting to test
-// their own handling of it needs the same — this double will report the wrong answer
-// confidently, which is worse than reporting none.
 
 // Repave removes the superseded slip and its commit index entry (children live on the Slip
 // struct in the mock, so removing the slip removes everything) and stores newSlip in its
@@ -318,14 +297,6 @@ func (m *MockStore) Repave(
 			return slippy.ErrSlipWentLive
 		}
 		removedOld = true
-		// Only unmap the commit index entry if it still points at THIS slip. Create
-		// permits duplicate (repo, sha) rows and re-points the index at the newest one, so
-		// an older row's removal must not clear an index entry that has since moved on to
-		// a different, still-live row (DEVOPS-231 review D1.1).
-		key := commitIndexKey(slip.Repository, slip.CommitSHA)
-		if id, idOK := m.CommitIndex[key]; idOK && id == oldCorrelationID {
-			delete(m.CommitIndex, key)
-		}
 		delete(m.Slips, oldCorrelationID)
 	}
 
@@ -352,23 +323,12 @@ func (m *MockStore) Repave(
 				newSlip.CommitSHA),
 		})
 	}
+	// No commit index to reconcile: the commit lookups derive their answer from the stored rows
+	// (slipsForCommit), so removing the superseded row and adding the successor is the whole
+	// update. The shape this used to get wrong — store holds ended slip A and live slip C for
+	// one commit, Repave(A, B) re-points the commit at B and hides the still-live C — is now
+	// unrepresentable rather than guarded.
 	m.Slips[newSlip.CorrelationID] = stored
-	// Claim the commit index only if it is not already pointing at a DIFFERENT slip. The
-	// guard above declines to clear an entry that has moved on to another row — writing here
-	// unconditionally undid that in the same call, because the successor carries the same
-	// (repository, commit SHA).
-	//
-	// The shape that broke: the store holds ended slip A and live slip C for one commit, with
-	// the index on C. Repave(A, B) correctly leaves the index on C, then reassigned it to B —
-	// so LoadByCommit returned B and the live run C became invisible. That is exactly the
-	// case this PR taught PostgresStore.LoadByCommit to get right via live-first ordering, so
-	// leaving it here would make the published fixture disagree with the store on the very
-	// behaviour the change adds — greenlighting a consumer's push test that re-dispatches
-	// against a pipeline still running in production.
-	key := commitIndexKey(newSlip.Repository, newSlip.CommitSHA)
-	if id, ok := m.CommitIndex[key]; !ok || id == oldCorrelationID || id == newSlip.CorrelationID {
-		m.CommitIndex[key] = newSlip.CorrelationID
-	}
 	return nil
 }
 
@@ -409,18 +369,12 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 		return nil, m.LoadByCommitError
 	}
 
-	key := commitIndexKey(repository, commitSHA)
-	correlationID, ok := m.CommitIndex[key]
-	if !ok {
+	matches := m.slipsForCommit(repository, commitSHA)
+	if len(matches) == 0 {
 		return nil, slippy.ErrSlipNotFound
 	}
 
-	slip, ok := m.Slips[correlationID]
-	if !ok {
-		return nil, slippy.ErrSlipNotFound
-	}
-
-	return DeepCopySlip(slip), nil
+	return DeepCopySlip(matches[0]), nil
 }
 
 // LoadLiveByCommit retrieves the most recent live slip by repository and commit SHA,
@@ -438,25 +392,20 @@ func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA 
 		return nil, m.LoadLiveByCommitError
 	}
 
-	key := commitIndexKey(repository, commitSHA)
-	correlationID, ok := m.CommitIndex[key]
-	if !ok {
-		return nil, slippy.ErrSlipNotFound
+	// Mirror prod semantics: exclude terminal-superseded statuses. The filter is applied per
+	// row, matching the store's WHERE clause — filtering the single already-chosen row instead
+	// reports ErrSlipNotFound for a commit that still has a live slip, whenever an excluded
+	// duplicate happens to sort first.
+	for _, slip := range m.slipsForCommit(repository, commitSHA) {
+		if slip.Status == slippy.SlipStatusAbandoned ||
+			slip.Status == slippy.SlipStatusPromoted ||
+			slip.Status == slippy.SlipStatusCompensated {
+			continue
+		}
+		return DeepCopySlip(slip), nil
 	}
 
-	slip, ok := m.Slips[correlationID]
-	if !ok {
-		return nil, slippy.ErrSlipNotFound
-	}
-
-	// Mirror prod semantics: exclude terminal-superseded statuses.
-	if slip.Status == slippy.SlipStatusAbandoned ||
-		slip.Status == slippy.SlipStatusPromoted ||
-		slip.Status == slippy.SlipStatusCompensated {
-		return nil, slippy.ErrSlipNotFound
-	}
-
-	return DeepCopySlip(slip), nil
+	return nil, slippy.ErrSlipNotFound
 }
 
 // FindByCommits finds a slip matching any commit in the ordered list.
@@ -479,11 +428,8 @@ func (m *MockStore) FindByCommits(
 
 	// Find the first matching commit in order
 	for _, commit := range commits {
-		key := commitIndexKey(repository, commit)
-		if correlationID, ok := m.CommitIndex[key]; ok {
-			if slip, ok := m.Slips[correlationID]; ok {
-				return DeepCopySlip(slip), commit, nil
-			}
+		if matches := m.slipsForCommit(repository, commit); len(matches) > 0 {
+			return DeepCopySlip(matches[0]), commit, nil
 		}
 	}
 
@@ -512,14 +458,11 @@ func (m *MockStore) FindAllByCommits(
 	// Find all matching commits in order
 	var results []slippy.SlipWithCommit
 	for _, commit := range commits {
-		key := commitIndexKey(repository, commit)
-		if correlationID, ok := m.CommitIndex[key]; ok {
-			if slip, ok := m.Slips[correlationID]; ok {
-				results = append(results, slippy.SlipWithCommit{
-					Slip:          DeepCopySlip(slip),
-					MatchedCommit: commit,
-				})
-			}
+		if matches := m.slipsForCommit(repository, commit); len(matches) > 0 {
+			results = append(results, slippy.SlipWithCommit{
+				Slip:          DeepCopySlip(matches[0]),
+				MatchedCommit: commit,
+			})
 		}
 	}
 
@@ -817,7 +760,6 @@ func (m *MockStore) Reset() {
 	defer m.mu.Unlock()
 
 	m.Slips = make(map[string]*slippy.Slip)
-	m.CommitIndex = make(map[string]string)
 	m.CreateCalls = nil
 	m.LoadCalls = nil
 	m.LoadByCommitCalls = nil
@@ -857,9 +799,6 @@ func (m *MockStore) AddSlip(slip *slippy.Slip) {
 
 	slipCopy := DeepCopySlip(slip)
 	m.Slips[slip.CorrelationID] = slipCopy
-
-	key := commitIndexKey(slip.Repository, slip.CommitSHA)
-	m.CommitIndex[key] = slip.CorrelationID
 }
 
 // DeepCopySlip creates a deep copy of a Slip to prevent test interference.
@@ -917,6 +856,47 @@ func (m *MockStore) ResolveAncestry(
 	maxDepth int,
 ) ([]slippy.AncestryEntry, error) {
 	return []slippy.AncestryEntry{}, nil
+}
+
+// slipsForCommit returns every stored slip for one (repository, commit SHA), ordered the way
+// PostgresStore's commit lookups order rows: live rows first, then updated_at DESC.
+//
+// Phase A can hold more than one routing_slips row per commit, so this double stores rows and
+// derives the answer on read rather than keeping a "current slip for this commit" index. An
+// index can only name one row, which is what previously made the ended-shadows-live hazard
+// unrepresentable here: seed a live row A and a newer ended row B for one commit and the index
+// pointed only at B, so the double reported B — or, for LoadLiveByCommit with B abandoned,
+// reported nothing — where Postgres returns A. A double that answers confidently and wrongly
+// is worse for a consumer than one that cannot answer, so the index is gone.
+//
+// The live/ended split is read from SlipStatus.IsLive — the same predicate
+// repaveableSlipStatusesSQL is pinned against by TestRepaveableSlipStatusesSQL_MatchesIsLive —
+// so this double and the store cannot drift on which statuses count as ended without that test
+// failing. That shared predicate is the point: the ordering rule here is two comparisons, not a
+// reimplementation of the query.
+//
+// Ties on updated_at fall back to correlation ID so this double stays deterministic where
+// Postgres (ORDER BY ... LIMIT 1 over equal keys) is not. No test should depend on which of
+// two otherwise-identical rows wins; seed distinct timestamps when the choice matters.
+func (m *MockStore) slipsForCommit(repository, commitSHA string) []*slippy.Slip {
+	want := commitKey(repository, commitSHA)
+	matches := make([]*slippy.Slip, 0, 1)
+	for _, slip := range m.Slips {
+		if commitKey(slip.Repository, slip.CommitSHA) == want {
+			matches = append(matches, slip)
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		liveI, liveJ := matches[i].Status.IsLive(), matches[j].Status.IsLive()
+		if liveI != liveJ {
+			return liveI
+		}
+		if !matches[i].UpdatedAt.Equal(matches[j].UpdatedAt) {
+			return matches[i].UpdatedAt.After(matches[j].UpdatedAt)
+		}
+		return matches[i].CorrelationID < matches[j].CorrelationID
+	})
+	return matches
 }
 
 // Ensure MockStore implements slippy.SlipStore at compile time.
