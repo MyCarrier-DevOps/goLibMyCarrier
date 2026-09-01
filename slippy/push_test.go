@@ -5145,3 +5145,100 @@ func TestShippedConfigsAreAggregateFirst(t *testing.T) {
 		})
 	}
 }
+
+// TestCreateSlipForPush_ReturnedEqualsSentImpliesLive pins the single invariant the caller
+// protocol rests on, across the whole decision surface rather than one path at a time.
+//
+// The contract between this library and its callers is: `returned != sent` means "deduplicated,
+// suppress your side effects", and `returned == sent` means "this is your slip, proceed". So
+// whenever the returned correlation ID equals the one the caller sent, the returned slip MUST
+// be live — otherwise the caller dispatches builds, tests and deploys, then reports them
+// against a run that has already ended.
+//
+// Two defects found in review were both instances of violating exactly this, in different
+// branches: the empty-run guard claiming a same-correlation push and handing back a terminal
+// slip, and the same-correlation retry arm being unreachable for `completed` because it sat
+// behind that guard. Pinning the invariant rather than the branches means a future
+// rearrangement of the decision tree cannot reintroduce the class somewhere new.
+//
+// The sweep covers every existing-slip status including absent, both correlation-ID
+// relationships, every DispatchIntent including unrecognized and near-miss casing/whitespace
+// variants, and three component counts. Errors are skipped: a failed push returns no slip, so
+// the invariant does not apply to it.
+func TestCreateSlipForPush_ReturnedEqualsSentImpliesLive(t *testing.T) {
+	ctx := context.Background()
+
+	statuses := []SlipStatus{
+		"", // no existing slip for this commit
+		SlipStatusPending, SlipStatusInProgress, SlipStatusCompensating,
+		SlipStatusFailed,
+		SlipStatusCompleted, SlipStatusAbandoned, SlipStatusPromoted, SlipStatusCompensated,
+	}
+	// Near-miss values are deliberate: Dispatch crosses two repo boundaries as a string, so
+	// case and whitespace variants are reachable inputs rather than hypotheticals.
+	intents := []DispatchIntent{
+		DispatchIntentUnspecified, DispatchIntentSomething, DispatchIntentNothing,
+		"garbage", "Nothing", " nothing ",
+	}
+
+	checked := 0
+	for _, existingStatus := range statuses {
+		for _, sameCorrelation := range []bool{false, true} {
+			if existingStatus == "" && sameCorrelation {
+				continue // meaningless: there is no existing row to share an ID with
+			}
+			for _, intent := range intents {
+				for _, componentCount := range []int{0, 1, 3} {
+					const existingID = "corr-existing"
+					sentID := "corr-push"
+					if sameCorrelation {
+						sentID = existingID
+					}
+
+					store := NewMockStore()
+					client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+						Config{PipelineConfig: testPipelineConfig()})
+					if existingStatus != "" {
+						store.AddSlip(&Slip{
+							CorrelationID: existingID, Repository: "owner/repo",
+							Branch: "integration", CommitSHA: "sha-invariant",
+							Status: existingStatus,
+						})
+					}
+					components := make([]ComponentDefinition, componentCount)
+					for i := range components {
+						components[i] = ComponentDefinition{Name: fmt.Sprintf("c%d", i)}
+					}
+
+					result, err := client.CreateSlipForPush(ctx, PushOptions{
+						CorrelationID: sentID,
+						Repository:    "owner/repo",
+						Branch:        "integration",
+						CommitSHA:     "sha-invariant",
+						Components:    components,
+						Dispatch:      intent,
+					})
+					if err != nil || result == nil || result.Slip == nil {
+						continue // a failed push returns no slip; nothing to assert
+					}
+
+					checked++
+					if result.Slip.CorrelationID == sentID && !result.Slip.Status.IsLive() {
+						t.Errorf("invariant violated: existing=%q sameCorrelation=%v intent=%q "+
+							"components=%d returned the sent id with status %q — the caller will "+
+							"dispatch and report against an ended run",
+							existingStatus, sameCorrelation, intent, componentCount,
+							result.Slip.Status)
+					}
+				}
+			}
+		}
+	}
+
+	// Guards the sweep itself: a refactor that made most combinations error out would other-
+	// wise leave this test passing while asserting almost nothing.
+	if checked < 250 {
+		t.Errorf("expected the sweep to reach at least 250 non-error combinations, got %d — "+
+			"the decision surface changed shape and this test may no longer cover it", checked)
+	}
+}
