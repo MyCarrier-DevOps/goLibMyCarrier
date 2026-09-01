@@ -179,9 +179,15 @@ const (
 	// supersede). The superseded row does survive, so the usual "Kafka redelivers against a
 	// store that still holds the row" argument applies to the row — but the offending value
 	// is the caller's own input and is stable across attempts, so every redelivery is
-	// rejected identically. Setting this field is what makes a zero-component push able to
-	// reach store.Repave at all, so it is also what exposes such a caller to that class;
-	// repaveExistingSlip gives it an explicit arm rather than letting it read as transient.
+	// rejected identically.
+	//
+	// Setting this field does NOT expose a caller to that class on the main path, and an
+	// earlier version of this note said it did. persistSlipForPush diverts a self-correlation
+	// push to the in-place upsert before repaveExistingSlip is reached, so for that shape the
+	// field opts you into the upsert path rather than the repave path. The sentinel is still
+	// reachable — handleDuplicateSlipBackstop also calls store.Repave — but only there, and
+	// the backstop now diverts the same shape for the same reason. Both paths give the
+	// sentinel an explicit arm rather than letting it read as transient.
 	DispatchIntentSomething DispatchIntent = "something"
 
 	// DispatchIntentNothing means this push will dispatch NO CI work, so an ended slip for
@@ -214,17 +220,6 @@ func (o PushOptions) Validate() error {
 	return nil
 }
 
-// dispatchesNothing reports whether this push will dispatch no CI work at all, in which
-// case repaving an ended slip for the same commit would destroy that run's history for zero
-// benefit. A RECOGNIZED explicit Dispatch wins; DispatchIntentUnspecified and any
-// unrecognized value both fall back to the legacy component-count inference — a caller
-// therefore does not need to pre-validate its enum value to get safe behavior, but it does
-// need to send a recognized one to get intent honored.
-//
-// Both empty-run guards (CreateSlipForPush's and handleDuplicateSlipBackstop's mirror of it)
-// route through this one method, so the two cannot drift — they are documented as converging
-// on the same outcome for the same inputs, and previously that was two copies of the same
-// expression.
 // recognized reports whether this DispatchIntent is one the library acts on. An unrecognized
 // value is not rejected — dispatchesNothing falls back to the component-count inference for
 // it, deliberately, so a malformed value can never license destroying a prior run's history —
@@ -242,6 +237,17 @@ func (d DispatchIntent) recognized() bool {
 	}
 }
 
+// dispatchesNothing reports whether this push will dispatch no CI work at all, in which
+// case repaving an ended slip for the same commit would destroy that run's history for zero
+// benefit. A RECOGNIZED explicit Dispatch wins; DispatchIntentUnspecified and any
+// unrecognized value both fall back to the legacy component-count inference — a caller
+// therefore does not need to pre-validate its enum value to get safe behavior, but it does
+// need to send a recognized one to get intent honored.
+//
+// Both empty-run guards (CreateSlipForPush's and handleDuplicateSlipBackstop's mirror of it)
+// route through this one method, so the two cannot drift — they are documented as converging
+// on the same outcome for the same inputs, and previously that was two copies of the same
+// expression.
 func (o PushOptions) dispatchesNothing() bool {
 	switch o.Dispatch {
 	case DispatchIntentNothing:
@@ -362,6 +368,31 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 	if existing.CorrelationID == opts.CorrelationID {
 		return false
 	}
+
+	// A RECOGNIZED explicit intent is authoritative in both directions, and is therefore
+	// consulted BEFORE the `failed` carve-out below rather than after it.
+	//
+	// Order matters here, and getting it wrong is destructive. With the carve-out first, a
+	// caller stating DispatchIntentNothing on a failed slip — an authoritative "no work will
+	// run" — fell through to a repave: the failed run's history was destroyed AND the
+	// successor seeded no components (because the same intent suppresses seeding), leaving a
+	// slip nothing could ever advance. That is precisely the outcome the guard exists to
+	// prevent, and it contradicted this field's own documented promise of being authoritative
+	// in both directions.
+	switch opts.Dispatch {
+	case DispatchIntentNothing:
+		return true
+	case DispatchIntentSomething:
+		return false
+	case DispatchIntentUnspecified:
+		// Fall through to the carve-out and the inference below.
+	default:
+		// An unrecognized value falls through too — see dispatchesNothing.
+	}
+
+	// The `failed` carve-out governs the INFERENCE only: it covers the window before
+	// slippy-api and pushhookparser forward Dispatch, during which every real push arrives
+	// Unspecified and a componentless push onto a failed run must still retrigger it.
 	if existing.Status == SlipStatusFailed {
 		return false
 	}
@@ -544,17 +575,21 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			// See DispatchIntent for why component count cannot answer this, and for what
 			// setting it opts such a push into: ancestry resolution, the repave path, and
 			// a repave failure being fatal — none of which this early return reaches.
+			// Whether the caller's stated intent DECIDED this outcome — not merely whether
+			// the value was recognized. False covers both an unrecognized Dispatch and the
+			// unset zero value: this line only ever fires when the guard applied, so
+			// DispatchIntentSomething can never reach it, and for Unspecified the
+			// component-count inference decided rather than the caller. A flag reading
+			// "recognized" would be true for Unspecified and so assert the opposite of what
+			// an operator would take it to mean.
+			intentHonored := opts.Dispatch != DispatchIntentUnspecified && opts.Dispatch.recognized()
 			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
 				map[string]interface{}{
-					"existing_id":     existingSlip.CorrelationID,
-					"commit":          shortSHA(existingSlip.CommitSHA),
-					"dispatch_intent": opts.Dispatch,
-					// Whether the value above was HONORED. An unrecognized Dispatch falls
-					// back to the component-count inference, so without this the line reads
-					// as though the caller's stated intent decided the outcome when it did
-					// not — see DispatchIntent.recognized.
-					"dispatch_intent_recognized": opts.Dispatch.recognized(),
-					"components":                 len(opts.Components),
+					"existing_id":             existingSlip.CorrelationID,
+					"commit":                  shortSHA(existingSlip.CommitSHA),
+					"dispatch_intent":         opts.Dispatch,
+					"dispatch_intent_honored": intentHonored,
+					"components":              len(opts.Components),
 				})
 			result.Slip = existingSlip
 			result.AncestryResolved = true
@@ -1135,11 +1170,13 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// destroy its history for no benefit. Dedup onto it instead of replacing it.
 		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
 			map[string]interface{}{
-				"conflicting_id":             conflicting.CorrelationID,
-				"commit":                     shortSHA(conflicting.CommitSHA),
-				"superseding_id":             opts.CorrelationID,
-				"dispatch_intent":            opts.Dispatch,
-				"dispatch_intent_recognized": opts.Dispatch.recognized(),
+				"conflicting_id":  conflicting.CorrelationID,
+				"commit":          shortSHA(conflicting.CommitSHA),
+				"superseding_id":  opts.CorrelationID,
+				"dispatch_intent": opts.Dispatch,
+				"dispatch_intent_honored": opts.Dispatch != DispatchIntentUnspecified &&
+					opts.Dispatch.recognized(),
+				"components": len(opts.Components),
 			})
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
@@ -1823,28 +1860,40 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 				firstStep = stepConfig.Name
 				// Only auto-run first step if it's NOT an aggregate step,
 				// OR if it's an aggregate that will actually have components to process.
-				// This prevents mobile apps (zero-component slips) from getting stuck.
+				// This keeps mobile apps (zero-component slips) from reporting a step as
+				// started that nothing will ever advance.
 				//
-				// THIS is the gate that decides whether the run can make progress — it sets
-				// the step to running with a StartedAt — so it is the one that must honour
-				// dispatch intent. The aggregate-contents gate below decides only what the
+				// THIS is the gate that decides whether step 0 is REPORTED as started — it
+				// sets the step to running with a StartedAt — so it is the one that must
+				// honour dispatch intent. The aggregate-contents gate below decides only what the
 				// aggregate holds. Component count alone is the wrong question here for the
 				// same reason it is wrong for the empty-run guard: a caller declaring
 				// DispatchIntentNothing while holding components (a combination
 				// DispatchIntent's godoc declares supported and authoritative) would mark an
 				// aggregate step running over an aggregate that the gate below leaves EMPTY.
-				// Nothing could then advance it — applyComponentStatesToAggregate returns
-				// early when no component has reported, and recomputeAggregate returns early
-				// on an empty active set — and the wedge is unrecoverable by any later push,
-				// because handlePushRetry only resets push_parsed, which is not a step in an
-				// aggregate-first config. It also propagates: getPrereqStatus reads this
-				// step's status, and the deploy steps list it as a prerequisite.
+				// What this gate does NOT do is make such a slip advance on its own, and an
+				// earlier version of this comment claimed otherwise: `pending` is no more
+				// self-advancing than `running`. applyComponentStatesToAggregate returns early
+				// when no component has reported, recomputeAggregate returns early on an empty
+				// active set, getPrereqStatus hands the raw status to AllPrerequisitesMet
+				// which requires `completed`, and checkPipelineCompletion buckets pending and
+				// running identically. The slip is in_progress either way, so a later push
+				// takes the IsLive() retry path into handlePushRetry, which only resets
+				// push_parsed — a step no shipped config defines. So there is no PUSH-DRIVEN
+				// recovery for a zero-work aggregate-first slip, with or without this gate:
+				// clearing step 0 takes an explicit consumer call (SkipStep, CompleteStep or
+				// UpdateStepWithStatus in steps.go — skipped counts as success per
+				// StepStatus.IsSuccess, and the call must be component-scoped or the Postgres
+				// recompute is a no-op). That gap is pre-existing DEVOPS-231 behaviour, not
+				// something this gate closes. What this gate buys is reporting accuracy — no
+				// falsified StartedAt, no step reported as started — the same class as the
+				// seeding change below.
 				//
 				// The conjunction is deliberate. Replacing the count with !dispatchesNothing()
 				// alone would flip the tests-only shape (Something + zero components) from
-				// pending to running with an empty aggregate — wedging the very repos
-				// DEVOPS-264 exists to unblock. Both terms are required: work is dispatched
-				// AND there are components to track it.
+				// pending to running with an empty aggregate — reporting a start that never
+				// happened for the very repos DEVOPS-264 exists to unblock. Both terms are
+				// required: work is dispatched AND there are components to track it.
 				isAggregateStep := stepConfig.Aggregates != ""
 				hasComponents := len(opts.Components) > 0 && !opts.dispatchesNothing()
 				if !isAggregateStep || hasComponents {
@@ -1897,10 +1946,21 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 		steps["push_parsed"] = Step{Status: StepStatusRunning, StartedAt: &now}
 	}
 
+	// Report the status step 0 actually received, not an assumed `running`. The gate above
+	// leaves an aggregate first step `pending` whenever this push tracks no components, and a
+	// history entry saying `running` over a pending step is consumer-observable: GetHistory
+	// returns StateHistory verbatim and GetStepHistory filters it, so a caller asking for that
+	// step's history was told it started when it had not. Pre-existing for the zero-component
+	// mobile-app shape; the dispatch-intent gate widened the set of inputs that reach it,
+	// which is what makes the contradiction worth closing rather than inheriting.
+	firstStepStatus := StepStatusPending
+	if step, ok := steps[firstStep]; ok {
+		firstStepStatus = step.Status
+	}
 	history := []StateHistoryEntry{
 		{
 			Step:      firstStep,
-			Status:    StepStatusRunning,
+			Status:    firstStepStatus,
 			Timestamp: now,
 			Actor:     "slippy-library",
 			Message:   "processing push event",
