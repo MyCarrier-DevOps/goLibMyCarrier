@@ -891,6 +891,63 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	t.Run("explicit Nothing on a FAILED slip preserves its history - intent beats the carve-out",
+		func(t *testing.T) {
+			// The `failed` carve-out and explicit intent both bear on this push, and the order
+			// they are consulted in decides whether a run's history survives.
+			//
+			// With the carve-out first, a caller stating DispatchIntentNothing on a failed
+			// slip fell through to a repave: the failed run's history was destroyed, and the
+			// successor seeded no components — because the same intent suppresses seeding — so
+			// the replacement was a slip nothing could ever advance. Both halves of that are
+			// the outcome the guard exists to prevent, and it contradicted DispatchIntent's
+			// documented promise of being authoritative in both directions.
+			//
+			// A recognized explicit intent is therefore consulted first. The carve-out still
+			// governs the inference, which is what covers the pre-adoption window — see the
+			// unset-Dispatch subtest above.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-failed-nothing",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-branch-recreate",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{{Step: "unit_tests", Actor: "ci"}},
+			})
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-recreate",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-branch-recreate",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+				Dispatch:      DispatchIntentNothing, // authoritative: nothing will run
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-failed-nothing" {
+				t.Fatalf("an authoritative Nothing must dedup onto the existing run, got %+v",
+					result.Slip)
+			}
+			if len(store.RepaveCalls) != 0 {
+				t.Errorf("the failed run's history must survive an explicit Nothing, got repaves: %v",
+					store.RepaveCalls)
+			}
+			stored, loadErr := store.Load(ctx, "corr-failed-nothing")
+			if loadErr != nil {
+				t.Fatalf("the failed run must still exist: %v", loadErr)
+			}
+			if len(stored.StateHistory) != 1 {
+				t.Errorf("its history must be intact, got %d entries", len(stored.StateHistory))
+			}
+		})
+
 	t.Run("ended slip + components but dispatch intent says nothing will run - dedups", func(t *testing.T) {
 		// The converse: intent is authoritative in BOTH directions. A caller that knows
 		// nothing will dispatch gets the guard even when components are present, so the
@@ -940,8 +997,10 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		// comment claimed the seeded rows kept the slip IsLive() and so forced later pushes
 		// down handlePushRetry; that chain does not exist. Neither store feeds these rows to
 		// computeAggregateStatus, and checkPipelineCompletion never reads Aggregates at all.
-		// The liveness hazard lives in initializeSlipForPush's hasComponents gate, which is
-		// covered separately.
+		// The reporting-accuracy question lives in initializeSlipForPush's hasComponents
+		// gate, which is covered separately. Note that gate does not confer recoverability
+		// either — see its comment for why a pending step is no more self-advancing than a
+		// running one.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
@@ -976,8 +1035,10 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		// checkPipelineCompletion never reads Aggregates at all — it terminates on
 		// Steps["prod_steady_state"] or a primary step failure. So an empty aggregate cannot
 		// end a slip or stop it being live. What this fix actually buys is data accuracy;
-		// what prevents the wedge is the hasComponents gate in initializeSlipForPush, which
+		// what keeps step 0 from being REPORTED as started is the hasComponents gate in
+		// initializeSlipForPush, which
 		// TestClient_InitializeSlipForPush_NothingIntentDoesNotStartAggregateStep covers.
+		// That gate is reporting accuracy too — it does not make such a slip recoverable.
 	})
 
 	t.Run(
@@ -2504,7 +2565,8 @@ func TestClient_InitializeSlipForPush_MobileApp(t *testing.T) {
 	slip := client.initializeSlipForPush(opts, nil)
 
 	// CRITICAL: First step should be PENDING (not RUNNING) when it's an aggregate with zero components
-	// This allows the step to auto-complete since there are no components to wait for
+	// The step stays pending rather than reporting a start nothing will advance. It does NOT
+	// auto-complete — neither store feeds these seeded rows to computeAggregateStatus.
 	firstStepName := config.Steps[0].Name
 	if slip.Steps[firstStepName].Status != StepStatusPending {
 		t.Errorf(
@@ -2563,13 +2625,16 @@ func aggregateFirstTestConfig() *PipelineConfig {
 // slip, so it is the one that matters.
 //
 // With intent honoured for contents but not for the gate, a Nothing push carrying components
-// marks `builds` running over an aggregate that is now EMPTY, and nothing can ever advance it:
+// marks `builds` running, with a StartedAt, over an aggregate that is now EMPTY — reporting
+// work as in flight that will never report. Nothing advances such a step:
 // applyComponentStatesToAggregate returns early when no component reported, and
-// recomputeAggregate returns early on an empty active set. The wedge is then unrecoverable by
-// any later push, because handlePushRetry only ever resets `push_parsed` — which is not a step
-// in this config — so its status write is skipped entirely and the stuck step is untouched. It
-// also propagates: getPrereqStatus reads Steps[prereq].Status, and both deploy steps list
-// `builds` as a prerequisite, so both gate on `running` indefinitely.
+// recomputeAggregate returns early on an empty active set.
+//
+// What this does NOT claim, because it is not true: that the gate makes the slip recoverable.
+// A `pending` step is no more self-advancing than a `running` one, and no later push clears
+// either — handlePushRetry only resets `push_parsed`, which no shipped config defines, so its
+// status write is skipped entirely. That gap is pre-existing DEVOPS-231 behaviour. What the
+// gate buys is that step 0's status and StartedAt tell the truth.
 //
 // Not reachable in production today — no caller sets Dispatch yet, and pushhookparser empties
 // components exactly when nothing builds — but DispatchIntentNothing's own godoc declares the
@@ -4958,4 +5023,32 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			t.Errorf("expected ancestor slip status 'abandoned', got '%s'", abandonedSlip.Status)
 		}
 	})
+}
+
+// TestShippedConfigsAreAggregateFirst pins the premise the dispatch-intent gate tests rest on.
+//
+// aggregateFirstTestConfig() hand-mirrors the shape the shipped configs have — step 0 an
+// aggregate — and all four InitializeSlipForPush gate tests use that hand-rolled config. So if
+// a shipped config stopped being aggregate-first, the hasComponents gate would be dead for
+// every real pipeline, those four tests would keep passing, and the helper's doc claim would be
+// silently false. Nothing detected that: every LoadPipelineConfigFromFile call site for a
+// shipped config is behind the integration build tag.
+func TestShippedConfigsAreAggregateFirst(t *testing.T) {
+	for _, name := range []string{"default.json", "production.json"} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := LoadPipelineConfigFromFile(name)
+			if err != nil {
+				t.Fatalf("load %s: %v", name, err)
+			}
+			if len(cfg.Steps) == 0 {
+				t.Fatalf("%s has no steps", name)
+			}
+			if cfg.Steps[0].Aggregates == "" {
+				t.Fatalf("%s step 0 %q is no longer an aggregate step, so the hasComponents "+
+					"gate is unreachable for every shipped pipeline and "+
+					"aggregateFirstTestConfig no longer mirrors anything that ships",
+					name, cfg.Steps[0].Name)
+			}
+		})
+	}
 }
