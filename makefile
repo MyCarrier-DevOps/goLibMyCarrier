@@ -14,6 +14,14 @@ LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafk
 # ships a new minor, bump this to a release whose notes list that version's support
 # (`golangci-lint version` prints the Go it was built with).
 GOLANGCI_LINT_VERSION := v2.13.1
+# Commit that $(GOLANGCI_LINT_VERSION) points at. Pinned SEPARATELY because a git tag is
+# mutable: absent a tag-protection rule it can be force-moved, raw.githubusercontent.com serves
+# whatever the ref resolves to at fetch time with no integrity check, and install.sh verifies
+# the tarball it downloads — not itself. I declined this last round on refresh friction; that
+# was the weaker argument, and the sibling repo pins it, so both now agree. Refresh with:
+#   gh api /repos/golangci/golangci-lint/git/ref/tags/$(GOLANGCI_LINT_VERSION) --jq .object.sha
+#   gh api /repos/golangci/golangci-lint/git/tags/<that-sha> --jq .object.sha
+GOLANGCI_LINT_INSTALLER_SHA := 6d2288e072e6f9c9bca28180cae9ce58a049c912
 GOVULNCHECK_VERSION   := v1.7.0
 GO_TEST_COVERAGE_VERSION := v2.19.0
 
@@ -327,11 +335,11 @@ help:
 # install-tools installs golangci-lint at the pinned version, skipping the download when it
 # is already present.
 #
-# The installer is fetched at the SAME tag as the binary it installs, not from HEAD. HEAD is a
-# mutable ref, so piping it to sh executes whatever that branch contains at fetch time. The
-# script already verifies the tarball it downloads (golangci-lint-<version>-checksums.txt +
-# sha256), so pinning the tag closes the one unverified link left in the chain: the script that
-# does the verifying.
+# The installer is fetched at an IMMUTABLE COMMIT, not from HEAD and not from the tag. HEAD is a
+# mutable ref, so piping it to sh executes whatever that branch contains at fetch time; a tag is
+# re-pointable too. The script already verifies the tarball it downloads
+# (golangci-lint-<version>-checksums.txt + sha256), so pinning the commit closes the one
+# unverified link left in the chain: the script that does the verifying.
 #
 # The already-installed short-circuit matters for the same reason, and matches what
 # install-mutest and install-govulncheck already do. `lint` depends on this target, and CI runs
@@ -368,6 +376,7 @@ install-tools:
 		echo "golangci-lint $$got already installed ($$(command -v golangci-lint)), skipping download"; \
 	else \
 		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
-		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh \
+		curl -sSfL --proto '=https' --tlsv1.2 \
+			https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_INSTALLER_SHA)/install.sh \
 			| sh -s -- -b `go env GOPATH`/bin $(GOLANGCI_LINT_VERSION); \
 	fi
