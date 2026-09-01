@@ -353,7 +353,22 @@ func (m *MockStore) Repave(
 		})
 	}
 	m.Slips[newSlip.CorrelationID] = stored
-	m.CommitIndex[commitIndexKey(newSlip.Repository, newSlip.CommitSHA)] = newSlip.CorrelationID
+	// Claim the commit index only if it is not already pointing at a DIFFERENT slip. The
+	// guard above declines to clear an entry that has moved on to another row — writing here
+	// unconditionally undid that in the same call, because the successor carries the same
+	// (repository, commit SHA).
+	//
+	// The shape that broke: the store holds ended slip A and live slip C for one commit, with
+	// the index on C. Repave(A, B) correctly leaves the index on C, then reassigned it to B —
+	// so LoadByCommit returned B and the live run C became invisible. That is exactly the
+	// case this PR taught PostgresStore.LoadByCommit to get right via live-first ordering, so
+	// leaving it here would make the published fixture disagree with the store on the very
+	// behaviour the change adds — greenlighting a consumer's push test that re-dispatches
+	// against a pipeline still running in production.
+	key := commitIndexKey(newSlip.Repository, newSlip.CommitSHA)
+	if id, ok := m.CommitIndex[key]; !ok || id == oldCorrelationID || id == newSlip.CorrelationID {
+		m.CommitIndex[key] = newSlip.CorrelationID
+	}
 	return nil
 }
 
@@ -823,8 +838,13 @@ func (m *MockStore) Reset() {
 	m.RepaveSuccessorCalls = nil
 	m.RepaveParents = nil
 	// RepaveWentLiveStatus is a one-shot hook: an entry that never fired would otherwise
-	// survive Reset and mutate a later scenario's slip.
+	// survive Reset and mutate a later scenario's slip. RepaveError goes with it — the hook's
+	// own doc says the went-live mutation fires only while RepaveError is set, so clearing one
+	// and not the other leaves the pair split: error armed, hook disarmed. The next scenario
+	// then gets a stale error with no mutation, which is neither scenario's configured
+	// behaviour and reads as deliberate.
 	m.RepaveWentLiveStatus = make(map[string]slippy.SlipStatus)
+	m.RepaveError = nil
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }

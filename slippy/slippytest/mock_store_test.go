@@ -1055,3 +1055,69 @@ func TestMockStore_Reset_ClearsRepaveState(t *testing.T) {
 	assert.Empty(t, store.Slips, "stored slips must not survive Reset")
 	assert.Empty(t, store.CommitIndex, "the commit index must not survive Reset")
 }
+
+// TestMockStore_Repave_DoesNotStealIndexFromALiveSlip pins that the successor claims the
+// commit index only when the index is not already pointing at a different run.
+//
+// The guard that declines to CLEAR a moved-on index entry is worthless if the write that
+// follows reassigns it anyway — and it did, because the successor carries the same
+// (repository, commit SHA). The shape: ended slip A and live slip C share a commit, the index
+// points at C, and Repave(A, B) left the index on C and then set it to B, making the live run
+// invisible to LoadByCommit.
+//
+// That is the case this PR taught PostgresStore.LoadByCommit to get right via live-first
+// ordering, so a divergence here would greenlight a consumer's push test that re-dispatches
+// against a pipeline still running in production — the exact failure the double exists to
+// prevent.
+func TestMockStore_Repave_DoesNotStealIndexFromALiveSlip(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	// Ended slip A, then live slip C for the same commit. Create re-points the index at the
+	// newest row, so it now names C.
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-A", Repository: "test/repo", Branch: "main",
+		CommitSHA: "sha-shared", Status: slippy.SlipStatusCompleted,
+	})
+	require.NoError(t, store.Create(ctx, &slippy.Slip{
+		CorrelationID: "corr-C", Repository: "test/repo", Branch: "main",
+		CommitSHA: "sha-shared", Status: slippy.SlipStatusInProgress,
+	}))
+	require.Equal(t, "corr-C", store.CommitIndex["test/repo:sha-shared"],
+		"precondition: the index has moved on to the live run")
+
+	require.NoError(t, store.Repave(ctx, "corr-A",
+		repaveSuccessorSlip("corr-B", "test/repo", "main", "sha-shared"), nil))
+
+	assert.Equal(t, "corr-C", store.CommitIndex["test/repo:sha-shared"],
+		"the successor must not steal an index entry pointing at a different, still-live run")
+
+	got, err := store.LoadByCommit(ctx, "test/repo", "sha-shared")
+	require.NoError(t, err)
+	assert.Equal(t, "corr-C", got.CorrelationID,
+		"LoadByCommit must still find the live run, not the successor")
+
+	// The successor is still stored and reachable by ID — only the index is left alone.
+	_, err = store.Load(ctx, "corr-B")
+	assert.NoError(t, err, "the successor must exist regardless of the index decision")
+}
+
+// TestMockStore_Repave_ClaimsIndexWhenItPointsAtTheSupersededRun is the complement: the
+// ordinary case must still hand the index to the successor, or the fix above would break
+// every normal repave.
+func TestMockStore_Repave_ClaimsIndexWhenItPointsAtTheSupersededRun(t *testing.T) {
+	store := NewMockStore()
+	ctx := context.Background()
+
+	store.AddSlip(&slippy.Slip{
+		CorrelationID: "corr-old", Repository: "test/repo", Branch: "main",
+		CommitSHA: "sha-only", Status: slippy.SlipStatusFailed,
+	})
+	require.Equal(t, "corr-old", store.CommitIndex["test/repo:sha-only"])
+
+	require.NoError(t, store.Repave(ctx, "corr-old",
+		repaveSuccessorSlip("corr-new", "test/repo", "main", "sha-only"), nil))
+
+	assert.Equal(t, "corr-new", store.CommitIndex["test/repo:sha-only"],
+		"the successor takes the index when it was pointing at the run being replaced")
+}

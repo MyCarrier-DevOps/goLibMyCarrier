@@ -54,7 +54,8 @@ FK, and both of its FKs are on `correlation_id`); the superseded run's own paren
 carried forward when the caller resolved no ancestry, instead of being deleted and never
 replaced; the successor's identity is a `*Slip` the store itself writes rather than a
 caller-supplied ID string written into other slips' ancestry rows unvalidated; and the
-descendant repoint now rewrites `parent_branch` and `parent_status` alongside the id, so a
+descendant repoint now rewrites the whole denormalized parent snapshot alongside the id —
+`parent_repository`, `parent_branch`, `parent_status`, `parent_commit_sha` and `created_at` — so a
 cross-branch repave no longer truncates `ResolveAncestry` at that hop.
 
 **Consumer-visible contract change: `CreateSlipResult.AncestryResolved`.** It used to be

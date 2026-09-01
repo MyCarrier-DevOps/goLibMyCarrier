@@ -422,7 +422,12 @@ func (m *MockStore) Repave(
 		})
 	}
 	m.Slips[newSlip.CorrelationID] = stored
-	m.CommitIndex[commitIndexKey(newSlip.Repository, newSlip.CommitSHA)] = newSlip.CorrelationID
+	// Mirrors the exported fixture: claim the index only if it is not already pointing at a
+	// different slip, so this does not undo the guard above for a same-commit repave.
+	key := commitIndexKey(newSlip.Repository, newSlip.CommitSHA)
+	if id, ok := m.CommitIndex[key]; !ok || id == oldCorrelationID || id == newSlip.CorrelationID {
+		m.CommitIndex[key] = newSlip.CorrelationID
+	}
 	return nil
 }
 
@@ -932,6 +937,7 @@ func (m *MockStore) Reset() {
 	// conflicting row into the next scenario's supposedly fresh store — the hardest kind of
 	// cross-test contamination to diagnose, because the store looks clean.
 	m.RepaveWentLiveStatus = make(map[string]SlipStatus)
+	m.RepaveError = nil
 	m.CreateErrorOnce = make(map[string]error)
 	m.SeedOnCreate = make(map[string]*Slip)
 	m.LoadByCommitNilOnCall = 0

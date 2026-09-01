@@ -339,8 +339,18 @@ help:
 # that is 19 fetch-and-pipe-to-sh executions per push. Fewer curl | sh runs is a smaller
 # window as well as a faster build.
 #
-# The version comparison reuses `doctor`'s word-boundary regex rather than a substring match:
-# a plain `case *2.13.1*` would accept 2.13.10 as satisfying a 2.13.1 pin.
+# The version comparison extracts the version FIELD and compares for equality, rather than
+# pattern-matching the whole banner. `golangci-lint version` prints four fields, and a regex
+# built from a dotted version carries unescaped `.` wildcards — so a loose match can be
+# satisfied by the build-SHA or Go-toolchain field instead of the version. Reachability is tiny
+# at a 2.x pin, but this check GATES whether the pinned binary is fetched (in `doctor` the same
+# pattern only prints a status line), and a collision would hand the lint gate to an unpinned
+# binary. Equality on the extracted field keeps the property the previous regex had — 2.13.10
+# does not satisfy a 2.13.1 pin — and fails closed: no match yields an empty `got`, so it
+# installs. The message prints what was FOUND, so a surprise is visible rather than silent.
+#
+# Deliberately NOT shared with `doctor`, whose one pattern spans four tools with four banner
+# shapes; a golangci-lint-specific extraction cannot generalize there.
 #
 # The check reads the binary PATH resolves, because that is the one `lint` will actually run,
 # while the install writes to `go env GOPATH`/bin. Those are the same thing in CI (setup-go
@@ -352,9 +362,10 @@ help:
 .PHONY: install-tools
 install-tools:
 	@want_bare=$$(echo "$(GOLANGCI_LINT_VERSION)" | sed 's/^v//'); \
-	if command -v golangci-lint >/dev/null 2>&1 && \
-	   golangci-lint version 2>&1 | grep -qE "(^|[^0-9.])v?$$want_bare([^0-9.]|$$)"; then \
-		echo "golangci-lint $(GOLANGCI_LINT_VERSION) already installed ($$(command -v golangci-lint)), skipping download"; \
+	got=$$(command -v golangci-lint >/dev/null 2>&1 && golangci-lint version 2>&1 \
+		| sed -n 's/.*has version \([0-9][0-9.]*\).*/\1/p'); \
+	if [ "$$got" = "$$want_bare" ]; then \
+		echo "golangci-lint $$got already installed ($$(command -v golangci-lint)), skipping download"; \
 	else \
 		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
 		curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_VERSION)/install.sh \

@@ -376,9 +376,11 @@ func repaveCarriedLinkRow(parentID string) *pgxmock.Rows {
 // transaction through the descendant repoint, all succeeding, for a repave called with a nil
 // parent. Callers append the statement they want to fail.
 //
-// The carry-forward read comes FIRST, ahead of the guarded delete: Phase B's cascade FK on
-// slip_ancestry.correlation_id would otherwise remove the row it reads at end of the delete
-// statement. Anything that reorders those two fails here, which is the point.
+// When parent is nil the carry-forward read is queued FIRST, ahead of the guarded delete —
+// Phase B's cascade FK on slip_ancestry.correlation_id would otherwise remove the row it reads
+// at end of the delete statement — so a nil-parent caller does pin that ordering. A non-nil
+// parent skips the read entirely (Repave guards it on parent == nil), so callers passing one
+// pin the statements after it and nothing about the read's position.
 func queueRepaveThroughRepoint(store *PostgresStore, mock pgxmock.PgxPoolIface, parent *AncestryEntry) {
 	// The carry-forward read is issued only when the caller supplied no parent — Repave
 	// skips it otherwise, so queuing it unconditionally would leave an unmatched expectation.
@@ -412,12 +414,18 @@ func queueRepaveThroughRepoint(store *PostgresStore, mock pgxmock.PgxPoolIface, 
 //	carry-forward read -> guarded delete -> superseded children -> SUCCESSOR INSERT ->
 //	descendant repoint -> predecessor history -> link (in a SAVEPOINT)
 //
-// Two positions are load-bearing. The carry-forward read comes FIRST because migration v5's
-// fk_ancestry_slip cascades at the end of the guarded delete's statement, so reading after it
-// would silently find nothing. And the successor insert sits BEFORE the repoint, which is what
+// What this test pins is the successor insert sitting BEFORE the repoint, which is what
 // stops a descendant from ever naming a correlation ID that has no row — necessary but not
 // sufficient for a Phase B foreign key on slip_ancestry.parent_correlation_id, since the
 // guarded delete still removes the referenced row while descendants point at it.
+//
+// It does NOT pin the carry-forward read's position, despite the ordered-mode note below.
+// Repave issues that read only when parent == nil, and this test passes a non-nil parent, so
+// no ExpectQuery is queued for it and reverting the read/delete hoist would not fail here.
+// The read's position is pinned by the tests that pass a nil parent —
+// ..._CarriesForwardParentLinkWhenCallerHasNone, ..._CarryForwardReadFailureAborts,
+// ..._RepointRewritesFullParentSnapshot, ..._StatusGuard_CoversEndedStatuses — and against a
+// real cascade FK by ..._CarriesForwardParentLinkUnderCascadeFK_Integration.
 func TestPostgresStore_Repave_EndedSlip_OrdersStatementsForAtomicReplacement(t *testing.T) {
 	store, mock := newMockStore(t)
 	successor := repaveSuccessor()

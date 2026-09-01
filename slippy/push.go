@@ -194,6 +194,22 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 	if existing == nil {
 		return false
 	}
+	// A self-correlation push is never a dedup, so the guard must not claim it. The guard's
+	// entire contract is that the caller sees returned != sent and suppresses its side
+	// effects — that is the only reason returning someone else's slip is safe. When the
+	// existing row already carries THIS push's correlation ID, returned == sent, so the
+	// caller reads the result as a slip it just created and proceeds to dispatch and report
+	// against it. For an ended row that means reporting against a terminal slip.
+	//
+	// Reachable through the same in-delivery retry the reset arm in persistSlipForPush
+	// exists for: attempt 1 creates and dispatches, the run ENDS, attempt 2 arrives with the
+	// same ID and zero components. The `failed` carve-out below does not cover it, because a
+	// run that completed is not `failed`. Declining here sends it to that reset arm, which
+	// upserts the row back to a live status so the caller's dispatch is correct rather than
+	// merely unsuppressed.
+	if existing.CorrelationID == opts.CorrelationID {
+		return false
+	}
 	if existing.Status == SlipStatusFailed {
 		return false
 	}
@@ -222,7 +238,8 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 //     stale and repaved on the same terms as the failed case above — replaced, in one
 //     transaction, by a fresh slip under the new correlation ID from opts. This prevents
 //     resurrecting superseded slips on webhook re-delivery or bot-commit races.
-//   - Existing slip is failed/terminal AND opts.Components is empty: the empty-run guard
+//   - Existing slip is TERMINAL (not failed) AND opts.Components is empty AND the push does
+//     not carry the existing row's own correlation ID: the empty-run guard
 //     short-circuits the repave above and returns the existing (ended) slip as a dedup,
 //     since nothing would be dispatched and repaving would only destroy history for no
 //     benefit. handleDuplicateSlipBackstop applies the identical guard so the two paths
@@ -485,10 +502,20 @@ func (c *Client) persistSlipForPush(
 	//
 	// Caveat, unchanged from the pre-Repave behaviour this matches: the row is rewritten but
 	// its slip_component_states children are not deleted, so the new attempt inherits the
-	// previous attempt's component rows under the same id. That is the same inheritance the
-	// upsert-collision note on SlipStore.Repave describes, reached deliberately here rather
-	// than by accident, and clearing them would need a store operation the interface does not
-	// have.
+	// previous attempt's component rows under the same id.
+	//
+	// That is the same child-row state the upsert-collision note on SlipStore.Repave
+	// describes, but do NOT carry that note's reachability over: it is about a CROSS-RUN
+	// collision needing a caller to reuse another run's UUID, which the note itself calls
+	// unreachable in practice. This arm reaches the state through the routine in-delivery
+	// retry it exists to serve. The consequence is the one that note traces —
+	// recomputeAggregate aggregates every surviving child row for the id and
+	// computeAggregateStatus returns completed once they are all completed, which
+	// AllPrerequisitesMet reads as satisfied — so a downstream gate can open while this
+	// attempt's other components are still building. It needs one component to reach
+	// completed before the others report at all; the retry's own first write makes the set
+	// mixed and anyRunning wins. Narrower than the cross-run case, and genuinely reachable.
+	// Clearing the children would need a store operation the interface does not have.
 	if existingSlip.CorrelationID == opts.CorrelationID {
 		c.logger.Info(ctx, "Same-correlation push for an ended slip: resetting it in place",
 			map[string]interface{}{
@@ -496,6 +523,23 @@ func (c *Client) persistSlipForPush(
 				"commit":         shortSHA(opts.CommitSHA),
 				"prior_status":   string(existingSlip.Status),
 			})
+		// Record that a prior attempt existed. Create upserts state_history along with every
+		// other non-PK column, so without this the previous attempt is replaced by
+		// initializeSlipForPush's single seed entry and the row carries no evidence it was
+		// ever reset. That matters more here than on the repave path, because the correlation
+		// ID does not change either: an operator would see a live row with one seed entry and
+		// be unable to tell a first attempt from a reset one — the same indistinguishability
+		// the store's self-repave guard cites as its reason for existing. Every other
+		// supersede path leaves a marker (Repave appends one, handlePushRetry writes "retry
+		// detected"); this was the only one that did not.
+		slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
+			Step:      "push_parsed",
+			Status:    StepStatusRunning,
+			Timestamp: time.Now(),
+			Actor:     "slippy-library",
+			Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
+				existingSlip.Status, shortSHA(opts.CommitSHA)),
+		})
 		return c.createFreshSlip(ctx, opts, slip, parent, result)
 	}
 
@@ -901,6 +945,30 @@ func (c *Client) handleDuplicateSlipBackstop(
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
 		return true, nil
+	}
+
+	if conflicting.CorrelationID == opts.CorrelationID {
+		// Self-referential: the conflicting row already carries this push's correlation ID,
+		// so Repave would be asked to supersede a row with itself and would reject it with
+		// ErrInvalidConfiguration — a rejection redelivery cannot clear, since the offending
+		// value is the caller's own stable ID. The main path handles this exact shape in
+		// persistSlipForPush by upserting in place; the backstop must not diverge, and this
+		// file asserts elsewhere that the two guard paths converge on the same outcome for
+		// the same inputs.
+		//
+		// handled=false hands control back to createFreshSlip's retry, whose Create is an
+		// upsert on correlation_id — the same in-place reset the main path performs.
+		//
+		// Dormant until Phase B: ErrDuplicateSlip is what routes here, and no unique index
+		// exists yet to raise it.
+		c.logger.Info(ctx, "Duplicate-create backstop: conflicting slip is this push's own; "+
+			"resetting in place instead of repaving",
+			map[string]interface{}{
+				"correlation_id": opts.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+				"prior_status":   string(conflicting.Status),
+			})
+		return false, nil
 	}
 
 	c.logger.Debug(ctx, "Duplicate-create backstop: attempting repave of ended conflicting slip",

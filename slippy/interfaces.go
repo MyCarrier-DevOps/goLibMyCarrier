@@ -119,17 +119,25 @@ type SlipStore interface {
 	// leave the caller with no slip. Implementations MAY make the link atomic too, but MUST
 	// NOT let its failure veto the replacement.
 	//
+	// Read "its failure" narrowly: it is the LINK WRITE that may not veto. A failure of the
+	// savepoint machinery around it — opening, rolling back with anything other than an
+	// already-closed error, or releasing — is a different class and DOES abort the whole
+	// replacement, because at that point the transaction's state is no longer known to be
+	// sound. Those land in the "any other error: nothing is written" case below.
+	//
 	// The delete half is status-guarded: it removes the row ONLY when its status is ended
 	// (failed, completed, abandoned, promoted, compensated), so a slip that has gone live
 	// again between the caller's repave decision and this call is never destroyed.
 	//
 	// Descendant links: any OTHER slip whose ancestry points at oldCorrelationID as its
-	// parent is repointed to newSlip — id, REPOSITORY, branch and status all rewritten to
-	// describe the successor, and parent_failed_step cleared — rather than left dangling,
-	// which would silently truncate that descendant's ResolveAncestry walk. All four columns
-	// matter, not just the id: ResolveAncestry's next hop is an exact, case-sensitive match on
+	// parent is repointed to newSlip — the WHOLE denormalized snapshot describing the parent is
+	// rewritten: id, REPOSITORY, branch, status and commit SHA now name the successor,
+	// created_at is re-stamped, and parent_failed_step is cleared — rather than left dangling,
+	// which would silently truncate that descendant's ResolveAncestry walk. Every column
+	// matters, not just the id: ResolveAncestry's next hop is an exact, case-sensitive match on
 	// (repository, branch, correlation_id), so a stale repository or branch truncates the walk
-	// exactly as a stale id would.
+	// exactly as a stale id would, and a stale parent_commit_sha leaves the descendant's
+	// AncestryEntry.CommitSHA naming a run that no longer exists.
 	//
 	// The repoint happens AFTER newSlip's row exists, so it never names a correlation ID that
 	// does not yet exist. That ordering is necessary but not sufficient for a foreign key on

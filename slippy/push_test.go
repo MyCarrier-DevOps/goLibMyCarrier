@@ -454,6 +454,68 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
+	// The empty-run guard must never claim a push whose correlation ID already matches the
+	// existing row. The guard's contract is that the caller sees returned != sent and
+	// suppresses its side effects — that is the only thing making it safe to return a slip
+	// the caller did not create. When returned == sent, the caller reads the result as its
+	// own freshly created slip and dispatches against it, so for an ended row it would report
+	// against a terminal slip.
+	//
+	// Tabled over all five ended statuses because the earlier fix covered `failed` only, and
+	// `completed` is the shape that exposed the hole: a run that finished between two
+	// attempts of one delivery is not `failed`, so the carve-out never fired.
+	for _, endedStatus := range []SlipStatus{
+		SlipStatusCompleted,
+		SlipStatusFailed,
+		SlipStatusAbandoned,
+		SlipStatusPromoted,
+		SlipStatusCompensated,
+	} {
+		t.Run("same-correlation zero-component push onto "+string(endedStatus)+
+			" resets in place, guard must not claim it", func(t *testing.T) {
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-self",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-self",
+				Status:        endedStatus,
+				Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-self", // an in-delivery retry reuses its ID
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-self",
+				Components:    nil, // zero components: what the guard keys on
+			})
+			if err != nil {
+				t.Fatalf("a same-correlation retry must converge, got %v", err)
+			}
+			if result.Slip == nil {
+				t.Fatal("expected a slip")
+			}
+			if !result.Slip.Status.IsLive() {
+				t.Errorf("the returned slip must be LIVE: the caller sees returned == sent and "+
+					"will dispatch against it, so handing back a %s slip means reporting "+
+					"against a terminal run", endedStatus)
+			}
+			if len(store.RepaveCalls) != 0 {
+				t.Errorf("no repave may be attempted for a self-referential id, got %v",
+					store.RepaveCalls)
+			}
+			if len(store.CreateCalls) != 1 {
+				t.Errorf("expected exactly one Create (the in-place upsert), got %d",
+					len(store.CreateCalls))
+			}
+		})
+	}
+
 	t.Run("repave rejected on its inputs - fatal, and named as non-converging", func(t *testing.T) {
 		// ErrInvalidConfiguration gets its own arm rather than landing in the fatal
 		// default, because the default's justification for being fatal inverts for it.

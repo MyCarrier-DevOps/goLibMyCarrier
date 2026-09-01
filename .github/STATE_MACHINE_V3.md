@@ -128,7 +128,10 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   a pipeline config deployed ahead of the migration adding its step's column (Postgres
   42703 on every insert). The statement order inside the transaction is also load-bearing:
   the successor's row is inserted BEFORE any descendant is repointed onto it, which is what
-  keeps a descendant from naming a row that does not exist. That is necessary but not
+  keeps a descendant from naming a row that does not exist. The repoint rewrites every column
+  describing the parent — id, repository, branch, status and commit SHA, plus a re-stamped
+  `created_at` — since a stale value beside a fresh id reproduces the very inconsistency the
+  repoint removes. That is necessary but not
   sufficient for a foreign key on `slip_ancestry.parent_correlation_id`: the guarded `DELETE`
   still runs first, while descendants reference the row it removes, so a plain NOT DEFERRABLE
   FK would raise `23503` on every repave with a descendant. Migration v5 adds no such FK —
@@ -191,15 +194,39 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   This is a deliberate contract change, not a bug: refusing to repave any ended slip
   that recorded an image tag would make re-pushing an already-built commit
   non-repaveable, which is this PR's primary case.
-- **Empty-run guard consequences.** In a zero-component repo, a failed run cannot be
-  retriggered by re-pushing the same commit — the guard returns the existing (still
-  failed) slip and the caller suppresses re-dispatch. The guard's early return also
-  skips `resolveAndAbandonAncestors`, so an older in-flight slip on the same branch
-  that a fall-through push would otherwise have abandoned stays live. And because the
-  guard dedupes onto ANY ended status, a superseded-terminal slip
-  (`abandoned`/`promoted`/`compensated`) can now be returned from `CreateSlipForPush`
-  for a componentless push — previously impossible, since that function always
-  either reused a live slip or created a fresh one.
+- **Empty-run guard consequences.** ~~In a zero-component repo, a failed run cannot be
+  retriggered by re-pushing the same commit.~~ **No longer true — this was the guard's
+  worst consequence and it is fixed.** `emptyRunGuardApplies` never claims a `failed`
+  slip, so re-pushing a commit whose run failed DOES repave and re-dispatch, which is
+  what makes unit-test retrigger work on a tests-only repo (`buildable=false` +
+  `RunUnitTests=true`) before `DispatchIntent` is adopted end-to-end. If you are
+  triaging a stuck tests-only repo, re-pushing is expected to help.
+
+  The guard also never claims a push whose correlation ID already matches the existing
+  row, because its whole contract is that the caller sees `returned != sent` and
+  suppresses its side effects; when they are equal the caller would instead dispatch
+  against the slip it was handed.
+
+  What remains true for the statuses the guard still claims (`completed`, `abandoned`,
+  `promoted`, `compensated` with zero components): the early return skips
+  `resolveAndAbandonAncestors`, so an older in-flight slip on the same branch that a
+  fall-through push would otherwise have abandoned stays live. And a superseded-terminal
+  slip (`abandoned`/`promoted`/`compensated`) can be returned from `CreateSlipForPush`
+  for a componentless push — previously impossible, since that function always either
+  reused a live slip or created a fresh one.
+- **An ended row may have work in flight against it (DEVOPS-285).** "Ended" includes
+  `failed`, and the operator rerun flow adopts a failed slip's correlation ID and
+  dispatches workflows *before* writing anything to slippy — so the row sits `failed`,
+  and therefore repave-eligible, for as long as that work takes to report its first
+  step. A same-commit push in that window repaves, deletes the row, and the in-flight
+  rerun's step writes then fail `ErrSlipNotFound`. This generalises the in-flight-peer
+  bullet above: pre-DEVOPS-231 late events from *any* superseded run landed on the
+  abandoned row and returned 2xx, and the hard DELETE turns all of them into 404s.
+  Tracked as **DEVOPS-285**, which is deliberately blocked on DEVOPS-277 — if history
+  preservation lands as a tombstone rather than a delete, this class disappears and
+  anything narrower built now is wasted. Note the `failed` carve-out above widens the
+  input surface here: a componentless push onto a `failed` row now falls through to the
+  guarded DELETE where it previously deduped.
 - **No duplicate detection in Phase A.** Without the `uq_routing_slips_repo_sha`
   unique index (Phase B), an insert for the same `(repository, commit_sha)` never
   conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore

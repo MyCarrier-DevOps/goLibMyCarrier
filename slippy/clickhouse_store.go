@@ -452,27 +452,23 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 	}
 
 	// Only select active rows (sign=1) to exclude orphaned cancel rows.
+	// Order by version DESC to get the latest version.
 	//
-	// Live rows sort FIRST, then version DESC. The second term alone answers the wrong
-	// question, for the same reason it did in PostgresStore.LoadByCommit: CreateSlipForPush
-	// routes entirely on this row's status — IsLive() dedupes onto it, anything else is
-	// superseded and CI fully re-dispatches — and "highest version" is not "the one that
-	// matters". Late build events for an abandoned slip insert newer-version rows, so a
-	// redelivered push could find the abandoned row ahead of a still-running one, see it as
-	// ended, and re-dispatch while that run is in flight. main's LoadLiveByCommit excluded
-	// such rows and could not make that mistake.
-	//
-	// This store is not the operational push path (Postgres is, per DEVOPS-127) and its
-	// Repave returns ErrRepaveUnsupported, so on ClickHouse every supersede degrades to
-	// abandon-and-create — which means abandoned/live same-sha pairs accumulate here rather
-	// than being cleaned up, making the hazard MORE likely for any future CH-backed client,
-	// not less. Ordering it correctly costs nothing today.
-	//
-	// The status list matches repaveableSlipStatusesSQL (the complement of IsLive), which
-	// TestRepaveableSlipStatusesSQL_MatchesIsLive pins against the Go predicate.
+	// Deliberately NOT given the live-first ordering PostgresStore.LoadByCommit received for
+	// DEVOPS-231. That ordering exists because CreateSlipForPush routes on this row's status,
+	// and it is correct for Postgres — but Postgres is the slip store (DEVOPS-127), and this
+	// store is not on the push path at all: slippy-api injects a PostgresStore via
+	// NewClientWithDependencies, and ClickHouseStore.Repave returns ErrRepaveUnsupported by
+	// design. Applying it here was a mistake and is reverted: on a VersionedCollapsingMergeTree
+	// an update inserts a cancel row plus a new row at a higher version, so until background
+	// merges collapse the pair, `WHERE sign = 1` sees EVERY historical version of one
+	// correlation_id — and a status-first sort then ranks a stale in_progress version ABOVE
+	// that same slip's newer ended version, an inversion plain `version DESC` cannot produce.
+	// Closing that would need LoadLiveByCommit's per-correlation max(version) subquery, which
+	// is complexity for a store nothing routes pushes through.
 	query := s.queryBuilder.BuildSelectQuery(
 		"WHERE lower(repository) = lower(?) AND commit_sha = ? AND sign = 1",
-		"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, version DESC LIMIT 1",
+		"ORDER BY version DESC LIMIT 1",
 	)
 	slip, err := s.scanSlip(ctx, query, repository, commitSHA)
 	if err != nil {

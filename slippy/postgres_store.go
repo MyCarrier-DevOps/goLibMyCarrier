@@ -153,6 +153,20 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 	// updated_at DESC then breaks ties within each group: among ended rows the newest is the
 	// one worth repaving. Once Phase B lands there is one row per commit and both terms cost
 	// nothing extra.
+	//
+	// KNOWN PHASE A STATE, accepted deliberately: this converts a nondeterministic wrong
+	// answer into a deterministic one. A live row from a CRASHED run is never updated again,
+	// so under updated_at DESC alone it lost to any newer ended row; live-first means it now
+	// always WINS, and every subsequent push for that commit dedupes onto the zombie via
+	// handlePushRetry with the caller suppressing side effects — until the Phase B cleanup
+	// removes the duplicate. There is no timeout or escape hatch.
+	//
+	// That is still the right trade, and the reasoning is worth recording because the
+	// alternative looks safer than it is. Getting it wrong the other way repaves a pipeline
+	// that is genuinely RUNNING: a double dispatch, plus the DEVOPS-285 class of mid-run
+	// 404s, with real CI and deploy effects and no way to un-ring it. A wedged commit is
+	// inert and operator-recoverable. An age bound was considered and rejected — it picks an
+	// arbitrary N and still fails a run that legitimately goes quiet for longer than N.
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
