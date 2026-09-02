@@ -392,15 +392,15 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 	// slip nothing could ever advance. That is precisely the outcome the guard exists to
 	// prevent, and it contradicted this field's own documented promise of being authoritative
 	// in both directions.
-	switch opts.Dispatch {
-	case DispatchIntentNothing:
-		return true
-	case DispatchIntentSomething:
-		return false
-	case DispatchIntentUnspecified:
-		// Fall through to the carve-out and the inference below.
-	default:
-		// An unrecognized value falls through too — see dispatchesNothing.
+	//
+	// honored() is exactly "Nothing or Something", so this delegates those two answers to
+	// dispatchesNothing and lets everything else — Unspecified and any unrecognized value —
+	// fall through to the carve-out and the inference below. Written as a delegation rather
+	// than a second copy of dispatchesNothing's switch: the two are NOT equivalent, because
+	// only this path's fall-through passes through the `failed` check, and having the
+	// difference live in one place is what makes that readable.
+	if opts.Dispatch.honored() {
+		return opts.dispatchesNothing()
 	}
 
 	// The `failed` carve-out governs the INFERENCE only: it covers the window before
