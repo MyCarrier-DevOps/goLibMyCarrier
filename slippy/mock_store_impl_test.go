@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 )
@@ -764,26 +765,41 @@ func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
 		}
 	}
 
+	// The four lookups answer differently on purpose, because the store's four queries do:
+	//
+	//	LoadByCommit      no status filter   live-first, then updated_at DESC
+	//	LoadLiveByCommit  excludes 3         live-first, then updated_at DESC
+	//	FindByCommits     excludes 3         updated_at DESC only (no live-first)
+	//	FindAllByCommits  no status filter   updated_at DESC only, EVERY row
+	//
+	// "excludes 3" is abandoned/promoted/compensated. Collapsing these into one expectation is
+	// how an earlier version of this table came to assert the negation of the store on two of
+	// the four.
 	tests := []struct {
 		name         string
 		rows         []*Slip
 		wantByCommit string
 		wantLive     string // "" means ErrSlipNotFound
+		wantFind     string // "" means ErrSlipNotFound
+		wantFindAll  []string
 	}{
 		{
 			name:         "live row is not shadowed by a newer completed duplicate",
 			rows:         []*Slip{seed("live", SlipStatusPending, older), seed("ended", SlipStatusCompleted, newer)},
 			wantByCommit: "live", wantLive: "live",
+			wantFind: "ended", wantFindAll: []string{"ended", "live"},
 		},
 		{
 			name:         "live row is not shadowed by a newer abandoned duplicate",
 			rows:         []*Slip{seed("live", SlipStatusInProgress, older), seed("ended", SlipStatusAbandoned, newer)},
 			wantByCommit: "live", wantLive: "live",
+			wantFind: "live", wantFindAll: []string{"ended", "live"},
 		},
 		{
 			name:         "compensating counts as live",
 			rows:         []*Slip{seed("live", SlipStatusCompensating, older), seed("ended", SlipStatusFailed, newer)},
 			wantByCommit: "live", wantLive: "live",
+			wantFind: "ended", wantFindAll: []string{"ended", "live"},
 		},
 		{
 			// Makes LoadLiveByCommit's per-row filter load-bearing: an excluded row sorts
@@ -795,6 +811,7 @@ func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
 			},
 			wantByCommit: "abandoned",
 			wantLive:     "completed",
+			wantFind:     "completed", wantFindAll: []string{"abandoned", "completed"},
 		},
 		{
 			name: "no live row: newest ended row wins",
@@ -804,6 +821,7 @@ func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
 			},
 			wantByCommit: "new-ended",
 			wantLive:     "new-ended",
+			wantFind:     "new-ended", wantFindAll: []string{"new-ended", "old-ended"},
 		},
 		{
 			name: "every row excluded from the live lookup reports not found",
@@ -813,11 +831,13 @@ func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
 			},
 			wantByCommit: "promoted",
 			wantLive:     "",
+			wantFind:     "", wantFindAll: []string{"promoted", "abandoned"},
 		},
 		{
 			name:         "single row behaves exactly as before",
 			rows:         []*Slip{seed("only", SlipStatusCompleted, newer)},
 			wantByCommit: "only", wantLive: "only",
+			wantFind: "only", wantFindAll: []string{"only"},
 		},
 	}
 
@@ -850,15 +870,34 @@ func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
 					tt.wantLive, gotLive.CorrelationID)
 			}
 
-			// FindByCommits resolves a commit to a slip too, so it must agree rather than
-			// keeping a second, differently-ordered answer.
+			// FindByCommits keeps a SEPARATE answer from LoadByCommit because the store's
+			// query does: it carries the abandoned/promoted/compensated filter and orders on
+			// updated_at DESC with no live-first term.
 			found, matched, err := store.FindByCommits(ctx, repo, []string{sha})
-			if err != nil {
+			switch {
+			case tt.wantFind == "":
+				if !errors.Is(err, ErrSlipNotFound) {
+					t.Errorf("expected ErrSlipNotFound from FindByCommits, got %v", err)
+				}
+			case err != nil:
 				t.Fatalf("FindByCommits failed: %v", err)
+			case matched != sha || found.CorrelationID != tt.wantFind:
+				t.Errorf("FindByCommits picked the wrong row: want %s, got %s",
+					tt.wantFind, found.CorrelationID)
 			}
-			if matched != sha || found.CorrelationID != tt.wantByCommit {
-				t.Errorf("FindByCommits disagreed with LoadByCommit: want %s, got %s",
-					tt.wantByCommit, found.CorrelationID)
+
+			// FindAllByCommits returns one entry per matching ROW - no LIMIT, no status filter.
+			all, err := store.FindAllByCommits(ctx, repo, []string{sha})
+			if err != nil {
+				t.Fatalf("FindAllByCommits failed: %v", err)
+			}
+			gotAll := make([]string, 0, len(all))
+			for _, r := range all {
+				gotAll = append(gotAll, r.Slip.CorrelationID)
+			}
+			if !slices.Equal(gotAll, tt.wantFindAll) {
+				t.Errorf("FindAllByCommits must return every row newest-first: want %v, got %v",
+					tt.wantFindAll, gotAll)
 			}
 		})
 	}

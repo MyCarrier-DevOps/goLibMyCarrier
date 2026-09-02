@@ -523,27 +523,37 @@ func (c *Client) persistSlipForPush(
 				"commit":         shortSHA(opts.CommitSHA),
 				"prior_status":   string(existingSlip.Status),
 			})
-		// Record that a prior attempt existed. Create upserts state_history along with every
-		// other non-PK column, so without this the previous attempt is replaced by
-		// initializeSlipForPush's single seed entry and the row carries no evidence it was
-		// ever reset. That matters more here than on the repave path, because the correlation
-		// ID does not change either: an operator would see a live row with one seed entry and
-		// be unable to tell a first attempt from a reset one — the same indistinguishability
-		// the store's self-repave guard cites as its reason for existing. Every other
-		// supersede path leaves a marker (Repave appends one, handlePushRetry writes "retry
-		// detected"); this was the only one that did not.
-		slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
-			Step:      "push_parsed",
-			Status:    StepStatusRunning,
-			Timestamp: time.Now(),
-			Actor:     "slippy-library",
-			Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
-				existingSlip.Status, shortSHA(opts.CommitSHA)),
-		})
+		appendResetMarker(slip, existingSlip.Status, opts.CommitSHA)
 		return c.createFreshSlip(ctx, opts, slip, parent, result)
 	}
 
 	return c.repaveExistingSlip(ctx, existingSlip, opts, slip, parent, result)
+}
+
+// appendResetMarker records that a prior attempt for this commit existed, on a slip that is
+// about to be upserted in place under its own correlation ID.
+//
+// Create upserts state_history along with every other non-PK column, so without this the
+// previous attempt is replaced by initializeSlipForPush's single seed entry and the row carries
+// no evidence it was ever reset. That matters more on this path than on the repave path, because
+// the correlation ID does not change either: an operator would see a live row with one seed entry
+// and be unable to tell a first attempt from a reset one — the same indistinguishability the
+// store's self-repave guard cites as its reason for existing. Every other supersede path leaves a
+// marker (Repave appends one, handlePushRetry writes "retry detected").
+//
+// Both in-place reset arms call it — persistSlipForPush's and the duplicate-create backstop's —
+// because this file asserts in two places that those paths converge on the same outcome for the
+// same inputs, and a marker written by only one of them is a divergence on the very observable
+// that exists to make the state legible.
+func appendResetMarker(slip *Slip, priorStatus SlipStatus, commitSHA string) {
+	slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
+		Step:      "push_parsed",
+		Status:    StepStatusRunning,
+		Timestamp: time.Now(),
+		Actor:     "slippy-library",
+		Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
+			priorStatus, shortSHA(commitSHA)),
+	})
 }
 
 // createFreshSlip inserts slip and writes its parent link, for the paths where there is no
@@ -636,12 +646,9 @@ func (c *Client) writeAncestryLink(
 // never comes into existence.
 //
 // That ordering is necessary but NOT sufficient for a foreign key on
-// slip_ancestry.parent_correlation_id, which an earlier version of this comment claimed it
-// enabled. Repave's FIRST statement is still the guarded DELETE of the old row, and it runs
-// while descendants still carry parent_correlation_id = old — so a plain (NOT DEFERRABLE, NO
-// ACTION) FK would raise 23503 at the end of that statement for every repave that has a
-// descendant, i.e. exactly the case the repoint serves. Phase B deliberately adds no such FK;
-// both of its FKs are on correlation_id.
+// slip_ancestry.parent_correlation_id, and Phase B deliberately adds none — see
+// SlipStore.Repave in interfaces.go for the full argument, which is kept in one place because
+// it drifted across four copies in three review rounds.
 func (c *Client) repaveExistingSlip(
 	ctx context.Context,
 	existingSlip *Slip,
@@ -957,7 +964,9 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// the same inputs.
 		//
 		// handled=false hands control back to createFreshSlip's retry, whose Create is an
-		// upsert on correlation_id — the same in-place reset the main path performs.
+		// upsert on correlation_id — the same in-place reset the main path performs, marker
+		// included: the retry's Create upserts state_history too, so without appending here the
+		// two convergent paths would differ on the one observable added to make a reset legible.
 		//
 		// Dormant until Phase B: ErrDuplicateSlip is what routes here, and no unique index
 		// exists yet to raise it.
@@ -968,6 +977,7 @@ func (c *Client) handleDuplicateSlipBackstop(
 				"commit":         shortSHA(conflicting.CommitSHA),
 				"prior_status":   string(conflicting.Status),
 			})
+		appendResetMarker(slip, conflicting.Status, conflicting.CommitSHA)
 		return false, nil
 	}
 

@@ -129,13 +129,16 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   42703 on every insert). The statement order inside the transaction is also load-bearing:
   the successor's row is inserted BEFORE any descendant is repointed onto it, which is what
   keeps a descendant from naming a row that does not exist. The repoint rewrites every column
-  describing the parent — id, repository, branch, status and commit SHA, plus a re-stamped
-  `created_at` — since a stale value beside a fresh id reproduces the very inconsistency the
-  repoint removes. That is necessary but not
-  sufficient for a foreign key on `slip_ancestry.parent_correlation_id`: the guarded `DELETE`
-  still runs first, while descendants reference the row it removes, so a plain NOT DEFERRABLE
-  FK would raise `23503` on every repave with a descendant. Migration v5 adds no such FK —
-  both of its FKs are on `correlation_id`.
+  describing the parent, not just the id, since a stale value beside a fresh id reproduces the
+  very inconsistency the repoint removes; the column list is in `PostgresStore.Repave`
+  (`postgres_store_updates.go`), beside the `UPDATE` it has to stay in step with. That
+  ordering is necessary but not sufficient for a foreign key on
+  `slip_ancestry.parent_correlation_id`, and migration v5 adds none — both of its FKs are on
+  `correlation_id`. The full argument is on `SlipStore.Repave` in `interfaces.go`.
+
+  These two claims are stated here as conclusions with pointers rather than restated in
+  full: they drifted across four and three copies respectively in three consecutive review
+  rounds, so each now has exactly one home.
 
   Two further guarantees follow from doing it in one place: if the push resolved no
   ancestry (e.g. a GitHub outage), the superseded run's own parent link is **carried
@@ -149,10 +152,19 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   row. A store that cannot repave at all (`ClickHouseStore`) returns `ErrRepaveUnsupported`
   and the push path falls back to pre-DEVOPS-231 abandon-then-create semantics.
 - **Empty-run guard.** If the incoming push carries no components (e.g. branch
-  create/recreate at an existing SHA, or a components-less repo) and the existing slip
-  for that SHA is ended, `CreateSlipForPush` returns the existing slip instead of
-  repaving — nothing would be dispatched either way, so repaving would only destroy the
+  create/recreate at an existing SHA, or a components-less repo), the existing slip for
+  that SHA is TERMINAL — **not `failed`**, see below — and the push does **not** carry
+  that row's own `correlation_id`, `CreateSlipForPush` returns the existing slip instead
+  of repaving; nothing would be dispatched either way, so repaving would only destroy the
   prior run's history for no benefit.
+
+  Both exclusions are load-bearing and both are easy to miss because "ended" in this
+  document includes `failed`:
+  - **`failed` is excluded** so a componentless re-push can still retrigger a stuck run
+    (`push.go`, `emptyRunGuardApplies`). See "known sharp edges" below.
+  - **A self-correlation push is excluded** — when the existing row already carries this
+    push's `correlation_id`, returning it would mean `returned == sent`, which the caller
+    protocol reads as "this is your slip, proceed" rather than as a dedup.
 - **Cross-commit supersede → abandon (unchanged).** A newer commit still `AbandonSlip`s
   an in-flight older commit on the same branch (see above) — different `(repo, sha)`, so
   this is untouched by the repave change; `abandoned` rows still exist, there is just

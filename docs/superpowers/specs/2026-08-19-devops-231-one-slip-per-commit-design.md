@@ -213,7 +213,7 @@ Keep the status-based branching; change only the same-commit **ended** action:
 | live (`in_progress`/`pending`/`compensating`) | unchanged — `handlePushRetry` reuse; caller sees `Deduplicated: true`, suppresses |
 | `failed` | `DeleteSlip` (replaces `AbandonSlip`) → fall through to `Create` with the new run's id |
 | terminal (`completed`/`abandoned`/`promoted`/`compensated`) | **also** `DeleteSlip` → fall through to `Create` (today this path silently double-inserts; the index would reject it) |
-| ended **and** the incoming create carries **no components** | **empty-run guard**: return the existing slip as a dedup — do NOT repave real history into an empty run |
+| TERMINAL (**not** `failed`), the incoming create carries **no components**, **and** it does not carry that row's own `correlation_id` | **empty-run guard**: return the existing slip as a dedup — do NOT repave real history into an empty run |
 
 - The lookup must catch terminal rows too: the terminal branch needs `LoadByCommit`
   semantics (or an equivalent check), since `LoadLiveByCommit` filters
@@ -224,10 +224,14 @@ Keep the status-based branching; change only the same-commit **ended** action:
   the existing ended slip (dedup → suppress) is harmless and preserves the real run's
   history. This also retires the shape that produced part of the 10 cross-branch
   duplicates.
-- **Empty-run guard trade-off (accepted):** tests-only repos
+- **Empty-run guard trade-off (partially retired):** tests-only repos
   (`buildable=false` + `RunUnitTests=true` + `AllowSlipWithNoBuilds=true`) always
-  create slips with nil components, so a *webhook-redelivery* retrigger of such a repo
-  is guard-suppressed instead of repaved. Their retrigger capability is the rerun path
+  create slips with nil components. The guard's `failed` exclusion means a re-push onto a
+  **failed** run of such a repo now DOES repave and re-dispatch, so the original trade-off
+  no longer applies to the case that motivated it. What remains suppressed is a
+  componentless re-push onto a run that ended in one of the other four statuses
+  (`completed`/`abandoned`/`promoted`/`compensated`); that is what `DispatchIntent`
+  addresses once callers forward it. Their retrigger capability is also the rerun path
   (retrigger-ci `scope=unit_tests`/`all`), which is unaffected. Regular build repos are
   untouched — their retriggers carry components and repave normally.
 - **Cross-branch is not special**: repave uniformly; the fresh row carries the new

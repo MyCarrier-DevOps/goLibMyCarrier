@@ -4501,3 +4501,69 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 		}
 	})
 }
+
+// TestClient_CreateSlipForPush_BackstopResetLeavesAMarker pins that the duplicate-create
+// backstop's self-correlation arm records a prior attempt the same way the main path's reset arm
+// does.
+//
+// push.go asserts in two places that the two paths "converge on the same outcome for the same
+// inputs" (the backstop's own comment, and the reset arm's). The state-history marker is the one
+// observable added specifically to make an in-place reset legible: Create upserts state_history
+// with every other non-PK column, so without a marker the row carries a single seed entry and an
+// operator cannot tell a first attempt from a reset one — and unlike the repave path, the
+// correlation ID does not change either, so there is nothing else to go on.
+//
+// Dormant in Phase A (ErrDuplicateSlip needs uq_routing_slips_repo_sha), which is exactly why it
+// needs a test: nothing exercises this arm in production yet.
+func TestClient_CreateSlipForPush_BackstopResetLeavesAMarker(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	github := NewMockGitHubAPI()
+	client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+	// The conflicting row carries THIS push's correlation ID - the self-referential shape that
+	// routes to the in-place reset instead of a repave.
+	store.CreateErrorOnce["corr-self-reset"] = ErrDuplicateSlip
+	store.SeedOnCreate["corr-self-reset"] = &Slip{
+		CorrelationID: "corr-self-reset",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-reset",
+		Status:        SlipStatusCompleted,
+	}
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-self-reset",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-reset",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Slip == nil || result.Slip.CorrelationID != "corr-self-reset" {
+		t.Fatalf("expected the caller's own slip back, got %+v", result.Slip)
+	}
+	if len(store.RepaveCalls) != 0 {
+		t.Errorf("a self-referential conflict must reset in place, not repave: %v", store.RepaveCalls)
+	}
+
+	stored, ok := store.Slips["corr-self-reset"]
+	if !ok {
+		t.Fatal("the reset slip must be persisted")
+	}
+	var marker string
+	for _, e := range stored.StateHistory {
+		if strings.Contains(e.Message, "reset in place after") {
+			marker = e.Message
+		}
+	}
+	if marker == "" {
+		t.Fatalf("the backstop's in-place reset must record a prior attempt the way the main "+
+			"path does; history was %+v", stored.StateHistory)
+	}
+	if !strings.Contains(marker, string(SlipStatusCompleted)) {
+		t.Errorf("the marker must name the prior attempt's status, got %q", marker)
+	}
+}

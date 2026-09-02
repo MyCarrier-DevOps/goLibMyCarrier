@@ -86,6 +86,46 @@ type UpdateSlipStatusCall struct {
 	Status        SlipStatus
 }
 
+// supersededTerminal mirrors the SQL predicate `status NOT IN
+// ('abandoned','promoted','compensated')`, which appears on exactly two of the four commit
+// lookups: LoadLiveByCommit (postgres_store.go) and FindByCommits (postgres_store_reads.go).
+// LoadByCommit and FindAllByCommits deliberately carry no such filter.
+func supersededTerminal(status SlipStatus) bool {
+	return status == SlipStatusAbandoned ||
+		status == SlipStatusPromoted ||
+		status == SlipStatusCompensated
+}
+
+// loadOrder sorts rows the way the store's two Load* queries order them: live rows first, then
+// updated_at DESC. The live/ended split reads SlipStatus.IsLive, the same predicate
+// repaveableSlipStatusesSQL is pinned against, so this cannot drift from the store silently.
+func loadOrder(rows []*Slip) {
+	sort.Slice(rows, func(i, j int) bool {
+		liveI, liveJ := rows[i].Status.IsLive(), rows[j].Status.IsLive()
+		if liveI != liveJ {
+			return liveI
+		}
+		return tieBreak(rows[i], rows[j])
+	})
+}
+
+// findOrder sorts rows the way the store's two Find* queries order them: updated_at DESC with NO
+// live-first term. The difference from loadOrder is deliberate — sorting Find* live-first makes
+// this double disagree with the store, which returns the newest row regardless of whether an
+// older one is still running.
+func findOrder(rows []*Slip) {
+	sort.Slice(rows, func(i, j int) bool { return tieBreak(rows[i], rows[j]) })
+}
+
+// tieBreak is the updated_at DESC comparison both orderings share, falling back to correlation ID
+// so this double stays deterministic where Postgres is not.
+func tieBreak(a, b *Slip) bool {
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return a.UpdatedAt.After(b.UpdatedAt)
+	}
+	return a.CorrelationID < b.CorrelationID
+}
+
 // MockStore is an in-memory implementation of SlipStore for testing.
 // It provides configurable behavior and tracking of method calls.
 type MockStore struct {
@@ -327,9 +367,8 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 	return nil
 }
 
-// Repave removes the superseded slip and its commit index entry (children live on the
-// Slip struct in the mock, so removing the slip removes everything) and stores newSlip in
-// its place. Modelling both halves is what makes this double faithful: SlipStore.Repave
+// Repave removes the superseded slip and stores newSlip in its place (children live on
+// the Slip struct in the mock, so removing the slip removes everything). Modelling both halves is what makes this double faithful: SlipStore.Repave
 // guarantees a caller never observes one without the other, so on any error nothing here
 // changes, and on success the superseded slip is gone AND the successor is present.
 //
@@ -436,41 +475,22 @@ func (m *MockStore) Load(ctx context.Context, correlationID string) (*Slip, erro
 	return deepCopySlip(slip), nil
 }
 
-// slipsForCommit returns every stored slip for one (repository, commit SHA), ordered the way
-// PostgresStore's commit lookups order rows: live rows first, then updated_at DESC.
+// rowsForCommit returns every stored slip for one (repository, commit SHA), UNORDERED. Callers
+// apply loadOrder or findOrder depending on which store query they mirror — the two differ, and
+// picking the wrong one is what made this double disagree with the store on FindByCommits.
 //
-// Phase A can hold more than one routing_slips row per commit, so this double stores rows and
-// derives the answer on read rather than keeping a "current slip for this commit" index. An
-// index can only name one row, which previously made the ended-shadows-live hazard
-// unrepresentable here — the exact hazard live-first ordering was added to PostgresStore to fix,
-// so a push test could pass against this double and re-dispatch against a live pipeline in
-// production.
-//
-// The live/ended split reads SlipStatus.IsLive, the same predicate repaveableSlipStatusesSQL is
-// pinned against by TestRepaveableSlipStatusesSQL_MatchesIsLive, so this double and the store
-// cannot drift on which statuses count as ended without that test failing.
-//
-// Ties on updated_at fall back to correlation ID so this double stays deterministic where
-// Postgres is not; seed distinct timestamps when the choice matters.
-func (m *MockStore) slipsForCommit(repository, commitSHA string) []*Slip {
+// This mock is the one push_test.go runs against, so the fidelity matters more here than in the
+// exported fixture: if the double resolves a commit differently than the store, a push test
+// greenlights behaviour production will not reproduce.
+func (m *MockStore) rowsForCommit(repository, commitSHA string) []*Slip {
 	want := commitKey(repository, commitSHA)
-	matches := make([]*Slip, 0, 1)
+	rows := make([]*Slip, 0, 1)
 	for _, slip := range m.Slips {
 		if commitKey(slip.Repository, slip.CommitSHA) == want {
-			matches = append(matches, slip)
+			rows = append(rows, slip)
 		}
 	}
-	sort.Slice(matches, func(i, j int) bool {
-		liveI, liveJ := matches[i].Status.IsLive(), matches[j].Status.IsLive()
-		if liveI != liveJ {
-			return liveI
-		}
-		if !matches[i].UpdatedAt.Equal(matches[j].UpdatedAt) {
-			return matches[i].UpdatedAt.After(matches[j].UpdatedAt)
-		}
-		return matches[i].CorrelationID < matches[j].CorrelationID
-	})
-	return matches
+	return rows
 }
 
 // LoadByCommit retrieves a slip by repository and commit SHA.
@@ -491,12 +511,13 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 		return nil, nil
 	}
 
-	matches := m.slipsForCommit(repository, commitSHA)
-	if len(matches) == 0 {
+	rows := m.rowsForCommit(repository, commitSHA)
+	if len(rows) == 0 {
 		return nil, ErrSlipNotFound
 	}
+	loadOrder(rows)
 
-	return deepCopySlip(matches[0]), nil
+	return deepCopySlip(rows[0]), nil
 }
 
 // LoadLiveByCommit retrieves the most recent live slip by repository and commit SHA,
@@ -520,10 +541,10 @@ func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA 
 	// row, matching the store's WHERE clause — filtering the single already-chosen row instead
 	// reports ErrSlipNotFound for a commit that still has a live slip, whenever an excluded
 	// duplicate happens to sort first.
-	for _, slip := range m.slipsForCommit(repository, commitSHA) {
-		if slip.Status == SlipStatusAbandoned ||
-			slip.Status == SlipStatusPromoted ||
-			slip.Status == SlipStatusCompensated {
+	rows := m.rowsForCommit(repository, commitSHA)
+	loadOrder(rows)
+	for _, slip := range rows {
+		if supersededTerminal(slip.Status) {
 			continue
 		}
 		return deepCopySlip(slip), nil
@@ -548,10 +569,17 @@ func (m *MockStore) FindByCommits(ctx context.Context, repository string, commit
 		return nil, "", m.FindByCommitsError
 	}
 
-	// Find the first matching commit in order
+	// Find the first matching commit in order. The store's query carries
+	// `AND s.status NOT IN ('abandoned','promoted','compensated')` — a filter LoadByCommit does
+	// NOT have — so a commit whose only rows are superseded-terminal is skipped entirely.
 	for _, commit := range commits {
-		if matches := m.slipsForCommit(repository, commit); len(matches) > 0 {
-			return deepCopySlip(matches[0]), commit, nil
+		rows := m.rowsForCommit(repository, commit)
+		findOrder(rows)
+		for _, slip := range rows {
+			if supersededTerminal(slip.Status) {
+				continue
+			}
+			return deepCopySlip(slip), commit, nil
 		}
 	}
 
@@ -580,10 +608,15 @@ func (m *MockStore) FindAllByCommits(
 
 	// Find all matching slips in commit order
 	var results []SlipWithCommit
+	// EVERY matching row, not one per commit: the store's query has no LIMIT and appends each
+	// row it scans. Multiplicity is this method's whole contract. No status filter either,
+	// unlike FindByCommits.
 	for _, commit := range commits {
-		if matches := m.slipsForCommit(repository, commit); len(matches) > 0 {
+		rows := m.rowsForCommit(repository, commit)
+		findOrder(rows)
+		for _, slip := range rows {
 			results = append(results, SlipWithCommit{
-				Slip:          deepCopySlip(matches[0]),
+				Slip:          deepCopySlip(slip),
 				MatchedCommit: commit,
 			})
 		}

@@ -48,15 +48,16 @@ rolls back instead of destroying the run. Implementations MUST provide that atom
 Folding the create into the store also closed four other defects structurally rather than
 by documentation: the successor's row is inserted **before** any descendant is repointed
 onto it (so no descendant can name a correlation ID that has no row — necessary but not
-sufficient for a foreign key on `slip_ancestry.parent_correlation_id`, since the guarded
-DELETE still removes the referenced row while descendants point at it; Phase B adds no such
-FK, and both of its FKs are on `correlation_id`); the superseded run's own parent link is
+sufficient for a foreign key on `slip_ancestry.parent_correlation_id`, and Phase B adds
+none; the full argument lives on `SlipStore.Repave` in `interfaces.go`); the superseded
+run's own parent link is
 carried forward when the caller resolved no ancestry, instead of being deleted and never
 replaced; the successor's identity is a `*Slip` the store itself writes rather than a
 caller-supplied ID string written into other slips' ancestry rows unvalidated; and the
-descendant repoint now rewrites the whole denormalized parent snapshot alongside the id —
-`parent_repository`, `parent_branch`, `parent_status`, `parent_commit_sha` and `created_at` — so a
-cross-branch repave no longer truncates `ResolveAncestry` at that hop.
+descendant repoint now rewrites the whole denormalized parent snapshot alongside the id, so
+a cross-branch repave no longer truncates `ResolveAncestry` at that hop. The column list is
+deliberately not repeated here — it is in `PostgresStore.Repave` (`postgres_store_updates.go`),
+beside the `UPDATE` that has to stay in step with it.
 
 **Consumer-visible contract change: `CreateSlipResult.AncestryResolved`.** It used to be
 computed as `len(slip.Ancestry) > 0` on the dedup paths, and no store hydrates `Slip.Ancestry`
@@ -83,7 +84,17 @@ store, e.g. `ClickHouseStore`, does not support repave and the caller should fal
 abandon semantics, then create the successor separately). `Repave` can also return
 `ErrDuplicateSlip` once Phase B's unique index exists. See `errors.go` for full contracts.
 
+**DEVOPS-231 also removed the exported field `slippytest.MockStore.CommitIndex`.** The
+published double no longer keeps a `"repo:sha" -> correlation_id` map; its four commit
+lookups derive their answer from the stored rows instead (`rowsForCommit` plus `loadOrder`
+or `findOrder`, depending on which store query the method mirrors). No consumer in this
+workspace imports `slippytest` today, so nothing is known to break — but the field was
+exported, and any caller that seeded `store.CommitIndex[...]` alongside `AddSlip` fails to
+compile after this bump. The fix is to delete the line: seeding the slip is sufficient, and
+always was.
+
 ---
+
 
 ## Overview
 

@@ -51,6 +51,58 @@ func commitKey(repository, commitSHA string) string {
 	return strings.ToLower(repository) + ":" + commitSHA
 }
 
+// supersededTerminal reports whether a status is one the store excludes from its
+// "current slip for this commit" reads. It mirrors the SQL predicate
+// `status NOT IN ('abandoned','promoted','compensated')`, which appears on exactly two of the
+// four commit lookups: LoadLiveByCommit (postgres_store.go) and FindByCommits
+// (postgres_store_reads.go). LoadByCommit and FindAllByCommits deliberately carry no such
+// filter, so do not add one here without changing those queries too.
+func supersededTerminal(status slippy.SlipStatus) bool {
+	return status == slippy.SlipStatusAbandoned ||
+		status == slippy.SlipStatusPromoted ||
+		status == slippy.SlipStatusCompensated
+}
+
+// loadOrder sorts rows the way the store's two Load* queries order them: live rows first, then
+// updated_at DESC (`ORDER BY (status IN (repaveable)) ASC, updated_at DESC`, postgres_store.go).
+//
+// The live/ended split reads SlipStatus.IsLive - the same predicate repaveableSlipStatusesSQL is
+// pinned against by TestRepaveableSlipStatusesSQL_MatchesIsLive - so this and the store cannot
+// drift on which statuses count as ended without that test failing.
+func loadOrder(rows []*slippy.Slip) {
+	sort.Slice(rows, func(i, j int) bool {
+		liveI, liveJ := rows[i].Status.IsLive(), rows[j].Status.IsLive()
+		if liveI != liveJ {
+			return liveI
+		}
+		return tieBreak(rows[i], rows[j])
+	})
+}
+
+// findOrder sorts rows the way the store's two Find* queries order them: updated_at DESC with
+// NO live-first term (`ORDER BY c.priority ASC, s.updated_at DESC`, postgres_store_reads.go).
+// c.priority orders ACROSS commits and is handled by the callers' loop over the commit list, so
+// only the within-commit tie-break belongs here.
+//
+// The difference from loadOrder is deliberate and load-bearing: sorting Find* results live-first
+// makes this double disagree with the store, which returns the newest row regardless of whether
+// an older one is still running. Whether the store SHOULD order live-first is a separate open
+// question about the store, not something a double gets to decide.
+func findOrder(rows []*slippy.Slip) {
+	sort.Slice(rows, func(i, j int) bool { return tieBreak(rows[i], rows[j]) })
+}
+
+// tieBreak is the updated_at DESC comparison both orderings share, falling back to correlation
+// ID so this double stays deterministic where Postgres (ORDER BY ... over equal keys) is not.
+// No test should depend on which of two otherwise-identical rows wins; seed distinct timestamps
+// when the choice matters.
+func tieBreak(a, b *slippy.Slip) bool {
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return a.UpdatedAt.After(b.UpdatedAt)
+	}
+	return a.CorrelationID < b.CorrelationID
+}
+
 // MockStore is an in-memory implementation of slippy.SlipStore for testing.
 //
 // It provides configurable behavior and tracking of method calls.
@@ -234,9 +286,8 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 	return nil
 }
 
-// Repave removes the superseded slip and its commit index entry (children live on the Slip
-// struct in the mock, so removing the slip removes everything) and stores newSlip in its
-// place. Modelling both halves is what makes this double faithful to
+// Repave removes the superseded slip and stores newSlip in its place (children live on the
+// Slip struct in the mock, so removing the slip removes everything). Modelling both halves is what makes this double faithful to
 // slippy.SlipStore.Repave: a caller never observes one without the other, so on any error
 // nothing here changes, and on success the superseded slip is gone AND the successor is
 // present.
@@ -369,12 +420,13 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 		return nil, m.LoadByCommitError
 	}
 
-	matches := m.slipsForCommit(repository, commitSHA)
-	if len(matches) == 0 {
+	rows := m.rowsForCommit(repository, commitSHA)
+	if len(rows) == 0 {
 		return nil, slippy.ErrSlipNotFound
 	}
+	loadOrder(rows)
 
-	return DeepCopySlip(matches[0]), nil
+	return DeepCopySlip(rows[0]), nil
 }
 
 // LoadLiveByCommit retrieves the most recent live slip by repository and commit SHA,
@@ -396,10 +448,10 @@ func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA 
 	// row, matching the store's WHERE clause — filtering the single already-chosen row instead
 	// reports ErrSlipNotFound for a commit that still has a live slip, whenever an excluded
 	// duplicate happens to sort first.
-	for _, slip := range m.slipsForCommit(repository, commitSHA) {
-		if slip.Status == slippy.SlipStatusAbandoned ||
-			slip.Status == slippy.SlipStatusPromoted ||
-			slip.Status == slippy.SlipStatusCompensated {
+	rows := m.rowsForCommit(repository, commitSHA)
+	loadOrder(rows)
+	for _, slip := range rows {
+		if supersededTerminal(slip.Status) {
 			continue
 		}
 		return DeepCopySlip(slip), nil
@@ -426,10 +478,19 @@ func (m *MockStore) FindByCommits(
 		return nil, "", m.FindByCommitsError
 	}
 
-	// Find the first matching commit in order
+	// Find the first matching commit in order. The store's query carries
+	// `AND s.status NOT IN ('abandoned','promoted','compensated')`
+	// (postgres_store_reads.go) — a filter LoadByCommit does NOT have — so a commit whose only
+	// rows are superseded-terminal is skipped entirely and the search moves to the next commit,
+	// exactly as `LIMIT 1` over the filtered join does.
 	for _, commit := range commits {
-		if matches := m.slipsForCommit(repository, commit); len(matches) > 0 {
-			return DeepCopySlip(matches[0]), commit, nil
+		rows := m.rowsForCommit(repository, commit)
+		findOrder(rows)
+		for _, slip := range rows {
+			if supersededTerminal(slip.Status) {
+				continue
+			}
+			return DeepCopySlip(slip), commit, nil
 		}
 	}
 
@@ -455,12 +516,20 @@ func (m *MockStore) FindAllByCommits(
 		return nil, m.FindAllByCommitsError
 	}
 
-	// Find all matching commits in order
+	// EVERY matching row, not one per commit: the store's query has no LIMIT and appends each
+	// row it scans (postgres_store_reads.go). Multiplicity is this method's whole contract —
+	// interfaces.go documents it as "finds all slips matching any commit in the ordered list" —
+	// so collapsing duplicates to one row per commit is the one shape a double must not take.
+	//
+	// No status filter either, unlike FindByCommits: that query's WHERE clause has one and this
+	// one does not.
 	var results []slippy.SlipWithCommit
 	for _, commit := range commits {
-		if matches := m.slipsForCommit(repository, commit); len(matches) > 0 {
+		rows := m.rowsForCommit(repository, commit)
+		findOrder(rows)
+		for _, slip := range rows {
 			results = append(results, slippy.SlipWithCommit{
-				Slip:          DeepCopySlip(matches[0]),
+				Slip:          DeepCopySlip(slip),
 				MatchedCommit: commit,
 			})
 		}
@@ -785,6 +854,12 @@ func (m *MockStore) Reset() {
 	// and not the other leaves the pair split: error armed, hook disarmed. The next scenario
 	// then gets a stale error with no mutation, which is neither scenario's configured
 	// behaviour and reads as deliberate.
+	//
+	// RepaveError is the ONLY injected error Reset clears, and only because of that coupling.
+	// Every other error field (CreateError, LoadError, PingError, ...) and every ...ErrorFor map
+	// deliberately SURVIVES Reset, so a fixture that arms one in a setup helper keeps it across
+	// sub-tests. Clearing them all would silently disarm those fixtures — a test would stop
+	// erroring and pass for the wrong reason — so the asymmetry is intentional, not an oversight.
 	m.RepaveWentLiveStatus = make(map[string]slippy.SlipStatus)
 	m.RepaveError = nil
 	m.CloseCalls = 0
@@ -858,45 +933,26 @@ func (m *MockStore) ResolveAncestry(
 	return []slippy.AncestryEntry{}, nil
 }
 
-// slipsForCommit returns every stored slip for one (repository, commit SHA), ordered the way
-// PostgresStore's commit lookups order rows: live rows first, then updated_at DESC.
+// rowsForCommit returns every stored slip for one (repository, commit SHA), UNORDERED. Callers
+// apply loadOrder or findOrder depending on which store query they mirror — the two differ, and
+// picking the wrong one is what made this double disagree with the store on FindByCommits.
 //
 // Phase A can hold more than one routing_slips row per commit, so this double stores rows and
-// derives the answer on read rather than keeping a "current slip for this commit" index. An
+// derives each answer on read rather than keeping a "current slip for this commit" index. An
 // index can only name one row, which is what previously made the ended-shadows-live hazard
 // unrepresentable here: seed a live row A and a newer ended row B for one commit and the index
 // pointed only at B, so the double reported B — or, for LoadLiveByCommit with B abandoned,
-// reported nothing — where Postgres returns A. A double that answers confidently and wrongly
-// is worse for a consumer than one that cannot answer, so the index is gone.
-//
-// The live/ended split is read from SlipStatus.IsLive — the same predicate
-// repaveableSlipStatusesSQL is pinned against by TestRepaveableSlipStatusesSQL_MatchesIsLive —
-// so this double and the store cannot drift on which statuses count as ended without that test
-// failing. That shared predicate is the point: the ordering rule here is two comparisons, not a
-// reimplementation of the query.
-//
-// Ties on updated_at fall back to correlation ID so this double stays deterministic where
-// Postgres (ORDER BY ... LIMIT 1 over equal keys) is not. No test should depend on which of
-// two otherwise-identical rows wins; seed distinct timestamps when the choice matters.
-func (m *MockStore) slipsForCommit(repository, commitSHA string) []*slippy.Slip {
+// reported nothing — where Postgres returns A. A double that answers confidently and wrongly is
+// worse for a consumer than one that cannot answer, so the index is gone.
+func (m *MockStore) rowsForCommit(repository, commitSHA string) []*slippy.Slip {
 	want := commitKey(repository, commitSHA)
-	matches := make([]*slippy.Slip, 0, 1)
+	rows := make([]*slippy.Slip, 0, 1)
 	for _, slip := range m.Slips {
 		if commitKey(slip.Repository, slip.CommitSHA) == want {
-			matches = append(matches, slip)
+			rows = append(rows, slip)
 		}
 	}
-	sort.Slice(matches, func(i, j int) bool {
-		liveI, liveJ := matches[i].Status.IsLive(), matches[j].Status.IsLive()
-		if liveI != liveJ {
-			return liveI
-		}
-		if !matches[i].UpdatedAt.Equal(matches[j].UpdatedAt) {
-			return matches[i].UpdatedAt.After(matches[j].UpdatedAt)
-		}
-		return matches[i].CorrelationID < matches[j].CorrelationID
-	})
-	return matches
+	return rows
 }
 
 // Ensure MockStore implements slippy.SlipStore at compile time.
