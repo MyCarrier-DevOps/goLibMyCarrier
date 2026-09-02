@@ -104,8 +104,12 @@ fixture deliberately pointed a commit at a row other than the newest, deleting t
 
 **DEVOPS-264 added `PushOptions.Dispatch` (`DispatchIntent`).** This one is *not* breaking:
 the zero value, `DispatchIntentUnspecified`, preserves the previous behavior exactly, so an
-un-updated caller is unaffected. Setting it is how a caller fixes the tests-only retrigger
-hole — the empty-run guard used to infer "this push dispatches nothing" from
+un-updated caller is unaffected. Setting it closes the rest of the tests-only retrigger
+hole: the `failed` carve-out already covers a prior run that FAILED, which is the case
+"the tests-only retrigger hole" names elsewhere in this repo, so what `Dispatch` adds is
+the same repo re-pushing a commit whose prior run ended `completed`, `abandoned`,
+`promoted` or `compensated`. The mechanism is the same in both — the empty-run guard used
+to infer "this push dispatches nothing" from
 `len(Components) == 0`, which is wrong for a repo running unit tests without builds
 (`buildable=false` + `RunUnitTests=true`), because pushhookparser nils out components
 whenever builds are skipped while still dispatching unit tests. The guard then returned the

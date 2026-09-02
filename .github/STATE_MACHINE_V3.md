@@ -234,8 +234,9 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   non-repaveable, which is this PR's primary case.
 - **Empty-run guard consequences.** ~~In a zero-component repo, a failed run cannot be
   retriggered by re-pushing the same commit.~~ **No longer true — this was the guard's
-  worst consequence and it is fixed.** `emptyRunGuardApplies` never claims a `failed`
-  slip, so re-pushing a commit whose run failed DOES repave and re-dispatch, which is
+  worst consequence and it is fixed.** With `Dispatch` unset or unrecognized — which is
+  every real push until it is forwarded end-to-end — `emptyRunGuardApplies` never claims a
+  `failed` slip, so re-pushing a commit whose run failed DOES repave and re-dispatch, which is
   what makes unit-test retrigger work on a tests-only repo (`buildable=false` +
   `RunUnitTests=true`) before `DispatchIntent` is adopted end-to-end. If you are
   triaging a stuck tests-only repo, re-pushing is expected to help.
