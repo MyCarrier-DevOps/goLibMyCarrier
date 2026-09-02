@@ -162,8 +162,12 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   fall back to `len(Components) == 0`. `Validate()` deliberately never rejects an
   unrecognized value — a safe degradation is preferable to a hard push failure — so an
   explicit-but-mis-serialized intent (wrong casing crossing the slippy-api JSON boundary,
-  say) is silently ignored rather than honored. The guard's log line carries
-  `dispatch_intent_honored` alongside the value so that is visible rather than inferred.
+  say) is silently ignored rather than honored. Three log lines carry
+  `dispatch_intent_honored` alongside the raw value so that is visible rather than inferred:
+  both guard-applied (dedup) lines and the repave line. The repave one matters most — it is the
+  case where an ignored intent went on to destroy a prior run's history, and until round 7 it
+  emitted neither field, so precisely the occurrence worth auditing left no record.
+  `honored=false` beside a non-empty `dispatch_intent` is that signature.
 
   Component count is neither necessary nor sufficient on its own: a tests-only repo
   (`buildable=false` + `RunUnitTests=true`) dispatches unit tests with zero build
@@ -182,6 +186,13 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   - **A self-correlation push is excluded**, unconditionally. When the existing row already
     carries this push's `correlation_id`, returning it would mean `returned == sent`, which
     the caller protocol reads as "this is your slip, proceed" rather than as a dedup.
+
+    Being excluded from the guard does **not** mean falling through to a repave. That push is
+    diverted to an **in-place upsert**: `persistSlipForPush` resets the row to live under the
+    SAME correlation ID, keeping its component children and replacing its state history, and
+    records a `reset in place after <status> attempt` marker so an operator can tell a reset
+    from a first attempt. This is the ordinary in-delivery retry, not an exotic shape — so
+    "repaved under a new correlation ID" describes only pushes carrying a DIFFERENT id.
 
   See "the guard no longer infers intent from component count" below for the failure this
   fixed, and `DispatchIntent` in `push.go` for what setting it opts a componentless push
