@@ -550,8 +550,11 @@ slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
     // State whether this push will dispatch any CI work. Optional: leaving it unset
     // keeps the legacy behaviour of inferring it from len(Components). Set it when
     // component count would be misleading — most importantly a repo that runs unit
-    // tests with no build components, where the inference otherwise suppresses the
-    // retrigger of a failed run. See slippy.DispatchIntent.
+    // tests with no build components, where the inference suppresses a re-run of a
+    // commit whose prior run ended `completed`, `abandoned`, `promoted` or
+    // `compensated`. (A `failed` prior run already retriggers without this field: the
+    // inference carves `failed` out. Setting Dispatch is what covers the other four.)
+    // See slippy.DispatchIntent.
     Dispatch: dispatchIntentForThisPush, // MUST be computed per push, never a constant
 })
 

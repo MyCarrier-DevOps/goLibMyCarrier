@@ -879,19 +879,26 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		})
 
 	t.Run("ended slip + no components but dispatch intent says work WILL run - repaves", func(t *testing.T) {
-		// The POST-adoption shape: once callers forward the field, intent decides and the
-		// carve-out above is no longer what carries this case.
+		// The POST-adoption shape: once callers forward the field, intent decides.
+		//
+		// The prior row is seeded `completed`, NOT `failed`, and that is what makes this test
+		// discriminating. With `failed` the guard declines at the carve-out regardless of
+		// intent, so the asserted outcome came from base-branch behaviour and the test passed
+		// with DispatchIntentSomething entirely un-honored. `completed` isolates the intent
+		// term: the guard would otherwise fire here (ended row, zero components), so only
+		// Something stops it. Any non-`failed` ended status works; `completed` matches the
+		// sibling subtest above.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
 
 		store.AddSlip(&Slip{
-			CorrelationID: "corr-failed-tests-only",
+			CorrelationID: "corr-ended-tests-only",
 			Repository:    "owner/repo",
 			Branch:        "integration",
 			CommitSHA:     "sha-tests-only",
-			Status:        SlipStatusFailed,
-			Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"unit_tests": {Status: StepStatusCompleted}},
 			StateHistory:  []StateHistoryEntry{},
 		})
 
@@ -910,11 +917,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if result.Slip.CorrelationID != "corr-retrigger-tests-only" {
 			t.Errorf("expected the fresh slip so the caller re-dispatches, got %q", result.Slip.CorrelationID)
 		}
-		if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "corr-failed-tests-only" {
-			t.Errorf("expected the failed run to be repaved, got %v", store.RepaveCalls)
+		if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "corr-ended-tests-only" {
+			t.Errorf("expected the ended run to be repaved, got %v", store.RepaveCalls)
 		}
-		if _, ok := store.Slips["corr-failed-tests-only"]; ok {
-			t.Error("the failed run must be replaced, not left behind")
+		if _, ok := store.Slips["corr-ended-tests-only"]; ok {
+			t.Error("the ended run must be replaced, not left behind")
 		}
 	})
 
@@ -3842,13 +3849,19 @@ func TestClient_CreateSlipForPush_BackstopHonorsDispatchIntent(t *testing.T) {
 
 	// The conflicting row appears at Create time, so only the backstop's own lookup sees
 	// it — the same shape the other backstop tests use.
+	//
+	// Seeded `completed`, NOT `failed`: the guard declines any `failed` slip at the carve-out
+	// regardless of intent, so with `failed` this test asserted base-branch behaviour and
+	// passed with DispatchIntentSomething entirely un-honored. `completed` isolates the intent
+	// term — the guard would otherwise fire (ended row, zero components), so only Something
+	// stops it and the assertion below actually tests the feature this is named for.
 	store.SeedOnCreate["corr-caller-tests-only"] = &Slip{
 		CorrelationID: "corr-conflict-tests-only",
 		Repository:    "owner/repo",
 		Branch:        "integration",
 		CommitSHA:     "sha-backstop-tests-only",
-		Status:        SlipStatusFailed,
-		Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+		Status:        SlipStatusCompleted,
+		Steps:         map[string]Step{"unit_tests": {Status: StepStatusCompleted}},
 		StateHistory:  []StateHistoryEntry{},
 	}
 	store.CreateErrorOnce["corr-caller-tests-only"] = ErrDuplicateSlip
@@ -3864,10 +3877,10 @@ func TestClient_CreateSlipForPush_BackstopHonorsDispatchIntent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Under the old component-count guard the backstop would have deduped onto the failed
+	// Under the old component-count guard the backstop would have deduped onto the ended
 	// conflicting row, suppressing the retrigger. It must repave instead.
 	if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "corr-conflict-tests-only" {
-		t.Errorf("expected the backstop to repave the failed conflicting row, got %v", store.RepaveCalls)
+		t.Errorf("expected the backstop to repave the ended conflicting row, got %v", store.RepaveCalls)
 	}
 	if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-tests-only" {
 		t.Errorf("expected the caller's own fresh slip, got %+v", result.Slip)
