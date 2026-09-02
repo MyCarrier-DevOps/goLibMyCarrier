@@ -237,6 +237,19 @@ func (d DispatchIntent) recognized() bool {
 	}
 }
 
+// honored reports whether the caller's stated intent DECIDED an outcome — not merely whether
+// the value was recognized. It is what the `dispatch_intent_honored` log field carries.
+//
+// Both terms are load-bearing, which is why this is a method rather than the expression written
+// out at each log site. `recognized()` alone is the wrong predicate: DispatchIntentUnspecified
+// IS recognized, but it is never honored — the component-count inference decides instead — so a
+// flag reading "recognized" would be true for the unset zero value and assert the opposite of
+// what an operator would take it to mean. False therefore covers both an unrecognized Dispatch
+// and the unset zero value.
+func (d DispatchIntent) honored() bool {
+	return d != DispatchIntentUnspecified && d.recognized()
+}
+
 // dispatchesNothing reports whether this push will dispatch no CI work at all, in which
 // case repaving an ended slip for the same commit would destroy that run's history for zero
 // benefit. A RECOGNIZED explicit Dispatch wins; DispatchIntentUnspecified and any
@@ -420,20 +433,31 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 //     a step re-run, so a new push for the same commit (webhook re-delivery or a
 //     same-commit re-push) is treated as a deliberate request to run CI again.
 //
+//     One exception: a push stating a recognized DispatchIntentNothing dedups onto the failed
+//     slip instead of repaving it. See the empty-run guard bullet below.
+//
 //   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
 //     stale and repaved on the same terms as the failed case above — replaced, in one
 //     transaction, by a fresh slip under the new correlation ID from opts. This prevents
 //     resurrecting superseded slips on webhook re-delivery or bot-commit races.
 //
-//   - Existing slip is TERMINAL (not failed), this push will dispatch nothing, AND the push
-//     does not carry the existing row's own correlation ID: the empty-run guard
-//     short-circuits the repave above and returns the existing (ended) slip as a dedup,
-//     since nothing would be dispatched and repaving would only destroy history for no
-//     benefit.
+//   - Existing slip is ended, this push will dispatch nothing, AND the push does not carry
+//     the existing row's own correlation ID: the empty-run guard short-circuits the repave
+//     above and returns the existing (ended) slip as a dedup, since nothing would be
+//     dispatched and repaving would only destroy history for no benefit.
 //
-//     All three conditions matter. `failed` is excluded, regardless of intent, so a re-push
-//     can retrigger a stuck run — see emptyRunGuardApplies for why that carve-out exists
-//     independently of the Dispatch field. The self-correlation exclusion exists because the
+//     All three conditions matter, and "will dispatch nothing" is where Dispatch enters:
+//
+//     A recognized Dispatch value is authoritative and is consulted FIRST. So a push stating
+//     DispatchIntentNothing dedups onto ANY ended slip, `failed` included — repaving there
+//     would destroy the failed run's history and seed a successor with no components that
+//     nothing could ever advance.
+//
+//     Only when Dispatch is unset or unrecognized does the guard infer intent from
+//     len(Components) == 0, and it is that INFERENCE which excludes `failed`, so a
+//     componentless re-push can still retrigger a stuck run. See emptyRunGuardApplies.
+//
+//     The self-correlation exclusion is unconditional and exists because the
 //     guard's contract is that the caller sees returned != sent and suppresses its side
 //     effects; when they are equal the caller would instead dispatch against the very slip
 //     it was handed.
@@ -575,20 +599,15 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			// See DispatchIntent for why component count cannot answer this, and for what
 			// setting it opts such a push into: ancestry resolution, the repave path, and
 			// a repave failure being fatal — none of which this early return reaches.
-			// Whether the caller's stated intent DECIDED this outcome — not merely whether
-			// the value was recognized. False covers both an unrecognized Dispatch and the
-			// unset zero value: this line only ever fires when the guard applied, so
-			// DispatchIntentSomething can never reach it, and for Unspecified the
-			// component-count inference decided rather than the caller. A flag reading
-			// "recognized" would be true for Unspecified and so assert the opposite of what
-			// an operator would take it to mean.
-			intentHonored := opts.Dispatch != DispatchIntentUnspecified && opts.Dispatch.recognized()
+			// See DispatchIntent.honored for why "honored" and not "recognized". This line
+			// only ever fires when the guard applied, so DispatchIntentSomething can never
+			// reach it.
 			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
 				map[string]interface{}{
 					"existing_id":             existingSlip.CorrelationID,
 					"commit":                  shortSHA(existingSlip.CommitSHA),
 					"dispatch_intent":         opts.Dispatch,
-					"dispatch_intent_honored": intentHonored,
+					"dispatch_intent_honored": opts.Dispatch.honored(),
 					"components":              len(opts.Components),
 				})
 			result.Slip = existingSlip
@@ -1170,13 +1189,12 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// destroy its history for no benefit. Dedup onto it instead of replacing it.
 		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
 			map[string]interface{}{
-				"conflicting_id":  conflicting.CorrelationID,
-				"commit":          shortSHA(conflicting.CommitSHA),
-				"superseding_id":  opts.CorrelationID,
-				"dispatch_intent": opts.Dispatch,
-				"dispatch_intent_honored": opts.Dispatch != DispatchIntentUnspecified &&
-					opts.Dispatch.recognized(),
-				"components": len(opts.Components),
+				"conflicting_id":          conflicting.CorrelationID,
+				"commit":                  shortSHA(conflicting.CommitSHA),
+				"superseding_id":          opts.CorrelationID,
+				"dispatch_intent":         opts.Dispatch,
+				"dispatch_intent_honored": opts.Dispatch.honored(),
+				"components":              len(opts.Components),
 			})
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
