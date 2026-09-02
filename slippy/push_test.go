@@ -5303,3 +5303,147 @@ func TestDispatchIntent_honored(t *testing.T) {
 		t.Error("precondition: Unspecified must be recognized, or the table's point is lost")
 	}
 }
+
+// TestClient_CreateSlipForPush_ScanOnlyPushMustNotClaimNothing pins the consequence of getting
+// the DispatchIntent derivation wrong, so the criterion in DispatchIntent's doc has a test
+// behind it rather than only prose.
+//
+// A scan-only push — no build components, no unit tests, but a secret scan dispatched against
+// this slip — is DispatchIntentSomething. Deriving the value as `shouldBuild ||
+// shouldRunUnitTests` would state Nothing instead, and because a recognized intent is consulted
+// before the `failed` carve-out, that dedups onto the failed run: the commit becomes
+// unretriggerable, which is the hole DEVOPS-264 exists to close.
+//
+// Both halves are asserted, because the first alone would pass against a guard that never fires.
+func TestClient_CreateSlipForPush_ScanOnlyPushMustNotClaimNothing(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func(store *MockStore) {
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-failed-scan-only",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-scan-only",
+			Status:        SlipStatusFailed,
+			StateHistory:  []StateHistoryEntry{},
+		})
+	}
+	push := func(intent DispatchIntent) PushOptions {
+		return PushOptions{
+			CorrelationID: "corr-retrigger-scan-only",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-scan-only",
+			Components:    nil, // no builds, no unit tests — only the scan will run
+			Dispatch:      intent,
+		}
+	}
+
+	t.Run("stated correctly as Something, the failed run is retriggered", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: testPipelineConfig()})
+		seed(store)
+
+		result, err := client.CreateSlipForPush(ctx, push(DispatchIntentSomething))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-retrigger-scan-only" {
+			t.Errorf("expected the caller's own slip so it re-dispatches, got %q",
+				result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 1 {
+			t.Errorf("the failed run must be repaved, got %v", store.RepaveCalls)
+		}
+	})
+
+	t.Run("mis-stated as Nothing, the failed run becomes unretriggerable", func(t *testing.T) {
+		// Not a bug in the guard — the guard is doing what a recognized Nothing asks. This pins
+		// the COST of a wrong derivation, so the criterion in DispatchIntent's doc is load-bearing.
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: testPipelineConfig()})
+		seed(store)
+
+		result, err := client.CreateSlipForPush(ctx, push(DispatchIntentNothing))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-failed-scan-only" {
+			t.Errorf("expected the dedup onto the failed run, got %q", result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("a recognized Nothing must not repave, got %v", store.RepaveCalls)
+		}
+	})
+}
+
+// TestPushOptions_MisSerializedIntentIsNotSafe pins the documented behaviour of a value that
+// crosses the JSON boundary mis-cased or padded.
+//
+// The library's promise used to be that an unrecognized value "can never license destroying a
+// prior run's history". That is false: the fallback is the legacy component-count inference, and
+// the inference licenses a repave whenever components are present. These rows are the evidence,
+// and they exist so nobody "fixes" the fallback without seeing what it currently does — the
+// obvious fix was tried and rejected, because it turns a mis-cased "Something" from a tests-only
+// repo from retrigger into blocked.
+//
+// TestCreateSlipForPush_ReturnedEqualsSentImpliesLive sweeps these same values but asserts only
+// `returned == sent ⇒ live`, which both outcomes satisfy — so it pins nothing about
+// repave-vs-dedup. This does.
+func TestPushOptions_MisSerializedIntentIsNotSafe(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		intent     DispatchIntent
+		components int
+		prior      SlipStatus
+		wantRepave bool
+		why        string
+	}{
+		{"nothing", 1, SlipStatusCompleted, false,
+			"correctly cased: recognized, authoritative, dedups even with components"},
+		{"Nothing", 1, SlipStatusCompleted, true,
+			"wrong casing falls back to the inference, which sees components and repaves"},
+		{" nothing ", 1, SlipStatusCompleted, true,
+			"padding is unrecognized, same fallback"},
+		{"garbage", 1, SlipStatusCompleted, true,
+			"any out-of-range value falls back the same way"},
+		{"Nothing", 0, SlipStatusFailed, true,
+			"unrecognized falls past honored() to the failed carve-out, which declines first"},
+		{"nothing", 0, SlipStatusFailed, false,
+			"recognized Nothing is consulted BEFORE the carve-out, so it dedups"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.intent)+"/"+string(tt.prior), func(t *testing.T) {
+			store := NewMockStore()
+			client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+				Config{PipelineConfig: testPipelineConfig()})
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-prior", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-mis", Status: tt.prior, StateHistory: []StateHistoryEntry{},
+			})
+			var comps []ComponentDefinition
+			for i := 0; i < tt.components; i++ {
+				comps = append(comps, ComponentDefinition{Name: "api", DockerfilePath: "src/MC.Api"})
+			}
+
+			if _, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-new", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-mis", Components: comps, Dispatch: tt.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			repaved := len(store.RepaveCalls) > 0
+			if repaved != tt.wantRepave {
+				t.Errorf("Dispatch=%q components=%d prior=%s: repaved=%v, want %v — %s",
+					string(tt.intent), tt.components, tt.prior, repaved, tt.wantRepave, tt.why)
+			}
+			if _, alive := store.Slips["corr-prior"]; alive == tt.wantRepave {
+				t.Errorf("prior run alive=%v but repaved=%v — history outcome disagrees with the repave",
+					alive, tt.wantRepave)
+			}
+		})
+	}
+}
