@@ -5255,3 +5255,51 @@ func TestCreateSlipForPush_ReturnedEqualsSentImpliesLive(t *testing.T) {
 			"the decision surface changed shape and this test may no longer cover it", checked)
 	}
 }
+
+// TestDispatchIntent_honored pins what honored() returns for every value, which nothing did.
+//
+// It had 100% statement coverage and zero assertion coverage: `make mutation PKG=slippy` flipped
+// `!=` to `==` at push.go:250 and the whole module stayed green. That mutant makes honored()
+// return true exactly when the caller's intent was IGNORED — and during the rollout window every
+// real push arrives Unspecified, so it would have been wrong on every production guard hit.
+//
+// Both terms are load-bearing and the table covers why: Unspecified is RECOGNIZED but is never
+// honored, because the component-count inference decides instead. A predicate reading
+// "recognized" would be true there and assert the opposite of what an operator reads from
+// dispatch_intent_honored.
+func TestDispatchIntent_honored(t *testing.T) {
+	tests := []struct {
+		intent DispatchIntent
+		want   bool
+		why    string
+	}{
+		{DispatchIntentNothing, true, "a recognized explicit intent decides the outcome"},
+		{DispatchIntentSomething, true, "a recognized explicit intent decides the outcome"},
+		{DispatchIntentUnspecified, false,
+			"recognized, but the component-count inference decides — not the caller"},
+		{DispatchIntent(""), false, "the zero value IS DispatchIntentUnspecified"},
+		{DispatchIntent("Nothing"), false, "wrong casing is unrecognized, so it is ignored"},
+		{DispatchIntent(" nothing "), false, "surrounding whitespace is unrecognized"},
+		{DispatchIntent("garbage"), false, "an out-of-range value is ignored"},
+		{DispatchIntent("NOTHING"), false, "upper case is unrecognized"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.intent), func(t *testing.T) {
+			if got := tt.intent.honored(); got != tt.want {
+				t.Errorf("DispatchIntent(%q).honored() = %v, want %v — %s",
+					string(tt.intent), got, tt.want, tt.why)
+			}
+		})
+	}
+
+	// The relationship the two-term predicate exists to encode, asserted rather than described:
+	// honored implies recognized, but not the reverse.
+	for _, tt := range tests {
+		if tt.intent.honored() && !tt.intent.recognized() {
+			t.Errorf("DispatchIntent(%q) is honored but not recognized", string(tt.intent))
+		}
+	}
+	if !DispatchIntentUnspecified.recognized() {
+		t.Error("precondition: Unspecified must be recognized, or the table's point is lost")
+	}
+}
