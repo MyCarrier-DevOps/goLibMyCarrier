@@ -445,7 +445,7 @@ func (m *MockStore) Repave(
 		})
 	}
 	// No commit index to reconcile: the commit lookups derive their answer from the stored
-	// rows (slipsForCommit), so removing the superseded row and adding the successor is the
+	// rows (rowsForCommit), so removing the superseded row and adding the successor is the
 	// whole update.
 	m.Slips[newSlip.CorrelationID] = stored
 	return nil

@@ -670,6 +670,10 @@ func TestMockStore_Reset(t *testing.T) {
 		store.AddSlip(&Slip{CorrelationID: "test", Repository: "repo", CommitSHA: "sha"})
 		store.LoadCalls = append(store.LoadCalls, "test")
 		store.CloseCalls = 5
+		// Armed so the RepaveError assertion below is not vacuous: an unset field is nil
+		// either way, so without arming it the clear in Reset is unpinned.
+		store.RepaveError = ErrSlipWentLive
+		store.RepaveWentLiveStatus["corr-unspent"] = SlipStatusInProgress
 
 		// Reset
 		store.Reset()
@@ -677,6 +681,13 @@ func TestMockStore_Reset(t *testing.T) {
 		// Verify data and calls are cleared
 		if len(store.Slips) != 0 {
 			t.Error("Slips not cleared")
+		}
+		if store.RepaveError != nil {
+			t.Error("RepaveError not cleared — it is coupled to the one-shot went-live hook, " +
+				"so clearing one without the other hands the next scenario an error with no mutation")
+		}
+		if len(store.RepaveWentLiveStatus) != 0 {
+			t.Error("RepaveWentLiveStatus not cleared")
 		}
 		if len(store.LoadCalls) != 0 {
 			t.Error("LoadCalls not cleared")

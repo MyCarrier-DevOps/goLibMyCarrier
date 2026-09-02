@@ -130,8 +130,8 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   the successor's row is inserted BEFORE any descendant is repointed onto it, which is what
   keeps a descendant from naming a row that does not exist. The repoint rewrites every column
   describing the parent, not just the id, since a stale value beside a fresh id reproduces the
-  very inconsistency the repoint removes; the column list is in `PostgresStore.Repave`
-  (`postgres_store_updates.go`), beside the `UPDATE` it has to stay in step with. That
+  very inconsistency the repoint removes; the column list is on `SlipStore.Repave` in
+  `interfaces.go`, the contract every store implementation owes. That
   ordering is necessary but not sufficient for a foreign key on
   `slip_ancestry.parent_correlation_id`, and migration v5 adds none — both of its FKs are on
   `correlation_id`. The full argument is on `SlipStore.Repave` in `interfaces.go`.

@@ -39,14 +39,19 @@ MUTATION_THRESHOLD ?= 100
 lint: install-tools
 	@if [ -z "$(PKG)" ]; then \
 		echo "Linting all modules..."; \
+		failed=""; \
 		for dir in $(LIB_DIRS); do \
 			if [ -d "$$dir" ]; then \
 				echo "Linting $$dir module..."; \
-				(cd $$dir && go mod tidy && golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...); \
+				(cd $$dir && go mod tidy && golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...) \
+					|| failed="$$failed $$dir"; \
 			else \
 				echo "Directory $$dir not found, skipping..."; \
 			fi; \
 		done; \
+		if [ -n "$$failed" ]; then \
+			echo "lint FAILED in:$$failed" >&2; exit 1; \
+		fi; \
 	else \
 		echo "Linting $(PKG) module..."; \
 		(cd $(PKG) && go mod tidy && golangci-lint run --config ../.github/.golangci.yml --timeout 5m ./...); \
@@ -367,16 +372,28 @@ help:
 # report "already installed" while GOPATH/bin holds something else, or reinstall on every run
 # without ever changing what lint uses. `make doctor` is what reports that; it prints the
 # resolved path alongside the wanted version precisely so the divergence is visible.
+# `set -o pipefail` is load-bearing, not decorative: `curl ... | sh` otherwise reports SH's exit
+# status, and sh reads EOF from an empty pipe and exits 0. A failed fetch — rate limit, 5xx, DNS,
+# proxy, or a bad GOLANGCI_LINT_INSTALLER_SHA — would install nothing and report success. In CI
+# that turns up one step later as "golangci-lint: command not found" attributed to the lint step;
+# locally it is worse, because the version check has just REJECTED the binary on PATH and `lint`
+# then runs that same rejected binary. SHELL is bash (top of file) with no .SHELLFLAGS, so
+# neither pipefail nor errexit is otherwise in effect.
 .PHONY: install-tools
 install-tools:
-	@want_bare=$$(echo "$(GOLANGCI_LINT_VERSION)" | sed 's/^v//'); \
+	@set -o pipefail; \
+	want_bare=$$(echo "$(GOLANGCI_LINT_VERSION)" | sed 's/^v//'); \
 	got=$$(command -v golangci-lint >/dev/null 2>&1 && golangci-lint version 2>&1 \
 		| sed -n 's/.*has version \([0-9][0-9.]*\).*/\1/p'); \
 	if [ "$$got" = "$$want_bare" ]; then \
 		echo "golangci-lint $$got already installed ($$(command -v golangci-lint)), skipping download"; \
 	else \
-		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)..."; \
+		gopath_bin="$$(go env GOPATH 2>/dev/null)/bin"; \
+		if [ "$$gopath_bin" = "/bin" ]; then \
+			echo "error: 'go' not found on PATH; cannot install golangci-lint" >&2; exit 1; \
+		fi; \
+		echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION) into $$gopath_bin..."; \
 		curl -sSfL --proto '=https' --tlsv1.2 \
 			https://raw.githubusercontent.com/golangci/golangci-lint/$(GOLANGCI_LINT_INSTALLER_SHA)/install.sh \
-			| sh -s -- -b `go env GOPATH`/bin $(GOLANGCI_LINT_VERSION); \
+			| sh -s -- -b "$$gopath_bin" $(GOLANGCI_LINT_VERSION); \
 	fi

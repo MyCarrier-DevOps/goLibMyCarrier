@@ -480,9 +480,10 @@ const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','
 //     23503 there on every repave with a descendant. Phase B adds no such FK — both of its
 //     FKs are on correlation_id.
 //  5. Repoint descendants of the superseded run onto the successor, rewriting the whole
-//     denormalized snapshot that describes the parent: id, repository, branch, status and
-//     commit SHA now name the successor, created_at is re-stamped, and parent_failed_step is
-//     cleared. All three of id,
+//     denormalized snapshot that describes the parent, not just the id. The column list is
+//     deliberately NOT repeated here: it lives on SlipStore.Repave in interfaces.go, which is
+//     the contract every store implementation owes — a non-Postgres implementor should not
+//     have to read Postgres code to learn which columns they must rewrite. All three of id,
 //     repository and branch are ResolveAncestry join keys — its next hop selects on
 //     (repository, branch, correlation_id) using the values recorded beside the parent id,
 //     and none of them is case-folded — so leaving any one describing the deleted run

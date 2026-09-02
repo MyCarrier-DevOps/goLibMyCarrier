@@ -56,8 +56,8 @@ replaced; the successor's identity is a `*Slip` the store itself writes rather t
 caller-supplied ID string written into other slips' ancestry rows unvalidated; and the
 descendant repoint now rewrites the whole denormalized parent snapshot alongside the id, so
 a cross-branch repave no longer truncates `ResolveAncestry` at that hop. The column list is
-deliberately not repeated here — it is in `PostgresStore.Repave` (`postgres_store_updates.go`),
-beside the `UPDATE` that has to stay in step with it.
+deliberately not repeated here — it is on `SlipStore.Repave` in `interfaces.go`, the contract
+every store implementation owes.
 
 **Consumer-visible contract change: `CreateSlipResult.AncestryResolved`.** It used to be
 computed as `len(slip.Ancestry) > 0` on the dedup paths, and no store hydrates `Slip.Ancestry`

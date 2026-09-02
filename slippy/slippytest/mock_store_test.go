@@ -1042,6 +1042,9 @@ func TestMockStore_Reset_ClearsRepaveState(t *testing.T) {
 		repaveSuccessorSlip("corr-new", "test/repo", "main", "sha-reset"),
 		&slippy.AncestryEntry{CorrelationID: "parent-1"}))
 	store.RepaveWentLiveStatus["corr-unspent"] = slippy.SlipStatusInProgress
+	// Armed so the RepaveError assertion below is not vacuous: an unset field is nil either
+	// way, so without arming it the clear in Reset is unpinned and deleting it stays green.
+	store.RepaveError = slippy.ErrSlipWentLive
 
 	require.NotEmpty(t, store.RepaveCalls, "precondition: the call was recorded")
 
@@ -1052,6 +1055,10 @@ func TestMockStore_Reset_ClearsRepaveState(t *testing.T) {
 	assert.Empty(t, store.RepaveParents, "RepaveParents must not survive Reset")
 	assert.Empty(t, store.RepaveWentLiveStatus,
 		"an unspent one-shot hook must not leak into the next scenario")
+	assert.NoError(t, store.RepaveError,
+		"RepaveError is cleared with the hook it is coupled to — the went-live mutation only "+
+			"fires while it is set, so leaving one armed and the other disarmed hands the next "+
+			"scenario an error with no mutation")
 	assert.Empty(t, store.Slips, "stored slips must not survive Reset")
 
 	// Slips is the only commit-lookup state there is, so an empty map is the whole claim -

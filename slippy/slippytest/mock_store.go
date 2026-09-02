@@ -375,7 +375,7 @@ func (m *MockStore) Repave(
 		})
 	}
 	// No commit index to reconcile: the commit lookups derive their answer from the stored rows
-	// (slipsForCommit), so removing the superseded row and adding the successor is the whole
+	// (rowsForCommit), so removing the superseded row and adding the successor is the whole
 	// update. The shape this used to get wrong — store holds ended slip A and live slip C for
 	// one commit, Repave(A, B) re-points the commit at B and hides the still-live C — is now
 	// unrepresentable rather than guarded.

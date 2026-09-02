@@ -49,6 +49,23 @@ type SlipStore interface {
 	// and no slip is ever created for that commit. Implementations must translate any
 	// "no rows" condition to ErrSlipNotFound before returning, and must not use
 	// ErrSlipNotFound for anything other than a genuine clean miss.
+	//
+	// Selection contract: until Phase B's cleanup and uq_routing_slips_repo_sha land, MORE THAN
+	// ONE row can exist for a (repository, commit_sha). When several match, an implementation
+	// MUST return a LIVE row (Status.IsLive()) if any exists, and the most recently updated one
+	// otherwise. This is behaviour, not an implementation detail: CreateSlipForPush routes
+	// entirely on the returned row's status — a live row dedups onto it, anything else is
+	// repaved and CI fully re-dispatches — so returning an ended duplicate while a run is still
+	// in flight repaves a running pipeline.
+	//
+	// Ordering by recency alone is NOT sufficient, and the failure is not exotic: a `completed`
+	// duplicate touched after the live row's last write sorts first on updated_at DESC, and no
+	// status filter screens it because `completed` is not terminal-superseded. State the rule
+	// here rather than leaving it to each store, so dropping the live-first term from a query
+	// reads as the contract break it is instead of a local optimisation.
+	//
+	// ClickHouseStore deliberately does not implement this ordering; the reason is specific to
+	// VersionedCollapsingMergeTree and is documented at that implementation.
 	LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error)
 
 	// LoadLiveByCommit returns the LIVE (non-terminal) slip for the exact (repository, commitSHA).

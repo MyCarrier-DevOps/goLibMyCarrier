@@ -513,6 +513,33 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 				t.Errorf("expected exactly one Create (the in-place upsert), got %d",
 					len(store.CreateCalls))
 			}
+
+			// The reachable half of appendResetMarker. Its other caller — the duplicate-create
+			// backstop — is dormant until Phase B's unique index exists, so without this the
+			// only assertion on the marker sat on the arm that cannot run, and deleting the
+			// call in persistSlipForPush was green.
+			//
+			// Create upserts state_history along with every other non-PK column, so a reset
+			// with no marker leaves a live row carrying one seed entry and nothing to
+			// distinguish a first attempt from a reset one — the indistinguishability the
+			// store's own self-repave guard cites as its reason for existing.
+			stored, ok := store.Slips["corr-self"]
+			if !ok {
+				t.Fatal("the reset slip must be persisted")
+			}
+			var marker string
+			for _, e := range stored.StateHistory {
+				if strings.Contains(e.Message, "reset in place after") {
+					marker = e.Message
+				}
+			}
+			if marker == "" {
+				t.Fatalf("an in-place reset must record the prior attempt, as the backstop arm "+
+					"does; history was %+v", stored.StateHistory)
+			}
+			if !strings.Contains(marker, string(endedStatus)) {
+				t.Errorf("the marker must name the prior attempt's status, got %q", marker)
+			}
 		})
 	}
 
