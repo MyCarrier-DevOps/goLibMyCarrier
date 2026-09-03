@@ -475,10 +475,8 @@ const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','
 //  4. Insert the successor. This must precede step 5: the repoint names the successor's
 //     correlation ID, so the row has to exist first — that is what keeps a descendant from
 //     ever pointing at a phantom. It is necessary but NOT sufficient for a foreign key on
-//     slip_ancestry.parent_correlation_id: the guarded DELETE in step 2 still removes the
-//     referenced row while descendants point at it, so a plain NOT DEFERRABLE FK would raise
-//     23503 there on every repave with a descendant. Phase B adds no such FK — both of its
-//     FKs are on correlation_id.
+//     slip_ancestry.parent_correlation_id, and Phase B deliberately adds none — the full
+//     argument is on SlipStore.Repave in interfaces.go.
 //  5. Repoint descendants of the superseded run onto the successor, rewriting the whole
 //     denormalized snapshot that describes the parent, not just the id. The column list is
 //     deliberately NOT repeated here: it lives on SlipStore.Repave in interfaces.go, which is

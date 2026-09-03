@@ -500,9 +500,27 @@ func (c *Client) persistSlipForPush(
 	// dispatch, and then report against a slip whose top-level status is still failed. The
 	// upsert is what makes the returned slip genuinely live.
 	//
-	// Caveat, unchanged from the pre-Repave behaviour this matches: the row is rewritten but
+	// Caveat 1, unchanged from the pre-Repave behaviour this matches: the row is rewritten but
 	// its slip_component_states children are not deleted, so the new attempt inherits the
 	// previous attempt's component rows under the same id.
+	//
+	// Caveat 2: Create is the one full-row overwrite in PostgresStore that does NOT take the
+	// per-slip FOR UPDATE lock (postgres_store.go, Create; contrast Update, whose comment says
+	// the lock exists to stop a concurrent updateStepTx commit being clobbered).
+	// AbandonSlip/PromoteSlip also write unlocked but go through UpdateSlipStatus, a
+	// single-column SET that cannot clobber anything else; Create can.
+	//
+	// Not a torn write: lockSlip is SELECT ... FOR UPDATE and a conflicting INSERT ... ON
+	// CONFLICT blocks behind it, so the two statements serialize. It is last-write-wins — and
+	// if a component of this same run is still reporting when the upsert lands second, its step
+	// columns and state_history are discarded, under a correlation ID that gives an operator no
+	// way to tell which attempt wrote what.
+	//
+	// Accepted deliberately, and recorded here because this arm is now the DESIGNED route to
+	// that write rather than an incidental fall-through: at merge base all five ended statuses
+	// reached the identical unlocked Create anyway, and because the conflict target is
+	// correlation_id, every write at risk belongs to the id this arm is resetting on purpose.
+	// The reset marker appended below is what makes the overwrite legible afterwards.
 	//
 	// That is the same child-row state the upsert-collision note on SlipStore.Repave
 	// describes, but do NOT carry that note's reachability over: it is about a CROSS-RUN

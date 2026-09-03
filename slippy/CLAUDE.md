@@ -90,8 +90,14 @@ lookups derive their answer from the stored rows instead (`rowsForCommit` plus `
 or `findOrder`, depending on which store query the method mirrors). No consumer in this
 workspace imports `slippytest` today, so nothing is known to break — but the field was
 exported, and any caller that seeded `store.CommitIndex[...]` alongside `AddSlip` fails to
-compile after this bump. The fix is to delete the line: seeding the slip is sufficient, and
-always was.
+compile after this bump. Usually the fix is to delete the line.
+
+**The lookups also answer differently now, with no compile error to point at it.** A fixture
+holding more than one row for one `(repository, commit_sha)` used to get whichever was seeded
+last, and now gets the store's own ordering; and a row written straight into the exported
+`Slips` map used to be invisible to all four lookups and now participates in every one. So if a
+fixture deliberately pointed a commit at a row other than the newest, deleting the line does
+**not** preserve its behaviour — seed distinct `UpdatedAt` values instead.
 
 ---
 
