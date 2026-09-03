@@ -99,6 +99,26 @@ last, and now gets the store's own ordering; and a row written straight into the
 fixture deliberately pointed a commit at a row other than the newest, deleting the line does
 **not** preserve its behaviour — seed distinct `UpdatedAt` values instead.
 
+
+### Not breaking: `PushOptions.Dispatch` (DEVOPS-264)
+
+**DEVOPS-264 added `PushOptions.Dispatch` (`DispatchIntent`).** This one is *not* breaking:
+the zero value, `DispatchIntentUnspecified`, preserves the previous behavior exactly, so an
+un-updated caller is unaffected. Setting it closes the rest of the tests-only retrigger
+hole: the `failed` carve-out already covers a prior run that FAILED, which is the case
+"the tests-only retrigger hole" names elsewhere in this repo, so what `Dispatch` adds is
+the same repo re-pushing a commit whose prior run ended `completed`, `abandoned`,
+`promoted` or `compensated`. The mechanism is the same in both — the empty-run guard used
+to infer "this push dispatches nothing" from
+`len(Components) == 0`, which is wrong for a repo running unit tests without builds
+(`buildable=false` + `RunUnitTests=true`), because pushhookparser nils out components
+whenever builds are skipped while still dispatching unit tests. The guard then returned the
+old slip, the caller read `returned != sent` as a duplicate, and suppressed everything
+including the unit tests it wanted to re-run. Set `DispatchIntentSomething` when work will
+dispatch, `DispatchIntentNothing` when it will not; see `DispatchIntent` for why component
+count cannot answer this. The fix is only live once slippy-api and pushhookparser also pass
+it through.
+
 ---
 
 
@@ -302,6 +322,9 @@ slip, err := client.CreateSlipForPush(ctx, slippy.PushOptions{
         {Name: "api", DockerfilePath: "src/MC.Api"},
         {Name: "worker", DockerfilePath: "src/MC.Worker"},
     },
+    // Optional; unset keeps the legacy len(Components) inference. Set it when
+    // component count would be misleading — see slippy.DispatchIntent.
+    Dispatch: dispatchIntentForThisPush, // MUST be computed per push, never a constant
 })
 ```
 

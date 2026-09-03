@@ -99,6 +99,152 @@ type PushOptions struct {
 
 	// Components defines the components to track
 	Components []ComponentDefinition
+
+	// Dispatch states whether this push will actually dispatch CI work, which the
+	// empty-run guard needs to know and cannot reliably infer. Leave it at its zero
+	// value (DispatchIntentUnspecified) to keep the legacy component-count inference;
+	// set it explicitly to make the guard correct. See DispatchIntent.
+	Dispatch DispatchIntent
+}
+
+// DispatchIntent is a caller's statement about whether a push will dispatch any CI work. The
+// empty-run guard in CreateSlipForPush uses it to decide whether repaving an ended slip for the
+// same commit is worth destroying that run's history: if nothing will be dispatched, the repave
+// buys nothing and the guard dedups onto the existing run instead.
+//
+// HOW TO DERIVE THE VALUE. "Any CI work" means any step of the pipeline config that this push
+// will cause to report — which in the shipped configs is THREE independent classes, not two:
+//
+//  1. builds
+//  2. unit tests
+//  3. secret scan
+//
+// The third is easy to miss and is the reason this paragraph exists. `secret_scan` is a
+// componentless non-aggregate step in both shipped configs and a prerequisite of
+// `preprod_deploy` (and of `dev_deploy` in default.json), and pushhookparser dispatches it for
+// every HUMAN commit independently of builds and unit tests — the only exemption is a bot
+// image-tag commit. So a push that builds nothing and runs no unit tests still dispatches real
+// work that reports against this slip, and MUST state DispatchIntentSomething.
+//
+// Deriving it as `shouldBuild || shouldRunUnitTests` is therefore wrong. On a repo that creates
+// slips without builds, such a push would state DispatchIntentNothing; because a recognized
+// intent is consulted BEFORE the `failed` carve-out, that dedups onto a failed run and the
+// commit can no longer be retriggered by re-pushing — reintroducing exactly the hole this field
+// exists to close, in the one place the carve-out no longer reaches.
+//
+// A practical consequence worth knowing before adopting: since the scan fires for every human
+// commit, nearly every human push is DispatchIntentSomething. DispatchIntentNothing is for bot
+// image-tag commits and genuinely zero-work pushes, not for "this repo has no build
+// components".
+//
+// It exists because the guard's original inference — "len(Components) == 0 means nothing
+// will be dispatched" — is wrong for a repo that runs unit tests without builds
+// (buildable=false + RunUnitTests=true). pushhookparser nils out components whenever builds
+// are skipped, while still dispatching the unit-tester event, so the guard fired on pushes
+// that DID dispatch work. The consequence was a real functional hole: a failed unit-test run
+// on such a repo could not be retriggered by re-pushing the commit, because the guard
+// returned the old slip and the caller treats a returned id ≠ the id it sent as a duplicate
+// and suppresses every side effect — unit tests included.
+//
+// Component count is not recoverable as a signal here, because the same "zero components"
+// value legitimately means BOTH "branch create at an existing SHA, nothing to do" and
+// "tests-only repo, unit tests are about to run". Only the caller knows which.
+//
+// The two point-in-time facts behind that, recorded here and deliberately nowhere else in
+// this repo — they describe another repository's source and config, so nothing here can
+// notice them going stale:
+//   - the pushhookparser line is `if !shouldBuild { slipComponents = nil }`, in
+//     pkg/parser/pushparser.go, which runs even when shouldRunUnitTests is true;
+//   - as of 2026-08-28, five MyCarrier-Engineering repos carry the triggering combination
+//     (buildable=false + RunUnitTests=true + AllowSlipWithNoBuilds=true). The third
+//     property is required: shouldCreateSlip is `shouldBuild || allowSlipWithNoBuilds` and
+//     does not include shouldRunUnitTests, so without it no slip is created at all.
+//
+// Adoption order across the three repos, and the one rule that matters: this library
+// releases first, then slippy-api forwards the field, then pushhookparser sets it. The
+// middle hop must FORWARD the origin's intent and must never re-derive it — deriving
+// Dispatch from len(components) in slippy-api would re-encode the exact inference this type
+// exists to remove, except as an EXPLICIT value that beats the DispatchIntentUnspecified
+// fallback and therefore cannot be corrected by any later release of this library. Only the
+// component that knows whether work will actually dispatch may set this.
+//
+// It is a string type, like every other enum-like type in this package (SlipStatus,
+// StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). It also carries a String()
+// method, as SlipStatus, StepStatus and PrereqStatus do; the other two do not. That is
+// not only convention: the dispatch_intent trio this adds is rendered by zap, which matches
+// fmt.Stringer but does NOT match a named uint8 type — so a numeric enum would have printed
+// `dispatch_intent=0` on the lines an operator reads to explain why a run's history was
+// preserved or destroyed. Choosing the underlying type now matters because changing it after
+// release is breaking, while adding String() never is.
+//
+// The field set and its call sites are stated once, on addDispatchIntentFields. Do not restate
+// the counts here: "two fields" and "the one line" were both correct when written and both went
+// stale within a commit.
+type DispatchIntent string
+
+const (
+	// DispatchIntentUnspecified means the caller has not stated its intent, so the guard
+	// falls back to inferring it from len(Components). This is the zero value on purpose:
+	// this library releases before its consumers (slippy-api, pushhookparser) adopt the
+	// field, and an un-updated caller must keep behaving exactly as it does today rather
+	// than silently changing semantics during the release window.
+	DispatchIntentUnspecified DispatchIntent = ""
+
+	// DispatchIntentSomething means this push WILL dispatch CI work, so an ended slip for
+	// the same commit should be repaved even when Components is empty. This is what a
+	// tests-only repo sends.
+	//
+	// Sequencing note for an adopting consumer: setting this opts a zero-component push
+	// INTO the repave path, and therefore into the Phase A double-row race described in
+	// .github/STATE_MACHINE_V3.md — two concurrent same-commit pushes can both repave and
+	// both insert, because no unique index exists until Phase B. The component-count
+	// inference previously shielded these repos from that. It also opts the push into
+	// ancestry resolution and into a repave failure being fatal, where the guard's early
+	// return previously made it a no-op; see CreateSlipForPush.
+	//
+	// One class of that fatality does not converge on redelivery: ErrInvalidConfiguration
+	// (today, a self-repave where the caller presents its own correlation ID as the row to
+	// supersede). The superseded row does survive, so the usual "Kafka redelivers against a
+	// store that still holds the row" argument applies to the row — but the offending value
+	// is the caller's own input and is stable across attempts, so every redelivery is
+	// rejected identically.
+	//
+	// Setting this field does NOT expose a caller to that class, and an earlier version of this
+	// note said it did. The self-correlation exclusion in emptyRunGuardApplies sits ABOVE the
+	// intent switch and is unconditional, so a self-correlation push reaches the in-place
+	// upsert identically whether Dispatch is unset, something, nothing, or unrecognized — this
+	// field opts you into nothing for that shape.
+	//
+	// ErrInvalidConfiguration is in fact unreachable today from every call site: Repave rejects
+	// only a nil successor and a self-referential supersede, all three store.Repave call sites
+	// sit past a same-correlation divert, and the successor's ID is assigned once from
+	// opts.CorrelationID and never reassigned. The explicit arms remain because the sentinel is
+	// part of the store contract and a future caller could present either shape; they are
+	// defensive, not currently exercised.
+	DispatchIntentSomething DispatchIntent = "something"
+
+	// DispatchIntentNothing means this push will dispatch NO CI work, so an ended slip for
+	// the same commit must be left intact and deduped onto. Authoritative even when
+	// Components is non-empty — in which case the fresh-create path also declines to seed
+	// component rows for work that will never report (see initializeSlipForPush).
+	//
+	// Sequencing note for an adopting consumer, mirroring the one on DispatchIntentSomething: a
+	// Nothing push can race a Something push for the same SHA — a branch-create event and a push
+	// event for one commit, which is exactly the shape the empty-run guard exists for. The guard
+	// returns the snapshot it loaded, which the concurrent push may already have repaved or
+	// reset to live under another run's identity. The returned correlation ID is therefore a
+	// dedup marker, not a write handle: it must not be used for subsequent UpdateStep calls,
+	// which would either fail with ErrSlipNotFound or land on another run's row.
+	DispatchIntentNothing DispatchIntent = "nothing"
+)
+
+// String names the zero value explicitly so a structured log field reads "unspecified"
+// rather than an empty value.
+func (d DispatchIntent) String() string {
+	if d == DispatchIntentUnspecified {
+		return "unspecified"
+	}
+	return string(d)
 }
 
 // Validate checks that all required fields are present.
@@ -113,6 +259,138 @@ func (o PushOptions) Validate() error {
 		return fmt.Errorf("commit_sha is required")
 	}
 	return nil
+}
+
+// recognized reports whether this DispatchIntent is one the library acts on. An unrecognized
+// value is not rejected — dispatchesNothing falls back to the component-count inference for it,
+// deliberately — but the fallback is NOT a guarantee that history survives: see
+// dispatchesNothing for the two shapes where a mis-serialized value repaves. The fallback is
+// also otherwise silent, and the guard's log line renders Dispatch verbatim.
+// Without this flag alongside it, that line reads as though the caller's stated intent decided
+// the outcome when in fact it was ignored. The domain is a string crossing two repo
+// boundaries (library → slippy-api → pushhookparser), so case and whitespace variants of the
+// valid values are reachable inputs, not hypotheticals.
+func (d DispatchIntent) recognized() bool {
+	switch d {
+	case DispatchIntentNothing, DispatchIntentSomething, DispatchIntentUnspecified:
+		return true
+	default:
+		return false
+	}
+}
+
+// addDispatchIntentFields merges the dispatch-intent audit trio into a log field map and
+// returns it. THIS IS THE ONE PLACE the trio is constructed — every call site gets the same
+// three fields, so adding a fourth or renaming one cannot leave a site behind, and no comment
+// anywhere needs to state how many fields there are.
+//
+// The fields:
+//
+//	dispatch_intent             the caller's raw value, rendered via String()
+//	dispatch_intent_honored     a recognized non-Unspecified value decided the outcome
+//	dispatch_intent_recognized  the value is inside the enum at all
+//
+// ALERT ON dispatch_intent_recognized = false. That is the only one of the three that isolates
+// a caller who got the value wrong. `honored = false` looks like the right signature and is not:
+// it is also false for the UNSET zero value, which String() renders as the literal
+// "unspecified" — so until Dispatch is forwarded end-to-end, when every real push arrives
+// Unspecified, "honored=false beside a non-empty dispatch_intent" matches every push and
+// isolates nothing. `recognized` also does not depend on how a consumer's Logger serializes the
+// value; Logger is an interface consumers implement, and DispatchIntent has String() but no
+// MarshalJSON, so the rendering was never this library's to guarantee.
+//
+// Every log line that reports a decision about an ended slip for this commit calls this, and
+// the repave lines matter most: that is where an intent that was ignored went on to destroy a
+// prior run's history. `grep -n addDispatchIntentFields` is the site list; do not write the
+// count into a comment, because it has gone stale in three consecutive review rounds.
+func addDispatchIntentFields(fields map[string]interface{}, d DispatchIntent) map[string]interface{} {
+	fields["dispatch_intent"] = d
+	fields["dispatch_intent_honored"] = d.honored()
+	fields["dispatch_intent_recognized"] = d.recognized()
+	return fields
+}
+
+// honored reports whether the caller's stated intent DECIDED an outcome — not merely whether
+// the value was recognized. It is what the `dispatch_intent_honored` log field carries.
+//
+// Both terms are load-bearing, which is why this is a method rather than the expression written
+// out at each log site. `recognized()` alone is the wrong predicate: DispatchIntentUnspecified
+// IS recognized, but it is never honored — the component-count inference decides instead — so a
+// flag reading "recognized" would be true for the unset zero value and assert the opposite of
+// what an operator would take it to mean for THIS field. False therefore covers both an
+// unrecognized Dispatch and the unset zero value.
+//
+// That is an argument about which predicate the `dispatch_intent_honored` field should carry,
+// not an argument against `recognized` as a signal: both ship, because they answer different
+// questions. recognized=false means the caller sent a value outside the enum, which is the
+// predicate to ALERT on; honored=false means the caller's value did not decide the outcome,
+// which is true of every unset push. See addDispatchIntentFields.
+func (d DispatchIntent) honored() bool {
+	return d != DispatchIntentUnspecified && d.recognized()
+}
+
+// dispatchesNothing reports whether this push will dispatch no CI work at all, in which
+// case repaving an ended slip for the same commit would destroy that run's history for zero
+// benefit. A RECOGNIZED explicit Dispatch wins; DispatchIntentUnspecified and any
+// unrecognized value both fall back to the legacy component-count inference.
+//
+// A MIS-SERIALIZED VALUE IS NOT SAFE, and an earlier version of this comment said it was
+// ("a caller does not need to pre-validate its enum value to get safe behavior"). The fallback
+// is the legacy inference, and the inference licenses a repave in two shapes:
+//
+//   - Dispatch="Nothing" (wrong casing) WITH components: the inference sees len(Components) > 0,
+//     returns false, the guard declines, and the prior run is repaved — where the correctly
+//     cased "nothing" would have deduped and preserved it.
+//   - Dispatch="Nothing" with ZERO components on a `failed` row: the unrecognized value falls
+//     through emptyRunGuardApplies' honored() check to the `failed` carve-out, which declines
+//     before this method is consulted at all.
+//
+// So a caller crossing a JSON boundary SHOULD validate the value at that boundary. The right
+// place is slippy-api's request decoding, where a bad value can be a 422 the sender sees.
+//
+// The fallback itself is deliberately left alone. Making the unrecognized arm skip the
+// carve-out was tried and rejected: it changes exactly the cells where a mis-cased "Something"
+// from a tests-only repo goes from retrigger to blocked — the outage DEVOPS-264 exists to
+// close. Normalizing case or whitespace is worse still, since it would make the library guess
+// at a value the sender got wrong. Degrading to the legacy behaviour is the least-bad of the
+// three; it is just not the same thing as being safe.
+//
+// Both empty-run guards (CreateSlipForPush's and handleDuplicateSlipBackstop's mirror of it)
+// route through the single emptyRunGuardApplies, which is what keeps them from drifting.
+//
+// What that does NOT mean is that the guard answers the intent question itself. honored()
+// reports only THAT a recognized intent was stated, never WHICH one — so the guard's
+// `if opts.Dispatch.honored() { return opts.dispatchesNothing() }` hands exactly
+// {nothing, something} to this method, and the two arms below supply the entire answer for
+// those values. They are reachable from BOTH guards, and from initializeSlipForPush, which
+// calls this method directly to decide component seeding.
+//
+// An earlier version of this paragraph called those arms "unreachable from either guard". That
+// was wrong, and wrong in a dangerous direction: neutering them changes 15 guard outcomes over
+// the five ended statuses the guard governs — every `nothing` with components flips
+// dedup→repave, every `something` without them flips repave→dedup — including
+// `failed` + `nothing` + components, which is the history-preservation case this field exists
+// for. Six top-level tests fail, one of them through the backstop's guard.
+//
+// The two entry paths are still deliberately not equivalent: only the guard's fall-through —
+// the Unspecified-or-unrecognized case, which skips honored() and reaches this method through
+// the `failed` carve-out — passes through that check. That difference is the root of the
+// mis-serialized-value behaviour documented above.
+func (o PushOptions) dispatchesNothing() bool {
+	switch o.Dispatch {
+	case DispatchIntentNothing:
+		return true
+	case DispatchIntentSomething:
+		return false
+	case DispatchIntentUnspecified:
+		// Legacy inference, below.
+	default:
+		// An unrecognized value uses the legacy inference too. That is a deliberate
+		// degradation, not a safety guarantee — the inference licenses a repave whenever
+		// components are present. See this method's doc for the two shapes and for why the
+		// alternatives were rejected.
+	}
+	return len(o.Components) == 0
 }
 
 // CreateSlipResult contains the result of slip creation including any warnings.
@@ -186,10 +464,19 @@ type CreateSlipResult struct {
 // AllowSlipWithNoBuilds=true) dispatches unit tests with ZERO build components, because
 // pushhookparser nils components whenever !shouldBuild. The caller would see returned != sent,
 // suppress every side effect, and a failed unit-test run on those repos could not be
-// retriggered by re-pushing — for as long as it took slippy-api AND pushhookparser to adopt
-// DispatchIntent (DEVOPS-264). Component count is not a safe proxy for "dispatches nothing";
-// DispatchIntent is what answers it properly, and until callers pass it this keeps the
-// pre-adoption path byte-identical to the behaviour it replaced.
+// retriggered by re-pushing.
+//
+// DispatchIntent (DEVOPS-264) is the proper answer to "does this push dispatch anything", and
+// dispatchesNothing consults it below. But intent only helps once slippy-api AND
+// pushhookparser forward the field, and until then every real push from those repos arrives
+// with Dispatch unset and falls back to the component-count inference. The `failed` carve-out
+// is what makes the fix independent of that adoption order: it keeps the pre-adoption path
+// behaving as it did before the guard existed, rather than leaving those repos unable to
+// retrigger for the length of a three-repo rollout.
+//
+// The two terms are complementary, not redundant. Intent covers every status once adopted
+// (including a caller that declares Nothing while holding components); the carve-out covers
+// `failed` regardless of adoption. Removing either re-opens a real case.
 func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 	if existing == nil {
 		return false
@@ -210,10 +497,35 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 	if existing.CorrelationID == opts.CorrelationID {
 		return false
 	}
+
+	// A RECOGNIZED explicit intent is authoritative in both directions, and is therefore
+	// consulted BEFORE the `failed` carve-out below rather than after it.
+	//
+	// Order matters here, and getting it wrong is destructive. With the carve-out first, a
+	// caller stating DispatchIntentNothing on a failed slip — an authoritative "no work will
+	// run" — fell through to a repave: the failed run's history was destroyed AND the
+	// successor seeded no components (because the same intent suppresses seeding), leaving a
+	// slip nothing could ever advance. That is precisely the outcome the guard exists to
+	// prevent, and it contradicted this field's own documented promise of being authoritative
+	// in both directions.
+	//
+	// honored() is exactly "Nothing or Something", so this delegates those two answers to
+	// dispatchesNothing and lets everything else — Unspecified and any unrecognized value —
+	// fall through to the carve-out and the inference below. Written as a delegation rather
+	// than a second copy of dispatchesNothing's switch: the two are NOT equivalent, because
+	// only this path's fall-through passes through the `failed` check, and having the
+	// difference live in one place is what makes that readable.
+	if opts.Dispatch.honored() {
+		return opts.dispatchesNothing()
+	}
+
+	// The `failed` carve-out governs the INFERENCE only: it covers the window before
+	// slippy-api and pushhookparser forward Dispatch, during which every real push arrives
+	// Unspecified and a componentless push onto a failed run must still retrigger it.
 	if existing.Status == SlipStatusFailed {
 		return false
 	}
-	return len(opts.Components) == 0
+	return opts.dispatchesNothing()
 }
 
 // CreateSlipForPush creates a new routing slip for a git push event.
@@ -227,23 +539,64 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 // Retry vs repave vs new-slip behavior for the same commit SHA, decided by
 // SlipStatus.IsLive() (the single live-vs-ended predicate shared with
 // handleDuplicateSlipBackstop below — DEVOPS-231 review finding B5):
+//
 //   - Existing slip IsLive() (pending/in_progress/compensating): retried via
 //     handlePushRetry (same correlation ID is reused) — the pipeline is still in flight,
 //     so re-dispatching would double-run work.
+//
 //   - Existing slip is failed: the stuck slip is repaved — replaced, in one transaction,
 //     by a fresh slip under the new correlation ID from opts. A failed slip never advances without
 //     a step re-run, so a new push for the same commit (webhook re-delivery or a
 //     same-commit re-push) is treated as a deliberate request to run CI again.
+//
+//     Two exceptions. First, a push stating a recognized DispatchIntentNothing dedups onto the
+//     failed slip instead of repaving it; see the empty-run guard bullet below. Second, a push
+//     carrying the existing row's OWN correlation ID is not repaved under a new ID at all —
+//     persistSlipForPush diverts it to an in-place upsert that resets the row to live under the
+//     SAME correlation ID, keeping its component children and replacing its state history. That
+//     is the ordinary in-delivery retry, not an exotic shape.
+//
 //   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
 //     stale and repaved on the same terms as the failed case above — replaced, in one
 //     transaction, by a fresh slip under the new correlation ID from opts. This prevents
-//     resurrecting superseded slips on webhook re-delivery or bot-commit races.
-//   - Existing slip is TERMINAL (not failed) AND opts.Components is empty AND the push does
-//     not carry the existing row's own correlation ID: the empty-run guard
-//     short-circuits the repave above and returns the existing (ended) slip as a dedup,
-//     since nothing would be dispatched and repaving would only destroy history for no
-//     benefit. handleDuplicateSlipBackstop applies the identical guard so the two paths
+//     resurrecting superseded slips on webhook re-delivery or bot-commit races. Both this
+//     bullet and the one above say "under the new correlation ID"; that holds only when the
+//     push carries a DIFFERENT id than the existing row. See the self-correlation exception.
+//
+//   - Existing slip is ended, this push will dispatch nothing, AND the push does not carry
+//     the existing row's own correlation ID: the empty-run guard short-circuits the repave
+//     above and returns the existing (ended) slip as a dedup, since nothing would be
+//     dispatched and repaving would only destroy history for no benefit.
+//
+//     All three conditions matter, and "will dispatch nothing" is where Dispatch enters:
+//
+//     A recognized Dispatch value is authoritative and is consulted FIRST. So a push stating
+//     DispatchIntentNothing dedups onto ANY ended slip, `failed` included — repaving there
+//     would destroy the failed run's history and seed a successor with no components that
+//     nothing could ever advance.
+//
+//     Only when Dispatch is unset or unrecognized does the guard infer intent from
+//     len(Components) == 0, and it is that INFERENCE which excludes `failed`, so a
+//     componentless re-push can still retrigger a stuck run. See emptyRunGuardApplies.
+//
+//     The self-correlation exclusion is unconditional. Being excluded from the guard does NOT
+//     mean falling through to a repave — it falls through to the in-place upsert above. It
+//     exists because the
+//     guard's contract is that the caller sees returned != sent and suppresses its side
+//     effects; when they are equal the caller would instead dispatch against the very slip
+//     it was handed.
+//
+//     "Will dispatch nothing" is PushOptions.Dispatch when the caller states a RECOGNIZED
+//     value (see DispatchIntent); DispatchIntentUnspecified and any unrecognized value both
+//     fall back to len(opts.Components) == 0 — component count is neither necessary nor
+//     sufficient on its own, which is why the field exists. That distinction matters to a
+//     consumer author: a mis-cased or mis-serialized value crossing the slippy-api JSON
+//     boundary is silently ignored rather than honored. A caller that dispatches work
+//     without build components (a tests-only repo) MUST set DispatchIntentSomething, or,
+//     pre-adoption, rely on the `failed` exclusion.
+//     handleDuplicateSlipBackstop applies the identical guard so the two paths
 //     converge on the same outcome for the same inputs.
+//
 //   - The repave itself can report that the decision is stale:
 //     ErrSlipWentLive means the slip became live again before the repave landed, so the
 //     repave is abandoned and treated like the IsLive() case above: dedup onto the
@@ -358,15 +711,27 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     when the new row is inserted.
 		//
 		if emptyRunGuardApplies(existingSlip, opts) {
-			// Empty-run guard: nothing will be dispatched for this push (branch
-			// create/recreate at an existing SHA, or a components-less repo).
+			// Empty-run guard: nothing will be dispatched for this push (a branch
+			// create/recreate at an existing SHA, or a repo with no work to run).
 			// Repaving would destroy the prior run's history for zero benefit.
 			// Return the existing slip; the caller sees returned != sent and
 			// suppresses side effects.
-			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for componentless push", map[string]interface{}{
-				"existing_id": existingSlip.CorrelationID,
-				"commit":      shortSHA(existingSlip.CommitSHA),
-			})
+			//
+			// A caller that DOES dispatch work without build components — a tests-only
+			// repo (buildable=false + RunUnitTests=true) — must say so via
+			// PushOptions.Dispatch, or this guard suppresses the retrigger it wanted.
+			// See DispatchIntent for why component count cannot answer this, and for what
+			// setting it opts such a push into: ancestry resolution, the repave path, and
+			// a repave failure being fatal — none of which this early return reaches.
+			// This line only ever fires when the guard applied, so DispatchIntentSomething can
+			// never reach it. See addDispatchIntentFields for the field set and the alert
+			// predicate.
+			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
+				addDispatchIntentFields(map[string]interface{}{
+					"existing_id": existingSlip.CorrelationID,
+					"commit":      shortSHA(existingSlip.CommitSHA),
+					"components":  len(opts.Components),
+				}, opts.Dispatch))
 			result.Slip = existingSlip
 			result.AncestryResolved = true
 			return result, nil
@@ -444,12 +809,33 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 
 	result.Slip = slip
 
-	c.logger.Info(ctx, "Created routing slip", map[string]interface{}{
-		"correlation_id": slip.CorrelationID,
-		"components":     len(opts.Components),
-		"ancestors":      len(ancestry),
-		"warnings":       len(result.Warnings),
-	})
+	// The trio is here too, because this is the one line that always fires on the create path:
+	// every other site requires an existing ended slip for the same commit, so a FIRST push
+	// emitted none of the three. That is the lower-stakes case — there is no prior history to
+	// destroy — but it is also where a mis-serialized "nothing" silently seeds an aggregate step
+	// as running for work that will never report, and nothing recorded that an intent was
+	// discarded.
+	//
+	// components_seeded, not len(opts.Components): a recognized DispatchIntentNothing declines to
+	// seed component rows even when Components is non-empty, so the raw count would read
+	// "components=1" beside zero seeded rows. Before Dispatch existed, len > 0 always implied
+	// seeded rows; it no longer does.
+	// components_seeded counted from the slip that was actually built, not re-derived from the
+	// gate: a recognized DispatchIntentNothing declines to seed component rows even when
+	// Components is non-empty, so the raw count alone would read "components=1" beside zero
+	// seeded rows. Before Dispatch existed, len > 0 always implied seeded rows; it no longer
+	// does, and reading the built slip keeps this honest if the gate ever changes.
+	componentsSeeded := 0
+	for _, rows := range slip.Aggregates {
+		componentsSeeded += len(rows)
+	}
+	c.logger.Info(ctx, "Created routing slip", addDispatchIntentFields(map[string]interface{}{
+		"correlation_id":    slip.CorrelationID,
+		"components":        len(opts.Components),
+		"components_seeded": componentsSeeded,
+		"ancestors":         len(ancestry),
+		"warnings":          len(result.Warnings),
+	}, opts.Dispatch))
 
 	return result, nil
 }
@@ -695,13 +1081,18 @@ func (c *Client) repaveExistingSlip(
 	repaveErr := c.store.Repave(ctx, existingSlip.CorrelationID, slip, parent)
 	switch {
 	case repaveErr == nil:
+		// The audit trio is emitted here as well as on the guard-applied lines, because those
+		// only fire when the guard dedups — without it the case that most needs a record left
+		// none: a mis-serialized intent that was ignored AND then repaved a prior run's history
+		// away. See addDispatchIntentFields for the field set and for which of the three is the
+		// alert predicate (it is NOT honored).
 		c.logger.Info(ctx, "Repaved ended slip for same commit (replaced in one transaction)",
-			map[string]interface{}{
+			addDispatchIntentFields(map[string]interface{}{
 				"repaved_id":     existingSlip.CorrelationID,
 				"repaved_commit": shortSHA(existingSlip.CommitSHA),
 				"repaved_status": string(existingSlip.Status),
 				"superseding_id": opts.CorrelationID,
-			})
+			}, opts.Dispatch))
 		return false, nil
 
 	case errors.Is(repaveErr, ErrSlipWentLive):
@@ -958,15 +1349,17 @@ func (c *Client) handleDuplicateSlipBackstop(
 	}
 
 	if emptyRunGuardApplies(conflicting, opts) {
-		// Empty-run guard (mirrored from CreateSlipForPush's main path): nothing would
+		// Empty-run guard (mirrored from CreateSlipForPush's main path, and sharing its
+		// single emptyRunGuardApplies predicate so the two cannot drift): nothing would
 		// be dispatched for this push, so repaving the conflicting row would only
-		// destroy its history for no benefit. Dedup onto it instead of deleting it.
+		// destroy its history for no benefit. Dedup onto it instead of replacing it.
 		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
-			map[string]interface{}{
+			addDispatchIntentFields(map[string]interface{}{
 				"conflicting_id": conflicting.CorrelationID,
 				"commit":         shortSHA(conflicting.CommitSHA),
 				"superseding_id": opts.CorrelationID,
-			})
+				"components":     len(opts.Components),
+			}, opts.Dispatch))
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
 		return true, nil
@@ -1014,12 +1407,15 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// the slip it wanted to create already exists. Report it as handled and populate
 		// result here, rather than returning handled=false and letting the caller re-run
 		// an insert that would only re-write the same row.
-		c.logger.Info(ctx, "Duplicate-create backstop: repaved ended conflicting slip", map[string]interface{}{
-			"repaved_id":     conflicting.CorrelationID,
-			"repaved_commit": shortSHA(conflicting.CommitSHA),
-			"repaved_status": string(conflicting.Status),
-			"superseding_id": opts.CorrelationID,
-		})
+		// The trio is on BOTH repave paths, not just the main one: this is a repave — history
+		// destroyed — so an ignored intent has to be as auditable here as in repaveExistingSlip.
+		c.logger.Info(ctx, "Duplicate-create backstop: repaved ended conflicting slip",
+			addDispatchIntentFields(map[string]interface{}{
+				"repaved_id":     conflicting.CorrelationID,
+				"repaved_commit": shortSHA(conflicting.CommitSHA),
+				"repaved_status": string(conflicting.Status),
+				"superseding_id": opts.CorrelationID,
+			}, opts.Dispatch))
 		result.Slip = slip
 		// AncestryResolved is deliberately left as resolveAndAbandonAncestors set it (D3.2):
 		// this is a fresh successor, not a dedup onto someone else's slip, so the accurate
@@ -1648,10 +2044,43 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			if i == 0 {
 				firstStep = stepConfig.Name
 				// Only auto-run first step if it's NOT an aggregate step,
-				// OR if it's an aggregate but has components to process.
-				// This prevents mobile apps (zero-component slips) from getting stuck.
+				// OR if it's an aggregate that will actually have components to process.
+				// This keeps mobile apps (zero-component slips) from reporting a step as
+				// started that nothing will ever advance.
+				//
+				// THIS is the gate that decides whether step 0 is REPORTED as started — it
+				// sets the step to running with a StartedAt — so it is the one that must
+				// honour dispatch intent. The aggregate-contents gate below decides only what the
+				// aggregate holds. Component count alone is the wrong question here for the
+				// same reason it is wrong for the empty-run guard: a caller declaring
+				// DispatchIntentNothing while holding components (a combination
+				// DispatchIntent's godoc declares supported and authoritative) would mark an
+				// aggregate step running over an aggregate that the gate below leaves EMPTY.
+				// What this gate does NOT do is make such a slip advance on its own, and an
+				// earlier version of this comment claimed otherwise: `pending` is no more
+				// self-advancing than `running`. applyComponentStatesToAggregate returns early
+				// when no component has reported, recomputeAggregate returns early on an empty
+				// active set, getPrereqStatus hands the raw status to AllPrerequisitesMet
+				// which requires `completed`, and checkPipelineCompletion buckets pending and
+				// running identically. The slip is in_progress either way, so a later push
+				// takes the IsLive() retry path into handlePushRetry, which only resets
+				// push_parsed — a step no shipped config defines. So there is no PUSH-DRIVEN
+				// recovery for a zero-work aggregate-first slip, with or without this gate:
+				// clearing step 0 takes an explicit consumer call (SkipStep, CompleteStep or
+				// UpdateStepWithStatus in steps.go — skipped counts as success per
+				// StepStatus.IsSuccess, and the call must be component-scoped or the Postgres
+				// recompute is a no-op). That gap is pre-existing DEVOPS-231 behaviour, not
+				// something this gate closes. What this gate buys is reporting accuracy — no
+				// falsified StartedAt, no step reported as started — the same class as the
+				// seeding change below.
+				//
+				// The conjunction is deliberate. Replacing the count with !dispatchesNothing()
+				// alone would flip the tests-only shape (Something + zero components) from
+				// pending to running with an empty aggregate — reporting a start that never
+				// happened for the very repos DEVOPS-264 exists to unblock. Both terms are
+				// required: work is dispatched AND there are components to track it.
 				isAggregateStep := stepConfig.Aggregates != ""
-				hasComponents := len(opts.Components) > 0
+				hasComponents := len(opts.Components) > 0 && !opts.dispatchesNothing()
 				if !isAggregateStep || hasComponents {
 					step.Status = StepStatusRunning
 					step.StartedAt = &now
@@ -1664,11 +2093,33 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			// Column name is the step name (e.g., "builds_completed"), not the pluralized aggregate
 			if stepConfig.Aggregates != "" {
 				columnName := stepConfig.Name
-				componentData := make([]ComponentStepData, len(opts.Components))
-				for j, def := range opts.Components {
-					componentData[j] = ComponentStepData{
-						Component: def.Name,
-						Status:    StepStatusPending,
+				// A push that dispatches nothing tracks no components, even when the
+				// caller supplied some: pending rows for work that will never report
+				// misrepresent the run's contents to anything reading Aggregates. This is a
+				// data-accuracy change only.
+				//
+				// It does NOT decide whether such a slip can make progress, and an earlier
+				// version of this comment claimed a causal chain that the code does not have.
+				// Neither store derives an aggregate step's status from these seeded rows —
+				// both aggregate only over components that have actually reported
+				// (filterActiveComponents in clickhouse_store.go, and the len(active) == 0
+				// early return in postgres_store_updates.go's recomputeAggregate) — and
+				// checkPipelineCompletion never reads Aggregates at all, so an empty
+				// aggregate cannot end or extend a slip. Progress is decided by the
+				// hasComponents gate above.
+				//
+				// Built with make(..., 0, len) + append rather than a nil slice so the
+				// in-memory struct CreateSlipForPush returns serializes the same as the one
+				// Load reconstructs: both store write paths normalize nil to [], so a nil
+				// here would marshal as null on the create side and [] on the load side.
+				// This also keeps every path consistent, including Nothing-with-components.
+				componentData := make([]ComponentStepData, 0, len(opts.Components))
+				if !opts.dispatchesNothing() {
+					for _, def := range opts.Components {
+						componentData = append(componentData, ComponentStepData{
+							Component: def.Name,
+							Status:    StepStatusPending,
+						})
 					}
 				}
 				aggregates[columnName] = componentData
@@ -1680,10 +2131,21 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 		steps["push_parsed"] = Step{Status: StepStatusRunning, StartedAt: &now}
 	}
 
+	// Report the status step 0 actually received, not an assumed `running`. The gate above
+	// leaves an aggregate first step `pending` whenever this push tracks no components, and a
+	// history entry saying `running` over a pending step is consumer-observable: GetHistory
+	// returns StateHistory verbatim and GetStepHistory filters it, so a caller asking for that
+	// step's history was told it started when it had not. Pre-existing for the zero-component
+	// mobile-app shape; the dispatch-intent gate widened the set of inputs that reach it,
+	// which is what makes the contradiction worth closing rather than inheriting.
+	firstStepStatus := StepStatusPending
+	if step, ok := steps[firstStep]; ok {
+		firstStepStatus = step.Status
+	}
 	history := []StateHistoryEntry{
 		{
 			Step:      firstStep,
-			Status:    StepStatusRunning,
+			Status:    firstStepStatus,
 			Timestamp: now,
 			Actor:     "slippy-library",
 			Message:   "processing push event",

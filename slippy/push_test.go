@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -758,6 +759,12 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		// components (AllowSlipWithNoBuilds repos). Nothing would be dispatched, so
 		// repaving would only destroy the real run's history. Return the existing
 		// ended slip as a dedup instead (caller sees returned != sent → suppress).
+		//
+		// This also pins the back-compat property the rollout depends on: Dispatch is
+		// left at its zero value here, so it doubles as the DispatchIntentUnspecified
+		// case. goLib releases before slippy-api and pushhookparser adopt the field, and
+		// a caller that sets nothing must behave exactly as it does today. The predicate
+		// itself is covered directly by TestPushOptions_dispatchesNothing.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
@@ -803,65 +810,269 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	t.Run("failed slip + no components - retriggers, the empty-run guard must not apply", func(t *testing.T) {
-		// The empty-run guard is introduced by this branch, so it must not narrow what a
-		// push could do before it existed. On the merge base a same-commit push onto a
-		// FAILED slip always abandoned it and created a fresh slip under the caller's
-		// correlation ID — component count was never consulted — and the code said why:
-		// "blocking fresh-slip creation here would re-introduce the 'retrigger never
-		// builds' bug". A failed slip never advances on its own, so a new push for the
-		// same commit is a deliberate request to run CI again.
+	// TestClient_CreateSlipForPush's dispatch-intent subtests pin the fix for the
+	// tests-only-repo retrigger hole (DEVOPS-264): the empty-run guard used to infer "this
+	// push dispatches nothing" from len(Components) == 0, which is wrong for a repo that
+	// runs unit tests without builds, so a failed run there could not be retriggered by
+	// re-pushing the commit.
+	//
+	// The mechanism, the affected repo set, and the quoted pushhookparser line all live in
+	// one place — DispatchIntent's godoc in push.go. They are facts about ANOTHER
+	// repository's config and source, so nothing here can observe them going stale;
+	// duplicating them would just rot in two places at once.
+	//
+	// One fact that IS local and does belong here: DEVOPS-231's guard also excludes `failed`
+	// outright, independently of intent. That is what covers the rollout window, during which
+	// every real push from those repos still arrives with Dispatch unset. The two terms are
+	// complementary — intent covers every status once adopted, the carve-out covers `failed`
+	// regardless of adoption — so both are exercised below.
+
+	t.Run("failed slip + no components, dispatch unset - retriggers via the failed carve-out",
+		func(t *testing.T) {
+			// The PRE-adoption shape: a real tests-only-repo push during the rollout window.
+			// On the merge base a same-commit push onto a FAILED slip always abandoned it and
+			// created a fresh slip under the caller's correlation ID, and the code said why —
+			// "blocking fresh-slip creation here would re-introduce the 'retrigger never
+			// builds' bug". A failed slip never advances on its own, so a new push for the
+			// same commit is a deliberate request to run CI again.
+			//
+			// This must hold with Dispatch at its zero value, which is the whole point: it is
+			// what makes the fix independent of the adoption order.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-failed-run",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-retrigger",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-retrigger",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-retrigger",
+				Components:    nil, // tests-only repo: unit tests dispatch, no build components
+				// Dispatch deliberately left unset — the pre-adoption reality.
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip.CorrelationID != "corr-retrigger" {
+				t.Errorf("a failed slip must be replaced by a fresh slip under the caller's id "+
+					"(so the caller sees returned == sent and re-dispatches), got %q",
+					result.Slip.CorrelationID)
+			}
+			if len(store.RepaveCalls) != 1 {
+				t.Errorf("expected exactly 1 Repave call for the failed slip, got %v", store.RepaveCalls)
+			} else if store.RepaveCalls[0] != "corr-failed-run" {
+				t.Errorf("expected the failed slip to be repaved, got %q", store.RepaveCalls[0])
+			}
+			if _, ok := store.Slips["corr-failed-run"]; ok {
+				t.Error("the failed run must be replaced, not left behind")
+			}
+		})
+
+	t.Run("ended slip + no components but dispatch intent says work WILL run - repaves", func(t *testing.T) {
+		// The POST-adoption shape: once callers forward the field, intent decides.
 		//
-		// Component count cannot stand in for "this push dispatches nothing" here. A
-		// tests-only repo (buildable=false + RunUnitTests=true + AllowSlipWithNoBuilds)
-		// dispatches unit tests with zero build components: pushhookparser nils components
-		// whenever !shouldBuild while still dispatching those tests. If the guard claimed
-		// this push, the caller would see returned != sent, suppress everything, and a
-		// failed unit-test run on those repos could never be retriggered by re-pushing —
-		// a regression against the merge base that would last until slippy-api AND
-		// pushhookparser both adopt DispatchIntent (DEVOPS-264).
-		//
-		// So the guard covers the ENDED statuses it was written for (a branch
-		// create/recreate at an existing SHA, whose slip is normally completed) and
-		// leaves `failed` to repave. DispatchIntent makes the same decision precisely
-		// once callers pass it; this keeps the pre-adoption path identical to the base.
+		// The prior row is seeded `completed`, NOT `failed`, and that is what makes this test
+		// discriminating. With `failed` the guard declines at the carve-out regardless of
+		// intent, so the asserted outcome came from base-branch behaviour and the test passed
+		// with DispatchIntentSomething entirely un-honored. `completed` isolates the intent
+		// term: the guard would otherwise fire here (ended row, zero components), so only
+		// Something stops it. Any non-`failed` ended status works; `completed` matches the
+		// sibling subtest above.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
 
 		store.AddSlip(&Slip{
-			CorrelationID: "corr-failed-run",
+			CorrelationID: "corr-ended-tests-only",
 			Repository:    "owner/repo",
 			Branch:        "integration",
-			CommitSHA:     "sha-retrigger",
-			Status:        SlipStatusFailed,
-			Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+			CommitSHA:     "sha-tests-only",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"unit_tests": {Status: StepStatusCompleted}},
 			StateHistory:  []StateHistoryEntry{},
 		})
 
 		result, err := client.CreateSlipForPush(ctx, PushOptions{
-			CorrelationID: "corr-retrigger",
+			CorrelationID: "corr-retrigger-tests-only",
 			Repository:    "owner/repo",
 			Branch:        "integration",
-			CommitSHA:     "sha-retrigger",
-			Components:    nil, // tests-only repo: unit tests dispatch, no build components
+			CommitSHA:     "sha-tests-only",
+			// A tests-only repo: no build components, but unit tests will be dispatched.
+			Components: nil,
+			Dispatch:   DispatchIntentSomething,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if result.Slip.CorrelationID != "corr-retrigger" {
-			t.Errorf("a failed slip must be replaced by a fresh slip under the caller's id "+
-				"(so the caller sees returned == sent and re-dispatches), got %q",
-				result.Slip.CorrelationID)
+		if result.Slip.CorrelationID != "corr-retrigger-tests-only" {
+			t.Errorf("expected the fresh slip so the caller re-dispatches, got %q", result.Slip.CorrelationID)
 		}
-		if len(store.RepaveCalls) != 1 {
-			t.Errorf("expected exactly 1 Repave call for the failed slip, got %v", store.RepaveCalls)
-		} else if store.RepaveCalls[0] != "corr-failed-run" {
-			t.Errorf("expected the failed slip to be repaved, got %q", store.RepaveCalls[0])
+		if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "corr-ended-tests-only" {
+			t.Errorf("expected the ended run to be repaved, got %v", store.RepaveCalls)
 		}
-		if _, ok := store.Slips["corr-failed-run"]; ok {
-			t.Error("the failed run must be replaced, not left behind")
+		if _, ok := store.Slips["corr-ended-tests-only"]; ok {
+			t.Error("the ended run must be replaced, not left behind")
 		}
+	})
+
+	t.Run("explicit Nothing on a FAILED slip preserves its history - intent beats the carve-out",
+		func(t *testing.T) {
+			// The `failed` carve-out and explicit intent both bear on this push, and the order
+			// they are consulted in decides whether a run's history survives.
+			//
+			// With the carve-out first, a caller stating DispatchIntentNothing on a failed
+			// slip fell through to a repave: the failed run's history was destroyed, and the
+			// successor seeded no components — because the same intent suppresses seeding — so
+			// the replacement was a slip nothing could ever advance. Both halves of that are
+			// the outcome the guard exists to prevent, and it contradicted DispatchIntent's
+			// documented promise of being authoritative in both directions.
+			//
+			// A recognized explicit intent is therefore consulted first. The carve-out still
+			// governs the inference, which is what covers the pre-adoption window — see the
+			// unset-Dispatch subtest above.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-failed-nothing",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-branch-recreate",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{{Step: "unit_tests", Actor: "ci"}},
+			})
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-recreate",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-branch-recreate",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+				Dispatch:      DispatchIntentNothing, // authoritative: nothing will run
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-failed-nothing" {
+				t.Fatalf("an authoritative Nothing must dedup onto the existing run, got %+v",
+					result.Slip)
+			}
+			if len(store.RepaveCalls) != 0 {
+				t.Errorf("the failed run's history must survive an explicit Nothing, got repaves: %v",
+					store.RepaveCalls)
+			}
+			stored, loadErr := store.Load(ctx, "corr-failed-nothing")
+			if loadErr != nil {
+				t.Fatalf("the failed run must still exist: %v", loadErr)
+			}
+			if len(stored.StateHistory) != 1 {
+				t.Errorf("its history must be intact, got %d entries", len(stored.StateHistory))
+			}
+		})
+
+	t.Run("ended slip + components but dispatch intent says nothing will run - dedups", func(t *testing.T) {
+		// The converse: intent is authoritative in BOTH directions. A caller that knows
+		// nothing will dispatch gets the guard even when components are present, so the
+		// guard stops depending on component count entirely. Note the seeded status is
+		// `completed`, not `failed` — the failed carve-out would otherwise decide this, and
+		// what is under test here is the intent term.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-real-run-2",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-no-dispatch",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-would-be-fresh-2",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-no-dispatch",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			Dispatch:      DispatchIntentNothing,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-real-run-2" {
+			t.Errorf("guard must return the existing run, got %q", result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("guard must not repave, got Repave calls: %v", store.RepaveCalls)
+		}
+	})
+
+	t.Run("dispatch intent Nothing seeds no components on the fresh-create path", func(t *testing.T) {
+		// The guards only run when an ended row already exists. On the fresh-create path
+		// there is no guard, so a Nothing push carrying components used to seed pending
+		// aggregate rows for work that will never report — misrepresenting the run's
+		// contents to anything reading Aggregates.
+		//
+		// This is a data-accuracy property, not a liveness one. An earlier version of this
+		// comment claimed the seeded rows kept the slip IsLive() and so forced later pushes
+		// down handlePushRetry; that chain does not exist. Neither store feeds these rows to
+		// computeAggregateStatus, and checkPipelineCompletion never reads Aggregates at all.
+		// The reporting-accuracy question lives in initializeSlipForPush's hasComponents
+		// gate, which is covered separately. Note that gate does not confer recoverability
+		// either — see its comment for why a pending step is no more self-advancing than a
+		// running one.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-nothing-with-components",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-nothing-fresh",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			Dispatch:      DispatchIntentNothing,
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for name, comps := range result.Slip.Aggregates {
+			if len(comps) != 0 {
+				t.Errorf("aggregate %q seeded %d components for a push that dispatches nothing: %+v",
+					name, len(comps), comps)
+			}
+		}
+
+		// Deliberately NOT asserted here: computeAggregateStatus over these (now empty)
+		// slices. computeAggregateStatus([]) is unconditionally StepStatusCompleted — the
+		// allCompleted flag starts true and the loop body never runs — so such an assertion
+		// could only fail when the len(comps) != 0 check above already has. It would add no
+		// detection.
+		//
+		// It would also pin a mechanism the code does not have, which is worse than adding
+		// nothing: neither store feeds these seeded rows to computeAggregateStatus (both
+		// aggregate only over components that have actually reported), and
+		// checkPipelineCompletion never reads Aggregates at all — it terminates on
+		// Steps["prod_steady_state"] or a primary step failure. So an empty aggregate cannot
+		// end a slip or stop it being live. What this fix actually buys is data accuracy;
+		// what keeps step 0 from being REPORTED as started is the hasComponents gate in
+		// initializeSlipForPush, which
+		// TestClient_InitializeSlipForPush_NothingIntentDoesNotStartAggregateStep covers.
+		// That gate is reporting accuracy too — it does not make such a slip recoverable.
 	})
 
 	t.Run(
@@ -2388,7 +2599,8 @@ func TestClient_InitializeSlipForPush_MobileApp(t *testing.T) {
 	slip := client.initializeSlipForPush(opts, nil)
 
 	// CRITICAL: First step should be PENDING (not RUNNING) when it's an aggregate with zero components
-	// This allows the step to auto-complete since there are no components to wait for
+	// The step stays pending rather than reporting a start nothing will advance. It does NOT
+	// auto-complete — neither store feeds these seeded rows to computeAggregateStatus.
 	firstStepName := config.Steps[0].Name
 	if slip.Steps[firstStepName].Status != StepStatusPending {
 		t.Errorf(
@@ -2407,6 +2619,191 @@ func TestClient_InitializeSlipForPush_MobileApp(t *testing.T) {
 	}
 	if len(slip.Aggregates["builds"]) != 0 {
 		t.Errorf("expected 0 components in builds aggregate, got %d", len(slip.Aggregates["builds"]))
+	}
+}
+
+// aggregateFirstTestConfig builds a pipeline whose FIRST step is an aggregate, matching the
+// shape slippy/default.json ships (step 0 is `builds` with `aggregates: "build"`). The
+// zero-component-aggregate gate only exists for this shape, so it is the only config that can
+// exercise it.
+func aggregateFirstTestConfig() *PipelineConfig {
+	config := &PipelineConfig{
+		Version: "1",
+		Name:    "aggregate-first",
+		Steps: []StepConfig{
+			{Name: "builds", Description: "Builds completed", Aggregates: "build"},
+			{Name: "unit_tests", Description: "Unit tests", Prerequisites: []string{"builds"}},
+		},
+	}
+	config.stepsByName = make(map[string]*StepConfig)
+	config.aggregateMap = make(map[string]string)
+	config.gateSteps = make([]string, 0)
+	for i := range config.Steps {
+		step := &config.Steps[i]
+		step.order = i
+		config.stepsByName[step.Name] = step
+		if step.Aggregates != "" {
+			config.aggregateMap[step.Aggregates] = step.Name
+		}
+	}
+	return config
+}
+
+// TestClient_InitializeSlipForPush_NothingIntentDoesNotStartAggregateStep pins that
+// DispatchIntentNothing suppresses the auto-run of an aggregate first step, not just the
+// seeding of its component rows.
+//
+// initializeSlipForPush answers "does this push have work?" twice, and the two answers must
+// agree. One decides the aggregate's CONTENTS; the other — the `hasComponents` gate here —
+// decides whether step 0 is marked `running` with a StartedAt. Only the second can wedge a
+// slip, so it is the one that matters.
+//
+// With intent honoured for contents but not for the gate, a Nothing push carrying components
+// marks `builds` running, with a StartedAt, over an aggregate that is now EMPTY — reporting
+// work as in flight that will never report. Nothing advances such a step:
+// applyComponentStatesToAggregate returns early when no component reported, and
+// recomputeAggregate returns early on an empty active set.
+//
+// What this does NOT claim, because it is not true: that the gate makes the slip recoverable.
+// A `pending` step is no more self-advancing than a `running` one, and no later push clears
+// either — handlePushRetry only resets `push_parsed`, which no shipped config defines, so its
+// status write is skipped entirely. That gap is pre-existing DEVOPS-231 behaviour. What the
+// gate buys is that step 0's status and StartedAt tell the truth.
+//
+// Not reachable in production today — no caller sets Dispatch yet, and pushhookparser empties
+// components exactly when nothing builds — but DispatchIntentNothing's own godoc declares the
+// with-components combination supported and authoritative, so adoption arms it.
+func TestClient_InitializeSlipForPush_NothingIntentDoesNotStartAggregateStep(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	slip := client.initializeSlipForPush(PushOptions{
+		CorrelationID: "corr-nothing-with-components",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-nothing",
+		// Components present, but the caller states authoritatively that nothing dispatches.
+		Components: []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		Dispatch:   DispatchIntentNothing,
+	}, nil)
+
+	if got := slip.Steps["builds"].Status; got != StepStatusPending {
+		t.Errorf("an aggregate first step must not be marked running when the push dispatches "+
+			"nothing: its aggregate is empty, so no component write can ever advance it "+
+			"(got %q)", got)
+	}
+	if slip.Steps["builds"].StartedAt != nil {
+		t.Error("expected StartedAt to be nil for a step that was never really started")
+	}
+	if len(slip.Aggregates["builds"]) != 0 {
+		t.Errorf("a non-dispatching push tracks no components, got %d", len(slip.Aggregates["builds"]))
+	}
+}
+
+// TestClient_InitializeSlipForPush_AggregatesSerializeAsEmptyArrayNotNull pins that the
+// in-memory slip CreateSlipForPush hands back serializes the same way as the one Load
+// reconstructs.
+//
+// Both store write paths normalize a nil component slice to [] before persisting, so the
+// COLUMN is unaffected either way — the asymmetry is between the struct returned on the
+// create side and the struct rebuilt on the load side, which would marshal as null and []
+// respectively. Slip.Aggregates is a tagged JSON field on a struct this library hands to
+// consumers, and slippy-api is the documented next hop, so a type that changes shape
+// depending on which side produced it is a trap even with no in-repo consumer today.
+//
+// Asserted on the legacy shape (Dispatch unset, no components) because that is the path this
+// PR promises is inert, and on the Nothing-with-components shape because that is the one the
+// gate deliberately empties.
+func TestClient_InitializeSlipForPush_AggregatesSerializeAsEmptyArrayNotNull(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	cases := []struct {
+		name string
+		opts PushOptions
+	}{
+		{
+			name: "legacy: dispatch unset, no components",
+			opts: PushOptions{
+				CorrelationID: "corr-shape-legacy", Repository: "owner/repo",
+				Branch: "main", CommitSHA: "sha-shape-1",
+			},
+		},
+		{
+			name: "nothing intent with components supplied",
+			opts: PushOptions{
+				CorrelationID: "corr-shape-nothing", Repository: "owner/repo",
+				Branch: "main", CommitSHA: "sha-shape-2",
+				Components: []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+				Dispatch:   DispatchIntentNothing,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			slip := client.initializeSlipForPush(tc.opts, nil)
+			if slip.Aggregates["builds"] == nil {
+				t.Fatal("expected a non-nil empty slice so this marshals as [] rather than null")
+			}
+			encoded, err := json.Marshal(slip.Aggregates)
+			if err != nil {
+				t.Fatalf("marshal failed: %v", err)
+			}
+			if strings.Contains(string(encoded), "null") {
+				t.Errorf("aggregates must not serialize any member as null, got %s", encoded)
+			}
+		})
+	}
+}
+
+// TestClient_InitializeSlipForPush_SomethingIntentStartsAggregateStepWithoutComponents pins
+// the other direction, and is why the gate takes a conjunction rather than being replaced by
+// !dispatchesNothing() outright. A tests-only repo declares Something with ZERO components;
+// that must NOT mark the aggregate step running, because its aggregate would be empty and
+// wedge exactly as above — which is the very repo shape DEVOPS-264 exists to unblock.
+func TestClient_InitializeSlipForPush_SomethingIntentStartsAggregateStepWithoutComponents(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	slip := client.initializeSlipForPush(PushOptions{
+		CorrelationID: "corr-something-no-components",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-something",
+		Components:    nil,
+		Dispatch:      DispatchIntentSomething,
+	}, nil)
+
+	if got := slip.Steps["builds"].Status; got != StepStatusPending {
+		t.Errorf("Something with zero components must still leave an aggregate first step "+
+			"pending — its aggregate is empty either way (got %q)", got)
+	}
+}
+
+// TestClient_InitializeSlipForPush_AggregateStepStartsWithComponents pins the positive case,
+// so the two tests above cannot be satisfied by a gate that never starts anything.
+func TestClient_InitializeSlipForPush_AggregateStepStartsWithComponents(t *testing.T) {
+	config := aggregateFirstTestConfig()
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{PipelineConfig: config})
+
+	slip := client.initializeSlipForPush(PushOptions{
+		CorrelationID: "corr-real-build",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-real",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		Dispatch:      DispatchIntentSomething,
+	}, nil)
+
+	if got := slip.Steps["builds"].Status; got != StepStatusRunning {
+		t.Errorf("a real build push must start the aggregate step, got %q", got)
+	}
+	if slip.Steps["builds"].StartedAt == nil {
+		t.Error("expected StartedAt to be set for a genuinely started step")
+	}
+	if len(slip.Aggregates["builds"]) != 1 {
+		t.Errorf("expected the component to be tracked, got %d", len(slip.Aggregates["builds"]))
 	}
 }
 
@@ -3349,6 +3746,145 @@ func TestClient_CreateSlipForPush_DuplicateBackstopFailurePaths(t *testing.T) {
 			t.Error("no link may be written when the slip itself was never created")
 		}
 	})
+}
+
+// TestDispatchIntent_String pins how the two new log fields render. The zero value is the
+// case that matters: without an explicit name it would log as an empty string, on the one
+// line an operator reads to explain why a run's history was preserved or destroyed.
+func TestDispatchIntent_String(t *testing.T) {
+	tests := []struct {
+		intent DispatchIntent
+		want   string
+	}{
+		{DispatchIntentUnspecified, "unspecified"},
+		{DispatchIntentSomething, "something"},
+		{DispatchIntentNothing, "nothing"},
+		{DispatchIntent("garbage"), "garbage"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			if got := tc.intent.String(); got != tc.want {
+				t.Errorf("String() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// The type must satisfy fmt.Stringer for zap to use it: zap matches fmt.Stringer but
+	// would otherwise reflect a named string type, which is the drift this guards.
+	var _ fmt.Stringer = DispatchIntentSomething
+}
+
+// TestPushOptions_dispatchesNothing is the table-driven contract for the single predicate
+// both empty-run guards share. Keeping it in one place is the point: the guard used to be
+// two copies of `len(opts.Components) == 0` in CreateSlipForPush and
+// handleDuplicateSlipBackstop, which are documented as converging on the same outcome for
+// the same inputs and could silently diverge.
+func TestPushOptions_dispatchesNothing(t *testing.T) {
+	withComponents := []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}}
+
+	tests := []struct {
+		name       string
+		dispatch   DispatchIntent
+		components []ComponentDefinition
+		want       bool
+		why        string
+	}{
+		{
+			name:     "explicit Nothing wins over present components",
+			dispatch: DispatchIntentNothing, components: withComponents, want: true,
+			why: "intent is authoritative in both directions, not just when components are empty",
+		},
+		{
+			name:     "explicit Something wins over absent components",
+			dispatch: DispatchIntentSomething, components: nil, want: false,
+			why: "the tests-only repo case: no build components, but unit tests will dispatch",
+		},
+		{
+			name:     "unspecified with no components falls back to true",
+			dispatch: DispatchIntentUnspecified, components: nil, want: true,
+			why: "legacy behavior must be preserved for callers that have not adopted the field",
+		},
+		{
+			name:     "unspecified with components falls back to false",
+			dispatch: DispatchIntentUnspecified, components: withComponents, want: false,
+			why: "legacy behavior must be preserved for callers that have not adopted the field",
+		},
+		{
+			name:     "out-of-range value falls back to the inference rather than assuming work runs",
+			dispatch: DispatchIntent("garbage"), components: nil, want: true,
+			why: "a garbage value must never license destroying a prior run's history",
+		},
+		{
+			name:     "out-of-range value with components infers work",
+			dispatch: DispatchIntent("garbage"), components: withComponents, want: false,
+			why: "the fallback is the inference, not a hardcoded answer",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := PushOptions{
+				CorrelationID: "c1",
+				Repository:    "owner/repo",
+				CommitSHA:     "sha1",
+				Components:    tc.components,
+				Dispatch:      tc.dispatch,
+			}
+			if got := opts.dispatchesNothing(); got != tc.want {
+				t.Errorf("dispatchesNothing() = %v, want %v — %s", got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// TestClient_CreateSlipForPush_BackstopHonorsDispatchIntent pins that the backstop's
+// mirrored guard follows the same intent as the main path. Dormant until Phase B (see
+// CreateSlipForPush's doc), but if the two guards disagreed, the same push would repave or
+// dedup depending only on which path it happened to take.
+func TestClient_CreateSlipForPush_BackstopHonorsDispatchIntent(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	github := NewMockGitHubAPI()
+	client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+	// The conflicting row appears at Create time, so only the backstop's own lookup sees
+	// it — the same shape the other backstop tests use.
+	//
+	// Seeded `completed`, NOT `failed`: the guard declines any `failed` slip at the carve-out
+	// regardless of intent, so with `failed` this test asserted base-branch behaviour and
+	// passed with DispatchIntentSomething entirely un-honored. `completed` isolates the intent
+	// term — the guard would otherwise fire (ended row, zero components), so only Something
+	// stops it and the assertion below actually tests the feature this is named for.
+	store.SeedOnCreate["corr-caller-tests-only"] = &Slip{
+		CorrelationID: "corr-conflict-tests-only",
+		Repository:    "owner/repo",
+		Branch:        "integration",
+		CommitSHA:     "sha-backstop-tests-only",
+		Status:        SlipStatusCompleted,
+		Steps:         map[string]Step{"unit_tests": {Status: StepStatusCompleted}},
+		StateHistory:  []StateHistoryEntry{},
+	}
+	store.CreateErrorOnce["corr-caller-tests-only"] = ErrDuplicateSlip
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-caller-tests-only",
+		Repository:    "owner/repo",
+		Branch:        "integration",
+		CommitSHA:     "sha-backstop-tests-only",
+		Components:    nil,                     // tests-only: no build components...
+		Dispatch:      DispatchIntentSomething, // ...but unit tests will dispatch
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Under the old component-count guard the backstop would have deduped onto the ended
+	// conflicting row, suppressing the retrigger. It must repave instead.
+	if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "corr-conflict-tests-only" {
+		t.Errorf("expected the backstop to repave the ended conflicting row, got %v", store.RepaveCalls)
+	}
+	if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-tests-only" {
+		t.Errorf("expected the caller's own fresh slip, got %+v", result.Slip)
+	}
 }
 
 // TestClient_CreateSlipForPush_RepaveDuplicateBackstop covers the repave path's own
@@ -4593,4 +5129,534 @@ func TestClient_CreateSlipForPush_BackstopResetLeavesAMarker(t *testing.T) {
 	if !strings.Contains(marker, string(SlipStatusCompleted)) {
 		t.Errorf("the marker must name the prior attempt's status, got %q", marker)
 	}
+}
+
+// TestShippedConfigsAreAggregateFirst pins the premise the dispatch-intent gate tests rest on.
+//
+// aggregateFirstTestConfig() hand-mirrors the shape the shipped configs have — step 0 an
+// aggregate — and all four InitializeSlipForPush gate tests use that hand-rolled config. So if
+// a shipped config stopped being aggregate-first, the hasComponents gate would be dead for
+// every real pipeline, those four tests would keep passing, and the helper's doc claim would be
+// silently false. Nothing detected that: every LoadPipelineConfigFromFile call site for a
+// shipped config is behind the integration build tag.
+func TestShippedConfigsAreAggregateFirst(t *testing.T) {
+	for _, name := range []string{"default.json", "production.json"} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := LoadPipelineConfigFromFile(name)
+			if err != nil {
+				t.Fatalf("load %s: %v", name, err)
+			}
+			if len(cfg.Steps) == 0 {
+				t.Fatalf("%s has no steps", name)
+			}
+			if cfg.Steps[0].Aggregates == "" {
+				t.Fatalf("%s step 0 %q is no longer an aggregate step, so the hasComponents "+
+					"gate is unreachable for every shipped pipeline and "+
+					"aggregateFirstTestConfig no longer mirrors anything that ships",
+					name, cfg.Steps[0].Name)
+			}
+		})
+	}
+}
+
+// TestCreateSlipForPush_ReturnedEqualsSentImpliesLive pins the single invariant the caller
+// protocol rests on, across the whole decision surface rather than one path at a time.
+//
+// The contract between this library and its callers is: `returned != sent` means "deduplicated,
+// suppress your side effects", and `returned == sent` means "this is your slip, proceed". So
+// whenever the returned correlation ID equals the one the caller sent, the returned slip MUST
+// be live — otherwise the caller dispatches builds, tests and deploys, then reports them
+// against a run that has already ended.
+//
+// Two defects found in review were both instances of violating exactly this, in different
+// branches: the empty-run guard claiming a same-correlation push and handing back a terminal
+// slip, and the same-correlation retry arm being unreachable for `completed` because it sat
+// behind that guard. Pinning the invariant rather than the branches means a future
+// rearrangement of the decision tree cannot reintroduce the class somewhere new.
+//
+// The sweep covers every existing-slip status including absent, both correlation-ID
+// relationships, every DispatchIntent including unrecognized and near-miss casing/whitespace
+// variants, and three component counts. Errors are skipped: a failed push returns no slip, so
+// the invariant does not apply to it.
+func TestCreateSlipForPush_ReturnedEqualsSentImpliesLive(t *testing.T) {
+	ctx := context.Background()
+
+	statuses := []SlipStatus{
+		"", // no existing slip for this commit
+		SlipStatusPending, SlipStatusInProgress, SlipStatusCompensating,
+		SlipStatusFailed,
+		SlipStatusCompleted, SlipStatusAbandoned, SlipStatusPromoted, SlipStatusCompensated,
+	}
+	// Near-miss values are deliberate: Dispatch crosses two repo boundaries as a string, so
+	// case and whitespace variants are reachable inputs rather than hypotheticals.
+	intents := []DispatchIntent{
+		DispatchIntentUnspecified, DispatchIntentSomething, DispatchIntentNothing,
+		"garbage", "Nothing", " nothing ",
+	}
+
+	checked := 0
+	for _, existingStatus := range statuses {
+		for _, sameCorrelation := range []bool{false, true} {
+			if existingStatus == "" && sameCorrelation {
+				continue // meaningless: there is no existing row to share an ID with
+			}
+			for _, intent := range intents {
+				for _, componentCount := range []int{0, 1, 3} {
+					const existingID = "corr-existing"
+					sentID := "corr-push"
+					if sameCorrelation {
+						sentID = existingID
+					}
+
+					store := NewMockStore()
+					client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+						Config{PipelineConfig: testPipelineConfig()})
+					if existingStatus != "" {
+						store.AddSlip(&Slip{
+							CorrelationID: existingID, Repository: "owner/repo",
+							Branch: "integration", CommitSHA: "sha-invariant",
+							Status: existingStatus,
+						})
+					}
+					components := make([]ComponentDefinition, componentCount)
+					for i := range components {
+						components[i] = ComponentDefinition{Name: fmt.Sprintf("c%d", i)}
+					}
+
+					result, err := client.CreateSlipForPush(ctx, PushOptions{
+						CorrelationID: sentID,
+						Repository:    "owner/repo",
+						Branch:        "integration",
+						CommitSHA:     "sha-invariant",
+						Components:    components,
+						Dispatch:      intent,
+					})
+					if err != nil || result == nil || result.Slip == nil {
+						continue // a failed push returns no slip; nothing to assert
+					}
+
+					checked++
+					if result.Slip.CorrelationID == sentID && !result.Slip.Status.IsLive() {
+						t.Errorf("invariant violated: existing=%q sameCorrelation=%v intent=%q "+
+							"components=%d returned the sent id with status %q — the caller will "+
+							"dispatch and report against an ended run",
+							existingStatus, sameCorrelation, intent, componentCount,
+							result.Slip.Status)
+					}
+				}
+			}
+		}
+	}
+
+	// Guards the sweep itself: a refactor that made most combinations error out would other-
+	// wise leave this test passing while asserting almost nothing.
+	if checked < 250 {
+		t.Errorf("expected the sweep to reach at least 250 non-error combinations, got %d — "+
+			"the decision surface changed shape and this test may no longer cover it", checked)
+	}
+}
+
+// TestDispatchIntent_honored pins what honored() returns for every value, which nothing did.
+//
+// It had 100% statement coverage and zero assertion coverage: `make mutation PKG=slippy` flipped
+// `!=` to `==` at push.go:250 and the whole module stayed green. That mutant makes honored()
+// return true exactly when the caller's intent was IGNORED — and during the rollout window every
+// real push arrives Unspecified, so it would have been wrong on every production guard hit.
+//
+// Both terms are load-bearing and the table covers why: Unspecified is RECOGNIZED but is never
+// honored, because the component-count inference decides instead. A predicate reading
+// "recognized" would be true there and assert the opposite of what an operator reads from
+// dispatch_intent_honored.
+func TestDispatchIntent_honored(t *testing.T) {
+	tests := []struct {
+		intent DispatchIntent
+		want   bool
+		why    string
+	}{
+		{DispatchIntentNothing, true, "a recognized explicit intent decides the outcome"},
+		{DispatchIntentSomething, true, "a recognized explicit intent decides the outcome"},
+		{DispatchIntentUnspecified, false,
+			"recognized, but the component-count inference decides — not the caller"},
+		{DispatchIntent(""), false, "the zero value IS DispatchIntentUnspecified"},
+		{DispatchIntent("Nothing"), false, "wrong casing is unrecognized, so it is ignored"},
+		{DispatchIntent(" nothing "), false, "surrounding whitespace is unrecognized"},
+		{DispatchIntent("garbage"), false, "an out-of-range value is ignored"},
+		{DispatchIntent("NOTHING"), false, "upper case is unrecognized"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.intent), func(t *testing.T) {
+			if got := tt.intent.honored(); got != tt.want {
+				t.Errorf("DispatchIntent(%q).honored() = %v, want %v — %s",
+					string(tt.intent), got, tt.want, tt.why)
+			}
+		})
+	}
+
+	// The relationship the two-term predicate exists to encode, asserted rather than described:
+	// honored implies recognized, but not the reverse.
+	for _, tt := range tests {
+		if tt.intent.honored() && !tt.intent.recognized() {
+			t.Errorf("DispatchIntent(%q) is honored but not recognized", string(tt.intent))
+		}
+	}
+	if !DispatchIntentUnspecified.recognized() {
+		t.Error("precondition: Unspecified must be recognized, or the table's point is lost")
+	}
+}
+
+// TestClient_CreateSlipForPush_ScanOnlyPushMustNotClaimNothing pins the consequence of getting
+// the DispatchIntent derivation wrong, so the criterion in DispatchIntent's doc has a test
+// behind it rather than only prose.
+//
+// A scan-only push — no build components, no unit tests, but a secret scan dispatched against
+// this slip — is DispatchIntentSomething. Deriving the value as `shouldBuild ||
+// shouldRunUnitTests` would state Nothing instead, and because a recognized intent is consulted
+// before the `failed` carve-out, that dedups onto the failed run: the commit becomes
+// unretriggerable, which is the hole DEVOPS-264 exists to close.
+//
+// Both halves are asserted, because the first alone would pass against a guard that never fires.
+func TestClient_CreateSlipForPush_ScanOnlyPushMustNotClaimNothing(t *testing.T) {
+	ctx := context.Background()
+
+	seed := func(store *MockStore) {
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-failed-scan-only",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-scan-only",
+			Status:        SlipStatusFailed,
+			StateHistory:  []StateHistoryEntry{},
+		})
+	}
+	push := func(intent DispatchIntent) PushOptions {
+		return PushOptions{
+			CorrelationID: "corr-retrigger-scan-only",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-scan-only",
+			Components:    nil, // no builds, no unit tests — only the scan will run
+			Dispatch:      intent,
+		}
+	}
+
+	t.Run("stated correctly as Something, the failed run is retriggered", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: testPipelineConfig()})
+		seed(store)
+
+		result, err := client.CreateSlipForPush(ctx, push(DispatchIntentSomething))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-retrigger-scan-only" {
+			t.Errorf("expected the caller's own slip so it re-dispatches, got %q",
+				result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 1 {
+			t.Errorf("the failed run must be repaved, got %v", store.RepaveCalls)
+		}
+	})
+
+	t.Run("mis-stated as Nothing, the failed run becomes unretriggerable", func(t *testing.T) {
+		// Not a bug in the guard — the guard is doing what a recognized Nothing asks. This pins
+		// the COST of a wrong derivation, so the criterion in DispatchIntent's doc is load-bearing.
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: testPipelineConfig()})
+		seed(store)
+
+		result, err := client.CreateSlipForPush(ctx, push(DispatchIntentNothing))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-failed-scan-only" {
+			t.Errorf("expected the dedup onto the failed run, got %q", result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("a recognized Nothing must not repave, got %v", store.RepaveCalls)
+		}
+	})
+}
+
+// TestPushOptions_MisSerializedIntentIsNotSafe pins the documented behaviour of a value that
+// crosses the JSON boundary mis-cased or padded.
+//
+// The library's promise used to be that an unrecognized value "can never license destroying a
+// prior run's history". That is false: the fallback is the legacy component-count inference, and
+// the inference licenses a repave whenever components are present. These rows are the evidence,
+// and they exist so nobody "fixes" the fallback without seeing what it currently does — the
+// obvious fix was tried and rejected, because it turns a mis-cased "Something" from a tests-only
+// repo from retrigger into blocked.
+//
+// TestCreateSlipForPush_ReturnedEqualsSentImpliesLive sweeps these same values but asserts only
+// `returned == sent ⇒ live`, which both outcomes satisfy — so it pins nothing about
+// repave-vs-dedup. This does.
+func TestPushOptions_MisSerializedIntentIsNotSafe(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		intent     DispatchIntent
+		components int
+		prior      SlipStatus
+		wantRepave bool
+		why        string
+	}{
+		{"nothing", 1, SlipStatusCompleted, false,
+			"correctly cased: recognized, authoritative, dedups even with components"},
+		{"Nothing", 1, SlipStatusCompleted, true,
+			"wrong casing falls back to the inference, which sees components and repaves"},
+		{" nothing ", 1, SlipStatusCompleted, true,
+			"padding is unrecognized, same fallback"},
+		{"garbage", 1, SlipStatusCompleted, true,
+			"any out-of-range value falls back the same way"},
+		{"Nothing", 0, SlipStatusFailed, true,
+			"unrecognized falls past honored() to the failed carve-out, which declines first"},
+		{"nothing", 0, SlipStatusFailed, false,
+			"recognized Nothing is consulted BEFORE the carve-out, so it dedups"},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.intent)+"/"+string(tt.prior), func(t *testing.T) {
+			store := NewMockStore()
+			client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+				Config{PipelineConfig: testPipelineConfig()})
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-prior", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-mis", Status: tt.prior, StateHistory: []StateHistoryEntry{},
+			})
+			var comps []ComponentDefinition
+			for i := 0; i < tt.components; i++ {
+				comps = append(comps, ComponentDefinition{Name: "api", DockerfilePath: "src/MC.Api"})
+			}
+
+			if _, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-new", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-mis", Components: comps, Dispatch: tt.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			repaved := len(store.RepaveCalls) > 0
+			if repaved != tt.wantRepave {
+				t.Errorf("Dispatch=%q components=%d prior=%s: repaved=%v, want %v — %s",
+					string(tt.intent), tt.components, tt.prior, repaved, tt.wantRepave, tt.why)
+			}
+			if _, alive := store.Slips["corr-prior"]; alive == tt.wantRepave {
+				t.Errorf("prior run alive=%v but repaved=%v — history outcome disagrees with the repave",
+					alive, tt.wantRepave)
+			}
+		})
+	}
+}
+
+// TestDispatchIntentTelemetryIsEmitted pins that the dispatch-intent trio actually reaches the
+// logger, on every path that decides an ended slip's fate.
+//
+// The emission IS the mitigation: STATE_MACHINE_V3.md promises it normatively, and the design's
+// justification for silently degrading a malformed enum on a history-destroying path is that the
+// consequence is observable here. Nothing asserted it — deleting all six field lines left the
+// module green, and `dispatch_intent` appeared in this package's tests only inside a comment.
+//
+// The mutation gate does not cover this: it mutates comparison operators, and this gap is a
+// statement deletion. Same blind spot that let honored() ship with 100% statement coverage and
+// zero assertion coverage.
+//
+// `recognized` is the discriminator an operator should alert on, and the table below is why:
+// `honored=false` beside a non-empty `dispatch_intent` also matches the UNSET zero value,
+// because String() renders it "unspecified" — so in the pre-adoption window, when every real
+// push arrives Unspecified, that signature matches every repave and isolates nothing.
+// `recognized=false` is true only for a value the caller actually got wrong, and unlike the
+// rendering it does not depend on whether the consumer's Logger honours Stringer.
+func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
+	ctx := context.Background()
+
+	// fieldsFor finds the log call for ONE named site and returns its fields.
+	//
+	// Keyed on the message rather than "the last call carrying dispatch_intent": every site
+	// emits the same three keys with the same values for a given intent, so a subtest matching
+	// on the key alone passes when a DIFFERENT site produced the fields. That is not
+	// hypothetical — with the empty-run guard forced off, the push repaves instead, the repave
+	// line carries an identical trio, and all three guard-dedup subtests passed while site 1
+	// went unexercised.
+	//
+	// Also not capturingLogger.callsWithField: that matches only keys whose value is boolean
+	// true, which is wrong for dispatch_intent (a DispatchIntent) and silently matches nothing.
+	fieldsFor := func(t *testing.T, logger *capturingLogger, message string) map[string]interface{} {
+		t.Helper()
+		var found map[string]interface{}
+		for _, c := range logger.calls {
+			if strings.Contains(c.message, message) {
+				if _, ok := c.fields["dispatch_intent"]; !ok {
+					t.Fatalf("log line %q fired but carried no dispatch_intent — the emission IS "+
+						"the mitigation, so an unemitted field is an unmitigated path", c.message)
+				}
+				found = c.fields
+			}
+		}
+		if found == nil {
+			t.Fatalf("no log call matched %q, so this subtest did not exercise its own site "+
+				"(another site's identical trio would otherwise satisfy it)", message)
+		}
+		return found
+	}
+
+	type expectation struct {
+		intent         DispatchIntent
+		wantRendered   string
+		wantHonored    bool
+		wantRecognized bool
+	}
+	assertTrio := func(t *testing.T, logger *capturingLogger, site string, e expectation) {
+		t.Helper()
+		f := fieldsFor(t, logger, site)
+		if got := fmt.Sprint(f["dispatch_intent"]); got != e.wantRendered {
+			t.Errorf("dispatch_intent rendered %q, want %q", got, e.wantRendered)
+		}
+		if got, ok := f["dispatch_intent_honored"].(bool); !ok || got != e.wantHonored {
+			t.Errorf("dispatch_intent_honored = %v, want %v", f["dispatch_intent_honored"], e.wantHonored)
+		}
+		if got, ok := f["dispatch_intent_recognized"].(bool); !ok || got != e.wantRecognized {
+			t.Errorf("dispatch_intent_recognized = %v, want %v",
+				f["dispatch_intent_recognized"], e.wantRecognized)
+		}
+	}
+
+	// assertTrioAndReturn is assertTrio plus the fields, for the one site that asserts more.
+	assertTrioAndReturn := func(t *testing.T, logger *capturingLogger, site string, e expectation,
+		ff func(*testing.T, *capturingLogger, string) map[string]interface{},
+	) map[string]interface{} {
+		t.Helper()
+		assertTrio(t, logger, site, e)
+		return ff(t, logger, site)
+	}
+
+	newClient := func(store *MockStore, logger *capturingLogger) *Client {
+		return NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: testPipelineConfig(), Logger: logger})
+	}
+	prior := func(sha string) *Slip {
+		return &Slip{
+			CorrelationID: "corr-prior", Repository: "owner/repo", Branch: "main",
+			CommitSHA: sha, Status: SlipStatusCompleted, StateHistory: []StateHistoryEntry{},
+		}
+	}
+	oneComponent := []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}}
+
+	all := []expectation{
+		{DispatchIntentUnspecified, "unspecified", false, true},
+		{DispatchIntent("Nothing"), "Nothing", false, false},
+		{DispatchIntentNothing, "nothing", true, true},
+	}
+
+	// Site 1 — the empty-run guard's dedup line. Zero components on an ended row, so the guard
+	// fires for all three: Nothing explicitly, the other two by inference.
+	for _, e := range all {
+		t.Run("guard dedup/"+e.intent.String(), func(t *testing.T) {
+			store, logger := NewMockStore(), &capturingLogger{}
+			store.AddSlip(prior("sha-tel-guard"))
+			if _, err := newClient(store, logger).CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-new", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-tel-guard", Components: nil, Dispatch: e.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			// The precondition sites 2-4 already had. Without it a guard that stops firing
+			// leaves this subtest green on the repave line's identical trio.
+			if len(store.RepaveCalls) != 0 {
+				t.Fatalf("precondition: this case must dedup via the guard to reach the "+
+					"guard-applied log line, got repaves %v", store.RepaveCalls)
+			}
+			assertTrio(t, logger, "Empty-run guard", e)
+		})
+	}
+
+	// Site 2 — the main repave line, the history-DESTROYING path the audit signature exists for.
+	// Only the two intents that reach a repave with components present: a recognized `nothing`
+	// dedups instead, by design, so it cannot appear here.
+	for _, e := range all[:2] {
+		t.Run("main repave/"+e.intent.String(), func(t *testing.T) {
+			store, logger := NewMockStore(), &capturingLogger{}
+			store.AddSlip(prior("sha-tel-repave"))
+			if _, err := newClient(store, logger).CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-new", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-tel-repave", Components: oneComponent, Dispatch: e.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(store.RepaveCalls) == 0 {
+				t.Fatal("precondition: this case must repave to reach the repave log line")
+			}
+			assertTrio(t, logger, "Repaved ended slip for same commit", e)
+		})
+	}
+
+	// Sites 3 and 4 — the backstop's dedup and repave lines. Dormant until Phase B, which is
+	// why they need pinning: nothing exercises them in production, and the backstop's repave
+	// line carried no dispatch fields at all until round 7.
+	backstop := func(t *testing.T, sha string, comps []ComponentDefinition, e expectation,
+		wantRepave bool, site string) {
+		store, logger := NewMockStore(), &capturingLogger{}
+		store.SeedOnCreate["corr-caller"] = &Slip{
+			CorrelationID: "corr-conflict", Repository: "owner/repo", Branch: "main",
+			CommitSHA: sha, Status: SlipStatusCompleted, StateHistory: []StateHistoryEntry{},
+		}
+		store.CreateErrorOnce["corr-caller"] = ErrDuplicateSlip
+
+		if _, err := newClient(store, logger).CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller", Repository: "owner/repo", Branch: "main",
+			CommitSHA: sha, Components: comps, Dispatch: e.intent,
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if wantRepave && len(store.RepaveCalls) == 0 {
+			t.Fatal("precondition: the backstop must repave to reach its repave log line")
+		}
+		if !wantRepave && len(store.RepaveCalls) != 0 {
+			t.Fatalf("precondition: this case must dedup, got repaves %v", store.RepaveCalls)
+		}
+		assertTrio(t, logger, site, e)
+	}
+
+	// Site 5 — the create path. Every other site needs an existing ended slip for the same
+	// commit, so before round 8 a FIRST push emitted none of the three fields. Lower stakes
+	// (no prior history to destroy) but it is where a mis-serialized "nothing" silently seeds
+	// an aggregate step as running for work that will never report.
+	for _, e := range all {
+		t.Run("fresh create/"+e.intent.String(), func(t *testing.T) {
+			store, logger := NewMockStore(), &capturingLogger{}
+			client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+				Config{PipelineConfig: aggregateFirstTestConfig(), Logger: logger})
+
+			if _, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-fresh", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-fresh", Components: oneComponent, Dispatch: e.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(store.RepaveCalls) != 0 {
+				t.Fatalf("precondition: a first push has nothing to repave, got %v", store.RepaveCalls)
+			}
+			f := assertTrioAndReturn(t, logger, "Created routing slip", e, fieldsFor)
+
+			// components vs components_seeded: a recognized Nothing seeds no rows even with
+			// components present, and before round 8 the line reported only the raw count.
+			wantSeeded := len(oneComponent)
+			if e.intent == DispatchIntentNothing {
+				wantSeeded = 0
+			}
+			if got := f["components_seeded"]; got != wantSeeded {
+				t.Errorf("components_seeded = %v, want %v (components=%v)",
+					got, wantSeeded, f["components"])
+			}
+		})
+	}
+
+	t.Run("backstop dedup", func(t *testing.T) {
+		backstop(t, "sha-bs-dedup", nil, all[2], false,
+			"Duplicate-create backstop: empty-run guard")
+	})
+	t.Run("backstop repave", func(t *testing.T) {
+		// Unspecified, not Nothing: a recognized Nothing dedups even with components.
+		backstop(t, "sha-bs-repave", oneComponent, all[0], true,
+			"Duplicate-create backstop: repaved")
+	})
 }
