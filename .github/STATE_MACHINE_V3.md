@@ -162,12 +162,20 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   fall back to `len(Components) == 0`. `Validate()` deliberately never rejects an
   unrecognized value — a safe degradation is preferable to a hard push failure — so an
   explicit-but-mis-serialized intent (wrong casing crossing the slippy-api JSON boundary,
-  say) is silently ignored rather than honored. Three log lines carry
-  `dispatch_intent_honored` alongside the raw value so that is visible rather than inferred:
-  both guard-applied (dedup) lines and the repave line. The repave one matters most — it is the
-  case where an ignored intent went on to destroy a prior run's history, and until round 7 it
-  emitted neither field, so precisely the occurrence worth auditing left no record.
-  `honored=false` beside a non-empty `dispatch_intent` is that signature.
+  say) is silently ignored rather than honored. **Four** log lines carry the raw value plus
+  `dispatch_intent_honored` and `dispatch_intent_recognized`, so that is visible rather than
+  inferred: both guard-applied (dedup) lines and **both** repave lines — the main path's and the
+  duplicate-create backstop's. The repave ones matter most, because that is where an ignored
+  intent went on to destroy a prior run's history.
+
+  **Alert on `dispatch_intent_recognized = false`**, not on `honored`. `honored=false` beside a
+  non-empty `dispatch_intent` looks like the right signature and is not: `DispatchIntent.String()`
+  renders the zero value as the literal `unspecified`, so under a Stringer-honouring logger the
+  field is never empty and that predicate also matches every unset push — which, until the field
+  is forwarded end-to-end, is every real push. It would match every repave and isolate nothing.
+  `recognized=false` is true only for a value a caller actually got wrong, and unlike the
+  rendering it does not depend on how a consumer's `Logger` serializes the field (`Logger` is an
+  interface consumers implement, and `DispatchIntent` has `String()` but no `MarshalJSON`).
 
   Component count is neither necessary nor sufficient on its own: a tests-only repo
   (`buildable=false` + `RunUnitTests=true`) dispatches unit tests with zero build

@@ -5447,3 +5447,152 @@ func TestPushOptions_MisSerializedIntentIsNotSafe(t *testing.T) {
 		})
 	}
 }
+
+// TestDispatchIntentTelemetryIsEmitted pins that the dispatch-intent trio actually reaches the
+// logger, on every path that decides an ended slip's fate.
+//
+// The emission IS the mitigation: STATE_MACHINE_V3.md promises it normatively, and the design's
+// justification for silently degrading a malformed enum on a history-destroying path is that the
+// consequence is observable here. Nothing asserted it — deleting all six field lines left the
+// module green, and `dispatch_intent` appeared in this package's tests only inside a comment.
+//
+// The mutation gate does not cover this: it mutates comparison operators, and this gap is a
+// statement deletion. Same blind spot that let honored() ship with 100% statement coverage and
+// zero assertion coverage.
+//
+// `recognized` is the discriminator an operator should alert on, and the table below is why:
+// `honored=false` beside a non-empty `dispatch_intent` also matches the UNSET zero value,
+// because String() renders it "unspecified" — so in the pre-adoption window, when every real
+// push arrives Unspecified, that signature matches every repave and isolates nothing.
+// `recognized=false` is true only for a value the caller actually got wrong, and unlike the
+// rendering it does not depend on whether the consumer's Logger honours Stringer.
+func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
+	ctx := context.Background()
+
+	// fieldsFor finds the last log call carrying the key, whatever its value type.
+	// capturingLogger.callsWithField matches only keys whose value is boolean true, which is
+	// wrong for dispatch_intent (a DispatchIntent) and would silently pass over a repave line.
+	fieldsFor := func(t *testing.T, logger *capturingLogger, key string) map[string]interface{} {
+		t.Helper()
+		var found map[string]interface{}
+		for _, c := range logger.calls {
+			if _, ok := c.fields[key]; ok {
+				found = c.fields
+			}
+		}
+		if found == nil {
+			t.Fatalf("no log call carried %q — the emission IS the mitigation, so an unemitted "+
+				"field is an unmitigated path", key)
+		}
+		return found
+	}
+
+	type expectation struct {
+		intent         DispatchIntent
+		wantRendered   string
+		wantHonored    bool
+		wantRecognized bool
+	}
+	assertTrio := func(t *testing.T, logger *capturingLogger, e expectation) {
+		t.Helper()
+		f := fieldsFor(t, logger, "dispatch_intent")
+		if got := fmt.Sprint(f["dispatch_intent"]); got != e.wantRendered {
+			t.Errorf("dispatch_intent rendered %q, want %q", got, e.wantRendered)
+		}
+		if got, ok := f["dispatch_intent_honored"].(bool); !ok || got != e.wantHonored {
+			t.Errorf("dispatch_intent_honored = %v, want %v", f["dispatch_intent_honored"], e.wantHonored)
+		}
+		if got, ok := f["dispatch_intent_recognized"].(bool); !ok || got != e.wantRecognized {
+			t.Errorf("dispatch_intent_recognized = %v, want %v",
+				f["dispatch_intent_recognized"], e.wantRecognized)
+		}
+	}
+
+	newClient := func(store *MockStore, logger *capturingLogger) *Client {
+		return NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: testPipelineConfig(), Logger: logger})
+	}
+	prior := func(sha string) *Slip {
+		return &Slip{
+			CorrelationID: "corr-prior", Repository: "owner/repo", Branch: "main",
+			CommitSHA: sha, Status: SlipStatusCompleted, StateHistory: []StateHistoryEntry{},
+		}
+	}
+	oneComponent := []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}}
+
+	all := []expectation{
+		{DispatchIntentUnspecified, "unspecified", false, true},
+		{DispatchIntent("Nothing"), "Nothing", false, false},
+		{DispatchIntentNothing, "nothing", true, true},
+	}
+
+	// Site 1 — the empty-run guard's dedup line. Zero components on an ended row, so the guard
+	// fires for all three: Nothing explicitly, the other two by inference.
+	for _, e := range all {
+		t.Run("guard dedup/"+e.intent.String(), func(t *testing.T) {
+			store, logger := NewMockStore(), &capturingLogger{}
+			store.AddSlip(prior("sha-tel-guard"))
+			if _, err := newClient(store, logger).CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-new", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-tel-guard", Components: nil, Dispatch: e.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			assertTrio(t, logger, e)
+		})
+	}
+
+	// Site 2 — the main repave line, the history-DESTROYING path the audit signature exists for.
+	// Only the two intents that reach a repave with components present: a recognized `nothing`
+	// dedups instead, by design, so it cannot appear here.
+	for _, e := range all[:2] {
+		t.Run("main repave/"+e.intent.String(), func(t *testing.T) {
+			store, logger := NewMockStore(), &capturingLogger{}
+			store.AddSlip(prior("sha-tel-repave"))
+			if _, err := newClient(store, logger).CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-new", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-tel-repave", Components: oneComponent, Dispatch: e.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(store.RepaveCalls) == 0 {
+				t.Fatal("precondition: this case must repave to reach the repave log line")
+			}
+			assertTrio(t, logger, e)
+		})
+	}
+
+	// Sites 3 and 4 — the backstop's dedup and repave lines. Dormant until Phase B, which is
+	// why they need pinning: nothing exercises them in production, and the backstop's repave
+	// line carried no dispatch fields at all until round 7.
+	backstop := func(t *testing.T, sha string, comps []ComponentDefinition, e expectation, wantRepave bool) {
+		store, logger := NewMockStore(), &capturingLogger{}
+		store.SeedOnCreate["corr-caller"] = &Slip{
+			CorrelationID: "corr-conflict", Repository: "owner/repo", Branch: "main",
+			CommitSHA: sha, Status: SlipStatusCompleted, StateHistory: []StateHistoryEntry{},
+		}
+		store.CreateErrorOnce["corr-caller"] = ErrDuplicateSlip
+
+		if _, err := newClient(store, logger).CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller", Repository: "owner/repo", Branch: "main",
+			CommitSHA: sha, Components: comps, Dispatch: e.intent,
+		}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if wantRepave && len(store.RepaveCalls) == 0 {
+			t.Fatal("precondition: the backstop must repave to reach its repave log line")
+		}
+		if !wantRepave && len(store.RepaveCalls) != 0 {
+			t.Fatalf("precondition: this case must dedup, got repaves %v", store.RepaveCalls)
+		}
+		assertTrio(t, logger, e)
+	}
+
+	t.Run("backstop dedup", func(t *testing.T) {
+		backstop(t, "sha-bs-dedup", nil, all[2], false)
+	})
+	t.Run("backstop repave", func(t *testing.T) {
+		// Unspecified, not Nothing: a recognized Nothing dedups even with components.
+		backstop(t, "sha-bs-repave", oneComponent, all[0], true)
+	})
+}
