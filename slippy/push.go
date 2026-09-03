@@ -317,13 +317,24 @@ func (d DispatchIntent) honored() bool {
 // Both empty-run guards (CreateSlipForPush's and handleDuplicateSlipBackstop's mirror of it)
 // route through the single emptyRunGuardApplies, which is what keeps them from drifting.
 //
-// Note what that does NOT mean: the guard consults intent itself, via honored(), BEFORE its
-// `failed` carve-out, and only delegates here once the value is Unspecified-or-unrecognized. So
-// the Nothing and Something arms below are unreachable from either guard — they are live for
-// initializeSlipForPush, which calls this method directly to decide component seeding. The two
-// callers are deliberately not equivalent: only the guard's path passes through the `failed`
-// check, and that difference is the root of the mis-serialized-value behaviour documented
-// above.
+// What that does NOT mean is that the guard answers the intent question itself. honored()
+// reports only THAT a recognized intent was stated, never WHICH one — so the guard's
+// `if opts.Dispatch.honored() { return opts.dispatchesNothing() }` hands exactly
+// {nothing, something} to this method, and the two arms below supply the entire answer for
+// those values. They are reachable from BOTH guards, and from initializeSlipForPush, which
+// calls this method directly to decide component seeding.
+//
+// An earlier version of this paragraph called those arms "unreachable from either guard". That
+// was wrong, and wrong in a dangerous direction: neutering them changes 15 guard outcomes over
+// the five ended statuses the guard governs — every `nothing` with components flips
+// dedup→repave, every `something` without them flips repave→dedup — including
+// `failed` + `nothing` + components, which is the history-preservation case this field exists
+// for. Six top-level tests fail, one of them through the backstop's guard.
+//
+// The two entry paths are still deliberately not equivalent: only the guard's fall-through —
+// the Unspecified-or-unrecognized case, which skips honored() and reaches this method through
+// the `failed` carve-out — passes through that check. That difference is the root of the
+// mis-serialized-value behaviour documented above.
 func (o PushOptions) dispatchesNothing() bool {
 	switch o.Dispatch {
 	case DispatchIntentNothing:
@@ -676,11 +687,12 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			// reach it.
 			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
 				map[string]interface{}{
-					"existing_id":             existingSlip.CorrelationID,
-					"commit":                  shortSHA(existingSlip.CommitSHA),
-					"dispatch_intent":         opts.Dispatch,
-					"dispatch_intent_honored": opts.Dispatch.honored(),
-					"components":              len(opts.Components),
+					"existing_id":                existingSlip.CorrelationID,
+					"commit":                     shortSHA(existingSlip.CommitSHA),
+					"dispatch_intent":            opts.Dispatch,
+					"dispatch_intent_honored":    opts.Dispatch.honored(),
+					"dispatch_intent_recognized": opts.Dispatch.recognized(),
+					"components":                 len(opts.Components),
 				})
 			result.Slip = existingSlip
 			result.AncestryResolved = true
@@ -1017,12 +1029,13 @@ func (c *Client) repaveExistingSlip(
 		// dispatch_intent is exactly that signature.
 		c.logger.Info(ctx, "Repaved ended slip for same commit (replaced in one transaction)",
 			map[string]interface{}{
-				"repaved_id":              existingSlip.CorrelationID,
-				"repaved_commit":          shortSHA(existingSlip.CommitSHA),
-				"repaved_status":          string(existingSlip.Status),
-				"superseding_id":          opts.CorrelationID,
-				"dispatch_intent":         opts.Dispatch,
-				"dispatch_intent_honored": opts.Dispatch.honored(),
+				"repaved_id":                 existingSlip.CorrelationID,
+				"repaved_commit":             shortSHA(existingSlip.CommitSHA),
+				"repaved_status":             string(existingSlip.Status),
+				"superseding_id":             opts.CorrelationID,
+				"dispatch_intent":            opts.Dispatch,
+				"dispatch_intent_honored":    opts.Dispatch.honored(),
+				"dispatch_intent_recognized": opts.Dispatch.recognized(),
 			})
 		return false, nil
 
@@ -1286,12 +1299,13 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// destroy its history for no benefit. Dedup onto it instead of replacing it.
 		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
 			map[string]interface{}{
-				"conflicting_id":          conflicting.CorrelationID,
-				"commit":                  shortSHA(conflicting.CommitSHA),
-				"superseding_id":          opts.CorrelationID,
-				"dispatch_intent":         opts.Dispatch,
-				"dispatch_intent_honored": opts.Dispatch.honored(),
-				"components":              len(opts.Components),
+				"conflicting_id":             conflicting.CorrelationID,
+				"commit":                     shortSHA(conflicting.CommitSHA),
+				"superseding_id":             opts.CorrelationID,
+				"dispatch_intent":            opts.Dispatch,
+				"dispatch_intent_honored":    opts.Dispatch.honored(),
+				"dispatch_intent_recognized": opts.Dispatch.recognized(),
+				"components":                 len(opts.Components),
 			})
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
@@ -1340,11 +1354,18 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// the slip it wanted to create already exists. Report it as handled and populate
 		// result here, rather than returning handled=false and letting the caller re-run
 		// an insert that would only re-write the same row.
+		// The dispatch_intent trio is on BOTH repave paths, not just the main one. This is a
+		// repave — history destroyed — so an intent that was stated and then ignored has to be
+		// as auditable here as it is in repaveExistingSlip; a signature that holds on one of two
+		// history-destroying paths is not a mitigation.
 		c.logger.Info(ctx, "Duplicate-create backstop: repaved ended conflicting slip", map[string]interface{}{
-			"repaved_id":     conflicting.CorrelationID,
-			"repaved_commit": shortSHA(conflicting.CommitSHA),
-			"repaved_status": string(conflicting.Status),
-			"superseding_id": opts.CorrelationID,
+			"repaved_id":                 conflicting.CorrelationID,
+			"repaved_commit":             shortSHA(conflicting.CommitSHA),
+			"repaved_status":             string(conflicting.Status),
+			"superseding_id":             opts.CorrelationID,
+			"dispatch_intent":            opts.Dispatch,
+			"dispatch_intent_honored":    opts.Dispatch.honored(),
+			"dispatch_intent_recognized": opts.Dispatch.recognized(),
 		})
 		result.Slip = slip
 		// AncestryResolved is deliberately left as resolveAndAbandonAncestors set it (D3.2):
