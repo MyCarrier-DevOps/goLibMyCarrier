@@ -5469,20 +5469,32 @@ func TestPushOptions_MisSerializedIntentIsNotSafe(t *testing.T) {
 func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 	ctx := context.Background()
 
-	// fieldsFor finds the last log call carrying the key, whatever its value type.
-	// capturingLogger.callsWithField matches only keys whose value is boolean true, which is
-	// wrong for dispatch_intent (a DispatchIntent) and would silently pass over a repave line.
-	fieldsFor := func(t *testing.T, logger *capturingLogger, key string) map[string]interface{} {
+	// fieldsFor finds the log call for ONE named site and returns its fields.
+	//
+	// Keyed on the message rather than "the last call carrying dispatch_intent": every site
+	// emits the same three keys with the same values for a given intent, so a subtest matching
+	// on the key alone passes when a DIFFERENT site produced the fields. That is not
+	// hypothetical — with the empty-run guard forced off, the push repaves instead, the repave
+	// line carries an identical trio, and all three guard-dedup subtests passed while site 1
+	// went unexercised.
+	//
+	// Also not capturingLogger.callsWithField: that matches only keys whose value is boolean
+	// true, which is wrong for dispatch_intent (a DispatchIntent) and silently matches nothing.
+	fieldsFor := func(t *testing.T, logger *capturingLogger, message string) map[string]interface{} {
 		t.Helper()
 		var found map[string]interface{}
 		for _, c := range logger.calls {
-			if _, ok := c.fields[key]; ok {
+			if strings.Contains(c.message, message) {
+				if _, ok := c.fields["dispatch_intent"]; !ok {
+					t.Fatalf("log line %q fired but carried no dispatch_intent — the emission IS "+
+						"the mitigation, so an unemitted field is an unmitigated path", c.message)
+				}
 				found = c.fields
 			}
 		}
 		if found == nil {
-			t.Fatalf("no log call carried %q — the emission IS the mitigation, so an unemitted "+
-				"field is an unmitigated path", key)
+			t.Fatalf("no log call matched %q, so this subtest did not exercise its own site "+
+				"(another site's identical trio would otherwise satisfy it)", message)
 		}
 		return found
 	}
@@ -5493,9 +5505,9 @@ func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 		wantHonored    bool
 		wantRecognized bool
 	}
-	assertTrio := func(t *testing.T, logger *capturingLogger, e expectation) {
+	assertTrio := func(t *testing.T, logger *capturingLogger, site string, e expectation) {
 		t.Helper()
-		f := fieldsFor(t, logger, "dispatch_intent")
+		f := fieldsFor(t, logger, site)
 		if got := fmt.Sprint(f["dispatch_intent"]); got != e.wantRendered {
 			t.Errorf("dispatch_intent rendered %q, want %q", got, e.wantRendered)
 		}
@@ -5506,6 +5518,15 @@ func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 			t.Errorf("dispatch_intent_recognized = %v, want %v",
 				f["dispatch_intent_recognized"], e.wantRecognized)
 		}
+	}
+
+	// assertTrioAndReturn is assertTrio plus the fields, for the one site that asserts more.
+	assertTrioAndReturn := func(t *testing.T, logger *capturingLogger, site string, e expectation,
+		ff func(*testing.T, *capturingLogger, string) map[string]interface{},
+	) map[string]interface{} {
+		t.Helper()
+		assertTrio(t, logger, site, e)
+		return ff(t, logger, site)
 	}
 
 	newClient := func(store *MockStore, logger *capturingLogger) *Client {
@@ -5538,7 +5559,13 @@ func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			assertTrio(t, logger, e)
+			// The precondition sites 2-4 already had. Without it a guard that stops firing
+			// leaves this subtest green on the repave line's identical trio.
+			if len(store.RepaveCalls) != 0 {
+				t.Fatalf("precondition: this case must dedup via the guard to reach the "+
+					"guard-applied log line, got repaves %v", store.RepaveCalls)
+			}
+			assertTrio(t, logger, "Empty-run guard", e)
 		})
 	}
 
@@ -5558,14 +5585,15 @@ func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 			if len(store.RepaveCalls) == 0 {
 				t.Fatal("precondition: this case must repave to reach the repave log line")
 			}
-			assertTrio(t, logger, e)
+			assertTrio(t, logger, "Repaved ended slip for same commit", e)
 		})
 	}
 
 	// Sites 3 and 4 — the backstop's dedup and repave lines. Dormant until Phase B, which is
 	// why they need pinning: nothing exercises them in production, and the backstop's repave
 	// line carried no dispatch fields at all until round 7.
-	backstop := func(t *testing.T, sha string, comps []ComponentDefinition, e expectation, wantRepave bool) {
+	backstop := func(t *testing.T, sha string, comps []ComponentDefinition, e expectation,
+		wantRepave bool, site string) {
 		store, logger := NewMockStore(), &capturingLogger{}
 		store.SeedOnCreate["corr-caller"] = &Slip{
 			CorrelationID: "corr-conflict", Repository: "owner/repo", Branch: "main",
@@ -5585,14 +5613,50 @@ func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 		if !wantRepave && len(store.RepaveCalls) != 0 {
 			t.Fatalf("precondition: this case must dedup, got repaves %v", store.RepaveCalls)
 		}
-		assertTrio(t, logger, e)
+		assertTrio(t, logger, site, e)
+	}
+
+	// Site 5 — the create path. Every other site needs an existing ended slip for the same
+	// commit, so before round 8 a FIRST push emitted none of the three fields. Lower stakes
+	// (no prior history to destroy) but it is where a mis-serialized "nothing" silently seeds
+	// an aggregate step as running for work that will never report.
+	for _, e := range all {
+		t.Run("fresh create/"+e.intent.String(), func(t *testing.T) {
+			store, logger := NewMockStore(), &capturingLogger{}
+			client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+				Config{PipelineConfig: aggregateFirstTestConfig(), Logger: logger})
+
+			if _, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-fresh", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-fresh", Components: oneComponent, Dispatch: e.intent,
+			}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(store.RepaveCalls) != 0 {
+				t.Fatalf("precondition: a first push has nothing to repave, got %v", store.RepaveCalls)
+			}
+			f := assertTrioAndReturn(t, logger, "Created routing slip", e, fieldsFor)
+
+			// components vs components_seeded: a recognized Nothing seeds no rows even with
+			// components present, and before round 8 the line reported only the raw count.
+			wantSeeded := len(oneComponent)
+			if e.intent == DispatchIntentNothing {
+				wantSeeded = 0
+			}
+			if got := f["components_seeded"]; got != wantSeeded {
+				t.Errorf("components_seeded = %v, want %v (components=%v)",
+					got, wantSeeded, f["components"])
+			}
+		})
 	}
 
 	t.Run("backstop dedup", func(t *testing.T) {
-		backstop(t, "sha-bs-dedup", nil, all[2], false)
+		backstop(t, "sha-bs-dedup", nil, all[2], false,
+			"Duplicate-create backstop: empty-run guard")
 	})
 	t.Run("backstop repave", func(t *testing.T) {
 		// Unspecified, not Nothing: a recognized Nothing dedups even with components.
-		backstop(t, "sha-bs-repave", oneComponent, all[0], true)
+		backstop(t, "sha-bs-repave", oneComponent, all[0], true,
+			"Duplicate-create backstop: repaved")
 	})
 }

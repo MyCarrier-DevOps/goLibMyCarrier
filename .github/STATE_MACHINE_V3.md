@@ -162,11 +162,18 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   fall back to `len(Components) == 0`. `Validate()` deliberately never rejects an
   unrecognized value — a safe degradation is preferable to a hard push failure — so an
   explicit-but-mis-serialized intent (wrong casing crossing the slippy-api JSON boundary,
-  say) is silently ignored rather than honored. **Four** log lines carry the raw value plus
-  `dispatch_intent_honored` and `dispatch_intent_recognized`, so that is visible rather than
-  inferred: both guard-applied (dedup) lines and **both** repave lines — the main path's and the
-  duplicate-create backstop's. The repave ones matter most, because that is where an ignored
-  intent went on to destroy a prior run's history.
+  say) is silently ignored rather than honored. Every log line that reports a decision about an
+  ended slip for this commit carries the raw value plus `dispatch_intent_honored` and
+  `dispatch_intent_recognized`, so that is visible rather than inferred — both guard-applied
+  (dedup) lines, both repave lines (the main path's and the duplicate-create backstop's), and the
+  create line. The repave ones matter most, because that is where an ignored intent went on to
+  destroy a prior run's history.
+
+  The field set and its call sites live in exactly one place, on `addDispatchIntentFields` in
+  `push.go`; `grep -n addDispatchIntentFields` is the site list. This paragraph deliberately does
+  not state a count — "two fields" and "the one line" were each correct when written and each went
+  stale within a commit, and doc/code drift on these counts produced a review finding in six
+  consecutive rounds.
 
   **Alert on `dispatch_intent_recognized = false`**, not on `honored`. `honored=false` beside a
   non-empty `dispatch_intent` looks like the right signature and is not: `DispatchIntent.String()`

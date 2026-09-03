@@ -171,11 +171,15 @@ type PushOptions struct {
 // It is a string type, like every other enum-like type in this package (SlipStatus,
 // StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). It also carries a String()
 // method, as SlipStatus, StepStatus and PrereqStatus do; the other two do not. That is
-// not only convention: the two log fields this adds are rendered by zap, which matches
+// not only convention: the dispatch_intent trio this adds is rendered by zap, which matches
 // fmt.Stringer but does NOT match a named uint8 type — so a numeric enum would have printed
-// `dispatch_intent=0` on the one line an operator reads to explain why a run's history was
+// `dispatch_intent=0` on the lines an operator reads to explain why a run's history was
 // preserved or destroyed. Choosing the underlying type now matters because changing it after
 // release is breaking, while adding String() never is.
+//
+// The field set and its call sites are stated once, on addDispatchIntentFields. Do not restate
+// the counts here: "two fields" and "the one line" were both correct when written and both went
+// stale within a commit.
 type DispatchIntent string
 
 const (
@@ -275,6 +279,37 @@ func (d DispatchIntent) recognized() bool {
 	}
 }
 
+// addDispatchIntentFields merges the dispatch-intent audit trio into a log field map and
+// returns it. THIS IS THE ONE PLACE the trio is constructed — every call site gets the same
+// three fields, so adding a fourth or renaming one cannot leave a site behind, and no comment
+// anywhere needs to state how many fields there are.
+//
+// The fields:
+//
+//	dispatch_intent             the caller's raw value, rendered via String()
+//	dispatch_intent_honored     a recognized non-Unspecified value decided the outcome
+//	dispatch_intent_recognized  the value is inside the enum at all
+//
+// ALERT ON dispatch_intent_recognized = false. That is the only one of the three that isolates
+// a caller who got the value wrong. `honored = false` looks like the right signature and is not:
+// it is also false for the UNSET zero value, which String() renders as the literal
+// "unspecified" — so until Dispatch is forwarded end-to-end, when every real push arrives
+// Unspecified, "honored=false beside a non-empty dispatch_intent" matches every push and
+// isolates nothing. `recognized` also does not depend on how a consumer's Logger serializes the
+// value; Logger is an interface consumers implement, and DispatchIntent has String() but no
+// MarshalJSON, so the rendering was never this library's to guarantee.
+//
+// Every log line that reports a decision about an ended slip for this commit calls this, and
+// the repave lines matter most: that is where an intent that was ignored went on to destroy a
+// prior run's history. `grep -n addDispatchIntentFields` is the site list; do not write the
+// count into a comment, because it has gone stale in three consecutive review rounds.
+func addDispatchIntentFields(fields map[string]interface{}, d DispatchIntent) map[string]interface{} {
+	fields["dispatch_intent"] = d
+	fields["dispatch_intent_honored"] = d.honored()
+	fields["dispatch_intent_recognized"] = d.recognized()
+	return fields
+}
+
 // honored reports whether the caller's stated intent DECIDED an outcome — not merely whether
 // the value was recognized. It is what the `dispatch_intent_honored` log field carries.
 //
@@ -282,8 +317,14 @@ func (d DispatchIntent) recognized() bool {
 // out at each log site. `recognized()` alone is the wrong predicate: DispatchIntentUnspecified
 // IS recognized, but it is never honored — the component-count inference decides instead — so a
 // flag reading "recognized" would be true for the unset zero value and assert the opposite of
-// what an operator would take it to mean. False therefore covers both an unrecognized Dispatch
-// and the unset zero value.
+// what an operator would take it to mean for THIS field. False therefore covers both an
+// unrecognized Dispatch and the unset zero value.
+//
+// That is an argument about which predicate the `dispatch_intent_honored` field should carry,
+// not an argument against `recognized` as a signal: both ship, because they answer different
+// questions. recognized=false means the caller sent a value outside the enum, which is the
+// predicate to ALERT on; honored=false means the caller's value did not decide the outcome,
+// which is true of every unset push. See addDispatchIntentFields.
 func (d DispatchIntent) honored() bool {
 	return d != DispatchIntentUnspecified && d.recognized()
 }
@@ -682,18 +723,15 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			// See DispatchIntent for why component count cannot answer this, and for what
 			// setting it opts such a push into: ancestry resolution, the repave path, and
 			// a repave failure being fatal — none of which this early return reaches.
-			// See DispatchIntent.honored for why "honored" and not "recognized". This line
-			// only ever fires when the guard applied, so DispatchIntentSomething can never
-			// reach it.
+			// This line only ever fires when the guard applied, so DispatchIntentSomething can
+			// never reach it. See addDispatchIntentFields for the field set and the alert
+			// predicate.
 			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
-				map[string]interface{}{
-					"existing_id":                existingSlip.CorrelationID,
-					"commit":                     shortSHA(existingSlip.CommitSHA),
-					"dispatch_intent":            opts.Dispatch,
-					"dispatch_intent_honored":    opts.Dispatch.honored(),
-					"dispatch_intent_recognized": opts.Dispatch.recognized(),
-					"components":                 len(opts.Components),
-				})
+				addDispatchIntentFields(map[string]interface{}{
+					"existing_id": existingSlip.CorrelationID,
+					"commit":      shortSHA(existingSlip.CommitSHA),
+					"components":  len(opts.Components),
+				}, opts.Dispatch))
 			result.Slip = existingSlip
 			result.AncestryResolved = true
 			return result, nil
@@ -771,12 +809,33 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 
 	result.Slip = slip
 
-	c.logger.Info(ctx, "Created routing slip", map[string]interface{}{
-		"correlation_id": slip.CorrelationID,
-		"components":     len(opts.Components),
-		"ancestors":      len(ancestry),
-		"warnings":       len(result.Warnings),
-	})
+	// The trio is here too, because this is the one line that always fires on the create path:
+	// every other site requires an existing ended slip for the same commit, so a FIRST push
+	// emitted none of the three. That is the lower-stakes case — there is no prior history to
+	// destroy — but it is also where a mis-serialized "nothing" silently seeds an aggregate step
+	// as running for work that will never report, and nothing recorded that an intent was
+	// discarded.
+	//
+	// components_seeded, not len(opts.Components): a recognized DispatchIntentNothing declines to
+	// seed component rows even when Components is non-empty, so the raw count would read
+	// "components=1" beside zero seeded rows. Before Dispatch existed, len > 0 always implied
+	// seeded rows; it no longer does.
+	// components_seeded counted from the slip that was actually built, not re-derived from the
+	// gate: a recognized DispatchIntentNothing declines to seed component rows even when
+	// Components is non-empty, so the raw count alone would read "components=1" beside zero
+	// seeded rows. Before Dispatch existed, len > 0 always implied seeded rows; it no longer
+	// does, and reading the built slip keeps this honest if the gate ever changes.
+	componentsSeeded := 0
+	for _, rows := range slip.Aggregates {
+		componentsSeeded += len(rows)
+	}
+	c.logger.Info(ctx, "Created routing slip", addDispatchIntentFields(map[string]interface{}{
+		"correlation_id":    slip.CorrelationID,
+		"components":        len(opts.Components),
+		"components_seeded": componentsSeeded,
+		"ancestors":         len(ancestry),
+		"warnings":          len(result.Warnings),
+	}, opts.Dispatch))
 
 	return result, nil
 }
@@ -1022,21 +1081,18 @@ func (c *Client) repaveExistingSlip(
 	repaveErr := c.store.Repave(ctx, existingSlip.CorrelationID, slip, parent)
 	switch {
 	case repaveErr == nil:
-		// dispatch_intent / dispatch_intent_honored are emitted HERE as well as on the two
-		// guard-applied lines, because those two only fire when the guard dedups. Without this,
-		// the case that most needs a record left none: a mis-serialized intent that was ignored
-		// AND then repaved a prior run's history away. honored()=false beside a non-empty
-		// dispatch_intent is exactly that signature.
+		// The audit trio is emitted here as well as on the guard-applied lines, because those
+		// only fire when the guard dedups — without it the case that most needs a record left
+		// none: a mis-serialized intent that was ignored AND then repaved a prior run's history
+		// away. See addDispatchIntentFields for the field set and for which of the three is the
+		// alert predicate (it is NOT honored).
 		c.logger.Info(ctx, "Repaved ended slip for same commit (replaced in one transaction)",
-			map[string]interface{}{
-				"repaved_id":                 existingSlip.CorrelationID,
-				"repaved_commit":             shortSHA(existingSlip.CommitSHA),
-				"repaved_status":             string(existingSlip.Status),
-				"superseding_id":             opts.CorrelationID,
-				"dispatch_intent":            opts.Dispatch,
-				"dispatch_intent_honored":    opts.Dispatch.honored(),
-				"dispatch_intent_recognized": opts.Dispatch.recognized(),
-			})
+			addDispatchIntentFields(map[string]interface{}{
+				"repaved_id":     existingSlip.CorrelationID,
+				"repaved_commit": shortSHA(existingSlip.CommitSHA),
+				"repaved_status": string(existingSlip.Status),
+				"superseding_id": opts.CorrelationID,
+			}, opts.Dispatch))
 		return false, nil
 
 	case errors.Is(repaveErr, ErrSlipWentLive):
@@ -1298,15 +1354,12 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// be dispatched for this push, so repaving the conflicting row would only
 		// destroy its history for no benefit. Dedup onto it instead of replacing it.
 		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
-			map[string]interface{}{
-				"conflicting_id":             conflicting.CorrelationID,
-				"commit":                     shortSHA(conflicting.CommitSHA),
-				"superseding_id":             opts.CorrelationID,
-				"dispatch_intent":            opts.Dispatch,
-				"dispatch_intent_honored":    opts.Dispatch.honored(),
-				"dispatch_intent_recognized": opts.Dispatch.recognized(),
-				"components":                 len(opts.Components),
-			})
+			addDispatchIntentFields(map[string]interface{}{
+				"conflicting_id": conflicting.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+				"superseding_id": opts.CorrelationID,
+				"components":     len(opts.Components),
+			}, opts.Dispatch))
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
 		return true, nil
@@ -1354,19 +1407,15 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// the slip it wanted to create already exists. Report it as handled and populate
 		// result here, rather than returning handled=false and letting the caller re-run
 		// an insert that would only re-write the same row.
-		// The dispatch_intent trio is on BOTH repave paths, not just the main one. This is a
-		// repave — history destroyed — so an intent that was stated and then ignored has to be
-		// as auditable here as it is in repaveExistingSlip; a signature that holds on one of two
-		// history-destroying paths is not a mitigation.
-		c.logger.Info(ctx, "Duplicate-create backstop: repaved ended conflicting slip", map[string]interface{}{
-			"repaved_id":                 conflicting.CorrelationID,
-			"repaved_commit":             shortSHA(conflicting.CommitSHA),
-			"repaved_status":             string(conflicting.Status),
-			"superseding_id":             opts.CorrelationID,
-			"dispatch_intent":            opts.Dispatch,
-			"dispatch_intent_honored":    opts.Dispatch.honored(),
-			"dispatch_intent_recognized": opts.Dispatch.recognized(),
-		})
+		// The trio is on BOTH repave paths, not just the main one: this is a repave — history
+		// destroyed — so an ignored intent has to be as auditable here as in repaveExistingSlip.
+		c.logger.Info(ctx, "Duplicate-create backstop: repaved ended conflicting slip",
+			addDispatchIntentFields(map[string]interface{}{
+				"repaved_id":     conflicting.CorrelationID,
+				"repaved_commit": shortSHA(conflicting.CommitSHA),
+				"repaved_status": string(conflicting.Status),
+				"superseding_id": opts.CorrelationID,
+			}, opts.Dispatch))
 		result.Slip = slip
 		// AncestryResolved is deliberately left as resolveAndAbandonAncestors set it (D3.2):
 		// this is a fresh successor, not a dedup onto someone else's slip, so the accurate
