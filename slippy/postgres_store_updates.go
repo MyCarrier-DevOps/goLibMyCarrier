@@ -421,3 +421,371 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 	}
 	return nil
 }
+
+// repaveableSlipStatusesSQL is the set of statuses Repave's guard treats as "ended" and
+// therefore safe to supersede. Kept separate from the terminal-monotonicity guard's
+// terminalStepStatusesSQL/nonTerminalStepStatusesSQL above (those are STEP statuses;
+// this is the top-level SLIP status).
+//
+// This must always equal exactly the SlipStatus values for which IsLive() is false — the
+// SQL guard below and the Go predicate are two independent encodings of the same "is this
+// slip ended" decision. TestRepaveableSlipStatusesSQL_MatchesIsLive (in
+// postgres_store_updates_test.go) parses this constant and asserts that equality across a
+// hand-maintained list of SlipStatus values, not across the enum itself.
+//
+// Nothing mechanically prevents drift. The `exhaustive` linter forces a VISIT to IsTerminal's
+// switch when a status is added — it fails until the new constant appears in one of that
+// switch's explicit case lists — but nothing there points at a SQL constant in a different
+// file, and nothing points at the test's hand-maintained slice either. A ninth SlipStatus
+// added to IsTerminal, omitted from both, is lint-clean and test-green. So: exhaustive forces
+// the visit, it does not stop the drift.
+//
+// If they do drift, the guarded DELETE below stops matching a status CreateSlipForPush
+// still treats as ended: RowsAffected() comes back 0, the existence check finds the row,
+// and Repave returns ErrSlipWentLive for a slip that never actually went live — wedging
+// every push for that commit onto the old, ended slip with no error surfaced anywhere
+// (D2.3, DEVOPS-231 review). Update this constant AND the test's enumeration together with
+// any change to SlipStatus.IsTerminal/IsLive.
+const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','compensated'"
+
+// Repave atomically replaces one commit's ended run with a fresh one. See SlipStore.Repave
+// in interfaces.go for the contract; this comment covers the Postgres mechanics.
+//
+// Everything runs in a single transaction, which is the reason the method exists: the
+// delete and the create used to be two store calls, so a create failure after a committed
+// delete left the commit with no slip at all and every Kafka redelivery reproduced it (the
+// producible case being a pipeline config deployed ahead of the migration that adds its
+// step's column — slipColumns() then names a column that does not exist and the insert
+// fails 42703 deterministically). Now that insert failure rolls the delete back.
+//
+// Statement order inside the transaction, and why each position is load-bearing:
+//
+//  1. Read the superseded run's OWN parent link, so it can be carried forward when the
+//     caller resolved no ancestry of its own. This runs FIRST, ahead of the guarded DELETE,
+//     because migration v5's fk_ancestry_slip (correlation_id → routing_slips, ON DELETE
+//     CASCADE) removes the row this reads at the end of that DELETE's statement. Reading
+//     afterwards returns nothing, with no error — and only on the GitHub-outage path the
+//     carry-forward exists for. The result is used only if step 2 actually removed a row.
+//  2. Guarded DELETE of the superseded row (status IN the ended set). The went-live
+//     rejection happens here, before anything is written.
+//  3. Delete the superseded run's children explicitly rather than relying on cascade FKs,
+//     so this step is correct both before and after v5 adds them. Note that v5-safety is a
+//     property of THIS step — it is not a property of the transaction as a whole, which is
+//     what step 1 exists to handle.
+//  4. Insert the successor. This must precede step 5: the repoint names the successor's
+//     correlation ID, so the row has to exist first — that is what keeps a descendant from
+//     ever pointing at a phantom. It is necessary but NOT sufficient for a foreign key on
+//     slip_ancestry.parent_correlation_id, and Phase B deliberately adds none — the full
+//     argument is on SlipStore.Repave in interfaces.go.
+//  5. Repoint descendants of the superseded run onto the successor, rewriting the whole
+//     denormalized snapshot that describes the parent, not just the id. The column list is
+//     deliberately NOT repeated here: it lives on SlipStore.Repave in interfaces.go, which is
+//     the contract every store implementation owes — a non-Postgres implementor should not
+//     have to read Postgres code to learn which columns they must rewrite. All three of id,
+//     repository and branch are ResolveAncestry join keys — its next hop selects on
+//     (repository, branch, correlation_id) using the values recorded beside the parent id,
+//     and none of them is case-folded — so leaving any one describing the deleted run
+//     truncates the walk at exactly the hop this repoint exists to preserve. That bites for
+//     repository via casing (LoadByCommit matches lower(repository), so webhook casing
+//     variance is real and expected) as well as via a genuine repo change. parent_status is
+//     knowable at all (unlike under the old two-call sequence) precisely because step 4
+//     already inserted the successor in this same transaction.
+//  6. Append a state-history entry on the SUCCESSOR naming the run it replaced. Without it
+//     the successor row carries no evidence a prior run existed for this commit: the old row
+//     and its children are gone, and the only other record of the supersession lives in
+//     spans and log lines rather than on any row. Costs one UPDATE on a row this
+//     transaction already holds. This is NOT history preservation (DEVOPS-277) — the prior
+//     run's own state history is still destroyed; it only records that it happened.
+//  7. Insert the successor's own parent link: the caller's, or the one carried forward at
+//     step 1. This one statement runs inside a SAVEPOINT and is best-effort — a failure
+//     rolls back only the link and lets the replacement commit, because failing the whole
+//     repave over a lineage hop would permanently block CI for the commit. See
+//     insertAncestryLinkBestEffort.
+//
+// Steps 3, 5 and 6 are reached only when step 2 reported RowsAffected() > 0 — i.e. only when
+// this call itself removed the row — and step 1's result is discarded under the same
+// condition. A repave whose superseded row was already gone still creates the successor (so
+// redelivery converges) but rewrites nothing else, so it can never reassign an unrelated
+// descendant's parent (D2.1, DEVOPS-231 review).
+func (s *PostgresStore) Repave(
+	ctx context.Context,
+	oldCorrelationID string,
+	newSlip *Slip,
+	parent *AncestryEntry,
+) error {
+	if newSlip == nil {
+		return fmt.Errorf("%w: Repave requires a successor slip", ErrInvalidConfiguration)
+	}
+	if oldCorrelationID == newSlip.CorrelationID {
+		// Self-repave: nothing distinguishes "replaced" from "untouched" afterwards, so
+		// this can only destroy data silently. Without the guard the transaction runs to
+		// completion with no error — delete the row, delete its children, re-insert it
+		// fresh — leaving an ended run's state history and component rows replaced by a
+		// pending run under the SAME correlation ID, with a success log whose repaved_id
+		// and superseding_id are identical and therefore indistinguishable from a no-op.
+		//
+		// It is reachable: a caller that retries within one delivery reuses its
+		// correlation ID, so a retry after a partially-observed failure can present the
+		// same id on both sides. Rejecting is strictly better than the alternative of
+		// treating it as a no-op, because a caller in this state has a bug worth seeing.
+		return fmt.Errorf("%w: Repave successor %s is the slip being repaved",
+			ErrInvalidConfiguration, newSlip.CorrelationID)
+	}
+
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		// Read the superseded run's own ancestry link BEFORE the guarded DELETE below, not
+		// after. This ordering is required by Phase B and is invisible without it.
+		//
+		// Phase B adds fk_ancestry_slip (correlation_id) REFERENCES routing_slips
+		// ON DELETE CASCADE. A cascade is an AFTER ROW trigger, so for a non-deferrable
+		// constraint it fires at end of statement: the moment the guarded DELETE of the
+		// routing_slips row completes, this run's slip_ancestry rows are gone — and gone to
+		// every later statement in this same transaction. Read after the delete and the
+		// lookup returns nothing, with no error and no warning.
+		//
+		// The consequence lands where nobody would see it. The carry-forward only runs when
+		// the caller resolved no ancestry of its own (a GitHub outage), so the lineage hop
+		// would be destroyed in exactly the degraded case the mechanism exists for, and
+		// never in the healthy case. Nor would the suite catch it: CI migrates to v4 and the
+		// FK arrives in v5, so everything stays green until the migration ships.
+		// TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration
+		// installs that FK itself so the ordering is pinned now rather than on trust.
+		//
+		// Reading before the DELETE means reading without the row lock the DELETE takes,
+		// and that introduces no new race: two concurrent repaves of the same old ID read
+		// the same link and carry the same value forward (idempotent), and the guarded
+		// DELETE still decides which one wins. The only cost is one wasted round-trip on
+		// the paths where the delete then finds nothing.
+		var carried AncestryEntry
+		var carriedFound bool
+		if parent == nil {
+			var carryErr error
+			carried, carriedFound, carryErr = loadOwnAncestryLinkTx(ctx, tx, oldCorrelationID)
+			if carryErr != nil {
+				return fmt.Errorf("repave %s: reading superseded ancestry link: %w",
+					oldCorrelationID, carryErr)
+			}
+		}
+
+		removedOld, err := removeSupersededSlipTx(ctx, tx, oldCorrelationID)
+		if err != nil {
+			return err
+		}
+
+		link := parent
+		if removedOld {
+			if link == nil && carriedFound {
+				// The caller resolved no ancestry (e.g. a GitHub outage). Carry the
+				// superseded run's own parent link forward rather than destroying the
+				// lineage hop along with its row. Gated on removedOld so a repave that
+				// found no old row to replace does not invent a parent for the successor.
+				link = &carried
+			}
+
+			for _, stmt := range []string{
+				"DELETE FROM slip_component_states WHERE correlation_id = $1",
+				"DELETE FROM slip_ancestry WHERE correlation_id = $1",
+			} {
+				if _, err := tx.Exec(ctx, stmt, oldCorrelationID); err != nil {
+					return fmt.Errorf("repave %s: deleting superseded children: %w", oldCorrelationID, err)
+				}
+			}
+		}
+
+		// The successor's row must exist before anything is pointed at it.
+		if err := s.createTx(ctx, tx, newSlip); err != nil {
+			return err
+		}
+
+		if removedOld {
+			// parent_commit_sha and created_at are in the SET list for the reason the
+			// "whole denormalized snapshot" claim requires: every column here describes the
+			// parent, and leaving any of them naming the deleted run reproduces the
+			// inconsistency the repoint exists to remove — an id and the fields beside it
+			// describing two different runs.
+			//
+			// parent_commit_sha is a no-op for a same-commit repave, which is all any
+			// in-repo caller performs, but SlipStore.Repave never requires
+			// newSlip.CommitSHA to equal the superseded row's. A future cross-commit
+			// repave would otherwise leave a descendant's AncestryEntry.CommitSHA naming a
+			// commit whose run no longer exists. created_at is stale even for the
+			// same-commit case, since the link now describes a different run.
+			if _, err := tx.Exec(ctx,
+				"UPDATE slip_ancestry SET parent_correlation_id = $1, parent_repository = $2, "+
+					"parent_branch = $3, parent_status = $4, parent_commit_sha = $5, "+
+					"created_at = now(), parent_failed_step = '' "+
+					"WHERE parent_correlation_id = $6",
+				newSlip.CorrelationID, newSlip.Repository, newSlip.Branch,
+				string(newSlip.Status), newSlip.CommitSHA, oldCorrelationID,
+			); err != nil {
+				return fmt.Errorf("repave %s: repointing descendants to %s: %w",
+					oldCorrelationID, newSlip.CorrelationID, err)
+			}
+		}
+
+		if removedOld {
+			// Record on the successor that it replaced a predecessor. Without this the
+			// successor row carries no evidence a prior run ever existed for this commit:
+			// the old row and its children are gone, and the only other link
+			// (supersededBy) lives in spans and log lines, not on any row. One history
+			// entry inside this same transaction makes the replacement visible to anyone
+			// reading the slip later, and costs one UPDATE on a row already locked here.
+			//
+			// This is NOT the history-preservation decision (DEVOPS-277) — the prior run's
+			// own state history is still destroyed. It only records that it happened.
+			if err := appendHistoryTx(ctx, tx, newSlip.CorrelationID, StateHistoryEntry{
+				Step:      "push_parsed",
+				Status:    StepStatusRunning,
+				Timestamp: time.Now(),
+				// "slippy-library" matches every other library-emitted history entry
+				// (history.go, push.go, steps.go). It was "slippy" here, which made this
+				// entry distinguishable by Actor purely by accident — worth avoiding,
+				// because a consumer would then be relying on a typo. A repave is
+				// identified by the Message, as the integration test does.
+				Actor: "slippy-library",
+				Message: fmt.Sprintf("repaved %s for commit %s", oldCorrelationID,
+					shortSHA(newSlip.CommitSHA)),
+			}); err != nil {
+				return fmt.Errorf("repave %s: recording predecessor on successor: %w",
+					oldCorrelationID, err)
+			}
+		}
+
+		if link != nil {
+			if err := s.insertAncestryLinkBestEffort(ctx, tx, newSlip, *link); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// insertAncestryLinkBestEffort writes the successor's parent link inside a SAVEPOINT, so a
+// failure to write it rolls back only that statement and lets the replacement itself
+// commit. It returns an error only when the savepoint machinery itself fails.
+//
+// Why the link is not allowed to veto the replacement: it is the least important write in
+// the transaction, and failing it here would permanently block CI for the commit. The
+// failure is not transient — every redelivery meets the same superseded row and the same
+// failing insert — while slip_ancestry's only reader (Client.ResolveAncestry) has no
+// non-test caller in this repo today. Blocking a pipeline on a lineage hop nothing reads is
+// the wrong trade, and it would also make the repave path stricter than the fresh-create
+// path, where writeAncestryLink already treats the identical failure as a warning.
+//
+// The delete/create atomicity that motivates Repave is untouched: the savepoint scopes the
+// relaxation to this one statement.
+func (s *PostgresStore) insertAncestryLinkBestEffort(
+	ctx context.Context,
+	tx pgx.Tx,
+	slip *Slip,
+	parent AncestryEntry,
+) error {
+	sp, spErr := tx.Begin(ctx)
+	if spErr != nil {
+		return fmt.Errorf("repave %s: open ancestry-link savepoint: %w", slip.CorrelationID, spErr)
+	}
+
+	if linkErr := insertAncestryLinkTx(ctx, sp, slip, parent); linkErr != nil {
+		if rbErr := sp.Rollback(ctx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			// Join rather than wrap only rbErr: a context cancellation or a dead connection
+			// during the link insert fails BOTH statements, and returning the rollback error
+			// alone discards the root cause — the Warn below, which carries linkErr, is not
+			// reached on this path. An operator debugging repeated repave failures under
+			// redelivery would chase the rollback instead of the insert.
+			return fmt.Errorf("repave %s: roll back ancestry-link savepoint: %w",
+				slip.CorrelationID, errors.Join(rbErr, linkErr))
+		}
+		s.logger.Warn(ctx, "Repave committed without the successor's ancestry link",
+			map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"parent_id":      parent.CorrelationID,
+				"error":          linkErr.Error(),
+			})
+		return nil
+	}
+
+	if commitErr := sp.Commit(ctx); commitErr != nil {
+		return fmt.Errorf("repave %s: release ancestry-link savepoint: %w",
+			slip.CorrelationID, commitErr)
+	}
+	return nil
+}
+
+// removeSupersededSlipTx runs Repave's guarded delete of the superseded row and reports
+// whether it removed it. A false return means the row was already gone, which is not an
+// error: the caller still creates the successor, but must skip every statement that is
+// only licensed by having removed the row itself.
+//
+// Returns ErrSlipWentLive when the row is still present but no longer ended — the repave
+// decision is stale, and rolling back leaves both the live run and the absent successor
+// exactly as the caller found them.
+func removeSupersededSlipTx(ctx context.Context, tx pgx.Tx, correlationID string) (bool, error) {
+	tag, err := tx.Exec(ctx,
+		"DELETE FROM routing_slips WHERE correlation_id = $1 AND status IN ("+repaveableSlipStatusesSQL+")",
+		correlationID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("repave %s: deleting superseded row: %w", correlationID, err)
+	}
+	if tag.RowsAffected() > 0 {
+		return true, nil
+	}
+
+	// Nothing matched: either the guard rejected the delete (row present, status no longer
+	// ended) or the row was already gone. Distinguish them, because one is a rejection and
+	// the other is a legitimate idempotent path.
+	var id string
+	checkErr := tx.QueryRow(ctx,
+		"SELECT correlation_id FROM routing_slips WHERE correlation_id = $1", correlationID,
+	).Scan(&id)
+	switch {
+	case checkErr == nil:
+		return false, fmt.Errorf("repave %s: %w", correlationID, ErrSlipWentLive)
+	case isNoRows(checkErr):
+		return false, nil
+	default:
+		return false, fmt.Errorf("repave %s: checking superseded row: %w", correlationID, checkErr)
+	}
+}
+
+// loadOwnAncestryLinkTx reads the direct-parent link belonging to correlationID. Used by
+// Repave to carry a superseded run's lineage hop forward to its successor.
+//
+// found distinguishes "this run has no parent link" (found=false, a normal state for a
+// root commit) from a read failure, so the caller can treat only the latter as fatal.
+//
+// LIMIT 1 with no ORDER BY is deliberate. slip_ancestry's primary key is (repository,
+// branch, correlation_id), so a single correlation ID could in principle carry more than one
+// row — but a run's (repository, branch) never changes after creation, so in practice there
+// is exactly one link row per correlation_id and there is no tiebreak to make.
+//
+// Specifically NOT ordered by created_at: that column holds the ANCESTOR's creation time
+// (ancestryLinkArgs binds parent.CreatedAt, and the upsert re-stamps it), not the link's
+// write time, so it cannot express link recency. Ordering by it would install an invariant
+// the schema does not support. Ordering properly would need a real linked_at column and a
+// new versioned migration, which this change deliberately does not ship.
+func loadOwnAncestryLinkTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	correlationID string,
+) (entry AncestryEntry, found bool, err error) {
+	var status string
+	err = tx.QueryRow(ctx,
+		"SELECT parent_correlation_id, parent_commit_sha, parent_status, parent_failed_step, "+
+			"parent_repository, parent_branch, created_at FROM slip_ancestry "+
+			"WHERE correlation_id = $1 LIMIT 1",
+		correlationID,
+	).Scan(
+		&entry.CorrelationID, &entry.CommitSHA, &status, &entry.FailedStep,
+		&entry.Repository, &entry.Branch, &entry.CreatedAt,
+	)
+	switch {
+	case err == nil:
+		entry.Status = SlipStatus(status)
+		return entry, true, nil
+	case isNoRows(err):
+		return AncestryEntry{}, false, nil
+	default:
+		return AncestryEntry{}, false, err
+	}
+}

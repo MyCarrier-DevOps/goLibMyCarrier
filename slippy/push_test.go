@@ -3,6 +3,8 @@ package slippy
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -243,15 +245,25 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.AppendHistoryCalls) != 1 {
 			t.Errorf("expected exactly 1 AppendHistoryCalls entry, got %d", len(store.AppendHistoryCalls))
 		}
+		// B6 (review fix): the in-flight reuse path dedups onto a pre-existing slip
+		// (existingSlip has no Ancestry set here), so AncestryResolved must be true -
+		// "no resolution was attempted or needed" - not `len(slip.Ancestry) > 0`,
+		// which is unconditionally false in production (no store hydrates Ancestry on
+		// load).
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true for the in-flight reuse dedup")
+		}
 	})
 
-	t.Run("failed existing slip - supersedes and creates fresh", func(t *testing.T) {
+	t.Run("failed existing slip - repaves (delete + create fresh)", func(t *testing.T) {
 		// A prior pipeline for this EXACT commit ran and FAILED (non-terminal, stuck).
-		// A new push for the same commit (retrigger-ci replay, or webhook re-delivery of
-		// a failed run) must abandon the failed slip and create a FRESH slip with the
-		// caller's correlation ID — NOT reuse it via handlePushRetry. Reusing it returns
-		// a different correlation ID to the caller (slippy-api → pushhookparser), which
-		// reads that as a dedup and suppresses builds + unit tests (the retrigger bug).
+		// A new push for the same commit (webhook re-delivery or same-commit re-push)
+		// must repave: DELETE the failed slip and create a FRESH slip with the caller's
+		// correlation ID — NOT reuse it via handlePushRetry, and not merely abandon it,
+		// per DEVOPS-231's one-row-per-(repository, commit_sha) repave model
+		// (STATE_MACHINE_V3.md). Reusing it via retry returns a different correlation ID
+		// to the caller (slippy-api → pushhookparser), which reads that as a dedup and
+		// suppresses builds + unit tests (the retrigger bug).
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		config := testPipelineConfig()
@@ -286,17 +298,24 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if result.Slip.CorrelationID != "corr-retrigger-new" {
 			t.Errorf("expected new slip ID 'corr-retrigger-new', got '%s'", result.Slip.CorrelationID)
 		}
-		// Exactly one Create call for the fresh slip.
-		if len(store.CreateCalls) != 1 {
-			t.Errorf("expected 1 Create call for fresh slip, got %d", len(store.CreateCalls))
+		// The successor is written by Repave itself, inside the same transaction that
+		// removed the superseded row, so there is no separate Create call to count any
+		// more. What matters is that the successor really is persisted.
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("a repave must not issue a separate Create, got %d", len(store.CreateCalls))
 		}
-		// The old failed slip must be abandoned (terminal, excluded from future live lookups).
-		old, ok := store.Slips["corr-old-failed"]
-		if !ok {
-			t.Fatal("old slip missing from store")
+		if _, ok := store.Slips["corr-retrigger-new"]; !ok {
+			t.Error("successor must be persisted by the repave")
 		}
-		if old.Status != SlipStatusAbandoned {
-			t.Errorf("expected old failed slip to be abandoned, got %q", old.Status)
+		// The old failed slip must be REPLACED (repaved), not abandoned — one row per commit.
+		if _, ok := store.Slips["corr-old-failed"]; ok {
+			t.Error("old failed slip must be removed on repave, still present")
+		}
+		if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "corr-old-failed" {
+			t.Errorf("expected Repave(corr-old-failed), got %v", store.RepaveCalls)
+		}
+		if len(store.RepaveSuccessorCalls) != 1 || store.RepaveSuccessorCalls[0] != "corr-retrigger-new" {
+			t.Errorf("expected the fresh slip to be the repave successor, got %v", store.RepaveSuccessorCalls)
 		}
 		// handlePushRetry (reset push_parsed -> running) must NOT run for a failed slip.
 		for _, call := range store.UpdateStepCalls {
@@ -306,10 +325,14 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	t.Run("failed existing slip - abandon error is non-fatal, still creates fresh", func(t *testing.T) {
-		// If abandoning the failed slip fails, slip creation must still proceed (with a
-		// recorded warning). Blocking here would re-introduce the "retrigger never builds"
-		// bug; a lingering failed row is shadowed by the newer slip (version DESC).
+	t.Run("failed existing slip - repave failure is fatal, leaving the store untouched", func(t *testing.T) {
+		// A repave failure is now FATAL, a deliberate reversal of the pre-Repave code
+		// (which warned and created the slip anyway). That leniency only made sense while
+		// delete and create were separate calls: the create could still succeed on its own,
+		// at the cost of leaving a stale row behind. Repave writes nothing when it fails,
+		// so there is no successor to fall through to — reporting success here would
+		// return a slip that does not exist. Failing the push lets Kafka redeliver, which
+		// converges because the superseded row is still there to repave next time.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
@@ -323,37 +346,265 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
 			StateHistory:  []StateHistoryEntry{},
 		})
-		// AbandonSlip does Load + atomic UpdateSlipStatus; fail the status update so abandon
-		// errors. (Create is unaffected, so fresh-slip creation still succeeds.)
-		store.UpdateSlipStatusError = errors.New("clickhouse unavailable")
+		store.RepaveError = errors.New("postgres unavailable")
 
 		opts := PushOptions{
 			CorrelationID: "corr-retrigger-2",
 			Repository:    "owner/repo",
 			Branch:        "integration",
 			CommitSHA:     "failed-commit-abc",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
 		}
 
 		result, err := client.CreateSlipForPush(ctx, opts)
-		if err != nil {
-			t.Fatalf("unexpected error (abandon failure must be non-fatal): %v", err)
+		if err == nil {
+			t.Fatal("expected a repave failure to fail the push so Kafka redelivers")
 		}
-		if result.Slip.CorrelationID != "corr-retrigger-2" {
-			t.Errorf("expected fresh slip 'corr-retrigger-2', got '%s'", result.Slip.CorrelationID)
+		if !strings.Contains(err.Error(), "postgres unavailable") {
+			t.Errorf("expected the underlying store error to be wrapped, got %v", err)
 		}
-		if len(store.CreateCalls) != 1 {
-			t.Errorf("expected 1 Create call, got %d", len(store.CreateCalls))
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
 		}
-		if len(result.Warnings) == 0 {
-			t.Error("expected a warning recorded for the failed abandon")
+		// Convergence depends on this: the superseded row must still be there for the
+		// redelivery to repave, and no half-written successor may exist.
+		if _, ok := store.Slips["corr-old-failed-2"]; !ok {
+			t.Error("the superseded row must survive a failed repave so a redelivery can converge")
+		}
+		if _, ok := store.Slips["corr-retrigger-2"]; ok {
+			t.Error("a failed repave must not leave a successor behind")
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("a failed repave must not fall through to Create, got %d calls", len(store.CreateCalls))
 		}
 	})
 
-	t.Run("new slip for terminal existing slip", func(t *testing.T) {
+	t.Run("same-correlation retry on an ended slip converges instead of dead-lettering", func(t *testing.T) {
+		// A caller retrying WITHIN one delivery reuses its correlation ID, so the id it
+		// presents as the successor can be the id already on the row. pushhookparser's
+		// bounded retry does exactly this.
+		//
+		// The sequence that reaches it: attempt 1 creates the slip and dispatches, then fails
+		// later in the handler (a check-run write, say); the dispatched build fails fast, so
+		// the slip is `failed` by the time attempt 2 runs. Attempt 2's LoadByCommit finds an
+		// ENDED row whose correlation_id equals opts.CorrelationID.
+		//
+		// Routing that to Repave cannot work — the store rejects a self-repave, correctly,
+		// because it can only destroy history under an unchanged id. But the rejection is
+		// non-converging: every retry presents the identical input, so the push fails
+		// identically and the message dead-letters. Before this branch existed, the same
+		// retry SUCCEEDED, because Create is an upsert on correlation_id and abandon+create
+		// simply rewrote the row.
+		//
+		// So a same-correlation push takes the plain create path: the upsert rewrites the row
+		// in place, resetting it to a live status, and the caller sees returned == sent and
+		// re-dispatches. That restores the pre-Repave outcome exactly rather than inventing
+		// new semantics for it.
+		//
+		// Note what this deliberately does NOT do: it is not routed to handlePushRetry, which
+		// would return the ended row with only push_parsed reset — the caller would then see
+		// returned == sent, dispatch anyway, and report against a slip whose top-level status
+		// is still `failed`. The upsert is what makes the returned slip genuinely live.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-same-delivery",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retry",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-same-delivery", // SAME id as the row: an in-delivery retry
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retry",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("a same-correlation retry must converge, not fail: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-same-delivery" {
+			t.Fatalf("expected the slip under the caller's own id, got %+v", result.Slip)
+		}
+		if !result.Slip.Status.IsLive() {
+			t.Errorf("the row must be reset to a LIVE status so the re-dispatched run can "+
+				"report against it — a returned slip still carrying the failed status is "+
+				"the outcome routing this to handlePushRetry would have produced (got %q)",
+				result.Slip.Status)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("no repave may be attempted for a self-referential id, got %v", store.RepaveCalls)
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected exactly one Create (the upsert), got %d", len(store.CreateCalls))
+		}
+		stored, loadErr := store.Load(ctx, "corr-same-delivery")
+		if loadErr != nil {
+			t.Fatalf("the row must still exist after the reset: %v", loadErr)
+		}
+		if !stored.Status.IsLive() {
+			t.Errorf("the persisted row must be reset too, not just the returned copy, "+
+				"got %q", stored.Status)
+		}
+	})
+
+	// The empty-run guard must never claim a push whose correlation ID already matches the
+	// existing row. The guard's contract is that the caller sees returned != sent and
+	// suppresses its side effects — that is the only thing making it safe to return a slip
+	// the caller did not create. When returned == sent, the caller reads the result as its
+	// own freshly created slip and dispatches against it, so for an ended row it would report
+	// against a terminal slip.
+	//
+	// Tabled over all five ended statuses because the earlier fix covered `failed` only, and
+	// `completed` is the shape that exposed the hole: a run that finished between two
+	// attempts of one delivery is not `failed`, so the carve-out never fired.
+	for _, endedStatus := range []SlipStatus{
+		SlipStatusCompleted,
+		SlipStatusFailed,
+		SlipStatusAbandoned,
+		SlipStatusPromoted,
+		SlipStatusCompensated,
+	} {
+		t.Run("same-correlation zero-component push onto "+string(endedStatus)+
+			" resets in place, guard must not claim it", func(t *testing.T) {
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-self",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-self",
+				Status:        endedStatus,
+				Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-self", // an in-delivery retry reuses its ID
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-self",
+				Components:    nil, // zero components: what the guard keys on
+			})
+			if err != nil {
+				t.Fatalf("a same-correlation retry must converge, got %v", err)
+			}
+			if result.Slip == nil {
+				t.Fatal("expected a slip")
+			}
+			if !result.Slip.Status.IsLive() {
+				t.Errorf("the returned slip must be LIVE: the caller sees returned == sent and "+
+					"will dispatch against it, so handing back a %s slip means reporting "+
+					"against a terminal run", endedStatus)
+			}
+			if len(store.RepaveCalls) != 0 {
+				t.Errorf("no repave may be attempted for a self-referential id, got %v",
+					store.RepaveCalls)
+			}
+			if len(store.CreateCalls) != 1 {
+				t.Errorf("expected exactly one Create (the in-place upsert), got %d",
+					len(store.CreateCalls))
+			}
+
+			// The reachable half of appendResetMarker. Its other caller — the duplicate-create
+			// backstop — is dormant until Phase B's unique index exists, so without this the
+			// only assertion on the marker sat on the arm that cannot run, and deleting the
+			// call in persistSlipForPush was green.
+			//
+			// Create upserts state_history along with every other non-PK column, so a reset
+			// with no marker leaves a live row carrying one seed entry and nothing to
+			// distinguish a first attempt from a reset one — the indistinguishability the
+			// store's own self-repave guard cites as its reason for existing.
+			stored, ok := store.Slips["corr-self"]
+			if !ok {
+				t.Fatal("the reset slip must be persisted")
+			}
+			var marker string
+			for _, e := range stored.StateHistory {
+				if strings.Contains(e.Message, "reset in place after") {
+					marker = e.Message
+				}
+			}
+			if marker == "" {
+				t.Fatalf("an in-place reset must record the prior attempt, as the backstop arm "+
+					"does; history was %+v", stored.StateHistory)
+			}
+			if !strings.Contains(marker, string(endedStatus)) {
+				t.Errorf("the marker must name the prior attempt's status, got %q", marker)
+			}
+		})
+	}
+
+	t.Run("repave rejected on its inputs - fatal, and named as non-converging", func(t *testing.T) {
+		// ErrInvalidConfiguration gets its own arm rather than landing in the fatal
+		// default, because the default's justification for being fatal inverts for it.
+		// The default reasons that failing the push "lets Kafka redeliver against a store
+		// that still holds the superseded row" — i.e. that redelivery converges. This
+		// sentinel cannot converge: the store refused the INPUTS (today, a self-repave
+		// where oldCorrelationID == newSlip.CorrelationID), the correlation ID is stable
+		// within a delivery, so every redelivery is rejected identically.
+		//
+		// Fatal is still right — a caller in this state has a bug worth surfacing, and
+		// degrading would either destroy history or return a slip whose status contradicts
+		// what the caller thinks it created. What the arm buys is that the sentinel is
+		// wrapped and logged as its own class instead of looking like a transient store
+		// failure that a retry might clear.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-badinput",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-badinput",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.RepaveError = fmt.Errorf("%w: Repave successor corr-badinput is the slip being repaved",
+			ErrInvalidConfiguration)
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-badinput-push",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-badinput",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err == nil {
+			t.Fatal("a repave rejected on its inputs must fail the push")
+		}
+		if !errors.Is(err, ErrInvalidConfiguration) {
+			t.Errorf("the sentinel must survive wrapping so callers can classify it, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("no successor may be created, got %d Create calls", len(store.CreateCalls))
+		}
+		if _, ok := store.Slips["corr-badinput"]; !ok {
+			t.Error("the superseded row must be left untouched")
+		}
+	})
+
+	t.Run("terminal existing slip - repaves (delete + create fresh)", func(t *testing.T) {
 		// When a terminal slip (abandoned, promoted, compensated, completed) already
 		// exists for the commit SHA, CreateSlipForPush must NOT call handlePushRetry.
-		// Instead it falls through and creates a fresh slip with the new correlation ID.
-		// This prevents webhook re-delivery or bot-commit races from resurrecting stale slips.
+		// Instead it repaves: delete the old row, then fall through and create a fresh
+		// slip with the new correlation ID. Under one-row-per-commit ANY existing row
+		// for the pushed SHA must be repaved before Create — this prevents webhook
+		// re-delivery or bot-commit races from resurrecting stale slips, and keeps the
+		// unique (repository, commit_sha) index from rejecting the insert.
 		for _, termStatus := range []SlipStatus{
 			SlipStatusAbandoned, SlipStatusPromoted, SlipStatusCompensated, SlipStatusCompleted,
 		} {
@@ -380,7 +631,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 					Repository:    "owner/repo",
 					Branch:        "main",
 					CommitSHA:     "terminal-commit-abc",
-					Components:    []ComponentDefinition{},
+					Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
 				}
 
 				result, err := client.CreateSlipForPush(ctx, opts)
@@ -393,9 +644,14 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 					t.Errorf("expected new slip ID 'corr-new-after-terminal', got '%s'", result.Slip.CorrelationID)
 				}
 
-				// Exactly one Create call for the new slip
-				if len(store.CreateCalls) != 1 {
-					t.Errorf("expected 1 Create call for new slip, got %d", len(store.CreateCalls))
+				// Repave writes the successor itself, so no separate Create is issued —
+				// the invariant to check is that the successor is persisted.
+				if len(store.CreateCalls) != 0 {
+					t.Errorf("[%s] a repave must not issue a separate Create, got %d",
+						termStatus, len(store.CreateCalls))
+				}
+				if _, ok := store.Slips["corr-new-after-terminal"]; !ok {
+					t.Errorf("[%s] successor must be persisted by the repave", termStatus)
 				}
 
 				// handlePushRetry resets push_parsed to running — must NOT have happened
@@ -404,44 +660,314 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 						t.Error("handlePushRetry must not be called for a terminal existing slip")
 					}
 				}
+
+				// One row per (repository, commit_sha): the old terminal slip must be
+				// repaved (replaced), not left behind.
+				if _, ok := store.Slips["corr-terminal-old"]; ok {
+					t.Errorf("[%s] old terminal slip must be removed on repave (one row per commit)", termStatus)
+				}
+				if len(store.RepaveCalls) != 1 {
+					t.Errorf("[%s] expected 1 Repave call, got %d", termStatus, len(store.RepaveCalls))
+				}
 			})
 		}
 	})
 
-	t.Run("retry detection uses LoadLiveByCommit not LoadByCommit", func(t *testing.T) {
-		// Guard against accidental regression of the F1 migration. CreateSlipForPush's
-		// retry-detection lookup is exact-SHA intent and must route through
-		// LoadLiveByCommit so superseded-terminal slips (abandoned/promoted/compensated)
-		// are filtered at the DB layer rather than relying solely on the post-call
-		// IsTerminal() guard. The IsTerminal() guard still catches the 'completed'
-		// case since LoadLiveByCommit does not filter completed slips.
+	t.Run("retry detection uses unfiltered LoadByCommit (one row per commit)", func(t *testing.T) {
+		// DEVOPS-231 (one row per commit) reversed the F1-era invariant this guard
+		// used to protect: the retry-detection lookup must now route through
+		// unfiltered LoadByCommit, not LoadLiveByCommit. Under one-row-per-commit,
+		// ANY existing row for the pushed (repo, sha) — including an
+		// abandoned/promoted/compensated row left behind by a cross-commit
+		// supersede — must be found and repaved before Create, or the unique
+		// (repository, commit_sha) index rejects the insert. Live-only filtering
+		// (the old LoadLiveByCommit routing) would hide exactly those rows from the
+		// repave path, leaving them behind.
+		//
+		// This also re-proves the property the old guard actually protected: a
+		// superseded/abandoned same-SHA row is never resurrected via
+		// handlePushRetry. Under the new routing it's still never reused — it's
+		// repaved (deleted) instead of reset.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-abandoned-old",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "routing-check-sha",
+			Status:        SlipStatusAbandoned,
+			Steps:         map[string]Step{},
+			StateHistory:  []StateHistoryEntry{},
+		})
 
 		opts := PushOptions{
 			CorrelationID: "corr-routing-check",
 			Repository:    "owner/repo",
 			Branch:        "main",
 			CommitSHA:     "routing-check-sha",
-			Components:    []ComponentDefinition{},
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
 		}
 
-		_, err := client.CreateSlipForPush(ctx, opts)
+		result, err := client.CreateSlipForPush(ctx, opts)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		if len(store.LoadLiveByCommitCalls) != 1 {
-			t.Errorf("expected exactly 1 LoadLiveByCommit call, got %d", len(store.LoadLiveByCommitCalls))
+		// (a) LoadByCommit is the retained routing: exactly one lookup for the
+		// pushed (repo, sha).
+		if len(store.LoadByCommitCalls) != 1 {
+			t.Errorf("expected exactly 1 LoadByCommit call, got %d", len(store.LoadByCommitCalls))
+		} else if call := store.LoadByCommitCalls[0]; call.Repository != opts.Repository || call.CommitSHA != opts.CommitSHA {
+			t.Errorf("expected LoadByCommit(%q, %q), got LoadByCommit(%q, %q)",
+				opts.Repository, opts.CommitSHA, call.Repository, call.CommitSHA)
 		}
-		if len(store.LoadByCommitCalls) != 0 {
+
+		// (b) LoadLiveByCommit must no longer be consulted on this path.
+		if len(store.LoadLiveByCommitCalls) != 0 {
 			t.Errorf(
-				"expected 0 LoadByCommit calls (retry detection must use LoadLiveByCommit), got %d",
-				len(store.LoadByCommitCalls),
+				"expected 0 LoadLiveByCommit calls (retry detection must use unfiltered LoadByCommit), got %d",
+				len(store.LoadLiveByCommitCalls),
 			)
 		}
+
+		// (c) The abandoned same-SHA row must be repaved, not resurrected: the
+		// caller sees its NEW correlation_id, and the old row was replaced (one
+		// Repave call, gone from store.Slips) rather than reset via
+		// handlePushRetry (no push_parsed -> running UpdateStep call on the old id).
+		if result.Slip.CorrelationID != opts.CorrelationID {
+			t.Errorf("expected fresh slip %q, got %q", opts.CorrelationID, result.Slip.CorrelationID)
+		}
+		if _, ok := store.Slips["corr-abandoned-old"]; ok {
+			t.Error("abandoned same-SHA row must be repaved (removed), not left behind")
+		}
+		if len(store.RepaveCalls) != 1 {
+			t.Errorf("expected 1 Repave call for the abandoned row, got %d", len(store.RepaveCalls))
+		}
+		for _, call := range store.UpdateStepCalls {
+			if call.CorrelationID == "corr-abandoned-old" && call.StepName == "push_parsed" &&
+				call.Status == StepStatusRunning {
+				t.Error("abandoned row must not be reused via handlePushRetry (no push_parsed reset on the old id)")
+			}
+		}
 	})
+
+	t.Run("ended slip + no components - returns existing slip, no repave (empty-run guard)", func(t *testing.T) {
+		// Branch create/recreate at an existing SHA reaches CreateSlip with no
+		// components (AllowSlipWithNoBuilds repos). Nothing would be dispatched, so
+		// repaving would only destroy the real run's history. Return the existing
+		// ended slip as a dedup instead (caller sees returned != sent → suppress).
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-real-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-branch-create",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-branch-create",
+			Repository:    "owner/repo",
+			Branch:        "feature/new-branch",
+			CommitSHA:     "sha-branch-create",
+			Components:    nil, // no work to dispatch
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-real-run" {
+			t.Errorf("guard must return the existing run, got %q", result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("guard must not repave, got Repave calls: %v", store.RepaveCalls)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("guard must not create, got %d Create calls", len(store.CreateCalls))
+		}
+		// B6 (review fix): AncestryResolved=true here means "no resolution was
+		// attempted or needed - the returned slip is pre-existing", NOT "the loaded
+		// slip happens to carry a populated Ancestry field". The reused slip here has
+		// no ancestry, and AncestryResolved must still be true: no store hydrates
+		// Slip.Ancestry on load in production, so `len(existingSlip.Ancestry) > 0`
+		// was unconditionally false in prod and misfired dedup-alert consumers on
+		// every guard hit.
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true (dedup: no resolution needed for a pre-existing slip)")
+		}
+	})
+
+	t.Run("failed slip + no components - retriggers, the empty-run guard must not apply", func(t *testing.T) {
+		// The empty-run guard is introduced by this branch, so it must not narrow what a
+		// push could do before it existed. On the merge base a same-commit push onto a
+		// FAILED slip always abandoned it and created a fresh slip under the caller's
+		// correlation ID — component count was never consulted — and the code said why:
+		// "blocking fresh-slip creation here would re-introduce the 'retrigger never
+		// builds' bug". A failed slip never advances on its own, so a new push for the
+		// same commit is a deliberate request to run CI again.
+		//
+		// Component count cannot stand in for "this push dispatches nothing" here. A
+		// tests-only repo (buildable=false + RunUnitTests=true + AllowSlipWithNoBuilds)
+		// dispatches unit tests with zero build components: pushhookparser nils components
+		// whenever !shouldBuild while still dispatching those tests. If the guard claimed
+		// this push, the caller would see returned != sent, suppress everything, and a
+		// failed unit-test run on those repos could never be retriggered by re-pushing —
+		// a regression against the merge base that would last until slippy-api AND
+		// pushhookparser both adopt DispatchIntent (DEVOPS-264).
+		//
+		// So the guard covers the ENDED statuses it was written for (a branch
+		// create/recreate at an existing SHA, whose slip is normally completed) and
+		// leaves `failed` to repave. DispatchIntent makes the same decision precisely
+		// once callers pass it; this keeps the pre-adoption path identical to the base.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-failed-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retrigger",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"unit_tests": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-retrigger",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-retrigger",
+			Components:    nil, // tests-only repo: unit tests dispatch, no build components
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-retrigger" {
+			t.Errorf("a failed slip must be replaced by a fresh slip under the caller's id "+
+				"(so the caller sees returned == sent and re-dispatches), got %q",
+				result.Slip.CorrelationID)
+		}
+		if len(store.RepaveCalls) != 1 {
+			t.Errorf("expected exactly 1 Repave call for the failed slip, got %v", store.RepaveCalls)
+		} else if store.RepaveCalls[0] != "corr-failed-run" {
+			t.Errorf("expected the failed slip to be repaved, got %q", store.RepaveCalls[0])
+		}
+		if _, ok := store.Slips["corr-failed-run"]; ok {
+			t.Error("the failed run must be replaced, not left behind")
+		}
+	})
+
+	t.Run(
+		"ended slip + no components + ancestry - guard reuse still reports AncestryResolved=true",
+		func(t *testing.T) {
+			// Same empty-run guard as above, but the reused ended slip HAS ancestry. This
+			// pins that AncestryResolved=true does NOT depend on the loaded slip's own
+			// Ancestry field one way or the other (see B6 above) - true in both the
+			// no-ancestry and has-ancestry cases, for the same reason (dedup onto a
+			// pre-existing slip, nothing was resolved).
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-real-run-ancestry",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-branch-create-ancestry",
+				Status:        SlipStatusCompleted,
+				Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+				StateHistory:  []StateHistoryEntry{},
+				Ancestry: []AncestryEntry{
+					{CorrelationID: "corr-ancestor", CommitSHA: "sha-ancestor", Status: SlipStatusCompleted},
+				},
+			})
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-branch-create-ancestry",
+				Repository:    "owner/repo",
+				Branch:        "feature/new-branch",
+				CommitSHA:     "sha-branch-create-ancestry",
+				Components:    nil, // no work to dispatch
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip.CorrelationID != "corr-real-run-ancestry" {
+				t.Errorf("guard must return the existing run, got %q", result.Slip.CorrelationID)
+			}
+			if !result.AncestryResolved {
+				t.Error("expected AncestryResolved=true for a reused slip that has ancestry")
+			}
+		},
+	)
+
+	t.Run(
+		"empty-run guard with superseded-terminal row - abandoned/promoted can now escape as result.Slip",
+		func(t *testing.T) {
+			// B8 (review fix): the empty-run guard was only ever exercised with a
+			// `completed` existing row. Before B5's fix, the backstop's live-vs-ended
+			// check was NOT applied consistently, but the MAIN path's guard already
+			// covered abandoned/promoted, they just were not asserted. Pin this
+			// explicitly for supersede-terminal statuses (abandoned - superseded by a
+			// direct push - and promoted - superseded via squash-merge PR): such a slip
+			// can now be returned as result.Slip from CreateSlipForPush, which could not
+			// happen before the guard existed (any terminal row used to always be
+			// repaved, never returned to the caller).
+			for _, termStatus := range []SlipStatus{SlipStatusAbandoned, SlipStatusPromoted} {
+				termStatus := termStatus
+				t.Run(string(termStatus), func(t *testing.T) {
+					store := NewMockStore()
+					github := NewMockGitHubAPI()
+					client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+					commitSHA := "sha-superseded-terminal-" + string(termStatus)
+					store.AddSlip(&Slip{
+						CorrelationID: "corr-superseded-terminal-" + string(termStatus),
+						Repository:    "owner/repo",
+						Branch:        "integration",
+						CommitSHA:     commitSHA,
+						Status:        termStatus,
+						Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+						StateHistory:  []StateHistoryEntry{},
+					})
+
+					result, err := client.CreateSlipForPush(ctx, PushOptions{
+						CorrelationID: "corr-branch-create-" + string(termStatus),
+						Repository:    "owner/repo",
+						Branch:        "feature/new-branch-" + string(termStatus),
+						CommitSHA:     commitSHA,
+						Components:    nil, // no work to dispatch
+					})
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					if result.Slip == nil ||
+						result.Slip.CorrelationID != "corr-superseded-terminal-"+string(termStatus) {
+						t.Errorf("expected guard to return the existing %s slip, got %+v", termStatus, result.Slip)
+					}
+					if result.Slip.Status != termStatus {
+						t.Errorf("expected returned slip to keep status %s, got %s", termStatus, result.Slip.Status)
+					}
+					if len(store.RepaveCalls) != 0 {
+						t.Errorf("[%s] guard must not repave, got Repave calls: %v", termStatus, store.RepaveCalls)
+					}
+					if len(store.CreateCalls) != 0 {
+						t.Errorf("[%s] guard must not create, got %d Create calls", termStatus, len(store.CreateCalls))
+					}
+					if !result.AncestryResolved {
+						t.Errorf("[%s] expected AncestryResolved=true (dedup onto a pre-existing slip)", termStatus)
+					}
+				})
+			}
+		},
+	)
 
 	t.Run("validation error", func(t *testing.T) {
 		store := NewMockStore()
@@ -556,6 +1082,1129 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 				"expected the history write-back failure to be recorded as swallowed, got %d",
 				len(store.SwallowedHistoryErrors),
 			)
+		}
+	})
+
+	t.Run("cross-branch ended slip - repaves onto the new branch", func(t *testing.T) {
+		// FF-merge shape: SHA built on feature branch, same SHA pushed to integration
+		// after the slip ended. One row per commit: the slip repaves onto the new
+		// branch and the caller re-dispatches (returned == sent).
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-feature-run",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-ff-merge",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-integration-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-ff-merge",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-integration-run" {
+			t.Errorf("expected repave with new id, got %q", result.Slip.CorrelationID)
+		}
+		if result.Slip.Branch != "integration" {
+			t.Errorf("branch must follow the current run, got %q", result.Slip.Branch)
+		}
+		if _, ok := store.Slips["corr-feature-run"]; ok {
+			t.Error("feature-branch run must be deleted (one row per commit)")
+		}
+	})
+
+	t.Run("cross-branch in-flight slip - reuses and keeps original branch", func(t *testing.T) {
+		// Same SHA pushed to a second branch while the first branch's slip is live:
+		// reuse (suppress), slip keeps the original branch. Pre-existing behavior.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-inflight",
+			Repository:    "owner/repo",
+			Branch:        "feature/thing",
+			CommitSHA:     "sha-inflight",
+			Status:        SlipStatusInProgress,
+			Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-second-branch",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-inflight",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-inflight" {
+			t.Errorf("expected reuse of in-flight slip, got %q", result.Slip.CorrelationID)
+		}
+		if result.Slip.Branch != "feature/thing" {
+			t.Errorf("in-flight reuse must keep the original branch, got %q", result.Slip.Branch)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Error("in-flight slip must never be repaved")
+		}
+	})
+
+	t.Run("duplicate-create backstop - repaves and retries once", func(t *testing.T) {
+		// Redis-lock fail-open race: two creates for the same new commit; the loser's
+		// INSERT hits the unique index (ErrDuplicateSlip). The backstop loads the
+		// winner row, repaves it, and retries the create once.
+		//
+		// NOTE: this arrangement FIRST hits Task 3's normal repave (an ended slip for
+		// sha-race already exists), which deletes the winner row and clears its commit
+		// index entry before Create is even attempted. That leaves nothing for the
+		// backstop's own LoadByCommit to find once the injected ErrDuplicateSlip fires,
+		// so the backstop retries Create directly without a second delete. What matters
+		// is the FINAL state: create succeeds, no error surfaces, and at least one
+		// repave/backstop delete happened along the way.
+		//
+		// CreateErrorFor fires on every attempt for an id, which can't express "fail
+		// first, succeed on retry" - use the one-shot CreateErrorOnce instead.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		// Winner row exists but is NOT indexed under the loser's lookup until Create
+		// is attempted: simulate by injecting the error on first Create only.
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-race-winner",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race",
+			Status:        SlipStatusCompleted, // ended by the time the retry lands
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.CreateErrorOnce["corr-race-loser"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-race-loser",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("backstop must recover, got error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-race-loser" {
+			t.Errorf("expected corr-race-loser to be created after backstop retry, got %+v", result.Slip)
+		}
+		if _, ok := store.Slips["corr-race-loser"]; !ok {
+			t.Error("expected corr-race-loser to be persisted after backstop retry")
+		}
+		if len(store.RepaveCalls) < 1 {
+			t.Errorf("expected at least one repave/backstop delete, got %v", store.RepaveCalls)
+		}
+	})
+
+	t.Run("duplicate-create backstop - live conflicting row is not deleted (dedup)", func(t *testing.T) {
+		// The real race this backstop exists for: no existing row for this commit
+		// (both pushes see not-found on the initial LoadByCommit), both call Create.
+		// The winner's insert lands WHILE the loser's Create is in flight - a live
+		// (in_progress) row now exists that did not exist a moment ago - and the
+		// loser's insert hits the unique index (ErrDuplicateSlip).
+		//
+		// Unlike the subtest above (whose fixture seeds a TERMINAL winner that the
+		// normal repave block deletes before Create is ever attempted, so the
+		// backstop's LoadByCommit finds nothing), this fixture must make the winner
+		// row appear strictly BETWEEN the loser's initial LoadByCommit (must find
+		// nothing) and the backstop's LoadByCommit (must find the live winner).
+		// SeedOnCreate injects the winner at the moment Create is called, achieving
+		// exactly that ordering.
+		//
+		// The live winner's pipeline may already be dispatched under its
+		// correlation_id, so the backstop must treat it like the reuse branch does:
+		// dedup onto the winner, do NOT delete it, and do NOT retry Create.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		winner := &Slip{
+			CorrelationID: "corr-race-winner-live",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race-live",
+			Status:        SlipStatusInProgress, // still live - pipeline may be dispatched
+			Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-race-loser-live"] = winner
+		store.CreateErrorOnce["corr-race-loser-live"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-race-loser-live",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-race-live",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-race-winner-live" {
+			t.Errorf("expected dedup onto the live winner corr-race-winner-live, got %+v", result.Slip)
+		}
+		for _, deleted := range store.RepaveCalls {
+			if deleted == "corr-race-winner-live" {
+				t.Errorf("live conflicting slip must never be repaved, got Repave calls: %v", store.RepaveCalls)
+			}
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected exactly one Create attempt (no retry after dedup), got %d", len(store.CreateCalls))
+		}
+		// B6 (review fix): the backstop dedup path also dedups onto a pre-existing
+		// slip (winner has no Ancestry set), so AncestryResolved must be true here too.
+		// Note this holds because resolveAndAbandonAncestors SUCCEEDED (the GitHub mock is
+		// healthy) and set it true on its own — not because the backstop forces it. The
+		// subtest below covers the case where resolution failed.
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true for the backstop live-conflict dedup")
+		}
+	})
+
+	t.Run("duplicate-create backstop - dedup must not force AncestryResolved over a real failure",
+		func(t *testing.T) {
+			// AncestryResolved describes THIS push's resolution attempt, wherever an attempt
+			// happened — not the provenance of the slip being returned. The backstop runs
+			// AFTER resolveAndAbandonAncestors, so by the time it dedups, the field already
+			// holds that attempt's real outcome.
+			//
+			// Forcing true here would clobber a legitimate false whose failure is already
+			// recorded in result.Warnings, producing AncestryResolved=true sitting next to an
+			// ancestry error during a GitHub outage — a self-contradictory result that would
+			// misfire any alerting keyed on the field. That is the same reasoning the two
+			// went-live abort paths already state (D3.2); it applies identically here.
+			//
+			// The "returns someone else's slip, so nothing needed resolving" reading does not
+			// discriminate: the ended-conflict repave branch below also returns a reloaded
+			// conflicting row and deliberately preserves the computed value.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			github.GetCommitAncestryError = errors.New("github is down")
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			winner := &Slip{
+				CorrelationID: "corr-outage-winner",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-outage",
+				Status:        SlipStatusInProgress,
+				Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+				StateHistory:  []StateHistoryEntry{},
+			}
+			store.SeedOnCreate["corr-outage-loser"] = winner
+			store.CreateErrorOnce["corr-outage-loser"] = ErrDuplicateSlip
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-outage-loser",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-outage",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-outage-winner" {
+				t.Fatalf("expected dedup onto the live winner, got %+v", result.Slip)
+			}
+			if len(result.Warnings) == 0 {
+				t.Fatal("expected the ancestry failure to be recorded as a warning")
+			}
+			if result.AncestryResolved {
+				t.Errorf("AncestryResolved must stay false when resolution failed for this push; "+
+					"true alongside %d warning(s) contradicts them", len(result.Warnings))
+			}
+		})
+
+	t.Run("duplicate-create backstop - ended conflicting row (completed) is repaved and retried", func(t *testing.T) {
+		// The ENDED counterpart to "duplicate-create backstop - live conflicting row is
+		// not deleted (dedup)" above: the conflicting row the BACKSTOP ITSELF finds (via
+		// its own LoadByCommit, not the caller's initial one) is terminal, so it must be
+		// repaved and Create retried - unlike the live case, which must dedup without
+		// deleting.
+		//
+		// SeedOnCreate (not AddSlip) is required here: AddSlip would make the row
+		// visible to the caller's INITIAL LoadByCommit, which would route through the
+		// normal repave block in CreateSlipForPush and delete it before Create is ever
+		// attempted - never exercising handleDuplicateSlipBackstop's own ended-row
+		// branch at all (see the NOTE on "repaves and retries once" above, which hits
+		// exactly that shape). SeedOnCreate instead makes the row appear at the moment
+		// Create is called, so only the backstop's LoadByCommit ever sees it.
+		//
+		// Kills mutants that survive today: replacing the live-check
+		// (`!conflicting.Status.IsTerminal() && conflicting.Status != SlipStatusFailed`)
+		// with `if true` (would treat this ended row as live: dedup onto the conflicting
+		// id, never delete, never retry), and dropping the `!conflicting.Status.IsTerminal()`
+		// half of the conjunction.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		conflicting := &Slip{
+			CorrelationID: "corr-conflict-completed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-caller-completed"] = conflicting
+		store.CreateErrorOnce["corr-caller-completed"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-completed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-completed" {
+			t.Errorf("expected the caller's own new slip (not the conflicting one), got %+v", result.Slip)
+		}
+		foundRepave := false
+		for _, superseded := range store.RepaveCalls {
+			if superseded == "corr-conflict-completed" {
+				foundRepave = true
+			}
+		}
+		if !foundRepave {
+			t.Errorf(
+				"expected the ended conflicting row to be repaved, got Repave calls: %v",
+				store.RepaveCalls,
+			)
+		}
+		// The backstop's repave replaces the conflicting row WITH the caller's successor in
+		// one transaction, so there is no second Create attempt to make: the first (failed)
+		// attempt is the only one, and the successor exists because the repave wrote it.
+		callerCreates := 0
+		for _, call := range store.CreateCalls {
+			if call.Slip.CorrelationID == "corr-caller-completed" {
+				callerCreates++
+			}
+		}
+		if callerCreates != 1 {
+			t.Errorf(
+				"expected one Create attempt (the failed one); the repave supplies the successor, got %d",
+				callerCreates,
+			)
+		}
+		if len(store.RepaveSuccessorCalls) != 1 || store.RepaveSuccessorCalls[0] != "corr-caller-completed" {
+			t.Errorf("expected the caller's slip to be the repave successor, got %v", store.RepaveSuccessorCalls)
+		}
+		if _, ok := store.Slips["corr-caller-completed"]; !ok {
+			t.Error("the caller's successor must be persisted by the backstop's repave")
+		}
+	})
+
+	t.Run("duplicate-create backstop - ended conflicting row (failed) is repaved and retried", func(t *testing.T) {
+		// Same shape as the completed case above, but the conflicting row is
+		// SlipStatusFailed. Failed is non-terminal (IsTerminal()==false - a pipeline may
+		// still recover), so this specifically pins the `conflicting.Status !=
+		// SlipStatusFailed` half of the live-check conjunction: a mutant dropping just
+		// that half would see `!conflicting.Status.IsTerminal()` alone (true for
+		// failed) and wrongly treat this row as live, deduping onto it instead of
+		// repaving and retrying.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		conflicting := &Slip{
+			CorrelationID: "corr-conflict-failed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended-failed",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-caller-failed"] = conflicting
+		store.CreateErrorOnce["corr-caller-failed"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-failed",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-ended-failed",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-failed" {
+			t.Errorf("expected the caller's own new slip (not the conflicting one), got %+v", result.Slip)
+		}
+		foundRepave := false
+		for _, superseded := range store.RepaveCalls {
+			if superseded == "corr-conflict-failed" {
+				foundRepave = true
+			}
+		}
+		if !foundRepave {
+			t.Errorf(
+				"expected the failed conflicting row to be repaved, got Repave calls: %v",
+				store.RepaveCalls,
+			)
+		}
+		callerCreates := 0
+		for _, call := range store.CreateCalls {
+			if call.Slip.CorrelationID == "corr-caller-failed" {
+				callerCreates++
+			}
+		}
+		if callerCreates != 1 {
+			t.Errorf(
+				"expected one Create attempt (the failed one); the repave supplies the successor, got %d",
+				callerCreates,
+			)
+		}
+		if _, ok := store.Slips["corr-caller-failed"]; !ok {
+			t.Error("the caller's successor must be persisted by the backstop's repave")
+		}
+	})
+
+	t.Run("duplicate-create backstop - LoadByCommit returns (nil, nil) falls through to retry", func(t *testing.T) {
+		// Defensive-path coverage for handleDuplicateSlipBackstop's
+		// `loadErr != nil || conflicting == nil` guard. No known real store returns
+		// (nil, nil) from LoadByCommit - a miss always carries ErrSlipNotFound - but the
+		// guard is written to be safe against it anyway (DEVOPS-231). A mutant flipping
+		// `||` to `&&` would fail this exact input: (nil error, nil slip) makes the
+		// `&&` false, so the code would fall through to `conflicting.Status` and panic
+		// on the nil pointer instead of falling through to the caller's single retry.
+		//
+		// The hook is call-indexed (LoadByCommitNilOnCall = 2) because CreateSlipForPush's
+		// own initial lookup is LoadByCommit call 1. Call 1 is left to miss normally, so
+		// there is no row to repave and the push goes down the plain-create path; the
+		// duplicate on that Create is what invokes the backstop, whose own lookup is call 2.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.CreateErrorOnce["corr-caller-nilnil"] = ErrDuplicateSlip
+		store.LoadByCommitNilOnCall = 2
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-nilnil",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-nilnil",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-nilnil" {
+			t.Errorf("expected the caller's own new slip after the fall-through retry, got %+v", result.Slip)
+		}
+		// The guard must have sent the backstop down the fall-through path rather than the
+		// repave path: with no conflicting slip to name, nothing may be repaved.
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("a (nil, nil) lookup gives the backstop nothing to repave, got %v", store.RepaveCalls)
+		}
+		if len(store.LoadByCommitCalls) < 2 {
+			t.Errorf("expected the backstop to make its own LoadByCommit call, got %d total",
+				len(store.LoadByCommitCalls))
+		}
+		callerCreates := 0
+		for _, call := range store.CreateCalls {
+			if call.Slip.CorrelationID == "corr-caller-nilnil" {
+				callerCreates++
+			}
+		}
+		if callerCreates != 2 {
+			t.Errorf("expected the failed Create plus the fall-through retry, got %d", callerCreates)
+		}
+	})
+
+	t.Run("B1: repave returns ErrSlipWentLive - dedups onto the (reloaded) live slip, no create", func(t *testing.T) {
+		// The slip went live between the repave decision (existingSlip.Status was
+		// ended) and the Repave call (e.g. executor.go's recovery branch flipped
+		// it back to in_progress). Repave's status guard rejects the replacement and
+		// returns ErrSlipWentLive, having written nothing. Creating a fresh slip here
+		// would produce two competing live runs for the same commit (nothing at the DB
+		// level stops that pre-index). The repave must be abandoned and treated exactly
+		// like the live-reuse case: dedup onto the slip, reloaded so the returned copy
+		// reflects its current (live) state.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-went-live",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-went-live",
+			Status:        SlipStatusFailed, // ended at decision time
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		// Simulate the slip transitioning to live in the window between the repave
+		// decision (the LoadByCommit above sees it as Failed/ended) and the
+		// Repave call: RepaveWentLiveStatus mutates the stored row's status
+		// at the moment Repave is invoked, so the code's reload-after-error
+		// observes the new state rather than the stale decision-time snapshot.
+		store.RepaveError = ErrSlipWentLive
+		store.RepaveWentLiveStatus = map[string]SlipStatus{"corr-went-live": SlipStatusInProgress}
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-would-be-fresh",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-went-live",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-went-live" {
+			t.Errorf("expected dedup onto the now-live slip corr-went-live, got %+v", result.Slip)
+		}
+		if result.Slip.Status != SlipStatusInProgress {
+			t.Errorf("expected the returned slip to reflect its reloaded live status, got %s", result.Slip.Status)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("must not create a fresh slip when the existing one went live, got %d Create calls",
+				len(store.CreateCalls))
+		}
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true (dedup onto a pre-existing slip)")
+		}
+	})
+
+	t.Run(
+		"B2: repave delete returns ErrRepaveUnsupported - falls back to AbandonSlip, fresh slip still created",
+		func(t *testing.T) {
+			// ClickHouse-backed stores implement no delete path (DEVOPS-127: Postgres is
+			// the operational slip store). NewClient still builds a ClickHouseStore
+			// unconditionally, so a CH-backed client's repave attempts hit this on every
+			// same-commit push. The fallback restores the pre-DEVOPS-231 behavior:
+			// abandon the superseded slip instead of repaving it, then still create the
+			// fresh slip so the caller sees a new correlation_id and re-dispatches.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			config := testPipelineConfig()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: config})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-ch-old",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "ch-commit",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+			store.RepaveError = ErrRepaveUnsupported
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-ch-new",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "ch-commit",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-ch-new" {
+				t.Errorf("expected the fresh slip to still be created, got %+v", result.Slip)
+			}
+			if len(store.CreateCalls) != 1 {
+				t.Errorf("expected 1 Create call for the fresh slip, got %d", len(store.CreateCalls))
+			}
+			foundAbandon := false
+			for _, call := range store.UpdateSlipStatusCalls {
+				if call.CorrelationID == "corr-ch-old" && call.Status == SlipStatusAbandoned {
+					foundAbandon = true
+				}
+			}
+			if !foundAbandon {
+				t.Error("expected AbandonSlip fallback to mark the old slip abandoned")
+			}
+			// D3.3 (DEVOPS-231 review): zero warnings are expected on this successful-create
+			// path. AbandonSlip succeeds here (the old slip is Failed, not terminal), and this
+			// fallback fires on EVERY same-commit push against a ClickHouse-backed client -
+			// treating that as a Warning would misfire any consumer that alerts on
+			// len(result.Warnings) > 0 for what is a routine webhook redelivery. A Warning is
+			// only added when AbandonSlip itself fails (see the sibling "already terminal"
+			// and "abandon fails" subtests below).
+			if len(result.Warnings) != 0 {
+				t.Fatalf("expected 0 warnings for a successful create via the unsupported-repave fallback, got %d: %v",
+					len(result.Warnings), result.Warnings)
+			}
+		},
+	)
+
+	t.Run("D3.3: repave fallback on unsupported store - already-terminal slip is not falsely claimed abandoned",
+		func(t *testing.T) {
+			// AbandonSlip's checkTerminalStatus (client.go) silently no-ops for an
+			// already-terminal slip. LoadByCommit's unfiltered lookup means exactly these
+			// rows reach this fallback (a terminal existing slip is repaved just like a
+			// failed one). Before D3.3, the fallback unconditionally claimed "abandoned
+			// instead" and always added a warning, even though nothing changed here.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-ch-terminal",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "ch-commit-terminal",
+				Status:        SlipStatusCompleted, // already terminal: AbandonSlip would no-op
+				Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+			store.RepaveError = ErrRepaveUnsupported
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-ch-new-terminal",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "ch-commit-terminal",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-ch-new-terminal" {
+				t.Errorf("expected the fresh slip to still be created, got %+v", result.Slip)
+			}
+			for _, call := range store.UpdateSlipStatusCalls {
+				if call.CorrelationID == "corr-ch-terminal" {
+					t.Errorf("AbandonSlip must not be invoked on an already-terminal slip "+
+						"(it would silently no-op); got status update call %+v", call)
+				}
+			}
+			if len(result.Warnings) != 0 {
+				t.Errorf("expected no warnings for the routine ClickHouse unsupported-repave case, got %d: %v",
+					len(result.Warnings), result.Warnings)
+			}
+		})
+
+	t.Run("D3.3: repave fallback on unsupported store - AbandonSlip failure is still surfaced as a warning",
+		func(t *testing.T) {
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-ch-abandon-fail",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "ch-commit-abandon-fail",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+			store.RepaveError = ErrRepaveUnsupported
+			store.UpdateSlipStatusError = errors.New("store unavailable")
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-ch-new-abandon-fail",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "ch-commit-abandon-fail",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-ch-new-abandon-fail" {
+				t.Errorf("expected the fresh slip to still be created, got %+v", result.Slip)
+			}
+			if len(result.Warnings) != 1 {
+				t.Fatalf("expected exactly 1 warning (the genuine abandon failure), got %d: %v",
+					len(result.Warnings), result.Warnings)
+			}
+			if !strings.Contains(result.Warnings[0].Error(), "failed to abandon") {
+				t.Errorf("expected a warning recording the AbandonSlip failure, got: %v", result.Warnings[0])
+			}
+		})
+
+	t.Run("D3.3: repave log only claims a repave after the delete actually succeeds", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		logs := &capturingLogger{}
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig(), Logger: logs})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-ch-log-unsupported",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "ch-commit-log",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.RepaveError = ErrRepaveUnsupported
+
+		_, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-ch-log-new",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "ch-commit-log",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		for _, call := range logs.calls {
+			if strings.Contains(call.message, "delete + recreate") {
+				t.Errorf("must not claim a repave (delete + recreate) happened when the "+
+					"store rejected the delete; got log: %+v", call)
+			}
+		}
+	})
+
+	t.Run("D3.3: repave log fires only once the delete actually succeeds", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		logs := &capturingLogger{}
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig(), Logger: logs})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-ch-log-success",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "ch-commit-log-ok",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		_, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-ch-log-new-ok",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "ch-commit-log-ok",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		found := false
+		for _, call := range logs.calls {
+			if strings.Contains(call.message, "Repaved") {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("expected a 'Repaved' log after a successful repave delete")
+		}
+	})
+
+	t.Run("B4: LoadByCommit fails with a non-not-found error - returns the error, does not create", func(t *testing.T) {
+		// A DB timeout or connection-refused error must not be treated as "no
+		// existing slip" - that would let Create insert a second row while a LIVE
+		// slip for this commit might already exist, and the caller would fully
+		// re-dispatch a build that's already running. Failing the message (so Kafka
+		// redelivers) is safer than guessing.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{})
+		store.LoadByCommitError = errors.New("connection refused")
+
+		_, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-lookup-fail",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-lookup-fail",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err == nil {
+			t.Fatal("expected an error from the non-not-found LoadByCommit failure")
+		}
+		if !strings.Contains(err.Error(), "connection refused") {
+			t.Errorf("expected the underlying error to be wrapped, got: %v", err)
+		}
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("expected no Create call on lookup failure, got %d", len(store.CreateCalls))
+		}
+	})
+
+	t.Run("B5: duplicate-create backstop applies the empty-run guard - dedups without deleting", func(t *testing.T) {
+		// The backstop used to omit the empty-run guard the main path applies,
+		// diverging on identical inputs: a componentless push racing into the
+		// backstop against an ended conflicting row would repave (delete) it, even
+		// though nothing would be dispatched and the main path would have returned
+		// the existing slip untouched. Fixed by applying the same guard at both
+		// sites.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		conflicting := &Slip{
+			CorrelationID: "corr-conflict-empty-run",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-empty-run",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.SeedOnCreate["corr-caller-empty"] = conflicting
+		store.CreateErrorOnce["corr-caller-empty"] = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-caller-empty",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-backstop-empty-run",
+			Components:    nil, // componentless push
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip == nil || result.Slip.CorrelationID != "corr-conflict-empty-run" {
+			t.Errorf("expected dedup onto the conflicting slip, got %+v", result.Slip)
+		}
+		for _, superseded := range store.RepaveCalls {
+			if superseded == "corr-conflict-empty-run" {
+				t.Errorf("componentless push must not repave the conflicting slip, got Repave calls: %v",
+					store.RepaveCalls)
+			}
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected exactly one Create attempt (no retry after dedup), got %d", len(store.CreateCalls))
+		}
+		if !result.AncestryResolved {
+			t.Error("expected AncestryResolved=true (dedup onto a pre-existing slip)")
+		}
+	})
+
+	t.Run(
+		"D3.1: duplicate-create backstop - conflicting repave returns ErrSlipWentLive - dedups onto reloaded live slip",
+		func(t *testing.T) {
+			// Before D3.1, handleDuplicateSlipBackstop treated EVERY repave error as
+			// fatal, including the two sentinels its own doc comment claims it handles
+			// "exactly like the main path". Post-Phase-B, a lost insert race whose
+			// conflicting row goes live between the backstop's decision and its repave
+			// would fail the WHOLE message instead of deduping onto the live run - the
+			// exact outcome the main path's went-live branch (repaveExistingSlip) exists
+			// to avoid.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			conflicting := &Slip{
+				CorrelationID: "corr-conflict-went-live",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-backstop-went-live",
+				Status:        SlipStatusFailed, // ended at the backstop's decision time
+				Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{},
+			}
+			store.SeedOnCreate["corr-caller-went-live"] = conflicting
+			store.CreateErrorOnce["corr-caller-went-live"] = ErrDuplicateSlip
+			store.RepaveError = ErrSlipWentLive
+			store.RepaveWentLiveStatus = map[string]SlipStatus{"corr-conflict-went-live": SlipStatusInProgress}
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-caller-went-live",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-backstop-went-live",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-conflict-went-live" {
+				t.Errorf("expected dedup onto the now-live conflicting slip, got %+v", result.Slip)
+			}
+			if result.Slip.Status != SlipStatusInProgress {
+				t.Errorf("expected the returned slip to reflect its reloaded live status, got %s", result.Slip.Status)
+			}
+			callerCreates := 0
+			for _, call := range store.CreateCalls {
+				if call.Slip.CorrelationID == "corr-caller-went-live" {
+					callerCreates++
+				}
+			}
+			if callerCreates != 1 {
+				t.Errorf("expected exactly 1 Create attempt for the caller (the failed one; no retry "+
+					"after the went-live dedup), got %d", callerCreates)
+			}
+		},
+	)
+
+	t.Run("D3.1: duplicate-create backstop - conflicting delete returns ErrRepaveUnsupported - abandons and continues",
+		func(t *testing.T) {
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			conflicting := &Slip{
+				CorrelationID: "corr-conflict-ch",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-backstop-ch",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{},
+			}
+			store.SeedOnCreate["corr-caller-ch"] = conflicting
+			store.CreateErrorOnce["corr-caller-ch"] = ErrDuplicateSlip
+			store.RepaveError = ErrRepaveUnsupported
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-caller-ch",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-backstop-ch",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-caller-ch" {
+				t.Errorf("expected the caller's own fresh slip after the unsupported-delete fallback, got %+v",
+					result.Slip)
+			}
+			foundAbandon := false
+			for _, call := range store.UpdateSlipStatusCalls {
+				if call.CorrelationID == "corr-conflict-ch" && call.Status == SlipStatusAbandoned {
+					foundAbandon = true
+				}
+			}
+			if !foundAbandon {
+				t.Error("expected AbandonSlip fallback to mark the conflicting slip abandoned")
+			}
+			callerCreates := 0
+			for _, call := range store.CreateCalls {
+				if call.Slip.CorrelationID == "corr-caller-ch" {
+					callerCreates++
+				}
+			}
+			if callerCreates != 2 {
+				t.Errorf("expected exactly two Create attempts (failed first + retry after abandon fallback), got %d",
+					callerCreates)
+			}
+		})
+
+	t.Run("D3.2: repave delete returns ErrSlipWentLive - routes through handlePushRetry for audit trail",
+		func(t *testing.T) {
+			// Before D3.2, the went-live abort dedup skipped handlePushRetry entirely, so
+			// there was no push_parsed reset and no "retry detected" history entry - no
+			// audit record that a second push arrived, unlike the real IsLive() path.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-went-live-retry",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-went-live-retry",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+			store.RepaveError = ErrSlipWentLive
+			store.RepaveWentLiveStatus = map[string]SlipStatus{"corr-went-live-retry": SlipStatusInProgress}
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-would-be-fresh-2",
+				Repository:    "owner/repo",
+				Branch:        "integration",
+				CommitSHA:     "sha-went-live-retry",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-went-live-retry" {
+				t.Fatalf("expected dedup onto corr-went-live-retry, got %+v", result.Slip)
+			}
+			if store.UpdateStepWithHistoryCallCount != 1 {
+				t.Errorf("expected exactly 1 atomic UpdateStepWithHistory call for the push_parsed retry reset, got %d",
+					store.UpdateStepWithHistoryCallCount)
+			}
+			foundRetryEntry := false
+			for _, entry := range result.Slip.StateHistory {
+				if entry.Step == "push_parsed" && strings.Contains(entry.Message, "retry detected") {
+					foundRetryEntry = true
+				}
+			}
+			if !foundRetryEntry {
+				t.Error(
+					"expected a 'retry detected' state history entry after went-live dedup, matching the IsLive() case",
+				)
+			}
+		})
+
+	t.Run("D3.2: went-live abort must not clobber AncestryResolved when resolution ran and failed", func(t *testing.T) {
+		// Before D3.2, this path forced AncestryResolved = true unconditionally, even
+		// though resolveAndAbandonAncestors already ran (and failed) for this push before
+		// the repave delete was ever attempted - clobbering the accurate false while
+		// Warnings still holds the ancestry error, contradicting AncestryResolved's
+		// documented meaning.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-went-live-ancestry",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-went-live-ancestry",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		github.GetCommitAncestryError = errors.New("github unavailable")
+		store.RepaveError = ErrSlipWentLive
+		store.RepaveWentLiveStatus = map[string]SlipStatus{"corr-went-live-ancestry": SlipStatusInProgress}
+
+		result, err := client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: "corr-would-be-fresh-3",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-went-live-ancestry",
+			Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(result.Warnings) == 0 {
+			t.Fatal("expected an ancestry-resolution warning to be recorded")
+		}
+		if result.AncestryResolved {
+			t.Error("expected AncestryResolved=false: ancestry resolution ran and failed (Warnings is " +
+				"non-empty), so the went-live dedup must preserve that, not force true")
+		}
+	})
+
+	t.Run("D3.4: FF-merge self-ancestor - squash-merge fallback must not select the pushed commit's own ended slip",
+		func(t *testing.T) {
+			// Verified chain (D3.4): push of SHA X whose message references PR #N where
+			// GetPRHeadCommit(#N) == X (a fast-forward merge keeps the head SHA); an ended
+			// slip exists for (repo, X); no ancestors within search depth (the git-history
+			// search skips X itself, so only the squash-merge fallback can find it, since
+			// findSlipsInPRBranchHistory deliberately includes the head commit). Without
+			// the guard, the fallback selects the existing (repo, X) slip as its own
+			// "ancestor": PromoteSlip would promote it, repaveExistingSlip then deletes it
+			// (same commit, ended -> repaved), and InsertAncestryLink would write the
+			// newborn slip's parent pointing at the row just deleted - a dangling
+			// self-reference from birth.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-ff-self",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "sha-ff-self",
+				Status:        SlipStatusCompleted, // ended
+				Steps:         map[string]Step{"builds": {Status: StepStatusCompleted}},
+				StateHistory:  []StateHistoryEntry{},
+			})
+			// No ancestor commits at all: the git-history search must find nothing (it
+			// skips the pushed commit itself), so only the squash-merge fallback can
+			// surface a candidate.
+			github.SetAncestry("owner", "repo", "sha-ff-self", []string{"sha-ff-self"})
+			github.SetPRHeadCommit("owner", "repo", 55, "sha-ff-self") // FF merge: head == pushed commit
+
+			result, err := client.CreateSlipForPush(ctx, PushOptions{
+				CorrelationID: "corr-ff-new",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "sha-ff-self",
+				CommitMessage: "Merge pull request #55 from owner/feature",
+				Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result.Slip == nil || result.Slip.CorrelationID != "corr-ff-new" {
+				t.Fatalf("expected the fresh repaved slip, got %+v", result.Slip)
+			}
+			for _, entry := range result.Slip.Ancestry {
+				if entry.CorrelationID == "corr-ff-self" {
+					t.Errorf("must not record the just-repaved same-commit slip as its own ancestor, got ancestry: %+v",
+						result.Slip.Ancestry)
+				}
+			}
+			if _, ok := store.Slips["corr-ff-self"]; ok {
+				t.Error("expected the old same-commit slip to be repaved (deleted)")
+			}
+		})
+}
+
+func TestDropSelfAncestorLink(t *testing.T) {
+	t.Run("drops the entry matching repavedCorrelationID", func(t *testing.T) {
+		ancestry := []AncestryEntry{
+			{CorrelationID: "corr-parent-real", CommitSHA: "sha-parent"},
+		}
+		filtered := dropSelfAncestorLink(ancestry, "corr-parent-real")
+		if len(filtered) != 0 {
+			t.Errorf("expected the self-referential entry to be dropped, got %+v", filtered)
+		}
+	})
+
+	t.Run("does not drop unrelated entries", func(t *testing.T) {
+		ancestry := []AncestryEntry{
+			{CorrelationID: "corr-parent-real", CommitSHA: "sha-parent"},
+		}
+		filtered := dropSelfAncestorLink(ancestry, "corr-something-else")
+		if len(filtered) != 1 {
+			t.Errorf("must not drop unrelated ancestry entries, got %+v", filtered)
+		}
+	})
+
+	t.Run("nil ancestry in, nil out", func(t *testing.T) {
+		if got := dropSelfAncestorLink(nil, "corr-x"); got != nil {
+			t.Errorf("expected nil in, nil out, got %+v", got)
+		}
+	})
+
+	t.Run("empty repavedCorrelationID is a no-op", func(t *testing.T) {
+		ancestry := []AncestryEntry{{CorrelationID: "corr-parent-real"}}
+		filtered := dropSelfAncestorLink(ancestry, "")
+		if len(filtered) != 1 {
+			t.Errorf("expected no filtering with an empty repavedCorrelationID, got %+v", filtered)
+		}
+	})
+
+	t.Run("drops only the matching entry among several", func(t *testing.T) {
+		ancestry := []AncestryEntry{
+			{CorrelationID: "corr-a"},
+			{CorrelationID: "corr-self"},
+			{CorrelationID: "corr-b"},
+		}
+		filtered := dropSelfAncestorLink(ancestry, "corr-self")
+		if len(filtered) != 2 {
+			t.Fatalf("expected 2 remaining entries, got %d: %+v", len(filtered), filtered)
+		}
+		for _, e := range filtered {
+			if e.CorrelationID == "corr-self" {
+				t.Errorf("self-referential entry must be dropped, got %+v", filtered)
+			}
 		}
 	})
 }
@@ -1630,6 +3279,356 @@ func TestClient_findAncestorSlipsWithProgressiveDepth(t *testing.T) {
 	})
 }
 
+// TestClient_CreateSlipForPush_DuplicateBackstopFailurePaths covers the two ways the
+// fresh-create path can still fail after a duplicate: the backstop itself failing fatally,
+// and the post-backstop retry failing. Both must surface as errors so Kafka redelivers,
+// never as a success reporting a slip that was not written.
+func TestClient_CreateSlipForPush_DuplicateBackstopFailurePaths(t *testing.T) {
+	ctx := context.Background()
+
+	opts := PushOptions{
+		CorrelationID: "corr-caller",
+		Repository:    "owner/repo",
+		Branch:        "integration",
+		CommitSHA:     "sha-dup",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	}
+
+	t.Run("backstop repave fails fatally", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		// The conflicting row appears at Create time (the lost-race shape), is ended, and
+		// the backstop's repave of it fails with a non-sentinel error.
+		store.SeedOnCreate["corr-caller"] = &Slip{
+			CorrelationID: "corr-conflict",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-dup",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{},
+			StateHistory:  []StateHistoryEntry{},
+		}
+		store.CreateErrorOnce["corr-caller"] = ErrDuplicateSlip
+		store.RepaveError = errors.New("postgres unavailable")
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected a fatal backstop failure to fail the push")
+		}
+		if !strings.Contains(err.Error(), "postgres unavailable") {
+			t.Errorf("expected the underlying store error to be wrapped, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+	})
+
+	t.Run("retry after the backstop falls through also fails", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		// First Create reports the duplicate; the backstop finds no conflicting row (its
+		// own LoadByCommit misses), so it falls through to the single retry — which fails.
+		store.CreateErrorOnce["corr-caller"] = ErrDuplicateSlip
+		store.CreateErrorFor["corr-caller"] = errors.New("still conflicting")
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected the failed retry to fail the push")
+		}
+		if !strings.Contains(err.Error(), "after duplicate backstop") {
+			t.Errorf("expected the error to identify the post-backstop retry, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+		if len(store.AncestryLinkCalls) != 0 {
+			t.Error("no link may be written when the slip itself was never created")
+		}
+	})
+}
+
+// TestClient_CreateSlipForPush_RepaveDuplicateBackstop covers the repave path's own
+// ErrDuplicateSlip branch. It is dormant until Phase B's unique index exists, but it is
+// reachable after that through the concurrent same-commit push the feature exists for: two
+// pushes repave the same row, the loser's guarded delete finds the row already gone (the
+// winner committed), so the loser proceeds to insert its own successor and conflicts with
+// the winner's on uq_routing_slips_repo_sha. Both failure exits are exercised here so the
+// branch is not merely executed.
+func TestClient_CreateSlipForPush_RepaveDuplicateBackstop(t *testing.T) {
+	ctx := context.Background()
+
+	opts := PushOptions{
+		CorrelationID: "corr-loser",
+		Repository:    "owner/repo",
+		Branch:        "integration",
+		CommitSHA:     "sha-raced",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	}
+
+	// An ended row for the pushed commit, so the push takes the repave path rather than
+	// the plain-create path.
+	seedEndedRow := func(store *MockStore) {
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-superseded",
+			Repository:    "owner/repo",
+			Branch:        "integration",
+			CommitSHA:     "sha-raced",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+	}
+
+	t.Run("backstop failure propagates", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+		seedEndedRow(store)
+
+		// Every Repave reports the duplicate: the push's own, and the backstop's attempt on
+		// the conflicting row it finds. The latter is fatal inside the backstop, and that
+		// error must reach the caller rather than be swallowed.
+		store.RepaveError = ErrDuplicateSlip
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected the backstop's fatal repave failure to fail the push")
+		}
+		if !strings.Contains(err.Error(), "conflicting slip") {
+			t.Errorf("expected the backstop's error to propagate, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+	})
+
+	t.Run("retry after the backstop falls through also fails", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+		seedEndedRow(store)
+
+		store.RepaveError = ErrDuplicateSlip
+		// Force the backstop's own lookup (LoadByCommit call 2; call 1 is
+		// CreateSlipForPush's initial one) to find nothing, so the backstop falls through
+		// with handled=false instead of deduping — leaving the single retry, which fails.
+		store.LoadByCommitNilOnCall = 2
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err == nil {
+			t.Fatal("expected the failed post-backstop retry to fail the push")
+		}
+		if !strings.Contains(err.Error(), "after duplicate backstop") {
+			t.Errorf("expected the error to identify the post-backstop retry, got %v", err)
+		}
+		if result != nil {
+			t.Errorf("expected no result alongside the error, got %+v", result)
+		}
+		// Convergence: nothing was written, so the superseded row is still there for the
+		// redelivery to repave.
+		if _, ok := store.Slips["corr-superseded"]; !ok {
+			t.Error("the superseded row must survive so a redelivery can converge")
+		}
+		if _, ok := store.Slips["corr-loser"]; ok {
+			t.Error("no successor may be left behind")
+		}
+	})
+}
+
+// TestClient_CreateSlipForPush_LinkWriteRouting pins WHERE the successor's direct-parent
+// link is written, which the transactional Repave changes. On the fresh-create path the link
+// is a separate, best-effort store call; on the repave path it is handed to Repave so it
+// lands in the same transaction as the successor's row and can never be left missing.
+//
+// This is only assertable because MockStore.InsertAncestryLink now records its calls; while
+// it was a bare `return nil`, no test could tell whether a link had been written at all.
+func TestClient_CreateSlipForPush_LinkWriteRouting(t *testing.T) {
+	ctx := context.Background()
+
+	// A commit whose parent GitHub will report, so resolveAndAbandonAncestors produces an
+	// ancestry entry for the push to hand onward.
+	newClientWithAncestor := func(store *MockStore) *Client {
+		github := NewMockGitHubAPI()
+		github.Ancestry["owner/repo:sha-child"] = []string{"sha-child", "sha-ancestor"}
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-ancestor",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-ancestor",
+			Status:        SlipStatusCompleted,
+			Steps:         map[string]Step{},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		return NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+	}
+
+	opts := PushOptions{
+		CorrelationID: "corr-child-new",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-child",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	}
+
+	t.Run("fresh create writes the link as a separate store call", func(t *testing.T) {
+		store := NewMockStore()
+		client := newClientWithAncestor(store)
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(store.RepaveCalls) != 0 {
+			t.Errorf("no row existed for this commit, so nothing should be repaved: %v", store.RepaveCalls)
+		}
+		if len(store.AncestryLinkCalls) != 1 {
+			t.Fatalf("expected one non-transactional link write, got %d", len(store.AncestryLinkCalls))
+		}
+		link := store.AncestryLinkCalls[0]
+		if link.Slip.CorrelationID != "corr-child-new" {
+			t.Errorf("expected the link to be keyed on the new slip, got %s", link.Slip.CorrelationID)
+		}
+		if link.Parent.CorrelationID != "corr-ancestor" {
+			t.Errorf("expected the resolved ancestor as parent, got %s", link.Parent.CorrelationID)
+		}
+		if result.Slip.CorrelationID != "corr-child-new" {
+			t.Errorf("expected the fresh slip, got %s", result.Slip.CorrelationID)
+		}
+	})
+
+	t.Run("fresh create records a link failure as a warning, not a push failure", func(t *testing.T) {
+		// The slip exists and CI can run; only the lineage hop is missing. Failing the
+		// push here would be a regression against pre-DEVOPS-231 behavior.
+		store := NewMockStore()
+		client := newClientWithAncestor(store)
+		store.AncestryLinkError = errors.New("ancestry table unavailable")
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err != nil {
+			t.Fatalf("a link failure on the fresh path must not fail the push: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-child-new" {
+			t.Errorf("expected the fresh slip, got %s", result.Slip.CorrelationID)
+		}
+		foundWarning := false
+		for _, w := range result.Warnings {
+			if strings.Contains(w.Error(), "ancestry table unavailable") {
+				foundWarning = true
+			}
+		}
+		if !foundWarning {
+			t.Errorf("expected the link failure to surface as a warning, got %v", result.Warnings)
+		}
+	})
+
+	t.Run("repave hands the link to the store instead of writing it separately", func(t *testing.T) {
+		store := NewMockStore()
+		client := newClientWithAncestor(store)
+		// An ended row for the pushed commit, so this push repaves rather than creates.
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-child-old",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-child",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(store.RepaveCalls) != 1 || store.RepaveCalls[0] != "corr-child-old" {
+			t.Fatalf("expected the ended row to be repaved, got %v", store.RepaveCalls)
+		}
+		// The link must travel INTO Repave — that is what puts it in the same transaction
+		// as the successor's row.
+		if len(store.RepaveParents) != 1 || store.RepaveParents[0] == nil {
+			t.Fatalf("expected the resolved parent to be handed to Repave, got %v", store.RepaveParents)
+		}
+		if store.RepaveParents[0].CorrelationID != "corr-ancestor" {
+			t.Errorf("expected the resolved ancestor as the repave parent, got %s",
+				store.RepaveParents[0].CorrelationID)
+		}
+		// ...and must NOT also be written as a separate, non-transactional call.
+		if len(store.AncestryLinkCalls) != 0 {
+			t.Errorf("a repave must not write the link outside its transaction, got %v", store.AncestryLinkCalls)
+		}
+		if result.Slip.CorrelationID != "corr-child-new" {
+			t.Errorf("expected the successor, got %s", result.Slip.CorrelationID)
+		}
+	})
+
+	t.Run("repave passes a nil parent when this push resolved no ancestry", func(t *testing.T) {
+		// nil is meaningful, not merely absent: it tells the store to carry the superseded
+		// run's OWN parent link forward rather than destroy the lineage hop with its row.
+		// A GitHub outage is exactly this case, and it must reach the store as nil rather
+		// than as a fabricated entry.
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		github.GetCommitAncestryError = errors.New("github unavailable")
+		client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-child-old",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-child",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+
+		if _, err := client.CreateSlipForPush(ctx, opts); err != nil {
+			t.Fatalf("an ancestry-resolution failure must not fail the push: %v", err)
+		}
+		if len(store.RepaveParents) != 1 {
+			t.Fatalf("expected one repave, got %v", store.RepaveParents)
+		}
+		if store.RepaveParents[0] != nil {
+			t.Errorf("expected a nil parent so the store carries the old link forward, got %+v",
+				store.RepaveParents[0])
+		}
+	})
+
+	t.Run("unsupported repave falls back to create plus a separate link write", func(t *testing.T) {
+		// A ClickHouse-backed client cannot repave, so it abandons the superseded slip and
+		// then takes the fresh-create path — including that path's separate link write,
+		// since there is no transaction to put it in.
+		store := NewMockStore()
+		client := newClientWithAncestor(store)
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-child-old",
+			Repository:    "owner/repo",
+			Branch:        "main",
+			CommitSHA:     "sha-child",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory:  []StateHistoryEntry{},
+		})
+		store.RepaveError = ErrRepaveUnsupported
+
+		result, err := client.CreateSlipForPush(ctx, opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if result.Slip.CorrelationID != "corr-child-new" {
+			t.Errorf("expected the fresh slip, got %s", result.Slip.CorrelationID)
+		}
+		if len(store.CreateCalls) != 1 {
+			t.Errorf("expected the fallback to Create, got %d calls", len(store.CreateCalls))
+		}
+		if len(store.AncestryLinkCalls) != 1 {
+			t.Errorf("expected the fallback to write the link separately, got %d", len(store.AncestryLinkCalls))
+		}
+	})
+}
+
 func TestExtractPRNumber(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -1806,7 +3805,6 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-feature"] = featureSlip
-		store.CommitIndex["owner/repo:feature-commit-sha"] = "corr-feature"
 
 		// Set up PR head commit lookup and its ancestry
 		github.SetPRHeadCommit("owner", "repo", 42, "feature-commit-sha")
@@ -1854,7 +3852,6 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-feature"] = featureSlip
-		store.CommitIndex["owner/repo:earlier-commit-sha"] = "corr-feature"
 
 		// PR head is a non-slip commit (e.g., docs change) that comes after the slip commit
 		github.SetPRHeadCommit("owner", "repo", 99, "docs-commit-sha")
@@ -1962,7 +3959,6 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-feature"] = featureSlip
-		store.CommitIndex["owner/repo:feature-sha"] = "corr-feature"
 
 		// First PR (#100) not found (use ErrorFor to be specific)
 		github.GetPRHeadCommitErrorFor = map[string]error{
@@ -1994,6 +3990,41 @@ func TestClient_FindAncestorViaSquashMerge(t *testing.T) {
 			t.Errorf("expected at least 2 GetPRHeadCommit calls, got %d", len(github.GetPRHeadCommitCalls))
 		}
 	})
+
+	t.Run("does not select the pushed commit's own ended slip as its ancestor (FF-merge self-reference, D3.4)",
+		func(t *testing.T) {
+			// A fast-forward (or otherwise no-op) merge keeps the PR head SHA identical to
+			// the commit being pushed. findSlipsInPRBranchHistory deliberately includes
+			// the head commit in its search, so without the guard this would return the
+			// pushed commit's own ended slip as its "ancestor" - a self-reference.
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{})
+
+			selfSlip := &Slip{
+				CorrelationID: "corr-self",
+				Repository:    "owner/repo",
+				CommitSHA:     "sha-x",
+				Status:        SlipStatusCompleted,
+			}
+			store.Slips["corr-self"] = selfSlip
+
+			github.SetPRHeadCommit("owner", "repo", 7, "sha-x") // FF merge: PR head == pushed commit
+			github.SetAncestry("owner", "repo", "sha-x", []string{"sha-x"})
+
+			opts := PushOptions{
+				CorrelationID: "corr-merge-x",
+				Repository:    "owner/repo",
+				CommitSHA:     "sha-x", // same commit as the "ancestor" candidate
+				CommitMessage: "Merge pull request #7 from owner/feature",
+			}
+
+			_, found := client.findAncestorViaSquashMerge(ctx, "owner", "repo", opts)
+
+			if found {
+				t.Error("must not select the pushed commit's own slip as its ancestor (self-reference)")
+			}
+		})
 }
 
 func TestClient_PromoteSlip(t *testing.T) {
@@ -2399,7 +4430,6 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			CreatedAt:     time.Now().Add(-1 * time.Hour),
 		}
 		store.Slips["corr-feature-branch"] = featureSlip
-		store.CommitIndex["owner/repo:feature-head-sha"] = "corr-feature-branch"
 
 		// Set up PR head commit lookup (no git ancestry - simulates squash merge)
 		github.SetPRHeadCommit("owner", "repo", 77, "feature-head-sha")
@@ -2465,7 +4495,6 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			CreatedAt:     time.Now().Add(-1 * time.Hour),
 		}
 		store.Slips["corr-ancestor"] = ancestorSlip
-		store.CommitIndex["owner/repo:parent-sha"] = "corr-ancestor"
 
 		// Set up git ancestry
 		github.SetAncestry("owner", "repo", "child-sha", []string{"child-sha", "parent-sha"})
@@ -2498,4 +4527,70 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 			t.Errorf("expected ancestor slip status 'abandoned', got '%s'", abandonedSlip.Status)
 		}
 	})
+}
+
+// TestClient_CreateSlipForPush_BackstopResetLeavesAMarker pins that the duplicate-create
+// backstop's self-correlation arm records a prior attempt the same way the main path's reset arm
+// does.
+//
+// push.go asserts in two places that the two paths "converge on the same outcome for the same
+// inputs" (the backstop's own comment, and the reset arm's). The state-history marker is the one
+// observable added specifically to make an in-place reset legible: Create upserts state_history
+// with every other non-PK column, so without a marker the row carries a single seed entry and an
+// operator cannot tell a first attempt from a reset one — and unlike the repave path, the
+// correlation ID does not change either, so there is nothing else to go on.
+//
+// Dormant in Phase A (ErrDuplicateSlip needs uq_routing_slips_repo_sha), which is exactly why it
+// needs a test: nothing exercises this arm in production yet.
+func TestClient_CreateSlipForPush_BackstopResetLeavesAMarker(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	github := NewMockGitHubAPI()
+	client := NewClientWithDependencies(store, github, Config{PipelineConfig: testPipelineConfig()})
+
+	// The conflicting row carries THIS push's correlation ID - the self-referential shape that
+	// routes to the in-place reset instead of a repave.
+	store.CreateErrorOnce["corr-self-reset"] = ErrDuplicateSlip
+	store.SeedOnCreate["corr-self-reset"] = &Slip{
+		CorrelationID: "corr-self-reset",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-reset",
+		Status:        SlipStatusCompleted,
+	}
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-self-reset",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-reset",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Slip == nil || result.Slip.CorrelationID != "corr-self-reset" {
+		t.Fatalf("expected the caller's own slip back, got %+v", result.Slip)
+	}
+	if len(store.RepaveCalls) != 0 {
+		t.Errorf("a self-referential conflict must reset in place, not repave: %v", store.RepaveCalls)
+	}
+
+	stored, ok := store.Slips["corr-self-reset"]
+	if !ok {
+		t.Fatal("the reset slip must be persisted")
+	}
+	var marker string
+	for _, e := range stored.StateHistory {
+		if strings.Contains(e.Message, "reset in place after") {
+			marker = e.Message
+		}
+	}
+	if marker == "" {
+		t.Fatalf("the backstop's in-place reset must record a prior attempt the way the main "+
+			"path does; history was %+v", stored.StateHistory)
+	}
+	if !strings.Contains(marker, string(SlipStatusCompleted)) {
+		t.Errorf("the marker must name the prior attempt's status, got %q", marker)
+	}
 }

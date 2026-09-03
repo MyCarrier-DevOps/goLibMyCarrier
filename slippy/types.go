@@ -113,10 +113,28 @@ type AncestryEntry struct {
 	// CommitSHA is the git commit SHA of the ancestor slip
 	CommitSHA string `json:"commit_sha"`
 
-	// Status is the final status of the ancestor slip (failed, completed, abandoned)
+	// Status is the status of the ancestor slip as of when this link was written. It is a
+	// denormalized snapshot, not a live read, so it can lag the ancestor's current status.
+	//
+	// Across a repave (Repave, DEVOPS-231) the snapshot is kept internally consistent:
+	// when the ancestor referenced by CorrelationID is repaved, the repoint rewrites
+	// CorrelationID, Branch and Status together so all three describe the SUCCESSOR run,
+	// and clears FailedStep. That is possible because the successor's row is inserted in
+	// the same transaction as the repoint, so its status is known at repoint time.
+	// (Before Repave, the successor was created by a separate later call, so the repoint
+	// could only rewrite the id and left Status describing the deleted run — meaning the id
+	// and the status beside it named two different runs by construction.)
+	//
+	// A consumer that needs the ancestor's CURRENT status must still Load(CorrelationID):
+	// the snapshot is only accurate as of its last write, and the successor's status
+	// advances from pending as its pipeline runs.
 	Status SlipStatus `json:"status"`
 
-	// FailedStep is the step that failed (if Status is failed)
+	// FailedStep is the step that failed (if Status is failed). Repave's repoint clears
+	// this to "" when the ancestor is repaved and CorrelationID moves to a successor — the
+	// pre-repave run's failed step would otherwise sit next to an id for a different
+	// (successor) run, which is unambiguously wrong. See Status above for the same
+	// repoint's effect on the rest of this denormalized snapshot.
 	FailedStep string `json:"failed_step,omitempty"`
 
 	// CreatedAt is when the ancestor slip was created
@@ -128,6 +146,12 @@ type AncestryEntry struct {
 
 	// Branch is the branch of the ancestor slip.
 	// Used for cross-branch ancestry traversal when parent is on a different branch.
+	//
+	// This is a join key, not a display field: ResolveAncestry's next hop selects on
+	// (repository, branch, correlation_id), so a Branch that does not match the run named
+	// by CorrelationID truncates the walk at this entry. Repave's repoint therefore
+	// rewrites Branch alongside CorrelationID — a cross-branch repave changes the branch,
+	// and leaving the superseded run's branch here silently cut the chain.
 	Branch string `json:"branch,omitempty"`
 }
 

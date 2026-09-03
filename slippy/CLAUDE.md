@@ -2,16 +2,105 @@
 
 This document provides guidance for AI-assisted development of the slippy routing slip library and its integrations.
 
-**State machine specification and validation instructions are in `.github/`:**
+**State machine specification and validation instructions are in the repo root's `.github/`
+(i.e. `<repo-root>/.github/`, not a `slippy/.github/`):**
 
 | File | Purpose |
 |------|---------|
 | `.github/STATE_MACHINE_V3.md` | Full specification: pipeline phases, consistency invariants (I1–I4), algorithm reference, validation checklist, and automated test coverage |
 | `.github/PROJECT_STATE.md` | Project history, known discrepancy table, and architectural decisions |
 
-**Before making any changes to this package, read `.github/STATE_MACHINE_V3.md` first.**
+**Before making any changes to this package, read the repo root's `.github/STATE_MACHINE_V3.md` first.**
 
 ---
+
+## Breaking changes
+
+**DEVOPS-231 added `Repave` to the exported `SlipStore` interface:**
+
+```go
+Repave(ctx context.Context, oldCorrelationID string, newSlip *Slip, parent *AncestryEntry) error
+```
+
+This is a compile-breaking change for any downstream consumer with its own
+`SlipStore` implementation — a `var _ slippy.SlipStore = (*fakeStore)(nil)` assertion
+now fails with "missing method Repave" until that method is added. This was a
+deliberate choice: a reviewer suggested a narrower optional interface asserted at the
+call site instead, so existing implementers would not need to change; we rejected
+that in favor of compile-time conformance for the operational store, and this repo
+already has a documented process for exactly this situation — see the **Slippy Bump
+Checklist** in slippy-api's `CLAUDE.md` ("Check if `slippy.SlipStore` interface
+gained new methods — update `mockSlipStore`"). Since every module in this repo
+releases at one shared version, bumping the dependency in a downstream consumer means
+following that checklist, not working around the interface.
+
+**Why `Repave` and not a plain `DeleteSlip`.** An earlier iteration of this work added
+`DeleteSlip(ctx, correlationID, successorCorrelationID string) error` and left the push
+path to call `Create` afterwards. That shape was never released, and it had a defect that
+no amount of ordering could fix: once the delete committed, a failure in the following
+`Create` left the commit with **no slip at all**, and the next Kafka redelivery found no
+row to repave and failed identically — forever. The producible trigger is ordinary deploy
+ordering: `slipColumns()` derives the INSERT column list from the pipeline config, so a
+config deployed ahead of the migration that adds its step's `_status` column makes every
+insert fail with Postgres 42703. `Repave` makes the replacement atomic, so that failure
+rolls back instead of destroying the run. Implementations MUST provide that atomicity.
+
+Folding the create into the store also closed four other defects structurally rather than
+by documentation: the successor's row is inserted **before** any descendant is repointed
+onto it (so no descendant can name a correlation ID that has no row — necessary but not
+sufficient for a foreign key on `slip_ancestry.parent_correlation_id`, and Phase B adds
+none; the full argument lives on `SlipStore.Repave` in `interfaces.go`); the superseded
+run's own parent link is
+carried forward when the caller resolved no ancestry, instead of being deleted and never
+replaced; the successor's identity is a `*Slip` the store itself writes rather than a
+caller-supplied ID string written into other slips' ancestry rows unvalidated; and the
+descendant repoint now rewrites the whole denormalized parent snapshot alongside the id, so
+a cross-branch repave no longer truncates `ResolveAncestry` at that hop. The column list is
+deliberately not repeated here — it is on `SlipStore.Repave` in `interfaces.go`, the contract
+every store implementation owes.
+
+**Consumer-visible contract change: `CreateSlipResult.AncestryResolved`.** It used to be
+computed as `len(slip.Ancestry) > 0` on the dedup paths, and no store hydrates `Slip.Ancestry`
+on load in production — so in practice it was **always false** for every dedup. It now
+describes this push's ancestry-resolution attempt, which means it is `true` on the reuse and
+empty-run-guard paths (nothing needed resolving) and preserves the computed value everywhere
+resolution actually ran. The new value is the correct one; the old formula was a bug. But
+slippy-api forwards this field verbatim in its `POST /v1/slips` response and as a span
+attribute, so **any dashboard or alert keyed on `ancestry_resolved` changes meaning across
+this version bump** and should be checked. Note also that slippy-api computes the same
+condemned `len(Ancestry) > 0` formula on one of its own paths, so the two dedup-reporting
+sites will disagree until that is updated too.
+
+**One behavioral reversal to be aware of:** a failed repave is now **fatal** to the push.
+The pre-`Repave` code logged a failed delete as a warning and created the slip anyway.
+That leniency only made sense while delete and create were separate calls; a failed
+`Repave` writes nothing, so there is no successor to report. The push fails, Kafka
+redelivers, and the redelivery converges because the superseded row is still there.
+
+Callers may also now observe two sentinel errors from this path: `ErrSlipWentLive` (the
+repave was rejected because the slip went live between the repave decision and the call —
+nothing was written, and the successor was NOT created) and `ErrRepaveUnsupported` (the
+store, e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
+abandon semantics, then create the successor separately). `Repave` can also return
+`ErrDuplicateSlip` once Phase B's unique index exists. See `errors.go` for full contracts.
+
+**DEVOPS-231 also removed the exported field `slippytest.MockStore.CommitIndex`.** The
+published double no longer keeps a `"repo:sha" -> correlation_id` map; its four commit
+lookups derive their answer from the stored rows instead (`rowsForCommit` plus `loadOrder`
+or `findOrder`, depending on which store query the method mirrors). No consumer in this
+workspace imports `slippytest` today, so nothing is known to break — but the field was
+exported, and any caller that seeded `store.CommitIndex[...]` alongside `AddSlip` fails to
+compile after this bump. Usually the fix is to delete the line.
+
+**The lookups also answer differently now, with no compile error to point at it.** A fixture
+holding more than one row for one `(repository, commit_sha)` used to get whichever was seeded
+last, and now gets the store's own ordering; and a row written straight into the exported
+`Slips` map used to be invisible to all four lookups and now participates in every one. So if a
+fixture deliberately pointed a commit at a row other than the newest, deleting the line does
+**not** preserve its behaviour — seed distinct `UpdatedAt` values instead.
+
+---
+
 
 ## Overview
 
@@ -19,7 +108,12 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ### Key Characteristics
 
-- **ClickHouse-backed persistence** for high-performance queries
+- **Postgres (`PostgresStore`) is the operational slip store** (since DEVOPS-127). `ClickHouseStore`
+  remains in the codebase and implements the same `SlipStore` interface, but is not the write path
+  for production slips — e.g. `ClickHouseStore.Repave` (`clickhouse_store.go`) unconditionally
+  returns an error wrapping the `ErrRepaveUnsupported` sentinel (see `errors.go`), signaling
+  callers to fall back to abandon semantics instead of repave. ClickHouse has neither a
+  delete path nor transactions, so it cannot offer `Repave`'s atomicity contract at all.
 - **Dynamic schema** generated from JSON pipeline configuration
 - **Pre-job/Post-job execution model** - bookend operations around existing jobs (does NOT wrap job execution)
 - **Correlation ID** is the single canonical identifier for a slip throughout its lifecycle
@@ -140,7 +234,19 @@ type SlipPushData struct {
 
 ## Environment Variables
 
-### Required for Slippy Operation
+**Postgres is the operational slip store (see Key Characteristics above), but slippy does
+NOT read Postgres connection settings itself.** `NewPostgresStore(pool, config, logger)`
+takes an already-built `*pgxpool.Pool` — the caller constructs and injects it. The tables
+below (`CLICKHOUSE_*`, `SLIPPY_*`) are consumed by `slippy.ConfigFromEnv()`/`NewClient`,
+the ClickHouse-backed path; they say nothing about how a deployment provisions Postgres.
+For that, see the sibling `goLibMyCarrier/postgres` module: it provides a
+`POSTGRES_*`-prefixed env config (`PostgresLoadConfig`: `POSTGRES_HOSTNAME`,
+`POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE`, `POSTGRES_PORT`,
+`POSTGRES_SSLMODE`, plus pool/timeout tunables) and a pooled session helper
+(`session.go`), mirroring this package's `clickhouse` config shape — the designed
+counterpart for building the pool a caller then passes to `NewPostgresStore`.
+
+### Required for Slippy Operation (ClickHouse-backed `NewClient` path only)
 
 | Variable | Description | Example |
 |----------|-------------|---------|
@@ -213,21 +319,26 @@ correlationID := result.Slip.CorrelationID
 ### Step Updates (Post-Job)
 
 ```go
-// Update step status using correlation ID
-err := client.UpdateStepStatus(ctx, correlationID, "unit_tests", slippy.StepStatusSuccess)
+// Update step status using correlation ID (componentName is "" for a pure pipeline step)
+err := client.UpdateStepWithStatus(ctx, correlationID, "unit_tests", "", slippy.StepStatusCompleted, "unit tests passed")
 
-// Update component-specific status
-err := client.UpdateComponentStatus(ctx, correlationID, "api", "build", slippy.StepStatusSuccess)
+// Wrappers around UpdateStepWithStatus for common transitions
+err := client.CompleteStep(ctx, correlationID, "unit_tests", "")
+err := client.FailStep(ctx, correlationID, "unit_tests", "", "assertion failure in TestFoo")
+err := client.StartStep(ctx, correlationID, "unit_tests", "")
+
+// Update component-specific status (componentName is the component, e.g. "api")
+err := client.UpdateStepWithStatus(ctx, correlationID, "build", "api", slippy.StepStatusCompleted, "build succeeded")
 ```
 
 ### Prerequisite Checking
 
 ```go
-result, err := client.CheckPrerequisites(ctx, correlationID, "deploy_dev")
+result, err := client.CheckPrerequisites(ctx, slip, []string{"unit_tests"}, "")
 switch result.Status {
-case slippy.PrereqStatusReady:    // All prereqs complete
-case slippy.PrereqStatusWaiting:  // Some prereqs still running
-case slippy.PrereqStatusFailed:   // A prereq failed
+case slippy.PrereqStatusCompleted: // All prereqs complete
+case slippy.PrereqStatusRunning:   // Some prereqs still running
+case slippy.PrereqStatusFailed:    // A prereq failed
 }
 ```
 
@@ -286,19 +397,29 @@ slippy/
 ├── interfaces.go       # SlipStore, GitHubAPI interfaces
 ├── push.go             # CreateSlipForPush
 ├── resolve.go          # ResolveSlip (ancestry resolution)
-├── status.go           # UpdateStepStatus, UpdateComponentStatus
+├── status.go           # SlipStatus/StepStatus/PrereqStatus enums + predicates (IsTerminal, IsSuccess, IsFailure) only
+├── aggregate_status.go # computeAggregateStatus (component -> aggregate rollup shared by both stores)
+├── steps.go            # UpdateStepWithStatus + wrappers (CompleteStep, FailStep, StartStep, ...)
+├── history.go          # AppendHistoryEntry (state history convenience wrapper)
+├── executor.go         # RunPreExecution/RunPostExecution; checkPipelineCompletion (pipeline-status derivation, recovery)
 ├── prereqs.go          # CheckPrerequisites, holds
-├── hold.go             # HoldForPrerequisites
-├── migrations.go       # Schema migrations
-├── dynamic_migrations.go # Pipeline-config-based migrations
+├── hold.go             # WaitForPrerequisites
+├── migrations.go       # ClickHouse migration options/orchestration
+├── dynamic_migrations.go # Pipeline-config-based ClickHouse migrations
+├── schema_migrations.go # Versioned core schema migrations (table, materialized views)
 ├── pipeline_config.go  # Pipeline JSON parsing
-├── clickhouse_store.go # ClickHouse SlipStore implementation
+├── clickhouse_store.go # ClickHouse SlipStore implementation (not the operational store; see Key Characteristics)
+├── postgres_store.go   # PostgresStore type + pgxPool interface (the operational SlipStore, DEVOPS-127)
+├── postgres_store_reads.go   # PostgresStore read methods (FindByCommits, LoadByCommit, ResolveAncestry, ...)
+├── postgres_store_updates.go # PostgresStore write methods (Update, Repave, ...) + SlipStore conformance assertion
+├── postgres_migrate.go   # Postgres schema-migration options and expected-table checks
+├── postgres_migrations.go # PostgresDynamicMigrationManager (Postgres counterpart of DynamicMigrationManager)
 ├── github.go           # GitHub API implementation
 ├── errors.go           # Custom error types
 ├── columns.go          # Dynamic column generation
 ├── query_builder.go    # SQL query building
 ├── scanner.go          # Row scanning utilities
-├── utils.go            # Helper functions
+├── tracing.go          # OpenTelemetry span helpers
 ├── logger.go           # Logger interface adapter
 ├── slippytest/         # Test utilities package
 └── *_test.go           # Test files

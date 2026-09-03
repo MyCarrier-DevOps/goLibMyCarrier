@@ -219,6 +219,20 @@ func (m *PostgresDynamicMigrationManager) indexEnsurer() postgresmigrator.Schema
 	sql.WriteString(
 		"CREATE INDEX IF NOT EXISTS idx_routing_slips_status ON routing_slips (status);\n")
 
+	// slip_ancestry indexes for the repave path (DEVOPS-231). Repave runs three statements
+	// against this table — a child cleanup and a carry-forward read on correlation_id, and
+	// the descendant repoint on parent_correlation_id — all INSIDE the transaction that
+	// already holds the superseded row's delete lock. The table's only index is its
+	// (repository, branch, correlation_id) primary key, so correlation_id was reachable
+	// only as a full index scan and parent_correlation_id had no index at all. With a 30s
+	// statement timeout (postgres.DefaultStatementTimeout) and a repave failure now fatal
+	// to the push, a slow scan there does not degrade — it fails the message and every
+	// redelivery reproduces it.
+	sql.WriteString(
+		"CREATE INDEX IF NOT EXISTS idx_slip_ancestry_correlation ON slip_ancestry (correlation_id);\n")
+	sql.WriteString(
+		"CREATE INDEX IF NOT EXISTS idx_slip_ancestry_parent ON slip_ancestry (parent_correlation_id);\n")
+
 	// Indexes on deploy-step status columns commonly filtered for held slips. Only emitted
 	// for steps that exist in the config (the columns are created by their step ensurers).
 	for _, stepName := range []string{"dev_deploy", "preprod_deploy", "prod_deploy"} {
@@ -231,7 +245,7 @@ func (m *PostgresDynamicMigrationManager) indexEnsurer() postgresmigrator.Schema
 
 	return postgresmigrator.SchemaEnsurer{
 		Name:        "ensure_secondary_indexes",
-		Description: "Ensures secondary indexes exist on routing_slips",
+		Description: "Ensures secondary indexes exist on routing_slips and slip_ancestry",
 		SQL:         sql.String(),
 	}
 }

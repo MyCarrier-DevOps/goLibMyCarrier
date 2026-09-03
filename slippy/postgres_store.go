@@ -67,29 +67,12 @@ func (s *PostgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx
 // Create upserts a slip. Matches ClickHouse last-write-wins (and the in-memory
 // reference store): an existing correlation_id is overwritten rather than rejected.
 func (s *PostgresStore) Create(ctx context.Context, slip *Slip) error {
-	cols := s.slipColumns()
-	vals, err := s.slipValues(slip, true)
+	query, vals, err := s.buildCreateQuery(slip)
 	if err != nil {
 		return err
 	}
-
-	placeholders := make([]string, len(cols))
-	for i := range cols {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
-	}
-
-	// ON CONFLICT DO UPDATE for every non-PK column (cols[0] is correlation_id).
-	sets := make([]string, 0, len(cols)-1)
-	for _, col := range cols[1:] {
-		sets = append(sets, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
-	}
-
-	query := fmt.Sprintf(
-		"INSERT INTO routing_slips (%s) VALUES (%s) ON CONFLICT (correlation_id) DO UPDATE SET %s",
-		strings.Join(cols, ", "), strings.Join(placeholders, ", "), strings.Join(sets, ", "))
-
 	if _, err := s.pool.Exec(ctx, query, vals...); err != nil {
-		return fmt.Errorf("failed to create slip %s: %w", slip.CorrelationID, err)
+		return mapCreateError(slip.CorrelationID, err)
 	}
 	return nil
 }
@@ -147,25 +130,114 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 	return s.queryOne(ctx, query, correlationID)
 }
 
-// LoadByCommit retrieves the most recently updated slip for (repository, commitSHA).
+// LoadByCommit retrieves the slip for (repository, commitSHA).
 // Repository comparison is case-insensitive.
 func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
+	// Both ORDER BY terms are required, not decorative: Phase A (DEVOPS-231) ships ahead of
+	// the Phase B cleanup + uq_routing_slips_repo_sha unique index, so duplicate rows for the
+	// same (repository, commit_sha) can still exist in production today. Without an explicit
+	// order, Postgres gives LIMIT 1 no ordering guarantee at all.
+	//
+	// Live rows sort FIRST, and that term is the load-bearing one. CreateSlipForPush routes
+	// entirely on this row's status: IsLive() dedupes onto it and suppresses the caller's side
+	// effects, anything else repaves it and re-dispatches the pipeline under a fresh
+	// correlation ID. "Most recently updated" is the wrong answer to that question, because a
+	// duplicate abandoned after the live row's last step write is genuinely the newest row —
+	// so updated_at DESC alone hands back the ended one and the caller repaves a pipeline
+	// that is still running. LoadLiveByCommit, which this lookup replaced (see the comment in
+	// CreateSlipForPush for why it had to), filtered ended rows out and could not make that
+	// mistake; ordering is how this one keeps the same property while staying unfiltered.
+	//
+	// The status list is repaveableSlipStatusesSQL rather than a second hand-written set, so
+	// TestRepaveableSlipStatusesSQL_MatchesIsLive covers this ordering's notion of "live" too.
+	// updated_at DESC then breaks ties within each group: among ended rows the newest is the
+	// one worth repaving. Once Phase B lands there is one row per commit and both terms cost
+	// nothing extra.
+	//
+	// KNOWN PHASE A STATE, accepted deliberately: this converts a nondeterministic wrong
+	// answer into a deterministic one. A live row from a CRASHED run is never updated again,
+	// so under updated_at DESC alone it lost to any newer ended row; live-first means it now
+	// always WINS, and every subsequent push for that commit dedupes onto the zombie via
+	// handlePushRetry with the caller suppressing side effects — until the Phase B cleanup
+	// removes the duplicate. There is no timeout or escape hatch.
+	//
+	// That is still the right trade, and the reasoning is worth recording because the
+	// alternative looks safer than it is. Getting it wrong the other way repaves a pipeline
+	// that is genuinely RUNNING: a double dispatch, plus the DEVOPS-285 class of mid-run
+	// 404s, with real CI and deploy effects and no way to un-ring it. A wedged commit is
+	// inert and operator-recoverable. An age bound was considered and rejected — it picks an
+	// arbitrary N and still fails a run that legitimately goes quiet for longer than N.
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
-			"ORDER BY updated_at DESC LIMIT 1",
+			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
-// LoadLiveByCommit returns the most recent live slip for (repository, commitSHA),
+// LoadLiveByCommit returns the live slip for (repository, commitSHA),
 // excluding terminal-superseded statuses (abandoned, promoted, compensated).
 func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
+	// Ordered live-first then updated_at DESC for the same reason as LoadByCommit, and the
+	// status filter is not a substitute for it: the filter excludes abandoned/promoted/
+	// compensated but NOT 'completed' or 'failed', so a completed duplicate touched after the
+	// live row's last write surfaces ahead of it on updated_at DESC alone. Phase A can still
+	// hold duplicate rows per (repository, commit_sha), so that inversion is reachable today.
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"AND status NOT IN ('abandoned', 'promoted', 'compensated') "+
-			"ORDER BY updated_at DESC LIMIT 1",
+			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
 		strings.Join(s.slipColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
+}
+
+// createTx is Create against an open transaction. Repave uses it so the superseded row's
+// removal and the successor's insert commit or roll back together; both paths go through
+// buildCreateQuery/mapCreateError so a transactional create writes an identical row and
+// reports identical sentinels to a standalone one.
+func (s *PostgresStore) createTx(ctx context.Context, tx pgx.Tx, slip *Slip) error {
+	query, vals, err := s.buildCreateQuery(slip)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, query, vals...); err != nil {
+		return mapCreateError(slip.CorrelationID, err)
+	}
+	return nil
+}
+
+// buildCreateQuery builds the slip upsert statement and its ordered argument list.
+func (s *PostgresStore) buildCreateQuery(slip *Slip) (query string, args []any, err error) {
+	cols := s.slipColumns()
+	vals, err := s.slipValues(slip, true)
+	if err != nil {
+		return "", nil, err
+	}
+
+	placeholders := make([]string, len(cols))
+	for i := range cols {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	}
+
+	// ON CONFLICT DO UPDATE for every non-PK column (cols[0] is correlation_id).
+	sets := make([]string, 0, len(cols)-1)
+	for _, col := range cols[1:] {
+		sets = append(sets, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
+	}
+
+	return fmt.Sprintf(
+		"INSERT INTO routing_slips (%s) VALUES (%s) ON CONFLICT (correlation_id) DO UPDATE SET %s",
+		strings.Join(cols, ", "), strings.Join(placeholders, ", "), strings.Join(sets, ", ")), vals, nil
+}
+
+// mapCreateError translates a slip-insert failure into this package's sentinels: a
+// conflict on the one-row-per-commit unique index becomes ErrDuplicateSlip so callers can
+// route to their dedup backstop instead of treating it as a hard failure.
+func mapCreateError(correlationID string, err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_routing_slips_repo_sha" {
+		return fmt.Errorf("create slip %s: %w", correlationID, ErrDuplicateSlip)
+	}
+	return fmt.Errorf("failed to create slip %s: %w", correlationID, err)
 }
 
 // slipColumns returns the ordered routing_slips column list: core columns, then each

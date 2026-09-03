@@ -69,10 +69,23 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: |
           go mod download
-          # Exclude test fixture packages (e.g., loggertest, slippytest) from test and coverage
+          # Fixture packages (loggertest, slippytest, clickhousetest, migratortest) are kept
+          # OUT of the coverage profile — they are test doubles, and counting them would let
+          # fixture coverage mask production coverage — but their own tests must still RUN.
+          # They did not before: one `grep -v test` filter served both purposes, so every
+          # test inside a published fixture package was silently skipped. That matters
+          # because slippytest is consumer-facing API: a regression dropping the went-live
+          # guard or the self-repave rejection from its MockStore.Repave would keep CI green
+          # while downstream consumers validated their handling against a double that
+          # permits destroying a live slip.
           PKGS=$(go list ./... | grep -v 'test' || echo "./...")
+          FIXTURE_PKGS=$(go list ./... | grep 'test' || true)
           go test -cover -coverprofile=../coverage-${{ matrix.module }}.out -covermode=atomic $PKGS
           go tool cover -func=../coverage-${{ matrix.module }}.out
+          if [ -n "$FIXTURE_PKGS" ]; then
+            echo "Testing fixture packages (excluded from coverage): $FIXTURE_PKGS"
+            go test -count=1 $FIXTURE_PKGS
+          fi
       - name: check ${{ matrix.module }} test coverage
         uses: vladopajic/go-test-coverage@v2
         with:
@@ -104,11 +117,28 @@ jobs:
         with:
           go-version: ^1.26
           check-latest: true
-      - name: Run deterministic CLONE_DERIVED regression suite (TestStaleCloneDerive)
+      # Named rather than run-everything on purpose: the ClickHouse integration tests in
+      # this package are known-flaky and reproduce on main, so an unfiltered run would be
+      # a coin flip. Add deterministic suites here by name as they land.
+      #
+      # TestPostgresStore_Load* is included because the live-first ordering in LoadByCommit /
+      # LoadLiveByCommit decides whether a duplicate-row commit repaves a RUNNING pipeline,
+      # and ordering semantics cannot be asserted against pgxmock — only real rows with real
+      # timestamps can distinguish "live first" from "most recently updated".
+      #
+      # TestPostgresStore_Repave is included because it is the only thing that exercises
+      # Repave's SQL against a real schema. The pgxmock suite pins statement order and
+      # rollback, but only a real Postgres can catch the things that matter most here:
+      # that a failed statement actually aborts the transaction, that the SAVEPOINT around
+      # the ancestry link really scopes its rollback, and that the enum and column names
+      # in the repoint exist.
+      - name: Run deterministic integration suites (CLONE_DERIVED, Postgres repave)
         working-directory: slippy
         run: |
           go mod download
-          go test -tags integration -run 'TestStaleCloneDerive' -count=1 -timeout 10m ./...
+          go test -tags integration \
+            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load' \
+            -count=1 -timeout 10m ./...
 
   lint:
     name: lint-${{ matrix.module }}

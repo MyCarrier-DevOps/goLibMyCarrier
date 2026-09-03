@@ -13,7 +13,7 @@
 **Step statuses:** `pending`, `held`, `running`, `completed`, `skipped`, `failed`, `error`, `timeout`, `aborted`.
 - `completed` / `skipped`: terminal-success.
 - `failed` / `error` / `timeout`: terminal primary failure.
-- `aborted`: terminal-cascade (upstream prereq failed). **Reversible** — auto-reset to `pending` by recovery branch in `checkPipelineCompletion` when last primary failure resolves (`executor.go:307-346`).
+- `aborted`: terminal-cascade (upstream prereq failed). **Reversible** — auto-reset to `pending` by recovery branch in `checkPipelineCompletion` when last primary failure resolves (`executor.go:365-405`).
 - Full table: see Step Status Reference below.
 
 **Glossary:**
@@ -100,6 +100,168 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 - `abandoned` - automatic when a newer push supersedes this branch (`AbandonSlip`, `client.go:170`)
 - `promoted` - automatic on PR squash-merge to another branch (`PromoteSlip`, `client.go:204`)
 - No operator abort tool exists. Both bypass `checkPipelineCompletion`.
+
+**Same-commit slip identity — repave (DEVOPS-231):**
+
+Slip identity is `(lower(repository), commit_sha)` — one row per commit. `correlation_id`
+remains the primary key and the child-row anchor, but identifies the *current run*, not
+the slip's identity; `branch` is likewise an attribute of the current run, not part of
+identity. A DB unique index (`uq_routing_slips_repo_sha`) enforces this at the storage
+layer as of migration v5 — a later, separately-gated migration; `CreateSlipForPush`
+(`push.go`) already implements the contract below ahead of that index landing.
+
+- **Same-commit ended push → repave.** A push for a commit SHA whose existing slip is
+  `in_progress`/`pending`/`compensating` is reused (`handlePushRetry`): the returned
+  slip keeps the existing `correlation_id`, which differs from the one the caller sent,
+  so the caller (pushhookparser) detects a dedup and suppresses re-dispatch. A push for
+  a SHA whose slip is `failed` or terminal
+  (`completed`/`abandoned`/`promoted`/`compensated`) instead **repaves**: a single
+  `SlipStore.Repave` call removes the `routing_slips` row, explicitly deletes its
+  `slip_component_states`/`slip_ancestry` children (correct both before and after migration
+  v5's cascade FKs exist), inserts the fresh row under the new run's `correlation_id`,
+  repoints any descendant onto it, and writes the fresh run's own parent link — **all in
+  one transaction** — producing a full re-dispatch (builds, unit tests, secret scan).
+
+  The atomicity is the contract, not an implementation detail. When the delete and the
+  create were separate store calls, a create failure after a committed delete left the
+  commit with no slip at all and every redelivery reproduced it; the reachable trigger was
+  a pipeline config deployed ahead of the migration adding its step's column (Postgres
+  42703 on every insert). The statement order inside the transaction is also load-bearing:
+  the successor's row is inserted BEFORE any descendant is repointed onto it, which is what
+  keeps a descendant from naming a row that does not exist. The repoint rewrites every column
+  describing the parent, not just the id, since a stale value beside a fresh id reproduces the
+  very inconsistency the repoint removes; the column list is on `SlipStore.Repave` in
+  `interfaces.go`, the contract every store implementation owes. That
+  ordering is necessary but not sufficient for a foreign key on
+  `slip_ancestry.parent_correlation_id`, and migration v5 adds none — both of its FKs are on
+  `correlation_id`. The full argument is on `SlipStore.Repave` in `interfaces.go`.
+
+  These two claims are stated here as conclusions with pointers rather than restated in
+  full: they drifted across four and three copies respectively in three consecutive review
+  rounds, so each now has exactly one home.
+
+  Two further guarantees follow from doing it in one place: if the push resolved no
+  ancestry (e.g. a GitHub outage), the superseded run's own parent link is **carried
+  forward** to the successor rather than deleted with it; and the descendant repoint
+  rewrites `parent_branch` and `parent_status` alongside the id, so a cross-branch repave
+  no longer truncates `ResolveAncestry` at that hop (it joins the next hop on the branch
+  recorded beside the parent id).
+
+  A failed `Repave` is fatal to the push: nothing was written, so there is no successor to
+  report, and failing lets Kafka redeliver against a store that still holds the superseded
+  row. A store that cannot repave at all (`ClickHouseStore`) returns `ErrRepaveUnsupported`
+  and the push path falls back to pre-DEVOPS-231 abandon-then-create semantics.
+- **Empty-run guard.** If the incoming push carries no components (e.g. branch
+  create/recreate at an existing SHA, or a components-less repo), the existing slip for
+  that SHA is TERMINAL — **not `failed`**, see below — and the push does **not** carry
+  that row's own `correlation_id`, `CreateSlipForPush` returns the existing slip instead
+  of repaving; nothing would be dispatched either way, so repaving would only destroy the
+  prior run's history for no benefit.
+
+  Both exclusions are load-bearing and both are easy to miss because "ended" in this
+  document includes `failed`:
+  - **`failed` is excluded** so a componentless re-push can still retrigger a stuck run
+    (`push.go`, `emptyRunGuardApplies`). See "known sharp edges" below.
+  - **A self-correlation push is excluded** — when the existing row already carries this
+    push's `correlation_id`, returning it would mean `returned == sent`, which the caller
+    protocol reads as "this is your slip, proceed" rather than as a dedup.
+- **Cross-commit supersede → abandon (unchanged).** A newer commit still `AbandonSlip`s
+  an in-flight older commit on the same branch (see above) — different `(repo, sha)`, so
+  this is untouched by the repave change; `abandoned` rows still exist, there is just
+  never a second row for the same commit.
+- **`branch` is a run attribute, not slip identity.** A fast-forward of an existing SHA
+  onto a different branch is not treated specially: it repaves the same `(repo, sha)`
+  row, and the fresh row carries the new push's `branch`. The re-dispatch is observably
+  the same as before this change, which instead minted a second row for the same SHA
+  under the old branch.
+- **Note:** rewritten-history force-pushes can strand a live slip on an orphaned SHA
+  (pre-existing; ancestry walks cannot see rewritten-away commits) — not addressed by
+  this change.
+
+**Known sharp edges of repave:**
+
+- **In-flight peer steps.** `FailStep` (`steps.go`) never modifies peer steps, so a
+  slip can be `failed` (e.g. `unit_tests` failed) while another step (e.g. `build`)
+  still runs. Repaving deletes the `routing_slips` row those late writers target, so
+  their post-job `UpdateStepWithStatus` and any in-progress `WaitForPrerequisites`
+  poll (`hold.go`, which reloads the slip via `store.Load` each iteration) now fail
+  with `ErrSlipNotFound`, where pre-DEVOPS-231 abandon semantics left the row in
+  place to absorb them. This is deliberately NOT fixed by making not-found benign
+  across `steps.go`/`hold.go` — that would mask genuine not-found bugs repo-wide —
+  and is tracked as **DEVOPS-277**, which decides between preserving a repaved run's
+  history (tombstone or soft-delete, either of which also lets a late writer tell
+  "repaved, stop quietly" from "genuinely missing") and accepting the loss explicitly.
+  The status-guarded removal (`ErrSlipWentLive`) does remove the worst case: a `failed`
+  slip that recovers to `in_progress` before the repave lands is refused, so a
+  recovering run is never pulled out from under itself.
+
+  Verified mitigating context: this fails **closed**. A destroyed `secret_scan` verdict
+  cannot become a deploy permission, because `AllPrerequisitesMet` requires every
+  prerequisite to be `IsSuccess()` and a fresh slip starts `pending`. The cost is
+  availability (a false-red post-job), not integrity.
+- **Deploy-event attachment.** A same-commit re-push repaves an ended slip whose
+  image may have already shipped, so a deploy event for that image now attaches to
+  the current (repaved) run for that `(repo, sha)` rather than the run that actually
+  built it — see `resolve.go`'s `LoadByCommit` comment for the updated contract.
+  This is a deliberate contract change, not a bug: refusing to repave any ended slip
+  that recorded an image tag would make re-pushing an already-built commit
+  non-repaveable, which is this PR's primary case.
+- **Empty-run guard consequences.** ~~In a zero-component repo, a failed run cannot be
+  retriggered by re-pushing the same commit.~~ **No longer true — this was the guard's
+  worst consequence and it is fixed.** `emptyRunGuardApplies` never claims a `failed`
+  slip, so re-pushing a commit whose run failed DOES repave and re-dispatch, which is
+  what makes unit-test retrigger work on a tests-only repo (`buildable=false` +
+  `RunUnitTests=true`) before `DispatchIntent` is adopted end-to-end. If you are
+  triaging a stuck tests-only repo, re-pushing is expected to help.
+
+  The guard also never claims a push whose correlation ID already matches the existing
+  row, because its whole contract is that the caller sees `returned != sent` and
+  suppresses its side effects; when they are equal the caller would instead dispatch
+  against the slip it was handed.
+
+  What remains true for the statuses the guard still claims (`completed`, `abandoned`,
+  `promoted`, `compensated` with zero components): the early return skips
+  `resolveAndAbandonAncestors`, so an older in-flight slip on the same branch that a
+  fall-through push would otherwise have abandoned stays live. And a superseded-terminal
+  slip (`abandoned`/`promoted`/`compensated`) can be returned from `CreateSlipForPush`
+  for a componentless push — previously impossible, since that function always either
+  reused a live slip or created a fresh one.
+- **An ended row may have work in flight against it (DEVOPS-285).** "Ended" includes
+  `failed`, and the operator rerun flow adopts a failed slip's correlation ID and
+  dispatches workflows *before* writing anything to slippy — so the row sits `failed`,
+  and therefore repave-eligible, for as long as that work takes to report its first
+  step. A same-commit push in that window repaves, deletes the row, and the in-flight
+  rerun's step writes then fail `ErrSlipNotFound`. This generalises the in-flight-peer
+  bullet above: pre-DEVOPS-231 late events from *any* superseded run landed on the
+  abandoned row and returned 2xx, and the hard DELETE turns all of them into 404s.
+  Tracked as **DEVOPS-285**, which is deliberately blocked on DEVOPS-277 — if history
+  preservation lands as a tombstone rather than a delete, this class disappears and
+  anything narrower built now is wasted. Note the `failed` carve-out above widens the
+  input surface here: a componentless push onto a `failed` row now falls through to the
+  guarded DELETE where it previously deduped.
+- **No duplicate detection in Phase A.** Without the `uq_routing_slips_repo_sha`
+  unique index (Phase B), an insert for the same `(repository, commit_sha)` never
+  conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
+  `handleDuplicateSlipBackstop` — is unreachable. A lost Redis-lock race (the dedup lock
+  is fail-open) silently inserts a second row for one commit with no detection at all,
+  until the Phase B migration adds the index and its cleanup runs.
+
+  What Phase A *does* have, since `Repave` became transactional, is convergence on repave
+  failure: nothing is written, the push fails, and the redelivery repaves the still-present
+  superseded row. The earlier delete-then-create shape had no such property — a failed
+  delete left a stale row beside a fresh one, and a failed create destroyed the run.
+
+**Terminology — two mutually exclusive retrigger mechanisms:**
+- **Push-shaped retrigger** ("webhook re-delivery" / "same-commit re-push"): any push
+  event for a SHA that already has a slip, handled by `CreateSlipForPush` above (repave,
+  retry-reuse, or the empty-run guard). This is the only create/repave path.
+- **`retrigger-ci`** (the operator workflow that resolves and re-dispatches an existing
+  slip's steps, `action:"rerun"`): reuses the existing `correlation_id` and re-runs
+  steps in place — a `failed` slip recovers via `checkPipelineCompletion`'s recovery
+  branch (`executor.go:365-405`), not via a new push. It never calls `CreateSlipForPush`
+  and so never creates or repaves a slip; selective (e.g. unit-tests-only) retrigger must
+  never be implemented as a filtered push replay, since repave would delete the build
+  state such a retrigger wants to keep.
 
 ---
 
@@ -238,7 +400,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 
 > **Note:** "downstream lazy-abort" means downstream step rows are NOT changed by FailStep. Each downstream step transitions to `aborted` only when its own `WaitForPrerequisites` call observes the failed prereq.
 
-> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch (`executor.go:307-346`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
+> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch (`executor.go:365-405`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
 
 ---
 
@@ -422,7 +584,7 @@ slip recovers from failed → in_progress when:
   slip.Status == failed at the moment checkPipelineCompletion fires
 
 On recovery:
-  cascade-aborted (`aborted`) steps → reset to `pending` automatically by `checkPipelineCompletion` recovery branch (`executor.go:307-346`). `aborted` is the ONLY reversible terminal step status; `failed`, `error`, `timeout`, `completed`, `skipped` are not auto-reset. Peer steps in `running`/`held`/`pending` are NEVER modified by FailStep — only the failing step's own row and `slip.status` change synchronously.
+  cascade-aborted (`aborted`) steps → reset to `pending` automatically by `checkPipelineCompletion` recovery branch (`executor.go:365-405`). `aborted` is the ONLY reversible terminal step status; `failed`, `error`, `timeout`, `completed`, `skipped` are not auto-reset. Peer steps in `running`/`held`/`pending` are NEVER modified by FailStep — only the failing step's own row and `slip.status` change synchronously.
   slip.status → in_progress
   External orchestrators (auto-deployer, Argo) must re-trigger the pending steps
 ```
@@ -542,7 +704,7 @@ checkPipelineCompletion(ctx, correlationID):
 | `failed` | Yes | - | ✅ primary | Primary failure |
 | `error` | Yes | - | ✅ primary | Primary failure |
 | `timeout` | Yes | - | ✅ primary | Primary failure |
-| `aborted` | Yes* | - | ✅ cascade | Cascade - upstream prereq failed. *Reversible: auto-reset to `pending` on recovery (`executor.go:307-346`). |
+| `aborted` | Yes* | - | ✅ cascade | Cascade - upstream prereq failed. *Reversible: auto-reset to `pending` on recovery (`executor.go:365-405`). |
 
 ---
 
