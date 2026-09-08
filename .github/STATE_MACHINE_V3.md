@@ -151,20 +151,72 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   report, and failing lets Kafka redeliver against a store that still holds the superseded
   row. A store that cannot repave at all (`ClickHouseStore`) returns `ErrRepaveUnsupported`
   and the push path falls back to pre-DEVOPS-231 abandon-then-create semantics.
-- **Empty-run guard.** If the incoming push carries no components (e.g. branch
-  create/recreate at an existing SHA, or a components-less repo), the existing slip for
-  that SHA is TERMINAL — **not `failed`**, see below — and the push does **not** carry
-  that row's own `correlation_id`, `CreateSlipForPush` returns the existing slip instead
-  of repaving; nothing would be dispatched either way, so repaving would only destroy the
-  prior run's history for no benefit.
+- **Empty-run guard.** If the incoming push will dispatch nothing, the existing slip for
+  that SHA is ended, and the push does **not** carry that row's own `correlation_id`,
+  `CreateSlipForPush` returns the existing slip instead of repaving — nothing would be
+  dispatched either way, so repaving would only destroy the prior run's history for no
+  benefit.
 
-  Both exclusions are load-bearing and both are easy to miss because "ended" in this
+  "Will dispatch nothing" is `PushOptions.Dispatch` (`DispatchIntent`) when the caller
+  states a *recognized* value; `DispatchIntentUnspecified` and any unrecognized value both
+  fall back to `len(Components) == 0`. `Validate()` deliberately never rejects an
+  unrecognized value — a safe degradation is preferable to a hard push failure — so an
+  explicit-but-mis-serialized intent (wrong casing crossing the slippy-api JSON boundary,
+  say) is silently ignored rather than honored. Every log line that reports a decision about an
+  ended slip for this commit carries the raw value plus `dispatch_intent_honored` and
+  `dispatch_intent_recognized`, so that is visible rather than inferred — both guard-applied
+  (dedup) lines, both repave lines (the main path's and the duplicate-create backstop's), and the
+  create line. The repave ones matter most, because that is where an ignored intent went on to
+  destroy a prior run's history.
+
+  The field set and its call sites live in exactly one place, on `addDispatchIntentFields` in
+  `push.go`; `grep -n addDispatchIntentFields` is the site list. This paragraph deliberately does
+  not state a count — "two fields" and "the one line" were each correct when written and each went
+  stale within a commit, and doc/code drift on these counts produced a review finding in six
+  consecutive rounds.
+
+  **Alert on `dispatch_intent_recognized = false`**, not on `honored`. `honored=false` beside a
+  non-empty `dispatch_intent` looks like the right signature and is not: `DispatchIntent.String()`
+  renders the zero value as the literal `unspecified`, so under a Stringer-honouring logger the
+  field is never empty and that predicate also matches every unset push — which, until the field
+  is forwarded end-to-end, is every real push. It would match every repave and isolate nothing.
+  `recognized=false` is true only for a value a caller actually got wrong, and unlike the
+  rendering it does not depend on how a consumer's `Logger` serializes the field (`Logger` is an
+  interface consumers implement, and `DispatchIntent` has `String()` but no `MarshalJSON`).
+
+  Component count is neither necessary nor sufficient on its own: a tests-only repo
+  (`buildable=false` + `RunUnitTests=true`) dispatches unit tests with zero build
+  components, and a caller may declare `DispatchIntentNothing` while carrying components.
+
+  Two exclusions sit alongside that, and both are easy to miss because "ended" in this
   document includes `failed`:
-  - **`failed` is excluded** so a componentless re-push can still retrigger a stuck run
-    (`push.go`, `emptyRunGuardApplies`). See "known sharp edges" below.
-  - **A self-correlation push is excluded** — when the existing row already carries this
-    push's `correlation_id`, returning it would mean `returned == sent`, which the caller
-    protocol reads as "this is your slip, proceed" rather than as a dedup.
+  - **`failed` is excluded from the INFERENCE only.** With `Dispatch` unset or
+    unrecognized, the guard never claims a `failed` slip, so a componentless re-push can
+    still retrigger a stuck run — the carve-out that covers the window before `slippy-api`
+    and `pushhookparser` forward the field, during which every real push arrives
+    `DispatchIntentUnspecified`. A **recognized** explicit intent is authoritative in both
+    directions and is consulted *before* this exclusion, so `DispatchIntentNothing` on a
+    `failed` slip DOES dedup — deliberately, since repaving there would destroy the failed
+    run's history and seed a successor with no components that nothing could ever advance.
+  - **A self-correlation push is excluded**, unconditionally. When the existing row already
+    carries this push's `correlation_id`, returning it would mean `returned == sent`, which
+    the caller protocol reads as "this is your slip, proceed" rather than as a dedup.
+
+    Being excluded from the guard does **not** mean falling through to a repave. That push is
+    diverted to an **in-place upsert**: `persistSlipForPush` resets the row to live under the
+    SAME correlation ID, keeping its component children and replacing its state history, and
+    records a `reset in place after <status> attempt` marker so an operator can tell a reset
+    from a first attempt. This is the ordinary in-delivery retry, not an exotic shape — so
+    "repaved under a new correlation ID" describes only pushes carrying a DIFFERENT id.
+
+  See "the guard no longer infers intent from component count" below for the failure this
+  fixed, and `DispatchIntent` in `push.go` for what setting it opts a componentless push
+  into.
+
+  A consequence that outlives the rollout: a genuinely zero-work repo correctly sends
+  `DispatchIntentNothing`, the guard correctly fires, and a failed run there still cannot
+  be retriggered by re-pushing the same commit. That is the guard working as designed, not
+  the bug below.
 - **Cross-commit supersede → abandon (unchanged).** A newer commit still `AbandonSlip`s
   an in-flight older commit on the same branch (see above) — different `(repo, sha)`, so
   this is untouched by the repave change; `abandoned` rows still exist, there is just
@@ -208,8 +260,9 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   non-repaveable, which is this PR's primary case.
 - **Empty-run guard consequences.** ~~In a zero-component repo, a failed run cannot be
   retriggered by re-pushing the same commit.~~ **No longer true — this was the guard's
-  worst consequence and it is fixed.** `emptyRunGuardApplies` never claims a `failed`
-  slip, so re-pushing a commit whose run failed DOES repave and re-dispatch, which is
+  worst consequence and it is fixed.** With `Dispatch` unset or unrecognized — which is
+  every real push until it is forwarded end-to-end — `emptyRunGuardApplies` never claims a
+  `failed` slip, so re-pushing a commit whose run failed DOES repave and re-dispatch, which is
   what makes unit-test retrigger work on a tests-only repo (`buildable=false` +
   `RunUnitTests=true`) before `DispatchIntent` is adopted end-to-end. If you are
   triaging a stuck tests-only repo, re-pushing is expected to help.
@@ -226,6 +279,29 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   slip (`abandoned`/`promoted`/`compensated`) can be returned from `CreateSlipForPush`
   for a componentless push — previously impossible, since that function always either
   reused a live slip or created a fresh one.
+
+  **The guard no longer infers intent from component count alone.** It reads
+  `PushOptions.Dispatch` (`DispatchIntent`), because "zero components" legitimately means
+  both "branch create at an existing SHA, nothing to do" and "tests-only repo, unit tests
+  are about to run" — only the caller can tell them apart. The old inference broke the
+  second case concretely: `pushhookparser` nils out components whenever builds are skipped
+  while still dispatching the unit-tester event, so the guard fired on a push that DID
+  dispatch work, returned the old failed slip, and the caller's `Deduplicated` branch
+  short-circuited every side effect — unit tests included. A failed unit-test run on such a
+  repo therefore could not be retriggered by re-pushing the commit.
+
+  The affected repo set and the quoted `pushhookparser` source line are deliberately NOT
+  repeated here — they are point-in-time facts about another repository, so nothing in this
+  repo can notice them going stale. `DispatchIntent`'s godoc in `slippy/push.go` is the
+  single place that records them.
+
+  `DispatchIntentUnspecified` is the zero value and keeps the legacy inference, because this
+  library releases before `slippy-api` and `pushhookparser` adopt the field. That is exactly
+  why the `failed` exclusion above is not redundant with intent: during the whole adoption
+  window every real push arrives `Unspecified`, so the exclusion is what carries the
+  tests-only retrigger. A *recognized* explicit intent is authoritative in both directions
+  and is consulted before the exclusion.
+
 - **An ended row may have work in flight against it (DEVOPS-285).** "Ended" includes
   `failed`, and the operator rerun flow adopts a failed slip's correlation ID and
   dispatches workflows *before* writing anything to slippy — so the row sits `failed`,
