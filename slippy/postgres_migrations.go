@@ -250,7 +250,10 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 				-- Post-condition. The swallowed error above only proves a constraint of that NAME exists;
 				-- assert the definition and validity Repave depends on, so a pre-existing same-named FK
 				-- with another shape (NO ACTION / RESTRICT / DEFERRABLE / NOT VALID) fails this
-				-- migration loudly instead of being recorded as v5.
+				-- migration loudly instead of being recorded as v5. The expected text spells
+				-- routing_slips unqualified, which is how pg_get_constraintdef renders it whenever the
+				-- table is visible in the migrator's search_path; where it is not, the ALTER above has
+				-- already failed with 42P01, so a false mismatch here is unreachable.
 				FOR fk IN
 					SELECT * FROM (VALUES
 						('slip_component_states', 'fk_component_states_slip'),
