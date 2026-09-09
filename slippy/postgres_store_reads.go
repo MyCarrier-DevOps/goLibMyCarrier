@@ -31,6 +31,10 @@ func (s *PostgresStore) FindByCommits(
 	// still tie on c.priority today (same reason as LoadByCommit/LoadLiveByCommit); once
 	// the Phase B cleanup + unique index land there is one row per commit and no
 	// same-commit tie to break, so the ordering costs nothing extra.
+	//
+	// No live-first term here, unlike LoadByCommit/LoadLiveByCommit — deliberate. Phase B's
+	// unique index leaves one row per commit, so there is no same-commit tie to order; see
+	// DEVOPS-304 (closed, decided against changing this).
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s
@@ -72,6 +76,10 @@ func (s *PostgresStore) FindAllByCommits(
 	// still tie on c.priority today (same reason as LoadByCommit/LoadLiveByCommit); once
 	// the Phase B cleanup + unique index land there is one row per commit and no
 	// same-commit tie to break, so the ordering costs nothing extra.
+	//
+	// No live-first term here, unlike LoadByCommit/LoadLiveByCommit — deliberate. Phase B's
+	// unique index leaves one row per commit, so there is no same-commit tie to order; see
+	// DEVOPS-304 (closed, decided against changing this).
 	query := fmt.Sprintf(`
 		SELECT %s, c.commit_sha AS matched_commit
 		FROM routing_slips s

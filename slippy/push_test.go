@@ -5133,12 +5133,15 @@ func TestClient_CreateSlipForPush_BackstopResetLeavesAMarker(t *testing.T) {
 
 // TestShippedConfigsAreAggregateFirst pins the premise the dispatch-intent gate tests rest on.
 //
-// aggregateFirstTestConfig() hand-mirrors the shape the shipped configs have — step 0 an
-// aggregate — and all four InitializeSlipForPush gate tests use that hand-rolled config. So if
-// a shipped config stopped being aggregate-first, the hasComponents gate would be dead for
-// every real pipeline, those four tests would keep passing, and the helper's doc claim would be
-// silently false. Nothing detected that: every LoadPipelineConfigFromFile call site for a
-// shipped config is behind the integration build tag.
+// What it pins is this repo's EXAMPLE config files, `default.json` and `production.json`. It
+// does NOT pin the live pipeline config, which lives in Vault (`DevOps/data/slippy/config`)
+// and is not reachable from a unit test. The example files still matter: they are what a
+// developer reads to learn the config shape, and what aggregateFirstTestConfig() hand-mirrors
+// — step 0 an aggregate — while all four InitializeSlipForPush gate tests use that hand-rolled
+// config. So if an example config stopped being aggregate-first, the helper would no longer
+// mirror the shape developers read, those four tests would keep passing, and the helper's doc
+// claim would be silently false. Nothing else detected that: every other
+// LoadPipelineConfigFromFile call site for these files is behind the integration build tag.
 func TestShippedConfigsAreAggregateFirst(t *testing.T) {
 	for _, name := range []string{"default.json", "production.json"} {
 		t.Run(name, func(t *testing.T) {

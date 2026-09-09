@@ -144,7 +144,9 @@ type SlipStore interface {
 	//
 	// The delete half is status-guarded: it removes the row ONLY when its status is ended
 	// (failed, completed, abandoned, promoted, compensated), so a slip that has gone live
-	// again between the caller's repave decision and this call is never destroyed.
+	// again between the caller's repave decision and this call is never destroyed. The
+	// superseded run's row, state_history, component states and ancestry rows are destroyed,
+	// not archived — a recorded decision (DEVOPS-231 §4, confirmed DEVOPS-277).
 	//
 	// Descendant links: any OTHER slip whose ancestry points at oldCorrelationID as its
 	// parent is repointed to newSlip — the WHOLE denormalized snapshot describing the parent is

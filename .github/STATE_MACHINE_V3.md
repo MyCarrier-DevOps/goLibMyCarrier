@@ -232,6 +232,18 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
 
 **Known sharp edges of repave:**
 
+- **Repave is a hard delete, and that is a recorded decision.** A repaved run's
+  `routing_slips` row — and with it its `state_history` jsonb — plus its
+  `slip_component_states` and `slip_ancestry` rows are destroyed. No tombstone, archive
+  or retention copy exists anywhere. That was decided in DEVOPS-231 §4, and re-examined
+  and confirmed on 2026-09-09 under **DEVOPS-277**, which declined both soft-delete
+  (DEVOPS-230's partial-index model) and a tombstone row: nothing consumes a superseded
+  run's history, and the 22 dashboard queries that read `routing_slips_pg` with no status
+  filter would double-count under soft-delete. The consequence for work still in flight
+  against the deleted row — an operator rerun's late step writes hitting
+  `ErrSlipNotFound` — is fixed at its cause in pushhookparser (the rerunner claims the
+  slip before dispatching), tracked as **DEVOPS-285**; ordinary stragglers from any
+  superseded run remain a bare not-found.
 - **In-flight peer steps.** `FailStep` (`steps.go`) never modifies peer steps, so a
   slip can be `failed` (e.g. `unit_tests` failed) while another step (e.g. `build`)
   still runs. Repaving deletes the `routing_slips` row those late writers target, so
@@ -240,9 +252,10 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   with `ErrSlipNotFound`, where pre-DEVOPS-231 abandon semantics left the row in
   place to absorb them. This is deliberately NOT fixed by making not-found benign
   across `steps.go`/`hold.go` — that would mask genuine not-found bugs repo-wide —
-  and is tracked as **DEVOPS-277**, which decides between preserving a repaved run's
-  history (tombstone or soft-delete, either of which also lets a late writer tell
-  "repaved, stop quietly" from "genuinely missing") and accepting the loss explicitly.
+  and, per the recorded decision in the bullet above, it is not fixed by a tombstone or
+  a soft-delete either, so a late writer still cannot tell "repaved, stop quietly" from
+  "genuinely missing". The one window worth closing is the operator rerun's, and it is
+  being closed at its source rather than in the store — see **DEVOPS-285** below.
   The status-guarded removal (`ErrSlipWentLive`) does remove the worst case: a `failed`
   slip that recovers to `in_progress` before the repave lands is refused, so a
   recovering run is never pulled out from under itself.
@@ -310,11 +323,13 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   rerun's step writes then fail `ErrSlipNotFound`. This generalises the in-flight-peer
   bullet above: pre-DEVOPS-231 late events from *any* superseded run landed on the
   abandoned row and returned 2xx, and the hard DELETE turns all of them into 404s.
-  Tracked as **DEVOPS-285**, which is deliberately blocked on DEVOPS-277 — if history
-  preservation lands as a tombstone rather than a delete, this class disappears and
-  anything narrower built now is wasted. Note the `failed` carve-out above widens the
-  input surface here: a componentless push onto a `failed` row now falls through to the
-  guarded DELETE where it previously deduped.
+  Tracked as **DEVOPS-285**, and no longer blocked on DEVOPS-277: that ticket decided
+  against a tombstone (first bullet above), so this class does not disappear on its own,
+  and the rerunner's window is being closed at its cause instead — the rerunner claims
+  the slip before dispatching any workflow, so the row is live, and therefore not
+  repave-eligible, for as long as that work is in flight. Note the `failed` carve-out
+  above widens the input surface here: a componentless push onto a `failed` row now
+  falls through to the guarded DELETE where it previously deduped.
 - **No duplicate detection in Phase A.** Without the `uq_routing_slips_repo_sha`
   unique index (Phase B), an insert for the same `(repository, commit_sha)` never
   conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
