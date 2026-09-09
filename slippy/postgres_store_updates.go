@@ -546,10 +546,10 @@ func (s *PostgresStore) Repave(
 		// The consequence lands where nobody would see it. The carry-forward only runs when
 		// the caller resolved no ancestry of its own (a GitHub outage), so the lineage hop
 		// would be destroyed in exactly the degraded case the mechanism exists for, and
-		// never in the healthy case. Nor would the suite catch it: CI migrates to v4 and the
-		// FK arrives in v5, so everything stays green until the migration ships.
-		// TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration
-		// installs that FK itself so the ordering is pinned now rather than on trust.
+		// never in the healthy case. The suite catches it now: CI migrates to v5, so
+		// fk_ancestry_slip is present in
+		// TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration, which
+		// asserts the constraint and pins this ordering against it.
 		//
 		// Reading before the DELETE means reading without the row lock the DELETE takes,
 		// and that introduces no new race: two concurrent repaves of the same old ID read

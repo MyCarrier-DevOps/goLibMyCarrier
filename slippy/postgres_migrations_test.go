@@ -198,8 +198,10 @@ func TestIndexEnsurer_OmitsDeployIndexesForAbsentSteps(t *testing.T) {
 // slip_ancestry.parent_correlation_id — Repave's guarded DELETE runs while descendants still
 // point at the old row, so a plain FK there would raise 23503 on every repave with a
 // descendant (design spec §3 banner); an ON DELETE CASCADE there would delete a child's
-// lineage row when its parent run is repaved (§7). Both FK adds are wrapped so a re-run after
-// a partial failure does not trip on duplicate_object.
+// lineage row when its parent run is repaved (§7). Both FK adds swallow duplicate_object so a
+// concurrent or repeated migrator run is a no-op — there is no "partial failure" to re-run
+// after, since UpSQL and the version insert share one transaction — and each half of the
+// migration ends in a post-condition asserting the shape a name match alone cannot prove.
 func TestUniquenessMigration_V5(t *testing.T) {
 	cfg := pgTestPipelineConfig(t)
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
@@ -222,11 +224,27 @@ func TestUniquenessMigration_V5(t *testing.T) {
 		"ON DELETE CASCADE",
 		"CREATE UNIQUE INDEX IF NOT EXISTS uq_routing_slips_repo_sha",
 		"ON routing_slips (lower(repository), commit_sha)",
+		// Post-conditions: a name match (duplicate_object / IF NOT EXISTS) is not proof of shape.
+		"SELECT pg_get_constraintdef(oid), convalidated",
+		"IF actual_def IS DISTINCT FROM expected_def OR NOT coalesce(is_valid, false)",
+		"AND indrelid = 'routing_slips'::regclass",
+		"AND indisunique AND indisvalid AND indisready",
+		"LIKE 'CREATE UNIQUE INDEX uq_routing_slips_repo_sha '",
+		"|| 'ON %routing_slips USING btree (lower(repository), commit_sha)'",
 	} {
 		assert.Contains(t, up, want)
 	}
-	assert.Equal(t, 2, strings.Count(up, "ON DELETE CASCADE"), "exactly two cascade FKs, both on correlation_id")
-	assert.Equal(t, 2, strings.Count(up, "duplicate_object"), "both FK adds must be idempotent")
+	assert.Equal(t, 3, strings.Count(up, "ON DELETE CASCADE"),
+		"two cascade FK adds on correlation_id plus the post-condition's expected definition")
+	assert.Equal(t, 2, strings.Count(up, "duplicate_object"),
+		"both FK adds must be no-ops for a concurrent or repeated migrator run")
+	assert.Equal(t, 2, strings.Count(up, "RAISE EXCEPTION"), "one post-condition per half of the migration")
+	assert.NotContains(
+		t,
+		up,
+		"public.",
+		"schema-agnostic: pg_get_indexdef qualifies the table, so a hardcoded schema would reject a healthy index elsewhere",
+	)
 	assert.NotContains(t, up, "CONCURRENTLY",
 		"a plain build: CONCURRENTLY cannot run inside the migrator's per-migration transaction")
 	assert.NotContains(t, up, "parent_correlation_id",

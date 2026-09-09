@@ -26,13 +26,18 @@ func newMigratedStore(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineCon
 	return store, pool, cfg
 }
 
-// newStoreAtV4 is newMigratedStore stopped at schema v4 — the last version WITHOUT
+// newStoreAtV4 is newMigratedStore left at schema v4 — the last version WITHOUT
 // uq_routing_slips_repo_sha. Tests that deliberately seed two rows for one
 // (repository, commit_sha) need it: v5 makes that shape impossible, so against a fully
 // migrated database their second Create fails with ErrDuplicateSlip before the behaviour
 // under test is reached. The live-first ordering those tests pin is kept in the queries as
-// defence in depth for an environment where v5 has not yet been applied, which is exactly
-// the schema this helper produces.
+// defence in depth for an environment where v5 has not yet been applied.
+//
+// Note how it gets there: RunPostgresMigrations always runs CreateTables to LATEST first and
+// only then honours a lower TargetVersion (postgres_migrate.go), so this applies v5 and then
+// reverts it via v5's DownSQL. The resulting schema is identical to a pristine v4, but the
+// path means an incomplete DownSQL would otherwise surface as an ErrDuplicateSlip from a
+// store.Create in an unrelated test — hence the assertion below.
 func newStoreAtV4(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig) {
 	t.Helper()
 	pool := newPGMigrationTestPool(t)
@@ -40,6 +45,13 @@ func newStoreAtV4(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig)
 	_, err := RunPostgresMigrations(context.Background(), pool,
 		PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 4})
 	require.NoError(t, err)
+	var leftovers int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		"SELECT (SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_routing_slips_repo_sha') + "+
+			"(SELECT count(*) FROM pg_constraint WHERE conname IN "+
+			"('fk_component_states_slip','fk_ancestry_slip'))").Scan(&leftovers))
+	require.Zero(t, leftovers,
+		"v5's DownSQL must remove the index and both FKs; a leftover breaks the dup-seeding tests")
 	store, err := NewPostgresStore(pool, cfg, nil)
 	require.NoError(t, err)
 	return store, pool, cfg
@@ -465,9 +477,8 @@ func TestPostgresStore_Repave_CarriesForwardParentLink_Integration(t *testing.T)
 // The failure lands exactly where it is least visible. The carry-forward only runs when the
 // caller resolved no ancestry of its own, i.e. during a GitHub outage — so the lineage hop
 // would be destroyed precisely in the degraded case the mechanism was written for, and never
-// in the healthy case where someone would notice. And no ordinary test would catch it: CI
-// migrates to v4, the FK arrives in v5, so the suite stays green right up until the migration
-// ships.
+// in the healthy case where someone would notice. Before v5 existed no ordinary test would
+// have caught it either: CI migrated only to v4, so the suite stayed green without the FK.
 //
 // Until migration v5 existed this test installed the FK by hand; it now relies on v5 and
 // asserts the constraint is present, so it remains the one thing that pins the read/delete

@@ -350,7 +350,11 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   (goLibMyCarrier ≥ v1.3.100) is deployed there: the index must never be live under a
   pre-repave writer, whose failed-path created a second row per commit. Survivor rule:
   non-terminal row first, then `updated_at`, `created_at`, `correlation_id`; losers are
-  hard-deleted (DEVOPS-277 — accepted history loss, no archive).
+  hard-deleted (DEVOPS-277 — accepted history loss, no archive). v5 is idempotent by name
+  (`duplicate_object` swallowed, index `IF NOT EXISTS`) but asserted by shape: each half ends
+  in a post-condition that RAISEs unless the object it kept has exactly the expected
+  definition, so a pre-existing same-named FK or index of another shape fails the migration
+  instead of being recorded as v5.
 
   What Phase A *does* have, since `Repave` became transactional, is convergence on repave
   failure: nothing is written, the push fails, and the redelivery repaves the still-present

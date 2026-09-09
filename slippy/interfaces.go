@@ -234,6 +234,11 @@ type SlipStore interface {
 	SetComponentImageTag(ctx context.Context, correlationID, stepName, componentName, imageTag string) error
 
 	// InsertAncestryLink writes a single direct-parent link to the ancestry table.
+	//
+	// Implementations MAY require the slip's own row to exist first — the Postgres store does
+	// once migration v5's fk_ancestry_slip (on correlation_id) is applied — so callers write
+	// the slip before its link, as the push path already does. The PARENT side may dangle:
+	// there is deliberately no FK on parent_correlation_id (see Repave).
 	InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error
 
 	// ResolveAncestry walks parent links to reconstruct the full ancestry chain.

@@ -103,7 +103,20 @@ consumer to that version in ANY environment, both of these must already be true 
    RAISEs — rolling back — unless it ends with exactly the state v5 requires.
 
 slippy-migrator's default `target-version` is latest, so v5 applies automatically on the
-first deploy after the bump; there is no separate switch to flip.
+first deploy after the bump, and `target-version` cannot hold an environment below it: the
+migrator runs `CreateTables` to latest before honouring any lower target
+(`postgres_migrate.go`), so a lower value still attempts v5 and still fails. In an environment
+whose cleanup has not run, the observable is a crash-looping pre-deploy Job with the recorded
+version stuck at 4 — the version INSERT rides in the same transaction as the DDL — and the
+config-driven ensurers never reached, so new step columns and indexes do not land either. The
+recovery is to run the cleanup, or to pin the consumer to a pre-v5 goLibMyCarrier.
+
+v5 is also idempotent by name but asserted by shape: `duplicate_object` is swallowed and the
+index is `IF NOT EXISTS` so a repeated migrator run is a no-op, and each half then RAISEs unless
+the object it kept has exactly the expected definition (cascade FKs, `convalidated`; a UNIQUE
+valid index on `(lower(repository), commit_sha)`). A pre-existing same-named object of another
+shape — including a leftover from a hand-run `CREATE INDEX CONCURRENTLY` — fails v5 loudly; drop
+it and re-run. Do not pre-create the index or the FKs by hand.
 
 **DEVOPS-231 also removed the exported field `slippytest.MockStore.CommitIndex`.** The
 published double no longer keeps a `"repo:sha" -> correlation_id` map; its four commit

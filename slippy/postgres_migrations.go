@@ -203,6 +203,17 @@ func (m *PostgresDynamicMigrationManager) ancestryMigration() postgresmigrator.M
 // near-instant, and CONCURRENTLY cannot run inside the transaction the migrator wraps each
 // migration in — it would break the migrator, not merely waste time.
 //
+// Idempotent by NAME, asserted by SHAPE. `duplicate_object` is swallowed and the index is
+// IF NOT EXISTS so a concurrent or repeated migrator run is a no-op (postgresmigrator relies on
+// that), but a name match is not proof of definition: a pre-existing same-named object with
+// another shape — a NO ACTION or NOT VALID FK, an index built without lower(), a leftover from
+// a failed CONCURRENTLY build, even a table of that name — would otherwise be kept silently and
+// v5 recorded with the guarantee absent. Each half therefore ends in a post-condition that
+// asserts exactly what the code depends on (the FKs' pg_get_constraintdef text plus
+// convalidated; a UNIQUE, valid, ready btree index on exactly (lower(repository), commit_sha))
+// and RAISEs otherwise. The fix for that failure is to drop the foreign object and re-run,
+// never to weaken the check.
+//
 // Deliberately NO foreign key on slip_ancestry.parent_correlation_id. Repave's first statement
 // is the guarded DELETE of the old row, which runs while descendants still carry
 // parent_correlation_id = old, so a plain FK would raise 23503 on every repave that has a
@@ -215,6 +226,12 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 		Description: "Cascade FKs from child tables on correlation_id and a unique (lower(repository), commit_sha) index (DEVOPS-231 Phase B)",
 		UpSQL: `
 			DO $$
+			DECLARE
+				expected_def constant text :=
+					'FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id) ON DELETE CASCADE';
+				fk record;
+				actual_def text;
+				is_valid boolean;
 			BEGIN
 				BEGIN
 					ALTER TABLE slip_component_states
@@ -230,9 +247,50 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 						ON DELETE CASCADE;
 				EXCEPTION WHEN duplicate_object THEN NULL;
 				END;
+				-- Post-condition. The swallowed error above only proves a constraint of that NAME exists;
+				-- assert the definition and validity Repave depends on, so a pre-existing same-named FK
+				-- with another shape (NO ACTION / RESTRICT / DEFERRABLE / NOT VALID) fails this
+				-- migration loudly instead of being recorded as v5.
+				FOR fk IN
+					SELECT * FROM (VALUES
+						('slip_component_states', 'fk_component_states_slip'),
+						('slip_ancestry',         'fk_ancestry_slip')
+					) AS t(tbl, con)
+				LOOP
+					SELECT pg_get_constraintdef(oid), convalidated
+						INTO actual_def, is_valid
+						FROM pg_constraint
+						WHERE conrelid = fk.tbl::regclass AND conname = fk.con AND contype = 'f';
+					IF actual_def IS DISTINCT FROM expected_def OR NOT coalesce(is_valid, false) THEN
+						RAISE EXCEPTION 'migration v5: % on % is % (validated=%); expected %',
+							fk.con, fk.tbl, coalesce(actual_def, '<missing>'), is_valid, expected_def;
+					END IF;
+				END LOOP;
 			END $$;
 			CREATE UNIQUE INDEX IF NOT EXISTS uq_routing_slips_repo_sha
 				ON routing_slips (lower(repository), commit_sha);
+			DO $$
+			BEGIN
+				-- Post-condition. IF NOT EXISTS matches the relation NAME only: an invalid leftover from a
+				-- failed hand-run online build, a non-unique or differently-keyed index, or a table of that name
+				-- would all be "skipped" and v5 recorded with no uniqueness at all. Pin what the
+				-- one-slip invariant needs — UNIQUE, valid, ready, on exactly this expression — and
+				-- fail loudly otherwise. The flags are not redundant with the text: pg_get_indexdef
+				-- renders an INVALID index identically to a valid one. The pattern is anchored at both
+				-- ends with a single wildcard for the schema qualifier, because pg_get_indexdef
+				-- schema-qualifies the table and a hardcoded schema would reject a healthy index in
+				-- any other schema; the two regclass pins are what make that wildcard safe.
+				IF NOT EXISTS (
+					SELECT 1 FROM pg_index
+					WHERE indexrelid = 'uq_routing_slips_repo_sha'::regclass
+					  AND indrelid = 'routing_slips'::regclass
+					  AND indisunique AND indisvalid AND indisready
+					  AND pg_get_indexdef(indexrelid) LIKE 'CREATE UNIQUE INDEX uq_routing_slips_repo_sha '
+					      || 'ON %routing_slips USING btree (lower(repository), commit_sha)'
+				) THEN
+					RAISE EXCEPTION 'uq_routing_slips_repo_sha is not the expected valid unique index; DROP it and re-run v5';
+				END IF;
+			END $$;
 		`,
 		DownSQL: `
 			DROP INDEX IF EXISTS uq_routing_slips_repo_sha;
