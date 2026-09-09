@@ -113,18 +113,22 @@ type PushOptions struct {
 // buys nothing and the guard dedups onto the existing run instead.
 //
 // HOW TO DERIVE THE VALUE. "Any CI work" means any step of the pipeline config that this push
-// will cause to report — which in the shipped configs is THREE independent classes, not two:
+// will cause to report — which today is THREE independent classes, not two:
 //
 //  1. builds
 //  2. unit tests
 //  3. secret scan
 //
-// The third is easy to miss and is the reason this paragraph exists. `secret_scan` is a
-// componentless non-aggregate step in both shipped configs and a prerequisite of
-// `preprod_deploy` (and of `dev_deploy` in default.json), and pushhookparser dispatches it for
-// every HUMAN commit independently of builds and unit tests — the only exemption is a bot
-// image-tag commit. So a push that builds nothing and runs no unit tests still dispatches real
-// work that reports against this slip, and MUST state DispatchIntentSomething.
+// The third is easy to miss and is the reason this paragraph exists. What makes it a separate
+// class is NOT any file in this repo: `slippy/default.json` and `slippy/production.json` are
+// EXAMPLE configs, and the live pipeline config is the 16-step document in Vault at
+// `DevOps/data/slippy/config#config`, which no code or test here can read. The load-bearing
+// fact is pushhookparser's dispatch behaviour: it fires the secret scan for every HUMAN commit
+// independently of builds and unit tests — the only exemption is a bot image-tag commit. (The
+// example configs illustrate it as a componentless non-aggregate step and a prerequisite of
+// `preprod_deploy`, plus `dev_deploy` in default.json, but that is illustration, not the
+// reason.) So a push that builds nothing and runs no unit tests still dispatches real work
+// that reports against this slip, and MUST state DispatchIntentSomething.
 //
 // Deriving it as `shouldBuild || shouldRunUnitTests` is therefore wrong. On a repo that creates
 // slips without builds, such a push would state DispatchIntentNothing; because a recognized
