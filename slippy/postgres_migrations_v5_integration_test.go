@@ -23,8 +23,14 @@ func pgCountV5(t *testing.T, pool *pgxpool.Pool, q string, args ...any) int {
 // with a "NOT VALID" suffix, so equality (not Contains) plus convalidated is what pins it.
 const v5CascadeFKDef = "FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id) ON DELETE CASCADE"
 
-// v5PoolAtV4 is a fresh database migrated to v4 — the last version without v5's objects — so
-// a subtest can seed the exact pre-existing state it wants v5 to meet.
+// v5PoolAtV4 is a fresh database migrated to v4 — the last version without v5's objects — so a
+// subtest (or newStoreAtV4) can seed the exact pre-existing state it wants v5 to meet.
+//
+// Note how it gets there: RunPostgresMigrations always runs CreateTables to LATEST first and only
+// then honours a lower TargetVersion (postgres_migrate.go), so this applies v5 and then reverts it
+// via v5's DownSQL. The resulting schema is identical to a pristine v4 — but only if DownSQL is
+// complete, so that is asserted here rather than left to surface later as a confusing failure in
+// whatever the caller was actually testing.
 func v5PoolAtV4(t *testing.T) (*pgxpool.Pool, *PipelineConfig) {
 	t.Helper()
 	pool := newPGMigrationTestPool(t)
@@ -32,6 +38,15 @@ func v5PoolAtV4(t *testing.T) (*pgxpool.Pool, *PipelineConfig) {
 	_, err := RunPostgresMigrations(context.Background(), pool,
 		PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 4})
 	require.NoError(t, err)
+	var leftovers int
+	require.NoError(t, pool.QueryRow(context.Background(),
+		"SELECT (SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "+
+			"WHERE i.indrelid = 'routing_slips'::regclass AND ic.relname = 'uq_routing_slips_repo_sha') + "+
+			"(SELECT count(*) FROM pg_constraint WHERE conname IN "+
+			"('fk_component_states_slip','fk_ancestry_slip') AND conrelid IN "+
+			"('slip_component_states'::regclass,'slip_ancestry'::regclass))").Scan(&leftovers))
+	require.Zero(t, leftovers,
+		"v5's DownSQL must remove the index and both FKs; a leftover would fail this caller for the wrong reason")
 	return pool, cfg
 }
 
@@ -48,7 +63,10 @@ func v5MustRefuse(t *testing.T, pool *pgxpool.Pool, cfg *PipelineConfig, wantInE
 	}
 	v, err := GetCurrentPostgresSchemaVersion(ctx, pool)
 	require.NoError(t, err)
-	assert.Equal(t, 4, v, "the failed migration must not be recorded")
+	// Cheap, and pins the migrator contract this migration's whole design rests on rather than
+	// anything slippy-side: UpSQL and the version insert share one transaction, so a refusal
+	// cannot leave 5 recorded.
+	assert.Equal(t, 4, v, "a refused migration must not be recorded")
 }
 
 // TestUniquenessMigration_V5_Integration exercises DEVOPS-231 Phase B against a real
@@ -69,9 +87,11 @@ func TestUniquenessMigration_V5_Integration(t *testing.T) {
 		assert.Equal(t, 1, pgCountV5(
 			t,
 			pool,
-			"SELECT count(*) FROM pg_index WHERE indexrelid = 'uq_routing_slips_repo_sha'::regclass "+
-				"AND indrelid = 'routing_slips'::regclass AND indisunique AND indisvalid AND indisready "+
-				"AND pg_get_indexdef(indexrelid) LIKE '%USING btree (lower(repository), commit_sha)'",
+			"SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "+
+				"WHERE i.indrelid = 'routing_slips'::regclass AND ic.relname = 'uq_routing_slips_repo_sha' "+
+				"AND i.indisunique AND i.indisvalid AND i.indisready "+
+				"AND pg_get_indexdef(i.indexrelid) LIKE 'CREATE UNIQUE INDEX uq_routing_slips_repo_sha "+
+				`ON %routing_slips USING btree (lower(repository), commit\_sha)'`,
 		),
 			"the index must be UNIQUE, valid, ready and on exactly (lower(repository), commit_sha)")
 		for _, c := range []string{"fk_component_states_slip", "fk_ancestry_slip"} {
@@ -139,11 +159,11 @@ func TestUniquenessMigration_V5_Integration(t *testing.T) {
 		var def string
 		require.NoError(t, pool.QueryRow(ctx,
 			"SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_ancestry_slip'").Scan(&def))
-		assert.NotContains(
+		assert.Equal(
 			t,
+			"FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id)",
 			def,
-			"CASCADE",
-			"the foreign constraint is left for the operator to drop, not silently repaired",
+			"the foreign constraint is left exactly as the operator left it, not silently repaired",
 		)
 	})
 
@@ -168,13 +188,50 @@ func TestUniquenessMigration_V5_Integration(t *testing.T) {
 			"CREATE UNIQUE INDEX uq_routing_slips_repo_sha ON routing_slips (repository, commit_sha)")
 		require.NoError(t, err)
 
-		v5MustRefuse(t, pool, cfg, "uq_routing_slips_repo_sha is not the expected valid unique index")
+		v5MustRefuse(t, pool, cfg, "is not the expected valid unique index")
+	})
+
+	t.Run("refuses a same-named index keyed on a similarly named column", func(t *testing.T) {
+		// LIKE reads an unescaped _ as a single-character wildcard, so before commit\_sha was
+		// escaped in the pattern, an index on (lower(repository), commitzsha) satisfied it: v5
+		// reported success while case-variant duplicates still inserted freely. This is the only
+		// state that ever produced a silent success, so it is worth a test of its own.
+		pool, cfg := v5PoolAtV4(t)
+		_, err := pool.Exec(ctx, `
+			ALTER TABLE routing_slips ADD COLUMN commitzsha text NOT NULL DEFAULT '';
+			CREATE UNIQUE INDEX uq_routing_slips_repo_sha ON routing_slips (lower(repository), commitzsha)`)
+		require.NoError(t, err)
+
+		v5MustRefuse(t, pool, cfg, "is not the expected valid unique index")
+	})
+
+	t.Run("succeeds despite an unrelated same-named index in an earlier search_path schema", func(t *testing.T) {
+		// CREATE INDEX places the index in the TABLE's schema, so the post-condition has to look it
+		// up through the table. A bare 'uq_routing_slips_repo_sha'::regclass resolves through
+		// search_path instead — and the default search_path is "$user", public, so a schema named
+		// after the connecting role shadows public. That made v5 reject a database it had just
+		// migrated correctly, with a message telling the operator to drop the wrong index.
+		pool, cfg := v5PoolAtV4(t)
+		_, err := pool.Exec(ctx, `
+			CREATE SCHEMA slippy_write;
+			CREATE TABLE slippy_write.decoy (a text);
+			CREATE UNIQUE INDEX uq_routing_slips_repo_sha ON slippy_write.decoy (a)`)
+		require.NoError(t, err)
+
+		_, err = RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
+		require.NoError(t, err, "an unrelated index of that name in another schema must not fail v5")
+		assert.Equal(t, 1, pgCountV5(t, pool,
+			"SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "+
+				"WHERE i.indrelid = 'routing_slips'::regclass AND ic.relname = 'uq_routing_slips_repo_sha' "+
+				"AND i.indisunique AND i.indisvalid"),
+			"the canonical index must exist on routing_slips itself")
 	})
 
 	t.Run("re-applying the UpSQL on a migrated database is a no-op", func(t *testing.T) {
-		// A concurrent second migrator, or a manual re-run, must not fail: the FK adds swallow
-		// duplicate_object, the index is IF NOT EXISTS, and both post-conditions pass on the
-		// objects the first run created.
+		// A repeated run must not fail: the FK adds swallow duplicate_object, the index is
+		// IF NOT EXISTS, and both post-conditions pass on the objects the first run created.
+		// This is the sequential case; the concurrent-migrator case shares the same statements
+		// and is what postgresmigrator's "every step is idempotent" contract requires.
 		pool := newPGMigrationTestPool(t)
 		cfg := pgTestPipelineConfig(t)
 		_, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})

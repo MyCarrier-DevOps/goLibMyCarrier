@@ -274,24 +274,34 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 				ON routing_slips (lower(repository), commit_sha);
 			DO $$
 			BEGIN
-				-- Post-condition. IF NOT EXISTS matches the relation NAME only: an invalid leftover from a
-				-- failed hand-run online build, a non-unique or differently-keyed index, or a table of that name
-				-- would all be "skipped" and v5 recorded with no uniqueness at all. Pin what the
-				-- one-slip invariant needs — UNIQUE, valid, ready, on exactly this expression — and
-				-- fail loudly otherwise. The flags are not redundant with the text: pg_get_indexdef
-				-- renders an INVALID index identically to a valid one. The pattern is anchored at both
-				-- ends with a single wildcard for the schema qualifier, because pg_get_indexdef
-				-- schema-qualifies the table and a hardcoded schema would reject a healthy index in
-				-- any other schema; the two regclass pins are what make that wildcard safe.
+				-- Post-condition. IF NOT EXISTS matches the relation NAME only: an invalid leftover
+				-- from a hand-run CREATE INDEX CONCURRENTLY, a non-unique or differently-keyed index,
+				-- or a table of that name would all be "skipped" and v5 recorded with no uniqueness
+				-- at all. Pin what the one-slip invariant needs — UNIQUE, valid, ready, on exactly
+				-- this expression — and fail loudly otherwise.
+				--
+				-- Three details are load-bearing. The index is found via the TABLE (indrelid plus
+				-- relname), not by casting its bare name to regclass: CREATE INDEX puts the index in
+				-- the table's schema, while a bare name resolves through search_path and could find
+				-- an unrelated index of that name in an earlier schema — which would fail a database
+				-- this migration had just correctly migrated. The flags are not redundant with the
+				-- text, because pg_get_indexdef renders an invalid index identically to a valid one.
+				-- And the pattern is anchored at both ends, with one wildcard for the schema
+				-- qualifier pg_get_indexdef adds (a hardcoded schema would reject a healthy index in
+				-- any other schema) and commit\_sha escaped, since LIKE would otherwise read the
+				-- underscore as a single-character wildcard and accept an index on a similarly named
+				-- column.
 				IF NOT EXISTS (
-					SELECT 1 FROM pg_index
-					WHERE indexrelid = 'uq_routing_slips_repo_sha'::regclass
-					  AND indrelid = 'routing_slips'::regclass
-					  AND indisunique AND indisvalid AND indisready
-					  AND pg_get_indexdef(indexrelid) LIKE 'CREATE UNIQUE INDEX uq_routing_slips_repo_sha '
-					      || 'ON %routing_slips USING btree (lower(repository), commit_sha)'
+					SELECT 1
+					FROM pg_index i
+					JOIN pg_class ic ON ic.oid = i.indexrelid
+					WHERE i.indrelid = 'routing_slips'::regclass
+					  AND ic.relname = 'uq_routing_slips_repo_sha'
+					  AND i.indisunique AND i.indisvalid AND i.indisready
+					  AND pg_get_indexdef(i.indexrelid) LIKE 'CREATE UNIQUE INDEX uq_routing_slips_repo_sha '
+					      || 'ON %routing_slips USING btree (lower(repository), commit\_sha)'
 				) THEN
-					RAISE EXCEPTION 'uq_routing_slips_repo_sha is not the expected valid unique index; DROP it and re-run v5';
+					RAISE EXCEPTION 'uq_routing_slips_repo_sha on routing_slips is not the expected valid unique index; DROP it and re-run v5';
 				END IF;
 			END $$;
 		`,

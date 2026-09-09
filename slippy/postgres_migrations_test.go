@@ -189,6 +189,20 @@ func TestIndexEnsurer_OmitsDeployIndexesForAbsentSteps(t *testing.T) {
 	}
 }
 
+// stripSQLLineComments removes -- comments so an assertion can target what a migration
+// EXECUTES rather than what its comments say.
+func stripSQLLineComments(sql string) string {
+	var b strings.Builder
+	for line := range strings.SplitSeq(sql, "\n") {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // TestUniquenessMigration_V5 pins the shape of Phase B's migration (DEVOPS-231): the two
 // cascade FKs on correlation_id and the plain unique index on (lower(repository), commit_sha).
 //
@@ -227,10 +241,12 @@ func TestUniquenessMigration_V5(t *testing.T) {
 		// Post-conditions: a name match (duplicate_object / IF NOT EXISTS) is not proof of shape.
 		"SELECT pg_get_constraintdef(oid), convalidated",
 		"IF actual_def IS DISTINCT FROM expected_def OR NOT coalesce(is_valid, false)",
-		"AND indrelid = 'routing_slips'::regclass",
-		"AND indisunique AND indisvalid AND indisready",
-		"LIKE 'CREATE UNIQUE INDEX uq_routing_slips_repo_sha '",
-		"|| 'ON %routing_slips USING btree (lower(repository), commit_sha)'",
+		"WHERE i.indrelid = 'routing_slips'::regclass",
+		"AND ic.relname = 'uq_routing_slips_repo_sha'",
+		"AND i.indisunique AND i.indisvalid AND i.indisready",
+		// The expression, with the underscore escaped so LIKE cannot treat it as a wildcard.
+		// Deliberately not pinning how the pattern literal is split across source lines.
+		`ON %routing_slips USING btree (lower(repository), commit\_sha)`,
 	} {
 		assert.Contains(t, up, want)
 	}
@@ -239,16 +255,23 @@ func TestUniquenessMigration_V5(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(up, "duplicate_object"),
 		"both FK adds must be no-ops for a concurrent or repeated migrator run")
 	assert.Equal(t, 2, strings.Count(up, "RAISE EXCEPTION"), "one post-condition per half of the migration")
+
+	// The negative assertions are about what the migration EXECUTES, so they run against the SQL
+	// with -- comments stripped. Matching comment prose too would make these guards shape the
+	// documentation instead of the DDL: the index post-condition has to name
+	// CREATE INDEX CONCURRENTLY to explain the state it rejects, and an explanatory comment may
+	// legitimately mention a schema-qualified name.
+	upDDL := stripSQLLineComments(up)
+	assert.NotContains(t, upDDL, "CONCURRENTLY",
+		"a plain build: CONCURRENTLY cannot run inside the migrator's per-migration transaction")
+	assert.NotContains(t, upDDL, "parent_correlation_id",
+		"no FK of any kind on slip_ancestry.parent_correlation_id — see the spec §3 banner and §7")
 	assert.NotContains(
 		t,
-		up,
+		upDDL,
 		"public.",
 		"schema-agnostic: pg_get_indexdef qualifies the table, so a hardcoded schema would reject a healthy index elsewhere",
 	)
-	assert.NotContains(t, up, "CONCURRENTLY",
-		"a plain build: CONCURRENTLY cannot run inside the migrator's per-migration transaction")
-	assert.NotContains(t, up, "parent_correlation_id",
-		"no FK of any kind on slip_ancestry.parent_correlation_id — see the spec §3 banner and §7")
 
 	down := v5.DownSQL
 	for _, want := range []string{

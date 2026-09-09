@@ -33,25 +33,12 @@ func newMigratedStore(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineCon
 // under test is reached. The live-first ordering those tests pin is kept in the queries as
 // defence in depth for an environment where v5 has not yet been applied.
 //
-// Note how it gets there: RunPostgresMigrations always runs CreateTables to LATEST first and
-// only then honours a lower TargetVersion (postgres_migrate.go), so this applies v5 and then
-// reverts it via v5's DownSQL. The resulting schema is identical to a pristine v4, but the
-// path means an incomplete DownSQL would otherwise surface as an ErrDuplicateSlip from a
-// store.Create in an unrelated test — hence the assertion below.
+// v5PoolAtV4 owns how a v4 schema is reached and asserts that v5's DownSQL fully reverted;
+// keeping that in one place is what stops a DownSQL regression from surfacing here as an
+// unexplained ErrDuplicateSlip.
 func newStoreAtV4(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig) {
 	t.Helper()
-	pool := newPGMigrationTestPool(t)
-	cfg := pgTestPipelineConfig(t)
-	_, err := RunPostgresMigrations(context.Background(), pool,
-		PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 4})
-	require.NoError(t, err)
-	var leftovers int
-	require.NoError(t, pool.QueryRow(context.Background(),
-		"SELECT (SELECT count(*) FROM pg_indexes WHERE indexname = 'uq_routing_slips_repo_sha') + "+
-			"(SELECT count(*) FROM pg_constraint WHERE conname IN "+
-			"('fk_component_states_slip','fk_ancestry_slip'))").Scan(&leftovers))
-	require.Zero(t, leftovers,
-		"v5's DownSQL must remove the index and both FKs; a leftover breaks the dup-seeding tests")
+	pool, cfg := v5PoolAtV4(t)
 	store, err := NewPostgresStore(pool, cfg, nil)
 	require.NoError(t, err)
 	return store, pool, cfg
