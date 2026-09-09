@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +64,72 @@ func TestPostgresStore_Create_Upsert(t *testing.T) {
 
 	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
 	require.NoError(t, store.Create(context.Background(), slip))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_Create_DuplicateMapsToSentinel pins the 23505 -> ErrDuplicateSlip
+// mapping (DEVOPS-231). Until migration v5 adds the uq_routing_slips_repo_sha unique
+// index, no production INSERT can actually trigger this constraint violation - this
+// test exercises the mapping in isolation via a fake pgconn.PgError so the backstop's
+// errors.Is(err, ErrDuplicateSlip) contract is verified ahead of the migration landing.
+func TestPostgresStore_Create_DuplicateMapsToSentinel(t *testing.T) {
+	store, mock := newMockStore(t)
+	pgErr := &pgconn.PgError{
+		Code:           "23505",
+		ConstraintName: "uq_routing_slips_repo_sha",
+		Message:        "duplicate key value violates unique constraint \"uq_routing_slips_repo_sha\"",
+	}
+	mock.ExpectExec("INSERT INTO routing_slips .* ON CONFLICT \\(correlation_id\\) DO UPDATE SET").
+		WithArgs(anyArgs(len(store.slipColumns()))...).
+		WillReturnError(pgErr)
+
+	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
+	err := store.Create(context.Background(), slip)
+	require.ErrorIs(t, err, ErrDuplicateSlip)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_Create_OtherPgErrorNotMapped confirms the mapping is narrow: a
+// unique violation on a different constraint, or any other Postgres error code, is
+// wrapped as a plain error rather than misreported as ErrDuplicateSlip.
+func TestPostgresStore_Create_OtherPgErrorNotMapped(t *testing.T) {
+	store, mock := newMockStore(t)
+	pgErr := &pgconn.PgError{
+		Code:           "23505",
+		ConstraintName: "routing_slips_pkey",
+		Message:        "duplicate key value violates unique constraint \"routing_slips_pkey\"",
+	}
+	mock.ExpectExec("INSERT INTO routing_slips .* ON CONFLICT \\(correlation_id\\) DO UPDATE SET").
+		WithArgs(anyArgs(len(store.slipColumns()))...).
+		WillReturnError(pgErr)
+
+	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
+	err := store.Create(context.Background(), slip)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrDuplicateSlip)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_Create_WrongCodeNotMapped confirms the mapping requires BOTH the
+// 23505 (unique_violation) code AND the uq_routing_slips_repo_sha constraint name - a
+// mutant that drops the `pgErr.Code == "23505"` half of the check (keeping only the
+// constraint-name comparison) would map this to ErrDuplicateSlip even though the code
+// here (23503, foreign_key_violation) is not a unique violation at all.
+func TestPostgresStore_Create_WrongCodeNotMapped(t *testing.T) {
+	store, mock := newMockStore(t)
+	pgErr := &pgconn.PgError{
+		Code:           "23503",
+		ConstraintName: "uq_routing_slips_repo_sha",
+		Message:        "foreign key violation",
+	}
+	mock.ExpectExec("INSERT INTO routing_slips .* ON CONFLICT \\(correlation_id\\) DO UPDATE SET").
+		WithArgs(anyArgs(len(store.slipColumns()))...).
+		WillReturnError(pgErr)
+
+	slip := &Slip{CorrelationID: "c1", Repository: "owner/repo", Branch: "main", CommitSHA: "sha1"}
+	err := store.Create(context.Background(), slip)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrDuplicateSlip)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -140,6 +207,51 @@ func TestPostgresStore_Load_Hydrates(t *testing.T) {
 	assert.Equal(t, "api", slip.Aggregates["builds"][0].Component)
 	require.Len(t, slip.StateHistory, 1)
 	assert.Equal(t, "builds", slip.StateHistory[0].Step)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc pins both ORDER BY terms.
+// Phase A (this branch) ships before the Phase B cleanup + uq_routing_slips_repo_sha unique
+// index, so duplicate rows per (repository, commit_sha) can still exist in production, and
+// without an explicit order Postgres gives LIMIT 1 no ordering guarantee at all.
+//
+// The live-first term is the one that changes an outcome: CreateSlipForPush dedupes onto a
+// live row but REPAVES anything else, so returning a more-recently-updated ended duplicate
+// ahead of a stalled live row re-dispatches a pipeline that is still running. The behavioural
+// proof is in postgres_store_integration_test.go against real rows; this test pins the SQL so
+// the terms cannot be dropped or reordered silently.
+func TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
+	store, mock := newMockStore(t)
+	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
+	mock.ExpectQuery(
+		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
+			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
+			`updated_at DESC LIMIT 1`,
+	).WithArgs("owner/repo", "sha1").WillReturnRows(rows)
+
+	slip, err := store.LoadByCommit(context.Background(), "owner/repo", "sha1")
+	require.NoError(t, err)
+	assert.Equal(t, "c1", slip.CorrelationID)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestPostgresStore_LoadLiveByCommit_OrdersLiveFirstThenUpdatedAtDesc is the
+// LoadLiveByCommit counterpart. Its status filter is not a substitute for the ordering: it
+// excludes abandoned/promoted/compensated but not 'completed' or 'failed', so a completed
+// duplicate can still surface ahead of the live row on updated_at DESC alone.
+func TestPostgresStore_LoadLiveByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
+	store, mock := newMockStore(t)
+	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
+	mock.ExpectQuery(
+		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
+			`AND status NOT IN \('abandoned', 'promoted', 'compensated'\) `+
+			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
+			`updated_at DESC LIMIT 1`,
+	).WithArgs("owner/repo", "sha1").WillReturnRows(rows)
+
+	slip, err := store.LoadLiveByCommit(context.Background(), "owner/repo", "sha1")
+	require.NoError(t, err)
+	assert.Equal(t, "c1", slip.CorrelationID)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

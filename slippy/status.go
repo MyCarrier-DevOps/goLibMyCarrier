@@ -54,6 +54,21 @@ func (s SlipStatus) IsTerminal() bool {
 	}
 }
 
+// IsLive returns true when the slip status represents an in-flight (or recoverable)
+// pipeline that a same-commit push should reuse rather than repave: true for every
+// status that is neither terminal (see IsTerminal) nor SlipStatusFailed.
+//
+// This is the repave decision predicate shared by CreateSlipForPush's main path and
+// handleDuplicateSlipBackstop (DEVOPS-231 review finding B5): a live status means
+// "reuse via retry/dedup", a non-live (ended) status means "repave" (delete + create
+// fresh), subject to the empty-run guard both call sites apply. SlipStatusFailed is
+// deliberately non-live even though it is non-terminal — a failed slip never advances
+// on its own, so a new push for the same commit is treated as a deliberate re-run
+// request rather than an in-flight run to dedup onto.
+func (s SlipStatus) IsLive() bool {
+	return !s.IsTerminal() && s != SlipStatusFailed
+}
+
 // StepStatus represents the status of an individual pipeline step.
 // Steps progress through various states during execution.
 type StepStatus string

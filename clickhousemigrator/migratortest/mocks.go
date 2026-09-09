@@ -96,6 +96,15 @@ type MockConn struct {
 	// AsyncInsertError is returned by AsyncInsert
 	AsyncInsertError error
 
+	// QueryFormatReader is returned by QueryFormat
+	QueryFormatReader io.ReadCloser
+
+	// QueryFormatError is returned by QueryFormat
+	QueryFormatError error
+
+	// InsertFormatError is returned by InsertFormat
+	InsertFormatError error
+
 	// PrepareBatchCalls tracks PrepareBatch calls
 	PrepareBatchCalls int
 }
@@ -198,6 +207,23 @@ func (m *MockConn) Ping(ctx context.Context) error {
 // AsyncInsert performs an async insert.
 func (m *MockConn) AsyncInsert(ctx context.Context, query string, wait bool, args ...interface{}) error {
 	return m.AsyncInsertError
+}
+
+// QueryFormat executes a query returning the raw encoded result
+// (driver.Conn, clickhouse-go v2.48.0+).
+func (m *MockConn) QueryFormat(
+	ctx context.Context,
+	format string,
+	query string,
+	args ...interface{},
+) (io.ReadCloser, error) {
+	return m.QueryFormatReader, m.QueryFormatError
+}
+
+// InsertFormat streams an INSERT in the given format
+// (driver.Conn, clickhouse-go v2.48.0+).
+func (m *MockConn) InsertFormat(ctx context.Context, format, query string, data io.Reader) error {
+	return m.InsertFormatError
 }
 
 // PrepareBatch prepares a batch insert.
@@ -372,7 +398,7 @@ func (m *MockRow) Scan(dest ...interface{}) error {
 
 		// Use reflection to set the value
 		dv := reflect.ValueOf(d)
-		if dv.Kind() != reflect.Ptr {
+		if dv.Kind() != reflect.Pointer {
 			continue
 		}
 

@@ -122,3 +122,69 @@ func TestAbsInt(t *testing.T) {
 	assert.Equal(t, 3, absInt(3))
 	assert.Equal(t, 0, absInt(0))
 }
+
+// TestIndexEnsurer_EmitsEveryIndex pins the index names the ensurer emits.
+//
+// Nothing asserted these before: TestPostgresDynamicEnsurers_PerStep checks the per-step column
+// DDL and a generic "IF NOT EXISTS", and TestGetPostgresDynamic_FreeFuncs counts ensurers —
+// GenerateEnsurers appends exactly one index ensurer, so the statement count inside it cannot
+// move that number. Deleting any CREATE INDEX line was green.
+//
+// That mattered most for the two slip_ancestry indexes, which the ensurer's own comment argues
+// are load-bearing: Repave runs three slip_ancestry statements inside the transaction already
+// holding the superseded row's delete lock, under a 30s statement timeout, with a repave failure
+// now fatal to the push. Before them, correlation_id was reachable only as a full index scan and
+// parent_correlation_id had no index at all.
+//
+// This is a change-detector by construction — it proves the string is emitted, not that an index
+// exists. TestPostgresMigrations_IndexesExist_Integration is the behavioural half.
+func TestIndexEnsurer_EmitsEveryIndex(t *testing.T) {
+	m := &PostgresDynamicMigrationManager{config: testPipelineConfig()}
+	sql := m.indexEnsurer().SQL
+
+	// The five unconditional indexes.
+	for _, name := range []string{
+		"idx_routing_slips_repo",
+		"idx_routing_slips_commit",
+		"idx_routing_slips_status",
+		"idx_slip_ancestry_correlation",
+		"idx_slip_ancestry_parent",
+	} {
+		assert.Contains(t, sql, "CREATE INDEX IF NOT EXISTS "+name+" ",
+			"indexEnsurer must emit %s", name)
+	}
+
+	// The deploy-status indexes are conditional on the step existing, because their columns are
+	// created by the step ensurers. Derived from the config rather than hardcoded, so this states
+	// the rule instead of restating whatever testPipelineConfig happens to carry.
+	for _, stepName := range []string{"dev_deploy", "preprod_deploy", "prod_deploy"} {
+		stmt := "CREATE INDEX IF NOT EXISTS idx_" + stepName + "_status ON routing_slips (" +
+			stepName + "_status)"
+		if m.config.GetStep(stepName) != nil {
+			assert.Contains(t, sql, stmt, "%s is configured, so its index must be emitted", stepName)
+		} else {
+			assert.NotContains(t, sql, stmt,
+				"%s is not configured, so no step ensurer creates the column this would index", stepName)
+		}
+	}
+
+	// The two repave indexes must be on the columns Repave actually filters, not merely present
+	// under the right name — an index on the wrong column is the failure this guards.
+	assert.Contains(t, sql, "idx_slip_ancestry_correlation ON slip_ancestry (correlation_id)")
+	assert.Contains(t, sql, "idx_slip_ancestry_parent ON slip_ancestry (parent_correlation_id)")
+}
+
+// TestIndexEnsurer_OmitsDeployIndexesForAbsentSteps is the complement: the deploy-status indexes
+// are conditional on the step existing, because their columns are created by the step ensurers.
+// Without this, emitting them unconditionally would satisfy the table above.
+func TestIndexEnsurer_OmitsDeployIndexesForAbsentSteps(t *testing.T) {
+	m := &PostgresDynamicMigrationManager{config: &PipelineConfig{Steps: []StepConfig{{Name: "build"}}}}
+	sql := m.indexEnsurer().SQL
+
+	assert.Contains(t, sql, "idx_slip_ancestry_correlation",
+		"the unconditional indexes are still emitted")
+	for _, name := range []string{"idx_dev_deploy_status", "idx_preprod_deploy_status", "idx_prod_deploy_status"} {
+		assert.NotContains(t, sql, name,
+			"%s indexes a column no step ensurer creates for this config", name)
+	}
+}

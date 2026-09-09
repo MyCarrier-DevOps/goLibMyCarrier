@@ -3,6 +3,7 @@ package clickhousemigrator
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -231,6 +232,13 @@ type MockConn struct {
 	AsyncInsertCalls []AsyncInsertCall
 	AsyncInsertErr   error
 
+	// QueryFormat tracking (clickhouse-go v2.48.0+)
+	QueryFormatReader io.ReadCloser
+	QueryFormatErr    error
+
+	// InsertFormat tracking (clickhouse-go v2.48.0+)
+	InsertFormatErr error
+
 	// PrepareBatch tracking
 	PrepareBatchCalls []PrepareBatchCall
 	PrepareBatchErr   error
@@ -337,6 +345,25 @@ func (c *MockConn) AsyncInsert(ctx context.Context, query string, wait bool, arg
 	defer c.mu.Unlock()
 	c.AsyncInsertCalls = append(c.AsyncInsertCalls, AsyncInsertCall{Query: query, Args: args})
 	return c.AsyncInsertErr
+}
+
+// QueryFormat implements driver.Conn (clickhouse-go v2.48.0+).
+func (c *MockConn) QueryFormat(
+	ctx context.Context,
+	format string,
+	query string,
+	args ...interface{},
+) (io.ReadCloser, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.QueryFormatReader, c.QueryFormatErr
+}
+
+// InsertFormat implements driver.Conn (clickhouse-go v2.48.0+).
+func (c *MockConn) InsertFormat(ctx context.Context, format, query string, data io.Reader) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.InsertFormatErr
 }
 
 // PrepareBatch implements driver.Conn.

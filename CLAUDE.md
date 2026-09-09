@@ -91,8 +91,11 @@ make lint            # golangci-lint (NOT raw `golangci-lint run`)
 make test            # go test w/ race + count + coverage flags (NOT raw `go test ./...`)
 make fmt             # gofmt/goimports (NOT raw `gofmt -l`)
 make tidy            # go mod tidy across all modules
-make check-sec       # gosec scan (NOT raw `gosec ./...`)
-make check-coverage  # coverage threshold gate
+make check-sec       # govulncheck vulnerability scan (NOT raw `govulncheck ./...`)
+make check-coverage  # coverage gate, mirrors the CI job (same scope, exclusions, threshold)
+make doctor          # report local toolchain drift vs CI; non-zero on mismatch
+make mutation        # mutation-test lines changed vs MUTATION_BASE — diff-scoped pre-merge gate
+make mutation-all    # mutation-test a module in full — periodic audit, not a pre-merge gate
 make bump            # version bump helper
 ```
 
@@ -102,8 +105,8 @@ Available targets: `make help` (if defined) or `grep -E "^[a-z_-]+:" Makefile`.
 across all modules in `LIB_DIRS`. When you're working in one package, pass
 `PKG=<module>` to run just that one instead of the whole repo — e.g.
 `make test PKG=slippy`, `make lint PKG=clickhouse`, `make check-sec PKG=vault`.
-Only `lint`, `test`, and `check-sec` honor `PKG=`; `fmt`, `tidy`, and `bump`
-always run across all modules.
+Only `lint`, `test`, `check-sec`, `check-coverage`, `mutation`, and `mutation-all` honor
+`PKG=`; `fmt`, `tidy`, and `bump` always run across all modules.
 
 **Raw `go build ./...` / `go vet ./...` are acceptable for quick verification** but final gate before commit must run `make lint && make test`.
 
@@ -119,10 +122,11 @@ versioned packages, not a single service or binary. The root `go.mod`
 tracking; consumers import each package by its own module path
 (`.../goLibMyCarrier/slippy`, `.../goLibMyCarrier/clickhouse`, `.../goLibMyCarrier/logger`, …).
 
-There are 16 modules, each with its own `go.mod` (the root `.` plus the dirs in
-the Makefile's `LIB_DIRS`): `argocdclient`, `auth`, `cievents`, `clickhouse`,
+There are 19 modules, each with its own `go.mod`: the root `.` plus the 18 dirs
+in the Makefile's `LIB_DIRS`: `argocdclient`, `auth`, `cievents`, `clickhouse`,
 `clickhousemigrator`, `github`, `kafka`, `logger`, `otel`, `pollyapi`,
-`repocanon`, `slippy`, `slippyapi`, `vault`, `yaml`. The `make` targets iterate
+`postgres`, `postgresmigrator`, `repocanon`, `slippy`, `slippyapi`, `teamsbot`,
+`vault`, `yaml`. The `make` targets iterate
 `LIB_DIRS`, and CI discovers modules dynamically (`find . -name go.mod`) and fans
 out per-module matrix jobs for test, lint, and vuln, then tags and releases every
 module at one shared version.
@@ -135,8 +139,10 @@ The go-devkit block above refers to an `APPLICATION` variable — that's the
 single-service Makefile pattern and **does not exist in this repo**. Because this
 is a multi-module library, the Makefile enumerates its modules in a **`LIB_DIRS`**
 variable instead, and every target (`lint`, `test`, `fmt`, `bump`, `tidy`,
-`check-sec`) loops over `LIB_DIRS` (the `lint`, `test`, and `check-sec` targets
-also accept `PKG=<module>` to scope to a single package — see Build & Test).
+`check-sec`, `check-coverage`, `mutation`, `mutation-all`) loops over `LIB_DIRS`
+(the `lint`, `test`, `check-sec`, `check-coverage`, `mutation`, and
+`mutation-all` targets also accept `PKG=<module>` to scope to a single package —
+see Build & Test).
 CI ignores `LIB_DIRS` and discovers modules dynamically via
 `find . -name go.mod`. When you add or remove a module, update `LIB_DIRS` in the
 Makefile — there is no `APPLICATION` line to touch.

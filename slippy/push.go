@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -98,6 +99,152 @@ type PushOptions struct {
 
 	// Components defines the components to track
 	Components []ComponentDefinition
+
+	// Dispatch states whether this push will actually dispatch CI work, which the
+	// empty-run guard needs to know and cannot reliably infer. Leave it at its zero
+	// value (DispatchIntentUnspecified) to keep the legacy component-count inference;
+	// set it explicitly to make the guard correct. See DispatchIntent.
+	Dispatch DispatchIntent
+}
+
+// DispatchIntent is a caller's statement about whether a push will dispatch any CI work. The
+// empty-run guard in CreateSlipForPush uses it to decide whether repaving an ended slip for the
+// same commit is worth destroying that run's history: if nothing will be dispatched, the repave
+// buys nothing and the guard dedups onto the existing run instead.
+//
+// HOW TO DERIVE THE VALUE. "Any CI work" means any step of the pipeline config that this push
+// will cause to report — which in the shipped configs is THREE independent classes, not two:
+//
+//  1. builds
+//  2. unit tests
+//  3. secret scan
+//
+// The third is easy to miss and is the reason this paragraph exists. `secret_scan` is a
+// componentless non-aggregate step in both shipped configs and a prerequisite of
+// `preprod_deploy` (and of `dev_deploy` in default.json), and pushhookparser dispatches it for
+// every HUMAN commit independently of builds and unit tests — the only exemption is a bot
+// image-tag commit. So a push that builds nothing and runs no unit tests still dispatches real
+// work that reports against this slip, and MUST state DispatchIntentSomething.
+//
+// Deriving it as `shouldBuild || shouldRunUnitTests` is therefore wrong. On a repo that creates
+// slips without builds, such a push would state DispatchIntentNothing; because a recognized
+// intent is consulted BEFORE the `failed` carve-out, that dedups onto a failed run and the
+// commit can no longer be retriggered by re-pushing — reintroducing exactly the hole this field
+// exists to close, in the one place the carve-out no longer reaches.
+//
+// A practical consequence worth knowing before adopting: since the scan fires for every human
+// commit, nearly every human push is DispatchIntentSomething. DispatchIntentNothing is for bot
+// image-tag commits and genuinely zero-work pushes, not for "this repo has no build
+// components".
+//
+// It exists because the guard's original inference — "len(Components) == 0 means nothing
+// will be dispatched" — is wrong for a repo that runs unit tests without builds
+// (buildable=false + RunUnitTests=true). pushhookparser nils out components whenever builds
+// are skipped, while still dispatching the unit-tester event, so the guard fired on pushes
+// that DID dispatch work. The consequence was a real functional hole: a failed unit-test run
+// on such a repo could not be retriggered by re-pushing the commit, because the guard
+// returned the old slip and the caller treats a returned id ≠ the id it sent as a duplicate
+// and suppresses every side effect — unit tests included.
+//
+// Component count is not recoverable as a signal here, because the same "zero components"
+// value legitimately means BOTH "branch create at an existing SHA, nothing to do" and
+// "tests-only repo, unit tests are about to run". Only the caller knows which.
+//
+// The two point-in-time facts behind that, recorded here and deliberately nowhere else in
+// this repo — they describe another repository's source and config, so nothing here can
+// notice them going stale:
+//   - the pushhookparser line is `if !shouldBuild { slipComponents = nil }`, in
+//     pkg/parser/pushparser.go, which runs even when shouldRunUnitTests is true;
+//   - as of 2026-08-28, five MyCarrier-Engineering repos carry the triggering combination
+//     (buildable=false + RunUnitTests=true + AllowSlipWithNoBuilds=true). The third
+//     property is required: shouldCreateSlip is `shouldBuild || allowSlipWithNoBuilds` and
+//     does not include shouldRunUnitTests, so without it no slip is created at all.
+//
+// Adoption order across the three repos, and the one rule that matters: this library
+// releases first, then slippy-api forwards the field, then pushhookparser sets it. The
+// middle hop must FORWARD the origin's intent and must never re-derive it — deriving
+// Dispatch from len(components) in slippy-api would re-encode the exact inference this type
+// exists to remove, except as an EXPLICIT value that beats the DispatchIntentUnspecified
+// fallback and therefore cannot be corrected by any later release of this library. Only the
+// component that knows whether work will actually dispatch may set this.
+//
+// It is a string type, like every other enum-like type in this package (SlipStatus,
+// StepStatus, PrereqStatus, HoldOutcome, PreExecutionOutcome). It also carries a String()
+// method, as SlipStatus, StepStatus and PrereqStatus do; the other two do not. That is
+// not only convention: the dispatch_intent trio this adds is rendered by zap, which matches
+// fmt.Stringer but does NOT match a named uint8 type — so a numeric enum would have printed
+// `dispatch_intent=0` on the lines an operator reads to explain why a run's history was
+// preserved or destroyed. Choosing the underlying type now matters because changing it after
+// release is breaking, while adding String() never is.
+//
+// The field set and its call sites are stated once, on addDispatchIntentFields. Do not restate
+// the counts here: "two fields" and "the one line" were both correct when written and both went
+// stale within a commit.
+type DispatchIntent string
+
+const (
+	// DispatchIntentUnspecified means the caller has not stated its intent, so the guard
+	// falls back to inferring it from len(Components). This is the zero value on purpose:
+	// this library releases before its consumers (slippy-api, pushhookparser) adopt the
+	// field, and an un-updated caller must keep behaving exactly as it does today rather
+	// than silently changing semantics during the release window.
+	DispatchIntentUnspecified DispatchIntent = ""
+
+	// DispatchIntentSomething means this push WILL dispatch CI work, so an ended slip for
+	// the same commit should be repaved even when Components is empty. This is what a
+	// tests-only repo sends.
+	//
+	// Sequencing note for an adopting consumer: setting this opts a zero-component push
+	// INTO the repave path, and therefore into the Phase A double-row race described in
+	// .github/STATE_MACHINE_V3.md — two concurrent same-commit pushes can both repave and
+	// both insert, because no unique index exists until Phase B. The component-count
+	// inference previously shielded these repos from that. It also opts the push into
+	// ancestry resolution and into a repave failure being fatal, where the guard's early
+	// return previously made it a no-op; see CreateSlipForPush.
+	//
+	// One class of that fatality does not converge on redelivery: ErrInvalidConfiguration
+	// (today, a self-repave where the caller presents its own correlation ID as the row to
+	// supersede). The superseded row does survive, so the usual "Kafka redelivers against a
+	// store that still holds the row" argument applies to the row — but the offending value
+	// is the caller's own input and is stable across attempts, so every redelivery is
+	// rejected identically.
+	//
+	// Setting this field does NOT expose a caller to that class, and an earlier version of this
+	// note said it did. The self-correlation exclusion in emptyRunGuardApplies sits ABOVE the
+	// intent switch and is unconditional, so a self-correlation push reaches the in-place
+	// upsert identically whether Dispatch is unset, something, nothing, or unrecognized — this
+	// field opts you into nothing for that shape.
+	//
+	// ErrInvalidConfiguration is in fact unreachable today from every call site: Repave rejects
+	// only a nil successor and a self-referential supersede, all three store.Repave call sites
+	// sit past a same-correlation divert, and the successor's ID is assigned once from
+	// opts.CorrelationID and never reassigned. The explicit arms remain because the sentinel is
+	// part of the store contract and a future caller could present either shape; they are
+	// defensive, not currently exercised.
+	DispatchIntentSomething DispatchIntent = "something"
+
+	// DispatchIntentNothing means this push will dispatch NO CI work, so an ended slip for
+	// the same commit must be left intact and deduped onto. Authoritative even when
+	// Components is non-empty — in which case the fresh-create path also declines to seed
+	// component rows for work that will never report (see initializeSlipForPush).
+	//
+	// Sequencing note for an adopting consumer, mirroring the one on DispatchIntentSomething: a
+	// Nothing push can race a Something push for the same SHA — a branch-create event and a push
+	// event for one commit, which is exactly the shape the empty-run guard exists for. The guard
+	// returns the snapshot it loaded, which the concurrent push may already have repaved or
+	// reset to live under another run's identity. The returned correlation ID is therefore a
+	// dedup marker, not a write handle: it must not be used for subsequent UpdateStep calls,
+	// which would either fail with ErrSlipNotFound or land on another run's row.
+	DispatchIntentNothing DispatchIntent = "nothing"
+)
+
+// String names the zero value explicitly so a structured log field reads "unspecified"
+// rather than an empty value.
+func (d DispatchIntent) String() string {
+	if d == DispatchIntentUnspecified {
+		return "unspecified"
+	}
+	return string(d)
 }
 
 // Validate checks that all required fields are present.
@@ -114,6 +261,138 @@ func (o PushOptions) Validate() error {
 	return nil
 }
 
+// recognized reports whether this DispatchIntent is one the library acts on. An unrecognized
+// value is not rejected — dispatchesNothing falls back to the component-count inference for it,
+// deliberately — but the fallback is NOT a guarantee that history survives: see
+// dispatchesNothing for the two shapes where a mis-serialized value repaves. The fallback is
+// also otherwise silent, and the guard's log line renders Dispatch verbatim.
+// Without this flag alongside it, that line reads as though the caller's stated intent decided
+// the outcome when in fact it was ignored. The domain is a string crossing two repo
+// boundaries (library → slippy-api → pushhookparser), so case and whitespace variants of the
+// valid values are reachable inputs, not hypotheticals.
+func (d DispatchIntent) recognized() bool {
+	switch d {
+	case DispatchIntentNothing, DispatchIntentSomething, DispatchIntentUnspecified:
+		return true
+	default:
+		return false
+	}
+}
+
+// addDispatchIntentFields merges the dispatch-intent audit trio into a log field map and
+// returns it. THIS IS THE ONE PLACE the trio is constructed — every call site gets the same
+// three fields, so adding a fourth or renaming one cannot leave a site behind, and no comment
+// anywhere needs to state how many fields there are.
+//
+// The fields:
+//
+//	dispatch_intent             the caller's raw value, rendered via String()
+//	dispatch_intent_honored     a recognized non-Unspecified value decided the outcome
+//	dispatch_intent_recognized  the value is inside the enum at all
+//
+// ALERT ON dispatch_intent_recognized = false. That is the only one of the three that isolates
+// a caller who got the value wrong. `honored = false` looks like the right signature and is not:
+// it is also false for the UNSET zero value, which String() renders as the literal
+// "unspecified" — so until Dispatch is forwarded end-to-end, when every real push arrives
+// Unspecified, "honored=false beside a non-empty dispatch_intent" matches every push and
+// isolates nothing. `recognized` also does not depend on how a consumer's Logger serializes the
+// value; Logger is an interface consumers implement, and DispatchIntent has String() but no
+// MarshalJSON, so the rendering was never this library's to guarantee.
+//
+// Every log line that reports a decision about an ended slip for this commit calls this, and
+// the repave lines matter most: that is where an intent that was ignored went on to destroy a
+// prior run's history. `grep -n addDispatchIntentFields` is the site list; do not write the
+// count into a comment, because it has gone stale in three consecutive review rounds.
+func addDispatchIntentFields(fields map[string]interface{}, d DispatchIntent) map[string]interface{} {
+	fields["dispatch_intent"] = d
+	fields["dispatch_intent_honored"] = d.honored()
+	fields["dispatch_intent_recognized"] = d.recognized()
+	return fields
+}
+
+// honored reports whether the caller's stated intent DECIDED an outcome — not merely whether
+// the value was recognized. It is what the `dispatch_intent_honored` log field carries.
+//
+// Both terms are load-bearing, which is why this is a method rather than the expression written
+// out at each log site. `recognized()` alone is the wrong predicate: DispatchIntentUnspecified
+// IS recognized, but it is never honored — the component-count inference decides instead — so a
+// flag reading "recognized" would be true for the unset zero value and assert the opposite of
+// what an operator would take it to mean for THIS field. False therefore covers both an
+// unrecognized Dispatch and the unset zero value.
+//
+// That is an argument about which predicate the `dispatch_intent_honored` field should carry,
+// not an argument against `recognized` as a signal: both ship, because they answer different
+// questions. recognized=false means the caller sent a value outside the enum, which is the
+// predicate to ALERT on; honored=false means the caller's value did not decide the outcome,
+// which is true of every unset push. See addDispatchIntentFields.
+func (d DispatchIntent) honored() bool {
+	return d != DispatchIntentUnspecified && d.recognized()
+}
+
+// dispatchesNothing reports whether this push will dispatch no CI work at all, in which
+// case repaving an ended slip for the same commit would destroy that run's history for zero
+// benefit. A RECOGNIZED explicit Dispatch wins; DispatchIntentUnspecified and any
+// unrecognized value both fall back to the legacy component-count inference.
+//
+// A MIS-SERIALIZED VALUE IS NOT SAFE, and an earlier version of this comment said it was
+// ("a caller does not need to pre-validate its enum value to get safe behavior"). The fallback
+// is the legacy inference, and the inference licenses a repave in two shapes:
+//
+//   - Dispatch="Nothing" (wrong casing) WITH components: the inference sees len(Components) > 0,
+//     returns false, the guard declines, and the prior run is repaved — where the correctly
+//     cased "nothing" would have deduped and preserved it.
+//   - Dispatch="Nothing" with ZERO components on a `failed` row: the unrecognized value falls
+//     through emptyRunGuardApplies' honored() check to the `failed` carve-out, which declines
+//     before this method is consulted at all.
+//
+// So a caller crossing a JSON boundary SHOULD validate the value at that boundary. The right
+// place is slippy-api's request decoding, where a bad value can be a 422 the sender sees.
+//
+// The fallback itself is deliberately left alone. Making the unrecognized arm skip the
+// carve-out was tried and rejected: it changes exactly the cells where a mis-cased "Something"
+// from a tests-only repo goes from retrigger to blocked — the outage DEVOPS-264 exists to
+// close. Normalizing case or whitespace is worse still, since it would make the library guess
+// at a value the sender got wrong. Degrading to the legacy behaviour is the least-bad of the
+// three; it is just not the same thing as being safe.
+//
+// Both empty-run guards (CreateSlipForPush's and handleDuplicateSlipBackstop's mirror of it)
+// route through the single emptyRunGuardApplies, which is what keeps them from drifting.
+//
+// What that does NOT mean is that the guard answers the intent question itself. honored()
+// reports only THAT a recognized intent was stated, never WHICH one — so the guard's
+// `if opts.Dispatch.honored() { return opts.dispatchesNothing() }` hands exactly
+// {nothing, something} to this method, and the two arms below supply the entire answer for
+// those values. They are reachable from BOTH guards, and from initializeSlipForPush, which
+// calls this method directly to decide component seeding.
+//
+// An earlier version of this paragraph called those arms "unreachable from either guard". That
+// was wrong, and wrong in a dangerous direction: neutering them changes 15 guard outcomes over
+// the five ended statuses the guard governs — every `nothing` with components flips
+// dedup→repave, every `something` without them flips repave→dedup — including
+// `failed` + `nothing` + components, which is the history-preservation case this field exists
+// for. Six top-level tests fail, one of them through the backstop's guard.
+//
+// The two entry paths are still deliberately not equivalent: only the guard's fall-through —
+// the Unspecified-or-unrecognized case, which skips honored() and reaches this method through
+// the `failed` carve-out — passes through that check. That difference is the root of the
+// mis-serialized-value behaviour documented above.
+func (o PushOptions) dispatchesNothing() bool {
+	switch o.Dispatch {
+	case DispatchIntentNothing:
+		return true
+	case DispatchIntentSomething:
+		return false
+	case DispatchIntentUnspecified:
+		// Legacy inference, below.
+	default:
+		// An unrecognized value uses the legacy inference too. That is a deliberate
+		// degradation, not a safety guarantee — the inference licenses a repave whenever
+		// components are present. See this method's doc for the two shapes and for why the
+		// alternatives were rejected.
+	}
+	return len(o.Components) == 0
+}
+
 // CreateSlipResult contains the result of slip creation including any warnings.
 type CreateSlipResult struct {
 	// Slip is the created routing slip
@@ -126,12 +405,127 @@ type CreateSlipResult struct {
 	// Callers can inspect these to decide if they should be treated as errors.
 	Warnings []error
 
-	// AncestryResolved indicates whether ancestry resolution completed without errors.
-	// True means the resolution attempt succeeded (whether or not ancestors exist).
-	// False means resolution failed (e.g., GitHub API error, missing installation).
-	// Note: A first commit has no ancestors, but AncestryResolved=true because
-	// the resolution attempt itself succeeded.
+	// AncestryResolved indicates whether ancestry resolution completed without errors,
+	// OR that no resolution was attempted or needed because the returned slip is
+	// pre-existing. Concretely, true means either:
+	//   - a fresh slip was created and its ancestry resolution attempt succeeded
+	//     (whether or not ancestors were found — a first commit has no ancestors, but
+	//     AncestryResolved=true because the resolution attempt itself succeeded); or
+	//   - the result is a dedup onto an already-loaded slip where NO resolution was ever
+	//     attempted before the dedup: the in-flight IsLive() reuse path and the empty-run
+	//     guard both set this true unconditionally, since there is nothing to resolve for
+	//     a slip that was not freshly created — "no resolution was needed" also counts as
+	//     resolved. Both return before resolveAndAbandonAncestors runs at all.
+	// False means ancestry resolution ran for this push and failed (e.g. GitHub API error,
+	// missing installation).
+	//
+	// The rule is that this field describes THIS push's resolution attempt, wherever an
+	// attempt happened — not the provenance of the slip being returned. The two bullets above
+	// are the only unconditional-true sites, and they qualify solely because both return
+	// before resolveAndAbandonAncestors runs at all.
+	//
+	// Every path reached AFTER that call therefore preserves the computed value rather than
+	// forcing true: both went-live aborts (repaveExistingSlip's and the duplicate-create
+	// backstop's) and both backstop dedup branches (live-conflicting and empty-run guard).
+	// "The returned slip is not the one we resolved for" is NOT a discriminator — the
+	// backstop's ended-conflict repave branch also returns a reloaded conflicting row, and it
+	// preserves the value too. Forcing true on any of them would clobber a legitimate false
+	// whose failure is already recorded in Warnings, producing AncestryResolved=true sitting
+	// next to an ancestry error during a GitHub outage and misfiring alerting keyed on this
+	// field (DEVOPS-231 review D3.2).
+	//
+	// This is deliberately NOT computed from a loaded slip's own Ancestry field
+	// (e.g. `len(slip.Ancestry) > 0`): no store hydrates Slip.Ancestry on load in
+	// production (it is only populated by initializeSlipForPush for a freshly created
+	// slip), so that formula was unconditionally false for every dedup path and would
+	// misfire any alerting keyed off this field.
 	AncestryResolved bool
+}
+
+// emptyRunGuardApplies reports whether a same-commit push onto an already-ended slip should
+// reuse that slip instead of repaving it. Both guard sites — CreateSlipForPush's main path
+// and handleDuplicateSlipBackstop — call this so the two cannot drift.
+//
+// The guard exists because repave DELETES the superseded row: for a push that dispatches
+// nothing (a branch create/recreate at an existing SHA), replacing the row destroys the real
+// run's history and buys nothing, so returning the existing slip as a dedup is strictly
+// better.
+//
+// `failed` is excluded, and that exclusion is load-bearing rather than a nicety. The guard is
+// new in DEVOPS-231, and before it existed a same-commit push onto a failed slip ALWAYS
+// abandoned it and created a fresh slip under the caller's correlation ID — component count
+// was never consulted, and the reason was recorded in the code it replaced: "blocking
+// fresh-slip creation here would re-introduce the 'retrigger never builds' bug". A failed
+// slip never advances on its own (only re-running its failed STEPS recovers it, which a push
+// event does not do), so a new push for that commit is a deliberate request to run CI again.
+//
+// Letting the guard claim those pushes would regress against that baseline for exactly the
+// repos least able to absorb it. A tests-only repo (buildable=false + RunUnitTests=true +
+// AllowSlipWithNoBuilds=true) dispatches unit tests with ZERO build components, because
+// pushhookparser nils components whenever !shouldBuild. The caller would see returned != sent,
+// suppress every side effect, and a failed unit-test run on those repos could not be
+// retriggered by re-pushing.
+//
+// DispatchIntent (DEVOPS-264) is the proper answer to "does this push dispatch anything", and
+// dispatchesNothing consults it below. But intent only helps once slippy-api AND
+// pushhookparser forward the field, and until then every real push from those repos arrives
+// with Dispatch unset and falls back to the component-count inference. The `failed` carve-out
+// is what makes the fix independent of that adoption order: it keeps the pre-adoption path
+// behaving as it did before the guard existed, rather than leaving those repos unable to
+// retrigger for the length of a three-repo rollout.
+//
+// The two terms are complementary, not redundant. Intent covers every status once adopted
+// (including a caller that declares Nothing while holding components); the carve-out covers
+// `failed` regardless of adoption. Removing either re-opens a real case.
+func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
+	if existing == nil {
+		return false
+	}
+	// A self-correlation push is never a dedup, so the guard must not claim it. The guard's
+	// entire contract is that the caller sees returned != sent and suppresses its side
+	// effects — that is the only reason returning someone else's slip is safe. When the
+	// existing row already carries THIS push's correlation ID, returned == sent, so the
+	// caller reads the result as a slip it just created and proceeds to dispatch and report
+	// against it. For an ended row that means reporting against a terminal slip.
+	//
+	// Reachable through the same in-delivery retry the reset arm in persistSlipForPush
+	// exists for: attempt 1 creates and dispatches, the run ENDS, attempt 2 arrives with the
+	// same ID and zero components. The `failed` carve-out below does not cover it, because a
+	// run that completed is not `failed`. Declining here sends it to that reset arm, which
+	// upserts the row back to a live status so the caller's dispatch is correct rather than
+	// merely unsuppressed.
+	if existing.CorrelationID == opts.CorrelationID {
+		return false
+	}
+
+	// A RECOGNIZED explicit intent is authoritative in both directions, and is therefore
+	// consulted BEFORE the `failed` carve-out below rather than after it.
+	//
+	// Order matters here, and getting it wrong is destructive. With the carve-out first, a
+	// caller stating DispatchIntentNothing on a failed slip — an authoritative "no work will
+	// run" — fell through to a repave: the failed run's history was destroyed AND the
+	// successor seeded no components (because the same intent suppresses seeding), leaving a
+	// slip nothing could ever advance. That is precisely the outcome the guard exists to
+	// prevent, and it contradicted this field's own documented promise of being authoritative
+	// in both directions.
+	//
+	// honored() is exactly "Nothing or Something", so this delegates those two answers to
+	// dispatchesNothing and lets everything else — Unspecified and any unrecognized value —
+	// fall through to the carve-out and the inference below. Written as a delegation rather
+	// than a second copy of dispatchesNothing's switch: the two are NOT equivalent, because
+	// only this path's fall-through passes through the `failed` check, and having the
+	// difference live in one place is what makes that readable.
+	if opts.Dispatch.honored() {
+		return opts.dispatchesNothing()
+	}
+
+	// The `failed` carve-out governs the INFERENCE only: it covers the window before
+	// slippy-api and pushhookparser forward Dispatch, during which every real push arrives
+	// Unspecified and a componentless push onto a failed run must still retrigger it.
+	if existing.Status == SlipStatusFailed {
+		return false
+	}
+	return opts.dispatchesNothing()
 }
 
 // CreateSlipForPush creates a new routing slip for a git push event.
@@ -142,17 +536,104 @@ type CreateSlipResult struct {
 // finds any existing slips for ancestor commits, and ensures they are
 // in a terminal state (abandoning non-terminal slips that are being superseded).
 //
-// Retry vs supersede vs new-slip behavior for the same commit SHA:
-//   - Existing slip is non-terminal AND in_progress/pending/compensating: retried via
+// Retry vs repave vs new-slip behavior for the same commit SHA, decided by
+// SlipStatus.IsLive() (the single live-vs-ended predicate shared with
+// handleDuplicateSlipBackstop below — DEVOPS-231 review finding B5):
+//
+//   - Existing slip IsLive() (pending/in_progress/compensating): retried via
 //     handlePushRetry (same correlation ID is reused) — the pipeline is still in flight,
 //     so re-dispatching would double-run work.
-//   - Existing slip is failed: the stuck slip is abandoned and a fresh slip is created
-//     with the new correlation ID from opts. A failed slip never advances without a step
-//     re-run, so a new push for the same commit (retrigger-ci replay, or webhook
-//     re-delivery of a failed run) is treated as a deliberate request to run CI again.
+//
+//   - Existing slip is failed: the stuck slip is repaved — replaced, in one transaction,
+//     by a fresh slip under the new correlation ID from opts. A failed slip never advances without
+//     a step re-run, so a new push for the same commit (webhook re-delivery or a
+//     same-commit re-push) is treated as a deliberate request to run CI again.
+//
+//     Two exceptions. First, a push stating a recognized DispatchIntentNothing dedups onto the
+//     failed slip instead of repaving it; see the empty-run guard bullet below. Second, a push
+//     carrying the existing row's OWN correlation ID is not repaved under a new ID at all —
+//     persistSlipForPush diverts it to an in-place upsert that resets the row to live under the
+//     SAME correlation ID, keeping its component children and replacing its state history. That
+//     is the ordinary in-delivery retry, not an exotic shape.
+//
 //   - Existing slip is terminal (abandoned, promoted, compensated, completed): treated as
-//     stale and a fresh slip is created with the new correlation ID from opts. This
-//     prevents resurrecting superseded slips on webhook re-delivery or bot-commit races.
+//     stale and repaved on the same terms as the failed case above — replaced, in one
+//     transaction, by a fresh slip under the new correlation ID from opts. This prevents
+//     resurrecting superseded slips on webhook re-delivery or bot-commit races. Both this
+//     bullet and the one above say "under the new correlation ID"; that holds only when the
+//     push carries a DIFFERENT id than the existing row. See the self-correlation exception.
+//
+//   - Existing slip is ended, this push will dispatch nothing, AND the push does not carry
+//     the existing row's own correlation ID: the empty-run guard short-circuits the repave
+//     above and returns the existing (ended) slip as a dedup, since nothing would be
+//     dispatched and repaving would only destroy history for no benefit.
+//
+//     All three conditions matter, and "will dispatch nothing" is where Dispatch enters:
+//
+//     A recognized Dispatch value is authoritative and is consulted FIRST. So a push stating
+//     DispatchIntentNothing dedups onto ANY ended slip, `failed` included — repaving there
+//     would destroy the failed run's history and seed a successor with no components that
+//     nothing could ever advance.
+//
+//     Only when Dispatch is unset or unrecognized does the guard infer intent from
+//     len(Components) == 0, and it is that INFERENCE which excludes `failed`, so a
+//     componentless re-push can still retrigger a stuck run. See emptyRunGuardApplies.
+//
+//     The self-correlation exclusion is unconditional. Being excluded from the guard does NOT
+//     mean falling through to a repave — it falls through to the in-place upsert above. It
+//     exists because the
+//     guard's contract is that the caller sees returned != sent and suppresses its side
+//     effects; when they are equal the caller would instead dispatch against the very slip
+//     it was handed.
+//
+//     "Will dispatch nothing" is PushOptions.Dispatch when the caller states a RECOGNIZED
+//     value (see DispatchIntent); DispatchIntentUnspecified and any unrecognized value both
+//     fall back to len(opts.Components) == 0 — component count is neither necessary nor
+//     sufficient on its own, which is why the field exists. That distinction matters to a
+//     consumer author: a mis-cased or mis-serialized value crossing the slippy-api JSON
+//     boundary is silently ignored rather than honored. A caller that dispatches work
+//     without build components (a tests-only repo) MUST set DispatchIntentSomething, or,
+//     pre-adoption, rely on the `failed` exclusion.
+//     handleDuplicateSlipBackstop applies the identical guard so the two paths
+//     converge on the same outcome for the same inputs.
+//
+//   - The repave itself can report that the decision is stale:
+//     ErrSlipWentLive means the slip became live again before the repave landed, so the
+//     repave is abandoned and treated like the IsLive() case above: dedup onto the
+//     reloaded slip via handlePushRetry (same audit trail — push_parsed reset plus a
+//     "retry detected" history entry — as the IsLive() case), no fresh slip created.
+//     See repaveExistingSlip's doc for a caveat this path does NOT fully resolve: by the
+//     time the went-live abort is detected, ancestor slips may already have been
+//     abandoned/promoted on behalf of a successor correlation ID that will never be
+//     created (DEVOPS-231 review D3.2).
+//     ErrRepaveUnsupported means the store cannot repave at all (the ClickHouse
+//     store, since Postgres is the operational store per DEVOPS-127); the fallback is
+//     the pre-DEVOPS-231 semantics — AbandonSlip the superseded slip — followed by
+//     fresh-slip creation as usual.
+//
+// Ancestry resolution (resolveAndAbandonAncestors, which makes multi-second GitHub API
+// calls) runs BEFORE the successor is persisted, so no store mutation waits on GitHub. The
+// replacement itself is then a single transactional SlipStore.Repave: the superseded row's
+// removal, the successor's insert, the descendant repoint and the successor's ancestry link
+// either all commit or none do. There is no longer a window in which the commit has no slip
+// — the failure mode that made a create failure after a committed delete unrecoverable,
+// since the next redelivery found no row to repave and failed identically forever.
+//
+// Even when no existing row is found for this commit, the insert can still fail with
+// ErrDuplicateSlip: a concurrent push for the same commit can win the insert race between
+// our LoadByCommit and our own write (the Redis dedup lock is fail-open). A backstop loads
+// the conflicting row and applies the same live-vs-ended rule as above: a live conflicting
+// slip is deduped onto (never destroyed — its pipeline may already be dispatched), while an
+// ended one is repaved onto this push's successor.
+//
+// Phase A note (DEVOPS-231 review D3.6): ErrDuplicateSlip is unreachable via ANY path in
+// Phase A, so handleDuplicateSlipBackstop is dormant until the Phase B migration lands.
+// Without the uq_routing_slips_repo_sha unique index, the insert's ON CONFLICT target is
+// correlation_id only, so two different pushes' correlation IDs for the SAME (repository,
+// commit_sha) never conflict — both simply succeed, silently leaving two rows for one
+// commit, and a lost Redis-lock race has no detection at all. What Phase A DOES now have,
+// which it did not before, is convergence when a repave fails: nothing is written, the push
+// fails, and Kafka redelivers against a store that still holds the superseded row.
 //
 // The returned CreateSlipResult contains both the slip and any non-fatal errors
 // that occurred during processing (e.g., ancestry resolution failures).
@@ -176,96 +657,831 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 	//
 	// Exact-SHA intent: this lookup is keyed on the precise commit SHA being pushed,
 	// not on git ancestry — we want to detect "is there an in-flight slip for THIS
-	// commit?". LoadLiveByCommit filters out superseded-terminal statuses
-	// (abandoned/promoted/compensated) at the DB layer so webhook re-deliveries
-	// after the slip was superseded don't resurrect stale rows. The IsTerminal()
-	// guard below remains because LoadLiveByCommit does NOT filter 'completed',
-	// and a completed slip must still fall through to fresh-slip creation.
-	existingSlip, err := c.store.LoadLiveByCommit(ctx, opts.Repository, opts.CommitSHA)
-	if err == nil && existingSlip != nil && !existingSlip.Status.IsTerminal() {
-		// A live (non-terminal) slip already exists for this EXACT commit (existingSlip.Status
-		// is a SlipStatus, not a step status). What we do next depends on whether the prior
+	// commit?". The lookup is LoadByCommit (unfiltered) rather than LoadLiveByCommit
+	// because under one-row-per-commit ANY existing row for this (repo, sha) —
+	// including an abandoned/promoted/compensated row left over from a cross-commit
+	// supersede — must be repaved before Create, or the unique (repository,
+	// commit_sha) index rejects the insert. LoadLiveByCommit would filter those
+	// statuses out at the DB layer, so the code would never see them and the stale
+	// row would survive. LoadByCommit returns ErrSlipNotFound for a missing row
+	// exactly like LoadLiveByCommit did — the err == nil guard shape is unchanged.
+	//
+	// Contract note (DEVOPS-231 review D3.5): the `case err != nil` branch below treats
+	// ANY non-ErrSlipNotFound error as a hard failure of the push (it aborts, so Kafka
+	// redelivers). This makes LoadByCommit's error taxonomy load-bearing — see its
+	// contract on SlipStore in interfaces.go: a clean miss MUST be ErrSlipNotFound, and a
+	// store that signals absence any other way (e.g. an untranslated sql.ErrNoRows, or a
+	// generic error from a degraded/partial read) permanently hard-fails every push for
+	// that commit instead of proceeding to create a slip.
+	existingSlip, err := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
+	switch {
+	case err == nil && existingSlip != nil:
+		// A slip already exists for this EXACT commit (existingSlip.Status is a
+		// SlipStatus, not a step status). What we do next depends on whether the prior
 		// pipeline can still make progress on its own:
 		//
-		//   - failed: the prior pipeline is stuck. A failed slip never advances on its
-		//     own — it only recovers when its failed STEPS are re-run, which a fresh
-		//     push event does not do. So a new push for the same commit (a retrigger-ci
-		//     replay, or a webhook re-delivery of a failed run) is a deliberate request
-		//     to run CI again. Abandon the failed slip and fall through to fresh-slip
-		//     creation with the caller's correlation_id, so the caller sees a NEW slip
-		//     (not a dedup) and re-dispatches builds + unit tests. This is the
-		//     same-commit case of the "next push supersedes the old slip, creates a new
-		//     one" model (STATE_MACHINE_V3.md §"Pipeline termination without completing").
-		//
-		//   - any OTHER non-terminal slip status — in_progress in practice (the enum also
-		//     defines pending/compensating, which this pipeline does not use; see
-		//     STATE_MACHINE_V3.md): the prior pipeline is still in flight, or a concurrent
-		//     create just won the repo:sha race. Reuse the existing slip and reset
-		//     push_parsed via handlePushRetry — re-dispatching builds here would double-run
-		//     work that is already running. The caller (slippy-api → pushhookparser) detects
-		//     that the returned correlation_id differs from the one it sent and suppresses
-		//     duplicate side-effects.
-		if existingSlip.Status != SlipStatusFailed {
+		//   - IsLive() (pending/in_progress/compensating — in_progress in practice;
+		//     see STATE_MACHINE_V3.md): the prior pipeline is still in flight, or a
+		//     concurrent create just won the repo:sha race. Reuse the existing slip
+		//     and reset push_parsed via handlePushRetry — re-dispatching builds here
+		//     would double-run work that is already running. The caller
+		//     (slippy-api → pushhookparser) detects that the returned correlation_id
+		//     differs from the one it sent and suppresses duplicate side-effects.
+		if existingSlip.Status.IsLive() {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
 				return nil, retryErr
 			}
 			result.Slip = slip
-			result.AncestryResolved = len(slip.Ancestry) > 0
+			// Dedup onto a pre-existing slip: nothing was (or needed to be) resolved.
+			// See CreateSlipResult.AncestryResolved's doc.
+			result.AncestryResolved = true
 			return result, nil
 		}
 
-		c.logger.Info(ctx, "Superseding failed slip for same commit (retrigger / re-run)", map[string]interface{}{
-			"superseded_id":     existingSlip.CorrelationID,
-			"superseded_commit": shortSHA(existingSlip.CommitSHA),
-			"superseded_status": string(existingSlip.Status),
-			"superseding_id":    opts.CorrelationID,
-		})
-		if abandonErr := c.AbandonSlip(ctx, existingSlip.CorrelationID, opts.CorrelationID); abandonErr != nil {
-			// Non-fatal: record as a warning and still create the fresh slip. A
-			// lingering non-terminal failed row is shadowed by the newer slip
-			// (LoadLiveByCommit orders by version DESC), and blocking fresh-slip
-			// creation here would re-introduce the "retrigger never builds" bug.
-			result.Warnings = append(result.Warnings,
-				fmt.Errorf("failed to abandon superseded failed slip %s: %w", existingSlip.CorrelationID, abandonErr))
+		//   - failed: the prior pipeline is stuck. A failed slip never advances on its
+		//     own — it only recovers when its failed STEPS are re-run, which a fresh
+		//     push event does not do. So a new push for the same commit (webhook
+		//     re-delivery, or a same-commit re-push of a failed run) is a deliberate
+		//     request to run CI again.
+		//
+		//   - terminal (abandoned, promoted, compensated, completed): stale or
+		//     superseded. Resurrecting it on webhook re-delivery or a bot-commit race
+		//     would be wrong, and under one-row-per-commit it must not be left behind
+		//     when the new row is inserted.
+		//
+		if emptyRunGuardApplies(existingSlip, opts) {
+			// Empty-run guard: nothing will be dispatched for this push (a branch
+			// create/recreate at an existing SHA, or a repo with no work to run).
+			// Repaving would destroy the prior run's history for zero benefit.
+			// Return the existing slip; the caller sees returned != sent and
+			// suppresses side effects.
+			//
+			// A caller that DOES dispatch work without build components — a tests-only
+			// repo (buildable=false + RunUnitTests=true) — must say so via
+			// PushOptions.Dispatch, or this guard suppresses the retrigger it wanted.
+			// See DispatchIntent for why component count cannot answer this, and for what
+			// setting it opts such a push into: ancestry resolution, the repave path, and
+			// a repave failure being fatal — none of which this early return reaches.
+			// This line only ever fires when the guard applied, so DispatchIntentSomething can
+			// never reach it. See addDispatchIntentFields for the field set and the alert
+			// predicate.
+			c.logger.Info(ctx, "Empty-run guard: reusing ended slip for non-dispatching push",
+				addDispatchIntentFields(map[string]interface{}{
+					"existing_id": existingSlip.CorrelationID,
+					"commit":      shortSHA(existingSlip.CommitSHA),
+					"components":  len(opts.Components),
+				}, opts.Dispatch))
+			result.Slip = existingSlip
+			result.AncestryResolved = true
+			return result, nil
 		}
-		// fall through to fresh-slip creation with opts.CorrelationID
+		// Otherwise: existingSlip must be repaved. Deferred until immediately before
+		// Create (see repaveExistingSlip below) so ancestry resolution's multi-second
+		// GitHub API calls happen while the row still exists (see the doc comment on
+		// this function).
+
+	case errors.Is(err, ErrSlipNotFound):
+		existingSlip = nil // clean miss: no existing row, proceed to create
+
+	case err == nil:
+		// (nil, nil): no store returns this — a miss always carries ErrSlipNotFound — but
+		// the arm is explicit so this switch is total rather than relying on control
+		// falling off the end. The outcome is the same as a clean miss, and it must stay
+		// that way: routing it to the error arm below would hard-fail every push for the
+		// commit, which is far more expensive than treating an unexpected-but-empty
+		// result as "nothing here".
+		existingSlip = nil
+
+	case err != nil:
+		// A real lookup failure (DB timeout, connection refused, ...) — NOT a clean
+		// miss. Proceeding as if no slip existed risks Create inserting a second row
+		// while a LIVE slip for this commit already exists, and the caller would fully
+		// re-dispatch a build that's already running. Failing the message (so Kafka
+		// redelivers) is safer than guessing.
+		return nil, fmt.Errorf("failed to load existing slip for %s@%s: %w",
+			opts.Repository, shortSHA(opts.CommitSHA), err)
 	}
 
-	// Resolve ancestry chain and abandon superseded slips
+	// Resolve ancestry chain and abandon superseded slips. Runs BEFORE the repave
+	// delete below — see the doc comment on this function for why.
 	ancestry, ancestryWarnings := c.resolveAndAbandonAncestors(ctx, opts)
 	result.Warnings = append(result.Warnings, ancestryWarnings...)
 	result.AncestryResolved = len(ancestry) > 0 || len(ancestryWarnings) == 0
 
-	// Create new slip with full initialization including ancestry
-	slip := c.initializeSlipForPush(opts, ancestry)
-
-	if err := c.store.Create(ctx, slip); err != nil {
-		return nil, fmt.Errorf("failed to create slip: %w", err)
+	// D3.4 defensive guard: never let this push's own ancestry chain point at the slip
+	// we are about to repave (delete) for this exact commit. The primary guard lives in
+	// findAncestorViaSquashMerge below, which skips a squash-merge candidate whose
+	// CommitSHA equals opts.CommitSHA — a fast-forward/no-op merge keeps the PR head SHA
+	// identical to the pushed commit, so an ended slip for THIS SAME commit can otherwise
+	// surface as its own "ancestor" via the PR-branch-history search, which deliberately
+	// includes the head commit. This is a defensive backstop for any other path that
+	// might still produce a self-referential entry: without it, InsertAncestryLink below
+	// would write the newborn slip's parent pointing at existingSlip's correlation ID —
+	// the very row repaveExistingSlip is about to delete — a dangling self-reference from
+	// birth (DEVOPS-231 review D3.4).
+	if existingSlip != nil {
+		ancestry = dropSelfAncestorLink(ancestry, existingSlip.CorrelationID)
 	}
 
-	// Write direct parent link to slip_ancestry table (O(1) per slip)
+	// Build the successor BEFORE persisting anything. Under one-row-per-commit the repave
+	// below does not merely delete the superseded run — it replaces that run with this
+	// exact slip inside a single transaction — so the successor has to exist as a value
+	// before either half of the replacement can run.
+	slip := c.initializeSlipForPush(opts, ancestry)
+
+	// The direct parent link, handed to the store so it lands in the same transaction as
+	// the successor's row. nil means "this push resolved no ancestry"; for a repave that
+	// is not the same as "the successor has no parent", because the superseded run's own
+	// link is carried forward in that case (see SlipStore.Repave).
+	var parent *AncestryEntry
 	if len(ancestry) > 0 {
-		if err := c.store.InsertAncestryLink(ctx, slip, ancestry[0]); err != nil {
-			c.logger.Warn(ctx, "Failed to write ancestry link", map[string]interface{}{
-				"correlation_id": slip.CorrelationID,
-				"parent_id":      ancestry[0].CorrelationID,
-				"error":          err.Error(),
-			})
-			result.Warnings = append(result.Warnings, fmt.Errorf("failed to write ancestry link: %w", err))
-		}
+		parent = &ancestry[0]
+	}
+
+	handled, persistErr := c.persistSlipForPush(ctx, existingSlip, opts, slip, parent, result)
+	if persistErr != nil {
+		return nil, persistErr
+	}
+	if handled {
+		return result, nil
 	}
 
 	result.Slip = slip
 
-	c.logger.Info(ctx, "Created routing slip", map[string]interface{}{
-		"correlation_id": slip.CorrelationID,
-		"components":     len(opts.Components),
-		"ancestors":      len(ancestry),
-		"warnings":       len(result.Warnings),
-	})
+	// The trio is here too, because this is the one line that always fires on the create path:
+	// every other site requires an existing ended slip for the same commit, so a FIRST push
+	// emitted none of the three. That is the lower-stakes case — there is no prior history to
+	// destroy — but it is also where a mis-serialized "nothing" silently seeds an aggregate step
+	// as running for work that will never report, and nothing recorded that an intent was
+	// discarded.
+	//
+	// components_seeded, not len(opts.Components): a recognized DispatchIntentNothing declines to
+	// seed component rows even when Components is non-empty, so the raw count would read
+	// "components=1" beside zero seeded rows. Before Dispatch existed, len > 0 always implied
+	// seeded rows; it no longer does.
+	// components_seeded counted from the slip that was actually built, not re-derived from the
+	// gate: a recognized DispatchIntentNothing declines to seed component rows even when
+	// Components is non-empty, so the raw count alone would read "components=1" beside zero
+	// seeded rows. Before Dispatch existed, len > 0 always implied seeded rows; it no longer
+	// does, and reading the built slip keeps this honest if the gate ever changes.
+	componentsSeeded := 0
+	for _, rows := range slip.Aggregates {
+		componentsSeeded += len(rows)
+	}
+	c.logger.Info(ctx, "Created routing slip", addDispatchIntentFields(map[string]interface{}{
+		"correlation_id":    slip.CorrelationID,
+		"components":        len(opts.Components),
+		"components_seeded": componentsSeeded,
+		"ancestors":         len(ancestry),
+		"warnings":          len(result.Warnings),
+	}, opts.Dispatch))
 
 	return result, nil
+}
+
+// persistSlipForPush writes slip — the successor this push is creating — choosing between
+// the two persistence shapes the store offers:
+//
+//   - no existing row for this commit: a plain Create plus a best-effort ancestry link.
+//   - an existing ended row: a Repave, which removes that row and writes slip and its link
+//     as ONE transaction, so the commit is never left with no slip at all.
+//   - an existing ended row that IS this push's own slip: a plain Create, because Repave
+//     cannot express it and rejects it. See below.
+//
+// Returns handled=true when result is already populated and the caller should return it
+// as-is (the dedup outcomes); handled=false means slip itself is now persisted.
+func (c *Client) persistSlipForPush(
+	ctx context.Context,
+	existingSlip *Slip,
+	opts PushOptions,
+	slip *Slip,
+	parent *AncestryEntry,
+	result *CreateSlipResult,
+) (handled bool, err error) {
+	if existingSlip == nil {
+		return c.createFreshSlip(ctx, opts, slip, parent, result)
+	}
+
+	// Self-referential ids: the ended row we found IS the one this push is writing. Route to
+	// the plain create path, which upserts on correlation_id and so rewrites the row in place
+	// — resetting it to a live status — rather than asking the store to supersede a row with
+	// itself.
+	//
+	// This is reachable and not exotic. A caller retrying WITHIN one delivery reuses its
+	// correlation ID (pushhookparser's bounded retry does), so: attempt 1 creates the slip and
+	// dispatches, then fails later in the handler; the dispatched build fails fast; attempt 2
+	// finds an ENDED row carrying its own id.
+	//
+	// Handling it here rather than letting Repave reject it is a convergence requirement, not
+	// a nicety. SlipStore.Repave refuses a self-repave — correctly, since under an unchanged
+	// id it can only destroy history indistinguishably from a no-op — and that refusal is
+	// non-converging: the offending value is the caller's own id, stable across attempts, so
+	// every redelivery fails identically and the message dead-letters. Before Repave existed
+	// this same retry succeeded, because Create has always been an upsert and abandon+create
+	// simply rewrote the row. This restores that outcome rather than inventing a new one.
+	//
+	// Deliberately NOT routed to handlePushRetry, which was the other candidate: that returns
+	// the existing row with only push_parsed reset, so the caller would see returned == sent,
+	// dispatch, and then report against a slip whose top-level status is still failed. The
+	// upsert is what makes the returned slip genuinely live.
+	//
+	// Caveat 1, unchanged from the pre-Repave behaviour this matches: the row is rewritten but
+	// its slip_component_states children are not deleted, so the new attempt inherits the
+	// previous attempt's component rows under the same id.
+	//
+	// Caveat 2: Create is the one full-row overwrite in PostgresStore that does NOT take the
+	// per-slip FOR UPDATE lock (postgres_store.go, Create; contrast Update, whose comment says
+	// the lock exists to stop a concurrent updateStepTx commit being clobbered).
+	// AbandonSlip/PromoteSlip also write unlocked but go through UpdateSlipStatus, a
+	// single-column SET that cannot clobber anything else; Create can.
+	//
+	// Not a torn write: lockSlip is SELECT ... FOR UPDATE and a conflicting INSERT ... ON
+	// CONFLICT blocks behind it, so the two statements serialize. It is last-write-wins — and
+	// if a component of this same run is still reporting when the upsert lands second, its step
+	// columns and state_history are discarded, under a correlation ID that gives an operator no
+	// way to tell which attempt wrote what.
+	//
+	// Accepted deliberately, and recorded here because this arm is now the DESIGNED route to
+	// that write rather than an incidental fall-through: at merge base all five ended statuses
+	// reached the identical unlocked Create anyway, and because the conflict target is
+	// correlation_id, every write at risk belongs to the id this arm is resetting on purpose.
+	// The reset marker appended below is what makes the overwrite legible afterwards.
+	//
+	// That is the same child-row state the upsert-collision note on SlipStore.Repave
+	// describes, but do NOT carry that note's reachability over: it is about a CROSS-RUN
+	// collision needing a caller to reuse another run's UUID, which the note itself calls
+	// unreachable in practice. This arm reaches the state through the routine in-delivery
+	// retry it exists to serve. The consequence is the one that note traces —
+	// recomputeAggregate aggregates every surviving child row for the id and
+	// computeAggregateStatus returns completed once they are all completed, which
+	// AllPrerequisitesMet reads as satisfied — so a downstream gate can open while this
+	// attempt's other components are still building. It needs one component to reach
+	// completed before the others report at all; the retry's own first write makes the set
+	// mixed and anyRunning wins. Narrower than the cross-run case, and genuinely reachable.
+	// Clearing the children would need a store operation the interface does not have.
+	if existingSlip.CorrelationID == opts.CorrelationID {
+		c.logger.Info(ctx, "Same-correlation push for an ended slip: resetting it in place",
+			map[string]interface{}{
+				"correlation_id": opts.CorrelationID,
+				"commit":         shortSHA(opts.CommitSHA),
+				"prior_status":   string(existingSlip.Status),
+			})
+		appendResetMarker(slip, existingSlip.Status, opts.CommitSHA)
+		return c.createFreshSlip(ctx, opts, slip, parent, result)
+	}
+
+	return c.repaveExistingSlip(ctx, existingSlip, opts, slip, parent, result)
+}
+
+// appendResetMarker records that a prior attempt for this commit existed, on a slip that is
+// about to be upserted in place under its own correlation ID.
+//
+// Create upserts state_history along with every other non-PK column, so without this the
+// previous attempt is replaced by initializeSlipForPush's single seed entry and the row carries
+// no evidence it was ever reset. That matters more on this path than on the repave path, because
+// the correlation ID does not change either: an operator would see a live row with one seed entry
+// and be unable to tell a first attempt from a reset one — the same indistinguishability the
+// store's self-repave guard cites as its reason for existing. Every other supersede path leaves a
+// marker (Repave appends one, handlePushRetry writes "retry detected").
+//
+// Both in-place reset arms call it — persistSlipForPush's and the duplicate-create backstop's —
+// because this file asserts in two places that those paths converge on the same outcome for the
+// same inputs, and a marker written by only one of them is a divergence on the very observable
+// that exists to make the state legible.
+func appendResetMarker(slip *Slip, priorStatus SlipStatus, commitSHA string) {
+	slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
+		Step:      "push_parsed",
+		Status:    StepStatusRunning,
+		Timestamp: time.Now(),
+		Actor:     "slippy-library",
+		Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
+			priorStatus, shortSHA(commitSHA)),
+	})
+}
+
+// createFreshSlip inserts slip and writes its parent link, for the paths where there is no
+// row to repave: a first push for this commit, or a store that cannot repave at all.
+//
+// A link failure here is a warning rather than a push failure — the slip exists and CI can
+// run; only the lineage hop is missing. The repave path reaches the same outcome by a
+// different mechanism: there the link is written inside the repave transaction, but under a
+// SAVEPOINT, so a link failure rolls back only that statement and the replacement still
+// commits (see PostgresStore.insertAncestryLinkBestEffort). The one asymmetry left is where
+// the failure surfaces — this path records a result.Warning the caller can inspect, while
+// the repave path can only log, since SlipStore.Repave returns a bare error.
+func (c *Client) createFreshSlip(
+	ctx context.Context,
+	opts PushOptions,
+	slip *Slip,
+	parent *AncestryEntry,
+	result *CreateSlipResult,
+) (handled bool, err error) {
+	if createErr := c.store.Create(ctx, slip); createErr != nil {
+		if !errors.Is(createErr, ErrDuplicateSlip) {
+			return false, fmt.Errorf("failed to create slip: %w", createErr)
+		}
+
+		// Unique-index backstop (fail-open Redis race): another run holds the row.
+		// This is the same no-existing-row race the reuse branch in CreateSlipForPush
+		// handles for a row that was ALREADY there at lookup time - here, the winner's
+		// insert landed between our own now-stale LoadByCommit and our Create.
+		backstopHandled, backstopErr := c.handleDuplicateSlipBackstop(ctx, opts, slip, parent, result)
+		if backstopErr != nil {
+			return false, backstopErr
+		}
+		if backstopHandled {
+			return true, nil
+		}
+		if retryErr := c.store.Create(ctx, slip); retryErr != nil {
+			return false, fmt.Errorf("failed to create slip after duplicate backstop: %w", retryErr)
+		}
+	}
+
+	c.writeAncestryLink(ctx, slip, parent, result)
+	return false, nil
+}
+
+// writeAncestryLink writes slip's direct parent link outside any transaction, recording a
+// failure as a warning. Used only by createFreshSlip; see its doc for why the repave path
+// does not go through here.
+func (c *Client) writeAncestryLink(
+	ctx context.Context,
+	slip *Slip,
+	parent *AncestryEntry,
+	result *CreateSlipResult,
+) {
+	if parent == nil {
+		return
+	}
+	if err := c.store.InsertAncestryLink(ctx, slip, *parent); err != nil {
+		c.logger.Warn(ctx, "Failed to write ancestry link", map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+			"parent_id":      parent.CorrelationID,
+			"error":          err.Error(),
+		})
+		result.Warnings = append(result.Warnings, fmt.Errorf("failed to write ancestry link: %w", err))
+	}
+}
+
+// repaveExistingSlip replaces existingSlip with slip in a single store transaction, and
+// handles the sentinels Repave can return.
+//
+// Returns handled=true when the caller should return result directly — the ErrSlipWentLive
+// and backstop-dedup cases, where the repave is abandoned and result is populated with a
+// dedup onto an existing slip. Returns handled=false, err=nil when slip itself is now
+// persisted. Returns a non-nil err for a fatal condition: failing to reload the slip after
+// aborting on ErrSlipWentLive, handlePushRetry itself failing (DEVOPS-231 review D3.2 routes
+// the went-live dedup through handlePushRetry so it gets the same audit trail as the
+// IsLive() case — see that branch's doc below), or the repave itself failing.
+//
+// A failed repave being fatal is a deliberate change from the pre-Repave code, which logged
+// a failed delete as a warning and created the fresh slip anyway. That leniency only made
+// sense while delete and create were separate calls: a create could still succeed on its
+// own and CI could still run, at the cost of leaving a stale row behind. There is nothing
+// left to fall through to now — a failed Repave wrote nothing, so there is no successor —
+// so the honest outcome is to fail the push and let Kafka redeliver, which converges
+// because the superseded row is still there to repave next time. The alternative (swallow
+// the error and report a slip that was never written) is strictly worse.
+//
+// The phantom-successor window that the pre-Repave code documented here is closed rather
+// than described: the store now inserts the successor BEFORE repointing any descendant onto
+// it, inside one transaction, so no descendant can end up pointing at a correlation ID that
+// never comes into existence.
+//
+// That ordering is necessary but NOT sufficient for a foreign key on
+// slip_ancestry.parent_correlation_id, and Phase B deliberately adds none — see
+// SlipStore.Repave in interfaces.go for the full argument, which is kept in one place because
+// it drifted across four copies in three review rounds.
+func (c *Client) repaveExistingSlip(
+	ctx context.Context,
+	existingSlip *Slip,
+	opts PushOptions,
+	slip *Slip,
+	parent *AncestryEntry,
+	result *CreateSlipResult,
+) (handled bool, err error) {
+	// Either way (failed or terminal): replace the existing slip so the caller sees a NEW
+	// slip (not a dedup) and re-dispatches builds + unit tests. This keeps one row per
+	// (repository, commit_sha) rather than leaving a superseded row behind
+	// (STATE_MACHINE_V3.md §"Pipeline termination without completing").
+	//
+	// D3.3: log intent at Debug here, not as a claim of success — the "Repaved" log below
+	// only fires once Repave has confirmed it happened. Every same-commit push against a
+	// store that returns ErrRepaveUnsupported (i.e. every ClickHouse-backed client, since
+	// Postgres is the only store DEVOPS-231 wired for real repaves) used to log this as if
+	// delete + recreate had happened when it never did.
+	c.logger.Debug(ctx, "Attempting repave for same-commit push", map[string]interface{}{
+		"existing_id":     existingSlip.CorrelationID,
+		"existing_commit": shortSHA(existingSlip.CommitSHA),
+		"existing_status": string(existingSlip.Status),
+		"superseding_id":  opts.CorrelationID,
+	})
+
+	repaveErr := c.store.Repave(ctx, existingSlip.CorrelationID, slip, parent)
+	switch {
+	case repaveErr == nil:
+		// The audit trio is emitted here as well as on the guard-applied lines, because those
+		// only fire when the guard dedups — without it the case that most needs a record left
+		// none: a mis-serialized intent that was ignored AND then repaved a prior run's history
+		// away. See addDispatchIntentFields for the field set and for which of the three is the
+		// alert predicate (it is NOT honored).
+		c.logger.Info(ctx, "Repaved ended slip for same commit (replaced in one transaction)",
+			addDispatchIntentFields(map[string]interface{}{
+				"repaved_id":     existingSlip.CorrelationID,
+				"repaved_commit": shortSHA(existingSlip.CommitSHA),
+				"repaved_status": string(existingSlip.Status),
+				"superseding_id": opts.CorrelationID,
+			}, opts.Dispatch))
+		return false, nil
+
+	case errors.Is(repaveErr, ErrSlipWentLive):
+		// The repave decision is stale: the slip went live again between that decision
+		// and this call (e.g. a failed slip recovering via executor.go's recovery
+		// branch). Repave's status guard refused to destroy it, and — because the whole
+		// replacement is one transaction — refused to create the successor either.
+		// Creating a fresh slip now would produce two competing live runs for the same
+		// commit; nothing at the DB level stops that pre-index (Phase B). Dedup onto the
+		// live slip instead, reloaded so the returned copy reflects its current state.
+		//
+		// D3.2 (DEVOPS-231 review): this path is routed through handlePushRetry, exactly
+		// like the IsLive() branch at the top of CreateSlipForPush, so the same audit
+		// trail exists here too — a push_parsed reset plus a "retry detected" state
+		// history entry — rather than silently deduping with no record that a second
+		// push arrived. It still diverges from the IsLive() case in one way that is NOT
+		// fixed here: by this point in CreateSlipForPush, resolveAndAbandonAncestors has
+		// already run and may have abandoned or promoted ancestor slips on behalf of
+		// opts.CorrelationID — a successor that, on this path, is never created. Those
+		// ancestor status flips are persisted; only the phantom successor itself is
+		// purely in logs/traces. Undoing that would require restructuring so ancestry
+		// resolution runs after the went-live check is known, which this fix does not
+		// attempt (see CreateSlipForPush's doc comment for the ordering rationale that
+		// makes ancestry resolution run first).
+		c.logger.Warn(ctx, "Repave aborted: slip went live between decision and repave",
+			map[string]interface{}{
+				"correlation_id": existingSlip.CorrelationID,
+				"commit":         shortSHA(existingSlip.CommitSHA),
+			})
+		live, loadErr := c.store.Load(ctx, existingSlip.CorrelationID)
+		if loadErr != nil {
+			return false, fmt.Errorf(
+				"failed to reload slip %s after went-live repave abort: %w", existingSlip.CorrelationID, loadErr,
+			)
+		}
+		retried, retryErr := c.handlePushRetry(ctx, live)
+		if retryErr != nil {
+			return false, retryErr
+		}
+		result.Slip = retried
+		// Do NOT force AncestryResolved = true here (D3.2): resolveAndAbandonAncestors
+		// already ran for this push before this function was called and has already set
+		// result.AncestryResolved to the accurate outcome of that attempt. Forcing true
+		// would clobber a legitimate false (resolution ran and failed, with the failure
+		// recorded in result.Warnings) — see CreateSlipResult.AncestryResolved's doc.
+		return true, nil
+
+	case errors.Is(repaveErr, ErrRepaveUnsupported):
+		// The store cannot repave at all (the ClickHouse store: Postgres is the
+		// operational slip store per DEVOPS-127, and NewClient still builds a
+		// ClickHouseStore unconditionally, so this fires on every same-commit push for
+		// a CH-backed client). Fall back to the pre-DEVOPS-231 semantics — abandon the
+		// superseded slip rather than repaving it — then create the fresh slip the
+		// non-transactional way, since that is all such a store can offer.
+		// D3.3: abandonSupersededSlipForUnsupportedRepave only claims "abandoned" when
+		// AbandonSlip actually changed the slip's status, and does not add a Warning for
+		// this routine, expected-on-ClickHouse case (only a real AbandonSlip failure is
+		// surfaced as a Warning) — see its doc for why.
+		c.abandonSupersededSlipForUnsupportedRepave(ctx, existingSlip, opts, result, "Repave")
+		return c.createFreshSlip(ctx, opts, slip, parent, result)
+
+	case errors.Is(repaveErr, ErrDuplicateSlip):
+		// Dormant until Phase B's unique index exists, but genuinely reachable after that,
+		// via the concurrent same-commit push this whole feature is about. Two pushes for
+		// one commit both try to repave the same row: A's guarded delete takes the row lock
+		// and B blocks on it. When A commits (row deleted, A's successor inserted), B's
+		// delete matches zero rows and B's existence check — which looks up B's OWN
+		// oldCorrelationID — finds nothing, so B correctly reads it as "already gone" and
+		// proceeds to insert its own successor. That insert is what conflicts with A's
+		// successor on uq_routing_slips_repo_sha. Routed to the same backstop as the create
+		// path, which then dedups B onto A's run.
+		backstopHandled, backstopErr := c.handleDuplicateSlipBackstop(ctx, opts, slip, parent, result)
+		if backstopErr != nil {
+			return false, backstopErr
+		}
+		if backstopHandled {
+			return true, nil
+		}
+		if retryErr := c.store.Repave(ctx, existingSlip.CorrelationID, slip, parent); retryErr != nil {
+			return false, fmt.Errorf("failed to repave slip %s after duplicate backstop: %w",
+				existingSlip.CorrelationID, retryErr)
+		}
+		return false, nil
+
+	case errors.Is(repaveErr, ErrInvalidConfiguration):
+		// A precondition the store refuses on its inputs, not a state it can be retried
+		// out of — today that is the self-repave rejection (oldCorrelationID ==
+		// newSlip.CorrelationID). It is called out separately from the fatal default below
+		// because the default's stated reason for being fatal INVERTS here: the default
+		// argues that failing the push "lets Kafka redeliver against a store that still
+		// holds the superseded row", i.e. that redelivery converges. This one cannot. The
+		// row does survive, but every redelivery presents the identical inputs and is
+		// rejected identically — the offending value is the caller's own correlation ID,
+		// which is stable within a delivery. So the push fails, redelivers, and fails
+		// again with no path to success.
+		//
+		// Still fatal rather than degraded: a caller that presented its own correlation ID
+		// as the row to supersede has a bug, and quietly proceeding would either destroy
+		// history (the very thing the store's guard refuses) or return a slip whose status
+		// contradicts what the caller thinks it created. Logged at Error rather than left
+		// to the default's generic path so the non-converging class is visible in triage
+		// instead of looking like a transient store failure being retried.
+		c.logger.Error(ctx, "Repave rejected on its inputs; redelivery cannot clear this",
+			repaveErr,
+			map[string]interface{}{
+				"existing_id":    existingSlip.CorrelationID,
+				"superseding_id": opts.CorrelationID,
+				"commit":         shortSHA(opts.CommitSHA),
+			})
+		return false, fmt.Errorf("failed to repave slip %s: %w", existingSlip.CorrelationID, repaveErr)
+
+	default:
+		// Fatal — see this function's doc comment for why this is no longer a warning.
+		// The STORE wrote nothing, so there is no successor to fall through to; failing the
+		// push lets Kafka redeliver against a store that still holds the superseded row.
+		//
+		// "Nothing was written" is true of the repave, NOT of the push: by this point
+		// resolveAndAbandonAncestors has already committed AbandonSlip/PromoteSlip status
+		// flips on ancestor slips, on behalf of a successor that now will not exist. Those
+		// flips are persisted and are not undone by redelivery — the same carve-out the
+		// went-live branch above documents. A redelivery re-creates the successor but never
+		// un-abandons the ancestor.
+		return false, fmt.Errorf("failed to repave slip %s: %w", existingSlip.CorrelationID, repaveErr)
+	}
+}
+
+// abandonSupersededSlipForUnsupportedRepave is the shared ErrRepaveUnsupported fallback
+// for both repaveExistingSlip and handleDuplicateSlipBackstop (DEVOPS-231 review D3.1/D3.3):
+// the store cannot repave (e.g. ClickHouseStore), so fall back to abandon semantics rather
+// than claiming a repave that never happened.
+//
+// AbandonSlip's checkTerminalStatus (client.go) silently no-ops when the slip is already
+// terminal, so a caller that unconditionally logged/warned "abandoned instead" was lying
+// whenever the superseded slip was already terminal (exactly the rows LoadByCommit's
+// unfiltered lookup surfaces). This function checks slip.Status.IsTerminal() BEFORE calling
+// AbandonSlip: a same-commit dupe reaching this fallback is always either failed
+// (non-terminal) or already-terminal by construction (CreateSlipForPush only repaves in
+// those two cases), and terminal statuses never revert, so the caller's already-loaded
+// snapshot is safe to trust here without an extra Load.
+//
+// Messaging (D3.3): this only ever logs at Info level and adds NOTHING to result.Warnings on
+// the expected/successful outcomes (already-terminal: nothing to abandon; non-terminal:
+// abandoned successfully) — this fallback fires on every same-commit push against a
+// ClickHouse-backed client, so treating it as a Warning misfires any consumer that alerts on
+// len(result.Warnings) > 0 for what is a routine webhook redelivery. A Warning is added only
+// when AbandonSlip itself returns an error, since that means the superseded row's status was
+// NOT updated and dashboards/consumers may show it as still active.
+func (c *Client) abandonSupersededSlipForUnsupportedRepave(
+	ctx context.Context,
+	slip *Slip,
+	opts PushOptions,
+	result *CreateSlipResult,
+	logPrefix string,
+) {
+	if slip.Status.IsTerminal() {
+		c.logger.Info(ctx, logPrefix+" unsupported on this store; slip already terminal, old row left unchanged",
+			map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"commit":         shortSHA(slip.CommitSHA),
+				"status":         string(slip.Status),
+			})
+		return
+	}
+
+	if abandonErr := c.AbandonSlip(ctx, slip.CorrelationID, opts.CorrelationID); abandonErr != nil {
+		result.Warnings = append(result.Warnings, fmt.Errorf(
+			"failed to abandon slip %s after unsupported repave: %w", slip.CorrelationID, abandonErr,
+		))
+		return
+	}
+
+	c.logger.Info(ctx, logPrefix+" unsupported on this store; abandoned superseded slip instead",
+		map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+			"commit":         shortSHA(slip.CommitSHA),
+			"superseding_id": opts.CorrelationID,
+		})
+}
+
+// handleDuplicateSlipBackstop handles an ErrDuplicateSlip from Create: another concurrent
+// push won the insert race for this (repository, commit_sha) between our caller's
+// LoadByCommit and its Create call. It loads the conflicting row and applies the same
+// live-vs-ended decision as the main retry/repave logic in CreateSlipForPush, via the
+// shared SlipStatus.IsLive() predicate (DEVOPS-231 review finding B5): a live conflicting
+// slip is deduped onto (never destroyed - its pipeline may already be dispatched, and
+// destroying it here would pull the rug out from under an in-flight run while we dispatch a
+// duplicate); an ended one is either deduped onto (componentless push: the empty-run guard,
+// mirrored from the main path so identical inputs converge on identical outcomes through
+// either path) or repaved onto slip, this push's successor.
+//
+// Returns handled=true when the caller should return result directly, which now covers two
+// outcomes: the dedup cases (result.Slip is the conflicting slip) AND a successful repave of
+// the conflicting row (result.Slip is slip, already persisted by that repave — there is
+// nothing left for the caller to insert). Returns handled=false only when nothing was
+// written and the caller should retry its own insert: no conflicting row was found or
+// loadable, or the store cannot repave. Returns a non-nil err on a fatal repave failure.
+//
+// D3.1 (DEVOPS-231 review): the conflicting row's repave below applies the SAME
+// live-vs-ended decision as repaveExistingSlip's sentinel handling, not just a bare fatal
+// error — the doc above already claims this backstop "applies the same live-vs-ended
+// decision" as the main path, so treating ErrSlipWentLive or ErrRepaveUnsupported as
+// unconditionally fatal here contradicted that claim. ErrSlipWentLive reloads the
+// conflicting slip and dedups onto it (handled=true), mirroring the IsLive() dedup branch
+// above in this same function. ErrRepaveUnsupported falls back to abandon semantics via
+// abandonSupersededSlipForUnsupportedRepave (shared with repaveExistingSlip's D3.3 fix) and
+// then falls through to the caller's insert retry, for symmetry with repaveExistingSlip's
+// own ErrRepaveUnsupported branch. Both sentinels are dormant in Phase A (ErrDuplicateSlip
+// itself is unreachable without the uq_routing_slips_repo_sha index — see CreateSlipForPush's
+// doc comment), so this fix has zero behavioral effect until Phase B, but is still correct to
+// make now. Every other repave error remains fatal here — this backstop is already the
+// last-resort convergence path, so there is nothing further to fall back on.
+func (c *Client) handleDuplicateSlipBackstop(
+	ctx context.Context,
+	opts PushOptions,
+	slip *Slip,
+	parent *AncestryEntry,
+	result *CreateSlipResult,
+) (handled bool, err error) {
+	conflicting, loadErr := c.store.LoadByCommit(ctx, opts.Repository, opts.CommitSHA)
+	switch {
+	case loadErr != nil && !errors.Is(loadErr, ErrSlipNotFound):
+		// A REAL lookup failure — a DB timeout, a connection refused — not a clean miss.
+		// Treating it as "no conflicting row" would route it to a blind Create retry, and a
+		// sentinel from that retry (ErrSlipWentLive, say) then surfaces as fatal rather than
+		// being deduped. Fail the push instead and let Kafka redeliver against a store that
+		// can answer, which is the same choice CreateSlipForPush's own initial lookup makes
+		// for the same reason.
+		return false, fmt.Errorf("duplicate backstop: failed to load conflicting slip for %s@%s: %w",
+			opts.Repository, shortSHA(opts.CommitSHA), loadErr)
+
+	case loadErr != nil, conflicting == nil:
+		// A clean miss (ErrSlipNotFound), or the (nil, nil) shape no store returns. The
+		// winner's row is not visible to us, so there is nothing to repave or dedup onto:
+		// fall through to the caller's single Create retry, which will surface the real
+		// Create error if the conflict is still present.
+		//
+		//nolint:nilerr // ErrSlipNotFound is an absence signal, not a failure: the arm above
+		// already returned for every non-ErrSlipNotFound error, so the only error reaching
+		// here means "no such row", which is exactly the condition this fall-through is for.
+		return false, nil
+	}
+
+	if conflicting.Status.IsLive() {
+		c.logger.Info(ctx, "Duplicate-create backstop: live conflicting slip, deduping", map[string]interface{}{
+			"conflicting_id": conflicting.CorrelationID,
+			"commit":         shortSHA(conflicting.CommitSHA),
+			"superseding_id": opts.CorrelationID,
+		})
+		result.Slip = conflicting
+		// AncestryResolved is deliberately NOT forced true here (see its doc):
+		// resolveAndAbandonAncestors already ran for this push, so the field holds that
+		// attempt's real outcome. Forcing true would contradict result.Warnings.
+		return true, nil
+	}
+
+	if emptyRunGuardApplies(conflicting, opts) {
+		// Empty-run guard (mirrored from CreateSlipForPush's main path, and sharing its
+		// single emptyRunGuardApplies predicate so the two cannot drift): nothing would
+		// be dispatched for this push, so repaving the conflicting row would only
+		// destroy its history for no benefit. Dedup onto it instead of replacing it.
+		c.logger.Info(ctx, "Duplicate-create backstop: empty-run guard, deduping onto ended conflicting slip",
+			addDispatchIntentFields(map[string]interface{}{
+				"conflicting_id": conflicting.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+				"superseding_id": opts.CorrelationID,
+				"components":     len(opts.Components),
+			}, opts.Dispatch))
+		result.Slip = conflicting
+		// Same as the live-conflict branch above: preserve the computed value.
+		return true, nil
+	}
+
+	if conflicting.CorrelationID == opts.CorrelationID {
+		// Self-referential: the conflicting row already carries this push's correlation ID,
+		// so Repave would be asked to supersede a row with itself and would reject it with
+		// ErrInvalidConfiguration — a rejection redelivery cannot clear, since the offending
+		// value is the caller's own stable ID. The main path handles this exact shape in
+		// persistSlipForPush by upserting in place; the backstop must not diverge, and this
+		// file asserts elsewhere that the two guard paths converge on the same outcome for
+		// the same inputs.
+		//
+		// handled=false hands control back to createFreshSlip's retry, whose Create is an
+		// upsert on correlation_id — the same in-place reset the main path performs, marker
+		// included: the retry's Create upserts state_history too, so without appending here the
+		// two convergent paths would differ on the one observable added to make a reset legible.
+		//
+		// Dormant until Phase B: ErrDuplicateSlip is what routes here, and no unique index
+		// exists yet to raise it.
+		c.logger.Info(ctx, "Duplicate-create backstop: conflicting slip is this push's own; "+
+			"resetting in place instead of repaving",
+			map[string]interface{}{
+				"correlation_id": opts.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+				"prior_status":   string(conflicting.Status),
+			})
+		appendResetMarker(slip, conflicting.Status, conflicting.CommitSHA)
+		return false, nil
+	}
+
+	c.logger.Debug(ctx, "Duplicate-create backstop: attempting repave of ended conflicting slip",
+		map[string]interface{}{
+			"conflicting_id":     conflicting.CorrelationID,
+			"conflicting_commit": shortSHA(conflicting.CommitSHA),
+			"conflicting_status": string(conflicting.Status),
+			"superseding_id":     opts.CorrelationID,
+		})
+	repaveErr := c.store.Repave(ctx, conflicting.CorrelationID, slip, parent)
+	switch {
+	case repaveErr == nil:
+		// The repave replaced the conflicting row WITH our successor in one transaction,
+		// so unlike the pre-Repave code there is nothing left for the caller to retry:
+		// the slip it wanted to create already exists. Report it as handled and populate
+		// result here, rather than returning handled=false and letting the caller re-run
+		// an insert that would only re-write the same row.
+		// The trio is on BOTH repave paths, not just the main one: this is a repave — history
+		// destroyed — so an ignored intent has to be as auditable here as in repaveExistingSlip.
+		c.logger.Info(ctx, "Duplicate-create backstop: repaved ended conflicting slip",
+			addDispatchIntentFields(map[string]interface{}{
+				"repaved_id":     conflicting.CorrelationID,
+				"repaved_commit": shortSHA(conflicting.CommitSHA),
+				"repaved_status": string(conflicting.Status),
+				"superseding_id": opts.CorrelationID,
+			}, opts.Dispatch))
+		result.Slip = slip
+		// AncestryResolved is deliberately left as resolveAndAbandonAncestors set it (D3.2):
+		// this is a fresh successor, not a dedup onto someone else's slip, so the accurate
+		// outcome of this push's own resolution attempt is the right value to keep.
+		return true, nil
+
+	case errors.Is(repaveErr, ErrSlipWentLive):
+		// D3.1: mirror the IsLive() dedup branch above in this same function - the
+		// conflicting row went live between our decision (conflicting.Status was ended)
+		// and this call, so Repave's status guard refused to destroy it. Dedup onto it,
+		// reloaded so the returned copy reflects its current (live) state.
+		c.logger.Warn(ctx, "Duplicate-create backstop: conflicting slip went live between decision and repave",
+			map[string]interface{}{
+				"conflicting_id": conflicting.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+			})
+		live, loadErr := c.store.Load(ctx, conflicting.CorrelationID)
+		if loadErr != nil {
+			return false, fmt.Errorf(
+				"failed to reload conflicting slip %s after went-live backstop abort: %w",
+				conflicting.CorrelationID, loadErr,
+			)
+		}
+		result.Slip = live
+		// Do NOT force AncestryResolved = true here (D3.2), for the same reason
+		// repaveExistingSlip's went-live branch does not: resolveAndAbandonAncestors
+		// already ran for this push — this function is only ever reached through
+		// persistSlipForPush, which runs after it — and set the accurate outcome.
+		// Forcing true would clobber a legitimate false whose failure is already
+		// recorded in result.Warnings, producing AncestryResolved=true sitting next to
+		// an ancestry error during a GitHub outage.
+		return true, nil
+
+	case errors.Is(repaveErr, ErrRepaveUnsupported):
+		// D3.1: symmetric with repaveExistingSlip's own ErrRepaveUnsupported fallback -
+		// the store cannot repave, so abandon the conflicting row instead and let the
+		// caller retry its insert once (handled=false).
+		c.abandonSupersededSlipForUnsupportedRepave(ctx, conflicting, opts, result, "Duplicate-create backstop repave")
+		return false, nil
+
+	case errors.Is(repaveErr, ErrInvalidConfiguration):
+		// Same non-converging class as repaveExistingSlip's arm for this sentinel: the store
+		// refused the inputs, and redelivery presents identical inputs. Called out here too
+		// so the backstop does not report it through a default arm whose reasoning assumes
+		// a retry can eventually succeed.
+		c.logger.Error(ctx, "Duplicate-create backstop: repave rejected on its inputs; "+
+			"redelivery cannot clear this",
+			repaveErr,
+			map[string]interface{}{
+				"conflicting_id": conflicting.CorrelationID,
+				"superseding_id": opts.CorrelationID,
+				"commit":         shortSHA(conflicting.CommitSHA),
+			})
+		return false, fmt.Errorf(
+			"failed to repave conflicting slip %s: %w", conflicting.CorrelationID, repaveErr,
+		)
+
+	default:
+		// Fatal: this backstop is already the last-resort convergence path, so there is
+		// nothing further to fall back on if the conflicting row survives and the retry
+		// hits the same conflict again. ErrDuplicateSlip landing here would mean a third
+		// row for this (repository, commit_sha), which the unique index makes impossible.
+		return false, fmt.Errorf(
+			"failed to repave conflicting slip %s: %w", conflicting.CorrelationID, repaveErr,
+		)
+	}
 }
 
 // resolveAndAbandonAncestors fetches commit ancestry from GitHub,
@@ -491,6 +1707,38 @@ func (c *Client) resolveAndAbandonAncestors(ctx context.Context, opts PushOption
 	return ancestry, warnings
 }
 
+// dropSelfAncestorLink removes any entry from ancestry whose CorrelationID matches
+// repavedCorrelationID (DEVOPS-231 review D3.4). It is a defensive backstop invoked from
+// CreateSlipForPush right after ancestry is resolved, in case a self-referential entry
+// (the pushed commit's own prior slip, about to be repaved/deleted) makes it into the
+// chain via some path other than the primary guard in findAncestorViaSquashMerge. Returns
+// ancestry unchanged (including nil) when repavedCorrelationID is empty or nothing matches.
+func dropSelfAncestorLink(ancestry []AncestryEntry, repavedCorrelationID string) []AncestryEntry {
+	if repavedCorrelationID == "" || len(ancestry) == 0 {
+		return ancestry
+	}
+
+	hasMatch := false
+	for _, entry := range ancestry {
+		if entry.CorrelationID == repavedCorrelationID {
+			hasMatch = true
+			break
+		}
+	}
+	if !hasMatch {
+		return ancestry
+	}
+
+	filtered := make([]AncestryEntry, 0, len(ancestry)-1)
+	for _, entry := range ancestry {
+		if entry.CorrelationID == repavedCorrelationID {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+	return filtered
+}
+
 // findAncestorViaSquashMerge attempts to find an ancestor slip by parsing
 // a PR number from the commit message and looking up the PR's head commit.
 // This handles squash merge scenarios where git ancestry is broken.
@@ -546,6 +1794,28 @@ func (c *Client) findAncestorViaSquashMerge(
 		if len(ancestorSlips) > 0 {
 			// Found a slip via this PR
 			prSlip := ancestorSlips[0]
+
+			// D3.4 guard: a fast-forward / no-op merge keeps the PR head SHA identical to
+			// the commit being pushed (opts.CommitSHA). findSlipsInPRBranchHistory
+			// deliberately INCLUDES the head commit in its search (unlike the normal
+			// git-history ancestor search, which explicitly skips opts.CommitSHA), so an
+			// ended slip for THIS SAME commit can surface here as its own "ancestor".
+			// Using it would make the newborn slip its own ancestor: PromoteSlip would
+			// promote it, repaveExistingSlip would then delete it (same commit, ended),
+			// and InsertAncestryLink would write the newborn slip's parent pointing at the
+			// row just deleted — a dangling self-reference from birth (DEVOPS-231 review
+			// D3.4). Skip this candidate and keep trying other PR numbers.
+			if prSlip.Slip.CommitSHA == opts.CommitSHA {
+				c.logger.Debug(ctx, "Skipping squash-merge ancestor candidate matching the pushed commit itself",
+					map[string]interface{}{
+						"pr_number": prNumber,
+						"pr_head":   shortSHA(prHeadCommit),
+						"slip_id":   prSlip.Slip.CorrelationID,
+						"commit":    shortSHA(opts.CommitSHA),
+					})
+				continue
+			}
+
 			c.logger.Info(ctx, "Found feature branch slip via squash merge PR ancestry", map[string]interface{}{
 				"pr_number":   prNumber,
 				"pr_head":     shortSHA(prHeadCommit),
@@ -774,10 +2044,43 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			if i == 0 {
 				firstStep = stepConfig.Name
 				// Only auto-run first step if it's NOT an aggregate step,
-				// OR if it's an aggregate but has components to process.
-				// This prevents mobile apps (zero-component slips) from getting stuck.
+				// OR if it's an aggregate that will actually have components to process.
+				// This keeps mobile apps (zero-component slips) from reporting a step as
+				// started that nothing will ever advance.
+				//
+				// THIS is the gate that decides whether step 0 is REPORTED as started — it
+				// sets the step to running with a StartedAt — so it is the one that must
+				// honour dispatch intent. The aggregate-contents gate below decides only what the
+				// aggregate holds. Component count alone is the wrong question here for the
+				// same reason it is wrong for the empty-run guard: a caller declaring
+				// DispatchIntentNothing while holding components (a combination
+				// DispatchIntent's godoc declares supported and authoritative) would mark an
+				// aggregate step running over an aggregate that the gate below leaves EMPTY.
+				// What this gate does NOT do is make such a slip advance on its own, and an
+				// earlier version of this comment claimed otherwise: `pending` is no more
+				// self-advancing than `running`. applyComponentStatesToAggregate returns early
+				// when no component has reported, recomputeAggregate returns early on an empty
+				// active set, getPrereqStatus hands the raw status to AllPrerequisitesMet
+				// which requires `completed`, and checkPipelineCompletion buckets pending and
+				// running identically. The slip is in_progress either way, so a later push
+				// takes the IsLive() retry path into handlePushRetry, which only resets
+				// push_parsed — a step no shipped config defines. So there is no PUSH-DRIVEN
+				// recovery for a zero-work aggregate-first slip, with or without this gate:
+				// clearing step 0 takes an explicit consumer call (SkipStep, CompleteStep or
+				// UpdateStepWithStatus in steps.go — skipped counts as success per
+				// StepStatus.IsSuccess, and the call must be component-scoped or the Postgres
+				// recompute is a no-op). That gap is pre-existing DEVOPS-231 behaviour, not
+				// something this gate closes. What this gate buys is reporting accuracy — no
+				// falsified StartedAt, no step reported as started — the same class as the
+				// seeding change below.
+				//
+				// The conjunction is deliberate. Replacing the count with !dispatchesNothing()
+				// alone would flip the tests-only shape (Something + zero components) from
+				// pending to running with an empty aggregate — reporting a start that never
+				// happened for the very repos DEVOPS-264 exists to unblock. Both terms are
+				// required: work is dispatched AND there are components to track it.
 				isAggregateStep := stepConfig.Aggregates != ""
-				hasComponents := len(opts.Components) > 0
+				hasComponents := len(opts.Components) > 0 && !opts.dispatchesNothing()
 				if !isAggregateStep || hasComponents {
 					step.Status = StepStatusRunning
 					step.StartedAt = &now
@@ -790,11 +2093,33 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			// Column name is the step name (e.g., "builds_completed"), not the pluralized aggregate
 			if stepConfig.Aggregates != "" {
 				columnName := stepConfig.Name
-				componentData := make([]ComponentStepData, len(opts.Components))
-				for j, def := range opts.Components {
-					componentData[j] = ComponentStepData{
-						Component: def.Name,
-						Status:    StepStatusPending,
+				// A push that dispatches nothing tracks no components, even when the
+				// caller supplied some: pending rows for work that will never report
+				// misrepresent the run's contents to anything reading Aggregates. This is a
+				// data-accuracy change only.
+				//
+				// It does NOT decide whether such a slip can make progress, and an earlier
+				// version of this comment claimed a causal chain that the code does not have.
+				// Neither store derives an aggregate step's status from these seeded rows —
+				// both aggregate only over components that have actually reported
+				// (filterActiveComponents in clickhouse_store.go, and the len(active) == 0
+				// early return in postgres_store_updates.go's recomputeAggregate) — and
+				// checkPipelineCompletion never reads Aggregates at all, so an empty
+				// aggregate cannot end or extend a slip. Progress is decided by the
+				// hasComponents gate above.
+				//
+				// Built with make(..., 0, len) + append rather than a nil slice so the
+				// in-memory struct CreateSlipForPush returns serializes the same as the one
+				// Load reconstructs: both store write paths normalize nil to [], so a nil
+				// here would marshal as null on the create side and [] on the load side.
+				// This also keeps every path consistent, including Nothing-with-components.
+				componentData := make([]ComponentStepData, 0, len(opts.Components))
+				if !opts.dispatchesNothing() {
+					for _, def := range opts.Components {
+						componentData = append(componentData, ComponentStepData{
+							Component: def.Name,
+							Status:    StepStatusPending,
+						})
 					}
 				}
 				aggregates[columnName] = componentData
@@ -806,10 +2131,21 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 		steps["push_parsed"] = Step{Status: StepStatusRunning, StartedAt: &now}
 	}
 
+	// Report the status step 0 actually received, not an assumed `running`. The gate above
+	// leaves an aggregate first step `pending` whenever this push tracks no components, and a
+	// history entry saying `running` over a pending step is consumer-observable: GetHistory
+	// returns StateHistory verbatim and GetStepHistory filters it, so a caller asking for that
+	// step's history was told it started when it had not. Pre-existing for the zero-component
+	// mobile-app shape; the dispatch-intent gate widened the set of inputs that reach it,
+	// which is what makes the contradiction worth closing rather than inheriting.
+	firstStepStatus := StepStatusPending
+	if step, ok := steps[firstStep]; ok {
+		firstStepStatus = step.Status
+	}
 	history := []StateHistoryEntry{
 		{
 			Step:      firstStep,
-			Status:    StepStatusRunning,
+			Status:    firstStepStatus,
 			Timestamp: now,
 			Actor:     "slippy-library",
 			Message:   "processing push event",

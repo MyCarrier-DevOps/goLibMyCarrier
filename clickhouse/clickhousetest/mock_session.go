@@ -5,6 +5,7 @@ package clickhousetest
 
 import (
 	"context"
+	"io"
 	"sync"
 
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
@@ -385,6 +386,15 @@ type MockConn struct {
 	AsyncInsertFunc func(ctx context.Context, query string, wait bool, args ...any) error
 	AsyncInsertErr  error
 
+	// QueryFormat behavior (driver.Conn, clickhouse-go v2.48.0+)
+	QueryFormatFunc   func(ctx context.Context, format string, query string, args ...any) (io.ReadCloser, error)
+	QueryFormatReader io.ReadCloser
+	QueryFormatErr    error
+
+	// InsertFormat behavior (driver.Conn, clickhouse-go v2.48.0+)
+	InsertFormatFunc func(ctx context.Context, format, query string, data io.Reader) error
+	InsertFormatErr  error
+
 	// Ping behavior
 	PingFunc func(ctx context.Context) error
 	PingErr  error
@@ -451,6 +461,27 @@ func (m *MockConn) AsyncInsert(ctx context.Context, query string, wait bool, arg
 		return m.AsyncInsertFunc(ctx, query, wait, args...)
 	}
 	return m.AsyncInsertErr
+}
+
+// QueryFormat implements driver.Conn.QueryFormat (clickhouse-go v2.48.0+).
+func (m *MockConn) QueryFormat(
+	ctx context.Context,
+	format string,
+	query string,
+	args ...any,
+) (io.ReadCloser, error) {
+	if m.QueryFormatFunc != nil {
+		return m.QueryFormatFunc(ctx, format, query, args...)
+	}
+	return m.QueryFormatReader, m.QueryFormatErr
+}
+
+// InsertFormat implements driver.Conn.InsertFormat (clickhouse-go v2.48.0+).
+func (m *MockConn) InsertFormat(ctx context.Context, format, query string, data io.Reader) error {
+	if m.InsertFormatFunc != nil {
+		return m.InsertFormatFunc(ctx, format, query, data)
+	}
+	return m.InsertFormatErr
 }
 
 // Ping implements driver.Conn.Ping

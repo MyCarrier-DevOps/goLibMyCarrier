@@ -3,8 +3,10 @@ package slippy
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // pluralizeMock converts a singular step name to its plural form for column naming.
@@ -13,6 +15,16 @@ func pluralizeMock(name string) string {
 		return name + "es"
 	}
 	return name + "s"
+}
+
+// commitKey builds the commit-identity key for a repository/commit pair.
+// The repository is lowercased to mirror PostgresStore's case-insensitive
+// `lower(repository) = lower($1)` comparison (postgres_store.go); the commit SHA is
+// compared as-is, matching production. Every commit comparison in this file
+// must go through this helper so reads and writes stay in agreement (DEVOPS-231
+// review D1.1) - a partial fix (some sites lowercased, others not) is worse than none.
+func commitKey(repository, commitSHA string) string {
+	return strings.ToLower(repository) + ":" + commitSHA
 }
 
 // deepCopySlip creates a deep copy of a Slip to prevent shared map/slice references.
@@ -74,6 +86,46 @@ type UpdateSlipStatusCall struct {
 	Status        SlipStatus
 }
 
+// supersededTerminal mirrors the SQL predicate `status NOT IN
+// ('abandoned','promoted','compensated')`, which appears on exactly two of the four commit
+// lookups: LoadLiveByCommit (postgres_store.go) and FindByCommits (postgres_store_reads.go).
+// LoadByCommit and FindAllByCommits deliberately carry no such filter.
+func supersededTerminal(status SlipStatus) bool {
+	return status == SlipStatusAbandoned ||
+		status == SlipStatusPromoted ||
+		status == SlipStatusCompensated
+}
+
+// loadOrder sorts rows the way the store's two Load* queries order them: live rows first, then
+// updated_at DESC. The live/ended split reads SlipStatus.IsLive, the same predicate
+// repaveableSlipStatusesSQL is pinned against, so this cannot drift from the store silently.
+func loadOrder(rows []*Slip) {
+	sort.Slice(rows, func(i, j int) bool {
+		liveI, liveJ := rows[i].Status.IsLive(), rows[j].Status.IsLive()
+		if liveI != liveJ {
+			return liveI
+		}
+		return tieBreak(rows[i], rows[j])
+	})
+}
+
+// findOrder sorts rows the way the store's two Find* queries order them: updated_at DESC with NO
+// live-first term. The difference from loadOrder is deliberate — sorting Find* live-first makes
+// this double disagree with the store, which returns the newest row regardless of whether an
+// older one is still running.
+func findOrder(rows []*Slip) {
+	sort.Slice(rows, func(i, j int) bool { return tieBreak(rows[i], rows[j]) })
+}
+
+// tieBreak is the updated_at DESC comparison both orderings share, falling back to correlation ID
+// so this double stays deterministic where Postgres is not.
+func tieBreak(a, b *Slip) bool {
+	if !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return a.UpdatedAt.After(b.UpdatedAt)
+	}
+	return a.CorrelationID < b.CorrelationID
+}
+
 // MockStore is an in-memory implementation of SlipStore for testing.
 // It provides configurable behavior and tracking of method calls.
 type MockStore struct {
@@ -81,9 +133,6 @@ type MockStore struct {
 
 	// Storage maps correlation_id -> Slip
 	Slips map[string]*Slip
-
-	// CommitIndex maps "repo:commit" -> correlation_id for LoadByCommit
-	CommitIndex map[string]string
 
 	// Call tracking
 	CreateCalls           []CreateCall
@@ -98,7 +147,24 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
-	CloseCalls            int
+	RepaveCalls           []string
+	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
+	// the same call (empty string when a nil successor was passed). The in-memory mock has
+	// no slip_ancestry-equivalent table to repoint (InsertAncestryLink/ResolveAncestry are
+	// no-ops below), so it does not replicate PostgresStore's descendant-repoint behavior —
+	// this only records the argument for assertions.
+	RepaveSuccessorCalls []string
+	// RepaveParents parallels RepaveCalls with the parent link argument from the same call
+	// (nil when the caller resolved no ancestry). The mock cannot carry a superseded run's
+	// own link forward the way PostgresStore does — it has no ancestry table to read one
+	// from — so tests assert on what the push path passed in.
+	RepaveParents []*AncestryEntry
+	// AncestryLinkCalls records InsertAncestryLink calls — the NON-transactional link
+	// writes, i.e. the fresh-create path. A repave writes its successor's link inside
+	// Repave instead, so a repave contributes to RepaveParents and NOT to this slice;
+	// that difference is itself worth asserting.
+	AncestryLinkCalls []AncestryLinkCall
+	CloseCalls        int
 
 	// UpdateStepWithHistoryCallCount counts calls to the atomic UpdateStepWithHistory
 	// method specifically, separate from UpdateStepCalls/AppendHistoryCalls (which
@@ -132,6 +198,8 @@ type MockStore struct {
 	AppendHistoryError    error
 	SetImageTagError      error
 	UpdateSlipStatusError error
+	RepaveError           error
+	AncestryLinkError     error
 	CloseError            error
 
 	// Conditional error injection (returns error only for specific IDs)
@@ -140,6 +208,53 @@ type MockStore struct {
 	UpdateStepErrorFor      map[string]error
 	UpdateComponentErrorFor map[string]error
 	AppendHistoryErrorFor   map[string]error
+
+	// CreateErrorOnce injects an error for a single Create call keyed by correlation
+	// ID, then clears itself: unlike CreateErrorFor (which fires on every attempt for
+	// that id), this fires exactly once and is removed on first use. This is needed to
+	// simulate "fail first, succeed on retry" races such as the ErrDuplicateSlip
+	// backstop (DEVOPS-231), where CreateErrorFor's every-attempt semantics can't
+	// express a create that succeeds on the backstop's retry.
+	CreateErrorOnce map[string]error
+
+	// SeedOnCreate injects a slip into the store the moment Create is invoked for the
+	// matching correlation ID, then clears itself (one-shot, like CreateErrorOnce).
+	// This simulates a concurrent winner's insert landing BETWEEN our own initial
+	// LoadByCommit (which found nothing) and our own Create attempt - the exact
+	// no-existing-row race the ErrDuplicateSlip backstop exists for (DEVOPS-231).
+	// Pair it with CreateErrorOnce for the same correlation ID so the call both seeds
+	// the winner row and then reports the duplicate-key conflict, letting the
+	// backstop's subsequent LoadByCommit observe a row that was not there a moment
+	// ago.
+	SeedOnCreate map[string]*Slip
+
+	// LoadByCommitNilOnCall forces the Nth LoadByCommit call (1-indexed; 0 disables the
+	// hook) to return (nil, nil) regardless of whether it would have hit or missed. No
+	// known real store returns (nil, nil) from LoadByCommit - a miss always carries
+	// ErrSlipNotFound - but handleDuplicateSlipBackstop's
+	// `loadErr != nil || conflicting == nil` guard is written to be safe against it anyway
+	// (DEVOPS-231), and pinning that guard requires forcing the exact response.
+	//
+	// It is call-indexed rather than "next miss" because the caller's own initial lookup in
+	// CreateSlipForPush is itself a LoadByCommit: a "next miss" hook would be consumed
+	// there, never reaching the backstop's own lookup. Setting this to 2 targets the
+	// backstop's call while leaving the initial one behaving normally.
+	LoadByCommitNilOnCall int
+
+	// RepaveWentLiveStatus simulates a slip transitioning to a live status in the
+	// window between a caller's repave decision (an earlier LoadByCommit/Load saw it
+	// ended) and the Repave call itself: when Repave is invoked for a correlation ID
+	// present in this map WHILE RepaveError is set (e.g. to ErrSlipWentLive), the mock
+	// mutates the stored row's status to the mapped value before returning the injected
+	// error, then removes the entry (one-shot). This lets a subsequent Load (the caller's
+	// reload-after-ErrSlipWentLive) observe the new state instead of the stale
+	// decision-time snapshot - LoadByCommit and Load would otherwise always read the same
+	// never-mutated row (DEVOPS-231 review finding B1).
+	//
+	// Note this is only needed to force the error path. Repave's own live guard already
+	// returns ErrSlipWentLive for a stored slip whose status IsLive(), so a test that can
+	// arrange the live status directly does not need this field at all.
+	RepaveWentLiveStatus map[string]SlipStatus
 }
 
 // CreateCall records a Create call.
@@ -178,6 +293,12 @@ type UpdateStepCall struct {
 	Status        StepStatus
 }
 
+// AncestryLinkCall records an InsertAncestryLink call.
+type AncestryLinkCall struct {
+	Slip   *Slip
+	Parent AncestryEntry
+}
+
 // UpdateComponentCall records an UpdateComponentStatus call.
 type UpdateComponentCall struct {
 	CorrelationID string
@@ -204,12 +325,14 @@ type SetImageTagCall struct {
 func NewMockStore() *MockStore {
 	return &MockStore{
 		Slips:                   make(map[string]*Slip),
-		CommitIndex:             make(map[string]string),
 		CreateErrorFor:          make(map[string]error),
 		LoadErrorFor:            make(map[string]error),
 		UpdateStepErrorFor:      make(map[string]error),
 		UpdateComponentErrorFor: make(map[string]error),
 		AppendHistoryErrorFor:   make(map[string]error),
+		CreateErrorOnce:         make(map[string]error),
+		SeedOnCreate:            make(map[string]*Slip),
+		RepaveWentLiveStatus:    make(map[string]SlipStatus),
 	}
 }
 
@@ -220,8 +343,18 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 
 	m.CreateCalls = append(m.CreateCalls, CreateCall{Slip: slip})
 
+	if seed, ok := m.SeedOnCreate[slip.CorrelationID]; ok {
+		delete(m.SeedOnCreate, slip.CorrelationID)
+		seedCopy := deepCopySlip(seed)
+		m.Slips[seed.CorrelationID] = seedCopy
+	}
+
 	if m.CreateError != nil {
 		return m.CreateError
+	}
+	if err, ok := m.CreateErrorOnce[slip.CorrelationID]; ok {
+		delete(m.CreateErrorOnce, slip.CorrelationID)
+		return err
 	}
 	if err, ok := m.CreateErrorFor[slip.CorrelationID]; ok {
 		return err
@@ -231,10 +364,90 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 	slipCopy := deepCopySlip(slip)
 	m.Slips[slip.CorrelationID] = slipCopy
 
-	// Index by commit for LoadByCommit
-	key := slip.Repository + ":" + slip.CommitSHA
-	m.CommitIndex[key] = slip.CorrelationID
+	return nil
+}
 
+// Repave removes the superseded slip and stores newSlip in its place (children live on
+// the Slip struct in the mock, so removing the slip removes everything). Modelling both halves is what makes this double faithful: SlipStore.Repave
+// guarantees a caller never observes one without the other, so on any error nothing here
+// changes, and on success the superseded slip is gone AND the successor is present.
+//
+// The live guard is enforced here too, per SlipStore.Repave's contract. It is not
+// decorative: without it this double would delete a live slip that the real store refuses
+// to touch, letting push tests pass against behavior production rejects.
+//
+// The mock has no slip_ancestry-equivalent table, so it records rather than replicates the
+// relational effects: parent is captured in RepaveParents for assertions, and there are no
+// descendant links to repoint (see RepaveSuccessorCalls's doc comment).
+func (m *MockStore) Repave(
+	ctx context.Context,
+	oldCorrelationID string,
+	newSlip *Slip,
+	parent *AncestryEntry,
+) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.RepaveCalls = append(m.RepaveCalls, oldCorrelationID)
+	successorID := ""
+	if newSlip != nil {
+		successorID = newSlip.CorrelationID
+	}
+	m.RepaveSuccessorCalls = append(m.RepaveSuccessorCalls, successorID)
+	m.RepaveParents = append(m.RepaveParents, parent)
+
+	if m.RepaveError != nil {
+		if newStatus, ok := m.RepaveWentLiveStatus[oldCorrelationID]; ok {
+			delete(m.RepaveWentLiveStatus, oldCorrelationID)
+			if slip, exists := m.Slips[oldCorrelationID]; exists {
+				slip.Status = newStatus
+			}
+		}
+		return m.RepaveError
+	}
+
+	if newSlip == nil {
+		return fmt.Errorf("%w: Repave requires a successor slip", ErrInvalidConfiguration)
+	}
+
+	// Mirrors PostgresStore's self-repave rejection (SlipStore.Repave: "newSlip
+	// .CorrelationID must differ from oldCorrelationID"). Same argument as the live guard
+	// below: without it this double deletes and re-inserts the same map key, silently
+	// destroying an ended run's history exactly as the real store now refuses to.
+	if oldCorrelationID == newSlip.CorrelationID {
+		return fmt.Errorf("%w: Repave successor %s is the slip being repaved",
+			ErrInvalidConfiguration, newSlip.CorrelationID)
+	}
+
+	removedOld := false
+	if slip, ok := m.Slips[oldCorrelationID]; ok {
+		if slip.Status.IsLive() {
+			// Went live between the caller's repave decision and this call: the
+			// superseded run survives and the successor is NOT created.
+			return ErrSlipWentLive
+		}
+		removedOld = true
+		delete(m.Slips, oldCorrelationID)
+	}
+
+	// A missing superseded row is not an error: the successor is still created, so a
+	// redelivery converges rather than failing forever.
+	stored := deepCopySlip(newSlip)
+	if removedOld {
+		// Mirrors the predecessor marker PostgresStore.Repave appends to the successor, gated
+		// on removedOld the same way so a repave that replaced nothing records nothing.
+		stored.StateHistory = append(stored.StateHistory, StateHistoryEntry{
+			Step:      "push_parsed",
+			Status:    StepStatusRunning,
+			Timestamp: time.Now(),
+			Actor:     "slippy-library",
+			Message:   fmt.Sprintf("repaved %s for commit %s", oldCorrelationID, shortSHA(newSlip.CommitSHA)),
+		})
+	}
+	// No commit index to reconcile: the commit lookups derive their answer from the stored
+	// rows (rowsForCommit), so removing the superseded row and adding the successor is the
+	// whole update.
+	m.Slips[newSlip.CorrelationID] = stored
 	return nil
 }
 
@@ -262,34 +475,49 @@ func (m *MockStore) Load(ctx context.Context, correlationID string) (*Slip, erro
 	return deepCopySlip(slip), nil
 }
 
+// rowsForCommit returns every stored slip for one (repository, commit SHA), UNORDERED. Callers
+// apply loadOrder or findOrder depending on which store query they mirror — the two differ, and
+// picking the wrong one is what made this double disagree with the store on FindByCommits.
+//
+// This mock is the one push_test.go runs against, so the fidelity matters more here than in the
+// exported fixture: if the double resolves a commit differently than the store, a push test
+// greenlights behaviour production will not reproduce.
+func (m *MockStore) rowsForCommit(repository, commitSHA string) []*Slip {
+	want := commitKey(repository, commitSHA)
+	rows := make([]*Slip, 0, 1)
+	for _, slip := range m.Slips {
+		if commitKey(slip.Repository, slip.CommitSHA) == want {
+			rows = append(rows, slip)
+		}
+	}
+	return rows
+}
+
 // LoadByCommit retrieves a slip by repository and commit SHA.
 func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.LoadByCommitCalls = append(m.LoadByCommitCalls, LoadByCommitCall{
 		Repository: repository,
 		CommitSHA:  commitSHA,
 	})
-	m.mu.Unlock()
-
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 
 	if m.LoadByCommitError != nil {
 		return nil, m.LoadByCommitError
 	}
 
-	key := repository + ":" + commitSHA
-	correlationID, ok := m.CommitIndex[key]
-	if !ok {
-		return nil, ErrSlipNotFound
+	if m.LoadByCommitNilOnCall > 0 && len(m.LoadByCommitCalls) == m.LoadByCommitNilOnCall {
+		return nil, nil
 	}
 
-	slip, ok := m.Slips[correlationID]
-	if !ok {
+	rows := m.rowsForCommit(repository, commitSHA)
+	if len(rows) == 0 {
 		return nil, ErrSlipNotFound
 	}
+	loadOrder(rows)
 
-	return deepCopySlip(slip), nil
+	return deepCopySlip(rows[0]), nil
 }
 
 // LoadLiveByCommit retrieves the most recent live slip by repository and commit SHA,
@@ -309,25 +537,20 @@ func (m *MockStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA 
 		return nil, m.LoadLiveByCommitError
 	}
 
-	key := repository + ":" + commitSHA
-	correlationID, ok := m.CommitIndex[key]
-	if !ok {
-		return nil, ErrSlipNotFound
+	// Mirror prod semantics: exclude terminal-superseded statuses. The filter is applied per
+	// row, matching the store's WHERE clause — filtering the single already-chosen row instead
+	// reports ErrSlipNotFound for a commit that still has a live slip, whenever an excluded
+	// duplicate happens to sort first.
+	rows := m.rowsForCommit(repository, commitSHA)
+	loadOrder(rows)
+	for _, slip := range rows {
+		if supersededTerminal(slip.Status) {
+			continue
+		}
+		return deepCopySlip(slip), nil
 	}
 
-	slip, ok := m.Slips[correlationID]
-	if !ok {
-		return nil, ErrSlipNotFound
-	}
-
-	// Mirror prod semantics: exclude terminal-superseded statuses.
-	if slip.Status == SlipStatusAbandoned ||
-		slip.Status == SlipStatusPromoted ||
-		slip.Status == SlipStatusCompensated {
-		return nil, ErrSlipNotFound
-	}
-
-	return deepCopySlip(slip), nil
+	return nil, ErrSlipNotFound
 }
 
 // FindByCommits finds a slip matching any commit in the ordered list.
@@ -346,13 +569,17 @@ func (m *MockStore) FindByCommits(ctx context.Context, repository string, commit
 		return nil, "", m.FindByCommitsError
 	}
 
-	// Find the first matching commit in order
+	// Find the first matching commit in order. The store's query carries
+	// `AND s.status NOT IN ('abandoned','promoted','compensated')` — a filter LoadByCommit does
+	// NOT have — so a commit whose only rows are superseded-terminal is skipped entirely.
 	for _, commit := range commits {
-		key := repository + ":" + commit
-		if correlationID, ok := m.CommitIndex[key]; ok {
-			if slip, ok := m.Slips[correlationID]; ok {
-				return deepCopySlip(slip), commit, nil
+		rows := m.rowsForCommit(repository, commit)
+		findOrder(rows)
+		for _, slip := range rows {
+			if supersededTerminal(slip.Status) {
+				continue
 			}
+			return deepCopySlip(slip), commit, nil
 		}
 	}
 
@@ -381,15 +608,17 @@ func (m *MockStore) FindAllByCommits(
 
 	// Find all matching slips in commit order
 	var results []SlipWithCommit
+	// EVERY matching row, not one per commit: the store's query has no LIMIT and appends each
+	// row it scans. Multiplicity is this method's whole contract. No status filter either,
+	// unlike FindByCommits.
 	for _, commit := range commits {
-		key := repository + ":" + commit
-		if correlationID, ok := m.CommitIndex[key]; ok {
-			if slip, ok := m.Slips[correlationID]; ok {
-				results = append(results, SlipWithCommit{
-					Slip:          deepCopySlip(slip),
-					MatchedCommit: commit,
-				})
-			}
+		rows := m.rowsForCommit(repository, commit)
+		findOrder(rows)
+		for _, slip := range rows {
+			results = append(results, SlipWithCommit{
+				Slip:          deepCopySlip(slip),
+				MatchedCommit: commit,
+			})
 		}
 	}
 
@@ -613,9 +842,16 @@ func (m *MockStore) UpdateStepWithHistory(
 	return nil
 }
 
-// InsertAncestryLink writes a direct-parent link (no-op in mock).
+// InsertAncestryLink records a direct-parent link write. The mock has no
+// slip_ancestry-equivalent table, so nothing is stored — but recording the call is what
+// makes the push path's link writes visible to tests at all. While this was a bare
+// `return nil` the unit suite could not tell whether a successor's parent hop had been
+// written, which is exactly the class of bug the repave path is prone to.
 func (m *MockStore) InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error {
-	return nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.AncestryLinkCalls = append(m.AncestryLinkCalls, AncestryLinkCall{Slip: slip, Parent: parent})
+	return m.AncestryLinkError
 }
 
 // ResolveAncestry walks parent links to reconstruct ancestry (returns empty in mock).
@@ -715,7 +951,6 @@ func (m *MockStore) Reset() {
 	defer m.mu.Unlock()
 
 	m.Slips = make(map[string]*Slip)
-	m.CommitIndex = make(map[string]string)
 	m.CreateCalls = nil
 	m.LoadCalls = nil
 	m.LoadByCommitCalls = nil
@@ -727,6 +962,18 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.UpdateSlipStatusCalls = nil
+	m.RepaveCalls = nil
+	m.RepaveSuccessorCalls = nil
+	m.RepaveParents = nil
+	m.AncestryLinkCalls = nil
+	// One-shot hooks. An unspent SeedOnCreate entry surviving Reset would seed a phantom
+	// conflicting row into the next scenario's supposedly fresh store — the hardest kind of
+	// cross-test contamination to diagnose, because the store looks clean.
+	m.RepaveWentLiveStatus = make(map[string]SlipStatus)
+	m.RepaveError = nil
+	m.CreateErrorOnce = make(map[string]error)
+	m.SeedOnCreate = make(map[string]*Slip)
+	m.LoadByCommitNilOnCall = 0
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }
@@ -739,8 +986,6 @@ func (m *MockStore) AddSlip(slip *Slip) {
 	slipCopy := deepCopySlip(slip)
 	m.Slips[slip.CorrelationID] = slipCopy
 
-	key := slip.Repository + ":" + slip.CommitSHA
-	m.CommitIndex[key] = slip.CorrelationID
 }
 
 // Ensure MockStore implements SlipStore.

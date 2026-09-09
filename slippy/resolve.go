@@ -142,6 +142,20 @@ func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*Resolve
 			// Filtering terminal-superseded statuses here would drop those late-arriving
 			// deploy events on the floor. Migration to LoadLiveByCommit is NOT correct
 			// for this call site.
+			//
+			// Post-DEVOPS-231 contract update: same-commit repave changes what "the
+			// original build slip" means for a (repository, commit SHA) that has been
+			// re-pushed. A same-commit re-push of an ended slip replaces that row with a
+			// fresh one under the new push's correlation ID (Repave, driven by
+			// CreateSlipForPush), so LoadByCommit here resolves to whichever run
+			// currently holds that (repo, sha) — the repaved (current) run, not
+			// necessarily the run that actually produced the deployed image. A deploy
+			// event for an image built by a repaved run therefore attaches to the
+			// current run for that commit; the original run's state is intentionally
+			// not preserved. This is a deliberate trade-off (see STATE_MACHINE_V3.md's
+			// "Known sharp edges of repave"): refusing to repave any ended slip that
+			// recorded an image tag would make re-pushing an already-built commit
+			// non-repaveable, which is DEVOPS-231's primary case.
 			slip, err := c.store.LoadByCommit(ctx, opts.Repository, commitSHA)
 			if err == nil && slip != nil {
 				c.logger.Info(ctx, "Resolved slip via image tag", map[string]interface{}{

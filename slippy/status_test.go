@@ -60,6 +60,34 @@ func TestSlipStatus_IsTerminal(t *testing.T) {
 	}
 }
 
+func TestSlipStatus_IsLive(t *testing.T) {
+	// IsLive is the repave decision predicate shared by CreateSlipForPush's main path
+	// and handleDuplicateSlipBackstop (DEVOPS-231, review finding B5): true for every
+	// status that is neither terminal nor SlipStatusFailed. Covers all eight SlipStatus
+	// values so a future ninth status must be deliberately classified here too.
+	tests := []struct {
+		status   SlipStatus
+		expected bool
+	}{
+		{SlipStatusPending, true},
+		{SlipStatusInProgress, true},
+		{SlipStatusCompleted, false},
+		{SlipStatusFailed, false},
+		{SlipStatusCompensating, true},
+		{SlipStatusCompensated, false},
+		{SlipStatusAbandoned, false},
+		{SlipStatusPromoted, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(string(tt.status), func(t *testing.T) {
+			if got := tt.status.IsLive(); got != tt.expected {
+				t.Errorf("SlipStatus(%q).IsLive() = %v, want %v", tt.status, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestStepStatus_String(t *testing.T) {
 	tests := []struct {
 		status   StepStatus

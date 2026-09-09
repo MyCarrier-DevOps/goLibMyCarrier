@@ -453,6 +453,19 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 
 	// Only select active rows (sign=1) to exclude orphaned cancel rows.
 	// Order by version DESC to get the latest version.
+	//
+	// Deliberately NOT given the live-first ordering PostgresStore.LoadByCommit received for
+	// DEVOPS-231. That ordering exists because CreateSlipForPush routes on this row's status,
+	// and it is correct for Postgres — but Postgres is the slip store (DEVOPS-127), and this
+	// store is not on the push path at all: slippy-api injects a PostgresStore via
+	// NewClientWithDependencies, and ClickHouseStore.Repave returns ErrRepaveUnsupported by
+	// design. Applying it here was a mistake and is reverted: on a VersionedCollapsingMergeTree
+	// an update inserts a cancel row plus a new row at a higher version, so until background
+	// merges collapse the pair, `WHERE sign = 1` sees EVERY historical version of one
+	// correlation_id — and a status-first sort then ranks a stale in_progress version ABOVE
+	// that same slip's newer ended version, an inversion plain `version DESC` cannot produce.
+	// Closing that would need LoadLiveByCommit's per-correlation max(version) subquery, which
+	// is complexity for a store nothing routes pushes through.
 	query := s.queryBuilder.BuildSelectQuery(
 		"WHERE lower(repository) = lower(?) AND commit_sha = ? AND sign = 1",
 		"ORDER BY version DESC LIMIT 1",
@@ -912,6 +925,16 @@ func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, pa
 		parent.Branch,
 		parent.CreatedAt,
 	)
+}
+
+// Repave is not supported on the ClickHouse store. Postgres is the operational slip store
+// (DEVOPS-127); the repave path (DEVOPS-231) must never run against ClickHouse, which has
+// no delete path and no transactions to make the replacement atomic. Returns
+// ErrRepaveUnsupported wrapped with the superseded correlation ID (rather than a plain
+// formatted error) so callers can detect it with errors.Is and fall back to abandon
+// semantics instead of silently losing the old AbandonSlip behavior.
+func (s *ClickHouseStore) Repave(_ context.Context, oldCorrelationID string, _ *Slip, _ *AncestryEntry) error {
+	return fmt.Errorf("Repave(%s): %w", oldCorrelationID, ErrRepaveUnsupported)
 }
 
 // ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
