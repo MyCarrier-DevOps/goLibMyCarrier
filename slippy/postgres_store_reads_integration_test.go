@@ -48,8 +48,15 @@ func TestPostgresStore_Ancestry_Integration(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 
-	child := &Slip{CorrelationID: "child", Repository: "owner/repo", Branch: "feature"}
-	parentSlip := &Slip{CorrelationID: "p", Repository: "owner/repo", Branch: "main"}
+	child := &Slip{CorrelationID: "child", Repository: "owner/repo", Branch: "feature", CommitSHA: "csha"}
+	parentSlip := &Slip{CorrelationID: "p", Repository: "owner/repo", Branch: "main", CommitSHA: "psha"}
+	// Both slips must exist before their ancestry links: migration v5's fk_ancestry_slip
+	// (correlation_id -> routing_slips) rejects a link for a slip that was never created,
+	// which is what the push path guarantees anyway (writeAncestryLink runs after Create).
+	// Parents (p, gp, p2) are deliberately NOT all created: there is no FK on
+	// parent_correlation_id, and a dangling parent is a tolerated shape.
+	require.NoError(t, store.Create(ctx, child))
+	require.NoError(t, store.Create(ctx, parentSlip))
 
 	// child (feature) -> p (main): cross-branch link.
 	require.NoError(t, store.InsertAncestryLink(ctx, child, AncestryEntry{

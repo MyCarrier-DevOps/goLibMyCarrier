@@ -51,6 +51,7 @@ func (m *PostgresDynamicMigrationManager) GenerateMigrations() []postgresmigrato
 		m.routingSlipsMigration(),
 		m.componentStatesMigration(),
 		m.ancestryMigration(),
+		m.uniquenessMigration(),
 	}
 }
 
@@ -178,6 +179,66 @@ func (m *PostgresDynamicMigrationManager) ancestryMigration() postgresmigrator.M
 			)
 		`,
 		DownSQL: `DROP TABLE IF EXISTS slip_ancestry`,
+	}
+}
+
+// uniquenessMigration is DEVOPS-231 Phase B: one routing_slips row per
+// (lower(repository), commit_sha), enforced by the database, plus the cascade FKs that let
+// Repave's single guarded DELETE take the superseded run's child rows with it.
+//
+// PRECONDITION — a one-time cleanup script must have run in this environment first, in this
+// order: delete orphaned child rows, dedupe to one row per commit (non-terminal survivor, else
+// newest), delete the losers' children explicitly (the cascade does not exist yet). The FK
+// ADDs validate existing data and the unique index build fails on duplicates, so on an
+// uncleaned database this migration fails LOUDLY and the migrator rolls it back — the FKs are
+// added in the same transaction as the index, so nothing is left half-applied. A failure here
+// means the cleanup has not run; do NOT weaken this migration to get past it.
+//
+// Sequencing — the index must never be live while a pre-repave slippy-api runs: the old
+// failed-path (AbandonSlip + insert) creates a second row for the same commit and would
+// 23505-fail every same-commit retrigger. Release order is repave code (v1.3.100) deployed →
+// cleanup per environment → this migration. See the design spec §5.
+//
+// Plain CREATE UNIQUE INDEX, not CONCURRENTLY: the table is ~12.5k rows so the build is
+// near-instant, and CONCURRENTLY cannot run inside the transaction the migrator wraps each
+// migration in — it would break the migrator, not merely waste time.
+//
+// Deliberately NO foreign key on slip_ancestry.parent_correlation_id. Repave's first statement
+// is the guarded DELETE of the old row, which runs while descendants still carry
+// parent_correlation_id = old, so a plain FK would raise 23503 on every repave that has a
+// descendant; ON DELETE CASCADE there would delete a child's lineage row when its parent run
+// is repaved. It stays a plain column and may dangle (spec §3 banner, §7).
+func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator.Migration {
+	return postgresmigrator.Migration{
+		Version:     5,
+		Name:        "one_slip_per_commit",
+		Description: "Cascade FKs from child tables on correlation_id and a unique (lower(repository), commit_sha) index (DEVOPS-231 Phase B)",
+		UpSQL: `
+			DO $$
+			BEGIN
+				BEGIN
+					ALTER TABLE slip_component_states
+						ADD CONSTRAINT fk_component_states_slip
+						FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id)
+						ON DELETE CASCADE;
+				EXCEPTION WHEN duplicate_object THEN NULL;
+				END;
+				BEGIN
+					ALTER TABLE slip_ancestry
+						ADD CONSTRAINT fk_ancestry_slip
+						FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id)
+						ON DELETE CASCADE;
+				EXCEPTION WHEN duplicate_object THEN NULL;
+				END;
+			END $$;
+			CREATE UNIQUE INDEX IF NOT EXISTS uq_routing_slips_repo_sha
+				ON routing_slips (lower(repository), commit_sha);
+		`,
+		DownSQL: `
+			DROP INDEX IF EXISTS uq_routing_slips_repo_sha;
+			ALTER TABLE slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip;
+			ALTER TABLE slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip;
+		`,
 	}
 }
 

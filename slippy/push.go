@@ -201,7 +201,7 @@ const (
 	// Sequencing note for an adopting consumer: setting this opts a zero-component push
 	// INTO the repave path, and therefore into the Phase A double-row race described in
 	// .github/STATE_MACHINE_V3.md — two concurrent same-commit pushes can both repave and
-	// both insert, because no unique index exists until Phase B. The component-count
+	// both insert, wherever migration v5's unique index is not yet applied. The component-count
 	// inference previously shielded these repos from that. It also opts the push into
 	// ancestry resolution and into a repave failure being fatal, where the guard's early
 	// return previously made it a no-op; see CreateSlipForPush.
@@ -631,7 +631,8 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 // ended one is repaved onto this push's successor.
 //
 // Phase A note (DEVOPS-231 review D3.6): ErrDuplicateSlip is unreachable via ANY path in
-// Phase A, so handleDuplicateSlipBackstop is dormant until the Phase B migration lands.
+// Phase A, so handleDuplicateSlipBackstop is dormant wherever migration v5 (Phase B) is not
+// yet applied.
 // Without the uq_routing_slips_repo_sha unique index, the insert's ON CONFLICT target is
 // correlation_id only, so two different pushes' correlation IDs for the SAME (repository,
 // commit_sha) never conflict — both simply succeed, silently leaving two rows for one
@@ -1054,7 +1055,7 @@ func (c *Client) writeAncestryLink(
 // never comes into existence.
 //
 // That ordering is necessary but NOT sufficient for a foreign key on
-// slip_ancestry.parent_correlation_id, and Phase B deliberately adds none — see
+// slip_ancestry.parent_correlation_id, and migration v5 deliberately adds none — see
 // SlipStore.Repave in interfaces.go for the full argument, which is kept in one place because
 // it drifted across four copies in three review rounds.
 func (c *Client) repaveExistingSlip(
@@ -1105,7 +1106,7 @@ func (c *Client) repaveExistingSlip(
 		// branch). Repave's status guard refused to destroy it, and — because the whole
 		// replacement is one transaction — refused to create the successor either.
 		// Creating a fresh slip now would produce two competing live runs for the same
-		// commit; nothing at the DB level stops that pre-index (Phase B). Dedup onto the
+		// commit; nothing at the DB level stops that before migration v5's index. Dedup onto the
 		// live slip instead, reloaded so the returned copy reflects its current state.
 		//
 		// D3.2 (DEVOPS-231 review): this path is routed through handlePushRetry, exactly
@@ -1159,7 +1160,7 @@ func (c *Client) repaveExistingSlip(
 		return c.createFreshSlip(ctx, opts, slip, parent, result)
 
 	case errors.Is(repaveErr, ErrDuplicateSlip):
-		// Dormant until Phase B's unique index exists, but genuinely reachable after that,
+		// Dormant until migration v5's unique index is applied, but genuinely reachable after that,
 		// via the concurrent same-commit push this whole feature is about. Two pushes for
 		// one commit both try to repave the same row: A's guarded delete takes the row lock
 		// and B blocks on it. When A commits (row deleted, A's successor inserted), B's
@@ -1305,9 +1306,9 @@ func (c *Client) abandonSupersededSlipForUnsupportedRepave(
 // then falls through to the caller's insert retry, for symmetry with repaveExistingSlip's
 // own ErrRepaveUnsupported branch. Both sentinels are dormant in Phase A (ErrDuplicateSlip
 // itself is unreachable without the uq_routing_slips_repo_sha index — see CreateSlipForPush's
-// doc comment), so this fix has zero behavioral effect until Phase B, but is still correct to
-// make now. Every other repave error remains fatal here — this backstop is already the
-// last-resort convergence path, so there is nothing further to fall back on.
+// doc comment), so this fix has zero behavioral effect until migration v5 is applied, but is
+// still correct to make now. Every other repave error remains fatal here — this backstop is
+// already the last-resort convergence path, so there is nothing further to fall back on.
 func (c *Client) handleDuplicateSlipBackstop(
 	ctx context.Context,
 	opts PushOptions,
@@ -1383,8 +1384,8 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// included: the retry's Create upserts state_history too, so without appending here the
 		// two convergent paths would differ on the one observable added to make a reset legible.
 		//
-		// Dormant until Phase B: ErrDuplicateSlip is what routes here, and no unique index
-		// exists yet to raise it.
+		// Dormant until migration v5 is applied: ErrDuplicateSlip is what routes here, and no
+		// unique index exists before then to raise it.
 		c.logger.Info(ctx, "Duplicate-create backstop: conflicting slip is this push's own; "+
 			"resetting in place instead of repaving",
 			map[string]interface{}{
