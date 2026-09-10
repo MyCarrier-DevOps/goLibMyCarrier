@@ -50,8 +50,9 @@ type SlipStore interface {
 	// "no rows" condition to ErrSlipNotFound before returning, and must not use
 	// ErrSlipNotFound for anything other than a genuine clean miss.
 	//
-	// Selection contract: until Phase B's cleanup and uq_routing_slips_repo_sha land, MORE THAN
-	// ONE row can exist for a (repository, commit_sha). When several match, an implementation
+	// Selection contract: wherever the Phase B cleanup has not run and migration v5's
+	// uq_routing_slips_repo_sha is not yet applied, MORE THAN ONE row can exist for a
+	// (repository, commit_sha). When several match, an implementation
 	// MUST return a LIVE row (Status.IsLive()) if any exists, and the most recently updated one
 	// otherwise. This is behaviour, not an implementation detail: CreateSlipForPush routes
 	// entirely on the returned row's status — a live row dedups onto it, anything else is
@@ -163,7 +164,7 @@ type SlipStore interface {
 	// slip_ancestry.parent_correlation_id: the guarded DELETE still runs first, while
 	// descendants reference the row it removes, so a plain (NOT DEFERRABLE, NO ACTION) FK
 	// would raise 23503 at the end of that statement for every repave that has a descendant.
-	// Phase B deliberately adds no such FK — both of its FKs are on correlation_id.
+	// Migration v5 (Phase B) deliberately adds no such FK — both of its FKs are on correlation_id.
 	//
 	// Descendants are repointed only when this call actually removed the old row: a repave
 	// whose old row was already gone rewrites nothing, so a redelivery can never reassign an
@@ -206,7 +207,7 @@ type SlipStore interface {
 	//   - ErrSlipWentLive: oldCorrelationID's row exists but is no longer ended. Nothing
 	//     is written and newSlip is NOT created; the caller must dedup onto the live run.
 	//   - ErrDuplicateSlip: newSlip collided with the one-row-per-commit unique index
-	//     (Phase B). Nothing is written; the caller routes to its dedup backstop.
+	//     (migration v5, Phase B). Nothing is written; the caller routes to its dedup backstop.
 	//   - ErrInvalidConfiguration: a precondition on the arguments was violated — newSlip is
 	//     nil, or newSlip.CorrelationID equals oldCorrelationID. Nothing is written, no
 	//     transaction is opened, and REDELIVERY CANNOT CLEAR IT: the offending value is the
@@ -233,6 +234,11 @@ type SlipStore interface {
 	SetComponentImageTag(ctx context.Context, correlationID, stepName, componentName, imageTag string) error
 
 	// InsertAncestryLink writes a single direct-parent link to the ancestry table.
+	//
+	// Implementations MAY require the slip's own row to exist first — the Postgres store does
+	// once migration v5's fk_ancestry_slip (on correlation_id) is applied — so callers write
+	// the slip before its link, as the push path already does. The PARENT side may dangle:
+	// there is deliberately no FK on parent_correlation_id (see Repave).
 	InsertAncestryLink(ctx context.Context, slip *Slip, parent AncestryEntry) error
 
 	// ResolveAncestry walks parent links to reconstruct the full ancestry chain.

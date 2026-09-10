@@ -133,9 +133,9 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 // LoadByCommit retrieves the slip for (repository, commitSHA).
 // Repository comparison is case-insensitive.
 func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
-	// Both ORDER BY terms are required, not decorative: Phase A (DEVOPS-231) ships ahead of
-	// the Phase B cleanup + uq_routing_slips_repo_sha unique index, so duplicate rows for the
-	// same (repository, commit_sha) can still exist in production today. Without an explicit
+	// Both ORDER BY terms are required, not decorative: Phase A (DEVOPS-231) runs ahead of
+	// the Phase B cleanup + migration v5's uq_routing_slips_repo_sha unique index, so duplicate
+	// rows for one (repository, commit_sha) exist wherever v5 is not yet applied. Without an explicit
 	// order, Postgres gives LIMIT 1 no ordering guarantee at all.
 	//
 	// Live rows sort FIRST, and that term is the load-bearing one. CreateSlipForPush routes
@@ -151,7 +151,7 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 	// The status list is repaveableSlipStatusesSQL rather than a second hand-written set, so
 	// TestRepaveableSlipStatusesSQL_MatchesIsLive covers this ordering's notion of "live" too.
 	// updated_at DESC then breaks ties within each group: among ended rows the newest is the
-	// one worth repaving. Once Phase B lands there is one row per commit and both terms cost
+	// one worth repaving. Once migration v5 is applied there is one row per commit and both terms cost
 	// nothing extra.
 	//
 	// KNOWN PHASE A STATE, accepted deliberately: this converts a nondeterministic wrong
@@ -159,7 +159,7 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 	// so under updated_at DESC alone it lost to any newer ended row; live-first means it now
 	// always WINS, and every subsequent push for that commit dedupes onto the zombie via
 	// handlePushRetry with the caller suppressing side effects — until the Phase B cleanup
-	// removes the duplicate. There is no timeout or escape hatch.
+	// script (which precedes migration v5) removes the duplicate. There is no timeout or escape hatch.
 	//
 	// That is still the right trade, and the reasoning is worth recording because the
 	// alternative looks safer than it is. Getting it wrong the other way repaves a pipeline

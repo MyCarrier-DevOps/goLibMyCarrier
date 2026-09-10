@@ -475,7 +475,7 @@ const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','
 //  4. Insert the successor. This must precede step 5: the repoint names the successor's
 //     correlation ID, so the row has to exist first — that is what keeps a descendant from
 //     ever pointing at a phantom. It is necessary but NOT sufficient for a foreign key on
-//     slip_ancestry.parent_correlation_id, and Phase B deliberately adds none — the full
+//     slip_ancestry.parent_correlation_id, and migration v5 deliberately adds none — the full
 //     argument is on SlipStore.Repave in interfaces.go.
 //  5. Repoint descendants of the superseded run onto the successor, rewriting the whole
 //     denormalized snapshot that describes the parent, not just the id. The column list is
@@ -534,9 +534,9 @@ func (s *PostgresStore) Repave(
 
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		// Read the superseded run's own ancestry link BEFORE the guarded DELETE below, not
-		// after. This ordering is required by Phase B and is invisible without it.
+		// after. This ordering is required by migration v5 and is invisible where v5 is not applied.
 		//
-		// Phase B adds fk_ancestry_slip (correlation_id) REFERENCES routing_slips
+		// Migration v5 (Phase B) adds fk_ancestry_slip (correlation_id) REFERENCES routing_slips
 		// ON DELETE CASCADE. A cascade is an AFTER ROW trigger, so for a non-deferrable
 		// constraint it fires at end of statement: the moment the guarded DELETE of the
 		// routing_slips row completes, this run's slip_ancestry rows are gone — and gone to
@@ -546,10 +546,10 @@ func (s *PostgresStore) Repave(
 		// The consequence lands where nobody would see it. The carry-forward only runs when
 		// the caller resolved no ancestry of its own (a GitHub outage), so the lineage hop
 		// would be destroyed in exactly the degraded case the mechanism exists for, and
-		// never in the healthy case. Nor would the suite catch it: CI migrates to v4 and the
-		// FK arrives in v5, so everything stays green until the migration ships.
-		// TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration
-		// installs that FK itself so the ordering is pinned now rather than on trust.
+		// never in the healthy case. The suite catches it now: CI migrates to v5, so
+		// fk_ancestry_slip is present in
+		// TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration, which
+		// asserts the constraint and pins this ordering against it.
 		//
 		// Reading before the DELETE means reading without the row lock the DELETE takes,
 		// and that introduces no new race: two concurrent repaves of the same old ID read

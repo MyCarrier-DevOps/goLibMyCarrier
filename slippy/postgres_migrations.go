@@ -51,6 +51,7 @@ func (m *PostgresDynamicMigrationManager) GenerateMigrations() []postgresmigrato
 		m.routingSlipsMigration(),
 		m.componentStatesMigration(),
 		m.ancestryMigration(),
+		m.uniquenessMigration(),
 	}
 }
 
@@ -178,6 +179,165 @@ func (m *PostgresDynamicMigrationManager) ancestryMigration() postgresmigrator.M
 			)
 		`,
 		DownSQL: `DROP TABLE IF EXISTS slip_ancestry`,
+	}
+}
+
+// uniquenessMigration is DEVOPS-231 Phase B: one routing_slips row per
+// (lower(repository), commit_sha), enforced by the database, plus the cascade FKs that let
+// Repave's single guarded DELETE take the superseded run's child rows with it.
+//
+// PRECONDITION — a one-time cleanup script must have run in this environment first, in this
+// order: delete orphaned child rows, dedupe to one row per commit (non-terminal survivor, else
+// newest), delete the losers' children explicitly (the cascade does not exist yet). The FK
+// ADDs validate existing data and the unique index build fails on duplicates, so on an
+// uncleaned database this migration fails LOUDLY and the migrator rolls it back — the FKs are
+// added in the same transaction as the index, so nothing is left half-applied. A failure names
+// what broke — uq_routing_slips_repo_sha for a duplicate commit, fk_component_states_slip or
+// fk_ancestry_slip for an orphan child row. Usually the cleanup has not run; it can also have
+// been re-broken since, as a lost dedup-lock race is undetectable until this index exists (see
+// CreateSlipForPush in push.go). Either way, do NOT weaken this migration to get past it.
+//
+// Sequencing — the index must never be live while a pre-repave slippy-api runs: the old
+// failed-path (AbandonSlip + insert) creates a second row for the same commit and would
+// 23505-fail every same-commit retrigger. Release order is repave code (v1.3.100) deployed →
+// cleanup per environment → this migration. See the design spec §5.
+//
+// Plain CREATE UNIQUE INDEX, not CONCURRENTLY: the table is ~12.5k rows so the build is
+// near-instant, and CONCURRENTLY cannot run inside the transaction the migrator wraps each
+// migration in — it would break the migrator, not merely waste time.
+//
+// Idempotent by NAME, asserted by SHAPE. `duplicate_object` is swallowed and the index is
+// IF NOT EXISTS so a repeated migrator run is a no-op (postgresmigrator relies on that; it
+// takes no advisory lock and assumes one migrator at a time). Two concurrent runs from v4 also
+// converge, but incidentally: ADD FOREIGN KEY below takes SHARE ROW EXCLUSIVE held to commit,
+// so the loser blocks there and finds the index already built. Keep the index AFTER the FK
+// ADDs. A name match is still not proof of definition: a pre-existing same-named object with
+// another shape — a NO ACTION or NOT VALID FK, an index built without lower(), a leftover from
+// a failed CONCURRENTLY build, even a table of that name — would otherwise be kept silently and
+// v5 recorded with the guarantee absent. Each half therefore ends in a post-condition that
+// asserts exactly what the code depends on (the FKs' pg_get_constraintdef text plus
+// convalidated; a UNIQUE, valid, ready btree index on exactly (lower(repository), commit_sha))
+// and RAISEs otherwise. The fix for that failure is to drop the foreign object and re-run,
+// never to weaken the check.
+//
+// Deliberately NO foreign key on slip_ancestry.parent_correlation_id. Repave's first statement
+// is the guarded DELETE of the old row, which runs while descendants still carry
+// parent_correlation_id = old, so a plain FK would raise 23503 on every repave that has a
+// descendant; ON DELETE CASCADE there would delete a child's lineage row when its parent run
+// is repaved. It stays a plain column and may dangle (spec §3 banner, §7).
+func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator.Migration {
+	return postgresmigrator.Migration{
+		Version:     5,
+		Name:        "one_slip_per_commit",
+		Description: "Cascade FKs from child tables on correlation_id and a unique (lower(repository), commit_sha) index (DEVOPS-231 Phase B)",
+		UpSQL: `
+			DO $$
+			DECLARE
+				expected_def constant text :=
+					'FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id) ON DELETE CASCADE';
+				fk record;
+				actual_def text;
+				is_valid boolean;
+			BEGIN
+				BEGIN
+					ALTER TABLE slip_component_states
+						ADD CONSTRAINT fk_component_states_slip
+						FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id)
+						ON DELETE CASCADE;
+				EXCEPTION WHEN duplicate_object THEN NULL;
+				END;
+				BEGIN
+					ALTER TABLE slip_ancestry
+						ADD CONSTRAINT fk_ancestry_slip
+						FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id)
+						ON DELETE CASCADE;
+				EXCEPTION WHEN duplicate_object THEN NULL;
+				END;
+				-- Post-condition. The swallowed error above only proves a constraint of that NAME exists;
+				-- assert the definition and validity Repave depends on, so a pre-existing same-named FK
+				-- with another shape (NO ACTION / RESTRICT / DEFERRABLE / NOT VALID) fails this
+				-- migration loudly instead of being recorded as v5. The expected text spells
+				-- routing_slips unqualified, which is how pg_get_constraintdef renders it whenever the
+				-- table is visible in the migrator's search_path; where it is not, the ALTER above has
+				-- already failed with 42P01, so a false mismatch here is unreachable.
+				FOR fk IN
+					SELECT * FROM (VALUES
+						('slip_component_states', 'fk_component_states_slip'),
+						('slip_ancestry',         'fk_ancestry_slip')
+					) AS t(tbl, con)
+				LOOP
+					SELECT pg_get_constraintdef(oid), convalidated
+						INTO actual_def, is_valid
+						FROM pg_constraint
+						WHERE conrelid = fk.tbl::regclass AND conname = fk.con AND contype = 'f';
+					IF actual_def IS DISTINCT FROM expected_def OR NOT coalesce(is_valid, false) THEN
+						RAISE EXCEPTION 'migration v5: % on % is % (validated=%); expected %',
+							fk.con, fk.tbl, coalesce(actual_def, '<missing>'), is_valid, expected_def;
+					END IF;
+				END LOOP;
+			END $$;
+			CREATE UNIQUE INDEX IF NOT EXISTS uq_routing_slips_repo_sha
+				ON routing_slips (lower(repository), commit_sha);
+			DO $$
+			BEGIN
+				-- Post-condition. IF NOT EXISTS matches the relation NAME only: an invalid leftover
+				-- from a hand-run CREATE INDEX CONCURRENTLY, a non-unique or differently-keyed index,
+				-- or a table of that name would all be "skipped" and v5 recorded with no uniqueness
+				-- at all. Pin what the one-slip invariant needs — UNIQUE, valid, ready, on exactly
+				-- this expression — and fail loudly otherwise.
+				--
+				-- Three details are load-bearing. The index is found via the TABLE (indrelid plus
+				-- relname), not by casting its bare name to regclass: CREATE INDEX puts the index in
+				-- the table's schema, while a bare name resolves through search_path and could find
+				-- an unrelated index of that name in an earlier schema — which would fail a database
+				-- this migration had just correctly migrated. The flags are not redundant with the
+				-- text, because pg_get_indexdef renders an invalid index identically to a valid one.
+				-- And the pattern is anchored at both ends, with one wildcard for the schema
+				-- qualifier pg_get_indexdef adds (a hardcoded schema would reject a healthy index in
+				-- any other schema) and commit\_sha escaped, since LIKE would otherwise read the
+				-- underscore as a single-character wildcard and accept an index on a similarly named
+				-- column.
+				IF NOT EXISTS (
+					SELECT 1
+					FROM pg_index i
+					JOIN pg_class ic ON ic.oid = i.indexrelid
+					WHERE i.indrelid = 'routing_slips'::regclass
+					  AND ic.relname = 'uq_routing_slips_repo_sha'
+					  AND i.indisunique AND i.indisvalid AND i.indisready
+					  AND pg_get_indexdef(i.indexrelid) LIKE 'CREATE UNIQUE INDEX uq_routing_slips_repo_sha '
+					      || 'ON %routing_slips USING btree (lower(repository), commit\_sha)'
+				) THEN
+					RAISE EXCEPTION 'uq_routing_slips_repo_sha on routing_slips is not the expected valid unique index; DROP it and re-run v5';
+				END IF;
+			END $$;
+		`,
+		DownSQL: `
+			DO $$
+			DECLARE
+				idx regclass;
+			BEGIN
+				-- Find the index through the TABLE, mirroring the UpSQL post-condition. A bare
+				-- name resolves through search_path, so it could drop an unrelated index of this
+				-- name from an earlier schema and leave the real one live under a reverted
+				-- version — the one state a pre-repave writer must never meet, since it
+				-- 23505-fails every same-commit retrigger. regclass renders schema-qualified
+				-- when the relation is not visible, so this drops the object it found.
+				--
+				-- Deliberate behaviour change from a bare IF EXISTS drop: to_regclass returns
+				-- NULL instead of raising 42P01, so a missing routing_slips makes this a no-op
+				-- rather than an error. That is the right outcome on a down path.
+				SELECT i.indexrelid INTO idx
+					FROM pg_index i
+					JOIN pg_class ic ON ic.oid = i.indexrelid
+					WHERE i.indrelid = to_regclass('routing_slips')
+					  AND ic.relname = 'uq_routing_slips_repo_sha';
+				IF idx IS NOT NULL THEN
+					EXECUTE format('DROP INDEX %s', idx);
+				END IF;
+			END $$;
+			ALTER TABLE slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip;
+			ALTER TABLE slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip;
+		`,
 	}
 }
 

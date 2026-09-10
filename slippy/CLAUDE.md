@@ -48,7 +48,7 @@ rolls back instead of destroying the run. Implementations MUST provide that atom
 Folding the create into the store also closed four other defects structurally rather than
 by documentation: the successor's row is inserted **before** any descendant is repointed
 onto it (so no descendant can name a correlation ID that has no row — necessary but not
-sufficient for a foreign key on `slip_ancestry.parent_correlation_id`, and Phase B adds
+sufficient for a foreign key on `slip_ancestry.parent_correlation_id`, and migration v5 adds
 none; the full argument lives on `SlipStore.Repave` in `interfaces.go`); the superseded
 run's own parent link is
 carried forward when the caller resolved no ancestry, instead of being deleted and never
@@ -82,7 +82,41 @@ repave was rejected because the slip went live between the repave decision and t
 nothing was written, and the successor was NOT created) and `ErrRepaveUnsupported` (the
 store, e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
 abandon semantics, then create the successor separately). `Repave` can also return
-`ErrDuplicateSlip` once Phase B's unique index exists. See `errors.go` for full contracts.
+`ErrDuplicateSlip` once migration v5's unique index is applied. See `errors.go` for full contracts.
+
+**Migration v5 (`one_slip_per_commit`) has a hard, per-environment precondition.** The
+version that carries it adds `uq_routing_slips_repo_sha` on `(lower(repository), commit_sha)`
+plus `ON DELETE CASCADE` FKs from `slip_component_states` and `slip_ancestry` on
+`correlation_id`. `ADD CONSTRAINT` validates existing rows and a unique index build fails on
+duplicates, so on a database that still holds more than one `routing_slips` row for one
+commit, or orphan child rows, the migrator fails loudly and its per-migration transaction
+rolls v5 back. That is deliberate — do not weaken v5 to get past it. Before bumping a
+consumer to that version in ANY environment, both of these must already be true there:
+
+1. The consumer release carrying the repave code (slippy-api on goLibMyCarrier ≥ v1.3.100)
+   is deployed. The unique index must never be live while a pre-repave slippy-api runs: its
+   old failed-path (`AbandonSlip` + insert) made a second row per commit and would 23505-fail
+   every same-commit retrigger.
+2. The one-time cleanup script `DEVOPS-231-cleanup-one-row-per-commit.sql` has run against
+   that environment's database. It is an operator script kept outside this repo (the
+   DEVOPS-127 convention: the migrator Job is schema-only), runs in one transaction, and
+   RAISEs — rolling back — unless it ends with exactly the state v5 requires.
+
+slippy-migrator's default `target-version` is latest, so v5 applies automatically on the
+first deploy after the bump, and `target-version` cannot hold an environment below it: the
+migrator runs `CreateTables` to latest before honouring any lower target
+(`postgres_migrate.go`), so a lower value still attempts v5 and still fails. In an environment
+whose cleanup has not run, the observable is a crash-looping pre-deploy Job with the recorded
+version stuck at 4 — the version INSERT rides in the same transaction as the DDL — and the
+config-driven ensurers never reached, so new step columns and indexes do not land either. The
+recovery is to run the cleanup, or to pin the consumer to a pre-v5 goLibMyCarrier.
+
+v5 is also idempotent by name but asserted by shape: `duplicate_object` is swallowed and the
+index is `IF NOT EXISTS` so a repeated migrator run is a no-op, and each half then RAISEs unless
+the object it kept has exactly the expected definition (cascade FKs, `convalidated`; a UNIQUE
+valid index on `(lower(repository), commit_sha)`). A pre-existing same-named object of another
+shape — including a leftover from a hand-run `CREATE INDEX CONCURRENTLY` — fails v5 loudly; drop
+it and re-run. Do not pre-create the index or the FKs by hand.
 
 **DEVOPS-231 also removed the exported field `slippytest.MockStore.CommitIndex`.** The
 published double no longer keeps a `"repo:sha" -> correlation_id` map; its four commit

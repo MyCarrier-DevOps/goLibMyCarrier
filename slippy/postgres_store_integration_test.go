@@ -26,6 +26,24 @@ func newMigratedStore(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineCon
 	return store, pool, cfg
 }
 
+// newStoreAtV4 is newMigratedStore left at schema v4 — the last version WITHOUT
+// uq_routing_slips_repo_sha. Tests that deliberately seed two rows for one
+// (repository, commit_sha) need it: v5 makes that shape impossible, so against a fully
+// migrated database their second Create fails with ErrDuplicateSlip before the behaviour
+// under test is reached. The live-first ordering those tests pin is kept in the queries as
+// defence in depth for an environment where v5 has not yet been applied.
+//
+// v5PoolAtV4 owns how a v4 schema is reached and asserts that v5's DownSQL fully reverted;
+// keeping that in one place is what stops a DownSQL regression from surfacing here as an
+// unexplained ErrDuplicateSlip.
+func newStoreAtV4(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig) {
+	t.Helper()
+	pool, cfg := v5PoolAtV4(t)
+	store, err := NewPostgresStore(pool, cfg, nil)
+	require.NoError(t, err)
+	return store, pool, cfg
+}
+
 func TestPostgresStore_CRUD_Integration(t *testing.T) {
 	store, _, _ := newMigratedStore(t)
 	ctx := context.Background()
@@ -145,7 +163,8 @@ func TestPostgresStore_LoadLiveByCommit_Integration(t *testing.T) {
 // inside each group. This test seeds exactly the inversion: a stalled in_progress row whose
 // updated_at is older than an abandoned duplicate's.
 func TestPostgresStore_LoadByCommit_PrefersLiveOverNewerEndedDuplicate_Integration(t *testing.T) {
-	store, pool, _ := newMigratedStore(t)
+	// v4 schema on purpose: this seeds two rows for one commit, which v5 forbids. See newStoreAtV4.
+	store, pool, _ := newStoreAtV4(t)
 	ctx := context.Background()
 
 	// Two rows for the same commit: a stalled live run, and a duplicate that ended later.
@@ -199,7 +218,8 @@ func TestPostgresStore_LoadByCommit_PrefersLiveOverNewerEndedDuplicate_Integrati
 // surfaces ahead of it on updated_at DESC alone — the same inversion, through the narrower
 // hole its own doc comment already names.
 func TestPostgresStore_LoadLiveByCommit_PrefersLiveOverNewerEndedDuplicate_Integration(t *testing.T) {
-	store, pool, _ := newMigratedStore(t)
+	// v4 schema on purpose: this seeds two rows for one commit, which v5 forbids. See newStoreAtV4.
+	store, pool, _ := newStoreAtV4(t)
 	ctx := context.Background()
 
 	require.NoError(t, store.Create(ctx, &Slip{
@@ -444,24 +464,24 @@ func TestPostgresStore_Repave_CarriesForwardParentLink_Integration(t *testing.T)
 // The failure lands exactly where it is least visible. The carry-forward only runs when the
 // caller resolved no ancestry of its own, i.e. during a GitHub outage — so the lineage hop
 // would be destroyed precisely in the degraded case the mechanism was written for, and never
-// in the healthy case where someone would notice. And no ordinary test would catch it: CI
-// migrates to v4, the FK arrives in v5, so the suite stays green right up until the migration
-// ships.
+// in the healthy case where someone would notice. Before v5 existed no ordinary test would
+// have caught it either: CI migrated only to v4, so the suite stayed green without the FK.
 //
-// This test therefore installs the future FK itself rather than waiting for the migration.
-// It is the only thing that pins the read/delete ordering against the constraint that makes
-// the ordering matter, so whoever writes the v5 migration inherits a test that already
-// covers it instead of a comment claiming the code is v5-safe.
+// Until migration v5 existed this test installed the FK by hand; it now relies on v5 and
+// asserts the constraint is present, so it remains the one thing that pins the read/delete
+// ordering against the constraint that makes the ordering matter.
 func TestPostgresStore_Repave_CarriesForwardParentLinkUnderCascadeFK_Integration(t *testing.T) {
 	store, pool, _ := newMigratedStore(t)
 	ctx := context.Background()
 
-	// Install Phase B's cascade FK verbatim (design.md §3). Only the slip_ancestry one is
-	// needed here; the component-states FK cascades a table this test does not read.
-	_, err := pool.Exec(ctx, `ALTER TABLE slip_ancestry
-		ADD CONSTRAINT fk_ancestry_slip
-		FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id) ON DELETE CASCADE`)
-	require.NoError(t, err, "Phase B's FK must be installable against the v4 schema")
+	// Migration v5 (DEVOPS-231 Phase B) now installs fk_ancestry_slip, so newMigratedStore
+	// already has it. This test used to install the FK by hand ahead of the migration; it now
+	// asserts the migration delivered the constraint this ordering is protected against.
+	var fkDef string
+	err := pool.QueryRow(ctx,
+		"SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'fk_ancestry_slip'").Scan(&fkDef)
+	require.NoError(t, err, "migration v5 must install fk_ancestry_slip")
+	require.Contains(t, fkDef, "ON DELETE CASCADE")
 
 	old := &Slip{
 		CorrelationID: "corr-cascade-old",

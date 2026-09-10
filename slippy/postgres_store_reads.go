@@ -10,11 +10,11 @@ import (
 
 // FindByCommits returns the slip matching the highest-priority commit in the ordered
 // list (earliest in the list wins). The secondary ORDER BY (s.updated_at DESC) is
-// required, not decorative: Phase A (DEVOPS-231) ships ahead of the Phase B cleanup +
-// uq_routing_slips_repo_sha unique index, so duplicate rows for the same commit can
-// still tie on commit priority today; this breaks that tie deterministically. Once
-// Phase B lands there is one row per commit and no same-commit tie to break, so the
-// ordering costs nothing extra. Terminal-superseded statuses (abandoned, promoted,
+// required, not decorative: Phase A (DEVOPS-231) runs ahead of the Phase B cleanup +
+// migration v5's uq_routing_slips_repo_sha unique index, so wherever v5 is not yet
+// applied duplicate rows for the same commit can still tie on commit priority; this
+// breaks that tie deterministically. Once v5 is applied there is one row per commit
+// and no same-commit tie to break, so the ordering costs nothing extra. Terminal-superseded statuses (abandoned, promoted,
 // compensated) are excluded. Returns ErrSlipNotFound when no live slip matches any
 // commit.
 func (s *PostgresStore) FindByCommits(
@@ -27,12 +27,12 @@ func (s *PostgresStore) FindByCommits(
 	}
 
 	// c.priority orders across the distinct commits in the list. s.updated_at is a
-	// required secondary key while pre-Phase-B duplicate rows for the same commit can
-	// still tie on c.priority today (same reason as LoadByCommit/LoadLiveByCommit); once
-	// the Phase B cleanup + unique index land there is one row per commit and no
+	// required secondary key while pre-v5 duplicate rows for the same commit can still
+	// tie on c.priority (same reason as LoadByCommit/LoadLiveByCommit); once the Phase B
+	// cleanup has run and migration v5 is applied there is one row per commit and no
 	// same-commit tie to break, so the ordering costs nothing extra.
 	//
-	// No live-first term here, unlike LoadByCommit/LoadLiveByCommit — deliberate. Phase B's
+	// No live-first term here, unlike LoadByCommit/LoadLiveByCommit — deliberate. Migration v5's
 	// unique index leaves one row per commit, so there is no same-commit tie to order; see
 	// DEVOPS-304 (closed, decided against changing this).
 	query := fmt.Sprintf(`
@@ -57,8 +57,8 @@ func (s *PostgresStore) FindByCommits(
 
 // FindAllByCommits returns every slip matching any commit in the ordered list, ordered by
 // commit priority. The secondary ORDER BY (s.updated_at DESC) is required, not
-// decorative, for the same reason as FindByCommits: pre-Phase-B duplicate rows for the
-// same commit are secondarily ordered by most-recent update today; once Phase B lands
+// decorative, for the same reason as FindByCommits: pre-v5 duplicate rows for the same
+// commit are secondarily ordered by most-recent update; once migration v5 is applied
 // there's one row per commit and this ordering costs nothing extra. Unlike FindByCommits
 // it does not exclude terminal-superseded statuses. An empty commit list returns an
 // empty result (not an error).
@@ -72,12 +72,12 @@ func (s *PostgresStore) FindAllByCommits(
 	}
 
 	// c.priority orders across the distinct commits in the list. s.updated_at is a
-	// required secondary key while pre-Phase-B duplicate rows for the same commit can
-	// still tie on c.priority today (same reason as LoadByCommit/LoadLiveByCommit); once
-	// the Phase B cleanup + unique index land there is one row per commit and no
+	// required secondary key while pre-v5 duplicate rows for the same commit can still
+	// tie on c.priority (same reason as LoadByCommit/LoadLiveByCommit); once the Phase B
+	// cleanup has run and migration v5 is applied there is one row per commit and no
 	// same-commit tie to break, so the ordering costs nothing extra.
 	//
-	// No live-first term here, unlike LoadByCommit/LoadLiveByCommit — deliberate. Phase B's
+	// No live-first term here, unlike LoadByCommit/LoadLiveByCommit — deliberate. Migration v5's
 	// unique index leaves one row per commit, so there is no same-commit tie to order; see
 	// DEVOPS-304 (closed, decided against changing this).
 	query := fmt.Sprintf(`

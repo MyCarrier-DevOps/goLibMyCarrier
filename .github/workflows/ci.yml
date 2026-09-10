@@ -132,12 +132,21 @@ jobs:
       # that a failed statement actually aborts the transaction, that the SAVEPOINT around
       # the ancestry link really scopes its rollback, and that the enum and column names
       # in the repoint exist.
-      - name: Run deterministic integration suites (CLONE_DERIVED, Postgres repave)
+      #
+      # TestUniquenessMigration_V5_Integration is included because it is the only real-schema
+      # proof of migration v5's gate (DEVOPS-231 Phase B): that an uncleaned database is
+      # refused atomically with the version left at 4, that the post-conditions reject a
+      # same-named object of the wrong shape, and that a real 23505 from the unique index
+      # maps to ErrDuplicateSlip — the pgxmock suite fabricates that error and cannot prove
+      # the real index reports that constraint name. TestPostgresStore_Ancestry is included
+      # because v5's fk_ancestry_slip gave InsertAncestryLink a precondition that only a real
+      # schema enforces.
+      - name: Run deterministic integration suites (CLONE_DERIVED, Postgres repave, migration v5)
         working-directory: slippy
         run: |
           go mod download
           go test -tags integration \
-            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load' \
+            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry' \
             -count=1 -timeout 10m ./...
 
   lint:

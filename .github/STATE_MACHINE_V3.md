@@ -107,7 +107,8 @@ Slip identity is `(lower(repository), commit_sha)` — one row per commit. `corr
 remains the primary key and the child-row anchor, but identifies the *current run*, not
 the slip's identity; `branch` is likewise an attribute of the current run, not part of
 identity. A DB unique index (`uq_routing_slips_repo_sha`) enforces this at the storage
-layer as of migration v5 — a later, separately-gated migration; `CreateSlipForPush`
+layer as of migration v5 — a separately-gated migration (gate described under "No
+duplicate detection before migration v5" below); `CreateSlipForPush`
 (`push.go`) already implements the contract below ahead of that index landing.
 
 - **Same-commit ended push → repave.** A push for a commit SHA whose existing slip is
@@ -330,12 +331,30 @@ layer as of migration v5 — a later, separately-gated migration; `CreateSlipFor
   repave-eligible, for as long as that work is in flight. Note the `failed` carve-out
   above widens the input surface here: a componentless push onto a `failed` row now
   falls through to the guarded DELETE where it previously deduped.
-- **No duplicate detection in Phase A.** Without the `uq_routing_slips_repo_sha`
-  unique index (Phase B), an insert for the same `(repository, commit_sha)` never
-  conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
+- **No duplicate detection before migration v5.** Without the `uq_routing_slips_repo_sha`
+  unique index (migration v5, Phase B), an insert for the same `(repository, commit_sha)`
+  never conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
   `handleDuplicateSlipBackstop` — is unreachable. A lost Redis-lock race (the dedup lock
   is fail-open) silently inserts a second row for one commit with no detection at all,
-  until the Phase B migration adds the index and its cleanup runs.
+  in any environment where the Phase B cleanup has not run and v5 is not yet applied.
+
+  Migration v5 (`one_slip_per_commit`, `postgres_migrations.go`) adds that index plus
+  `ON DELETE CASCADE` FKs from `slip_component_states` and `slip_ancestry` on
+  `correlation_id`; it adds no FK on `parent_correlation_id` (above). It is gated per
+  environment, by construction rather than by a flag: the FK adds validate existing rows
+  and the index build fails on duplicates, so v5 fails loudly — and the migrator's
+  per-migration transaction rolls it back — until the one-time cleanup script
+  (`DEVOPS-231-cleanup-one-row-per-commit.sql`, operator-run, deliberately not a
+  migration step) has brought that database to one row per commit and zero orphan child
+  rows. That script in turn must run only after the repave-capable slippy-api
+  (goLibMyCarrier ≥ v1.3.100) is deployed there: the index must never be live under a
+  pre-repave writer, whose failed-path created a second row per commit. Survivor rule:
+  non-terminal row first, then `updated_at`, `created_at`, `correlation_id`; losers are
+  hard-deleted (DEVOPS-277 — accepted history loss, no archive). v5 is idempotent by name
+  (`duplicate_object` swallowed, index `IF NOT EXISTS`) but asserted by shape: each half ends
+  in a post-condition that RAISEs unless the object it kept has exactly the expected
+  definition, so a pre-existing same-named FK or index of another shape fails the migration
+  instead of being recorded as v5.
 
   What Phase A *does* have, since `Repave` became transactional, is convergence on repave
   failure: nothing is written, the push fails, and the redelivery repaves the still-present
