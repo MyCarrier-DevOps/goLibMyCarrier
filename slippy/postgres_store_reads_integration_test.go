@@ -58,6 +58,20 @@ func TestPostgresStore_Ancestry_Integration(t *testing.T) {
 	require.NoError(t, store.Create(ctx, child))
 	require.NoError(t, store.Create(ctx, parentSlip))
 
+	// Pin which side of ancestryLinkArgs the FK constrains, not just that the FK exists.
+	// slip.CorrelationID binds to correlation_id (FK'd) and parent.CorrelationID to
+	// parent_correlation_id (deliberately not FK'd); transposing them would satisfy every
+	// schema-level assertion while inverting the asymmetry SlipStore.InsertAncestryLink
+	// documents. The parent side staying dangling is asserted by the rest of this test,
+	// which never creates gp or p2.
+	require.Error(t, store.InsertAncestryLink(ctx,
+		&Slip{CorrelationID: "never-created", Repository: "owner/repo", Branch: "feature"},
+		AncestryEntry{
+			CorrelationID: "p", CommitSHA: "psha", Status: SlipStatusCompleted,
+			Repository: "owner/repo", Branch: "main", CreatedAt: now,
+		}),
+		"fk_ancestry_slip must reject a link whose own slip row does not exist")
+
 	// child (feature) -> p (main): cross-branch link.
 	require.NoError(t, store.InsertAncestryLink(ctx, child, AncestryEntry{
 		CorrelationID: "p", CommitSHA: "psha", Status: SlipStatusCompleted,

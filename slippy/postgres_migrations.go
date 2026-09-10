@@ -191,8 +191,11 @@ func (m *PostgresDynamicMigrationManager) ancestryMigration() postgresmigrator.M
 // newest), delete the losers' children explicitly (the cascade does not exist yet). The FK
 // ADDs validate existing data and the unique index build fails on duplicates, so on an
 // uncleaned database this migration fails LOUDLY and the migrator rolls it back — the FKs are
-// added in the same transaction as the index, so nothing is left half-applied. A failure here
-// means the cleanup has not run; do NOT weaken this migration to get past it.
+// added in the same transaction as the index, so nothing is left half-applied. A failure names
+// what broke — uq_routing_slips_repo_sha for a duplicate commit, fk_component_states_slip or
+// fk_ancestry_slip for an orphan child row. Usually the cleanup has not run; it can also have
+// been re-broken since, as a lost dedup-lock race is undetectable until this index exists (see
+// CreateSlipForPush in push.go). Either way, do NOT weaken this migration to get past it.
 //
 // Sequencing — the index must never be live while a pre-repave slippy-api runs: the old
 // failed-path (AbandonSlip + insert) creates a second row for the same commit and would
@@ -204,8 +207,11 @@ func (m *PostgresDynamicMigrationManager) ancestryMigration() postgresmigrator.M
 // migration in — it would break the migrator, not merely waste time.
 //
 // Idempotent by NAME, asserted by SHAPE. `duplicate_object` is swallowed and the index is
-// IF NOT EXISTS so a concurrent or repeated migrator run is a no-op (postgresmigrator relies on
-// that), but a name match is not proof of definition: a pre-existing same-named object with
+// IF NOT EXISTS so a repeated migrator run is a no-op (postgresmigrator relies on that; it
+// takes no advisory lock and assumes one migrator at a time). Two concurrent runs from v4 also
+// converge, but incidentally: ADD FOREIGN KEY below takes SHARE ROW EXCLUSIVE held to commit,
+// so the loser blocks there and finds the index already built. Keep the index AFTER the FK
+// ADDs. A name match is still not proof of definition: a pre-existing same-named object with
 // another shape — a NO ACTION or NOT VALID FK, an index built without lower(), a leftover from
 // a failed CONCURRENTLY build, even a table of that name — would otherwise be kept silently and
 // v5 recorded with the guarantee absent. Each half therefore ends in a post-condition that
@@ -306,7 +312,29 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 			END $$;
 		`,
 		DownSQL: `
-			DROP INDEX IF EXISTS uq_routing_slips_repo_sha;
+			DO $$
+			DECLARE
+				idx regclass;
+			BEGIN
+				-- Find the index through the TABLE, mirroring the UpSQL post-condition. A bare
+				-- name resolves through search_path, so it could drop an unrelated index of this
+				-- name from an earlier schema and leave the real one live under a reverted
+				-- version — the one state a pre-repave writer must never meet, since it
+				-- 23505-fails every same-commit retrigger. regclass renders schema-qualified
+				-- when the relation is not visible, so this drops the object it found.
+				--
+				-- Deliberate behaviour change from a bare IF EXISTS drop: to_regclass returns
+				-- NULL instead of raising 42P01, so a missing routing_slips makes this a no-op
+				-- rather than an error. That is the right outcome on a down path.
+				SELECT i.indexrelid INTO idx
+					FROM pg_index i
+					JOIN pg_class ic ON ic.oid = i.indexrelid
+					WHERE i.indrelid = to_regclass('routing_slips')
+					  AND ic.relname = 'uq_routing_slips_repo_sha';
+				IF idx IS NOT NULL THEN
+					EXECUTE format('DROP INDEX %s', idx);
+				END IF;
+			END $$;
 			ALTER TABLE slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip;
 			ALTER TABLE slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip;
 		`,

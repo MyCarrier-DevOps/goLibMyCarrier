@@ -205,26 +205,47 @@ func TestUniquenessMigration_V5_Integration(t *testing.T) {
 		v5MustRefuse(t, pool, cfg, "is not the expected valid unique index")
 	})
 
-	t.Run("succeeds despite an unrelated same-named index in an earlier search_path schema", func(t *testing.T) {
-		// CREATE INDEX places the index in the TABLE's schema, so the post-condition has to look it
-		// up through the table. A bare 'uq_routing_slips_repo_sha'::regclass resolves through
-		// search_path instead — and the default search_path is "$user", public, so a schema named
-		// after the connecting role shadows public. That made v5 reject a database it had just
-		// migrated correctly, with a message telling the operator to drop the wrong index.
+	t.Run("resolves the index through the table, not search_path, on both up and down", func(t *testing.T) {
+		// An index always lives in its TABLE's schema, so both halves of v5 have to find it that
+		// way. A bare name resolves through search_path instead, and the two statements go wrong
+		// differently: the UpSQL post-condition would inspect an unrelated index of that name in
+		// an earlier schema and reject a database it had just migrated correctly, while a bare
+		// DROP INDEX in DownSQL would delete that unrelated index and leave the real one live
+		// under a reverted version — silent, and the one state a pre-repave writer must never
+		// meet, since it 23505-fails every same-commit retrigger.
+		//
+		// The statements are run directly, on one pinned connection, rather than through the
+		// migrator: a schema that shadows public is also the default CREATE TABLE target, so it
+		// perturbs the migrator's own version table, which is not what is under test here.
 		pool, cfg := v5PoolAtV4(t)
-		_, err := pool.Exec(ctx, `
-			CREATE SCHEMA slippy_write;
-			CREATE TABLE slippy_write.decoy (a text);
-			CREATE UNIQUE INDEX uq_routing_slips_repo_sha ON slippy_write.decoy (a)`)
+		v5 := NewPostgresDynamicMigrationManager(cfg, nil).GenerateMigrations()[4]
+		conn, err := pool.Acquire(ctx)
+		require.NoError(t, err)
+		defer conn.Release()
+		_, err = conn.Exec(ctx, `
+			CREATE SCHEMA shadow;
+			CREATE TABLE shadow.decoy (a text);
+			CREATE UNIQUE INDEX uq_routing_slips_repo_sha ON shadow.decoy (a);
+			SET search_path = shadow, public`)
 		require.NoError(t, err)
 
-		_, err = RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
-		require.NoError(t, err, "an unrelated index of that name in another schema must not fail v5")
-		assert.Equal(t, 1, pgCountV5(t, pool,
-			"SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "+
-				"WHERE i.indrelid = 'routing_slips'::regclass AND ic.relname = 'uq_routing_slips_repo_sha' "+
-				"AND i.indisunique AND i.indisvalid"),
-			"the canonical index must exist on routing_slips itself")
+		_, err = conn.Exec(ctx, v5.UpSQL)
+		require.NoError(t, err, "the post-condition must find the index via the table, not the shadowed name")
+		onTable := func(schema string) int {
+			var n int
+			require.NoError(t, conn.QueryRow(ctx,
+				"SELECT count(*) FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "+
+					"JOIN pg_class tc ON tc.oid = i.indrelid JOIN pg_namespace n ON n.oid = tc.relnamespace "+
+					"WHERE n.nspname = $1 AND ic.relname = 'uq_routing_slips_repo_sha'", schema).Scan(&n))
+			return n
+		}
+		assert.Equal(t, 1, onTable("public"), "the canonical index belongs to routing_slips' own schema")
+		assert.Equal(t, 1, onTable("shadow"), "the unrelated index is untouched by the up path")
+
+		_, err = conn.Exec(ctx, v5.DownSQL)
+		require.NoError(t, err)
+		assert.Equal(t, 0, onTable("public"), "DownSQL must drop the index that is actually on routing_slips")
+		assert.Equal(t, 1, onTable("shadow"), "and must leave the unrelated index in the other schema alone")
 	})
 
 	t.Run("re-applying the UpSQL on a migrated database is a no-op", func(t *testing.T) {

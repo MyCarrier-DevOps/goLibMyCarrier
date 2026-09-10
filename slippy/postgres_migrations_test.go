@@ -228,7 +228,14 @@ func TestUniquenessMigration_V5(t *testing.T) {
 	assert.Equal(t, 5, mgr.LatestVersion())
 	assert.Equal(t, 5, GetPostgresDynamicMigrationVersion(cfg))
 
-	up := v5.UpSQL
+	// Every assertion below runs against the SQL with -- comments stripped, because they are all
+	// about what the migration EXECUTES, not how it is documented. No comment supplies any of
+	// these literals today, and stripping is what keeps that from mattering: on the raw string a
+	// Contains check would false-PASS on a statement commented out rather than deleted, since the
+	// literal survives in the prose, and an exact count would false-FAIL on a comment that merely
+	// mentions a counted phrase — already the case for CONCURRENTLY, which the index
+	// post-condition must name to explain the state it rejects (raw 1, stripped 0).
+	upDDL := stripSQLLineComments(v5.UpSQL)
 	for _, want := range []string{
 		"ALTER TABLE slip_component_states",
 		"ADD CONSTRAINT fk_component_states_slip",
@@ -248,20 +255,13 @@ func TestUniquenessMigration_V5(t *testing.T) {
 		// Deliberately not pinning how the pattern literal is split across source lines.
 		`ON %routing_slips USING btree (lower(repository), commit\_sha)`,
 	} {
-		assert.Contains(t, up, want)
+		assert.Contains(t, upDDL, want)
 	}
-	assert.Equal(t, 3, strings.Count(up, "ON DELETE CASCADE"),
+	assert.Equal(t, 3, strings.Count(upDDL, "ON DELETE CASCADE"),
 		"two cascade FK adds on correlation_id plus the post-condition's expected definition")
-	assert.Equal(t, 2, strings.Count(up, "duplicate_object"),
-		"both FK adds must be no-ops for a concurrent or repeated migrator run")
-	assert.Equal(t, 2, strings.Count(up, "RAISE EXCEPTION"), "one post-condition per half of the migration")
-
-	// The negative assertions are about what the migration EXECUTES, so they run against the SQL
-	// with -- comments stripped. Matching comment prose too would make these guards shape the
-	// documentation instead of the DDL: the index post-condition has to name
-	// CREATE INDEX CONCURRENTLY to explain the state it rejects, and an explanatory comment may
-	// legitimately mention a schema-qualified name.
-	upDDL := stripSQLLineComments(up)
+	assert.Equal(t, 2, strings.Count(upDDL, "duplicate_object"),
+		"both FK adds must be no-ops for a repeated migrator run")
+	assert.Equal(t, 2, strings.Count(upDDL, "RAISE EXCEPTION"), "one post-condition per half of the migration")
 	assert.NotContains(t, upDDL, "CONCURRENTLY",
 		"a plain build: CONCURRENTLY cannot run inside the migrator's per-migration transaction")
 	assert.NotContains(t, upDDL, "parent_correlation_id",
@@ -273,9 +273,13 @@ func TestUniquenessMigration_V5(t *testing.T) {
 		"schema-agnostic: pg_get_indexdef qualifies the table, so a hardcoded schema would reject a healthy index elsewhere",
 	)
 
-	down := v5.DownSQL
+	down := stripSQLLineComments(v5.DownSQL)
 	for _, want := range []string{
-		"DROP INDEX IF EXISTS uq_routing_slips_repo_sha",
+		// The index is dropped via the table, symmetrically with the UpSQL post-condition; a bare
+		// name would resolve through search_path and could drop an unrelated index of that name.
+		"WHERE i.indrelid = to_regclass('routing_slips')",
+		"AND ic.relname = 'uq_routing_slips_repo_sha'",
+		"EXECUTE format('DROP INDEX %s', idx)",
 		"DROP CONSTRAINT IF EXISTS fk_ancestry_slip",
 		"DROP CONSTRAINT IF EXISTS fk_component_states_slip",
 	} {
