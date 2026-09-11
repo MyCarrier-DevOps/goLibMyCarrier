@@ -58,7 +58,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 | **I1** | `slip=in_progress` while any step is a primary failure (`status ∈ {failed, error, timeout}`) → **violation** |
 | **I2** | `slip=failed` with zero primary failures → **violation** |
 | **I3** | `slip=completed` while any step is a primary failure OR `status = running` → **violation** |
-| **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335) |
+| **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335). **Known exception path:** slippy-api's `POST /slips/{id}/claim` writes `in_progress` unconditionally and does not refuse a `completed` prior status — see "An ended row may have work in flight against it" under the repave sharp edges |
 | **I5** | `routing_slips.<step>_status` column does not match event-log-derived status (via `argMax(status, timestamp) FROM slip_component_states GROUP BY step`) → **materialization violation** |
 
 **Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative event log in `slip_component_states`. Divergence indicates a write-path bug, not a state-machine logic bug.
@@ -319,18 +319,64 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 - **An ended row may have work in flight against it (DEVOPS-285).** "Ended" includes
   `failed`, and the operator rerun flow adopts a failed slip's correlation ID and
   dispatches workflows *before* writing anything to slippy — so the row sits `failed`,
-  and therefore repave-eligible, for as long as that work takes to report its first
-  step. A same-commit push in that window repaves, deletes the row, and the in-flight
-  rerun's step writes then fail `ErrSlipNotFound`. This generalises the in-flight-peer
-  bullet above: pre-DEVOPS-231 late events from *any* superseded run landed on the
-  abandoned row and returned 2xx, and the hard DELETE turns all of them into 404s.
-  Tracked as **DEVOPS-285**, and no longer blocked on DEVOPS-277: that ticket decided
-  against a tombstone (first bullet above), so this class does not disappear on its own,
-  and the rerunner's window is being closed at its cause instead — the rerunner claims
-  the slip before dispatching any workflow, so the row is live, and therefore not
-  repave-eligible, for as long as that work is in flight. Note the `failed` carve-out
-  above widens the input surface here: a componentless push onto a `failed` row now
+  and therefore repave-eligible, for as long as that work takes to report. A same-commit
+  push in that window repaves, deletes the row, and the in-flight rerun's step writes
+  then fail `ErrSlipNotFound`. This generalises the in-flight-peer bullet above:
+  pre-DEVOPS-231 late events from *any* superseded run landed on the abandoned row and
+  returned 2xx, and the hard DELETE turns all of them into 404s. Note the `failed`
+  carve-out above widens the input surface: a componentless push onto a `failed` row now
   falls through to the guarded DELETE where it previously deduped.
+
+  **A running step does NOT close this window.** An earlier version of this bullet said
+  the row is exposed only "for as long as that work takes to report its first step",
+  which is wrong and is the most likely thing for a reader to get wrong. The slip-level
+  status write in `steps.go` is gated on `status.IsTerminal() && componentName == ""`, so
+  a `running` step leaves `slip.status` at its previous value — including the repaveable
+  `failed`, `completed` and `promoted` — for the entire time the step runs. For the
+  terminal three it is worse: `checkPipelineCompletion` returns early for `completed`,
+  `abandoned` and `promoted`, so no later step write ever restores liveness and the
+  window never closes at all. When judging whether any adopt-then-dispatch flow is
+  exposed, treat "it writes a step event first" as **no protection**.
+
+  **Closed for the rerunner (2026-09-10), by an explicit live-status write.** slippy-api
+  gained `POST /v1/slips/{correlationID}/claim`, which appends a `slip_claimed` history
+  marker and sets `slip.status = in_progress`. `in_progress` is absent from
+  `repaveableSlipStatusesSQL`, so a same-commit push arriving after the claim takes the
+  dedup path instead of the DELETE. pushhookparser's rerunner calls it before dispatching
+  and treats failure as fatal, so a rerun that does not own its slip dispatches nothing.
+  Verified in prod: a claim at `00:02:04` on a `failed` slip, and in dev the differential
+  was observed directly — the same commit's push repaved while the slip was `failed` and
+  deduplicated onto the rerun's correlation ID six seconds after the claim.
+
+  Three properties of the claim worth knowing before relying on it:
+
+  - **It is advisory, not a lock.** The body carries no expected-status and no
+    expected-claimant, and a repeat claim on a slip already `in_progress` is a
+    deliberate no-op rather than a conflict, because the caller's retry after a lost
+    response *is* the recovery. Two adopters can therefore both claim and both dispatch.
+  - **It does not refuse any prior status, and for `completed` that crosses I4.** The
+    claim writes `in_progress` over whatever was there. For `completed` that is an I4
+    violation by the letter (`slip.status` change after `slip=completed`), mitigated only
+    by the fact that the step columns are untouched, so the next terminal write
+    re-enters `checkPipelineCompletion` and writes `completed` back. For `promoted` there
+    is no such restoration path — `prod_steady_state` was never completed on a
+    feature-branch slip — so the claim destroys the primary record of a promotion, and
+    `slip_ancestry.parent_status` is the only residual. DEVOPS-202 (persist `promoted_to`)
+    is the prerequisite for making that non-destructive.
+  - **A committed claim has no release.** If the adopter then fails to dispatch across
+    its whole retry budget, the slip is left `in_progress` with nothing running, which is
+    the ordinary crashed-run resting state documented on `LoadByCommit`. Abandoning is
+    **not** a release: `abandoned` is ended-and-not-`failed`, so it loses the `failed`
+    carve-out the empty-run guard needs and suppresses the next same-commit push's unit
+    tests. A conditional release needs the prior status persisted (DEVOPS-202) and an
+    expected-status compare-and-set (DEVOPS-302).
+
+  **Residual, unchanged:** ordinary stragglers from any superseded run still get a bare
+  not-found, and roughly 13 other flows share the adopt-then-dispatch shape — every
+  `slip-routed` workflow template that takes a correlation ID. They route through one
+  shared `slippy-pre-job` step, so a single claim there would cover the family; until
+  then they are exposed for the window between workflow start and their first terminal
+  slip-level write.
 - **No duplicate detection before migration v5.** Without the `uq_routing_slips_repo_sha`
   unique index (migration v5, Phase B), an insert for the same `(repository, commit_sha)`
   never conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
