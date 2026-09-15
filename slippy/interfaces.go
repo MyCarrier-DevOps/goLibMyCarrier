@@ -125,11 +125,14 @@ type SlipStore interface {
 	// in_progress and claimed_from to the status the row had. There is no half-claimed state
 	// and nothing about the decision is trusted from the caller's earlier read (DEVOPS-367).
 	//
-	// The claim lives from ClaimSlip until ReleaseClaim or a terminal status write, whichever
-	// comes first. The pipeline is free to write non-terminal statuses while it is held (a
-	// step failure writes failed over the claim's in_progress); claimed_from stays set, Repave
-	// refuses the row for as long as it is, and a same-commit push dedups onto the run. A
-	// terminal status ends the run and so ends the claim without a release.
+	// The claim lives from ClaimSlip until the run is over: ReleaseClaim, a terminal status
+	// write, or the library's own release once a failed pipeline has nothing running —
+	// whichever comes first. The pipeline is free to write non-terminal statuses while it is
+	// held (a step failure writes failed over the claim's in_progress); claimed_from stays
+	// set, Repave refuses the row for as long as it is, and a same-commit push dedups onto
+	// the run. A terminal status ends the run and so ends the claim without a release, and
+	// checkPipelineCompletion releases it when it writes failed with no step or component
+	// still running, so a failed run is repaveable again the moment it is quiescent.
 	//
 	// expected is the set of statuses the caller agreed to claim out of. nil means "any
 	// status except an unclaimed in_progress" — pending and compensating included, not only

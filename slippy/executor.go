@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -339,6 +340,7 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		if err := c.updateSlipStatusWithStepOverrides(ctx, correlationID, SlipStatusFailed, overrides...); err != nil {
 			return false, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
+		c.releaseClaimIfQuiescent(ctx, slip)
 		return false, SlipStatusFailed, nil
 	}
 
@@ -443,4 +445,51 @@ func ParsePrerequisites(prereqStr string) []string {
 		}
 	}
 	return result
+}
+
+// releaseClaimIfQuiescent ends a claim once a failed pipeline has nothing left running
+// (DEVOPS-367). failed is not terminal, so the status write keeps the claim while sibling
+// steps or components may still be executing; but once none is, the run is over with a
+// failure, and a claim held past that would refuse every same-commit retrigger (repave) until
+// someone released it — the flow that reruns a failed pipeline. A step or component still
+// pending here (dispatched, its pre-job not yet run) re-claims in that pre-job, so the only
+// exposure is the pre-existing window before it. Best effort: the status write has already
+// landed, so a release failure is logged and never fails the completion check.
+func (c *Client) releaseClaimIfQuiescent(ctx context.Context, slip *Slip) {
+	if slip.ClaimedFrom == "" || anyStepRunning(slip) {
+		return
+	}
+	_, err := c.store.ReleaseClaim(ctx, slip.CorrelationID, libraryActor, "pipeline failed with no step running")
+	switch {
+	case err == nil:
+		c.logger.Info(ctx, "Released slip claim: pipeline failed with nothing running", map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+		})
+	case errors.Is(err, ErrNotClaimed):
+		// Released or ended meanwhile; nothing to do.
+	default:
+		c.logger.Warn(ctx, "Could not release slip claim after a quiescent failure", map[string]interface{}{
+			"correlation_id": slip.CorrelationID,
+			"error":          err.Error(),
+		})
+	}
+}
+
+// anyStepRunning reports whether any step, or any component inside an aggregate step, is
+// still running. Components are checked as well as steps because an aggregate step's own
+// status can already read failed while a sibling component is still building.
+func anyStepRunning(slip *Slip) bool {
+	for _, step := range slip.Steps {
+		if step.Status == StepStatusRunning {
+			return true
+		}
+	}
+	for _, components := range slip.Aggregates {
+		for _, component := range components {
+			if component.Status == StepStatusRunning {
+				return true
+			}
+		}
+	}
+	return false
 }

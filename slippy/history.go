@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+// libraryActor is the state_history actor for entries the library writes on its own behalf,
+// as opposed to on behalf of a caller-named actor.
+const libraryActor = "slippy-library"
+
 // AppendHistoryEntry appends a state history entry to a slip.
 // This is a convenience method for recording state transitions.
 // The correlationID is the unique identifier for the routing slip.
@@ -16,7 +20,7 @@ func (c *Client) AppendHistoryEntry(ctx context.Context, correlationID string, e
 
 	// Set default actor if not provided
 	if entry.Actor == "" {
-		entry.Actor = "slippy-library"
+		entry.Actor = libraryActor
 	}
 
 	if err := c.store.AppendHistory(ctx, correlationID, entry); err != nil {
