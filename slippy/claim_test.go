@@ -26,3 +26,48 @@ func TestSlip_ClaimedFrom_JSONShape(t *testing.T) {
 	var zero Slip
 	assert.Empty(t, zero.ClaimedFrom)
 }
+
+// The marker builders moved here from slippy-api so every adopter writes the same shape;
+// their tests move with them. The prior status in the message is the only in-slip record of
+// what was adopted once the claim lands, so the format is load-bearing, not cosmetic.
+func TestClaimMarker_RecordsPriorStatusAndReason(t *testing.T) {
+	tests := []struct {
+		name, reason, wantMsg string
+		prior                 SlipStatus
+	}{
+		{"failed with scope", "retrigger builds", "adopted failed slip before dispatching: retrigger builds", SlipStatusFailed},
+		{"reason omitted", "", "adopted failed slip before dispatching", SlipStatusFailed},
+		{"completed reads as unusual", "", "adopted completed slip before dispatching", SlipStatusCompleted},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := ClaimMarker(tc.prior, "rerunner", tc.reason)
+			assert.Equal(t, tc.wantMsg, e.Message)
+			assert.Equal(t, "rerunner", e.Actor)
+			assert.Equal(t, ClaimMarkerStep, e.Step)
+			assert.Equal(t, StepStatusRunning, e.Status)
+			assert.False(t, e.Timestamp.IsZero())
+		})
+	}
+}
+
+func TestReleaseMarker_RecordsRestoredStatusAndReason(t *testing.T) {
+	e := ReleaseMarker(SlipStatusFailed, "post-job", "terminal write failed")
+	assert.Equal(t, "released claim; restored failed: terminal write failed", e.Message)
+	assert.Equal(t, "post-job", e.Actor)
+	assert.Equal(t, ReleaseMarkerStep, e.Step)
+	assert.Equal(t, StepStatusAborted, e.Status)
+	assert.Equal(t, "released claim; restored failed", ReleaseMarker(SlipStatusFailed, "x", "").Message)
+}
+
+// Neither marker may name a real pipeline step, or an aggregate or phase reader would take
+// it for a step event; and neither may reuse push_parsed, which the library's own reset
+// marker owns. The API's boot-time collision check keys on these constants.
+func TestMarkerSteps_AreNotPipelineSteps(t *testing.T) {
+	cfg := pgTestPipelineConfig(t)
+	for _, step := range []string{ClaimMarkerStep, ReleaseMarkerStep} {
+		assert.Nil(t, cfg.GetStep(step), "%q must not be a configured step", step)
+		assert.NotEqual(t, "push_parsed", step)
+	}
+	assert.NotEqual(t, ClaimMarkerStep, ReleaseMarkerStep)
+}
