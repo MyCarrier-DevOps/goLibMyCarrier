@@ -43,13 +43,22 @@ func (e *MigrationError) Error() string {
 
 // Unwrap exposes both the ErrMigrationFailed sentinel and the underlying cause, so
 // errors.Is works for either and errors.As still reaches a driver error such as
-// *pgconn.PgError. A nil Err (the empty-UpSQL guard) unwraps to the sentinel alone.
+// *pgconn.PgError (DEVOPS-344).
+//
+// Breaking change from the single-error Unwrap this replaced: errors.Unwrap only calls the
+// `Unwrap() error` form, so errors.Unwrap(err) and a direct migErr.Unwrap() no longer return
+// the cause — use Cause() for that. Every constructor in this package sets a non-nil Err;
+// the nil branch only defends a hand-built value.
 func (e *MigrationError) Unwrap() []error {
 	if e.Err == nil {
 		return []error{ErrMigrationFailed}
 	}
 	return []error{ErrMigrationFailed, e.Err}
 }
+
+// Cause returns the underlying error the migration failed with — the value errors.Unwrap
+// returned before Unwrap became multi-error. nil only for a hand-built MigrationError.
+func (e *MigrationError) Cause() error { return e.Err }
 
 // SchemaValidationError represents an error during schema validation.
 type SchemaValidationError struct {

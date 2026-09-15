@@ -347,9 +347,24 @@ func TestMigrationError_IsErrMigrationFailed(t *testing.T) {
 			t.Errorf("%s: errors.As(*MigrationError) must still work", op)
 		}
 	}
-	// A nil Err (as the empty-UpSQL guard constructs) must not panic and must still match.
+	// No constructor in this package produces a nil Err (the empty-UpSQL guard sets one too);
+	// a hand-built value can, and must not panic and must still match.
 	var bare error = &MigrationError{Version: 1, Operation: "up"}
 	if !errors.Is(bare, ErrMigrationFailed) {
 		t.Error("a MigrationError with nil Err must still be ErrMigrationFailed")
 	}
+}
+
+// Unwrap() []error is the shape errors.Is and errors.As need to see both the sentinel and
+// the cause, but errors.Unwrap only calls the single-error form and returns nil for it. A
+// caller that reached the driver error with errors.Unwrap(err) or migErr.Unwrap() before
+// DEVOPS-344 therefore gets nil now; Cause() is the replacement, and this pins both halves.
+func TestMigrationError_CauseReplacesErrorsUnwrap(t *testing.T) {
+	base := errors.New("pq: relation does not exist")
+	var err error = &MigrationError{Version: 7, Name: "x", Operation: "up", Err: base}
+	assert.Nil(t, errors.Unwrap(err), "the multi-error Unwrap is invisible to errors.Unwrap")
+	var me *MigrationError
+	require.True(t, errors.As(err, &me))
+	assert.Same(t, base, me.Cause())
+	assert.NoError(t, (&MigrationError{}).Cause(), "a nil Err has no cause")
 }
