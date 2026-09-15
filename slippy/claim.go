@@ -77,7 +77,8 @@ func (c *Client) ReleaseClaim(
 }
 
 // ClaimSlip takes ownership of a slip so a same-commit push deduplicates onto it instead of
-// repaving it, for as long as the claim is held (DEVOPS-285, DEVOPS-367). expected bounds
+// repaving it, for as long as the claim is held — until ReleaseClaim, or until the run
+// reaches a terminal status (DEVOPS-285, DEVOPS-367). expected bounds
 // which statuses may be claimed out of; nil admits any status except an unclaimed
 // in_progress, which is a live run — so nil also claims pending and compensating, not only
 // the ended statuses. See SlipStore.ClaimSlip for the full contract and error set.

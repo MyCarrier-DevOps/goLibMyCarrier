@@ -115,6 +115,9 @@ type SlipStore interface {
 	// UpdateSlipStatus atomically updates the slip's top-level status without a full Load+Update
 	// round-trip. Uses INSERT SELECT to copy the current DB row and override only the status
 	// column, preventing concurrent history appends from being lost under last-write-wins.
+	//
+	// A terminal status also clears claimed_from: terminal ends the run, so it ends the claim
+	// (DEVOPS-367). Non-terminal statuses — failed included — leave the claim in place.
 	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
 
 	// ClaimSlip records that an adopter has a run in flight against a slip, as ONE
@@ -122,10 +125,11 @@ type SlipStore interface {
 	// in_progress and claimed_from to the status the row had. There is no half-claimed state
 	// and nothing about the decision is trusted from the caller's earlier read (DEVOPS-367).
 	//
-	// The claim lives from ClaimSlip to ReleaseClaim, independent of status. The pipeline is
-	// free to write status while it is held (a step failure writes failed over the claim's
-	// in_progress); claimed_from stays set, Repave refuses the row for as long as it is, and
-	// a same-commit push dedups onto the run. Only ReleaseClaim clears it.
+	// The claim lives from ClaimSlip until ReleaseClaim or a terminal status write, whichever
+	// comes first. The pipeline is free to write non-terminal statuses while it is held (a
+	// step failure writes failed over the claim's in_progress); claimed_from stays set, Repave
+	// refuses the row for as long as it is, and a same-commit push dedups onto the run. A
+	// terminal status ends the run and so ends the claim without a release.
 	//
 	// expected is the set of statuses the caller agreed to claim out of. nil means "any
 	// status except an unclaimed in_progress" — pending and compensating included, not only

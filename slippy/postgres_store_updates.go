@@ -63,9 +63,19 @@ func (s *PostgresStore) AppendHistory(ctx context.Context, correlationID string,
 }
 
 // UpdateSlipStatus atomically updates the slip's top-level status column.
+//
+// A terminal status ends the run by definition (I4: terminal is monotonic), so it ends any
+// claim with it: nothing is left to protect, and a claim that outlived its run would refuse
+// every later repave of the commit with no client left to release it (DEVOPS-367). failed is
+// not terminal — other components of the run may still be executing — so it keeps the claim,
+// as does the reconcile path's in_progress; ReleaseClaim ends those when the run is over.
 func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID string, newStatus SlipStatus) error {
+	set := "status = $1, updated_at = now()"
+	if newStatus.IsTerminal() {
+		set = "status = $1, claimed_from = NULL, updated_at = now()"
+	}
 	tag, err := s.pool.Exec(ctx,
-		"UPDATE routing_slips SET status = $1, updated_at = now() WHERE correlation_id = $2",
+		"UPDATE routing_slips SET "+set+" WHERE correlation_id = $2",
 		string(newStatus), correlationID)
 	if err != nil {
 		return fmt.Errorf("failed to update status for %s: %w", correlationID, err)

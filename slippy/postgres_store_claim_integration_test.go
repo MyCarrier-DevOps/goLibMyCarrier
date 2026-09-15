@@ -240,21 +240,34 @@ func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 		assert.Equal(t, 0, countMarkers(t, store, "r-plain", ReleaseMarkerStep))
 	})
 
-	t.Run("pipeline advanced past the claim: claim cleared, the pipeline's status kept", func(t *testing.T) {
+	t.Run("run completed: the terminal write already ended the claim, release is ErrNotClaimed", func(t *testing.T) {
 		claimTestSlip(t, store, "r-done", "sha-d", SlipStatusFailed)
 		_, err := store.ClaimSlip(ctx, "r-done", nil, "rerunner", "")
 		require.NoError(t, err)
 		require.NoError(t, store.UpdateSlipStatus(ctx, "r-done", SlipStatusCompleted))
-		final, err := store.ReleaseClaim(ctx, "r-done", "post-job", "")
-		require.NoError(t, err, "the post-job releases after a run that wrote its own status")
-		assert.Equal(t, SlipStatusCompleted, final)
+		_, err = store.ReleaseClaim(ctx, "r-done", "post-job", "")
+		require.ErrorIs(t, err, ErrNotClaimed, "nothing left to release after a terminal write")
 		got, err := store.Load(ctx, "r-done")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusCompleted, got.Status, "release must never undo a status the run wrote")
-		assert.Empty(t, got.ClaimedFrom, "no residue: the slip is repaveable and claimable again")
-		assert.Equal(t, 1, countMarkers(t, store, "r-done", ReleaseMarkerStep))
+		assert.Empty(t, got.ClaimedFrom)
+		assert.Equal(t, 0, countMarkers(t, store, "r-done", ReleaseMarkerStep))
+	})
+
+	t.Run("run moved to a non-terminal status: release keeps it and clears the claim", func(t *testing.T) {
+		claimTestSlip(t, store, "r-comp", "sha-cp", SlipStatusFailed)
+		_, err := store.ClaimSlip(ctx, "r-comp", nil, "rerunner", "")
+		require.NoError(t, err)
+		require.NoError(t, store.UpdateSlipStatus(ctx, "r-comp", SlipStatusCompensating))
+		final, err := store.ReleaseClaim(ctx, "r-comp", "post-job", "")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusCompensating, final)
+		got, err := store.Load(ctx, "r-comp")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusCompensating, got.Status)
+		assert.Empty(t, got.ClaimedFrom)
 		last := got.StateHistory[len(got.StateHistory)-1]
-		assert.Contains(t, last.Message, "kept completed")
+		assert.Contains(t, last.Message, "kept compensating")
 	})
 
 	t.Run("step failure then release: failed kept, claim cleared, repeat release is ErrNotClaimed", func(t *testing.T) {
@@ -319,4 +332,36 @@ func TestPostgresStore_Repave_ClaimedSlip_Integration(t *testing.T) {
 	require.NoError(t, store.Repave(ctx, "rp-claimed", successor, nil), "released, the failed slip is repaveable again")
 	_, err = store.Load(ctx, "rp-claimed")
 	require.ErrorIs(t, err, ErrSlipNotFound)
+}
+
+// A terminal status ends the run by definition (I4: terminal is monotonic), so it ends the
+// claim too: nothing is left to protect, and a claim that outlived its run would refuse every
+// later repave of that commit with no client left to release it. failed is not terminal —
+// other components of the run may still be executing — so it keeps the claim; the same goes
+// for the reconcile path's in_progress. ReleaseClaim ends those when the run is over.
+func TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+	claimTestSlip(t, store, "t-claim", "sha-t", SlipStatusFailed)
+	_, err := store.ClaimSlip(ctx, "t-claim", nil, "slippy-cli", "")
+	require.NoError(t, err)
+
+	for _, kept := range []SlipStatus{SlipStatusFailed, SlipStatusInProgress, SlipStatusCompensating} {
+		require.NoError(t, store.UpdateSlipStatus(ctx, "t-claim", kept))
+		got, err := store.Load(ctx, "t-claim")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "%s is not terminal: the claim is kept", kept)
+	}
+
+	require.NoError(t, store.UpdateSlipStatus(ctx, "t-claim", SlipStatusCompleted))
+	got, err := store.Load(ctx, "t-claim")
+	require.NoError(t, err)
+	assert.Equal(t, SlipStatusCompleted, got.Status)
+	assert.Empty(t, got.ClaimedFrom, "a terminal write ends the claim")
+
+	successor := &Slip{
+		CorrelationID: "t-successor", Repository: "Owner/Repo", Branch: "main", CommitSHA: "sha-t",
+		Status: SlipStatusInProgress,
+	}
+	require.NoError(t, store.Repave(ctx, "t-claim", successor, nil), "the completed slip is repaveable with no release")
 }

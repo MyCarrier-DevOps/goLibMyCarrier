@@ -42,20 +42,30 @@ func TestMockStore_ClaimLifetime(t *testing.T) {
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
 	})
 
-	t.Run("release after the run wrote its status: claim cleared, status kept", func(t *testing.T) {
+	t.Run("release after the run wrote a non-terminal status: claim cleared, status kept", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&Slip{CorrelationID: "r", Status: SlipStatusCompleted})
+		_, err := store.ClaimSlip(ctx, "r", nil, "cli", "")
+		require.NoError(t, err)
+		require.NoError(t, store.UpdateSlipStatus(ctx, "r", SlipStatusFailed))
+		final, err := store.ReleaseClaim(ctx, "r", "cli", "")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusFailed, final)
+		got, _ := store.Load(ctx, "r")
+		assert.Equal(t, SlipStatusFailed, got.Status)
+		assert.Empty(t, got.ClaimedFrom)
+		_, err = store.ReleaseClaim(ctx, "r", "cli", "")
+		require.ErrorIs(t, err, ErrNotClaimed)
+	})
+
+	t.Run("a terminal status write ends the claim", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "r", Status: SlipStatusFailed})
 		_, err := store.ClaimSlip(ctx, "r", nil, "cli", "")
 		require.NoError(t, err)
-		require.NoError(t, store.UpdateSlipStatus(ctx, "r", SlipStatusCompleted))
-		final, err := store.ReleaseClaim(ctx, "r", "cli", "")
-		require.NoError(t, err)
-		assert.Equal(t, SlipStatusCompleted, final)
+		require.NoError(t, store.UpdateSlipStatus(ctx, "r", SlipStatusAbandoned))
 		got, _ := store.Load(ctx, "r")
-		assert.Equal(t, SlipStatusCompleted, got.Status)
 		assert.Empty(t, got.ClaimedFrom)
-		_, err = store.ReleaseClaim(ctx, "r", "cli", "")
-		require.ErrorIs(t, err, ErrNotClaimed)
 	})
 
 	t.Run("repave refuses a claimed row", func(t *testing.T) {

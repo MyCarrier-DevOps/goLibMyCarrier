@@ -795,6 +795,9 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 	}
 
 	slip.Status = status
+	if status.IsTerminal() {
+		slip.ClaimedFrom = "" // a terminal status ends the run, so it ends the claim
+	}
 	return nil
 }
 
