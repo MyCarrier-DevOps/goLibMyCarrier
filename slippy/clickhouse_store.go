@@ -937,6 +937,12 @@ func (s *ClickHouseStore) Repave(_ context.Context, oldCorrelationID string, _ *
 	return fmt.Errorf("Repave(%s): %w", oldCorrelationID, ErrRepaveUnsupported)
 }
 
+// ClaimSlip is unsupported on ClickHouse: no claimed_from column, no transaction to make
+// the claim atomic, and not the operational store (DEVOPS-127). Wrapped so errors.Is works.
+func (s *ClickHouseStore) ClaimSlip(_ context.Context, correlationID string, _ []SlipStatus, _, _ string) (SlipStatus, error) {
+	return "", fmt.Errorf("ClaimSlip(%s): %w", correlationID, ErrClaimUnsupported)
+}
+
 // ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
 // the full ancestry chain for a given slip. Returns entries ordered from
 // direct parent to oldest ancestor. Stops when no more parent links are found

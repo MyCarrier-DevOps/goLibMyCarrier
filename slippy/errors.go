@@ -136,6 +136,12 @@ var (
 	// outcome when the pipeline advanced the slip before the release ran, and callers should
 	// treat it as "nothing to undo" rather than as a failure (DEVOPS-367).
 	ErrNotClaimed = errors.New("slip is not currently claimed")
+
+	// ErrClaimUnsupported indicates the store cannot perform ClaimSlip or ReleaseClaim at
+	// all: it has no claimed_from column and no transaction to make the claim atomic. The
+	// ClickHouse store returns it, wrapped with the correlation ID, since it is not the
+	// operational slip store (DEVOPS-127, removal tracked in DEVOPS-343).
+	ErrClaimUnsupported = errors.New("store does not support ClaimSlip/ReleaseClaim")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

@@ -117,6 +117,30 @@ type SlipStore interface {
 	// column, preventing concurrent history appends from being lost under last-write-wins.
 	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
 
+	// ClaimSlip records that an adopter has taken ownership of an ended slip, as ONE
+	// transaction: lock the row, check the precondition, append entry, set status to
+	// in_progress and claimed_from to the status the row had. There is no half-claimed state
+	// and nothing about the decision is trusted from the caller's earlier read (DEVOPS-367).
+	//
+	// expected is the set of statuses the caller agreed to claim out of. nil means "any
+	// status that is not in_progress". Whatever expected says, an in_progress slip whose
+	// claimed_from is empty is a genuinely live run and is always refused.
+	//
+	// The store builds the adoption marker itself with ClaimMarker(prior, claimedBy, reason),
+	// because only it knows the true prior status at write time; a caller-built entry could
+	// name a status that changed between its read and this write.
+	//
+	// Returns the prior status, and:
+	//   - nil: the slip is now in_progress with claimed_from = prior, and the marker was appended.
+	//   - nil with no write: the slip was already claimed (in_progress, claimed_from set);
+	//     the returned prior is that claimed_from. Repeat claims are idempotent — no second
+	//     marker, so a retried request cannot inflate the audit trail.
+	//   - ErrClaimPreconditionFailed: the status was outside expected, or the slip is a live
+	//     unclaimed run. Nothing was written.
+	//   - ErrSlipNotFound: no row for correlationID.
+	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
+	ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (SlipStatus, error)
+
 	// Repave atomically replaces one commit's ended run with a fresh one: it removes the
 	// routing_slips row for oldCorrelationID and its child rows (slip_component_states,
 	// slip_ancestry), then creates newSlip — ALL AS ONE UNIT. Used by the same-commit repave

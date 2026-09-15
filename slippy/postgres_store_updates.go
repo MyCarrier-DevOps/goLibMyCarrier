@@ -76,6 +76,69 @@ func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID stri
 	return nil
 }
 
+// ClaimSlip implements SlipStore.ClaimSlip as one transaction. See the interface for the
+// contract; this comment covers the Postgres mechanics.
+//
+// The row is read FOR UPDATE, so two concurrent claims serialise: the second sees the
+// first's in_progress + claimed_from and takes the idempotent no-op arm. The marker append
+// and the status write are in the same transaction as that read, which is the property the
+// slippy-api adapter used to approximate with a marker-then-status ordering and can now
+// drop (DEVOPS-367).
+func (s *PostgresStore) ClaimSlip(
+	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
+) (SlipStatus, error) {
+	var prior SlipStatus
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		var status string
+		var claimedFrom *string
+		if err := tx.QueryRow(ctx,
+			"SELECT status, claimed_from FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
+			correlationID).Scan(&status, &claimedFrom); err != nil {
+			if isNoRows(err) {
+				return ErrSlipNotFound
+			}
+			return fmt.Errorf("claim %s: lock: %w", correlationID, err)
+		}
+		cur := SlipStatus(status)
+		if cur == SlipStatusInProgress {
+			if claimedFrom != nil && *claimedFrom != "" {
+				prior = SlipStatus(*claimedFrom) // already claimed: idempotent no-op
+				return nil
+			}
+			return fmt.Errorf("claim %s: in_progress with no claim recorded is a live run: %w",
+				correlationID, ErrClaimPreconditionFailed)
+		}
+		if len(expected) > 0 && !slipStatusIn(expected, cur) {
+			return fmt.Errorf("claim %s: status %s not in %v: %w",
+				correlationID, cur, expected, ErrClaimPreconditionFailed)
+		}
+		if err := appendHistoryTx(ctx, tx, correlationID, ClaimMarker(cur, claimedBy, reason)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			"UPDATE routing_slips SET status = $1, claimed_from = $2, updated_at = now() WHERE correlation_id = $3",
+			string(SlipStatusInProgress), status, correlationID); err != nil {
+			return fmt.Errorf("claim %s: status write: %w", correlationID, err)
+		}
+		prior = cur
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return prior, nil
+}
+
+// slipStatusIn reports whether s is one of set.
+func slipStatusIn(set []SlipStatus, s SlipStatus) bool {
+	for _, x := range set {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
 // SetComponentImageTag records the built image tag for a component, preserving its current
 // status, then refreshes the aggregate column so the tag surfaces on the slip.
 func (s *PostgresStore) SetComponentImageTag(

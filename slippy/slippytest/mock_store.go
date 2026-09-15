@@ -130,6 +130,7 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	ClaimSlipCalls        []ClaimSlipCall
 	RepaveCalls           []string
 	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
 	// the same call (empty string when a nil successor was passed). The in-memory mock has
@@ -161,6 +162,7 @@ type MockStore struct {
 	AppendHistoryError    error
 	SetImageTagError      error
 	UpdateSlipStatusError error
+	ClaimSlipError        error
 	RepaveError           error
 	CloseError            error
 
@@ -249,6 +251,14 @@ type SetImageTagCall struct {
 type UpdateSlipStatusCall struct {
 	CorrelationID string
 	Status        slippy.SlipStatus
+}
+
+// ClaimSlipCall records a call to ClaimSlip.
+type ClaimSlipCall struct {
+	CorrelationID string
+	Expected      []slippy.SlipStatus
+	ClaimedBy     string
+	Reason        string
 }
 
 // NewMockStore creates a new MockStore with initialized maps.
@@ -691,6 +701,44 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 
 	slip.Status = status
 	return nil
+}
+
+// ClaimSlip mirrors PostgresStore.ClaimSlip in memory: precondition, idempotent repeat,
+// live-run refusal, marker append, status + ClaimedFrom write (DEVOPS-367).
+func (m *MockStore) ClaimSlip(ctx context.Context, correlationID string, expected []slippy.SlipStatus, claimedBy, reason string) (slippy.SlipStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{CorrelationID: correlationID, Expected: expected, ClaimedBy: claimedBy, Reason: reason})
+	if m.ClaimSlipError != nil {
+		return "", m.ClaimSlipError
+	}
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return "", slippy.ErrSlipNotFound
+	}
+	if slip.Status == slippy.SlipStatusInProgress {
+		if slip.ClaimedFrom != "" {
+			return slip.ClaimedFrom, nil
+		}
+		return "", fmt.Errorf("claim %s: live run: %w", correlationID, slippy.ErrClaimPreconditionFailed)
+	}
+	if len(expected) > 0 {
+		found := false
+		for _, e := range expected {
+			if e == slip.Status {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", fmt.Errorf("claim %s: status %s not in %v: %w", correlationID, slip.Status, expected, slippy.ErrClaimPreconditionFailed)
+		}
+	}
+	prior := slip.Status
+	slip.StateHistory = append(slip.StateHistory, slippy.ClaimMarker(prior, claimedBy, reason))
+	slip.ClaimedFrom = prior
+	slip.Status = slippy.SlipStatusInProgress
+	return prior, nil
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.

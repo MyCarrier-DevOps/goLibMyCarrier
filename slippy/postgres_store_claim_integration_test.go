@@ -4,6 +4,7 @@ package slippy
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -68,5 +69,106 @@ func TestPostgresStore_ClaimedFrom_IsScannedOnEveryReadPath_Integration(t *testi
 		require.NoError(t, err)
 		assert.Equal(t, "renamed", again.Branch, "Update still writes the columns it owns")
 		assert.Equal(t, SlipStatusFailed, again.ClaimedFrom, "but never claimed_from")
+	})
+}
+
+// claimTestSlip creates a slip in the given status and returns it.
+func claimTestSlip(t *testing.T, store *PostgresStore, corr, sha string, status SlipStatus) *Slip {
+	t.Helper()
+	slip := &Slip{CorrelationID: corr, Repository: "Owner/Repo", Branch: "main", CommitSHA: sha, Status: status}
+	require.NoError(t, store.Create(context.Background(), slip))
+	return slip
+}
+
+func countMarkers(t *testing.T, store *PostgresStore, corr, step string) int {
+	t.Helper()
+	slip, err := store.Load(context.Background(), corr)
+	require.NoError(t, err)
+	n := 0
+	for _, e := range slip.StateHistory {
+		if e.Step == step {
+			n++
+		}
+	}
+	return n
+}
+
+// ClaimSlip is one transaction: lock, precondition, marker, status, claimed_from. There is
+// no half-claimed state, and nothing about the decision is trusted from the caller's read.
+func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	t.Run("claims out of failed: status, claimed_from, exactly one marker", func(t *testing.T) {
+		claimTestSlip(t, store, "c-failed", "sha-f", SlipStatusFailed)
+		prior, err := store.ClaimSlip(ctx, "c-failed", []SlipStatus{SlipStatusFailed}, "rerunner", "test")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusFailed, prior)
+		got, err := store.Load(ctx, "c-failed")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusInProgress, got.Status)
+		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom)
+		assert.Equal(t, 1, countMarkers(t, store, "c-failed", ClaimMarkerStep))
+		last := got.StateHistory[len(got.StateHistory)-1]
+		assert.Equal(t, "rerunner", last.Actor)
+		assert.Contains(t, last.Message, "adopted failed slip", "the store names the true prior, read under lock")
+	})
+
+	t.Run("precondition mismatch writes nothing", func(t *testing.T) {
+		claimTestSlip(t, store, "c-abandoned", "sha-a", SlipStatusAbandoned)
+		_, err := store.ClaimSlip(ctx, "c-abandoned", []SlipStatus{SlipStatusFailed}, "rerunner", "test")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
+		got, err := store.Load(ctx, "c-abandoned")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusAbandoned, got.Status, "status untouched")
+		assert.Empty(t, got.ClaimedFrom)
+		assert.Equal(t, 0, countMarkers(t, store, "c-abandoned", ClaimMarkerStep), "no marker on a refused claim")
+	})
+
+	t.Run("nil expected means any ended status", func(t *testing.T) {
+		claimTestSlip(t, store, "c-completed", "sha-c", SlipStatusCompleted)
+		prior, err := store.ClaimSlip(ctx, "c-completed", nil, "rerunner", "test")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusCompleted, prior)
+	})
+
+	t.Run("repeat claim is an idempotent no-op returning the prior", func(t *testing.T) {
+		claimTestSlip(t, store, "c-twice", "sha-t", SlipStatusFailed)
+		_, err := store.ClaimSlip(ctx, "c-twice", nil, "first", "test")
+		require.NoError(t, err)
+		prior, err := store.ClaimSlip(ctx, "c-twice", []SlipStatus{SlipStatusFailed}, "second", "test")
+		require.NoError(t, err, "a repeat claim must not be refused by its own precondition")
+		assert.Equal(t, SlipStatusFailed, prior)
+		assert.Equal(t, 1, countMarkers(t, store, "c-twice", ClaimMarkerStep), "no second marker")
+	})
+
+	t.Run("a live unclaimed in_progress run is refused", func(t *testing.T) {
+		claimTestSlip(t, store, "c-live", "sha-l", SlipStatusInProgress)
+		_, err := store.ClaimSlip(ctx, "c-live", nil, "rerunner", "test")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
+		assert.Equal(t, 0, countMarkers(t, store, "c-live", ClaimMarkerStep))
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		_, err := store.ClaimSlip(ctx, "c-missing", nil, "rerunner", "test")
+		require.ErrorIs(t, err, ErrSlipNotFound)
+	})
+
+	t.Run("concurrent claims produce exactly one marker", func(t *testing.T) {
+		claimTestSlip(t, store, "c-race", "sha-r", SlipStatusFailed)
+		var wg sync.WaitGroup
+		errs := make([]error, 8)
+		for i := range errs {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, errs[i] = store.ClaimSlip(ctx, "c-race", nil, "racer", "test")
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			require.NoError(t, err, "racer %d", i)
+		}
+		assert.Equal(t, 1, countMarkers(t, store, "c-race", ClaimMarkerStep))
 	})
 }

@@ -86,6 +86,14 @@ type UpdateSlipStatusCall struct {
 	Status        SlipStatus
 }
 
+// ClaimSlipCall records a call to ClaimSlip.
+type ClaimSlipCall struct {
+	CorrelationID string
+	Expected      []SlipStatus
+	ClaimedBy     string
+	Reason        string
+}
+
 // supersededTerminal mirrors the SQL predicate `status NOT IN
 // ('abandoned','promoted','compensated')`, which appears on exactly two of the four commit
 // lookups: LoadLiveByCommit (postgres_store.go) and FindByCommits (postgres_store_reads.go).
@@ -147,6 +155,7 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	ClaimSlipCalls        []ClaimSlipCall
 	RepaveCalls           []string
 	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
 	// the same call (empty string when a nil successor was passed). The in-memory mock has
@@ -198,6 +207,7 @@ type MockStore struct {
 	AppendHistoryError    error
 	SetImageTagError      error
 	UpdateSlipStatusError error
+	ClaimSlipError        error
 	RepaveError           error
 	AncestryLinkError     error
 	CloseError            error
@@ -772,6 +782,44 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 
 	slip.Status = status
 	return nil
+}
+
+// ClaimSlip mirrors PostgresStore.ClaimSlip in memory: precondition, idempotent repeat,
+// live-run refusal, marker append, status + ClaimedFrom write (DEVOPS-367).
+func (m *MockStore) ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (SlipStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{CorrelationID: correlationID, Expected: expected, ClaimedBy: claimedBy, Reason: reason})
+	if m.ClaimSlipError != nil {
+		return "", m.ClaimSlipError
+	}
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return "", ErrSlipNotFound
+	}
+	if slip.Status == SlipStatusInProgress {
+		if slip.ClaimedFrom != "" {
+			return slip.ClaimedFrom, nil
+		}
+		return "", fmt.Errorf("claim %s: live run: %w", correlationID, ErrClaimPreconditionFailed)
+	}
+	if len(expected) > 0 {
+		found := false
+		for _, e := range expected {
+			if e == slip.Status {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", fmt.Errorf("claim %s: status %s not in %v: %w", correlationID, slip.Status, expected, ErrClaimPreconditionFailed)
+		}
+	}
+	prior := slip.Status
+	slip.StateHistory = append(slip.StateHistory, ClaimMarker(prior, claimedBy, reason))
+	slip.ClaimedFrom = prior
+	slip.Status = SlipStatusInProgress
+	return prior, nil
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
