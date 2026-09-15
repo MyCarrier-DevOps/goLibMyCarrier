@@ -52,6 +52,52 @@ func (m *PostgresDynamicMigrationManager) GenerateMigrations() []postgresmigrato
 		m.componentStatesMigration(),
 		m.ancestryMigration(),
 		m.uniquenessMigration(),
+		m.claimedFromMigration(),
+	}
+}
+
+// claimedFromMigration (v6) adds the nullable column a conditional claim records the slip's
+// prior status in, and a release restores from (DEVOPS-367).
+//
+// Shape decisions, each deliberate:
+//   - text, not the slip_status DOMAIN: the value is only ever written by ClaimSlip from a
+//     status the row already held, so it cannot be out of range, and a DOMAIN would make the
+//     v6 → v5 DownSQL depend on nothing else referencing the domain. Plain text keeps the
+//     column self-contained.
+//   - NULL means "not currently claimed". No DEFAULT: an empty string would be a second
+//     encoding of the same fact and every reader would have to treat both as unclaimed.
+//   - No index: the column is read by correlation_id (ReleaseClaim) on a row already locked
+//     FOR UPDATE, never scanned.
+//
+// Idempotent by NAME (IF NOT EXISTS), asserted by SHAPE below: the swallowed re-run proves
+// only that a column called claimed_from exists, so the post-condition checks type and
+// nullability and RAISEs, so a pre-existing same-named column of another shape fails v6
+// loudly instead of being recorded as applied — the same posture as v5's constraint checks.
+func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrator.Migration {
+	return postgresmigrator.Migration{
+		Version:     6,
+		Name:        "claimed_from",
+		Description: "routing_slips.claimed_from: prior status recorded by ClaimSlip and restored by ReleaseClaim (DEVOPS-367)",
+		UpSQL: `
+			ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL;
+
+			-- Post-condition: IF NOT EXISTS matched a NAME; assert the SHAPE ReleaseClaim relies on.
+			DO $$
+			BEGIN
+				IF NOT EXISTS (
+					SELECT 1
+					FROM information_schema.columns
+					WHERE table_schema = current_schema()
+					  AND table_name   = 'routing_slips'
+					  AND column_name  = 'claimed_from'
+					  AND data_type    = 'text'
+					  AND is_nullable  = 'YES'
+				) THEN
+					RAISE EXCEPTION 'migration v6: routing_slips.claimed_from exists but is not a nullable text column; fix or drop it and re-run v6';
+				END IF;
+			END $$;
+		`,
+		DownSQL: `ALTER TABLE routing_slips DROP COLUMN IF EXISTS claimed_from;`,
 	}
 }
 

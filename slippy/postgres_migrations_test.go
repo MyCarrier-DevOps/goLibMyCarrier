@@ -221,12 +221,12 @@ func TestUniquenessMigration_V5(t *testing.T) {
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
 
 	migs := mgr.GenerateMigrations()
-	require.Len(t, migs, 5, "Phase B adds migration v5 on top of v1-v4")
+	require.Len(t, migs, 6, "v1-v4, v5 (DEVOPS-231 Phase B), v6 (DEVOPS-367)")
 	v5 := migs[4]
 	assert.Equal(t, 5, v5.Version)
 	assert.Equal(t, "one_slip_per_commit", v5.Name)
-	assert.Equal(t, 5, mgr.LatestVersion())
-	assert.Equal(t, 5, GetPostgresDynamicMigrationVersion(cfg))
+	assert.Equal(t, 6, mgr.LatestVersion(), "v6 (DEVOPS-367) is now latest; v5's own version is asserted above")
+	assert.Equal(t, 6, GetPostgresDynamicMigrationVersion(cfg))
 
 	// Every assertion below runs against the SQL with -- comments stripped, because they are all
 	// about what the migration EXECUTES, not how it is documented. No comment supplies any of
@@ -285,4 +285,29 @@ func TestUniquenessMigration_V5(t *testing.T) {
 	} {
 		assert.Contains(t, down, want)
 	}
+}
+
+// TestClaimedFromMigration_V6 asserts the SHAPE of v6, not merely that it exists: an
+// `IF NOT EXISTS` add-column is idempotent by name only, so the post-condition must assert
+// the column's type and nullability, or a pre-existing same-named column of another shape
+// would be recorded as v6 (the same reasoning as v5's constraint post-conditions).
+func TestClaimedFromMigration_V6(t *testing.T) {
+	cfg := pgTestPipelineConfig(t)
+	migs := NewPostgresDynamicMigrationManager(cfg, nil).GenerateMigrations()
+	require.Len(t, migs, 6, "DEVOPS-367 adds migration v6 on top of v1-v5")
+	v6 := migs[5]
+
+	assert.Equal(t, 6, v6.Version)
+	assert.Equal(t, "claimed_from", v6.Name)
+
+	up := stripSQLLineComments(v6.UpSQL)
+	assert.Contains(t, up, "ADD COLUMN IF NOT EXISTS claimed_from text")
+	assert.Equal(t, 1, strings.Count(up, "RAISE EXCEPTION"), "exactly one post-condition")
+	assert.Contains(t, up, "information_schema.columns", "post-condition asserts the column's shape")
+	assert.Regexp(t, `is_nullable\s*=\s*'YES'`, up, "the column must be nullable: NULL means unclaimed")
+	assert.NotContains(t, up, "DEFAULT", "no default: NULL is the only correct unclaimed value")
+	assert.NotContains(t, up, "INDEX", "claimed_from is read by correlation_id only; no index")
+
+	down := stripSQLLineComments(v6.DownSQL)
+	assert.Contains(t, down, "DROP COLUMN IF EXISTS claimed_from")
 }
