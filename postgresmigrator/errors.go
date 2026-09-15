@@ -10,7 +10,10 @@ var (
 	// ErrNilConnection is returned when a nil database connection is provided.
 	ErrNilConnection = errors.New("database connection cannot be nil")
 
-	// ErrMigrationFailed is returned when a migration fails to apply.
+	// ErrMigrationFailed is wrapped by every *MigrationError, so
+	// errors.Is(err, ErrMigrationFailed) is true for any migration that failed to apply or
+	// revert, regardless of the underlying cause. Use errors.As(err, &me) when you also need
+	// the version or operation (DEVOPS-344).
 	ErrMigrationFailed = errors.New("migration failed")
 
 	// ErrSchemaValidationFailed is returned when schema validation fails.
@@ -38,9 +41,14 @@ func (e *MigrationError) Error() string {
 	return fmt.Sprintf("migration %s failed for version %d (%s): %v", e.Operation, e.Version, e.Name, e.Err)
 }
 
-// Unwrap returns the underlying error.
-func (e *MigrationError) Unwrap() error {
-	return e.Err
+// Unwrap exposes both the ErrMigrationFailed sentinel and the underlying cause, so
+// errors.Is works for either and errors.As still reaches a driver error such as
+// *pgconn.PgError. A nil Err (the empty-UpSQL guard) unwraps to the sentinel alone.
+func (e *MigrationError) Unwrap() []error {
+	if e.Err == nil {
+		return []error{ErrMigrationFailed}
+	}
+	return []error{ErrMigrationFailed, e.Err}
 }
 
 // SchemaValidationError represents an error during schema validation.

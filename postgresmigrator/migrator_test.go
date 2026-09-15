@@ -326,3 +326,30 @@ func TestMigrator_Integration(t *testing.T) {
 	require.NoError(t, m.DropTables(ctx))
 	assert.False(t, colExists(t, pool, "things", "id"), "things dropped by DropTables")
 }
+
+// ErrMigrationFailed's doc promises errors.Is matches every real migration failure. Before
+// DEVOPS-344 the sentinel was declared and never wrapped, so that was permanently false —
+// and a reviewer proposing errors.Is against it would have shipped an assertion that never
+// fires. This pins the promise for both operations while keeping the underlying driver
+// error reachable, so errors.As on a *pgconn.PgError keeps working too.
+func TestMigrationError_IsErrMigrationFailed(t *testing.T) {
+	base := errors.New("pq: relation does not exist")
+	for _, op := range []string{"up", "down"} {
+		var err error = &MigrationError{Version: 7, Name: "x", Operation: op, Err: base}
+		if !errors.Is(err, ErrMigrationFailed) {
+			t.Errorf("%s: errors.Is(err, ErrMigrationFailed) = false; the sentinel is unreachable", op)
+		}
+		if !errors.Is(err, base) {
+			t.Errorf("%s: the underlying error must stay reachable through Unwrap", op)
+		}
+		var me *MigrationError
+		if !errors.As(err, &me) || me.Version != 7 {
+			t.Errorf("%s: errors.As(*MigrationError) must still work", op)
+		}
+	}
+	// A nil Err (as the empty-UpSQL guard constructs) must not panic and must still match.
+	var bare error = &MigrationError{Version: 1, Operation: "up"}
+	if !errors.Is(bare, ErrMigrationFailed) {
+		t.Error("a MigrationError with nil Err must still be ErrMigrationFailed")
+	}
+}
