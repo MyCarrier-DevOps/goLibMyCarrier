@@ -368,22 +368,51 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 			ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL;
 
 			-- Post-condition: IF NOT EXISTS matched a NAME; assert the SHAPE ReleaseClaim relies on.
+			-- Resolved through the TABLE (to_regclass), as v5's post-conditions are: a query on
+			-- information_schema filtered by current_schema() answers for the first schema on
+			-- search_path, which is not necessarily the routing_slips the ALTER above touched.
 			DO $$
 			BEGIN
 				IF NOT EXISTS (
 					SELECT 1
-					FROM information_schema.columns
-					WHERE table_schema = current_schema()
-					  AND table_name   = 'routing_slips'
-					  AND column_name  = 'claimed_from'
-					  AND data_type    = 'text'
-					  AND is_nullable  = 'YES'
+					FROM pg_attribute a
+					JOIN pg_type ty ON ty.oid = a.atttypid
+					WHERE a.attrelid = to_regclass('routing_slips')
+					  AND a.attname  = 'claimed_from'
+					  AND NOT a.attisdropped
+					  AND ty.typname = 'text'
+					  AND NOT a.attnotnull
 				) THEN
 					RAISE EXCEPTION 'migration v6: routing_slips.claimed_from exists but is not a nullable text column; fix or drop it and re-run v6';
 				END IF;
 			END $$;
 		`,
-		DownSQL: `ALTER TABLE routing_slips DROP COLUMN IF EXISTS claimed_from;`,
+		DownSQL: `
+			-- Refuse while any claim is held. Dropping claimed_from under a held claim leaves
+			-- that slip in_progress with no claim recorded: unclaimable (a live run), unreleasable
+			-- (nothing to restore from) and unrepaveable (not an ended status), with no way back
+			-- once the column is gone — rolling forward again brings the column back NULL, which
+			-- is the same wedge. Let the runs end or release the claims, then re-run the down.
+			-- to_regclass makes a missing table or column a no-op rather than an error.
+			DO $$
+			DECLARE
+				held bigint;
+			BEGIN
+				IF EXISTS (
+					SELECT 1 FROM pg_attribute
+					WHERE attrelid = to_regclass('routing_slips')
+					  AND attname = 'claimed_from'
+					  AND NOT attisdropped
+				) THEN
+					SELECT count(*) INTO held FROM routing_slips
+					WHERE claimed_from IS NOT NULL AND claimed_from <> '';
+					IF held > 0 THEN
+						RAISE EXCEPTION 'migration v6 down: % slip(s) hold a claim (claimed_from set); release them or let their runs end before dropping the column', held;
+					END IF;
+				END IF;
+			END $$;
+			ALTER TABLE routing_slips DROP COLUMN IF EXISTS claimed_from;
+		`,
 	}
 }
 

@@ -303,11 +303,20 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 	up := stripSQLLineComments(v6.UpSQL)
 	assert.Contains(t, up, "ADD COLUMN IF NOT EXISTS claimed_from text")
 	assert.Equal(t, 1, strings.Count(up, "RAISE EXCEPTION"), "exactly one post-condition")
-	assert.Contains(t, up, "information_schema.columns", "post-condition asserts the column's shape")
-	assert.Regexp(t, `is_nullable\s*=\s*'YES'`, up, "the column must be nullable: NULL means unclaimed")
+	assert.Contains(t, up, "to_regclass('routing_slips')",
+		"post-condition resolves the column through the TABLE, like v5's, not via information_schema + current_schema()")
+	assert.NotContains(t, up, "current_schema()")
+	assert.Regexp(t, `NOT a\.attnotnull`, up, "the column must be nullable: NULL means unclaimed")
 	assert.NotContains(t, up, "DEFAULT", "no default: NULL is the only correct unclaimed value")
 	assert.NotContains(t, up, "INDEX", "claimed_from is read by correlation_id only; no index")
 
 	down := stripSQLLineComments(v6.DownSQL)
 	assert.Contains(t, down, "DROP COLUMN IF EXISTS claimed_from")
+	// Dropping the column under a held claim wedges that slip for good: in_progress with no
+	// claim recorded and nothing left to restore from. Down must refuse, not proceed.
+	assert.Equal(t, 1, strings.Count(down, "RAISE EXCEPTION"), "down carries exactly one guard")
+	assert.Regexp(t, `claimed_from IS NOT NULL AND claimed_from <> ''`, down, "the guard counts held claims")
+	assert.Contains(t, down, "to_regclass('routing_slips')", "and is a no-op on a missing table or column")
+	assert.Less(t, strings.Index(down, "RAISE EXCEPTION"), strings.Index(down, "DROP COLUMN"),
+		"the guard must run before the drop")
 }

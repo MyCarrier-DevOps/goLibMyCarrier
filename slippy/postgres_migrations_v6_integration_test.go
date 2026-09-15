@@ -11,21 +11,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// v6ColumnShape reports (exists, data_type, is_nullable) for routing_slips.claimed_from.
-func v6ColumnShape(t *testing.T, pool *pgxpool.Pool) (bool, string, string) {
+// v6ColumnShape reports (exists, type name, nullable) for routing_slips.claimed_from,
+// resolved through the TABLE (to_regclass) exactly as the migration's own post-condition
+// does, so the two cannot disagree about which routing_slips they are looking at.
+func v6ColumnShape(t *testing.T, pool *pgxpool.Pool) (bool, string, bool) {
 	t.Helper()
-	var dataType, nullable string
+	var typeName string
+	var notNull bool
 	err := pool.QueryRow(context.Background(),
-		"SELECT data_type, is_nullable FROM information_schema.columns "+
-			"WHERE table_schema = current_schema() AND table_name = 'routing_slips' AND column_name = 'claimed_from'",
-	).Scan(&dataType, &nullable)
+		"SELECT ty.typname, a.attnotnull FROM pg_attribute a JOIN pg_type ty ON ty.oid = a.atttypid "+
+			"WHERE a.attrelid = to_regclass('routing_slips') AND a.attname = 'claimed_from' AND NOT a.attisdropped",
+	).Scan(&typeName, &notNull)
 	if err != nil {
 		if isNoRows(err) {
-			return false, "", ""
+			return false, "", false
 		}
 		require.NoError(t, err)
 	}
-	return true, dataType, nullable
+	return true, typeName, !notNull
 }
 
 // TestClaimedFromMigration_V6_Integration exercises v6 against a real Postgres: apply,
@@ -44,7 +47,7 @@ func TestClaimedFromMigration_V6_Integration(t *testing.T) {
 		exists, dt, nullable := v6ColumnShape(t, pool)
 		require.True(t, exists, "claimed_from must exist after v6")
 		assert.Equal(t, "text", dt)
-		assert.Equal(t, "YES", nullable)
+		assert.True(t, nullable)
 	})
 
 	t.Run("down removes the column and up re-applies idempotently", func(t *testing.T) {
@@ -81,4 +84,33 @@ func TestClaimedFromMigration_V6_Integration(t *testing.T) {
 		assert.Contains(t, err.Error(), "claimed_from")
 		assert.Contains(t, err.Error(), "nullable text")
 	})
+}
+
+// v6's DownSQL refuses to run while any slip holds a claim. Dropping claimed_from under a
+// held claim would leave that slip in_progress with no claim recorded — unclaimable,
+// unreleasable and unrepaveable — with nothing left to recover it from once the column is
+// gone (PR #87 review). Rolling forward again does not help: the row would come back with a
+// NULL claimed_from, which is the same wedge.
+func TestClaimedFromMigration_V6_DownRefusesHeldClaims_Integration(t *testing.T) {
+	ctx := context.Background()
+	store, pool, cfg := newMigratedStore(t)
+	claimTestSlip(t, store, "v6-held", "sha-held", SlipStatusFailed)
+	_, err := store.ClaimSlip(ctx, "v6-held", nil, "slippy-cli", "")
+	require.NoError(t, err)
+
+	_, err = RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 5})
+	require.Error(t, err, "down must refuse while a claim is held")
+	assert.Contains(t, err.Error(), "hold a claim")
+	exists, _, _ := v6ColumnShape(t, pool)
+	require.True(t, exists, "the refused down must leave the column in place")
+	got, err := store.Load(ctx, "v6-held")
+	require.NoError(t, err)
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "and the claim intact")
+
+	_, err = store.ReleaseClaim(ctx, "v6-held", "slippy-cli/postjob", "")
+	require.NoError(t, err)
+	_, err = RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 5})
+	require.NoError(t, err, "with no claim held, down proceeds")
+	exists, _, _ = v6ColumnShape(t, pool)
+	require.False(t, exists)
 }
