@@ -29,6 +29,44 @@ func ClaimMarker(prior SlipStatus, claimedBy, reason string) StateHistoryEntry {
 	}
 }
 
+// ReleaseMarkerStep is the state_history step name of the marker ReleaseClaim appends.
+// pushhookparser's stranded-slip cleanup treats a release as ending the claim's exemption.
+const ReleaseMarkerStep = "slip_released"
+
+// ReleaseMarker builds the release history entry. StepStatusAborted is the closest existing
+// step status to "this claim was abandoned before its work reported"; it is never read as a
+// pipeline step because the step name is not one.
+func ReleaseMarker(restored SlipStatus, releasedBy, reason string) StateHistoryEntry {
+	msg := fmt.Sprintf("released claim; restored %s", restored)
+	if reason != "" {
+		msg += ": " + reason
+	}
+	return StateHistoryEntry{
+		Step:      ReleaseMarkerStep,
+		Status:    StepStatusAborted,
+		Timestamp: time.Now(),
+		Actor:     releasedBy,
+		Message:   msg,
+	}
+}
+
+// ReleaseClaim undoes a claim whose work will never report — the post-job's terminal write
+// failed, or an adopter decided not to dispatch after all. Safe to call on any failure path:
+// a slip the pipeline advanced meanwhile is ErrNotClaimed and untouched. See
+// SlipStore.ReleaseClaim for the contract.
+func (c *Client) ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error) {
+	restored, err := c.store.ReleaseClaim(ctx, correlationID, releasedBy, reason)
+	if err != nil {
+		return "", NewSlipError("release claim", correlationID, err)
+	}
+	c.logger.Info(ctx, "Released slip claim", map[string]interface{}{
+		"correlation_id": correlationID,
+		"restored":       string(restored),
+		"released_by":    releasedBy,
+	})
+	return restored, nil
+}
+
 // ClaimSlip takes ownership of an ended slip so a same-commit push deduplicates onto it
 // instead of repaving it (DEVOPS-285). expected bounds which statuses may be claimed out of;
 // nil means any ended status. See SlipStore.ClaimSlip for the full contract and error set.

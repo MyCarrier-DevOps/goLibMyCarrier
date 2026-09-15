@@ -129,6 +129,48 @@ func (s *PostgresStore) ClaimSlip(
 	return prior, nil
 }
 
+// ReleaseClaim implements SlipStore.ReleaseClaim as one transaction. The guarded UPDATE is
+// the whole decision: it matches only a currently-claimed row, restores the prior status,
+// and returns it, so there is no read-then-write between "is it claimed" and "restore".
+// Zero rows means either not-found or not-claimed; a follow-up SELECT tells them apart, the
+// same way removeSupersededSlipTx distinguishes a rejected repave from an absent row.
+func (s *PostgresStore) ReleaseClaim(
+	ctx context.Context, correlationID string, releasedBy, reason string,
+) (SlipStatus, error) {
+	var restored SlipStatus
+	err := s.inTx(ctx, func(tx pgx.Tx) error {
+		var status string
+		err := tx.QueryRow(ctx,
+			"UPDATE routing_slips SET status = claimed_from, claimed_from = NULL, updated_at = now() "+
+				"WHERE correlation_id = $1 AND status = $2 AND claimed_from IS NOT NULL AND claimed_from <> '' "+
+				"RETURNING status",
+			correlationID, string(SlipStatusInProgress)).Scan(&status)
+		switch {
+		case err == nil:
+			restored = SlipStatus(status)
+			return appendHistoryTx(ctx, tx, correlationID, ReleaseMarker(restored, releasedBy, reason))
+		case isNoRows(err):
+			var id string
+			checkErr := tx.QueryRow(ctx,
+				"SELECT correlation_id FROM routing_slips WHERE correlation_id = $1", correlationID).Scan(&id)
+			switch {
+			case checkErr == nil:
+				return fmt.Errorf("release %s: %w", correlationID, ErrNotClaimed)
+			case isNoRows(checkErr):
+				return ErrSlipNotFound
+			default:
+				return fmt.Errorf("release %s: checking row: %w", correlationID, checkErr)
+			}
+		default:
+			return fmt.Errorf("release %s: %w", correlationID, err)
+		}
+	})
+	if err != nil {
+		return "", err
+	}
+	return restored, nil
+}
+
 // slipStatusIn reports whether s is one of set.
 func slipStatusIn(set []SlipStatus, s SlipStatus) bool {
 	for _, x := range set {

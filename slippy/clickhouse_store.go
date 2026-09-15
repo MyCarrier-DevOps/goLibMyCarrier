@@ -943,6 +943,11 @@ func (s *ClickHouseStore) ClaimSlip(_ context.Context, correlationID string, _ [
 	return "", fmt.Errorf("ClaimSlip(%s): %w", correlationID, ErrClaimUnsupported)
 }
 
+// ReleaseClaim is unsupported on ClickHouse for the same reasons as ClaimSlip.
+func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID string, _, _ string) (SlipStatus, error) {
+	return "", fmt.Errorf("ReleaseClaim(%s): %w", correlationID, ErrClaimUnsupported)
+}
+
 // ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
 // the full ancestry chain for a given slip. Returns entries ordered from
 // direct parent to oldest ancestor. Stops when no more parent links are found

@@ -87,6 +87,13 @@ type UpdateSlipStatusCall struct {
 }
 
 // ClaimSlipCall records a call to ClaimSlip.
+// ReleaseClaimCall records a call to ReleaseClaim.
+type ReleaseClaimCall struct {
+	CorrelationID string
+	ReleasedBy    string
+	Reason        string
+}
+
 type ClaimSlipCall struct {
 	CorrelationID string
 	Expected      []SlipStatus
@@ -156,6 +163,7 @@ type MockStore struct {
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
 	ClaimSlipCalls        []ClaimSlipCall
+	ReleaseClaimCalls     []ReleaseClaimCall
 	RepaveCalls           []string
 	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
 	// the same call (empty string when a nil successor was passed). The in-memory mock has
@@ -208,6 +216,7 @@ type MockStore struct {
 	SetImageTagError      error
 	UpdateSlipStatusError error
 	ClaimSlipError        error
+	ReleaseClaimError     error
 	RepaveError           error
 	AncestryLinkError     error
 	CloseError            error
@@ -820,6 +829,28 @@ func (m *MockStore) ClaimSlip(ctx context.Context, correlationID string, expecte
 	slip.ClaimedFrom = prior
 	slip.Status = SlipStatusInProgress
 	return prior, nil
+}
+
+// ReleaseClaim mirrors PostgresStore.ReleaseClaim in memory (DEVOPS-367).
+func (m *MockStore) ReleaseClaim(ctx context.Context, correlationID string, releasedBy, reason string) (SlipStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReleaseClaimCalls = append(m.ReleaseClaimCalls, ReleaseClaimCall{CorrelationID: correlationID, ReleasedBy: releasedBy, Reason: reason})
+	if m.ReleaseClaimError != nil {
+		return "", m.ReleaseClaimError
+	}
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return "", ErrSlipNotFound
+	}
+	if slip.Status != SlipStatusInProgress || slip.ClaimedFrom == "" {
+		return "", fmt.Errorf("release %s: %w", correlationID, ErrNotClaimed)
+	}
+	restored := slip.ClaimedFrom
+	slip.Status = restored
+	slip.ClaimedFrom = ""
+	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(restored, releasedBy, reason))
+	return restored, nil
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
