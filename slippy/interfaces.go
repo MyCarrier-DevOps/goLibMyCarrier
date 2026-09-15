@@ -139,7 +139,9 @@ type SlipStore interface {
 	//     unclaimed run. Nothing was written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
-	ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (SlipStatus, error)
+	ClaimSlip(
+		ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
+	) (SlipStatus, error)
 
 	// ReleaseClaim undoes a ClaimSlip that will never be followed by the work it announced:
 	// if the slip is still in_progress with a claim recorded, restore status to claimed_from,
@@ -151,7 +153,7 @@ type SlipStore interface {
 	//   - ErrNotClaimed: not in_progress, or claimed_from empty. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot release (ClickHouse).
-	ReleaseClaim(ctx context.Context, correlationID string, releasedBy, reason string) (SlipStatus, error)
+	ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error)
 
 	// Repave atomically replaces one commit's ended run with a fresh one: it removes the
 	// routing_slips row for oldCorrelationID and its child rows (slip_component_states,

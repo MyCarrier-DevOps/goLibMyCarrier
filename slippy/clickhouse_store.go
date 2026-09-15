@@ -939,12 +939,14 @@ func (s *ClickHouseStore) Repave(_ context.Context, oldCorrelationID string, _ *
 
 // ClaimSlip is unsupported on ClickHouse: no claimed_from column, no transaction to make
 // the claim atomic, and not the operational store (DEVOPS-127). Wrapped so errors.Is works.
-func (s *ClickHouseStore) ClaimSlip(_ context.Context, correlationID string, _ []SlipStatus, _, _ string) (SlipStatus, error) {
+func (s *ClickHouseStore) ClaimSlip(
+	_ context.Context, correlationID string, _ []SlipStatus, _, _ string,
+) (SlipStatus, error) {
 	return "", fmt.Errorf("ClaimSlip(%s): %w", correlationID, ErrClaimUnsupported)
 }
 
 // ReleaseClaim is unsupported on ClickHouse for the same reasons as ClaimSlip.
-func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID string, _, _ string) (SlipStatus, error) {
+func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID, _, _ string) (SlipStatus, error) {
 	return "", fmt.Errorf("ReleaseClaim(%s): %w", correlationID, ErrClaimUnsupported)
 }
 

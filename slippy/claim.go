@@ -54,7 +54,9 @@ func ReleaseMarker(restored SlipStatus, releasedBy, reason string) StateHistoryE
 // failed, or an adopter decided not to dispatch after all. Safe to call on any failure path:
 // a slip the pipeline advanced meanwhile is ErrNotClaimed and untouched. See
 // SlipStore.ReleaseClaim for the contract.
-func (c *Client) ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error) {
+func (c *Client) ReleaseClaim(
+	ctx context.Context, correlationID, releasedBy, reason string,
+) (SlipStatus, error) {
 	restored, err := c.store.ReleaseClaim(ctx, correlationID, releasedBy, reason)
 	if err != nil {
 		return "", NewSlipError("release claim", correlationID, err)

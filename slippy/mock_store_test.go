@@ -795,10 +795,14 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 
 // ClaimSlip mirrors PostgresStore.ClaimSlip in memory: precondition, idempotent repeat,
 // live-run refusal, marker append, status + ClaimedFrom write (DEVOPS-367).
-func (m *MockStore) ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (SlipStatus, error) {
+func (m *MockStore) ClaimSlip(
+	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
+) (SlipStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{CorrelationID: correlationID, Expected: expected, ClaimedBy: claimedBy, Reason: reason})
+	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{
+		CorrelationID: correlationID, Expected: expected, ClaimedBy: claimedBy, Reason: reason,
+	})
 	if m.ClaimSlipError != nil {
 		return "", m.ClaimSlipError
 	}
@@ -821,7 +825,8 @@ func (m *MockStore) ClaimSlip(ctx context.Context, correlationID string, expecte
 			}
 		}
 		if !found {
-			return "", fmt.Errorf("claim %s: status %s not in %v: %w", correlationID, slip.Status, expected, ErrClaimPreconditionFailed)
+			return "", fmt.Errorf("claim %s: status %s not in %v: %w",
+				correlationID, slip.Status, expected, ErrClaimPreconditionFailed)
 		}
 	}
 	prior := slip.Status
@@ -832,10 +837,14 @@ func (m *MockStore) ClaimSlip(ctx context.Context, correlationID string, expecte
 }
 
 // ReleaseClaim mirrors PostgresStore.ReleaseClaim in memory (DEVOPS-367).
-func (m *MockStore) ReleaseClaim(ctx context.Context, correlationID string, releasedBy, reason string) (SlipStatus, error) {
+func (m *MockStore) ReleaseClaim(
+	ctx context.Context, correlationID, releasedBy, reason string,
+) (SlipStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ReleaseClaimCalls = append(m.ReleaseClaimCalls, ReleaseClaimCall{CorrelationID: correlationID, ReleasedBy: releasedBy, Reason: reason})
+	m.ReleaseClaimCalls = append(m.ReleaseClaimCalls, ReleaseClaimCall{
+		CorrelationID: correlationID, ReleasedBy: releasedBy, Reason: reason,
+	})
 	if m.ReleaseClaimError != nil {
 		return "", m.ReleaseClaimError
 	}

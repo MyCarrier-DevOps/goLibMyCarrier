@@ -135,7 +135,7 @@ func (s *PostgresStore) ClaimSlip(
 // Zero rows means either not-found or not-claimed; a follow-up SELECT tells them apart, the
 // same way removeSupersededSlipTx distinguishes a rejected repave from an absent row.
 func (s *PostgresStore) ReleaseClaim(
-	ctx context.Context, correlationID string, releasedBy, reason string,
+	ctx context.Context, correlationID, releasedBy, reason string,
 ) (SlipStatus, error) {
 	var restored SlipStatus
 	err := s.inTx(ctx, func(tx pgx.Tx) error {

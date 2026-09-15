@@ -348,35 +348,50 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   was observed directly — the same commit's push repaved while the slip was `failed` and
   deduplicated onto the rerun's correlation ID six seconds after the claim.
 
-  Three properties of the claim worth knowing before relying on it:
+  Four properties of the claim, as of DEVOPS-367 (goLibMyCarrier ≥ v1.3.103):
 
-  - **It is advisory, not a lock.** The body carries no expected-status and no
-    expected-claimant, and a repeat claim on a slip already `in_progress` is a
-    deliberate no-op rather than a conflict, because the caller's retry after a lost
-    response *is* the recovery. Two adopters can therefore both claim and both dispatch.
-  - **It does not refuse any prior status, and for `completed` that crosses I4.** The
-    claim writes `in_progress` over whatever was there. For `completed` that is an I4
-    violation by the letter (`slip.status` change after `slip=completed`), mitigated only
-    by the fact that the step columns are untouched, so the next terminal write
-    re-enters `checkPipelineCompletion` and writes `completed` back. For `promoted` there
-    is no such restoration path — `prod_steady_state` was never completed on a
-    feature-branch slip — so the claim destroys the primary record of a promotion, and
-    `slip_ancestry.parent_status` is the only residual. DEVOPS-202 (persist `promoted_to`)
-    is the prerequisite for making that non-destructive.
-  - **A committed claim has no release.** If the adopter then fails to dispatch across
-    its whole retry budget, the slip is left `in_progress` with nothing running, which is
-    the ordinary crashed-run resting state documented on `LoadByCommit`. Abandoning is
-    **not** a release: `abandoned` is ended-and-not-`failed`, so it loses the `failed`
-    carve-out the empty-run guard needs and suppresses the next same-commit push's unit
-    tests. A conditional release needs the prior status persisted (DEVOPS-202) and an
-    expected-status compare-and-set (DEVOPS-302).
+  - **It is one transaction with a precondition.** `SlipStore.ClaimSlip` locks the row,
+    checks the caller's expected-status set (`if_status` on the API), appends the marker,
+    and writes `status = in_progress` plus `claimed_from = <prior>` together. A status
+    outside the set is `ErrClaimPreconditionFailed` with nothing written; the caller
+    decided on a stale read and must re-read rather than retry. An `in_progress` slip
+    with no `claimed_from` is a genuinely live run and is refused regardless of the set.
+    A repeat claim on an already-claimed slip is an idempotent no-op returning the prior
+    — no second marker — because a caller's retry after a lost response *is* the recovery.
+  - **The prior status is persisted, not just logged.** `routing_slips.claimed_from`
+    (migration v6, nullable, SELECT-only) records what the slip was; the marker's message
+    names it too, built by the store from the value it read under lock. `claimed_from` is
+    written only by `ClaimSlip` and cleared only by `ReleaseClaim`; `Create` and the
+    full-row `Update` never touch it, so a caller's snapshot cannot clear a claim it never
+    loaded. Non-empty `claimed_from` ⇔ `in_progress` by way of a claim.
+  - **A committed claim has a release.** `SlipStore.ReleaseClaim` (`POST
+    /v1/slips/{id}/release`) restores `claimed_from`, clears it and appends a
+    `slip_released` marker — but only while the slip is still `in_progress` with a claim
+    recorded. A slip whose pipeline advanced past the claim is `ErrNotClaimed` and
+    untouched, so a release can never undo real progress and is safe to call on any
+    failure path. The CLI post-job calls it when its terminal write fails.
+  - **Recovery from a dead run is the workflow exit hook, never a clock.** A run that
+    dies after claiming is reconciled by Argo's workflow-level `hooks.exit` running
+    `slippy-post-job`, which every slip-routed template carries (`prod-gate` and
+    `secretscan` gained theirs under DEVOPS-367); the post-job's `slip-post` step retries
+    transient API failures. No component decides a claimed run is dead by elapsed time:
+    a long build is indistinguishable from a wedge by status, so any bound would either
+    repave live runs or be too long to matter. The residual — slippy-api unavailable for
+    longer than the post-job's retry window — is an outage, recovered by one release call.
 
-  **Residual, unchanged:** ordinary stragglers from any superseded run still get a bare
-  not-found, and roughly 13 other flows share the adopt-then-dispatch shape — every
-  `slip-routed` workflow template that takes a correlation ID. They route through one
-  shared `slippy-pre-job` step, so a single claim there would cover the family; until
-  then they are exposed for the window between workflow start and their first terminal
-  slip-level write.
+  What the claim still does not do: it does not refuse `completed` or `promoted` on its
+  own. For `completed` a claim is an I4 violation by the letter, mitigated by the step
+  columns being untouched (the next terminal write re-enters `checkPipelineCompletion`)
+  and now by `claimed_from` making it reversible. For `promoted` there is no restoration
+  path through the pipeline, so a release is the only way back. Callers therefore state
+  an explicit `if_status`: the CLI pre-job claims out of `failed` only.
+
+  **Residual, narrowing:** ordinary stragglers from any superseded run still get a
+  not-found on write, now with a message that names the likely repave. The ~13
+  `slip-routed` templates that adopt a correlation ID route through one shared
+  `slippy-pre-job` step; Slippy#28 claims there (out of `failed`, after `StartStep`), and
+  is gated on DEVOPS-367 being deployed to the same environment first.
+
 - **No duplicate detection before migration v5.** Without the `uq_routing_slips_repo_sha`
   unique index (migration v5, Phase B), an insert for the same `(repository, commit_sha)`
   never conflicts on anything but `correlation_id`, so `ErrDuplicateSlip` — and therefore
