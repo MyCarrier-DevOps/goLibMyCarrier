@@ -126,7 +126,7 @@ func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 // Load retrieves a slip by correlation ID.
 func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, error) {
 	query := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1",
-		strings.Join(s.slipColumns(), ", "))
+		strings.Join(s.slipSelectColumns(), ", "))
 	return s.queryOne(ctx, query, correlationID)
 }
 
@@ -170,7 +170,7 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
-		strings.Join(s.slipColumns(), ", "))
+		strings.Join(s.slipSelectColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
@@ -186,7 +186,7 @@ func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commit
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"AND status NOT IN ('abandoned', 'promoted', 'compensated') "+
 			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
-		strings.Join(s.slipColumns(), ", "))
+		strings.Join(s.slipSelectColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
@@ -259,6 +259,15 @@ func (s *PostgresStore) slipColumns() []string {
 	return cols
 }
 
+// slipSelectColumns is slipColumns() plus the read-only columns a hydrated Slip carries but
+// no caller may write through Create or the full-row Update. claimed_from is the first:
+// it is owned by ClaimSlip and ReleaseClaim (DEVOPS-367), and letting a snapshot Update
+// write it back would let a caller that never loaded the claim silently clear it. Keep this
+// list and newSlipScan's trailing destinations in the same order.
+func (s *PostgresStore) slipSelectColumns() []string {
+	return append(s.slipColumns(), ColumnClaimedFrom)
+}
+
 // aggregateColumns returns the ordered aggregate (jsonb) column names.
 func (s *PostgresStore) aggregateColumns() []string {
 	var cols []string
@@ -289,6 +298,8 @@ func (s *PostgresStore) newSlipScan(extra ...any) (sc *pgSlipScan, dest []any) {
 	for i := range sc.aggregateBytes {
 		dest = append(dest, &sc.aggregateBytes[i])
 	}
+	// Read-only trailing columns from slipSelectColumns(), in the same order.
+	dest = append(dest, &sc.claimedFrom)
 	dest = append(dest, extra...)
 	return sc, dest
 }
@@ -300,6 +311,9 @@ func (s *PostgresStore) newSlipScan(extra ...any) (sc *pgSlipScan, dest []any) {
 func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 	slip := sc.slip
 	slip.Status = SlipStatus(sc.statusStr)
+	if sc.claimedFrom != nil {
+		slip.ClaimedFrom = SlipStatus(*sc.claimedFrom)
+	}
 
 	slip.Steps = make(map[string]Step, len(s.config.Steps))
 	for i, step := range s.config.Steps {
@@ -420,6 +434,7 @@ type pgSlipScan struct {
 	stepStatuses   []string
 	aggregateCols  []string
 	aggregateBytes [][]byte
+	claimedFrom    *string // NULL when unclaimed
 }
 
 // buildStepDetailsMap builds the step_details JSON object from a slip. Mirrors

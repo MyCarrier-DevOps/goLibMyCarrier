@@ -13,7 +13,9 @@ const (
 	ColumnStatus        = "status"
 	ColumnStepDetails   = "step_details"
 	ColumnStateHistory  = "state_history"
-	ColumnAncestry      = "ancestry"
+	// ColumnClaimedFrom is SELECT-only: written by ClaimSlip/ReleaseClaim, never by Create/Update.
+	ColumnClaimedFrom = "claimed_from"
+	ColumnAncestry    = "ancestry"
 
 	// VersionedCollapsingMergeTree columns
 	ColumnSign    = "sign"

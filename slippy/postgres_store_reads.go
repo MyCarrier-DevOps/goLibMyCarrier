@@ -200,7 +200,7 @@ func (s *PostgresStore) ResolveAncestry(
 // slipColumnsPrefixed returns slipColumns() joined with a table-alias prefix on each name,
 // for queries that alias routing_slips (e.g. the commit-priority join).
 func (s *PostgresStore) slipColumnsPrefixed(prefix string) string {
-	cols := s.slipColumns()
+	cols := s.slipSelectColumns()
 	prefixed := make([]string, len(cols))
 	for i, c := range cols {
 		prefixed[i] = prefix + c

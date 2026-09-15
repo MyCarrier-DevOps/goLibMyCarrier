@@ -187,11 +187,12 @@ func TestPostgresStore_Load_Hydrates(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)
 	updated := time.Date(2026, 1, 2, 4, 0, 0, 0, time.UTC)
 
-	rows := pgxmock.NewRows(store.slipColumns()).AddRow(
+	rows := pgxmock.NewRows(store.slipSelectColumns()).AddRow(
 		"c1", "owner/repo", "main", "sha1", created, updated,
 		"in_progress", stepDetails, stateHistory,
 		"pending", "completed", "pending", "pending", // push_parsed, builds, unit_tests, dev_deploy
 		buildsAgg,
+		nil, // claimed_from
 	)
 	mock.ExpectQuery("SELECT .* FROM routing_slips WHERE correlation_id").
 		WithArgs("c1").WillReturnRows(rows)
@@ -222,7 +223,7 @@ func TestPostgresStore_Load_Hydrates(t *testing.T) {
 // the terms cannot be dropped or reordered silently.
 func TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
 	store, mock := newMockStore(t)
-	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
+	rows := pgxmock.NewRows(store.slipSelectColumns()).AddRow(slipRowValues("c1", "sha1")...)
 	mock.ExpectQuery(
 		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
 			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
@@ -241,7 +242,7 @@ func TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.
 // duplicate can still surface ahead of the live row on updated_at DESC alone.
 func TestPostgresStore_LoadLiveByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
 	store, mock := newMockStore(t)
-	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
+	rows := pgxmock.NewRows(store.slipSelectColumns()).AddRow(slipRowValues("c1", "sha1")...)
 	mock.ExpectQuery(
 		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
 			`AND status NOT IN \('abandoned', 'promoted', 'compensated'\) `+
