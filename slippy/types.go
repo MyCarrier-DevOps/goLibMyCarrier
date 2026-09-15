@@ -45,6 +45,14 @@ type Slip struct {
 	// Status is the overall slip status
 	Status SlipStatus `json:"status" ch:"status"`
 
+	// ClaimedFrom is the status this slip had immediately before an adopter claimed it
+	// (POST /slips/{id}/claim), or "" when it is not currently claimed. A non-empty value
+	// implies Status == in_progress by way of a claim rather than a pipeline transition.
+	// Set only by SlipStore.ClaimSlip and cleared only by SlipStore.ReleaseClaim, which
+	// restores this value; persisted in routing_slips.claimed_from (migration v6). The
+	// ClickHouse store does not carry it (DEVOPS-367).
+	ClaimedFrom SlipStatus `json:"claimed_from,omitempty" ch:"-"`
+
 	// Steps maps step names to their current state
 	// This is dynamically populated based on the pipeline configuration
 	Steps map[string]Step `json:"steps" ch:"-"`

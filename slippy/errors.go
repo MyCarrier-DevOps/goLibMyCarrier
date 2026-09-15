@@ -123,6 +123,19 @@ var (
 	// the successor separately) rather than treating it as a fatal, unrecoverable error.
 	ErrRepaveUnsupported = errors.New(
 		"store does not support Repave; caller should fall back to abandon semantics")
+
+	// ErrClaimPreconditionFailed is returned by ClaimSlip when the slip's status at write
+	// time was not one the caller agreed to claim out of — either it was outside the
+	// caller's expected set, or it was in_progress with no claim recorded, which means a
+	// genuinely live run that must never be adopted. Nothing was written. The caller
+	// decided on a stale read; the remedy is to re-read, not to retry (DEVOPS-367).
+	ErrClaimPreconditionFailed = errors.New("slip status did not match the claim precondition")
+
+	// ErrNotClaimed is returned by ReleaseClaim when there is no claim to release: the slip
+	// is not in_progress, or claimed_from is empty. Nothing was written. This is the normal
+	// outcome when the pipeline advanced the slip before the release ran, and callers should
+	// treat it as "nothing to undo" rather than as a failure (DEVOPS-367).
+	ErrNotClaimed = errors.New("slip is not currently claimed")
 )
 
 // SlipError wraps an error with additional context about the slip operation.
