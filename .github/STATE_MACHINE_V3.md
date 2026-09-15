@@ -357,19 +357,35 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     decided on a stale read and must re-read rather than retry. An `in_progress` slip
     with no `claimed_from` is a genuinely live run and is refused regardless of the set.
     A repeat claim on an already-claimed slip is an idempotent no-op returning the prior
-    — no second marker — because a caller's retry after a lost response *is* the recovery.
+    — no second marker, no status write — because a caller's retry after a lost response
+    *is* the recovery, and because every pre-job of one run claims the same slip. The
+    no-op still checks `if_status` against the recorded prior, so a caller is never told
+    it claimed a status it refused.
   - **The prior status is persisted, not just logged.** `routing_slips.claimed_from`
     (migration v6, nullable, SELECT-only) records what the slip was; the marker's message
     names it too, built by the store from the value it read under lock. `claimed_from` is
-    written only by `ClaimSlip` and cleared only by `ReleaseClaim`; `Create` and the
-    full-row `Update` never touch it, so a caller's snapshot cannot clear a claim it never
-    loaded. Non-empty `claimed_from` ⇔ `in_progress` by way of a claim.
+    written only by `ClaimSlip` and cleared when the run is over: by `ReleaseClaim`, by a
+    terminal status write (terminal ends the run, so it ends the claim), or by
+    `checkPipelineCompletion` when it writes `failed` with no step or component still
+    running — so a completed run needs no release to be repaveable again, and a failed one
+    is repaveable the moment it is quiescent. `Create` and the full-row `Update` never touch
+    it, and a non-terminal status write with work still running never clears it, so neither
+    a caller's snapshot nor the pipeline's own progress can end a claim early. Non-empty
+    `claimed_from` means a
+    claimant's run is in flight *whatever `status` says*: a step failure mid-run writes
+    `failed` over the claim's `in_progress` and the claim survives it. `Repave` refuses a
+    row with `claimed_from` set exactly as it refuses a live one (`ErrSlipWentLive`) and
+    the push path deduplicates onto it, so the claim protects the whole run — not only the
+    stretch before its first step failure. Migration v6's down refuses while any claim is
+    held, because dropping the column under one would wedge that slip for good.
   - **A committed claim has a release.** `SlipStore.ReleaseClaim` (`POST
-    /v1/slips/{id}/release`) restores `claimed_from`, clears it and appends a
-    `slip_released` marker — but only while the slip is still `in_progress` with a claim
-    recorded. A slip whose pipeline advanced past the claim is `ErrNotClaimed` and
-    untouched, so a release can never undo real progress and is safe to call on any
-    failure path. The CLI post-job calls it when its terminal write fails.
+    /v1/slips/{id}/release`) clears `claimed_from` and appends a `slip_released` marker
+    whatever the status is, and settles `status` in the same transaction: restored to the
+    pre-claim value if it is still the claim's own `in_progress` (the run wrote nothing),
+    kept as the run wrote it otherwise. It never writes over a status the run wrote, so it
+    is safe to call blindly; an unclaimed slip is `ErrNotClaimed`. The CLI post-job calls
+    it on every exit, so a claim never outlives its run and leaves no residue to confuse
+    the next claim or repave.
   - **Recovery from a dead run is the workflow exit hook, never a clock.** A run that
     dies after claiming is reconciled by Argo's workflow-level `hooks.exit` running
     `slippy-post-job`, which every slip-routed template carries (`prod-gate` and

@@ -141,12 +141,17 @@ jobs:
       # the real index reports that constraint name. TestPostgresStore_Ancestry is included
       # because v5's fk_ancestry_slip gave InsertAncestryLink a precondition that only a real
       # schema enforces.
-      - name: Run deterministic integration suites (CLONE_DERIVED, Postgres repave, migration v5)
+      #
+      # TestPostgresStore_Claim*, TestPostgresStore_ReleaseClaim and TestClaimedFromMigration_V6*
+      # (DEVOPS-367) are included because the claim is a FOR UPDATE transaction whose
+      # serialisation, the claimed_from guard on Repave's DELETE, and v6's down guard are
+      # all properties of real Postgres locking and real DDL that pgxmock cannot exercise.
+      - name: Run deterministic integration suites (CLONE_DERIVED, Postgres repave, migrations v5/v6, claims)
         working-directory: slippy
         run: |
           go mod download
           go test -tags integration \
-            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry' \
+            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry|TestPostgresStore_Claim|TestPostgresStore_ReleaseClaim|TestClaimedFromMigration_V6' \
             -count=1 -timeout 10m ./...
 
   lint:

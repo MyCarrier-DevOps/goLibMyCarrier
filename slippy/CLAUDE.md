@@ -16,6 +16,22 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ## Breaking changes
 
+**DEVOPS-367 added `ClaimSlip` and `ReleaseClaim` to the exported `SlipStore` interface:**
+
+```go
+ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (SlipStatus, error)
+ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error)
+```
+
+Same posture as `Repave` below: a downstream `SlipStore` implementation fails to compile
+until both methods exist (the ClickHouse store returns `ErrClaimUnsupported`; the
+`slippytest.MockStore` and slippy-api's `mockSlipStore` implement them). `ReleaseMarker`
+also changed shape in the same release — `ReleaseMarker(status SlipStatus, restored bool,
+releasedBy, reason string)` — because a release no longer always restores: it clears the
+claim whatever the status is and restores the pre-claim status only when the run wrote
+nothing. The contract, including what `nil` means for `expected` and why the claim outlives
+status writes, is on `SlipStore.ClaimSlip` and `SlipStore.ReleaseClaim` in `interfaces.go`.
+
 **DEVOPS-231 added `Repave` to the exported `SlipStore` interface:**
 
 ```go

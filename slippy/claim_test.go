@@ -1,6 +1,8 @@
 package slippy
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,12 +21,24 @@ func TestClaimSentinelsAreDistinct(t *testing.T) {
 }
 
 // ClaimedFrom is the only field a release restores from; it must serialise under the
-// snake_case key the API contract will expose and be omitted when the slip is unclaimed.
+// snake_case key the API contract exposes, be omitted when the slip is unclaimed, and be
+// excluded from the ClickHouse column mapping (ch:"-") because no ClickHouse table has it.
 func TestSlip_ClaimedFrom_JSONShape(t *testing.T) {
-	s := &Slip{CorrelationID: "c1", Status: SlipStatusInProgress, ClaimedFrom: SlipStatusFailed}
-	assert.Equal(t, SlipStatusFailed, s.ClaimedFrom)
-	var zero Slip
-	assert.Empty(t, zero.ClaimedFrom)
+	claimed, err := json.Marshal(&Slip{CorrelationID: "c1", Status: SlipStatusInProgress, ClaimedFrom: SlipStatusFailed})
+	require.NoError(t, err)
+	assert.Contains(t, string(claimed), `"claimed_from":"failed"`)
+	var back Slip
+	require.NoError(t, json.Unmarshal(claimed, &back))
+	assert.Equal(t, SlipStatusFailed, back.ClaimedFrom, "round-trips under the snake_case key")
+
+	unclaimed, err := json.Marshal(&Slip{CorrelationID: "c2", Status: SlipStatusFailed})
+	require.NoError(t, err)
+	assert.NotContains(t, string(unclaimed), "claimed_from", "omitempty: an unclaimed slip carries no key")
+
+	field, ok := reflect.TypeOf(Slip{}).FieldByName("ClaimedFrom")
+	require.True(t, ok)
+	assert.Equal(t, "claimed_from,omitempty", field.Tag.Get("json"))
+	assert.Equal(t, "-", field.Tag.Get("ch"), "no ClickHouse column: the ch mapper must skip it")
 }
 
 // The marker builders moved here from slippy-api so every adopter writes the same shape;
