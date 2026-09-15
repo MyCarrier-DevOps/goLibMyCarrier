@@ -42,6 +42,7 @@ func deepCopySlip(slip *Slip) *Slip {
 		CreatedAt:     slip.CreatedAt,
 		UpdatedAt:     slip.UpdatedAt,
 		Status:        slip.Status,
+		ClaimedFrom:   slip.ClaimedFrom,
 		PromotedTo:    slip.PromotedTo,
 		Sign:          slip.Sign,
 		Version:       slip.Version,
@@ -86,7 +87,6 @@ type UpdateSlipStatusCall struct {
 	Status        SlipStatus
 }
 
-// ClaimSlipCall records a call to ClaimSlip.
 // ReleaseClaimCall records a call to ReleaseClaim.
 type ReleaseClaimCall struct {
 	CorrelationID string
@@ -94,6 +94,7 @@ type ReleaseClaimCall struct {
 	Reason        string
 }
 
+// ClaimSlipCall records a call to ClaimSlip.
 type ClaimSlipCall struct {
 	CorrelationID string
 	Expected      []SlipStatus
@@ -440,9 +441,9 @@ func (m *MockStore) Repave(
 
 	removedOld := false
 	if slip, ok := m.Slips[oldCorrelationID]; ok {
-		if slip.Status.IsLive() {
-			// Went live between the caller's repave decision and this call: the
-			// superseded run survives and the successor is NOT created.
+		if slip.Status.IsLive() || slip.ClaimedFrom != "" {
+			// Went live between the caller's repave decision and this call, or a claimant
+			// holds it: the superseded run survives and the successor is NOT created.
 			return ErrSlipWentLive
 		}
 		removedOld = true
@@ -655,11 +656,15 @@ func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 		return m.UpdateError
 	}
 
-	if _, ok := m.Slips[slip.CorrelationID]; !ok {
+	existing, ok := m.Slips[slip.CorrelationID]
+	if !ok {
 		return ErrSlipNotFound
 	}
 
-	m.Slips[slip.CorrelationID] = deepCopySlip(slip)
+	// claimed_from is SELECT-only in PostgresStore: a full-row Update never writes it.
+	stored := deepCopySlip(slip)
+	stored.ClaimedFrom = existing.ClaimedFrom
+	m.Slips[slip.CorrelationID] = stored
 	return nil
 }
 
@@ -810,24 +815,20 @@ func (m *MockStore) ClaimSlip(
 	if !ok {
 		return "", ErrSlipNotFound
 	}
-	if slip.Status == SlipStatusInProgress {
-		if slip.ClaimedFrom != "" {
-			return slip.ClaimedFrom, nil
+	if slip.ClaimedFrom != "" {
+		// Already claimed: idempotent no-op whatever the run wrote to status since.
+		if len(expected) > 0 && !slipStatusIn(expected, slip.ClaimedFrom) {
+			return "", fmt.Errorf("claim %s: already claimed out of %s, not in %v: %w",
+				correlationID, slip.ClaimedFrom, expected, ErrClaimPreconditionFailed)
 		}
+		return slip.ClaimedFrom, nil
+	}
+	if slip.Status == SlipStatusInProgress {
 		return "", fmt.Errorf("claim %s: live run: %w", correlationID, ErrClaimPreconditionFailed)
 	}
-	if len(expected) > 0 {
-		found := false
-		for _, e := range expected {
-			if e == slip.Status {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return "", fmt.Errorf("claim %s: status %s not in %v: %w",
-				correlationID, slip.Status, expected, ErrClaimPreconditionFailed)
-		}
+	if len(expected) > 0 && !slipStatusIn(expected, slip.Status) {
+		return "", fmt.Errorf("claim %s: status %s not in %v: %w",
+			correlationID, slip.Status, expected, ErrClaimPreconditionFailed)
 	}
 	prior := slip.Status
 	slip.StateHistory = append(slip.StateHistory, ClaimMarker(prior, claimedBy, reason))
@@ -852,14 +853,16 @@ func (m *MockStore) ReleaseClaim(
 	if !ok {
 		return "", ErrSlipNotFound
 	}
-	if slip.Status != SlipStatusInProgress || slip.ClaimedFrom == "" {
+	if slip.ClaimedFrom == "" {
 		return "", fmt.Errorf("release %s: %w", correlationID, ErrNotClaimed)
 	}
-	restored := slip.ClaimedFrom
-	slip.Status = restored
+	restored := slip.Status == SlipStatusInProgress
+	if restored {
+		slip.Status = slip.ClaimedFrom
+	}
 	slip.ClaimedFrom = ""
-	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(restored, releasedBy, reason))
-	return restored, nil
+	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(slip.Status, restored, releasedBy, reason))
+	return slip.Status, nil
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.

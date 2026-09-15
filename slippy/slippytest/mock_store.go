@@ -255,7 +255,6 @@ type UpdateSlipStatusCall struct {
 	Status        slippy.SlipStatus
 }
 
-// ClaimSlipCall records a call to ClaimSlip.
 // ReleaseClaimCall records a call to ReleaseClaim.
 type ReleaseClaimCall struct {
 	CorrelationID string
@@ -263,6 +262,7 @@ type ReleaseClaimCall struct {
 	Reason        string
 }
 
+// ClaimSlipCall records a call to ClaimSlip.
 type ClaimSlipCall struct {
 	CorrelationID string
 	Expected      []slippy.SlipStatus
@@ -363,7 +363,9 @@ func (m *MockStore) Repave(
 
 	removedOld := false
 	if slip, ok := m.Slips[oldCorrelationID]; ok {
-		if slip.Status.IsLive() {
+		// A claimed row is refused like a live one: a claimant's run is in flight whatever
+		// the status says (a step failure writes failed over the claim's in_progress).
+		if slip.Status.IsLive() || slip.ClaimedFrom != "" {
 			return slippy.ErrSlipWentLive
 		}
 		removedOld = true
@@ -568,11 +570,16 @@ func (m *MockStore) Update(ctx context.Context, slip *slippy.Slip) error {
 		return m.UpdateError
 	}
 
-	if _, ok := m.Slips[slip.CorrelationID]; !ok {
+	existing, ok := m.Slips[slip.CorrelationID]
+	if !ok {
 		return slippy.ErrSlipNotFound
 	}
 
-	m.Slips[slip.CorrelationID] = DeepCopySlip(slip)
+	// claimed_from is SELECT-only in PostgresStore: the full-row Update never writes it, so
+	// a caller's stale snapshot cannot clear a claim it never loaded. Mirror that here.
+	stored := DeepCopySlip(slip)
+	stored.ClaimedFrom = existing.ClaimedFrom
+	m.Slips[slip.CorrelationID] = stored
 
 	return nil
 }
@@ -729,24 +736,21 @@ func (m *MockStore) ClaimSlip(
 	if !ok {
 		return "", slippy.ErrSlipNotFound
 	}
-	if slip.Status == slippy.SlipStatusInProgress {
-		if slip.ClaimedFrom != "" {
-			return slip.ClaimedFrom, nil
+	if slip.ClaimedFrom != "" {
+		// Already claimed: idempotent no-op whatever status the run has written since;
+		// expected is checked against the status the claim was taken out of.
+		if !statusIn(expected, slip.ClaimedFrom) {
+			return "", fmt.Errorf("claim %s: already claimed out of %s, not in %v: %w",
+				correlationID, slip.ClaimedFrom, expected, slippy.ErrClaimPreconditionFailed)
 		}
+		return slip.ClaimedFrom, nil
+	}
+	if slip.Status == slippy.SlipStatusInProgress {
 		return "", fmt.Errorf("claim %s: live run: %w", correlationID, slippy.ErrClaimPreconditionFailed)
 	}
-	if len(expected) > 0 {
-		found := false
-		for _, e := range expected {
-			if e == slip.Status {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return "", fmt.Errorf("claim %s: status %s not in %v: %w",
-				correlationID, slip.Status, expected, slippy.ErrClaimPreconditionFailed)
-		}
+	if !statusIn(expected, slip.Status) {
+		return "", fmt.Errorf("claim %s: status %s not in %v: %w",
+			correlationID, slip.Status, expected, slippy.ErrClaimPreconditionFailed)
 	}
 	prior := slip.Status
 	slip.StateHistory = append(slip.StateHistory, slippy.ClaimMarker(prior, claimedBy, reason))
@@ -771,14 +775,30 @@ func (m *MockStore) ReleaseClaim(
 	if !ok {
 		return "", slippy.ErrSlipNotFound
 	}
-	if slip.Status != slippy.SlipStatusInProgress || slip.ClaimedFrom == "" {
+	if slip.ClaimedFrom == "" {
 		return "", fmt.Errorf("release %s: %w", correlationID, slippy.ErrNotClaimed)
 	}
-	restored := slip.ClaimedFrom
-	slip.Status = restored
+	// Restore only the claim's own in_progress; any other status was written by the run.
+	restored := slip.Status == slippy.SlipStatusInProgress
+	if restored {
+		slip.Status = slip.ClaimedFrom
+	}
 	slip.ClaimedFrom = ""
-	slip.StateHistory = append(slip.StateHistory, slippy.ReleaseMarker(restored, releasedBy, reason))
-	return restored, nil
+	slip.StateHistory = append(slip.StateHistory, slippy.ReleaseMarker(slip.Status, restored, releasedBy, reason))
+	return slip.Status, nil
+}
+
+// statusIn reports whether s is in set; an empty set admits every status.
+func statusIn(set []slippy.SlipStatus, s slippy.SlipStatus) bool {
+	if len(set) == 0 {
+		return true
+	}
+	for _, e := range set {
+		if e == s {
+			return true
+		}
+	}
+	return false
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
@@ -978,6 +998,7 @@ func DeepCopySlip(slip *slippy.Slip) *slippy.Slip {
 		CreatedAt:     slip.CreatedAt,
 		UpdatedAt:     slip.UpdatedAt,
 		Status:        slip.Status,
+		ClaimedFrom:   slip.ClaimedFrom,
 	}
 
 	// Deep copy steps map

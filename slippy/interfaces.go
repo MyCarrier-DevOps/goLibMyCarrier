@@ -117,40 +117,52 @@ type SlipStore interface {
 	// column, preventing concurrent history appends from being lost under last-write-wins.
 	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
 
-	// ClaimSlip records that an adopter has taken ownership of an ended slip, as ONE
+	// ClaimSlip records that an adopter has a run in flight against a slip, as ONE
 	// transaction: lock the row, check the precondition, append entry, set status to
 	// in_progress and claimed_from to the status the row had. There is no half-claimed state
 	// and nothing about the decision is trusted from the caller's earlier read (DEVOPS-367).
 	//
+	// The claim lives from ClaimSlip to ReleaseClaim, independent of status. The pipeline is
+	// free to write status while it is held (a step failure writes failed over the claim's
+	// in_progress); claimed_from stays set, Repave refuses the row for as long as it is, and
+	// a same-commit push dedups onto the run. Only ReleaseClaim clears it.
+	//
 	// expected is the set of statuses the caller agreed to claim out of. nil means "any
-	// status that is not in_progress". Whatever expected says, an in_progress slip whose
-	// claimed_from is empty is a genuinely live run and is always refused.
+	// status except an unclaimed in_progress" — pending and compensating included, not only
+	// the ended statuses. Whatever expected says, an in_progress slip whose claimed_from is
+	// empty is a genuinely live run and is always refused.
 	//
 	// The store builds the adoption marker itself with ClaimMarker(prior, claimedBy, reason),
 	// because only it knows the true prior status at write time; a caller-built entry could
-	// name a status that changed between its read and this write.
+	// name a status that changed between its read and this write. claimedBy is audit only:
+	// it names the actor in the marker and is never a key the claim is checked against.
 	//
 	// Returns the prior status, and:
 	//   - nil: the slip is now in_progress with claimed_from = prior, and the marker was appended.
-	//   - nil with no write: the slip was already claimed (in_progress, claimed_from set);
-	//     the returned prior is that claimed_from. Repeat claims are idempotent — no second
-	//     marker, so a retried request cannot inflate the audit trail.
-	//   - ErrClaimPreconditionFailed: the status was outside expected, or the slip is a live
-	//     unclaimed run. Nothing was written.
+	//   - nil with no write: the slip was already claimed (claimed_from set, whatever status
+	//     the run has written since); the returned prior is that claimed_from, and expected
+	//     is checked against it. Repeat claims are idempotent — no second marker and no
+	//     status write, so a retried request cannot inflate the audit trail or undo the run's
+	//     progress. Every pre-job of one run claims the same slip, so this arm is the normal
+	//     path for all but the first.
+	//   - ErrClaimPreconditionFailed: the status (or, on a held claim, claimed_from) was
+	//     outside expected, or the slip is a live unclaimed run. Nothing was written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
 	ClaimSlip(
 		ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 	) (SlipStatus, error)
 
-	// ReleaseClaim undoes a ClaimSlip that will never be followed by the work it announced:
-	// if the slip is still in_progress with a claim recorded, restore status to claimed_from,
-	// clear claimed_from and append a release marker, in one transaction (DEVOPS-367).
+	// ReleaseClaim ends a claim, in one transaction (DEVOPS-367): clear claimed_from, append a
+	// release marker, and settle the status — restored to claimed_from if it is still the
+	// claim's own in_progress (the run wrote nothing), otherwise kept exactly as the run wrote
+	// it. The claimant's post-job calls this on every exit, so a claim never outlives its run
+	// and no residue is left to confuse the next claim or repave.
 	//
-	// The guard is what makes this safe to call blindly on any failure path: a slip whose
-	// pipeline advanced past the claim (any other status) is ErrNotClaimed with nothing
-	// written, so a release can never undo real progress. Returns the restored status.
-	//   - ErrNotClaimed: not in_progress, or claimed_from empty. Nothing written.
+	// What makes this safe to call blindly is that it never writes over a status the run
+	// wrote: a slip whose pipeline advanced past the claim keeps that status and only loses
+	// the claim. releasedBy is audit only, like claimedBy. Returns the status after release.
+	//   - ErrNotClaimed: claimed_from empty. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot release (ClickHouse).
 	ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error)
@@ -242,7 +254,8 @@ type SlipStore interface {
 	// Returns:
 	//   - nil: newSlip exists, and the superseded row is gone (removed here, or already
 	//     absent — an absent old row is not an error, so redelivery converges).
-	//   - ErrSlipWentLive: oldCorrelationID's row exists but is no longer ended. Nothing
+	//   - ErrSlipWentLive: oldCorrelationID's row exists but is no longer ended, or a
+	//     claimant holds it (claimed_from set, DEVOPS-367). Nothing
 	//     is written and newSlip is NOT created; the caller must dedup onto the live run.
 	//   - ErrDuplicateSlip: newSlip collided with the one-row-per-commit unique index
 	//     (migration v5, Phase B). Nothing is written; the caller routes to its dedup backstop.

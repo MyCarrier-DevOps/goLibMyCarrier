@@ -51,13 +51,20 @@ func TestClaimMarker_RecordsPriorStatusAndReason(t *testing.T) {
 	}
 }
 
-func TestReleaseMarker_RecordsRestoredStatusAndReason(t *testing.T) {
-	e := ReleaseMarker(SlipStatusFailed, "post-job", "terminal write failed")
-	assert.Equal(t, "released claim; restored failed: terminal write failed", e.Message)
-	assert.Equal(t, "post-job", e.Actor)
-	assert.Equal(t, ReleaseMarkerStep, e.Step)
-	assert.Equal(t, StepStatusAborted, e.Status)
-	assert.Equal(t, "released claim; restored failed", ReleaseMarker(SlipStatusFailed, "x", "").Message)
+// The release marker records what the release did to the status, because a release no
+// longer always restores: after the run wrote its own status the claim is cleared and that
+// status is kept, and an operator reading the history must be able to tell the two apart.
+func TestReleaseMarker_RecordsOutcomeAndReason(t *testing.T) {
+	restored := ReleaseMarker(SlipStatusFailed, true, "post-job", "terminal write failed")
+	assert.Equal(t, "released claim; restored failed: terminal write failed", restored.Message)
+	assert.Equal(t, "post-job", restored.Actor)
+	assert.Equal(t, ReleaseMarkerStep, restored.Step)
+	assert.Equal(t, StepStatusAborted, restored.Status)
+	assert.Equal(t, "released claim; restored failed", ReleaseMarker(SlipStatusFailed, true, "x", "").Message)
+
+	kept := ReleaseMarker(SlipStatusCompleted, false, "post-job", "")
+	assert.Equal(t, "released claim; kept completed written by the pipeline", kept.Message)
+	assert.Equal(t, ReleaseMarkerStep, kept.Step)
 }
 
 // Neither marker may name a real pipeline step, or an aggregate or phase reader would take

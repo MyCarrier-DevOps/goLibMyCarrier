@@ -104,15 +104,17 @@ var (
 	// else holds the row" and routes to the repave/dedup backstop (DEVOPS-231).
 	ErrDuplicateSlip = errors.New("a slip already exists for this repository and commit")
 
-	// ErrSlipWentLive indicates Repave's status guard rejected a repave: the slip became
-	// live between the repave decision and the repave itself; do not repave. Concretely,
-	// the row still exists but its status is no longer one of the ended statuses
-	// (failed, completed, abandoned, promoted, compensated) that Repave requires — for
-	// example a failed slip can recover to in_progress via executor.go's recovery branch
-	// in the window between a caller's snapshot-based "this slip is ended" decision and
-	// the Repave call. Nothing is written: the transaction rolls back, so the superseded
-	// row survives AND no successor is created. Callers must not treat the successor as
-	// existing in this case, since the row for that commit is a live run.
+	// ErrSlipWentLive indicates Repave's guard rejected a repave: the slip became live
+	// between the repave decision and the repave itself, or a claimant holds it; do not
+	// repave. Concretely, the row still exists but either its status is no longer one of
+	// the ended statuses (failed, completed, abandoned, promoted, compensated) that Repave
+	// requires — for example a failed slip can recover to in_progress via executor.go's
+	// recovery branch in the window between a caller's snapshot-based "this slip is ended"
+	// decision and the Repave call — or its claimed_from is set, meaning a claimant's run
+	// is in flight whatever the status says (DEVOPS-367). Nothing is written: the
+	// transaction rolls back, so the superseded row survives AND no successor is created.
+	// Callers must not treat the successor as existing in this case, since the row for
+	// that commit is a running slip; the push path dedups onto it.
 	ErrSlipWentLive = errors.New("slip went live between the repave decision and the repave")
 
 	// ErrRepaveUnsupported indicates the store cannot repave (replace one commit's slip

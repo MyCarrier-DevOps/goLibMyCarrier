@@ -80,10 +80,12 @@ func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID stri
 // contract; this comment covers the Postgres mechanics.
 //
 // The row is read FOR UPDATE, so two concurrent claims serialise: the second sees the
-// first's in_progress + claimed_from and takes the idempotent no-op arm. The marker append
-// and the status write are in the same transaction as that read, which is the property the
-// slippy-api adapter used to approximate with a marker-then-status ordering and can now
-// drop (DEVOPS-367).
+// first's claimed_from and takes the idempotent no-op arm. That arm keys on claimed_from
+// alone, not on status, because the claim outlives the pipeline's status writes (a step
+// failure writes failed over the claim's in_progress) and a later claimant must join the
+// run rather than re-claim it. The marker append and the status write are in the same
+// transaction as that read, which is the property the slippy-api adapter used to
+// approximate with a marker-then-status ordering and can now drop (DEVOPS-367).
 func (s *PostgresStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 ) (SlipStatus, error) {
@@ -100,11 +102,18 @@ func (s *PostgresStore) ClaimSlip(
 			return fmt.Errorf("claim %s: lock: %w", correlationID, err)
 		}
 		cur := SlipStatus(status)
-		if cur == SlipStatusInProgress {
-			if claimedFrom != nil && *claimedFrom != "" {
-				prior = SlipStatus(*claimedFrom) // already claimed: idempotent no-op
-				return nil
+		if claimedFrom != nil && *claimedFrom != "" {
+			// Already claimed: the idempotent no-op arm, whatever the run has written to
+			// status since. expected is still honoured, against the status the claim was
+			// taken out of, so a caller is never told it claimed something it refused.
+			prior = SlipStatus(*claimedFrom)
+			if len(expected) > 0 && !slipStatusIn(expected, prior) {
+				return fmt.Errorf("claim %s: already claimed out of %s, not in %v: %w",
+					correlationID, prior, expected, ErrClaimPreconditionFailed)
 			}
+			return nil
+		}
+		if cur == SlipStatusInProgress {
 			return fmt.Errorf("claim %s: in_progress with no claim recorded is a live run: %w",
 				correlationID, ErrClaimPreconditionFailed)
 		}
@@ -129,46 +138,46 @@ func (s *PostgresStore) ClaimSlip(
 	return prior, nil
 }
 
-// ReleaseClaim implements SlipStore.ReleaseClaim as one transaction. The guarded UPDATE is
-// the whole decision: it matches only a currently-claimed row, restores the prior status,
-// and returns it, so there is no read-then-write between "is it claimed" and "restore".
-// Zero rows means either not-found or not-claimed; a follow-up SELECT tells them apart, the
-// same way removeSupersededSlipTx distinguishes a rejected repave from an absent row.
+// ReleaseClaim implements SlipStore.ReleaseClaim as one transaction in the same shape as
+// ClaimSlip: lock the row, decide from what the lock returned, write. The claim ends
+// whatever the status says; the status is restored only if it is still the claim's own
+// in_progress, because any other value was written by the run and is real progress that a
+// release must never undo.
 func (s *PostgresStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
 ) (SlipStatus, error) {
-	var restored SlipStatus
+	var final SlipStatus
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var status string
-		err := tx.QueryRow(ctx,
-			"UPDATE routing_slips SET status = claimed_from, claimed_from = NULL, updated_at = now() "+
-				"WHERE correlation_id = $1 AND status = $2 AND claimed_from IS NOT NULL AND claimed_from <> '' "+
-				"RETURNING status",
-			correlationID, string(SlipStatusInProgress)).Scan(&status)
-		switch {
-		case err == nil:
-			restored = SlipStatus(status)
-			return appendHistoryTx(ctx, tx, correlationID, ReleaseMarker(restored, releasedBy, reason))
-		case isNoRows(err):
-			var id string
-			checkErr := tx.QueryRow(ctx,
-				"SELECT correlation_id FROM routing_slips WHERE correlation_id = $1", correlationID).Scan(&id)
-			switch {
-			case checkErr == nil:
-				return fmt.Errorf("release %s: %w", correlationID, ErrNotClaimed)
-			case isNoRows(checkErr):
+		var claimedFrom *string
+		if err := tx.QueryRow(ctx,
+			"SELECT status, claimed_from FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
+			correlationID).Scan(&status, &claimedFrom); err != nil {
+			if isNoRows(err) {
 				return ErrSlipNotFound
-			default:
-				return fmt.Errorf("release %s: checking row: %w", correlationID, checkErr)
 			}
-		default:
-			return fmt.Errorf("release %s: %w", correlationID, err)
+			return fmt.Errorf("release %s: lock: %w", correlationID, err)
 		}
+		if claimedFrom == nil || *claimedFrom == "" {
+			return fmt.Errorf("release %s: %w", correlationID, ErrNotClaimed)
+		}
+		cur := SlipStatus(status)
+		restored := cur == SlipStatusInProgress
+		final = cur
+		if restored {
+			final = SlipStatus(*claimedFrom)
+		}
+		if _, err := tx.Exec(ctx,
+			"UPDATE routing_slips SET status = $1, claimed_from = NULL, updated_at = now() WHERE correlation_id = $2",
+			string(final), correlationID); err != nil {
+			return fmt.Errorf("release %s: status write: %w", correlationID, err)
+		}
+		return appendHistoryTx(ctx, tx, correlationID, ReleaseMarker(final, restored, releasedBy, reason))
 	})
 	if err != nil {
 		return "", err
 	}
-	return restored, nil
+	return final, nil
 }
 
 // slipStatusIn reports whether s is one of set.
@@ -553,6 +562,13 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 // any change to SlipStatus.IsTerminal/IsLive.
 const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','compensated'"
 
+// slipUnclaimedSQL is the claim half of Repave's guard. A row with claimed_from set has a
+// claimant's run in flight whatever its status column says — a step failure writes failed
+// over the claim's in_progress — and must survive a same-commit push exactly as a live row
+// does (DEVOPS-367). ClaimSlip and ReleaseClaim treat an empty string as unclaimed, so this
+// must too.
+const slipUnclaimedSQL = "(claimed_from IS NULL OR claimed_from = '')"
+
 // Repave atomically replaces one commit's ended run with a fresh one. See SlipStore.Repave
 // in interfaces.go for the contract; this comment covers the Postgres mechanics.
 //
@@ -821,12 +837,14 @@ func (s *PostgresStore) insertAncestryLinkBestEffort(
 // error: the caller still creates the successor, but must skip every statement that is
 // only licensed by having removed the row itself.
 //
-// Returns ErrSlipWentLive when the row is still present but no longer ended — the repave
-// decision is stale, and rolling back leaves both the live run and the absent successor
-// exactly as the caller found them.
+// Returns ErrSlipWentLive when the row is still present but is no longer ended, or a
+// claimant holds it (claimed_from set) — the repave decision is stale either way, and
+// rolling back leaves both the running slip and the absent successor exactly as the caller
+// found them. The push path dedups onto the surviving row on that sentinel.
 func removeSupersededSlipTx(ctx context.Context, tx pgx.Tx, correlationID string) (bool, error) {
 	tag, err := tx.Exec(ctx,
-		"DELETE FROM routing_slips WHERE correlation_id = $1 AND status IN ("+repaveableSlipStatusesSQL+")",
+		"DELETE FROM routing_slips WHERE correlation_id = $1 AND status IN ("+repaveableSlipStatusesSQL+
+			") AND "+slipUnclaimedSQL,
 		correlationID,
 	)
 	if err != nil {
@@ -836,9 +854,9 @@ func removeSupersededSlipTx(ctx context.Context, tx pgx.Tx, correlationID string
 		return true, nil
 	}
 
-	// Nothing matched: either the guard rejected the delete (row present, status no longer
-	// ended) or the row was already gone. Distinguish them, because one is a rejection and
-	// the other is a legitimate idempotent path.
+	// Nothing matched: either the guard rejected the delete (row present, but no longer
+	// ended or held by a claimant) or the row was already gone. Distinguish them, because one
+	// is a rejection and the other is a legitimate idempotent path.
 	var id string
 	checkErr := tx.QueryRow(ctx,
 		"SELECT correlation_id FROM routing_slips WHERE correlation_id = $1", correlationID,

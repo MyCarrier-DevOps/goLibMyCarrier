@@ -33,11 +33,17 @@ func ClaimMarker(prior SlipStatus, claimedBy, reason string) StateHistoryEntry {
 // pushhookparser's stranded-slip cleanup treats a release as ending the claim's exemption.
 const ReleaseMarkerStep = "slip_released"
 
-// ReleaseMarker builds the release history entry. StepStatusAborted is the closest existing
-// step status to "this claim was abandoned before its work reported"; it is never read as a
-// pipeline step because the step name is not one.
-func ReleaseMarker(restored SlipStatus, releasedBy, reason string) StateHistoryEntry {
-	msg := fmt.Sprintf("released claim; restored %s", restored)
+// ReleaseMarker builds the release history entry. status is the slip's status after the
+// release; restored says whether the release put it there (the run wrote nothing, so the
+// pre-claim status came back) or found it already written by the run and kept it. The
+// message names both, because once claimed_from is cleared the row no longer says.
+// StepStatusAborted is the closest existing step status to "this claim ended without its
+// work reporting"; it is never read as a pipeline step because the step name is not one.
+func ReleaseMarker(status SlipStatus, restored bool, releasedBy, reason string) StateHistoryEntry {
+	msg := fmt.Sprintf("released claim; kept %s written by the pipeline", status)
+	if restored {
+		msg = fmt.Sprintf("released claim; restored %s", status)
+	}
 	if reason != "" {
 		msg += ": " + reason
 	}
@@ -50,28 +56,31 @@ func ReleaseMarker(restored SlipStatus, releasedBy, reason string) StateHistoryE
 	}
 }
 
-// ReleaseClaim undoes a claim whose work will never report — the post-job's terminal write
-// failed, or an adopter decided not to dispatch after all. Safe to call on any failure path:
-// a slip the pipeline advanced meanwhile is ErrNotClaimed and untouched. See
-// SlipStore.ReleaseClaim for the contract.
+// ReleaseClaim ends a claim when the claimant's run is over: the post-job calls it on every
+// exit, and an adopter calls it when it decides not to dispatch after all. The claim ends
+// whatever the pipeline wrote meanwhile; only the status is conditional — restored to the
+// pre-claim value if the run wrote nothing, kept as the run left it otherwise. An unclaimed
+// slip is ErrNotClaimed and untouched. See SlipStore.ReleaseClaim for the contract.
 func (c *Client) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
 ) (SlipStatus, error) {
-	restored, err := c.store.ReleaseClaim(ctx, correlationID, releasedBy, reason)
+	status, err := c.store.ReleaseClaim(ctx, correlationID, releasedBy, reason)
 	if err != nil {
 		return "", NewSlipError("release claim", correlationID, err)
 	}
 	c.logger.Info(ctx, "Released slip claim", map[string]interface{}{
 		"correlation_id": correlationID,
-		"restored":       string(restored),
+		"status":         string(status),
 		"released_by":    releasedBy,
 	})
-	return restored, nil
+	return status, nil
 }
 
-// ClaimSlip takes ownership of an ended slip so a same-commit push deduplicates onto it
-// instead of repaving it (DEVOPS-285). expected bounds which statuses may be claimed out of;
-// nil means any ended status. See SlipStore.ClaimSlip for the full contract and error set.
+// ClaimSlip takes ownership of a slip so a same-commit push deduplicates onto it instead of
+// repaving it, for as long as the claim is held (DEVOPS-285, DEVOPS-367). expected bounds
+// which statuses may be claimed out of; nil admits any status except an unclaimed
+// in_progress, which is a live run — so nil also claims pending and compensating, not only
+// the ended statuses. See SlipStore.ClaimSlip for the full contract and error set.
 //
 // One store call: the store reads the prior status under lock and builds the marker from
 // it, so there is no read-then-write here and the marker can never name a stale status.

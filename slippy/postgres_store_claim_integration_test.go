@@ -125,11 +125,17 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		assert.Equal(t, 0, countMarkers(t, store, "c-abandoned", ClaimMarkerStep), "no marker on a refused claim")
 	})
 
-	t.Run("nil expected means any ended status", func(t *testing.T) {
+	t.Run("nil expected claims any unclaimed status, including a live pending one", func(t *testing.T) {
 		claimTestSlip(t, store, "c-completed", "sha-c", SlipStatusCompleted)
 		prior, err := store.ClaimSlip(ctx, "c-completed", nil, "rerunner", "test")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusCompleted, prior)
+		// pending is live by IsLive() but is not a running claimant, so nil admits it: the one
+		// status nil never claims out of is an unclaimed in_progress (the subtest below).
+		claimTestSlip(t, store, "c-pending", "sha-pe", SlipStatusPending)
+		prior, err = store.ClaimSlip(ctx, "c-pending", nil, "rerunner", "test")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusPending, prior)
 	})
 
 	t.Run("repeat claim is an idempotent no-op returning the prior", func(t *testing.T) {
@@ -140,6 +146,32 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		require.NoError(t, err, "a repeat claim must not be refused by its own precondition")
 		assert.Equal(t, SlipStatusFailed, prior)
 		assert.Equal(t, 1, countMarkers(t, store, "c-twice", ClaimMarkerStep), "no second marker")
+	})
+
+	t.Run("a claimed slip whose status moved on is still the idempotent no-op", func(t *testing.T) {
+		claimTestSlip(t, store, "c-moved", "sha-m", SlipStatusFailed)
+		_, err := store.ClaimSlip(ctx, "c-moved", nil, "first", "test")
+		require.NoError(t, err)
+		// The run hit a step failure: checkPipelineCompletion wrote failed over in_progress.
+		require.NoError(t, store.UpdateSlipStatus(ctx, "c-moved", SlipStatusFailed))
+		prior, err := store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusFailed}, "second", "test")
+		require.NoError(t, err, "the claim outlives status writes; a second claimant joins the run")
+		assert.Equal(t, SlipStatusFailed, prior)
+		got, err := store.Load(ctx, "c-moved")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusFailed, got.Status, "the no-op arm must not rewrite the pipeline's status")
+		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom)
+		assert.Equal(t, 1, countMarkers(t, store, "c-moved", ClaimMarkerStep), "no second marker")
+	})
+
+	t.Run("repeat claim checks expected against the recorded prior", func(t *testing.T) {
+		claimTestSlip(t, store, "c-prior", "sha-pr", SlipStatusPromoted)
+		_, err := store.ClaimSlip(ctx, "c-prior", nil, "first", "test")
+		require.NoError(t, err)
+		_, err = store.ClaimSlip(ctx, "c-prior", []SlipStatus{SlipStatusFailed}, "second", "test")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed,
+			"a caller that agreed to claim only failed must not be told it claimed a promoted slip")
+		assert.Equal(t, 1, countMarkers(t, store, "c-prior", ClaimMarkerStep))
 	})
 
 	t.Run("a live unclaimed in_progress run is refused", func(t *testing.T) {
@@ -173,8 +205,9 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 	})
 }
 
-// ReleaseClaim restores claimed_from only while the slip is still in the claimed state, so
-// it can never undo real pipeline progress; otherwise ErrNotClaimed and nothing written.
+// ReleaseClaim ends the claim whatever the status says: it restores claimed_from only while
+// the slip is still in_progress (the run wrote nothing), and otherwise keeps the status the
+// run wrote. Either way claimed_from is cleared, so no residue outlives the run.
 func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 	store, _, _ := newMigratedStore(t)
 	ctx := context.Background()
@@ -207,17 +240,34 @@ func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 		assert.Equal(t, 0, countMarkers(t, store, "r-plain", ReleaseMarkerStep))
 	})
 
-	t.Run("pipeline advanced past the claim: ErrNotClaimed, progress kept", func(t *testing.T) {
+	t.Run("pipeline advanced past the claim: claim cleared, the pipeline's status kept", func(t *testing.T) {
 		claimTestSlip(t, store, "r-done", "sha-d", SlipStatusFailed)
 		_, err := store.ClaimSlip(ctx, "r-done", nil, "rerunner", "")
 		require.NoError(t, err)
-		// The real pipeline completed the slip; claimed_from was left behind by that path.
 		require.NoError(t, store.UpdateSlipStatus(ctx, "r-done", SlipStatusCompleted))
-		_, err = store.ReleaseClaim(ctx, "r-done", "post-job", "")
-		require.ErrorIs(t, err, ErrNotClaimed, "release must never undo a terminal status")
+		final, err := store.ReleaseClaim(ctx, "r-done", "post-job", "")
+		require.NoError(t, err, "the post-job releases after a run that wrote its own status")
+		assert.Equal(t, SlipStatusCompleted, final)
 		got, err := store.Load(ctx, "r-done")
 		require.NoError(t, err)
-		assert.Equal(t, SlipStatusCompleted, got.Status)
+		assert.Equal(t, SlipStatusCompleted, got.Status, "release must never undo a status the run wrote")
+		assert.Empty(t, got.ClaimedFrom, "no residue: the slip is repaveable and claimable again")
+		assert.Equal(t, 1, countMarkers(t, store, "r-done", ReleaseMarkerStep))
+		last := got.StateHistory[len(got.StateHistory)-1]
+		assert.Contains(t, last.Message, "kept completed")
+	})
+
+	t.Run("step failure then release: failed kept, claim cleared, repeat release is ErrNotClaimed", func(t *testing.T) {
+		claimTestSlip(t, store, "r-fail", "sha-rf", SlipStatusFailed)
+		_, err := store.ClaimSlip(ctx, "r-fail", nil, "rerunner", "")
+		require.NoError(t, err)
+		require.NoError(t, store.UpdateSlipStatus(ctx, "r-fail", SlipStatusFailed))
+		final, err := store.ReleaseClaim(ctx, "r-fail", "post-job", "")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusFailed, final)
+		_, err = store.ReleaseClaim(ctx, "r-fail", "post-job", "")
+		require.ErrorIs(t, err, ErrNotClaimed, "the second release finds no claim")
+		assert.Equal(t, 1, countMarkers(t, store, "r-fail", ReleaseMarkerStep))
 	})
 
 	t.Run("claim, release, claim again yields two claim markers", func(t *testing.T) {
@@ -237,4 +287,36 @@ func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 		_, err := store.ReleaseClaim(ctx, "r-missing", "post-job", "")
 		require.ErrorIs(t, err, ErrSlipNotFound)
 	})
+}
+
+// Repave must not destroy a slip a claimant is running on, whatever its status says: a step
+// failure mid-run writes failed over the claim's in_progress, and before this guard that
+// reopened the repave window for the rest of the run (PR #87 review, critical). The refusal
+// is ErrSlipWentLive because the push path already handles that sentinel by deduplicating
+// onto the surviving row.
+func TestPostgresStore_Repave_ClaimedSlip_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+	claimTestSlip(t, store, "rp-claimed", "sha-rp", SlipStatusFailed)
+	_, err := store.ClaimSlip(ctx, "rp-claimed", nil, "slippy-cli", "rerun")
+	require.NoError(t, err)
+	require.NoError(t, store.UpdateSlipStatus(ctx, "rp-claimed", SlipStatusFailed), "a step failed mid-run")
+
+	successor := &Slip{
+		CorrelationID: "rp-successor", Repository: "Owner/Repo", Branch: "main", CommitSHA: "sha-rp",
+		Status: SlipStatusInProgress,
+	}
+	err = store.Repave(ctx, "rp-claimed", successor, nil)
+	require.ErrorIs(t, err, ErrSlipWentLive, "a claimed row is refused like a live one")
+	got, err := store.Load(ctx, "rp-claimed")
+	require.NoError(t, err, "the claimed row survives")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom)
+	_, err = store.Load(ctx, "rp-successor")
+	require.ErrorIs(t, err, ErrSlipNotFound, "no successor on a refused repave")
+
+	_, err = store.ReleaseClaim(ctx, "rp-claimed", "slippy-cli/postjob", "")
+	require.NoError(t, err)
+	require.NoError(t, store.Repave(ctx, "rp-claimed", successor, nil), "released, the failed slip is repaveable again")
+	_, err = store.Load(ctx, "rp-claimed")
+	require.ErrorIs(t, err, ErrSlipNotFound)
 }
