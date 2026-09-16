@@ -107,7 +107,10 @@ These are breaking, so the release is a **minor** bump, not a patch: the merge c
 tagged `slippy/v1.4.0` (and the sibling modules likewise, since every module in this repo
 releases at one shared version). `.github/Gitversion.yml` carries `next-version: 1.4.0` plus
 the `ConfiguredNextVersion` strategy that makes that floor effective, so main's `Patch`
-increment cannot land these on consumers pinned to `v1.3.x` with no signal.
+increment cannot land these on consumers pinned to `v1.3.x` with no signal. **The floor is
+for this release only: delete `next-version` (and `ConfiguredNextVersion`) once `v1.4.0` is
+tagged on main.** Left in place it would let the NEXT breaking `SlipStore` change ship as a
+`1.4.x` patch to consumers pinned to `1.4` — the same defect it was added to fix.
 
 ### `postgresmigrator` / `clickhousemigrator`: `MigrationError.Unwrap()` returns `[]error` — since `v1.4.0` (DEVOPS-344)
 

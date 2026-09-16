@@ -941,8 +941,8 @@ func (s *ClickHouseStore) Repave(_ context.Context, oldCorrelationID string, _ *
 // the claim atomic, and not the operational store (DEVOPS-127). Wrapped so errors.Is works.
 func (s *ClickHouseStore) ClaimSlip(
 	_ context.Context, correlationID string, _ []SlipStatus, _, _ string,
-) (SlipStatus, error) {
-	return "", fmt.Errorf("ClaimSlip(%s): %w", correlationID, ErrClaimUnsupported)
+) (ClaimOutcome, error) {
+	return ClaimOutcome{}, fmt.Errorf("ClaimSlip(%s): %w", correlationID, ErrClaimUnsupported)
 }
 
 // ReleaseClaim is unsupported on ClickHouse for the same reasons as ClaimSlip.

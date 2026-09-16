@@ -71,9 +71,12 @@ type Slip struct {
 	// Nil or empty if this is the first slip for this commit lineage.
 	Ancestry []AncestryEntry `json:"ancestry" ch:"-"`
 
-	// PromotedTo holds the correlation ID of the slip this was promoted to.
-	// Set when status is "promoted" (e.g., after a squash merge creates a new slip).
-	// Empty if not promoted.
+	// PromotedTo held the correlation ID of the slip this was promoted to.
+	//
+	// Deprecated: no store persists this and PromoteSlip no longer sets it (DEVOPS-202); it is
+	// always empty on a loaded slip. Read the promotion from the state history instead.
+	// The field and its tags are kept because removing them is a second breaking change for
+	// no gain: nothing reads a value that is never written.
 	PromotedTo string `json:"promoted_to,omitempty" ch:"promoted_to"`
 
 	// Sign is used by VersionedCollapsingMergeTree for row management.

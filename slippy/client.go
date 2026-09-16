@@ -192,7 +192,9 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 // PromoteSlip marks a slip as promoted, indicating its code was promoted to another branch
 // via a PR merge (typically squash merge). Unlike abandon, this is a successful outcome -
 // the slip's work continues in the new slip on the target branch.
-// The promotedTo parameter records the correlation ID of the new slip for bidirectional linking.
+// The promotedTo parameter is recorded on the span and in the log line only — it is NOT
+// persisted, because no store has a promoted_to column and Slip.PromotedTo is deprecated for
+// that reason (DEVOPS-202); read the promotion from the state history instead.
 func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo string) error {
 	// Start tracing span
 	ctx, span := StartSpan(ctx, "PromoteSlip", correlationID)

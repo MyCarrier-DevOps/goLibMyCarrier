@@ -122,6 +122,12 @@ func TestRunInFlight(t *testing.T) {
 		}, true},
 		{"completed and skipped only", &Slip{Steps: map[string]Step{"builds": {Status: StepStatusCompleted}, "secretscan": {Status: StepStatusSkipped}}}, false},
 		{"push_parsed running is the library's bookkeeping, not in flight", &Slip{Steps: map[string]Step{"push_parsed": {Status: StepStatusRunning}, "builds": {Status: StepStatusFailed}}}, false},
+		// Aggregates is keyed by step name too, so the same exemption has to hold there or a
+		// config that aggregated push_parsed would hold the claim open through its components.
+		{"a running component under push_parsed is that same bookkeeping", &Slip{
+			Steps:      map[string]Step{"push_parsed": {Status: StepStatusRunning}, "builds": {Status: StepStatusFailed}},
+			Aggregates: map[string][]ComponentStepData{"push_parsed": {{Component: "api", Status: StepStatusRunning}}},
+		}, false},
 		// Exported for third-party stores to route their own release decision through, so a
 		// store that hands over nothing must get an answer rather than a panic.
 		{"a nil slip has nothing in flight", nil, false},
@@ -133,8 +139,34 @@ func TestRunInFlight(t *testing.T) {
 	}
 }
 
-// DecideClaim is shared by the store and both doubles; this pins the one decision they share.
-func TestDecideClaim(t *testing.T) {
+// TestDecideClaim_Table is the whole decision space, cell by cell: every status crossed with
+// every claim state crossed with the if_status sets the real callers send. It exists because
+// the claim decision regressed three review rounds running, each time because one arm was
+// fixed in isolation (PR #87, sixth review). Cells, not narrative cases, are what stop that:
+// a change to one arm that breaks another now fails here rather than in production.
+//
+// The rule every cell follows, in this order: an empty status is refused outright; a
+// non-empty if_status is a compare-and-set on the CURRENT status whether or not a claim is
+// held; a live status (in_progress, compensating — pending is deliberately claimable) is
+// refused unless the caller named it; and only then does a held claim take the idempotent
+// no-op arm, returning the RECORDED prior with nothing written.
+//
+// claimedFrom runs over {unclaimed, failed, promoted}: the two claim values a real caller can
+// leave behind (the rerunner claims out of an ended status, the CLI pre-job out of a
+// non-terminal one). Three cells past the cross product cover claimedFrom = in_progress.
+func TestDecideClaim_Table(t *testing.T) {
+	var anyStatus []SlipStatus // nil: the caller agreed to claim out of anything
+	onlyFailed := []SlipStatus{SlipStatusFailed}
+	onlyInProgress := []SlipStatus{SlipStatusInProgress}
+	// The Slippy CLI pre-job's set: every non-terminal status (slipStatusTable, app.go).
+	nonTerminal := []SlipStatus{
+		SlipStatusPending, SlipStatusInProgress, SlipStatusFailed, SlipStatusCompensating,
+	}
+	// pushhookparser's rerunner set: every ended status (rerunClaimIfStatus, rerunner.go).
+	ended := []SlipStatus{
+		SlipStatusFailed, SlipStatusCompleted, SlipStatusCompensated, SlipStatusAbandoned, SlipStatusPromoted,
+	}
+
 	tests := []struct {
 		name        string
 		status      SlipStatus
@@ -144,30 +176,162 @@ func TestDecideClaim(t *testing.T) {
 		wantWrite   bool
 		wantErr     error
 	}{
-		{"fresh claim out of failed", SlipStatusFailed, "", []SlipStatus{SlipStatusFailed}, SlipStatusFailed, true, nil},
-		{"a slip with no status cannot be claimed", "", "", nil, "", false, ErrClaimPreconditionFailed},
-		// Inverted deliberately (PR #87 re-review): a nil expected used to adopt an unclaimed
-		// in_progress run. That is a live run nothing has claimed, and adopting it silently is
-		// how a rerun dispatches on top of a pipeline already in flight.
-		{"nil expected refuses a live in_progress", SlipStatusInProgress, "", nil, "", false, ErrClaimPreconditionFailed},
-		{"explicit in_progress claims a live run", SlipStatusInProgress, "", []SlipStatus{SlipStatusInProgress}, SlipStatusInProgress, true, nil},
-		{"nil expected admits promoted", SlipStatusPromoted, "", nil, SlipStatusPromoted, true, nil},
-		{"mismatch writes nothing", SlipStatusAbandoned, "", []SlipStatus{SlipStatusFailed}, "", false, ErrClaimPreconditionFailed},
-		{"repeat claim returns the recorded prior, no write", SlipStatusFailed, SlipStatusFailed, []SlipStatus{SlipStatusFailed}, SlipStatusFailed, false, nil},
-		{"repeat after the run moved status: prior is the recorded one", SlipStatusInProgress, SlipStatusFailed, nil, SlipStatusFailed, false, nil},
-		// The repeat arm compares expected against the RECORDED prior, not the current status:
-		// a retry after a lost response agreed to `failed` and must still pass once the run has
-		// moved the row to in_progress, while a claimant that never agreed to `failed` is refused.
-		{"repeat checks expected against the RECORDED prior", SlipStatusInProgress, SlipStatusFailed, []SlipStatus{SlipStatusFailed}, SlipStatusFailed, false, nil},
-		{"repeat refused when expected excludes the recorded prior", SlipStatusInProgress, SlipStatusFailed, []SlipStatus{SlipStatusCompleted}, "", false, ErrClaimPreconditionFailed},
-		{"a claimed in_progress row is a repeat, not a live-run refusal", SlipStatusInProgress, SlipStatusInProgress, nil, SlipStatusInProgress, false, nil},
+		// --- status "" ---
+		{"unclaimed / if_status=anyStatus: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", "", anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=anyStatus: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusFailed, anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=anyStatus: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusPromoted, anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyFailed: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", "", nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=nonTerminal: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusFailed, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=nonTerminal: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusPromoted, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=ended: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", "", ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=ended: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusFailed, ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=ended: no status at all: refused whatever is asked, an empty status cannot be recorded as a claim", "", SlipStatusPromoted, ended, "", false, ErrClaimPreconditionFailed},
+		// --- status pending ---
+		{"unclaimed / if_status=anyStatus: pending, no if_status: claimable by design, a pending slip has no run to dispatch onto", SlipStatusPending, "", anyStatus, SlipStatusPending, true, nil},
+		{"claim held out of failed / if_status=anyStatus: pending, no if_status: claimable by design, a pending slip has no run to dispatch onto; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPending, SlipStatusFailed, anyStatus, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=anyStatus: pending, no if_status: claimable by design, a pending slip has no run to dispatch onto; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPending, SlipStatusPromoted, anyStatus, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=onlyFailed: pending is outside if_status [failed]: refused", SlipStatusPending, "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: pending is outside if_status [failed]: refused", SlipStatusPending, SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: pending is outside if_status [failed]: refused", SlipStatusPending, SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: pending is outside if_status [in_progress]: refused", SlipStatusPending, "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: pending is outside if_status [in_progress]: refused", SlipStatusPending, SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: pending is outside if_status [in_progress]: refused", SlipStatusPending, SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: pending is in the CLI pre-job's set: claimed", SlipStatusPending, "", nonTerminal, SlipStatusPending, true, nil},
+		{"claim held out of failed / if_status=nonTerminal: pending is in the CLI pre-job's set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPending, SlipStatusFailed, nonTerminal, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=nonTerminal: pending is in the CLI pre-job's set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPending, SlipStatusPromoted, nonTerminal, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=ended: pending is outside the rerunner's ended set: refused", SlipStatusPending, "", ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=ended: pending is outside the rerunner's ended set: refused", SlipStatusPending, SlipStatusFailed, ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=ended: pending is outside the rerunner's ended set: refused", SlipStatusPending, SlipStatusPromoted, ended, "", false, ErrClaimPreconditionFailed},
+		// --- status in_progress ---
+		{"unclaimed / if_status=anyStatus: in_progress with no if_status is a live run: refused, never adopted silently", SlipStatusInProgress, "", anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=anyStatus: in_progress with no if_status is a live run: refused, never adopted silently", SlipStatusInProgress, SlipStatusFailed, anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=anyStatus: in_progress with no if_status is a live run: refused, never adopted silently", SlipStatusInProgress, SlipStatusPromoted, anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyFailed: in_progress is outside if_status [failed]: refused, the status moved off what was agreed", SlipStatusInProgress, "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: in_progress is outside if_status [failed]: refused, the status moved off what was agreed", SlipStatusInProgress, SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: in_progress is outside if_status [failed]: refused, the status moved off what was agreed", SlipStatusInProgress, SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: in_progress is named explicitly: a live run the caller asked for", SlipStatusInProgress, "", onlyInProgress, SlipStatusInProgress, true, nil},
+		{"claim held out of failed / if_status=onlyInProgress: in_progress is named explicitly: a live run the caller asked for; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusInProgress, SlipStatusFailed, onlyInProgress, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=onlyInProgress: in_progress is named explicitly: a live run the caller asked for; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusInProgress, SlipStatusPromoted, onlyInProgress, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=nonTerminal: in_progress is in the CLI pre-job's set: a later phase claims the live run it named", SlipStatusInProgress, "", nonTerminal, SlipStatusInProgress, true, nil},
+		{"claim held out of failed / if_status=nonTerminal: in_progress is in the CLI pre-job's set: a later phase claims the live run it named; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusInProgress, SlipStatusFailed, nonTerminal, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=nonTerminal: in_progress is in the CLI pre-job's set: a later phase claims the live run it named; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusInProgress, SlipStatusPromoted, nonTerminal, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=ended: rerunner retries after its dispatch already started: refused, the work is running", SlipStatusInProgress, "", ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=ended: rerunner retries after its dispatch already started: refused, the work is running", SlipStatusInProgress, SlipStatusFailed, ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=ended: rerunner retries after its dispatch already started: refused, the work is running", SlipStatusInProgress, SlipStatusPromoted, ended, "", false, ErrClaimPreconditionFailed},
+		// --- status compensating ---
+		{"unclaimed / if_status=anyStatus: compensating with no if_status is a live run too: refused", SlipStatusCompensating, "", anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=anyStatus: compensating with no if_status is a live run too: refused", SlipStatusCompensating, SlipStatusFailed, anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=anyStatus: compensating with no if_status is a live run too: refused", SlipStatusCompensating, SlipStatusPromoted, anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyFailed: compensating is outside if_status [failed]: refused", SlipStatusCompensating, "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: compensating is outside if_status [failed]: refused", SlipStatusCompensating, SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: compensating is outside if_status [failed]: refused", SlipStatusCompensating, SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: compensating is outside if_status [in_progress]: refused", SlipStatusCompensating, "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: compensating is outside if_status [in_progress]: refused", SlipStatusCompensating, SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: compensating is outside if_status [in_progress]: refused", SlipStatusCompensating, SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: compensating is in the CLI pre-job's set: claimed", SlipStatusCompensating, "", nonTerminal, SlipStatusCompensating, true, nil},
+		{"claim held out of failed / if_status=nonTerminal: compensating is in the CLI pre-job's set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompensating, SlipStatusFailed, nonTerminal, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=nonTerminal: compensating is in the CLI pre-job's set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompensating, SlipStatusPromoted, nonTerminal, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=ended: compensating is outside the rerunner's ended set: refused", SlipStatusCompensating, "", ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=ended: compensating is outside the rerunner's ended set: refused", SlipStatusCompensating, SlipStatusFailed, ended, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=ended: compensating is outside the rerunner's ended set: refused", SlipStatusCompensating, SlipStatusPromoted, ended, "", false, ErrClaimPreconditionFailed},
+		// --- status failed ---
+		{"unclaimed / if_status=anyStatus: failed with no if_status: claimed, a failed run is not live", SlipStatusFailed, "", anyStatus, SlipStatusFailed, true, nil},
+		{"claim held out of failed / if_status=anyStatus: failed with no if_status: claimed, a failed run is not live; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusFailed, anyStatus, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=anyStatus: failed with no if_status: claimed, a failed run is not live; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusPromoted, anyStatus, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=onlyFailed: failed named exactly: the rerunner's fresh claim", SlipStatusFailed, "", onlyFailed, SlipStatusFailed, true, nil},
+		{"claim held out of failed / if_status=onlyFailed: failed named exactly: the rerunner's fresh claim; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusFailed, onlyFailed, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=onlyFailed: failed named exactly: the rerunner's fresh claim; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusPromoted, onlyFailed, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=onlyInProgress: failed is outside if_status [in_progress]: refused", SlipStatusFailed, "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: failed is outside if_status [in_progress]: refused", SlipStatusFailed, SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: failed is outside if_status [in_progress]: refused", SlipStatusFailed, SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: failed is in the CLI pre-job's set: claimed", SlipStatusFailed, "", nonTerminal, SlipStatusFailed, true, nil},
+		{"claim held out of failed / if_status=nonTerminal: failed is in the CLI pre-job's set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusFailed, nonTerminal, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=nonTerminal: failed is in the CLI pre-job's set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusPromoted, nonTerminal, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=ended: rerunner retries before anything dispatched: the status never moved, so it claims", SlipStatusFailed, "", ended, SlipStatusFailed, true, nil},
+		{"claim held out of failed / if_status=ended: rerunner retries before anything dispatched: the status never moved, so it claims; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusFailed, ended, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=ended: rerunner retries before anything dispatched: the status never moved, so it claims; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusFailed, SlipStatusPromoted, ended, SlipStatusPromoted, false, nil},
+		// --- status completed ---
+		{"unclaimed / if_status=anyStatus: completed with no if_status: claimed, an ended slip is not live and the policy is the caller's", SlipStatusCompleted, "", anyStatus, SlipStatusCompleted, true, nil},
+		{"claim held out of failed / if_status=anyStatus: completed with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompleted, SlipStatusFailed, anyStatus, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=anyStatus: completed with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompleted, SlipStatusPromoted, anyStatus, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=onlyFailed: completed is outside if_status [failed]: refused", SlipStatusCompleted, "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: completed is outside if_status [failed]: refused", SlipStatusCompleted, SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: completed is outside if_status [failed]: refused", SlipStatusCompleted, SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: completed is outside if_status [in_progress]: refused", SlipStatusCompleted, "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: completed is outside if_status [in_progress]: refused", SlipStatusCompleted, SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: completed is outside if_status [in_progress]: refused", SlipStatusCompleted, SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: completed is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusCompleted, "", nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=nonTerminal: completed is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusCompleted, SlipStatusFailed, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=nonTerminal: completed is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusCompleted, SlipStatusPromoted, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=ended: completed is in the rerunner's ended set: claimed", SlipStatusCompleted, "", ended, SlipStatusCompleted, true, nil},
+		{"claim held out of failed / if_status=ended: completed is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompleted, SlipStatusFailed, ended, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=ended: completed is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompleted, SlipStatusPromoted, ended, SlipStatusPromoted, false, nil},
+		// --- status compensated ---
+		{"unclaimed / if_status=anyStatus: compensated with no if_status: claimed, an ended slip is not live and the policy is the caller's", SlipStatusCompensated, "", anyStatus, SlipStatusCompensated, true, nil},
+		{"claim held out of failed / if_status=anyStatus: compensated with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompensated, SlipStatusFailed, anyStatus, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=anyStatus: compensated with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompensated, SlipStatusPromoted, anyStatus, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=onlyFailed: compensated is outside if_status [failed]: refused", SlipStatusCompensated, "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: compensated is outside if_status [failed]: refused", SlipStatusCompensated, SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: compensated is outside if_status [failed]: refused", SlipStatusCompensated, SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: compensated is outside if_status [in_progress]: refused", SlipStatusCompensated, "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: compensated is outside if_status [in_progress]: refused", SlipStatusCompensated, SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: compensated is outside if_status [in_progress]: refused", SlipStatusCompensated, SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: compensated is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusCompensated, "", nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=nonTerminal: compensated is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusCompensated, SlipStatusFailed, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=nonTerminal: compensated is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusCompensated, SlipStatusPromoted, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=ended: compensated is in the rerunner's ended set: claimed", SlipStatusCompensated, "", ended, SlipStatusCompensated, true, nil},
+		{"claim held out of failed / if_status=ended: compensated is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompensated, SlipStatusFailed, ended, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=ended: compensated is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusCompensated, SlipStatusPromoted, ended, SlipStatusPromoted, false, nil},
+		// --- status abandoned ---
+		{"unclaimed / if_status=anyStatus: abandoned with no if_status: claimed, an ended slip is not live and the policy is the caller's", SlipStatusAbandoned, "", anyStatus, SlipStatusAbandoned, true, nil},
+		{"claim held out of failed / if_status=anyStatus: abandoned with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusAbandoned, SlipStatusFailed, anyStatus, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=anyStatus: abandoned with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusAbandoned, SlipStatusPromoted, anyStatus, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=onlyFailed: abandoned is outside if_status [failed]: refused", SlipStatusAbandoned, "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: abandoned is outside if_status [failed]: refused", SlipStatusAbandoned, SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: abandoned is outside if_status [failed]: refused", SlipStatusAbandoned, SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: abandoned is outside if_status [in_progress]: refused", SlipStatusAbandoned, "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: abandoned is outside if_status [in_progress]: refused", SlipStatusAbandoned, SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: abandoned is outside if_status [in_progress]: refused", SlipStatusAbandoned, SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: abandoned is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusAbandoned, "", nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=nonTerminal: abandoned is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusAbandoned, SlipStatusFailed, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=nonTerminal: abandoned is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusAbandoned, SlipStatusPromoted, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=ended: abandoned is in the rerunner's ended set: claimed", SlipStatusAbandoned, "", ended, SlipStatusAbandoned, true, nil},
+		{"claim held out of failed / if_status=ended: abandoned is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusAbandoned, SlipStatusFailed, ended, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=ended: abandoned is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusAbandoned, SlipStatusPromoted, ended, SlipStatusPromoted, false, nil},
+		// --- status promoted ---
+		{"unclaimed / if_status=anyStatus: promoted with no if_status: claimed, an ended slip is not live and the policy is the caller's", SlipStatusPromoted, "", anyStatus, SlipStatusPromoted, true, nil},
+		{"claim held out of failed / if_status=anyStatus: promoted with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPromoted, SlipStatusFailed, anyStatus, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=anyStatus: promoted with no if_status: claimed, an ended slip is not live and the policy is the caller's; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPromoted, SlipStatusPromoted, anyStatus, SlipStatusPromoted, false, nil},
+		{"unclaimed / if_status=onlyFailed: promoted is outside if_status [failed]: refused", SlipStatusPromoted, "", onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyFailed: promoted is outside if_status [failed]: refused", SlipStatusPromoted, SlipStatusFailed, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyFailed: promoted is outside if_status [failed]: refused", SlipStatusPromoted, SlipStatusPromoted, onlyFailed, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=onlyInProgress: promoted is outside if_status [in_progress]: refused", SlipStatusPromoted, "", onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=onlyInProgress: promoted is outside if_status [in_progress]: refused", SlipStatusPromoted, SlipStatusFailed, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=onlyInProgress: promoted is outside if_status [in_progress]: refused", SlipStatusPromoted, SlipStatusPromoted, onlyInProgress, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=nonTerminal: promoted is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusPromoted, "", nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of failed / if_status=nonTerminal: promoted is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusPromoted, SlipStatusFailed, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of promoted / if_status=nonTerminal: promoted is outside the CLI pre-job's set: refused, a terminal slip is never claimed", SlipStatusPromoted, SlipStatusPromoted, nonTerminal, "", false, ErrClaimPreconditionFailed},
+		{"unclaimed / if_status=ended: promoted is in the rerunner's ended set: claimed", SlipStatusPromoted, "", ended, SlipStatusPromoted, true, nil},
+		{"claim held out of failed / if_status=ended: promoted is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPromoted, SlipStatusFailed, ended, SlipStatusFailed, false, nil},
+		{"claim held out of promoted / if_status=ended: promoted is in the rerunner's ended set: claimed; the repeat is idempotent, the recorded prior comes back, nothing written", SlipStatusPromoted, SlipStatusPromoted, ended, SlipStatusPromoted, false, nil},
+		// --- past the cross product: a claim recorded out of in_progress ---
+		{"claim held out of in_progress / if_status=anyStatus: a recorded claim is no exemption, a live run is still refused when nothing names it", SlipStatusInProgress, SlipStatusInProgress, anyStatus, "", false, ErrClaimPreconditionFailed},
+		{"claim held out of in_progress / if_status=onlyInProgress: the CLI's later pre-job repeats its own claim on the live run it named", SlipStatusInProgress, SlipStatusInProgress, onlyInProgress, SlipStatusInProgress, false, nil},
+		{"claim held out of failed / if_status=[completed]: a second claimant that never agreed to the current status is refused, not handed the claim", SlipStatusFailed, SlipStatusFailed, []SlipStatus{SlipStatusCompleted}, "", false, ErrClaimPreconditionFailed},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			prior, write, err := DecideClaim(tc.status, tc.claimedFrom, tc.expected)
 			if tc.wantErr != nil {
 				require.ErrorIs(t, err, tc.wantErr)
-				assert.False(t, write)
+				assert.Empty(t, prior, "a refused claim reports no prior")
+				assert.False(t, write, "a refused claim writes nothing")
 				return
 			}
 			require.NoError(t, err)

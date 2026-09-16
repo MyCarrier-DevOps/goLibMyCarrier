@@ -151,35 +151,53 @@ type SlipStore interface {
 	// they end the claim even while steps are still running, and both are repaveable — an
 	// ancestor abandon or a promotion deliberately overrides a live claim.
 	//
-	// expected is the set of statuses the caller agreed to claim out of. On a FRESH claim it
-	// is a compare-and-set on the current status; nil admits any status EXCEPT an unclaimed
-	// in_progress, which is a live run nobody has adopted — a caller that means to claim one
-	// says so by listing in_progress (the Slippy CLI pre-job does; the rerunner, which names
-	// only the ended set, is what the refusal protects). On a REPEAT claim expected is checked
-	// against the RECORDED prior instead, so a retry after a lost response is idempotent while
-	// a different claimant that did not agree to that prior is still refused. The decision is
-	// DecideClaim, shared with the test doubles.
+	// expected is the set of statuses the caller agreed to claim out of, and it is ALWAYS a
+	// compare-and-set on the CURRENT status — whether or not a claim is already held. nil
+	// admits any status EXCEPT a live one (in_progress or compensating): a live run is never
+	// adopted by a caller that did not name it, and a claim already recorded on the row is no
+	// exemption from that. A caller that means to adopt a live run says so by listing the
+	// status (the Slippy CLI pre-job lists every non-terminal status; the rerunner, which
+	// names only the ended set, is what the refusal protects — including on its own retry,
+	// see below). pending is claimable by design: nothing has been dispatched onto it. The
+	// decision is DecideClaim, shared with the test doubles.
+	//
+	// A retry after a lost response therefore dispatches in exactly the window where it
+	// should. If the response was lost BEFORE the dispatch, nothing ran and the status has
+	// not moved, so the same expected still matches and the retry claims. If it was lost
+	// AFTER the dispatch, a step has reported and the status has moved off the ended set, so
+	// the retry is REFUSED — the dispatch it is retrying already happened (PR #87, round 6).
+	//
+	// A CLAIM WITH NOTHING IN FLIGHT IS REAPABLE, and pushhookparser's stranded-slip cleanup
+	// owns that. A claim taken by a pre-job whose workflow was then never dispatched sets
+	// claimed_from with no step ever reported: RunInFlight is false, so a release WOULD clear
+	// it, but no post-job will ever run to call one, and every later same-commit push
+	// deduplicates onto the row. That cleanup used to skip a claimed slip outright; it now
+	// exempts one only while a step or component is running or held — the same evidence
+	// DecideRelease uses — so a claimed slip with nothing in flight and no marker activity is
+	// reaped exactly as an unclaimed one is. This library adds no time-based sweeper for it,
+	// deliberately: elapsed time cannot tell a long build from a wedge (DEVOPS-367).
 	//
 	// The store builds the marker itself with ClaimMarker(prior, claimedBy, reason), because
 	// only it knows the true status at write time. claimedBy is audit only: it names the
 	// actor in the marker and is never a key the claim is checked against. There is no claim
 	// owner; every pre-job of a run claims the same slip and every post-job releases it.
 	//
-	// Returns the prior status, and:
-	//   - nil: claimed_from = prior was written and the marker appended.
-	//   - nil with no write: the slip was already claimed; the returned prior is the recorded
-	//     claimed_from. Repeat claims are idempotent — no second marker — so a retried
-	//     request cannot inflate the audit trail, and all but the first pre-job of a run
-	//     take this arm.
-	//   - ErrClaimPreconditionFailed: the status was outside expected (the current status on a
-	//     fresh claim, the recorded prior on a repeat), the slip has no status at all (an
-	//     empty status cannot be recorded as a claim), or it is an unclaimed in_progress run
-	//     and expected did not name in_progress. Nothing written.
+	// Returns a ClaimOutcome, and:
+	//   - Claimed=true, nil error: claimed_from = Prior was written and the marker appended.
+	//     Prior is the status the row read under the lock.
+	//   - Claimed=false, nil error: the slip was already claimed and NOTHING was written;
+	//     Prior is the recorded claimed_from. Repeat claims are idempotent — no second marker
+	//     — so a retried request cannot inflate the audit trail, and all but the first pre-job
+	//     of a run take this arm. Both arms mean the slip is claimed on return; a caller that
+	//     must not duplicate work is the one that reads Claimed.
+	//   - ErrClaimPreconditionFailed: the CURRENT status was outside expected (claimed or
+	//     not), the slip has no status at all (an empty status cannot be recorded as a claim),
+	//     or the current status is a live run expected did not name. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
 	ClaimSlip(
 		ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
-	) (SlipStatus, error)
+	) (ClaimOutcome, error)
 
 	// ReleaseClaim ends a claim once nothing of the run is in flight, as ONE transaction
 	// (DEVOPS-367): read the claim state FOR UPDATE — the claim, the status and every step

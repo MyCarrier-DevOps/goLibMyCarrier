@@ -43,26 +43,31 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		assert.Empty(t, got.ClaimedFrom, "the atomic status write is what ends it")
 	})
 
-	// Inverted deliberately (PR #87 re-review): the repeat arm used to compare expected
-	// against the CURRENT status, which refused the very retry the idempotent arm exists for
-	// once the run had moved the row on.
-	t.Run("claim never writes status; repeat claim is a no-op checked against the RECORDED prior", func(t *testing.T) {
+	// Inverted deliberately (PR #87 sixth review): the repeat arm used to compare expected
+	// against the RECORDED prior, so a second rerun request for a commit whose pipeline was
+	// already live matched the prior and dispatched on top of it. expected is a
+	// compare-and-set on the CURRENT status whether or not a claim is held, and the
+	// idempotent arm sits behind it.
+	t.Run("claim never writes status; a repeat is idempotent once expected agrees to the CURRENT status", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed})
-		prior, err := store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "first", "")
+		out, err := store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "first", "")
 		require.NoError(t, err)
-		assert.Equal(t, SlipStatusFailed, prior)
+		assert.Equal(t, SlipStatusFailed, out.Prior)
+		assert.True(t, out.Claimed)
 		got, _ := store.Load(ctx, "c")
 		assert.Equal(t, SlipStatusFailed, got.Status)
 		require.NoError(t, store.UpdateSlipStatus(ctx, "c", SlipStatusInProgress))
-		prior, err = store.ClaimSlip(ctx, "c", nil, "second", "")
-		require.NoError(t, err)
-		assert.Equal(t, SlipStatusFailed, prior, "the recorded prior")
-		prior, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
-		require.NoError(t, err, "the retry agreed to failed, which is the recorded prior")
-		assert.Equal(t, SlipStatusFailed, prior)
-		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusCompleted}, "fourth", "")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to failed is refused")
+		_, err = store.ClaimSlip(ctx, "c", nil, "second", "")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimed row is still a live run nothing named")
+		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "the rerunner's retry after its dispatch started is refused")
+		out, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusInProgress}, "fourth", "")
+		require.NoError(t, err, "a caller that names the current status reaches the idempotent arm")
+		assert.False(t, out.Claimed, "nothing written")
+		assert.Equal(t, SlipStatusFailed, out.Prior, "the recorded prior")
+		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusCompleted}, "fifth", "")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
 	})
 
 	// A live run nothing has claimed is not adoptable by a caller that named no status.
@@ -73,9 +78,10 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
 		got, _ := store.Load(ctx, "live")
 		assert.Empty(t, got.ClaimedFrom, "nothing written")
-		prior, err := store.ClaimSlip(ctx, "live", []SlipStatus{SlipStatusInProgress}, "cli/prejob", "")
+		out, err := store.ClaimSlip(ctx, "live", []SlipStatus{SlipStatusInProgress}, "cli/prejob", "")
 		require.NoError(t, err)
-		assert.Equal(t, SlipStatusInProgress, prior)
+		assert.Equal(t, SlipStatusInProgress, out.Prior)
+		assert.True(t, out.Claimed)
 	})
 
 	// Inverted deliberately (PR #87 re-review): the in-flight arm was ErrRunInFlight. It is

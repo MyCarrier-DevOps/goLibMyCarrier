@@ -39,9 +39,16 @@ func TestClient_ClaimAndRelease_SurfaceStoreDecisions(t *testing.T) {
 	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{})
 	store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed, Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
 
-	prior, err := client.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "cli", "")
+	claim, err := client.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "cli", "")
 	require.NoError(t, err)
-	assert.Equal(t, SlipStatusFailed, prior)
+	assert.Equal(t, SlipStatusFailed, claim.Prior)
+	assert.True(t, claim.Claimed, "this call recorded the claim")
+	// The repeat arm is reached only once expected agrees to the CURRENT status, and it
+	// reports Claimed=false so a caller can tell its own repeat from a fresh claim.
+	claim, err = client.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "cli", "")
+	require.NoError(t, err)
+	assert.False(t, claim.Claimed, "a claim was already held and nothing was written")
+	assert.Equal(t, SlipStatusFailed, claim.Prior, "the RECORDED prior")
 	_, err = client.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusCompleted}, "cli", "")
 	require.ErrorIs(t, err, ErrClaimPreconditionFailed)
 

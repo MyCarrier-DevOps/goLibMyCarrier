@@ -83,29 +83,37 @@ func TestMockStore_ClaimSlip_IsAFlag(t *testing.T) {
 	t.Run("claim sets claimed_from, leaves status alone, appends one marker", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&slippy.Slip{CorrelationID: "c", Status: slippy.SlipStatusFailed})
-		prior, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusFailed}, "cli", "rerun")
+		out, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusFailed}, "cli", "rerun")
 		require.NoError(t, err)
-		assert.Equal(t, slippy.SlipStatusFailed, prior)
+		assert.Equal(t, slippy.SlipStatusFailed, out.Prior)
+		assert.True(t, out.Claimed, "this call is what recorded the claim")
 		got, _ := store.Load(ctx, "c")
 		assert.Equal(t, slippy.SlipStatusFailed, got.Status)
 		assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom)
 		assert.Equal(t, 1, countStep(got, slippy.ClaimMarkerStep))
 	})
 
-	// Inverted deliberately (PR #87 re-review): expected used to be compared against the
-	// CURRENT status on a repeat claim, which refused the retry-after-a-lost-response the
-	// idempotent arm exists for once the run had moved the row on.
-	t.Run("repeat claim is a no-op that checks expected against the RECORDED prior", func(t *testing.T) {
+	// Inverted deliberately (PR #87 sixth review): expected used to be compared against the
+	// RECORDED prior on a repeat claim, so a second rerun request matched the prior and
+	// dispatched on top of the live run the first one had already started. It is a
+	// compare-and-set on the CURRENT status whether or not a claim is held; the idempotent
+	// arm is reached only after that agrees, and then reports Claimed=false with the RECORDED
+	// prior and no second marker.
+	t.Run("repeat claim is a no-op, but only once expected agrees to the CURRENT status", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&slippy.Slip{CorrelationID: "c", Status: slippy.SlipStatusFailed})
 		_, err := store.ClaimSlip(ctx, "c", nil, "first", "")
 		require.NoError(t, err)
 		require.NoError(t, store.UpdateSlipStatus(ctx, "c", slippy.SlipStatusInProgress)) // reconcile wrote it
-		prior, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusFailed}, "second", "")
-		require.NoError(t, err, "the retry agreed to failed, which is the recorded prior")
-		assert.Equal(t, slippy.SlipStatusFailed, prior)
-		_, err = store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusCompleted}, "third", "")
-		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed, "a claimant that never agreed to failed is refused")
+		_, err = store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusFailed}, "second", "")
+		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed,
+			"the run moved off failed: a retry here would dispatch on top of work already running")
+		out, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusInProgress}, "third", "")
+		require.NoError(t, err, "a caller that names the current status reaches the idempotent arm")
+		assert.False(t, out.Claimed, "nothing written: the claim was already held")
+		assert.Equal(t, slippy.SlipStatusFailed, out.Prior, "and the prior is the RECORDED one")
+		_, err = store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusCompleted}, "fourth", "")
+		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
 		got, _ := store.Load(ctx, "c")
 		assert.Equal(t, 1, countStep(got, slippy.ClaimMarkerStep))
 	})
@@ -122,9 +130,10 @@ func TestMockStore_ClaimSlip_IsAFlag(t *testing.T) {
 		assert.Empty(t, got.ClaimedFrom, "nothing written")
 		assert.Equal(t, 0, countStep(got, slippy.ClaimMarkerStep), "no marker either")
 
-		prior, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusInProgress}, "cli", "")
+		out, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusInProgress}, "cli", "")
 		require.NoError(t, err)
-		assert.Equal(t, slippy.SlipStatusInProgress, prior)
+		assert.Equal(t, slippy.SlipStatusInProgress, out.Prior)
+		assert.True(t, out.Claimed)
 	})
 }
 

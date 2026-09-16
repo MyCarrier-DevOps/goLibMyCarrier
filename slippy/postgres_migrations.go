@@ -402,11 +402,20 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 			-- count and the DROP COLUMN would be erased without the RAISE ever firing. Taking
 			-- ACCESS EXCLUSIVE first — the same lock the DROP will take — holds claimants out
 			-- for the rest of the transaction, so the count is the state the drop acts on.
-			-- The lock_timeout is required, not defensive: postgresmigrator runs the migration
+			--
+			-- The lock_timeout is the FIRST statement of the down, outside the DO block, so it
+			-- bounds EVERY lock request the transaction makes — the guard's LOCK TABLE and the
+			-- trailing DROP COLUMN's own ACCESS EXCLUSIVE alike. It used to sit inside the
+			-- IF EXISTS branch, which left the DROP unbounded on exactly the path where the
+			-- guard does not run (the column already absent, so no LOCK was taken either). It
+			-- is required rather than defensive: postgresmigrator runs the migration
 			-- transaction with SET LOCAL lock_timeout = 0, and an unbounded ACCESS EXCLUSIVE
 			-- request queues AHEAD of every subsequent reader, so on a busy database it would
 			-- stall all slip traffic until it were granted or the rollback were cancelled by
-			-- hand. Five seconds fails the down instead; re-run it.
+			-- hand. Five seconds fails the down instead; re-run it. SET LOCAL is scoped to the
+			-- migration transaction, so it restores itself on commit or rollback.
+			SET LOCAL lock_timeout = '5s';
+
 			DO $$
 			DECLARE
 				held bigint;
@@ -418,7 +427,6 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 					  AND attname = 'claimed_from'
 					  AND NOT attisdropped
 				) THEN
-					SET LOCAL lock_timeout = '5s';
 					LOCK TABLE routing_slips IN ACCESS EXCLUSIVE MODE;
 					SELECT count(*) INTO held FROM routing_slips
 					WHERE claimed_from IS NOT NULL AND claimed_from <> '';

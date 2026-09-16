@@ -28,6 +28,26 @@ func pgTestPipelineConfig(t *testing.T) *PipelineConfig {
 	return cfg
 }
 
+// pgMixedCasePipelineConfig is pgTestPipelineConfig with one step name carrying uppercase
+// letters. Postgres folds the ensurer's unquoted DDL, so this config is what proves the
+// column-name comparisons fold with it rather than against it (PR #87 finding 4).
+func pgMixedCasePipelineConfig(t *testing.T) *PipelineConfig {
+	t.Helper()
+	const j = `{
+		"version": "1.0",
+		"name": "pg-test-mixed-case",
+		"steps": [
+			{"name": "push_parsed", "description": "push received"},
+			{"name": "builds", "description": "container builds", "aggregates": "component_builds", "prerequisites": ["push_parsed"]},
+			{"name": "unit_tests", "description": "unit tests", "prerequisites": ["builds"], "is_gate": true},
+			{"name": "Dev_Deploy", "description": "deploy to dev", "prerequisites": ["unit_tests"]}
+		]
+	}`
+	cfg, err := ParsePipelineConfig([]byte(j))
+	require.NoError(t, err)
+	return cfg
+}
+
 func TestPostgresDynamicMigrations_Generate(t *testing.T) {
 	cfg := pgTestPipelineConfig(t)
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
@@ -336,4 +356,15 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 	assert.NotRegexp(t, `SET LOCAL lock_timeout = '?0'?\s*;`, down, "and the bound must not be zero")
 	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "LOCK TABLE"),
 		"the timeout must be set before the lock is requested")
+	// It must bound the DROP's own ACCESS EXCLUSIVE too, not just the guard's LOCK TABLE
+	// (PR #87 finding 7). Inside the IF EXISTS branch it bounded neither on the path where
+	// the column is already absent — the branch is skipped and the DROP still requests the
+	// lock unbounded. Hoisting it to the first statement of the down covers every request.
+	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "DO $$"),
+		"the timeout precedes the DO block, so it is not scoped to the guard's branch")
+	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "DROP COLUMN"),
+		"and therefore bounds the DROP's own ACCESS EXCLUSIVE request")
+	assert.Equal(t, strings.TrimSpace(down[strings.LastIndex(down, "END $$;")+len("END $$;"):]),
+		"ALTER TABLE routing_slips DROP COLUMN IF EXISTS claimed_from;",
+		"the DROP is still the last statement, after the guard")
 }

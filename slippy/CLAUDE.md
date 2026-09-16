@@ -20,7 +20,7 @@ This document provides guidance for AI-assisted development of the slippy routin
 `SlipStore` interface:**
 
 ```go
-ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (SlipStatus, error)
+ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (ClaimOutcome, error)
 ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (ReleaseOutcome, error)
 ProbeSchema(ctx context.Context) error
 ```
@@ -33,7 +33,21 @@ first two and `nil` from `ProbeSchema`, having no schema of its own; the
 no step or component is running or held — otherwise it returns
 `ReleaseOutcome{Released: false}` with nothing written, which callers treat as information.
 `ErrRunInFlight` is **removed**: work in flight is an outcome, not an error, because all but
-the last of a run's N post-job releases take that arm. `ProbeSchema` is on the interface so
+the last of a run's N post-job releases take that arm.
+`ClaimSlip` returns `ClaimOutcome{Claimed, Prior}` for the same reason and with the same
+shape: `Claimed=false` means a claim was already held and NOTHING was written — the
+idempotent repeat every pre-job after the first takes — and `Prior` is then the recorded
+`claimed_from` rather than the current status. Both values mean the slip is claimed on
+return; only a caller that must not duplicate work reads `Claimed`.
+`expected` is a **compare-and-set on the slip's CURRENT status, whether or not a claim is
+already held** — the idempotent repeat sits BEHIND that check, not in front of it. A nil
+`expected` admits any status except a live one (`in_progress`, `compensating`; `pending` is
+claimable by design), and a claim already recorded on the row is no exemption from that
+refusal. This is what stops a second rerun request dispatching on top of a pipeline the
+first one already started, while still letting a retry through in the only window where a
+retry should dispatch: the one where nothing ran, and the status therefore has not moved
+(PR #87, round 6 — an earlier round compared `expected` against the recorded prior instead,
+which reopened the double dispatch). `ProbeSchema` is on the interface so
 the readiness gate is reachable through the abstraction consumers hold (`Client.ProbeSchema`
 wraps it). Implementers should route their decisions through `slippy.DecideClaim` and
 `slippy.DecideRelease` so they cannot drift from the store.
@@ -50,6 +64,17 @@ carries, so a Load-then-Update can no longer clear a claim taken after its read;
 that is **in flight** — running or held steps and components. The gap between one step's
 last post-job and the next step's pre-job is not covered; that is tracked as **DEVOPS-371**
 (a dispatcher-held claim).
+
+**A claim with nothing in flight is reapable, and pushhookparser's stranded-slip cleanup owns
+that.** The one state no operator action reaches by itself is a claim taken by a pre-job whose
+workflow was then never dispatched: `claimed_from` is set, no step was ever reported,
+`RunInFlight` is false so a release WOULD clear it — but no post-job will ever run to call one,
+and every later same-commit push deduplicates onto the row. That cleanup used to skip any
+claimed slip; it now exempts one only while a step or component is running or held, so a
+claimed slip with nothing in flight and no marker activity is reaped exactly as an unclaimed
+one is. Do **not** add a time-based sweeper to this library for it: a long build is
+indistinguishable from a wedge by elapsed time, which is why the exemption reads in-flight
+evidence instead (DEVOPS-367, PR #87 finding 3).
 
 When a claim is left behind by a run that will never release it, the **stuck step holds it**:
 resolve that step (`POST /v1/slips/{id}/steps/{step}/complete`, or fail or skip it), then

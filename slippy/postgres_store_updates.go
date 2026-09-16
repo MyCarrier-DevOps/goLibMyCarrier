@@ -100,13 +100,15 @@ func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID stri
 // contract; this comment covers the Postgres mechanics.
 //
 // The row is read FOR UPDATE, so two concurrent claims serialise: the second sees the
-// first's claimed_from and takes the idempotent no-op arm. The decision itself is
-// DecideClaim, shared with the test doubles. The marker append and the claimed_from write
-// are in the same transaction as the read; status is never written (DEVOPS-367).
+// first's claimed_from and takes the idempotent no-op arm — ClaimOutcome{Claimed: false},
+// having written nothing — provided the compare-and-set on the status it reads under the
+// lock still agrees. The decision itself is DecideClaim, shared with the test doubles. The
+// marker append and the claimed_from write are in the same transaction as the read; status
+// is never written (DEVOPS-367).
 func (s *PostgresStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
-) (SlipStatus, error) {
-	var prior SlipStatus
+) (ClaimOutcome, error) {
+	var outcome ClaimOutcome
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		var status string
 		var claimedFrom *string
@@ -122,11 +124,11 @@ func (s *PostgresStore) ClaimSlip(
 		if claimedFrom != nil {
 			recorded = SlipStatus(*claimedFrom)
 		}
-		p, write, err := DecideClaim(SlipStatus(status), recorded, expected)
+		prior, write, err := DecideClaim(SlipStatus(status), recorded, expected)
 		if err != nil {
 			return fmt.Errorf("claim %s: %w", correlationID, err)
 		}
-		prior = p
+		outcome = ClaimOutcome{Claimed: write, Prior: prior}
 		if !write {
 			return nil
 		}
@@ -141,9 +143,9 @@ func (s *PostgresStore) ClaimSlip(
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return ClaimOutcome{}, err
 	}
-	return prior, nil
+	return outcome, nil
 }
 
 // ReleaseClaim implements SlipStore.ReleaseClaim as one transaction: the claim state is read

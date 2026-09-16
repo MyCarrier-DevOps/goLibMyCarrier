@@ -733,32 +733,32 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 }
 
 // ClaimSlip mirrors PostgresStore.ClaimSlip through the shared slippy.DecideClaim: a
-// compare-and-set on the current status, idempotent when already claimed, never writing
-// status.
+// compare-and-set on the CURRENT status whether or not a claim is held, idempotent
+// (ClaimOutcome{Claimed: false}, nothing written) once one is, never writing status.
 func (m *MockStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []slippy.SlipStatus, claimedBy, reason string,
-) (slippy.SlipStatus, error) {
+) (slippy.ClaimOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{
 		CorrelationID: correlationID, Expected: expected, ClaimedBy: claimedBy, Reason: reason,
 	})
 	if m.ClaimSlipError != nil {
-		return "", m.ClaimSlipError
+		return slippy.ClaimOutcome{}, m.ClaimSlipError
 	}
 	slip, ok := m.Slips[correlationID]
 	if !ok {
-		return "", slippy.ErrSlipNotFound
+		return slippy.ClaimOutcome{}, slippy.ErrSlipNotFound
 	}
 	prior, write, err := slippy.DecideClaim(slip.Status, slip.ClaimedFrom, expected)
 	if err != nil {
-		return "", fmt.Errorf("claim %s: %w", correlationID, err)
+		return slippy.ClaimOutcome{}, fmt.Errorf("claim %s: %w", correlationID, err)
 	}
 	if write {
 		slip.StateHistory = append(slip.StateHistory, slippy.ClaimMarker(prior, claimedBy, reason))
 		slip.ClaimedFrom = prior
 	}
-	return prior, nil
+	return slippy.ClaimOutcome{Claimed: write, Prior: prior}, nil
 }
 
 // ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared slippy.DecideRelease:

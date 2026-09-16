@@ -416,24 +416,27 @@ type CreateSlipResult struct {
 	//     (whether or not ancestors were found — a first commit has no ancestors, but
 	//     AncestryResolved=true because the resolution attempt itself succeeded); or
 	//   - the result is a dedup onto an already-loaded slip where NO resolution was ever
-	//     attempted before the dedup: the in-flight IsLive() reuse path and the empty-run
-	//     guard both set this true unconditionally, since there is nothing to resolve for
-	//     a slip that was not freshly created — "no resolution was needed" also counts as
-	//     resolved. Both return before resolveAndAbandonAncestors runs at all.
+	//     attempted before the dedup, since there is nothing to resolve for a slip that was
+	//     not freshly created — "no resolution was needed" also counts as resolved. The RULE,
+	//     not a list: every main-path early return that fires BEFORE
+	//     resolveAndAbandonAncestors runs sets this true unconditionally. Today those are the
+	//     in-flight IsLive() reuse, the empty-run guard, and the claimed-slip dedup
+	//     (DEVOPS-367); a fourth such arm would set it true for the same reason.
 	// False means ancestry resolution ran for this push and failed (e.g. GitHub API error,
 	// missing installation).
 	//
 	// The rule is that this field describes THIS push's resolution attempt, wherever an
-	// attempt happened — not the provenance of the slip being returned. The two bullets above
-	// are the only unconditional-true sites, and they qualify solely because both return
-	// before resolveAndAbandonAncestors runs at all.
+	// attempt happened — not the provenance of the slip being returned. A site may force true
+	// if and only if it returns BEFORE resolveAndAbandonAncestors runs; that is the whole
+	// test, and it is why the main path's pre-resolution early returns qualify.
 	//
 	// Every path reached AFTER that call therefore preserves the computed value rather than
-	// forcing true: both went-live aborts (repaveExistingSlip's and the duplicate-create
-	// backstop's) and both backstop dedup branches (live-conflicting and empty-run guard).
-	// "The returned slip is not the one we resolved for" is NOT a discriminator — the
-	// backstop's ended-conflict repave branch also returns a reloaded conflicting row, and it
-	// preserves the value too. Forcing true on any of them would clobber a legitimate false
+	// forcing true — both went-live aborts (repaveExistingSlip's and the duplicate-create
+	// backstop's) and EVERY backstop dedup branch, the live-conflicting, empty-run-guard and
+	// claimed-slip arms alike, since handleDuplicateSlipBackstop as a whole runs after
+	// resolution. "The returned slip is not the one we resolved for" is NOT a discriminator —
+	// the backstop's ended-conflict repave branch also returns a reloaded conflicting row, and
+	// it preserves the value too. Forcing true on any of them would clobber a legitimate false
 	// whose failure is already recorded in Warnings, producing AncestryResolved=true sitting
 	// next to an ancestry error during a GitHub outage and misfiring alerting keyed on this
 	// field (DEVOPS-231 review D3.2).
@@ -763,9 +766,23 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// it would hand the caller returned == sent on an ENDED row, so it dispatches and then
 		// reports against a terminal slip. It falls through to persistSlipForPush's
 		// self-referential arm, which upserts the row live again; Create's SET list excludes
-		// claimed_from, so that reset keeps the claim. handleDuplicateSlipBackstop orders its
-		// mirror of these the same way — live, empty-run guard, self-referential, claimed,
-		// repave — so identical inputs converge through either path.
+		// claimed_from, so that reset keeps the claim.
+		//
+		// WHAT CONVERGES WITH handleDuplicateSlipBackstop, AND WHAT DOES NOT. The backstop
+		// orders its mirror of these arms the same way — live, empty-run guard,
+		// self-referential, claimed, repave — so identical inputs reach the same DECISION
+		// (dedup vs repave) through either path, and that ordering is what the two paths
+		// promise each other. The SIDE EFFECTS of a dedup differ, deliberately and on every
+		// backstop dedup arm rather than this one shape: this branch routes through
+		// handlePushRetry, resetting push_parsed and writing the "retry detected" marker,
+		// while the backstop's live and claimed arms return the conflicting row untouched.
+		// Two reasons, both structural. The backstop is reached AFTER this push's Create lost
+		// the repo:sha race, so it never became that row's owner — the winner's own push runs
+		// whatever retry it needs. And resolveAndAbandonAncestors has already run by then, so
+		// the backstop cannot set AncestryResolved = true the way these early returns do
+		// without contradicting result.Warnings (see its branches' own comments, DEVOPS-231
+		// D3.2). PR #87 finding 8: the divergence is real and stated here rather than
+		// papered over with a convergence claim the code does not make.
 		if existingSlip.ClaimedFrom != "" && existingSlip.CorrelationID != opts.CorrelationID {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
@@ -1322,11 +1339,24 @@ func (c *Client) abandonSupersededSlipForUnsupportedRepave(
 // slip is deduped onto (never destroyed - its pipeline may already be dispatched, and
 // destroying it here would pull the rug out from under an in-flight run while we dispatch a
 // duplicate); an ended one is deduped onto when the empty-run guard applies (componentless
-// push) or when a claimant holds it (claimed_from set, DEVOPS-367 — a run is in flight
-// against it whatever its status says), and repaved onto slip, this push's successor,
-// otherwise. All three checks are mirrored from the main path IN THE SAME ORDER — live,
-// empty-run guard, claimed, repave — so identical inputs converge on identical outcomes
-// through either path.
+// push), when it already carries THIS push's correlation ID (reset in place, not repaved), or
+// when a claimant holds it (claimed_from set, DEVOPS-367 — a run is in flight against it
+// whatever its status says), and repaved onto slip, this push's successor, otherwise. Those
+// checks are mirrored from the main path IN THE SAME ORDER — live, empty-run guard,
+// self-referential, claimed, repave — so identical inputs reach the same DECISION through
+// either path.
+//
+// The ORDER and the decision are what converge; the dedup's side effects do not, and that is
+// deliberate (PR #87 finding 8). The main path routes its live and claimed dedups through
+// handlePushRetry — push_parsed reset to running plus a "retry detected" history entry — and
+// forces AncestryResolved = true. Neither happens on a backstop dedup. This path is reached
+// only after this push's own Create LOST the repo:sha race, so it never became the
+// conflicting row's owner and has no business writing a retry marker onto the winner's run;
+// and resolveAndAbandonAncestors has already run for this push by the time we get here, so
+// AncestryResolved must keep the real outcome of that attempt or it contradicts
+// result.Warnings (DEVOPS-231 D3.2). Do not "restore symmetry" by adding the retry call to
+// one arm: the live arm and the claimed arm are the same shape, and changing one of them
+// makes this function inconsistent with itself rather than with the main path.
 //
 // Returns handled=true when the caller should return result directly, which now covers two
 // outcomes: the dedup cases (result.Slip is the conflicting slip) AND a successful repave of
@@ -1448,7 +1478,16 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// again. Deduping it here instead would hand the caller returned == sent on an ENDED
 		// row, which is exactly the outcome the self-referential arm and the empty-run guard's
 		// self-correlation exclusion both exist to prevent. CreateSlipForPush's main path
-		// carves the same shape out of its own claimed branch, so the two converge.
+		// carves the same shape out of its own claimed branch, so the two reach the same
+		// decision on the same input.
+		//
+		// They do NOT do the same thing on the way out, and the difference is on purpose: the
+		// main path calls handlePushRetry here (push_parsed reset, "retry detected" marker)
+		// and forces AncestryResolved = true, while this arm — like the live arm above —
+		// returns the conflicting row untouched and keeps the computed AncestryResolved. See
+		// this function's doc comment for why both differences follow from being the
+		// race-loser's path, and why adding the retry call to this arm alone would be a
+		// regression in consistency rather than a fix (PR #87 finding 8).
 		c.logger.Info(ctx, "Duplicate-create backstop: claimed conflicting slip, deduping", map[string]interface{}{
 			"conflicting_id":     conflicting.CorrelationID,
 			"commit":             shortSHA(conflicting.CommitSHA),

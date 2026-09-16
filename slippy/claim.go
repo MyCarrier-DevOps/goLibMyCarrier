@@ -99,10 +99,11 @@ const PushParsedStep = "push_parsed"
 // client-side poll of the read-only prerequisites endpoint records nothing and leaves the
 // step `pending`.
 //
-// PushParsedStep is skipped: it is the library's own bookkeeping, reset to running by
-// every deduplicated push and never completed by a post-job, so counting it would make a
-// deduped claimed slip unreleasable. This is the one definition of "work in flight" the
-// claim protects.
+// PushParsedStep is skipped in BOTH loops — the step map and the aggregate map, which is
+// keyed by step name as well: it is the library's own bookkeeping, reset to running by every
+// deduplicated push and never completed by a post-job, so counting it would make a deduped
+// claimed slip unreleasable. This is the one definition of "work in flight" the claim
+// protects.
 func RunInFlight(slip *Slip) bool {
 	// Nil is "no slip, so nothing in flight" rather than a panic: this is exported for
 	// third-party stores to route their own release decision through, and a store that hands
@@ -119,7 +120,13 @@ func RunInFlight(slip *Slip) bool {
 			return true
 		}
 	}
-	for _, components := range slip.Aggregates {
+	for name, components := range slip.Aggregates {
+		// Skipped here for the same reason as above and by the same key: Aggregates is keyed
+		// by STEP name, so a config whose push_parsed step aggregates components would
+		// otherwise reintroduce the unreleasable claim through the component rollup.
+		if name == PushParsedStep {
+			continue
+		}
 		for _, component := range components {
 			if component.Status.IsRunning() {
 				return true
@@ -129,46 +136,71 @@ func RunInFlight(slip *Slip) bool {
 	return false
 }
 
+// ClaimOutcome is what a claim did. Claimed is true when THIS call recorded the claim and
+// false when one was already held — the idempotent repeat. Prior is the status the claim was
+// taken out of: the current status on a fresh claim, the recorded claimed_from on a repeat.
+// A caller that must not duplicate work keys on Claimed; a caller that only needs the slip
+// protected can ignore it, since both values mean the slip is claimed on return.
+type ClaimOutcome struct {
+	// Claimed is true when this call recorded the claim, false when one was already held.
+	Claimed bool
+
+	// Prior is the status the claim was taken out of, recorded or current.
+	Prior SlipStatus
+}
+
 // DecideClaim is the claim decision, shared by PostgresStore and both test doubles so the
 // three cannot drift. status is the row's current status and claimedFrom its recorded claim
 // ("" when unclaimed). prior is the status to report — the current one on a fresh claim, the
 // recorded one on a repeat — and write reports whether the store must record the claim
 // (claimed_from plus a marker) or this is the idempotent no-op arm.
 //
-// A slip with no status at all is refused outright: recording it would write
-// claimed_from = "", which every reader — the repave guard, the push fast path,
-// DecideRelease — treats as unclaimed.
+// THE RULE, in one sentence: expected is always a compare-and-set on the CURRENT status,
+// whether or not a claim is already held — a repeat claim is idempotent only once that
+// compare-and-set has agreed to the status the row reads NOW.
 //
-// A FRESH claim is a compare-and-set on the CURRENT status. A nil or empty expected admits
-// any status EXCEPT an unclaimed in_progress: a row reading in_progress with no claim
-// recorded is a live run nothing has adopted, and claiming one silently would let a rerun
-// dispatch on top of a pipeline already in flight. A caller that does mean to claim a live
-// run says so by listing in_progress in expected — the Slippy CLI pre-job claims out of
-// every non-terminal status and does exactly that; pushhookparser's rerunner claims out of
-// the ended set and is the caller this refusal protects.
+// The rest follows from it, in this order:
 //
-// A REPEAT claim on a held claim is an idempotent no-op returning the RECORDED prior, and
-// expected is checked against that recorded prior rather than the current status. A retry
-// after a lost response therefore passes, because the prior it agreed to is the one on the
-// row and the run may have moved the status since; a DIFFERENT claimant whose expected
-// excludes the recorded prior is refused rather than handed a claim it did not agree to.
+//   - A slip with no status at all is refused outright: recording it would write
+//     claimed_from = "", which every reader — the repave guard, the push fast path,
+//     DecideRelease — treats as unclaimed.
+//   - A non-empty expected that does not contain the current status is refused, claimed or
+//     not. This is the compare-and-set.
+//   - A LIVE status (IsLive: pending, in_progress, compensating) that expected did not name
+//     is refused, so a nil expected cannot adopt a run already in flight. pending is carved
+//     out because a pending slip is claimable by design: nothing has been dispatched onto it
+//     yet. The refusal does NOT depend on the row being unclaimed, so a live run already
+//     carrying a claim is protected by it too.
+//   - Only then, a held claim is the idempotent no-op: prior is the RECORDED claimed_from and
+//     nothing is written, so a repeat cannot inflate the audit trail.
+//
+// THE TWO WORKED CASES the rule exists for, both of them the rerunner retrying a claim whose
+// response it lost, with expected = the ended set:
+//
+//   - The response was lost BEFORE anything dispatched. Nothing ran, so the row still reads
+//     failed, the ended set matches, and the retry claims and dispatches. Recovery works —
+//     and it is the only window in which a retry SHOULD dispatch.
+//   - The response was lost AFTER the dispatch and a step has reported, so the reconcile
+//     branch has written in_progress. The ended set no longer matches and the retry is
+//     refused. That is the desired outcome, not a bug: the dispatch it is retrying already
+//     happened, and claiming again would put a second run on top of a live one.
+//
+// A caller that cannot tell "already claimed" from "precondition failed" reads
+// ClaimOutcome.Claimed, which is what that distinction is for; it is not a reason to compare
+// expected against the recorded prior instead (PR #87, rounds 4 and 6).
 func DecideClaim(status, claimedFrom SlipStatus, expected []SlipStatus) (prior SlipStatus, write bool, err error) {
 	if status == "" {
 		return "", false, fmt.Errorf("slip has no status: %w", ErrClaimPreconditionFailed)
 	}
-	if claimedFrom == "" && status == SlipStatusInProgress && !slices.Contains(expected, SlipStatusInProgress) {
-		return "", false, fmt.Errorf("in_progress with no claim recorded is a live run: %w",
-			ErrClaimPreconditionFailed)
-	}
-	if claimedFrom != "" {
-		if len(expected) > 0 && !slices.Contains(expected, claimedFrom) {
-			return "", false, fmt.Errorf("already claimed out of %s, not in %v: %w",
-				claimedFrom, expected, ErrClaimPreconditionFailed)
-		}
-		return claimedFrom, false, nil
-	}
 	if len(expected) > 0 && !slices.Contains(expected, status) {
 		return "", false, fmt.Errorf("status %s not in %v: %w", status, expected, ErrClaimPreconditionFailed)
+	}
+	if status.IsLive() && status != SlipStatusPending && !slices.Contains(expected, status) {
+		return "", false, fmt.Errorf("%s is a live run; name it in expected to adopt one: %w",
+			status, ErrClaimPreconditionFailed)
+	}
+	if claimedFrom != "" {
+		return claimedFrom, false, nil
 	}
 	return status, true, nil
 }
@@ -216,25 +248,31 @@ func DecideRelease(slip *Slip) (release bool, err error) {
 // deduplicates onto it instead of repaving it (DEVOPS-285, DEVOPS-367). The claim is a flag:
 // it never changes the slip's status, and it lives until the run is over — released by a
 // post-job once nothing is in flight, or ended by a terminal status write. expected is a
-// compare-and-set on the current status; nil admits any status except an unclaimed
-// in_progress, which is a live run — a caller that means to claim one lists in_progress in
-// expected. A repeat claim on a held claim is an idempotent no-op returning the recorded
-// prior, with expected checked against that recorded prior. See SlipStore.ClaimSlip.
+// compare-and-set on the CURRENT status whether or not a claim is already held; nil admits
+// any status except a live one (in_progress or compensating), which a caller that means to
+// adopt names in expected. Once that compare-and-set agrees, a claim already held is an
+// idempotent no-op: ClaimOutcome{Claimed: false} carrying the RECORDED prior, with nothing
+// written. Both outcomes mean the slip is claimed on return. See SlipStore.ClaimSlip.
 func (c *Client) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
-) (SlipStatus, error) {
+) (ClaimOutcome, error) {
 	ctx, span := StartSpan(ctx, "ClaimSlip", correlationID)
 	defer span.End()
-	prior, err := c.store.ClaimSlip(ctx, correlationID, expected, claimedBy, reason)
+	out, err := c.store.ClaimSlip(ctx, correlationID, expected, claimedBy, reason)
 	if err != nil {
-		return "", NewSlipError("claim", correlationID, err)
+		return ClaimOutcome{}, NewSlipError("claim", correlationID, err)
 	}
-	c.logger.Info(ctx, "Claimed slip", map[string]interface{}{
+	msg := "Claimed slip"
+	if !out.Claimed {
+		msg = "Slip already claimed: claim kept, nothing written"
+	}
+	c.logger.Info(ctx, msg, map[string]interface{}{
 		"correlation_id": correlationID,
-		"prior_status":   string(prior),
+		"prior_status":   string(out.Prior),
+		"claimed":        out.Claimed,
 		"claimed_by":     claimedBy,
 	})
-	return prior, nil
+	return out, nil
 }
 
 // ReleaseClaim ends a claim once the claimant's run has nothing left in flight. Every post-job

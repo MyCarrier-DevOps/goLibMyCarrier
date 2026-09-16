@@ -418,9 +418,19 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     `checkTerminalStatus` returns early and `AbandonSlip` returns nil without writing (I4), so
     the operator sees success and the claim survives — and terminal-claimed rows are ordinary,
     since the rerunner claims out of the ended set, four of whose statuses are terminal. Use
-    the step-then-release route there. Nothing reaps the state on its own: pushhookparser's
-    stranded-slip cleanup deliberately skips a claimed slip — the claim is precisely what
-    tells it a run owns the row.
+    the step-then-release route there.
+  - **A claim with nothing in flight is reapable, and the stranded-slip cleanup owns that.**
+    The one state no operator action and no post-job can reach is a claim taken by a pre-job
+    whose workflow was then never dispatched: `claimed_from` is set, no step was ever
+    reported, `RunInFlight` is false — a release WOULD clear it — but no post-job will ever
+    run to call one, and every later same-commit push deduplicates onto the row. The exit is
+    pushhookparser's stranded-slip cleanup, which used to skip a claimed slip outright and
+    now exempts one only while the claim is doing something — a step or component running or
+    held, the same `RunInFlight` evidence a release decides on. A claimed slip with nothing
+    in flight is reaped exactly as an unclaimed one is. The library adds NO time-based
+    sweeper of its own — elapsed time cannot tell a long build from a wedge, which is why
+    the in-flight evidence, not a clock, is what the exemption reads (DEVOPS-367, PR #87
+    finding 3).
 
   What the claim does not cover, stated plainly (tracked as **DEVOPS-371**, a
   dispatcher-held claim): the **gap between two workflows of one run** — after the last

@@ -79,6 +79,13 @@ func (s *PostgresStore) Create(ctx context.Context, slip *Slip) error {
 
 // Update writes the slip's current state to its existing row. Returns ErrSlipNotFound if
 // no row exists for the correlation ID.
+//
+// NOTHING IN THIS LIBRARY CALLS IT ANY MORE. The last caller was PromoteSlip, and DEVOPS-367
+// rerouted that through the atomic UpdateSlipStatus so a promotion cannot clobber concurrent
+// history appends or end a claim from a stale snapshot; AbandonSlip and checkPipelineCompletion
+// were moved for the same reason. It remains on SlipStore for external callers that really do
+// own the whole row, and it keeps the two properties that make it safe for them: the per-slip
+// FOR UPDATE lock below, and claimed_from's exclusion from slipColumns().
 func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 	cols := s.slipColumns()
 	vals, err := s.slipValues(slip, false)
@@ -98,10 +105,12 @@ func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 		args = append(args, vals[i])
 		n++
 	}
-	// claimed_from is SELECT-only: it is not in slipColumns(), so a full-row write never ends
-	// a claim WHATEVER STATUS IT CARRIES. That status came from the caller's own snapshot and
-	// a claim may have been taken after the read, so clearing on it would end a claim this
-	// caller never saw — and rewrite stale history with it. Terminal transitions go through
+	// The correlation_id WHERE key is the last bind, after every SET value.
+	//
+	// Note what is NOT in this statement: claimed_from. It is SELECT-only — slipColumns()
+	// omits it — so a full-row write never ends a claim WHATEVER STATUS THE SNAPSHOT CARRIES.
+	// That status came from the caller's own read, and a claim may have been taken since, so
+	// clearing on it would end a claim this caller never saw. Terminal transitions go through
 	// UpdateSlipStatus instead: AbandonSlip, PromoteSlip and checkPipelineCompletion all do.
 	args = append(args, slip.CorrelationID)
 
@@ -149,6 +158,14 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 //
 // to_regclass of a missing table is NULL, so attrelid = NULL matches nothing, every column
 // reads as absent and the probe reports behind — the right answer for an unmigrated database.
+//
+// Identifiers are compared CASE-INSENSITIVELY. Postgres folds an unquoted identifier to lower
+// case, and stepColumnEnsurer emits its DDL unquoted, so a configured step named `Deploy_Dev`
+// lands in pg_attribute as `deploy_dev` while slipSelectColumns() still names it as
+// configured. A case-sensitive diff would report that migrated column missing and crash-loop
+// the consumer's readiness gate against a schema that is in fact up to date. The missing
+// names are reported AS CONFIGURED rather than folded, so the operator sees the string their
+// pipeline config carries.
 func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
 	rows, err := s.pool.Query(ctx,
 		"SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
@@ -164,7 +181,7 @@ func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
 		if scanErr := rows.Scan(&name); scanErr != nil {
 			return fmt.Errorf("probe routing_slips schema: %w", scanErr)
 		}
-		present[name] = struct{}{}
+		present[strings.ToLower(name)] = struct{}{}
 	}
 	if rows.Err() != nil {
 		return fmt.Errorf("probe routing_slips schema: %w", rows.Err())
@@ -172,7 +189,7 @@ func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
 
 	var missing []string
 	for _, col := range s.slipSelectColumns() {
-		if _, ok := present[col]; !ok {
+		if _, ok := present[strings.ToLower(col)]; !ok {
 			missing = append(missing, col)
 		}
 	}
@@ -399,9 +416,16 @@ func (s *PostgresStore) stepsFromStatuses(statuses []string) map[string]Step {
 }
 
 // decodeAggregates unwraps the {"items": [...]} envelope each aggregate jsonb column holds,
-// for cols and raw in the same order. A NULL or empty column leaves that aggregate as an
-// empty slice; a malformed one leaves it unset rather than failing the read, matching the
-// ClickHouse scanner. Shared by populate and loadClaimStateTx.
+// for cols and raw in the same order. A NULL or empty column leaves that aggregate as a NIL
+// slice — the key is present in the map with a nil value, not an empty one — and a malformed
+// one leaves it unset rather than failing the read, matching the ClickHouse scanner. Shared
+// by populate and loadClaimStateTx.
+//
+// The nil matters past this function: encoding/json marshals a nil slice as `null` and an
+// empty one as `[]`, so an aggregate step with no components reaches a slippy-api response
+// body as `"builds": null`. Every reader of that field has to accept null as "no components"
+// (PR #87 finding 6). Nothing here depends on the distinction — the readers in this package
+// range over the value, and ranging over nil is a no-op.
 func decodeAggregates(cols []string, raw [][]byte) map[string][]ComponentStepData {
 	aggregates := make(map[string][]ComponentStepData, len(cols))
 	for i, col := range cols {

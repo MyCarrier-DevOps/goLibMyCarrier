@@ -178,7 +178,7 @@ func TestClickHouseStore_ClaimSlip_Unsupported(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	prior, err := store.ClaimSlip(context.Background(), "corr-claim-1", nil, "rerunner", "")
+	out, err := store.ClaimSlip(context.Background(), "corr-claim-1", nil, "rerunner", "")
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -188,8 +188,8 @@ func TestClickHouseStore_ClaimSlip_Unsupported(t *testing.T) {
 	if !strings.Contains(err.Error(), "corr-claim-1") {
 		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
 	}
-	if prior != "" {
-		t.Errorf("expected no prior status on an unsupported claim, got %q", prior)
+	if out.Claimed || out.Prior != "" {
+		t.Errorf("expected a zero ClaimOutcome on an unsupported claim, got %+v", out)
 	}
 }
 

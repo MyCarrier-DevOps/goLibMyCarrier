@@ -102,9 +102,10 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 
 	t.Run("claims out of failed: claimed_from set, status unchanged, exactly one marker", func(t *testing.T) {
 		claimTestSlip(t, store, "c-failed", "sha-f", SlipStatusFailed)
-		prior, err := store.ClaimSlip(ctx, "c-failed", []SlipStatus{SlipStatusFailed}, "rerunner", "test")
+		out, err := store.ClaimSlip(ctx, "c-failed", []SlipStatus{SlipStatusFailed}, "rerunner", "test")
 		require.NoError(t, err)
-		assert.Equal(t, SlipStatusFailed, prior)
+		assert.Equal(t, SlipStatusFailed, out.Prior)
+		assert.True(t, out.Claimed, "this call recorded the claim")
 		got, err := store.Load(ctx, "c-failed")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusFailed, got.Status, "the claim never writes status")
@@ -133,9 +134,10 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		for _, st := range []SlipStatus{SlipStatusCompleted, SlipStatusPending} {
 			id := "c-any-" + string(st)
 			claimTestSlip(t, store, id, "sha-"+string(st), st)
-			prior, err := store.ClaimSlip(ctx, id, nil, "rerunner", "test")
+			out, err := store.ClaimSlip(ctx, id, nil, "rerunner", "test")
 			require.NoError(t, err, st)
-			assert.Equal(t, st, prior)
+			assert.Equal(t, st, out.Prior)
+			assert.True(t, out.Claimed)
 			got, err := store.Load(ctx, id)
 			require.NoError(t, err)
 			assert.Equal(t, st, got.Status, "status untouched")
@@ -154,10 +156,11 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 
 	t.Run("an explicit in_progress in expected claims a live run", func(t *testing.T) {
 		claimTestSlip(t, store, "c-live-explicit", "sha-live-explicit", SlipStatusInProgress)
-		prior, err := store.ClaimSlip(ctx, "c-live-explicit",
+		out, err := store.ClaimSlip(ctx, "c-live-explicit",
 			[]SlipStatus{SlipStatusInProgress}, "slippy-cli/prejob", "test")
 		require.NoError(t, err, "the CLI pre-job claims out of every non-terminal status")
-		assert.Equal(t, SlipStatusInProgress, prior)
+		assert.Equal(t, SlipStatusInProgress, out.Prior)
+		assert.True(t, out.Claimed)
 		got, err := store.Load(ctx, "c-live-explicit")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusInProgress, got.Status, "status untouched")
@@ -169,25 +172,32 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		claimTestSlip(t, store, "c-twice", "sha-t", SlipStatusFailed)
 		_, err := store.ClaimSlip(ctx, "c-twice", nil, "first", "test")
 		require.NoError(t, err)
-		prior, err := store.ClaimSlip(ctx, "c-twice", []SlipStatus{SlipStatusFailed}, "second", "test")
-		require.NoError(t, err, "a repeat claim must not be refused by its own precondition")
-		assert.Equal(t, SlipStatusFailed, prior)
+		out, err := store.ClaimSlip(ctx, "c-twice", []SlipStatus{SlipStatusFailed}, "second", "test")
+		require.NoError(t, err, "a repeat claim of a row whose status has not moved still agrees")
+		assert.Equal(t, SlipStatusFailed, out.Prior)
+		assert.False(t, out.Claimed, "the claim was already held and nothing was written")
 		assert.Equal(t, 1, countMarkers(t, store, "c-twice", ClaimMarkerStep), "no second marker")
 	})
 
-	// Inverted deliberately (PR #87 re-review): expected used to be compared against the
-	// CURRENT status on a repeat claim, which refused the retry-after-a-lost-response the
-	// idempotent arm exists for as soon as the run moved the row on.
-	t.Run("repeat claim after the run moved status: expected checked against the RECORDED prior", func(t *testing.T) {
+	// Inverted deliberately (PR #87 sixth review): expected used to be compared against the
+	// RECORDED prior on a repeat claim, so a second rerun request for a commit whose pipeline
+	// had already gone live matched the prior and dispatched on top of it. The compare-and-set
+	// is on the CURRENT status whether or not a claim is held; the idempotent arm sits behind
+	// it and is reached by a caller that names the status the row reads now.
+	t.Run("repeat claim after the run moved status: expected is checked against the CURRENT status", func(t *testing.T) {
 		claimTestSlip(t, store, "c-moved", "sha-m", SlipStatusFailed)
 		_, err := store.ClaimSlip(ctx, "c-moved", nil, "first", "test")
 		require.NoError(t, err)
 		require.NoError(t, store.UpdateSlipStatus(ctx, "c-moved", SlipStatusInProgress), "the reconcile branch wrote it")
-		prior, err := store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusFailed}, "second", "test")
-		require.NoError(t, err, "the retry agreed to failed, which is what the row records")
-		assert.Equal(t, SlipStatusFailed, prior, "the recorded prior, not the current status")
-		_, err = store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusCompleted}, "third", "test")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to failed is refused")
+		_, err = store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusFailed}, "second", "test")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed,
+			"the dispatch this retry is repeating already started: refused, not handed the claim")
+		out, err := store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusInProgress}, "third", "test")
+		require.NoError(t, err, "a caller that names the current status reaches the idempotent arm")
+		assert.False(t, out.Claimed, "nothing written")
+		assert.Equal(t, SlipStatusFailed, out.Prior, "and the prior is the recorded one")
+		_, err = store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusCompleted}, "fourth", "test")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
 		got, err := store.Load(ctx, "c-moved")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusInProgress, got.Status, "the no-op arm writes nothing")
@@ -370,9 +380,10 @@ func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 		require.NoError(t, err)
 		_, err = store.ReleaseClaim(ctx, "r-again", "a", "")
 		require.NoError(t, err)
-		prior, err := store.ClaimSlip(ctx, "r-again", []SlipStatus{SlipStatusFailed}, "b", "")
+		out, err := store.ClaimSlip(ctx, "r-again", []SlipStatus{SlipStatusFailed}, "b", "")
 		require.NoError(t, err, "a released slip is claimable again")
-		assert.Equal(t, SlipStatusFailed, prior)
+		assert.Equal(t, SlipStatusFailed, out.Prior)
+		assert.True(t, out.Claimed, "a fresh claim, not a repeat: the release cleared the record")
 		assert.Equal(t, 2, countMarkers(t, store, "r-again", ClaimMarkerStep))
 		assert.Equal(t, 1, countMarkers(t, store, "r-again", ReleaseMarkerStep))
 	})
@@ -587,6 +598,30 @@ func TestPostgresStore_ProbeSchema_Integration(t *testing.T) {
 		require.Error(t, err, "the probe covers the whole select list, not one column of it")
 		assert.ErrorIs(t, err, ErrSchemaBehind)
 		assert.Contains(t, err.Error(), "dev_deploy_status", "and names the column that is missing")
+	})
+
+	// Postgres FOLDS an unquoted identifier to lower case, and stepColumnEnsurer emits its
+	// ALTER TABLE unquoted, so a configured step carrying an uppercase letter lands in
+	// pg_attribute lower-cased while slipSelectColumns() still names it as configured. A
+	// case-sensitive diff would report that migrated column missing and crash-loop the
+	// consumer's readiness gate against a schema that is in fact fully up to date
+	// (PR #87 finding 4). The DDL and the probe have to fold alike.
+	t.Run("case-folded identifiers: an uppercase step name still probes clean", func(t *testing.T) {
+		pool := newPGMigrationTestPool(t)
+		cfg := pgMixedCasePipelineConfig(t)
+		_, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
+		require.NoError(t, err)
+		store, err := NewPostgresStore(pool, cfg, nil)
+		require.NoError(t, err)
+
+		var folded bool
+		require.NoError(t, pool.QueryRow(ctx,
+			"SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
+				"AND attname = 'dev_deploy_status')").Scan(&folded))
+		require.True(t, folded, "the ensurer's unquoted DDL created the column folded")
+
+		require.NoError(t, store.ProbeSchema(ctx),
+			"the schema is migrated: the probe must not report Dev_Deploy_status missing")
 	})
 
 	t.Run("reports ErrSchemaBehind at v5, where every read fails", func(t *testing.T) {
