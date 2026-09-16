@@ -8,9 +8,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// PromoteSlip reaches a terminal status through the full-row Update, not UpdateSlipStatus.
-// Both paths must end the claim, or a claimed slip promoted mid-run would keep refusing
-// repaves forever with no client left to release it (PR #87 review).
+// PromoteSlip reaches a terminal status through UpdateSlipStatus, the one write path that
+// ends a claim. It must end it, or a claimed slip promoted mid-run would keep refusing
+// repaves forever with no client left to release it (PR #87 review). PromotedTo is asserted
+// as the status write rather than a round-trip: no store persists that field (no column), so
+// the full-row Update this replaced never carried it to the database either — it only added a
+// Load-then-Update snapshot race.
 func TestClient_PromoteSlip_EndsTheClaim(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
@@ -23,7 +26,8 @@ func TestClient_PromoteSlip_EndsTheClaim(t *testing.T) {
 	got, err := store.Load(ctx, "p")
 	require.NoError(t, err)
 	assert.Equal(t, SlipStatusPromoted, got.Status)
-	assert.Empty(t, got.ClaimedFrom, "terminal through Update ends the claim like UpdateSlipStatus does")
+	assert.Empty(t, got.ClaimedFrom, "the atomic terminal status write ends the claim")
+	assert.Empty(t, store.UpdateCalls, "promote no longer takes the full-row Update path")
 	_, err = store.ClaimSlip(ctx, "p", []SlipStatus{SlipStatusFailed}, "rerunner", "")
 	require.ErrorIs(t, err, ErrClaimPreconditionFailed, "and a later claim sees the real status, not a stale no-op arm")
 }
@@ -41,12 +45,16 @@ func TestClient_ClaimAndRelease_SurfaceStoreDecisions(t *testing.T) {
 	_, err = client.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusCompleted}, "cli", "")
 	require.ErrorIs(t, err, ErrClaimPreconditionFailed)
 
-	_, err = client.ReleaseClaim(ctx, "c", "cli", "")
-	require.ErrorIs(t, err, ErrRunInFlight)
-	require.NoError(t, store.UpdateStep(ctx, "c", "builds", "", StepStatusCompleted))
-	status, err := client.ReleaseClaim(ctx, "c", "cli", "")
+	// Work in flight is an outcome the client surfaces, not an error it wraps.
+	out, err := client.ReleaseClaim(ctx, "c", "cli", "")
 	require.NoError(t, err)
-	assert.Equal(t, SlipStatusFailed, status)
+	assert.False(t, out.Released)
+	assert.Equal(t, SlipStatusFailed, out.Status, "the status is reported on the held arm too")
+	require.NoError(t, store.UpdateStep(ctx, "c", "builds", "", StepStatusCompleted))
+	out, err = client.ReleaseClaim(ctx, "c", "cli", "")
+	require.NoError(t, err)
+	assert.True(t, out.Released)
+	assert.Equal(t, SlipStatusFailed, out.Status)
 	_, err = client.ReleaseClaim(ctx, "c", "cli", "")
 	require.ErrorIs(t, err, ErrNotClaimed)
 }

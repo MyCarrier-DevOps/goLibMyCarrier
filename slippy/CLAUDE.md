@@ -16,25 +16,47 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ## Breaking changes
 
-**DEVOPS-367 added `ClaimSlip` and `ReleaseClaim` to the exported `SlipStore` interface:**
+**DEVOPS-367 added `ClaimSlip`, `ReleaseClaim` and `ProbeSchema` to the exported
+`SlipStore` interface:**
 
 ```go
 ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (SlipStatus, error)
-ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error)
+ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (ReleaseOutcome, error)
+ProbeSchema(ctx context.Context) error
 ```
 
 Same posture as `Repave` below: a downstream `SlipStore` implementation fails to compile
-until both methods exist (the ClickHouse store returns `ErrClaimUnsupported`; the
+until all three methods exist (the ClickHouse store returns `ErrClaimUnsupported` from the
+first two and `nil` from `ProbeSchema`, having no schema of its own; the
 `slippytest.MockStore` and slippy-api's `mockSlipStore` implement them). The claim is a
 **flag**: `ClaimSlip` never writes `status`, and `ReleaseClaim` clears the claim only when
-no step or component is running or held — otherwise it is `ErrRunInFlight`, a new sentinel
-callers must treat as information. Implementers should route their decisions through
-`slippy.DecideClaim` and `slippy.DecideRelease` so they cannot drift from the store.
+no step or component is running or held — otherwise it returns
+`ReleaseOutcome{Released: false}` with nothing written, which callers treat as information.
+`ErrRunInFlight` is **removed**: work in flight is an outcome, not an error, because all but
+the last of a run's N post-job releases take that arm. `ProbeSchema` is on the interface so
+the readiness gate is reachable through the abstraction consumers hold (`Client.ProbeSchema`
+wraps it). Implementers should route their decisions through `slippy.DecideClaim` and
+`slippy.DecideRelease` so they cannot drift from the store.
 `ReleaseMarker(status SlipStatus, releasedBy, reason string)` changed shape in the same
 release (the earlier `restored` argument is gone: a release never restores anything). The
-contract, including what `nil` means for `expected`, is on `SlipStore.ClaimSlip` and
-`SlipStore.ReleaseClaim` in `interfaces.go`; the model is in
+contract, including what `nil` means for `expected`, is on `SlipStore.ClaimSlip`,
+`SlipStore.ReleaseClaim` and `SlipStore.ProbeSchema` in `interfaces.go`; the model is in
 `.github/STATE_MACHINE_V3.md` under DEVOPS-367.
+
+Exactly ONE write path ends a claim: `UpdateSlipStatus` on a terminal status. `Create` and
+the full-row `Update` never touch `claimed_from`, whatever status the caller's snapshot
+carries, so a Load-then-Update can no longer clear a claim taken after its read;
+`PromoteSlip` goes through the atomic status write for that reason. The claim protects work
+that is **in flight** — running or held steps and components. The gap between one step's
+last post-job and the next step's pre-job is not covered; that is tracked as **DEVOPS-371**
+(a dispatcher-held claim).
+
+When a claim is left behind by a run that will never release it, the **stuck step holds it**:
+resolve that step (`POST /v1/slips/{id}/steps/{step}/complete`, or fail or skip it), then
+`POST /v1/slips/{id}/release`, which then finds nothing in flight. On a non-terminal slip
+`POST /v1/slips/{id}/abandon` also ends it (`AbandonSlip` writes the terminal `abandoned`
+through `UpdateSlipStatus`); on an already-terminal slip it is a deliberate no-op (I4) and
+clears nothing, so use the step-then-release route there.
 
 **DEVOPS-231 added `Repave` to the exported `SlipStore` interface:**
 
@@ -244,22 +266,31 @@ if currentVersion < targetVersion {
 ```
 
 **Migration v6 (`claimed_from`, DEVOPS-367) rollout order.** Every Postgres read path
-selects `claimed_from` (`slipSelectColumns()`), so a library at or past v1.3.103 fails
+selects `claimed_from` (`slipSelectColumns()`), so a library at or past v1.4.0 fails
 every `Load` with Postgres 42703 against a database still at v5. The migrator Job must
 have applied v6 before any slippy-api pod on that library serves traffic; do not roll
-the API image ahead of the migrator. That order is now enforced rather than merely
-documented: `PostgresStore.ProbeSchema` asks whether `routing_slips.claimed_from` exists,
-and slippy-api calls it at startup and fails readiness — the pod exits and restarts — for
-as long as it returns `ErrSchemaBehind`. An API rolled ahead of the migrator therefore
-crash-loops until v6 is applied instead of answering every slip request with a 42703.
+the API image ahead of the migrator. This library supplies the check, but the ordering is
+enforced by the consumer that runs it — slippy-api's startup probe, not the library itself:
+`PostgresStore.ProbeSchema` compares `slipSelectColumns()` (every column the SELECTs name,
+`claimed_from` and each configured step's column alike) against the live schema, and
+slippy-api calls it at startup and fails readiness — the pod exits and restarts — for as
+long as it returns `ErrSchemaBehind`. An API wired that way crash-loops until v6 is applied
+instead of answering every slip request with a 42703; a consumer that never calls the probe
+gets no such protection. `ProbeSchema` is on `SlipStore` (and `Client`), so it is reachable
+through the abstraction rather than only on the concrete Postgres store.
 Rolling back is guarded: v6's DownSQL refuses while any slip holds a claim
 (`claimed_from` set), because dropping the column erases the in-flight flag of every held
 claim — that run's work becomes repaveable mid-flight — and breaks every `Load` until the
-library is rolled back with it. The refusal names up to 20 of the held correlation ids.
+library is rolled back with it. The refusal names up to 20 of the held correlation ids, and
+the guard takes an `ACCESS EXCLUSIVE` lock (bounded by a 5s `lock_timeout`, since the
+migration transaction otherwise runs with `lock_timeout = 0`) before it counts, so a claim
+taken between the count and the drop cannot slip through.
 Because every slip-routed pre-job now claims, some slip usually holds a claim in a busy
 environment, so plan a rollback as a drain: expect the down to refuse until runs finish or
-are released. Let the runs end, `ReleaseClaim` them, or abandon them
-(`POST /v1/slips/{id}/abandon`), then re-run the down.
+are released. Let the runs end and `ReleaseClaim` them; where a step is stuck, resolve that
+step (`POST /v1/slips/{id}/steps/{step}/complete`) and then release. A NON-terminal slip can
+also be ended with `POST /v1/slips/{id}/abandon`; an already-terminal one ignores that call
+(I4) and keeps its claim, so use the step-then-release route there. Then re-run the down.
 
 ### 3. Client Initialization Pattern
 

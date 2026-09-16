@@ -71,15 +71,34 @@ func ReleaseMarker(status SlipStatus, releasedBy, reason string) StateHistoryEnt
 // PushParsedStep is the library's own bookkeeping step: the push path writes it
 // (handlePushRetry resets it to running on every deduplicated push) and no post-job ever
 // reports it, so it can never mean claimant work is in flight and RunInFlight ignores it.
+//
+// The exemption is by name, and that is deliberate rather than a shortcut. The shipped
+// configs' step 0 is `builds`, an aggregate that build post-jobs report, so this is the one
+// step no reporter owns — and the exemption mirrors the one by-name write this library makes,
+// handlePushRetry's reset of the same step. A config whose step 0 were instead a
+// non-aggregate step that nothing ever reports would hold the claim open the same way; such
+// a slip also never completes, which initializeSlipForPush already documents.
 const PushParsedStep = "push_parsed"
 
 // RunInFlight reports whether any step, or any component inside an aggregate step, is
 // running or held (StepStatus.IsRunning). Components are checked as well as steps because an
 // aggregate step's own status can already read failed while a sibling component is still
-// building. Held counts as in flight because HoldStep writes it after StartStep, so the step
-// is already under way; a step that has not called StartStep yet is still pending and holds
-// nothing. Today's fleet never records held at all — a step waiting on prerequisites reads
-// pending, because the prerequisites endpoint is read-only and the CLI polls client-side.
+// building.
+//
+// Held counts as in flight because a held step is work the run has already committed to: it
+// is waiting on prerequisites and will proceed on its own. What holds nothing is a step never
+// reported at all, which reads pending. Note that `held` needs no StartStep before it —
+// HoldStep writes it directly, and WaitForPrerequisites writes it as its FIRST action — so
+// "held implies started" is not a property to lean on; "held implies committed" is.
+//
+// The operational consequence: WaitForPrerequisites returns on its ctx.Done() arms without
+// resolving the step, so a process killed mid-wait leaves the step `held` and the claim held
+// with it, exactly as a killed `running` step does. The way out is the recovery route on
+// ErrNotClaimed in errors.go — resolve the step, then release. Which helper a caller used
+// decides what it sees: this library's WaitForPrerequisites records `held`, while the CLI's
+// client-side poll of the read-only prerequisites endpoint records nothing and leaves the
+// step `pending`.
+//
 // PushParsedStep is skipped: it is the library's own bookkeeping, reset to running by
 // every deduplicated push and never completed by a post-job, so counting it would make a
 // deduped claimed slip unreleasable. This is the one definition of "work in flight" the
@@ -105,47 +124,95 @@ func RunInFlight(slip *Slip) bool {
 
 // DecideClaim is the claim decision, shared by PostgresStore and both test doubles so the
 // three cannot drift. status is the row's current status and claimedFrom its recorded claim
-// ("" when unclaimed). A non-empty expected is a compare-and-set on status: a mismatch is
-// ErrClaimPreconditionFailed and the store writes nothing. Otherwise the claim is granted:
-// write reports whether the store must record it (claimed_from plus a marker) or the slip is
-// already claimed and this is the idempotent no-op arm. prior is the status to report — the
-// current one on a fresh claim, the recorded one on a repeat. A slip with no status at all is
-// refused outright: recording it would write claimed_from = "", which every reader — the
-// repave guard, the push fast path, DecideRelease — treats as unclaimed.
+// ("" when unclaimed). prior is the status to report — the current one on a fresh claim, the
+// recorded one on a repeat — and write reports whether the store must record the claim
+// (claimed_from plus a marker) or this is the idempotent no-op arm.
+//
+// A slip with no status at all is refused outright: recording it would write
+// claimed_from = "", which every reader — the repave guard, the push fast path,
+// DecideRelease — treats as unclaimed.
+//
+// A FRESH claim is a compare-and-set on the CURRENT status. A nil or empty expected admits
+// any status EXCEPT an unclaimed in_progress: a row reading in_progress with no claim
+// recorded is a live run nothing has adopted, and claiming one silently would let a rerun
+// dispatch on top of a pipeline already in flight. A caller that does mean to claim a live
+// run says so by listing in_progress in expected — the Slippy CLI pre-job claims out of
+// every non-terminal status and does exactly that; pushhookparser's rerunner claims out of
+// the ended set and is the caller this refusal protects.
+//
+// A REPEAT claim on a held claim is an idempotent no-op returning the RECORDED prior, and
+// expected is checked against that recorded prior rather than the current status. A retry
+// after a lost response therefore passes, because the prior it agreed to is the one on the
+// row and the run may have moved the status since; a DIFFERENT claimant whose expected
+// excludes the recorded prior is refused rather than handed a claim it did not agree to.
 func DecideClaim(status, claimedFrom SlipStatus, expected []SlipStatus) (prior SlipStatus, write bool, err error) {
 	if status == "" {
 		return "", false, fmt.Errorf("slip has no status: %w", ErrClaimPreconditionFailed)
 	}
-	if len(expected) > 0 && !slices.Contains(expected, status) {
-		return "", false, fmt.Errorf("status %s not in %v: %w", status, expected, ErrClaimPreconditionFailed)
+	if claimedFrom == "" && status == SlipStatusInProgress && !slices.Contains(expected, SlipStatusInProgress) {
+		return "", false, fmt.Errorf("in_progress with no claim recorded is a live run: %w",
+			ErrClaimPreconditionFailed)
 	}
 	if claimedFrom != "" {
+		if len(expected) > 0 && !slices.Contains(expected, claimedFrom) {
+			return "", false, fmt.Errorf("already claimed out of %s, not in %v: %w",
+				claimedFrom, expected, ErrClaimPreconditionFailed)
+		}
 		return claimedFrom, false, nil
+	}
+	if len(expected) > 0 && !slices.Contains(expected, status) {
+		return "", false, fmt.Errorf("status %s not in %v: %w", status, expected, ErrClaimPreconditionFailed)
 	}
 	return status, true, nil
 }
 
-// DecideRelease is the release decision, shared the same way. nil means clear the claim.
-// ErrNotClaimed when there is none; ErrRunInFlight when the claim is held and the run still
-// has a step or component running or held — releasing then would expose that work to a
-// same-commit repave, so the release is refused and the caller's later release, or the
-// terminal status write, ends the claim instead.
-func DecideRelease(slip *Slip) error {
+// ReleaseOutcome is what a release decided. Released reports whether the claim was ended —
+// claimed_from cleared and a release marker appended — and Released=false means the claim is
+// held because work is in flight and NOTHING was written. That is information, not a failure:
+// every post-job of a run releases on exit, so all but the last take the false arm and the
+// one that finds nothing in flight clears the claim.
+//
+// Status is the slip's status at decision time in BOTH cases — a release never changes it.
+type ReleaseOutcome struct {
+	// Released is true when this call cleared the claim, false when it was kept.
+	Released bool
+
+	// Status is the slip's status when the decision was made, whichever arm was taken.
+	Status SlipStatus
+}
+
+// DecideRelease is the release decision, shared the same way. It answers only whether the
+// store must clear the claim; the status the caller reports comes from the same read.
+//
+//   - ErrSlipNotFound when slip is nil, so a store that hands over nothing cannot be read as
+//     "nothing to release".
+//   - ErrNotClaimed when claimed_from is empty — the normal outcome once a terminal status
+//     write already ended the claim.
+//   - (false, nil) when the claim is held and the run still has a step or component running
+//     or held: releasing then would expose that work to a same-commit repave, so nothing is
+//     written and a later release, or the terminal status write, ends the claim instead.
+//   - (true, nil) otherwise: the run is quiescent, clear the claim.
+func DecideRelease(slip *Slip) (release bool, err error) {
+	if slip == nil {
+		return false, ErrSlipNotFound
+	}
 	if slip.ClaimedFrom == "" {
-		return ErrNotClaimed
+		return false, ErrNotClaimed
 	}
 	if RunInFlight(slip) {
-		return ErrRunInFlight
+		return false, nil
 	}
-	return nil
+	return true, nil
 }
 
 // ClaimSlip records that a run is in flight against a slip, so a same-commit push
 // deduplicates onto it instead of repaving it (DEVOPS-285, DEVOPS-367). The claim is a flag:
 // it never changes the slip's status, and it lives until the run is over — released by a
 // post-job once nothing is in flight, or ended by a terminal status write. expected is a
-// compare-and-set on the current status; nil admits any status. A repeat claim on a held
-// claim is an idempotent no-op returning the recorded prior. See SlipStore.ClaimSlip.
+// compare-and-set on the current status; nil admits any status except an unclaimed
+// in_progress, which is a live run — a caller that means to claim one lists in_progress in
+// expected. A repeat claim on a held claim is an idempotent no-op returning the recorded
+// prior, with expected checked against that recorded prior. See SlipStore.ClaimSlip.
 func (c *Client) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 ) (SlipStatus, error) {
@@ -167,24 +234,37 @@ func (c *Client) ClaimSlip(
 // calls it on exit, and must have written its own step's terminal status first: quiescence is
 // judged from the row, so a post-job that releases before recording its step counts itself as
 // in flight and no post-job of the run ever clears the claim. While a sibling step or
-// component is still running or held the release is refused with ErrRunInFlight and nothing is
-// written, so the last post-job's release is the one that clears it. An unclaimed slip is
-// ErrNotClaimed — the normal outcome after a terminal status write already ended the claim.
-// The status is never changed; the returned value is the status at release.
-// See SlipStore.ReleaseClaim.
+// component is still running or held the claim is KEPT — ReleaseOutcome{Released: false} with
+// nothing written, not an error — so the last post-job's release is the one that clears it.
+// An unclaimed slip is ErrNotClaimed, the normal outcome after a terminal status write
+// already ended the claim. The status is never changed; ReleaseOutcome.Status is the status
+// at decision time on either arm. See SlipStore.ReleaseClaim.
 func (c *Client) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
-) (SlipStatus, error) {
+) (ReleaseOutcome, error) {
 	ctx, span := StartSpan(ctx, "ReleaseClaim", correlationID)
 	defer span.End()
-	status, err := c.store.ReleaseClaim(ctx, correlationID, releasedBy, reason)
+	out, err := c.store.ReleaseClaim(ctx, correlationID, releasedBy, reason)
 	if err != nil {
-		return "", NewSlipError("release claim", correlationID, err)
+		return ReleaseOutcome{}, NewSlipError("release claim", correlationID, err)
 	}
-	c.logger.Info(ctx, "Released slip claim", map[string]interface{}{
+	msg := "Released slip claim"
+	if !out.Released {
+		msg = "Slip claim kept: work in flight"
+	}
+	c.logger.Info(ctx, msg, map[string]interface{}{
 		"correlation_id": correlationID,
-		"status":         string(status),
+		"status":         string(out.Status),
+		"released":       out.Released,
 		"released_by":    releasedBy,
 	})
-	return status, nil
+	return out, nil
+}
+
+// ProbeSchema is the readiness gate consumers reach through the abstraction they hold: it
+// checks the store's SELECT column list against the live schema and reports ErrSchemaBehind
+// when the database is behind this library. A store with no schema of its own (ClickHouse)
+// returns nil. See SlipStore.ProbeSchema.
+func (c *Client) ProbeSchema(ctx context.Context) error {
+	return c.store.ProbeSchema(ctx)
 }

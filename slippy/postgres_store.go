@@ -98,13 +98,11 @@ func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 		args = append(args, vals[i])
 		n++
 	}
-	// claimed_from is SELECT-only: a caller's snapshot never carries an authoritative claim,
-	// so it is not in slipColumns() and this write cannot clear a claim it never loaded. The
-	// one exception is the same rule UpdateSlipStatus applies — a terminal status ends the
-	// run, so it ends the claim (PromoteSlip reaches a terminal status through this path).
-	if slip.Status.IsTerminal() {
-		sets = append(sets, "claimed_from = NULL")
-	}
+	// claimed_from is SELECT-only: it is not in slipColumns(), so a full-row write never ends
+	// a claim WHATEVER STATUS IT CARRIES. That status came from the caller's own snapshot and
+	// a claim may have been taken after the read, so clearing on it would end a claim this
+	// caller never saw — and rewrite stale history with it. Terminal transitions go through
+	// UpdateSlipStatus instead: AbandonSlip, PromoteSlip and checkPipelineCompletion all do.
 	args = append(args, slip.CorrelationID)
 
 	query := fmt.Sprintf("UPDATE routing_slips SET %s WHERE correlation_id = $%d",
@@ -137,24 +135,50 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 	return s.queryOne(ctx, query, correlationID)
 }
 
-// ProbeSchema verifies that routing_slips carries every column this store's SELECTs require.
-// It exists because slipSelectColumns() appends claimed_from unconditionally: against a
-// database still at v5, Load, LoadByCommit, FindByCommits and every other read fail with
-// 42703, so an API pod that starts before the migrator has applied v6 serves no slip
-// operation at all. Callers run it once at startup and treat ErrSchemaBehind as "not ready".
+// ProbeSchema verifies that routing_slips carries every column this store's SELECTs name —
+// the whole slipSelectColumns() list, not one column of it. It exists because every read path
+// selects that list verbatim, so a single missing column fails Load, LoadByCommit,
+// FindByCommits and the rest with Postgres 42703: a process that starts before the migrator
+// has caught up serves no slip operation at all. Callers run it once at startup and treat
+// ErrSchemaBehind as "not ready".
 //
-// to_regclass of a missing table is NULL, so attrelid = NULL matches nothing and the probe
-// reports behind — the right answer for an unmigrated database too.
+// Checking the full list rather than claimed_from alone covers the other producible ordering
+// too: slipColumns() derives its step columns from the pipeline config, so a config deployed
+// ahead of the migration that adds that step's _status column is the same failure, and this
+// probe catches it with the same answer.
+//
+// to_regclass of a missing table is NULL, so attrelid = NULL matches nothing, every column
+// reads as absent and the probe reports behind — the right answer for an unmigrated database.
 func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
-	var present bool
-	err := s.pool.QueryRow(ctx,
-		"SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
-			"AND attname = $1 AND NOT attisdropped)", ColumnClaimedFrom).Scan(&present)
+	rows, err := s.pool.Query(ctx,
+		"SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
+			"AND NOT attisdropped AND attnum > 0")
 	if err != nil {
 		return fmt.Errorf("probe routing_slips schema: %w", err)
 	}
-	if !present {
-		return fmt.Errorf("routing_slips.%s missing (migration v6 not applied): %w", ColumnClaimedFrom, ErrSchemaBehind)
+	defer rows.Close()
+
+	present := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if scanErr := rows.Scan(&name); scanErr != nil {
+			return fmt.Errorf("probe routing_slips schema: %w", scanErr)
+		}
+		present[name] = struct{}{}
+	}
+	if rows.Err() != nil {
+		return fmt.Errorf("probe routing_slips schema: %w", rows.Err())
+	}
+
+	var missing []string
+	for _, col := range s.slipSelectColumns() {
+		if _, ok := present[col]; !ok {
+			missing = append(missing, col)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("routing_slips missing columns %v (apply migrations before serving): %w",
+			missing, ErrSchemaBehind)
 	}
 	return nil
 }
@@ -344,25 +368,10 @@ func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 		slip.ClaimedFrom = SlipStatus(*sc.claimedFrom)
 	}
 
-	slip.Steps = make(map[string]Step, len(s.config.Steps))
-	for i, step := range s.config.Steps {
-		slip.Steps[step.Name] = Step{Status: StepStatus(sc.stepStatuses[i])}
-	}
+	slip.Steps = s.stepsFromStatuses(sc.stepStatuses)
 	mergeStepDetailsJSON(slip, sc.stepDetails)
 
-	slip.Aggregates = make(map[string][]ComponentStepData, len(sc.aggregateCols))
-	for i, col := range sc.aggregateCols {
-		var wrapper struct {
-			Items []ComponentStepData `json:"items"`
-		}
-		if len(sc.aggregateBytes[i]) > 0 {
-			if err := json.Unmarshal(sc.aggregateBytes[i], &wrapper); err != nil {
-				// Leave this aggregate unset on malformed JSON, matching the CH scanner.
-				continue
-			}
-		}
-		slip.Aggregates[col] = wrapper.Items
-	}
+	slip.Aggregates = decodeAggregates(sc.aggregateCols, sc.aggregateBytes)
 
 	if len(sc.stateHistory) > 0 {
 		var wrapper struct {
@@ -378,18 +387,53 @@ func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 	return slip
 }
 
+// stepsFromStatuses turns the scanned per-step status strings — always in s.config.Steps
+// order, the order slipColumns() and claimStateColumns() both emit — into the Steps map.
+// Shared by populate and loadClaimStateTx so the two reads cannot disagree about the mapping.
+func (s *PostgresStore) stepsFromStatuses(statuses []string) map[string]Step {
+	steps := make(map[string]Step, len(s.config.Steps))
+	for i, step := range s.config.Steps {
+		steps[step.Name] = Step{Status: StepStatus(statuses[i])}
+	}
+	return steps
+}
+
+// decodeAggregates unwraps the {"items": [...]} envelope each aggregate jsonb column holds,
+// for cols and raw in the same order. A NULL or empty column leaves that aggregate as an
+// empty slice; a malformed one leaves it unset rather than failing the read, matching the
+// ClickHouse scanner. Shared by populate and loadClaimStateTx.
+func decodeAggregates(cols []string, raw [][]byte) map[string][]ComponentStepData {
+	aggregates := make(map[string][]ComponentStepData, len(cols))
+	for i, col := range cols {
+		var wrapper struct {
+			Items []ComponentStepData `json:"items"`
+		}
+		if len(raw[i]) > 0 {
+			if err := json.Unmarshal(raw[i], &wrapper); err != nil {
+				continue
+			}
+		}
+		aggregates[col] = wrapper.Items
+	}
+	return aggregates
+}
+
 // claimStateColumns returns exactly the columns DecideRelease reads, in scan order:
 // claimed_from, status, every configured step's status column (slipColumns()' naming), then
 // every aggregate column (aggregateColumns()). It is deliberately NOT slipSelectColumns():
 // state_history and step_details are the two columns that grow without bound on a busy slip,
 // and the release decision reads neither, so keeping them out of the FOR UPDATE read keeps
 // the lock held over a bounded amount of data (DEVOPS-367).
-func (s *PostgresStore) claimStateColumns() []string {
-	cols := []string{ColumnClaimedFrom, ColumnStatus}
+//
+// The aggregate names are returned alongside so the caller can decode the jsonb destinations
+// without recomputing them.
+func (s *PostgresStore) claimStateColumns() (cols, aggregateCols []string) {
+	cols = []string{ColumnClaimedFrom, ColumnStatus}
 	for _, step := range s.config.Steps {
 		cols = append(cols, step.Name+"_status")
 	}
-	return append(cols, s.aggregateColumns()...)
+	aggregateCols = s.aggregateColumns()
+	return append(cols, aggregateCols...), aggregateCols
 }
 
 // loadClaimStateTx reads only the claim state under FOR UPDATE inside tx, so the quiescence
@@ -400,8 +444,7 @@ func (s *PostgresStore) claimStateColumns() []string {
 // a release neither reads nor writes them. Do not hand the result to anything but the release
 // decision.
 func (s *PostgresStore) loadClaimStateTx(ctx context.Context, tx pgx.Tx, correlationID string) (*Slip, error) {
-	cols := s.claimStateColumns()
-	aggCols := s.aggregateColumns()
+	cols, aggCols := s.claimStateColumns()
 
 	var claimedFrom *string
 	var statusStr string
@@ -429,24 +472,8 @@ func (s *PostgresStore) loadClaimStateTx(ctx context.Context, tx pgx.Tx, correla
 	if claimedFrom != nil {
 		slip.ClaimedFrom = SlipStatus(*claimedFrom)
 	}
-	slip.Steps = make(map[string]Step, len(s.config.Steps))
-	for i, step := range s.config.Steps {
-		slip.Steps[step.Name] = Step{Status: StepStatus(stepStatuses[i])}
-	}
-	// Same {"items": [...]} wrapper populate() unmarshals, and the same tolerance: a
-	// malformed aggregate leaves that step's components unset rather than failing the read.
-	slip.Aggregates = make(map[string][]ComponentStepData, len(aggCols))
-	for i, col := range aggCols {
-		var wrapper struct {
-			Items []ComponentStepData `json:"items"`
-		}
-		if len(aggregateBytes[i]) > 0 {
-			if err := json.Unmarshal(aggregateBytes[i], &wrapper); err != nil {
-				continue
-			}
-		}
-		slip.Aggregates[col] = wrapper.Items
-	}
+	slip.Steps = s.stepsFromStatuses(stepStatuses)
+	slip.Aggregates = decodeAggregates(aggCols, aggregateBytes)
 	return slip, nil
 }
 

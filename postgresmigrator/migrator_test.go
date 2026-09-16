@@ -355,6 +355,34 @@ func TestMigrationError_IsErrMigrationFailed(t *testing.T) {
 	}
 }
 
+// A revert failure is singled out by its own sentinel, keyed on OperationDown — the reason
+// Operation is a constant rather than a string literal at each constructor site. slippy's
+// migration v6 down refuses while any claim is held, and an operator's tooling needs to tell
+// that refused rollback from a failed roll-forward. Mirrors clickhousemigrator's test of the
+// same name.
+func TestMigrationError_RevertSentinelKeyedOnOperationDown(t *testing.T) {
+	base := errors.New("boom")
+
+	down := &MigrationError{Version: 3, Name: "add_col", Operation: OperationDown, Err: base}
+	if !errors.Is(down, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must match ErrMigrationRevertFailed", OperationDown)
+	}
+	if !errors.Is(down, ErrMigrationFailed) {
+		t.Error("a down failure is still a migration failure")
+	}
+	if !errors.Is(down, base) {
+		t.Error("the cause must stay reachable through errors.Is")
+	}
+
+	up := &MigrationError{Version: 3, Name: "add_col", Operation: OperationUp, Err: base}
+	if errors.Is(up, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must not match ErrMigrationRevertFailed", OperationUp)
+	}
+	if !errors.Is(up, ErrMigrationFailed) {
+		t.Error("an up failure is a migration failure")
+	}
+}
+
 // Unwrap() []error is the shape errors.Is and errors.As need to see both the sentinel and
 // the cause, but errors.Unwrap only calls the single-error form and returns nil for it. A
 // caller that reached the driver error with errors.Unwrap(err) or migErr.Unwrap() before

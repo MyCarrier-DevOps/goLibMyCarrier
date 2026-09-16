@@ -49,8 +49,10 @@ type Slip struct {
 	// this slip. Its value is the status the slip had when ClaimSlip recorded the claim, kept
 	// for the audit trail only — it implies nothing about the current Status, which the claim
 	// never writes. Set by ClaimSlip; cleared by ReleaseClaim once nothing is in flight, or by
-	// a terminal status write. SELECT-only in Postgres: Create and the full-row Update never
-	// write it. Not a ClickHouse column.
+	// UpdateSlipStatus on a terminal status — that atomic status write is the ONE write path
+	// that ends a claim. SELECT-only in Postgres: neither Create nor the full-row Update
+	// writes the column, whatever status they carry, so a caller's snapshot can never end a
+	// claim it did not see. Not a ClickHouse column.
 	ClaimedFrom SlipStatus `json:"claimed_from,omitempty" ch:"-"`
 
 	// Steps maps step names to their current state

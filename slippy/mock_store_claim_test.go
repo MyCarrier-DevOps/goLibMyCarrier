@@ -14,7 +14,7 @@ import (
 func TestMockStore_ClaimIsAFlag(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("copies, Update and Create keep claimed_from; a terminal Update clears it", func(t *testing.T) {
+	t.Run("copies, Update and Create keep claimed_from whatever status they carry", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed})
 		_, err := store.ClaimSlip(ctx, "c", nil, "cli", "")
@@ -29,14 +29,24 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		require.NoError(t, store.Create(ctx, &Slip{CorrelationID: "c", Status: SlipStatusInProgress}))
 		got, _ = store.Load(ctx, "c")
 		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "a redelivered Create keeps the claim, as ON CONFLICT does")
+		// Inverted deliberately (PR #87 re-review): a terminal Update used to end the claim.
+		// Its status comes from the caller's snapshot, so a claim taken after that read would
+		// be cleared by a writer that never saw it; UpdateSlipStatus is the one path that ends
+		// a claim.
 		snapshot, _ = store.Load(ctx, "c")
 		snapshot.Status = SlipStatusPromoted
 		require.NoError(t, store.Update(ctx, snapshot))
 		got, _ = store.Load(ctx, "c")
-		assert.Empty(t, got.ClaimedFrom, "a terminal Update ends the claim")
+		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "a terminal Update still cannot end the claim")
+		require.NoError(t, store.UpdateSlipStatus(ctx, "c", SlipStatusPromoted))
+		got, _ = store.Load(ctx, "c")
+		assert.Empty(t, got.ClaimedFrom, "the atomic status write is what ends it")
 	})
 
-	t.Run("claim never writes status; repeat claim is a no-op checked against the current status", func(t *testing.T) {
+	// Inverted deliberately (PR #87 re-review): the repeat arm used to compare expected
+	// against the CURRENT status, which refused the very retry the idempotent arm exists for
+	// once the run had moved the row on.
+	t.Run("claim never writes status; repeat claim is a no-op checked against the RECORDED prior", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed})
 		prior, err := store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "first", "")
@@ -48,21 +58,42 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		prior, err = store.ClaimSlip(ctx, "c", nil, "second", "")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusFailed, prior, "the recorded prior")
-		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
+		prior, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
+		require.NoError(t, err, "the retry agreed to failed, which is the recorded prior")
+		assert.Equal(t, SlipStatusFailed, prior)
+		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusCompleted}, "fourth", "")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to failed is refused")
 	})
 
-	t.Run("release refused while in flight, clears when quiescent, never writes status", func(t *testing.T) {
+	// A live run nothing has claimed is not adoptable by a caller that named no status.
+	t.Run("nil expected refuses an unclaimed in_progress; an explicit one claims it", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&Slip{CorrelationID: "live", Status: SlipStatusInProgress})
+		_, err := store.ClaimSlip(ctx, "live", nil, "rerunner", "")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
+		got, _ := store.Load(ctx, "live")
+		assert.Empty(t, got.ClaimedFrom, "nothing written")
+		prior, err := store.ClaimSlip(ctx, "live", []SlipStatus{SlipStatusInProgress}, "cli/prejob", "")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusInProgress, prior)
+	})
+
+	// Inverted deliberately (PR #87 re-review): the in-flight arm was ErrRunInFlight. It is
+	// ReleaseOutcome{Released: false} with nothing written — information, not a failure.
+	t.Run("release keeps the claim while in flight, clears when quiescent, never writes status", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "r", Status: SlipStatusFailed, Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
 		_, err := store.ClaimSlip(ctx, "r", nil, "cli", "")
 		require.NoError(t, err)
-		_, err = store.ReleaseClaim(ctx, "r", "cli", "")
-		require.ErrorIs(t, err, ErrRunInFlight)
-		require.NoError(t, store.UpdateStep(ctx, "r", "builds", "", StepStatusCompleted))
-		status, err := store.ReleaseClaim(ctx, "r", "cli", "")
+		out, err := store.ReleaseClaim(ctx, "r", "cli", "")
 		require.NoError(t, err)
-		assert.Equal(t, SlipStatusFailed, status)
+		assert.False(t, out.Released)
+		assert.Equal(t, SlipStatusFailed, out.Status)
+		require.NoError(t, store.UpdateStep(ctx, "r", "builds", "", StepStatusCompleted))
+		out, err = store.ReleaseClaim(ctx, "r", "cli", "")
+		require.NoError(t, err)
+		assert.True(t, out.Released)
+		assert.Equal(t, SlipStatusFailed, out.Status)
 		got, _ := store.Load(ctx, "r")
 		assert.Equal(t, SlipStatusFailed, got.Status)
 		assert.Empty(t, got.ClaimedFrom)

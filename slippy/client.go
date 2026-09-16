@@ -208,16 +208,15 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 		return nil
 	}
 
-	slip.Status = SlipStatusPromoted
-	slip.PromotedTo = promotedTo
-
-	// Unlike AbandonSlip, PromoteSlip is not (yet) on the atomic UpdateSlipStatus path: it also
-	// sets PromotedTo, which neither store persists today (no promoted_to column), so switching
-	// would be a no-op for that field in prod but would break the mock-backed tests that assert
-	// PromotedTo round-trips. Fixing this RMW is entangled with deciding whether to persist
-	// PromotedTo — tracked as a follow-up (DEVOPS-202). The full-row Update is at least
-	// serialized now, since PostgresStore.Update takes the per-slip lock.
-	if err := c.store.Update(ctx, slip); err != nil {
+	// Promote changes only the top-level status, so it takes the same atomic status write
+	// AbandonSlip does. PromotedTo is persisted by NEITHER store (there is no promoted_to
+	// column), so the full-row Update this replaced bought nothing for that field while
+	// costing a Load→Update snapshot race: it rewrote every column from a snapshot taken
+	// before the write, clobbering concurrent step and history writes. And the atomic status
+	// write is what ends the claim — UpdateSlipStatus is the one write path that does, so a
+	// promotion of a claimed slip releases it here rather than relying on the snapshot's
+	// status. Whether to persist PromotedTo at all remains DEVOPS-202.
+	if err := c.store.UpdateSlipStatus(ctx, correlationID, SlipStatusPromoted); err != nil {
 		return NewSlipError("promote", correlationID, err)
 	}
 

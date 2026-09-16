@@ -58,7 +58,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 | **I1** | `slip=in_progress` while any step is a primary failure (`status ∈ {failed, error, timeout}`) → **violation** |
 | **I2** | `slip=failed` with zero primary failures → **violation** |
 | **I3** | `slip=completed` while any step is a primary failure OR `status = running` → **violation** |
-| **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335). **Known exception path:** slippy-api's `POST /slips/{id}/claim` writes `in_progress` unconditionally and does not refuse a `completed` prior status — see "An ended row may have work in flight against it" under the repave sharp edges |
+| **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335). **Formerly an exception path:** slippy-api's `POST /v1/slips/{id}/claim` wrote `in_progress` unconditionally under DEVOPS-285; since DEVOPS-367 the claim is a flag and writes no status at all, so it no longer touches `slip.status` — see "An ended row may have work in flight against it" under the repave sharp edges |
 | **I5** | `routing_slips.<step>_status` column does not match event-log-derived status (via `argMax(status, timestamp) FROM slip_component_states GROUP BY step`) → **materialization violation** |
 
 **Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative event log in `slip_component_states`. Divergence indicates a write-path bug, not a state-machine logic bug.
@@ -354,17 +354,24 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   same commit's push repaved while the slip was `failed` and deduplicated onto the rerun's
   correlation ID six seconds after the claim.
 
-  The claim, as of DEVOPS-367 (goLibMyCarrier ≥ v1.3.103), is a **flag**: `claimed_from`
-  set means a run is in flight against the slip. Four properties:
+  The claim, as of DEVOPS-367 (goLibMyCarrier ≥ v1.4.0), is a **flag**: `claimed_from`
+  set means a run is in flight against the slip — running or held steps and components, which
+  is what `RunInFlight` counts. It protects *that*, and nothing wider: the gap between one
+  step's last post-job and the next step's pre-job is not covered, and closing it is tracked
+  as **DEVOPS-371** (a dispatcher-held claim). Four properties:
 
   - **It never writes `status`.** `SlipStore.ClaimSlip` locks the row, compare-and-sets on
     the *current* status (`if_status` on the API; a mismatch is `ErrClaimPreconditionFailed`
     with nothing written), appends the `slip_claimed` marker and sets `claimed_from` to the
     status the row had — as an audit record, not as something to restore. `nil` admits any
-    status, a live `in_progress` included; a slip with no status at all is refused. A repeat
-    claim on a held claim is an idempotent no-op returning the recorded prior — no second
-    marker — because every pre-job of one run claims the same slip and a retry after a lost
-    response *is* the recovery. The status column stays the pipeline's alone, so
+    status EXCEPT an unclaimed `in_progress`, which is a live run nothing has adopted: a
+    caller that means to claim one lists `in_progress` in `if_status` (the Slippy CLI pre-job
+    does; the rerunner, which names only the ended set, is what the refusal protects). A slip
+    with no status at all is refused. A repeat claim on a held claim is an idempotent no-op
+    returning the recorded prior — no second marker — and `if_status` is then checked against
+    that *recorded prior* rather than the current status, so a retry after a lost response
+    passes even once the run has moved the row on, while a different claimant that never
+    agreed to the recorded prior is refused. The status column stays the pipeline's alone, so
     `checkPipelineCompletion`'s terminal bypass keeps protecting `completed` and `promoted`
     even when they are claimed.
   - **While it is held, the row cannot be repaved.** `Repave` refuses a row with
@@ -378,19 +385,22 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     even while steps are still running, and both are repaveable — an ancestor abandon or a
     promotion deliberately overrides a live claim.
   - **It ends when the run is over, and only then.** Two ways: a **terminal status write**
-    (`UpdateSlipStatus` or a full-row `Update` with a terminal status — `PromoteSlip` takes
-    that path) clears it, because terminal ends the run; or a **release**.
-    `SlipStore.ReleaseClaim` (`POST /v1/slips/{id}/release`) reads the claim state — the
-    claim, the status and every step and aggregate column, and nothing else — `FOR UPDATE`
-    and clears the claim only if no step or component is running or held; otherwise it is
-    `ErrRunInFlight` with nothing written. Each post-job must write its own step's terminal
-    status before it releases, or it counts itself as in flight and no post-job of the run
-    ever clears the claim. `push_parsed`, the library's own
-    bookkeeping step, never counts as in flight. Every post-job releases on exit, so the
-    last one — the one that finds nothing in flight — clears it. A release never writes
-    `status`. Nothing else ends a claim: not a `failed` write, not the reconcile branch's
-    `in_progress`, not the passage of time. There is no claim owner; `claimed_by` and
-    `released_by` are audit strings.
+    through `UpdateSlipStatus` — the ONE write path that ends a claim, which `AbandonSlip`,
+    `PromoteSlip` and `checkPipelineCompletion` all take — clears it, because terminal ends
+    the run; or a **release**. `SlipStore.ReleaseClaim` (`POST /v1/slips/{id}/release`) reads
+    the claim state — the claim, the status and every step and aggregate column, and nothing
+    else — `FOR UPDATE` and clears the claim only if no step or component is running or held;
+    otherwise it returns `ReleaseOutcome{Released: false}` with nothing written, which is
+    information rather than an error (all but the last of a run's N post-job releases take
+    that arm). Each post-job must write its own step's terminal status before it releases, or
+    it counts itself as in flight and no post-job of the run ever clears the claim.
+    `push_parsed`, the library's own bookkeeping step, never counts as in flight. Every
+    post-job releases on exit, so the last one — the one that finds nothing in flight —
+    clears it. A release never writes `status`. Nothing else ends a claim: not `Create`, not
+    the full-row `Update` (whatever status either carries — that status is the caller's own
+    snapshot, and a claim may have been taken since it was read), not a `failed` write, not
+    the reconcile branch's `in_progress`, not the passage of time. There is no claim owner;
+    `claimed_by` and `released_by` are audit strings.
   - **Recovery from a dead run is the workflow exit hook, never a clock.** A workflow that
     dies mid-step leaves its step `running`, which blocks release until Argo's
     workflow-level `hooks.exit` runs `slippy-post-job` and writes the step's result (every
@@ -399,17 +409,23 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     No component decides a run is dead by elapsed time: a long build is indistinguishable
     from a wedge by status, so any bound would either repave live runs or be too long to
     matter. When the exit hook cannot run at all — the cluster is gone, the workflow was
-    deleted — the operator remedy is an **abandon**: `Client.AbandonSlip`
-    (`POST /v1/slips/{id}/abandon`) writes the terminal `abandoned` through
-    `UpdateSlipStatus`, which clears `claimed_from`, and `abandoned` is in
-    `repaveableSlipStatusesSQL`, so the next same-commit push repaves. Nothing else reaps
-    that state: pushhookparser's stranded-slip cleanup deliberately skips a claimed slip —
-    the claim is precisely what tells it a run owns the row — so the abandon is the only way
-    out.
+    deleted — **the stuck step is what holds the claim**, so the remedy that works in every
+    state is to resolve it (`POST /v1/slips/{id}/steps/{step}/complete`, or fail or skip it)
+    and then `POST /v1/slips/{id}/release`, which now finds nothing in flight. On a
+    **non-terminal** slip `POST /v1/slips/{id}/abandon` also ends the claim, because
+    `AbandonSlip` writes the terminal `abandoned` through `UpdateSlipStatus` and `abandoned`
+    is in `repaveableSlipStatusesSQL`. On an **already-terminal** slip it does not:
+    `checkTerminalStatus` returns early and `AbandonSlip` returns nil without writing (I4), so
+    the operator sees success and the claim survives — and terminal-claimed rows are ordinary,
+    since the rerunner claims out of the ended set, four of whose statuses are terminal. Use
+    the step-then-release route there. Nothing reaps the state on its own: pushhookparser's
+    stranded-slip cleanup deliberately skips a claimed slip — the claim is precisely what
+    tells it a run owns the row.
 
-  What the claim does not cover, stated plainly: the **gap between two workflows of one
-  run** — after the last post-job of one phase releases and before the next phase's pre-job
-  claims (an Argo sensor dispatch: seconds to minutes) — is a stretch with no claim held.
+  What the claim does not cover, stated plainly (tracked as **DEVOPS-371**, a
+  dispatcher-held claim): the **gap between two workflows of one run** — after the last
+  post-job of one phase releases and before the next phase's pre-job claims (an Argo sensor
+  dispatch: seconds to minutes) — is a stretch with no claim held.
   When the row also sits at a repaveable status — the `failed`-rerun case the claim was
   built for, not the healthy run whose row sits at `in_progress` and is protected by
   `IsLive()` — a same-commit push in that gap repaves and starts the commit over, and the
@@ -418,11 +434,12 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   *in flight*, not work that has not started. A step left `running` by a run that never
   reports (an `argo terminate`, a lost cluster) holds the claim until something writes that
   step; the rerunner still works (its claim is the idempotent no-op) and a same-commit push
-  deduplicates rather than repaving. The gap is **per step, not per run**: a step that has
-  not called `StartStep` yet is `pending` — including one waiting on prerequisites, which
-  the fleet never records as `held` — and holds nothing, so once the concurrent work
-  finishes, the first post-job to exit clears the claim even though later steps of the same
-  run are still to be dispatched.
+  deduplicates rather than repaving. The gap is **per step, not per run**: a step never reported at all is
+  `pending` and holds nothing — which is how the CLI's client-side poll of the read-only
+  prerequisites endpoint leaves a step waiting on prerequisites, whereas the library's own
+  `WaitForPrerequisites` writes `held` as its first action and so does hold the claim — so
+  once the concurrent work finishes, the first post-job to exit clears the claim even though
+  later steps of the same run are still to be dispatched.
 
   **A known resting state, pre-existing:** a partial clean rerun (some steps reset, the run
   not carried to an end) leaves the row at `status = in_progress` by way of the reconcile

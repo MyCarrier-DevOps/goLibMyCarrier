@@ -145,12 +145,12 @@ jobs:
       # TestPostgresStore_Claim*, TestPostgresStore_ReleaseClaim,
       # TestPostgresStore_Create_KeepsAnExistingClaim_Integration, the two terminal-write tests
       # (TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration and
-      # TestPostgresStore_Update_TerminalStatusEndsTheClaim_Integration) and
+      # TestPostgresStore_Update_NeverEndsTheClaim_Integration) and
       # TestClaimedFromMigration_V6* (DEVOPS-367) are included because the claim is a FOR UPDATE
       # transaction whose serialisation, the claimed_from guard on Repave's DELETE, Create's
       # ON CONFLICT arm leaving an existing claim alone, the terminal status write that clears
-      # the claim in real SQL, and v6's down guard are all properties of real Postgres locking
-      # and real DDL that pgxmock cannot exercise.
+      # the claim in real SQL (and the full-row Update that does NOT), and v6's down guard are
+      # all properties of real Postgres locking and real DDL that pgxmock cannot exercise.
       # TestPostgresStore_ProbeSchema_Integration is included for the same reason: it asserts
       # the probe reports ErrSchemaBehind against a real v5 schema AND that Load there fails
       # with the 42703 the probe exists to pre-empt, which only real DDL produces.
@@ -159,7 +159,7 @@ jobs:
         run: |
           go mod download
           go test -tags integration \
-            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry|TestPostgresStore_Claim|TestPostgresStore_ReleaseClaim|TestPostgresStore_Create_KeepsAnExistingClaim_Integration|TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration|TestPostgresStore_Update_TerminalStatusEndsTheClaim_Integration|TestPostgresStore_ProbeSchema_Integration|TestClaimedFromMigration_V6' \
+            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry|TestPostgresStore_Claim|TestPostgresStore_ReleaseClaim|TestPostgresStore_Create_KeepsAnExistingClaim_Integration|TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration|TestPostgresStore_Update_NeverEndsTheClaim_Integration|TestPostgresStore_ProbeSchema_Integration|TestClaimedFromMigration_V6' \
             -count=1 -timeout 10m ./...
 
   lint:

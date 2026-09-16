@@ -137,22 +137,20 @@ var (
 	// was written. This is the normal outcome when a terminal status write already ended
 	// the claim, and callers should treat it as "nothing to undo" rather than as a
 	// failure (DEVOPS-367).
+	//
+	// Work still in flight is NOT this error and not an error at all: the release returns
+	// ReleaseOutcome{Released: false} with nothing written, and a post-job must have written
+	// its own step's terminal status BEFORE it releases, or it counts itself as in flight and
+	// no post-job of the run ever clears the claim.
+	//
+	// Recovering a claim held by a run that will never release it: the stuck STEP is what
+	// holds the claim, so resolve it — POST /v1/slips/{id}/steps/{step}/complete, or fail or
+	// skip it — and then POST /v1/slips/{id}/release, which now finds nothing in flight. On a
+	// non-terminal slip POST /v1/slips/{id}/abandon also ends the claim, because AbandonSlip
+	// writes the terminal abandoned through UpdateSlipStatus. On an ALREADY-terminal slip it
+	// does not: AbandonSlip returns without writing (I4, terminal is monotonic), so the claim
+	// survives — use the step-then-release route there.
 	ErrNotClaimed = errors.New("slip is not currently claimed")
-
-	// ErrRunInFlight is returned by ReleaseClaim when the claim is held and the run still
-	// has a step or component running or held. Nothing was written: releasing then would
-	// expose that work to a same-commit repave. Every post-job releases on exit, so the
-	// last one — the one that finds nothing in flight — clears the claim; callers treat
-	// this as information, not failure (DEVOPS-367).
-	//
-	// A post-job must have written its own step's terminal status BEFORE it releases: this
-	// decision is read from the row, so a post-job that releases first counts itself as in
-	// flight and no post-job of the run ever clears the claim.
-	//
-	// If the run is dead — a step left running by a workflow that will never report — the
-	// exit is a terminal status write: Client.AbandonSlip (POST /slips/{id}/abandon) ends
-	// the claim and leaves the slip repaveable.
-	ErrRunInFlight = errors.New("claim held: the run still has work in flight")
 
 	// ErrClaimUnsupported indicates the store cannot perform ClaimSlip or ReleaseClaim at
 	// all: it has no claimed_from column and no transaction to make the claim atomic. The
@@ -165,11 +163,12 @@ var (
 	// ErrNotClaimed.
 	ErrClaimUnsupported = errors.New("store does not support ClaimSlip/ReleaseClaim")
 
-	// ErrSchemaBehind is returned by PostgresStore.ProbeSchema when routing_slips is missing a
-	// column this library's SELECTs require — today claimed_from (migration v6). Every read
-	// path selects that column, so a library ahead of its database fails every Load with
-	// Postgres 42703. Callers probe at startup and refuse to serve until the migrator has
-	// applied the schema (DEVOPS-367).
+	// ErrSchemaBehind is returned by PostgresStore.ProbeSchema when routing_slips is missing
+	// any column this library's SELECTs name — the whole slipSelectColumns() list, so
+	// claimed_from (migration v6) and every configured step's column alike. Every read path
+	// selects that list, so a library ahead of its database fails every Load with Postgres
+	// 42703. Callers probe at startup and refuse to serve until the migrator has applied the
+	// schema (DEVOPS-367).
 	ErrSchemaBehind = errors.New("routing_slips schema is behind this library; apply migrations before serving")
 )
 

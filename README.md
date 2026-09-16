@@ -103,11 +103,17 @@ This library follows [Semantic Versioning](https://semver.org/).
 
 ## Breaking changes
 
-### `postgresmigrator` / `clickhousemigrator`: `MigrationError.Unwrap()` returns `[]error` — since `v1.3.103` (DEVOPS-344)
+These are breaking, so the release is a **minor** bump, not a patch: the merge commit must be
+tagged `slippy/v1.4.0` (and the sibling modules likewise, since every module in this repo
+releases at one shared version). `.github/Gitversion.yml` carries `next-version: 1.4.0` plus
+the `ConfiguredNextVersion` strategy that makes that floor effective, so main's `Patch`
+increment cannot land these on consumers pinned to `v1.3.x` with no signal.
+
+### `postgresmigrator` / `clickhousemigrator`: `MigrationError.Unwrap()` returns `[]error` — since `v1.4.0` (DEVOPS-344)
 
 `MigrationError.Unwrap()` now returns `[]error` instead of a single `error`: the
-`ErrMigrationFailed` sentinel, plus `ErrMigrationRevertFailed` for a `clickhousemigrator`
-down, then the underlying cause. `errors.Is` and `errors.As` see all of them, so sentinel
+`ErrMigrationFailed` sentinel, plus `ErrMigrationRevertFailed` for a down in **either**
+migrator, then the underlying cause. `errors.Is` and `errors.As` see all of them, so sentinel
 checks and `errors.As(err, &pgErr)` keep working — and `errors.Is(err, ErrMigrationFailed)`
 starts working, which is the point of the change.
 

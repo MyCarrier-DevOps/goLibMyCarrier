@@ -17,8 +17,8 @@ func TestDeepCopySlip_CarriesClaimedFrom(t *testing.T) {
 	assert.Equal(t, slippy.SlipStatusFailed, DeepCopySlip(src).ClaimedFrom)
 }
 
-// PostgresStore's full-row Update never writes claimed_from (it is SELECT-only), except that
-// a terminal status ends the run and so ends the claim. The double must behave the same way.
+// PostgresStore's full-row Update never writes claimed_from (it is SELECT-only), whatever
+// status the snapshot carries. The double must behave the same way.
 func TestMockStore_Update_ClaimSemantics(t *testing.T) {
 	ctx := context.Background()
 	t.Run("a stale snapshot cannot clear the claim", func(t *testing.T) {
@@ -36,7 +36,11 @@ func TestMockStore_Update_ClaimSemantics(t *testing.T) {
 		assert.Equal(t, "renamed", got.Branch, "Update still writes the fields it owns")
 		assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom, "but never claimed_from")
 	})
-	t.Run("a terminal status through Update ends the claim (PromoteSlip's path)", func(t *testing.T) {
+	// Inverted deliberately (PR #87 re-review): a terminal Update used to end the claim. The
+	// status in a full-row write is the caller's own snapshot, so a claim taken after that
+	// read would be cleared by a writer that never saw it. PromoteSlip now goes through
+	// UpdateSlipStatus, the one write path that ends a claim.
+	t.Run("a terminal status through Update still cannot end the claim", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&slippy.Slip{CorrelationID: "u", Status: slippy.SlipStatusFailed})
 		_, err := store.ClaimSlip(ctx, "u", nil, "cli", "")
@@ -45,7 +49,11 @@ func TestMockStore_Update_ClaimSemantics(t *testing.T) {
 		snapshot.Status = slippy.SlipStatusPromoted
 		require.NoError(t, store.Update(ctx, snapshot))
 		got, _ := store.Load(ctx, "u")
-		assert.Empty(t, got.ClaimedFrom)
+		assert.Equal(t, slippy.SlipStatusPromoted, got.Status, "Update still writes the status column")
+		assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom, "but never claimed_from")
+		require.NoError(t, store.UpdateSlipStatus(ctx, "u", slippy.SlipStatusPromoted))
+		got, _ = store.Load(ctx, "u")
+		assert.Empty(t, got.ClaimedFrom, "the atomic status write is what ends it")
 	})
 }
 
@@ -84,31 +92,46 @@ func TestMockStore_ClaimSlip_IsAFlag(t *testing.T) {
 		assert.Equal(t, 1, countStep(got, slippy.ClaimMarkerStep))
 	})
 
-	t.Run("repeat claim is a no-op that still checks expected against the current status", func(t *testing.T) {
+	// Inverted deliberately (PR #87 re-review): expected used to be compared against the
+	// CURRENT status on a repeat claim, which refused the retry-after-a-lost-response the
+	// idempotent arm exists for once the run had moved the row on.
+	t.Run("repeat claim is a no-op that checks expected against the RECORDED prior", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&slippy.Slip{CorrelationID: "c", Status: slippy.SlipStatusFailed})
 		_, err := store.ClaimSlip(ctx, "c", nil, "first", "")
 		require.NoError(t, err)
 		require.NoError(t, store.UpdateSlipStatus(ctx, "c", slippy.SlipStatusInProgress)) // reconcile wrote it
-		prior, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusInProgress}, "second", "")
-		require.NoError(t, err)
-		assert.Equal(t, slippy.SlipStatusFailed, prior, "the recorded prior")
-		_, err = store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusFailed}, "third", "")
-		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed)
+		prior, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusFailed}, "second", "")
+		require.NoError(t, err, "the retry agreed to failed, which is the recorded prior")
+		assert.Equal(t, slippy.SlipStatusFailed, prior)
+		_, err = store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusCompleted}, "third", "")
+		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed, "a claimant that never agreed to failed is refused")
 		got, _ := store.Load(ctx, "c")
 		assert.Equal(t, 1, countStep(got, slippy.ClaimMarkerStep))
 	})
 
-	t.Run("nil expected admits a live in_progress run", func(t *testing.T) {
+	// Inverted deliberately (PR #87 re-review): a nil expected used to adopt an unclaimed
+	// in_progress run. That is a live run nothing has claimed; a caller that means to claim
+	// one now says so explicitly.
+	t.Run("nil expected refuses a live in_progress run; an explicit one claims it", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&slippy.Slip{CorrelationID: "c", Status: slippy.SlipStatusInProgress})
-		prior, err := store.ClaimSlip(ctx, "c", nil, "cli", "")
+		_, err := store.ClaimSlip(ctx, "c", nil, "cli", "")
+		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed)
+		got, _ := store.Load(ctx, "c")
+		assert.Empty(t, got.ClaimedFrom, "nothing written")
+		assert.Equal(t, 0, countStep(got, slippy.ClaimMarkerStep), "no marker either")
+
+		prior, err := store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusInProgress}, "cli", "")
 		require.NoError(t, err)
 		assert.Equal(t, slippy.SlipStatusInProgress, prior)
 	})
 }
 
-func TestMockStore_ReleaseClaim_RefusesWhileInFlight(t *testing.T) {
+// Work in flight KEEPS the claim and writes nothing — ReleaseOutcome{Released: false}, not an
+// error. Inverted deliberately (PR #87 re-review): this was ErrRunInFlight, which made N-1 of
+// N post-job releases look like failures to every caller.
+func TestMockStore_ReleaseClaim_KeepsTheClaimWhileInFlight(t *testing.T) {
 	ctx := context.Background()
 	claimed := func(t *testing.T, steps map[string]slippy.Step, aggs map[string][]slippy.ComponentStepData) *MockStore {
 		t.Helper()
@@ -119,30 +142,35 @@ func TestMockStore_ReleaseClaim_RefusesWhileInFlight(t *testing.T) {
 		return store
 	}
 
-	t.Run("a running step: ErrRunInFlight, nothing written", func(t *testing.T) {
+	t.Run("a running step: Released=false, nothing written", func(t *testing.T) {
 		store := claimed(t, map[string]slippy.Step{"builds": {Status: slippy.StepStatusRunning}}, nil)
-		_, err := store.ReleaseClaim(ctx, "r", "cli", "")
-		require.ErrorIs(t, err, slippy.ErrRunInFlight)
+		out, err := store.ReleaseClaim(ctx, "r", "cli", "")
+		require.NoError(t, err, "work in flight is an outcome, not an error")
+		assert.False(t, out.Released)
+		assert.Equal(t, slippy.SlipStatusFailed, out.Status, "the status is known on the held arm too")
 		got, _ := store.Load(ctx, "r")
 		assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom)
 		assert.Equal(t, 0, countStep(got, slippy.ReleaseMarkerStep))
 	})
 	t.Run("a held step counts as in flight", func(t *testing.T) {
 		store := claimed(t, map[string]slippy.Step{"dev_deploy": {Status: slippy.StepStatusHeld}}, nil)
-		_, err := store.ReleaseClaim(ctx, "r", "cli", "")
-		require.ErrorIs(t, err, slippy.ErrRunInFlight)
+		out, err := store.ReleaseClaim(ctx, "r", "cli", "")
+		require.NoError(t, err)
+		assert.False(t, out.Released)
 	})
 	t.Run("a running component under a failed aggregate counts as in flight", func(t *testing.T) {
 		store := claimed(t, map[string]slippy.Step{"builds": {Status: slippy.StepStatusFailed}},
 			map[string][]slippy.ComponentStepData{"builds": {{Component: "api", Status: slippy.StepStatusFailed}, {Component: "web", Status: slippy.StepStatusRunning}}})
-		_, err := store.ReleaseClaim(ctx, "r", "cli", "")
-		require.ErrorIs(t, err, slippy.ErrRunInFlight)
+		out, err := store.ReleaseClaim(ctx, "r", "cli", "")
+		require.NoError(t, err)
+		assert.False(t, out.Released)
 	})
 	t.Run("nothing in flight: cleared, status untouched, one marker, repeat is ErrNotClaimed", func(t *testing.T) {
 		store := claimed(t, map[string]slippy.Step{"builds": {Status: slippy.StepStatusFailed}, "unit_tests": {Status: slippy.StepStatusPending}}, nil)
-		status, err := store.ReleaseClaim(ctx, "r", "cli", "run over")
+		out, err := store.ReleaseClaim(ctx, "r", "cli", "run over")
 		require.NoError(t, err)
-		assert.Equal(t, slippy.SlipStatusFailed, status)
+		assert.True(t, out.Released)
+		assert.Equal(t, slippy.SlipStatusFailed, out.Status)
 		got, _ := store.Load(ctx, "r")
 		assert.Equal(t, slippy.SlipStatusFailed, got.Status, "release never writes status")
 		assert.Empty(t, got.ClaimedFrom)

@@ -69,7 +69,11 @@ func (s *PostgresStore) AppendHistory(ctx context.Context, correlationID string,
 // every later repave of the commit with no client left to release it (DEVOPS-367). failed is
 // not terminal — other components of the run may still be executing — so it keeps the claim,
 // as does the reconcile path's in_progress; ReleaseClaim ends those once nothing is in
-// flight. The full-row Update applies the same terminal rule (PromoteSlip goes that way).
+// flight.
+//
+// This is the ONLY write path that ends a claim. Create and the full-row Update never touch
+// claimed_from, whatever status their caller's snapshot carries, so every library path that
+// must end one — AbandonSlip, PromoteSlip, checkPipelineCompletion — comes through here.
 //
 // An abandon or promote is the exception to the claim's in-flight guarantee: both are
 // terminal statuses written from outside the run, so they end the claim even while steps are
@@ -151,30 +155,38 @@ func (s *PostgresStore) ClaimSlip(
 // The read is loadClaimStateTx, not a whole-row load: it selects only claimed_from, status,
 // the step status columns and the aggregate columns — DecideRelease's entire input — so the
 // unbounded state_history and step_details columns are not dragged through the row lock.
+//
+// Work in flight is an OUTCOME, not an error: the transaction commits having written
+// nothing and the call returns {Released: false, Status: <status under the lock>}.
 func (s *PostgresStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
-) (SlipStatus, error) {
-	var status SlipStatus
+) (ReleaseOutcome, error) {
+	var outcome ReleaseOutcome
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		slip, err := s.loadClaimStateTx(ctx, tx, correlationID)
 		if err != nil {
 			return err
 		}
-		if err := DecideRelease(slip); err != nil {
+		release, err := DecideRelease(slip)
+		if err != nil {
 			return fmt.Errorf("release %s: %w", correlationID, err)
+		}
+		if !release {
+			outcome = ReleaseOutcome{Released: false, Status: slip.Status}
+			return nil
 		}
 		if _, err := tx.Exec(ctx,
 			"UPDATE routing_slips SET claimed_from = NULL, updated_at = now() WHERE correlation_id = $1",
 			correlationID); err != nil {
 			return fmt.Errorf("release %s: clear: %w", correlationID, err)
 		}
-		status = slip.Status
-		return appendHistoryTx(ctx, tx, correlationID, ReleaseMarker(status, releasedBy, reason))
+		outcome = ReleaseOutcome{Released: true, Status: slip.Status}
+		return appendHistoryTx(ctx, tx, correlationID, ReleaseMarker(slip.Status, releasedBy, reason))
 	})
 	if err != nil {
-		return "", err
+		return ReleaseOutcome{}, err
 	}
-	return status, nil
+	return outcome, nil
 }
 
 // SetComponentImageTag records the built image tag for a component, preserving its current

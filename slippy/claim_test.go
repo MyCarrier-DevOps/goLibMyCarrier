@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -12,15 +13,15 @@ import (
 
 // The claim sentinels must be distinct from each other and from the repave sentinel they
 // sit beside: callers branch on errors.Is, so two sentinels that compared equal would make a
-// precondition failure indistinguishable from a live-run rejection.
+// precondition failure indistinguishable from a not-claimed one. Work in flight is
+// deliberately NOT a sentinel — it is ReleaseOutcome{Released: false} — so a post-job that
+// releases early sees an outcome, not an error.
 func TestClaimSentinelsAreDistinct(t *testing.T) {
 	require.NotErrorIs(t, ErrClaimPreconditionFailed, ErrSlipWentLive)
 	require.NotErrorIs(t, ErrNotClaimed, ErrClaimPreconditionFailed)
 	require.NotErrorIs(t, ErrNotClaimed, ErrSlipNotFound)
-	require.NotErrorIs(t, ErrRunInFlight, ErrNotClaimed)
 	assert.Contains(t, ErrClaimPreconditionFailed.Error(), "status")
 	assert.Contains(t, ErrNotClaimed.Error(), "claimed")
-	assert.Contains(t, ErrRunInFlight.Error(), "in flight")
 }
 
 // ClaimedFrom must serialise under the snake_case key the API contract exposes, be omitted
@@ -142,12 +143,21 @@ func TestDecideClaim(t *testing.T) {
 	}{
 		{"fresh claim out of failed", SlipStatusFailed, "", []SlipStatus{SlipStatusFailed}, SlipStatusFailed, true, nil},
 		{"a slip with no status cannot be claimed", "", "", nil, "", false, ErrClaimPreconditionFailed},
-		{"nil expected admits a live in_progress", SlipStatusInProgress, "", nil, SlipStatusInProgress, true, nil},
+		// Inverted deliberately (PR #87 re-review): a nil expected used to adopt an unclaimed
+		// in_progress run. That is a live run nothing has claimed, and adopting it silently is
+		// how a rerun dispatches on top of a pipeline already in flight.
+		{"nil expected refuses a live in_progress", SlipStatusInProgress, "", nil, "", false, ErrClaimPreconditionFailed},
+		{"explicit in_progress claims a live run", SlipStatusInProgress, "", []SlipStatus{SlipStatusInProgress}, SlipStatusInProgress, true, nil},
 		{"nil expected admits promoted", SlipStatusPromoted, "", nil, SlipStatusPromoted, true, nil},
 		{"mismatch writes nothing", SlipStatusAbandoned, "", []SlipStatus{SlipStatusFailed}, "", false, ErrClaimPreconditionFailed},
 		{"repeat claim returns the recorded prior, no write", SlipStatusFailed, SlipStatusFailed, []SlipStatus{SlipStatusFailed}, SlipStatusFailed, false, nil},
 		{"repeat after the run moved status: prior is the recorded one", SlipStatusInProgress, SlipStatusFailed, nil, SlipStatusFailed, false, nil},
-		{"repeat checks expected against the current status", SlipStatusInProgress, SlipStatusFailed, []SlipStatus{SlipStatusFailed}, "", false, ErrClaimPreconditionFailed},
+		// The repeat arm compares expected against the RECORDED prior, not the current status:
+		// a retry after a lost response agreed to `failed` and must still pass once the run has
+		// moved the row to in_progress, while a claimant that never agreed to `failed` is refused.
+		{"repeat checks expected against the RECORDED prior", SlipStatusInProgress, SlipStatusFailed, []SlipStatus{SlipStatusFailed}, SlipStatusFailed, false, nil},
+		{"repeat refused when expected excludes the recorded prior", SlipStatusInProgress, SlipStatusFailed, []SlipStatus{SlipStatusCompleted}, "", false, ErrClaimPreconditionFailed},
+		{"a claimed in_progress row is a repeat, not a live-run refusal", SlipStatusInProgress, SlipStatusInProgress, nil, SlipStatusInProgress, false, nil},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -167,9 +177,114 @@ func TestDecideClaim(t *testing.T) {
 func TestDecideRelease(t *testing.T) {
 	running := map[string]Step{"builds": {Status: StepStatusRunning}}
 	quiet := map[string]Step{"builds": {Status: StepStatusFailed}, "unit_tests": {Status: StepStatusPending}}
-	assert.ErrorIs(t, DecideRelease(&Slip{Steps: quiet}), ErrNotClaimed, "no claim, nothing to release")
-	assert.ErrorIs(t, DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed, Steps: running}), ErrRunInFlight)
-	assert.ErrorIs(t, DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed, Steps: map[string]Step{"d": {Status: StepStatusHeld}}}), ErrRunInFlight)
-	assert.NoError(t, DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed, Steps: quiet}), "quiescent: clear")
-	assert.NoError(t, DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed}), "no steps at all is quiescent")
+
+	release, err := DecideRelease(nil)
+	assert.ErrorIs(t, err, ErrSlipNotFound, "a nil slip is not 'nothing to release'")
+	assert.False(t, release)
+
+	release, err = DecideRelease(&Slip{Steps: quiet})
+	assert.ErrorIs(t, err, ErrNotClaimed, "no claim, nothing to release")
+	assert.False(t, release)
+
+	// Inverted deliberately (PR #87 re-review): work in flight used to be ErrRunInFlight.
+	// It is an outcome, not an error — N-1 of N post-job releases take this arm.
+	release, err = DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed, Steps: running})
+	require.NoError(t, err, "work in flight is not an error")
+	assert.False(t, release, "and nothing is written")
+
+	release, err = DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed, Steps: map[string]Step{"d": {Status: StepStatusHeld}}})
+	require.NoError(t, err)
+	assert.False(t, release, "a held step is work the run committed to")
+
+	release, err = DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed, Steps: quiet})
+	require.NoError(t, err)
+	assert.True(t, release, "quiescent: clear")
+
+	release, err = DecideRelease(&Slip{ClaimedFrom: SlipStatusFailed})
+	require.NoError(t, err)
+	assert.True(t, release, "no steps at all is quiescent")
+}
+
+// PostgresStore.ReleaseClaim hands DecideRelease a Slip hydrated from claimStateColumns()
+// alone — ClaimedFrom, Status, each step's Status and the aggregate components — while both
+// test doubles hand it a fully loaded row. The two agree today only because DecideRelease
+// reads nothing outside that set; if its read set ever widened, the doubles would keep
+// passing while the store silently decided on zero values. This pins the coupling: the same
+// answers for a full row and for one stripped to claimStateColumns()' fields.
+func TestDecideRelease_ReadsOnlyClaimStateFields(t *testing.T) {
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	hydrate := func(status SlipStatus, claimedFrom SlipStatus, steps map[string]Step,
+		aggs map[string][]ComponentStepData,
+	) *Slip {
+		return &Slip{
+			CorrelationID: "corr-full",
+			Repository:    "Owner/Repo",
+			Branch:        "main",
+			CommitSHA:     "0123456789abcdef",
+			CreatedAt:     now,
+			UpdatedAt:     now.Add(time.Hour),
+			Status:        status,
+			ClaimedFrom:   claimedFrom,
+			PromotedTo:    "corr-successor",
+			Steps:         steps,
+			Aggregates:    aggs,
+			StateHistory: []StateHistoryEntry{
+				{Step: ClaimMarkerStep, Status: StepStatusRunning, Timestamp: now, Actor: "rerunner"},
+				{Step: "builds", Status: StepStatusRunning, Timestamp: now, Actor: "ci"},
+			},
+			Ancestry: []AncestryEntry{{CorrelationID: "corr-parent", CommitSHA: "beef", Status: SlipStatusPromoted}},
+		}
+	}
+	// strip zeroes everything outside {Status, ClaimedFrom, Steps[*].Status, Aggregates[*][].Status}.
+	strip := func(full *Slip) *Slip {
+		bare := &Slip{Status: full.Status, ClaimedFrom: full.ClaimedFrom}
+		if full.Steps != nil {
+			bare.Steps = make(map[string]Step, len(full.Steps))
+			for name, step := range full.Steps {
+				bare.Steps[name] = Step{Status: step.Status}
+			}
+		}
+		if full.Aggregates != nil {
+			bare.Aggregates = make(map[string][]ComponentStepData, len(full.Aggregates))
+			for name, components := range full.Aggregates {
+				stripped := make([]ComponentStepData, len(components))
+				for i, c := range components {
+					stripped[i] = ComponentStepData{Status: c.Status}
+				}
+				bare.Aggregates[name] = stripped
+			}
+		}
+		return bare
+	}
+
+	timed := func(status StepStatus) Step {
+		return Step{Status: status, StartedAt: &now, CompletedAt: &now, Actor: "ci", Error: "boom"}
+	}
+	tests := []struct {
+		name string
+		full *Slip
+	}{
+		{"unclaimed", hydrate(SlipStatusFailed, "", map[string]Step{
+			"builds": timed(StepStatusFailed), "unit_tests": timed(StepStatusPending),
+		}, nil)},
+		{"claimed with a component still running", hydrate(SlipStatusFailed, SlipStatusFailed, map[string]Step{
+			"builds": timed(StepStatusFailed),
+		}, map[string][]ComponentStepData{"builds": {
+			{Component: "api", Status: StepStatusFailed, ImageTag: "sha-1"},
+			{Component: "web", Status: StepStatusRunning, ImageTag: "sha-2"},
+		}})},
+		{"claimed and quiescent", hydrate(SlipStatusCompleted, SlipStatusFailed, map[string]Step{
+			"builds": timed(StepStatusCompleted), "unit_tests": timed(StepStatusSkipped),
+		}, map[string][]ComponentStepData{"builds": {{Component: "api", Status: StepStatusCompleted}}})},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bare := strip(tc.full)
+			fullRelease, fullErr := DecideRelease(tc.full)
+			bareRelease, bareErr := DecideRelease(bare)
+			assert.Equal(t, fullRelease, bareRelease, "DecideRelease must read nothing outside claimStateColumns()")
+			assert.Equal(t, fullErr, bareErr)
+			assert.Equal(t, RunInFlight(tc.full), RunInFlight(bare), "nor may RunInFlight")
+		})
+	}
 }

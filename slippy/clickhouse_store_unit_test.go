@@ -197,7 +197,7 @@ func TestClickHouseStore_ReleaseClaim_Unsupported(t *testing.T) {
 	mockSession := &clickhousetest.MockSession{}
 	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
 
-	status, err := store.ReleaseClaim(context.Background(), "corr-release-1", "post-job", "")
+	out, err := store.ReleaseClaim(context.Background(), "corr-release-1", "post-job", "")
 	if err == nil {
 		t.Fatal("expected an error, got nil")
 	}
@@ -207,8 +207,19 @@ func TestClickHouseStore_ReleaseClaim_Unsupported(t *testing.T) {
 	if !strings.Contains(err.Error(), "corr-release-1") {
 		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
 	}
-	if status != "" {
-		t.Errorf("expected no status on an unsupported release, got %q", status)
+	if out.Released || out.Status != "" {
+		t.Errorf("expected a zero outcome on an unsupported release, got %+v", out)
+	}
+}
+
+// ProbeSchema is the readiness gate on SlipStore. ClickHouse has no schema of its own to
+// check for it, so it reports ready rather than failing a caller's startup probe.
+func TestClickHouseStore_ProbeSchema_ReportsReady(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	if err := store.ProbeSchema(context.Background()); err != nil {
+		t.Errorf("expected ProbeSchema to report ready on ClickHouse, got %v", err)
 	}
 }
 

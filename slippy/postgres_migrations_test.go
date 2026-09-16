@@ -323,4 +323,17 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 		"the refusal names the held correlation ids, not only how many there are")
 	assert.Less(t, strings.Index(down, "RAISE EXCEPTION"), strings.Index(down, "DROP COLUMN"),
 		"the guard must run before the drop")
+	// The count alone takes ACCESS SHARE, which does not conflict with ClaimSlip's ROW
+	// EXCLUSIVE: a claim taken between the count and the drop would be erased without the
+	// RAISE firing. The table lock closes that window, and must precede the count to do it.
+	assert.Contains(t, down, "LOCK TABLE routing_slips IN ACCESS EXCLUSIVE MODE",
+		"the guard must hold claimants out while it counts")
+	assert.Less(t, strings.Index(down, "LOCK TABLE"), strings.Index(down, "count(*)"),
+		"the lock must be taken before the count it protects")
+	// postgresmigrator runs the migration transaction with lock_timeout = 0, so an unbounded
+	// ACCESS EXCLUSIVE request would queue ahead of every reader and stall slip traffic.
+	assert.Regexp(t, `SET LOCAL lock_timeout = '[^']+'`, down, "the lock request must be bounded")
+	assert.NotRegexp(t, `SET LOCAL lock_timeout = '?0'?\s*;`, down, "and the bound must not be zero")
+	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "LOCK TABLE"),
+		"the timeout must be set before the lock is requested")
 }

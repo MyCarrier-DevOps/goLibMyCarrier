@@ -165,6 +165,7 @@ type MockStore struct {
 	UpdateSlipStatusError error
 	ClaimSlipError        error
 	ReleaseClaimError     error
+	ProbeSchemaError      error
 	RepaveError           error
 	CloseError            error
 
@@ -581,14 +582,12 @@ func (m *MockStore) Update(ctx context.Context, slip *slippy.Slip) error {
 		return slippy.ErrSlipNotFound
 	}
 
-	// claimed_from is SELECT-only in PostgresStore: the full-row Update never writes it, so
-	// a caller's stale snapshot cannot clear a claim it never loaded — except that a terminal
-	// status ends the run and so ends the claim, as in PostgresStore.Update.
+	// claimed_from is SELECT-only in PostgresStore: the full-row Update never writes it,
+	// whatever status the snapshot carries, so a caller's stale snapshot can clear neither a
+	// claim it never loaded nor one taken after its read. Only UpdateSlipStatus on a terminal
+	// status ends a claim.
 	stored := DeepCopySlip(slip)
 	stored.ClaimedFrom = existing.ClaimedFrom
-	if slip.Status.IsTerminal() {
-		stored.ClaimedFrom = ""
-	}
 	m.Slips[slip.CorrelationID] = stored
 
 	return nil
@@ -763,29 +762,41 @@ func (m *MockStore) ClaimSlip(
 }
 
 // ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared slippy.DecideRelease:
-// refused while any step or component is in flight, clears the claim otherwise, never
-// writing status.
+// the claim is KEPT (Released=false, nothing written) while any step or component is in
+// flight, cleared otherwise, and status is never written either way.
 func (m *MockStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
-) (slippy.SlipStatus, error) {
+) (slippy.ReleaseOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ReleaseClaimCalls = append(m.ReleaseClaimCalls, ReleaseClaimCall{
 		CorrelationID: correlationID, ReleasedBy: releasedBy, Reason: reason,
 	})
 	if m.ReleaseClaimError != nil {
-		return "", m.ReleaseClaimError
+		return slippy.ReleaseOutcome{}, m.ReleaseClaimError
 	}
 	slip, ok := m.Slips[correlationID]
 	if !ok {
-		return "", slippy.ErrSlipNotFound
+		return slippy.ReleaseOutcome{}, slippy.ErrSlipNotFound
 	}
-	if err := slippy.DecideRelease(slip); err != nil {
-		return "", fmt.Errorf("release %s: %w", correlationID, err)
+	release, err := slippy.DecideRelease(slip)
+	if err != nil {
+		return slippy.ReleaseOutcome{}, fmt.Errorf("release %s: %w", correlationID, err)
+	}
+	if !release {
+		return slippy.ReleaseOutcome{Released: false, Status: slip.Status}, nil
 	}
 	slip.ClaimedFrom = ""
 	slip.StateHistory = append(slip.StateHistory, slippy.ReleaseMarker(slip.Status, releasedBy, reason))
-	return slip.Status, nil
+	return slippy.ReleaseOutcome{Released: true, Status: slip.Status}, nil
+}
+
+// ProbeSchema mirrors PostgresStore.ProbeSchema's readiness gate. The double has no schema,
+// so it reports ready unless ProbeSchemaError is set.
+func (m *MockStore) ProbeSchema(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ProbeSchemaError
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.

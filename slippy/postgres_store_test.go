@@ -63,13 +63,15 @@ func TestPostgresStore_slipColumns(t *testing.T) {
 // row lock over them was the cost this read exists to avoid (DEVOPS-367).
 func TestPostgresStore_claimStateColumns(t *testing.T) {
 	store, _ := newMockStore(t)
-	cols := store.claimStateColumns()
+	cols, aggCols := store.claimStateColumns()
 
 	assert.Equal(t, []string{
 		"claimed_from", "status",
 		"push_parsed_status", "builds_status", "unit_tests_status", "dev_deploy_status",
 		"builds",
 	}, cols)
+	assert.Equal(t, store.aggregateColumns(), aggCols,
+		"the aggregate names are returned alongside so the read need not recompute them")
 	assert.NotContains(t, cols, ColumnStateHistory, "the release decision never reads state_history")
 	assert.NotContains(t, cols, ColumnStepDetails, "nor step_details")
 	// Every step's status column and every aggregate column must be present, or a step

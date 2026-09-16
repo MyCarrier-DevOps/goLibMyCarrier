@@ -13,7 +13,9 @@ const (
 	ColumnStatus        = "status"
 	ColumnStepDetails   = "step_details"
 	ColumnStateHistory  = "state_history"
-	// ColumnClaimedFrom is SELECT-only: written by ClaimSlip/ReleaseClaim, never by Create/Update.
+	// ColumnClaimedFrom is SELECT-only: written by ClaimSlip and ReleaseClaim, and cleared by
+	// UpdateSlipStatus on a terminal status — the one write path that ends a claim. Neither
+	// Create nor the full-row Update ever writes it, whatever status they carry.
 	ColumnClaimedFrom = "claimed_from"
 	ColumnAncestry    = "ancestry"
 

@@ -17,7 +17,17 @@ type Logger = logger.Logger
 // The correlationID is the single, canonical identifier for a routing slip
 // throughout its entire lifecycle.
 type SlipStore interface {
-	// Create persists a new routing slip
+	// Create persists a new routing slip.
+	//
+	// Implementations upsert rather than reject an existing correlation ID (the Kafka
+	// redelivery path), and claimed_from is NOT among the columns the conflict arm writes:
+	// the Postgres SET list is slipColumns(), which excludes it. So a redelivered Create
+	// carrying a TERMINAL status over a claimed row resets the row's own columns and leaves
+	// the claim standing — a terminal status in a caller's snapshot never ends a claim,
+	// only UpdateSlipStatus does (DEVOPS-367). That is the safe direction: the snapshot
+	// cannot clear a claim taken after it was read. If a claim is left behind by a run that
+	// will never release it, the way out is the recovery route documented on ErrNotClaimed
+	// in errors.go — resolve the step that holds it, then release.
 	Create(ctx context.Context, slip *Slip) error
 
 	// Load retrieves a slip by its correlation ID (the unique slip identifier).
@@ -93,9 +103,11 @@ type SlipStore interface {
 	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
 	// so there are no version conflicts.
 	//
-	// claimed_from is SELECT-only and is not written by Update, so a caller's stale snapshot
-	// cannot clear a claim it never loaded — except that a terminal status ends the run and
-	// so ends the claim, the same rule UpdateSlipStatus applies (DEVOPS-367).
+	// claimed_from is SELECT-only and is never written by Update, whatever status the slip
+	// carries: the status in a full-row write comes from the caller's own snapshot, and a
+	// claim may have been taken after that read, so keying a clear off it would end a claim
+	// the caller never saw. UpdateSlipStatus is the one write path that ends a claim
+	// (DEVOPS-367).
 	Update(ctx context.Context, slip *Slip) error
 
 	// UpdateStep updates a specific step's status
@@ -120,8 +132,11 @@ type SlipStore interface {
 	// round-trip. Uses INSERT SELECT to copy the current DB row and override only the status
 	// column, preventing concurrent history appends from being lost under last-write-wins.
 	//
-	// A terminal status also clears claimed_from: terminal ends the run, so it ends the claim
-	// (DEVOPS-367). Non-terminal statuses — failed included — leave the claim in place.
+	// This is THE ONE WRITE PATH THAT ENDS A CLAIM: a terminal status also clears
+	// claimed_from, because terminal ends the run (DEVOPS-367). Non-terminal statuses —
+	// failed included — leave the claim in place. Neither Create nor the full-row Update
+	// touches the column, so every library path that must end a claim (AbandonSlip,
+	// PromoteSlip, checkPipelineCompletion) comes through here.
 	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
 
 	// ClaimSlip records that a run is in flight against a slip, as ONE transaction: lock
@@ -129,17 +144,21 @@ type SlipStore interface {
 	// the status the row had. It never writes status (DEVOPS-367).
 	//
 	// The claim is a flag. It lives until the run is over: a post-job's ReleaseClaim that finds
-	// nothing in flight, or a terminal status write (UpdateSlipStatus or the full-row Update
-	// with a terminal status). While it is held, Repave refuses the row (ErrSlipWentLive) and
+	// nothing in flight, or a terminal status write through UpdateSlipStatus — the one write
+	// path that ends a claim. While it is held, Repave refuses the row (ErrSlipWentLive) and
 	// the push path dedups onto it, whatever status the pipeline writes meanwhile. An abandon
 	// or promote is the exception: both are terminal statuses written from outside the run, so
 	// they end the claim even while steps are still running, and both are repaveable — an
 	// ancestor abandon or a promotion deliberately overrides a live claim.
 	//
-	// expected is the set of statuses the caller agreed to claim out of, checked against the
-	// current status even on a repeat claim. nil admits any status, a live in_progress run
-	// included — claiming one is harmless, since in_progress is not repaveable anyway. The
-	// decision is DecideClaim, shared with the test doubles.
+	// expected is the set of statuses the caller agreed to claim out of. On a FRESH claim it
+	// is a compare-and-set on the current status; nil admits any status EXCEPT an unclaimed
+	// in_progress, which is a live run nobody has adopted — a caller that means to claim one
+	// says so by listing in_progress (the Slippy CLI pre-job does; the rerunner, which names
+	// only the ended set, is what the refusal protects). On a REPEAT claim expected is checked
+	// against the RECORDED prior instead, so a retry after a lost response is idempotent while
+	// a different claimant that did not agree to that prior is still refused. The decision is
+	// DecideClaim, shared with the test doubles.
 	//
 	// The store builds the marker itself with ClaimMarker(prior, claimedBy, reason), because
 	// only it knows the true status at write time. claimedBy is audit only: it names the
@@ -152,8 +171,10 @@ type SlipStore interface {
 	//     claimed_from. Repeat claims are idempotent — no second marker — so a retried
 	//     request cannot inflate the audit trail, and all but the first pre-job of a run
 	//     take this arm.
-	//   - ErrClaimPreconditionFailed: the current status was outside expected, or the slip
-	//     has no status at all (an empty status cannot be recorded as a claim). Nothing written.
+	//   - ErrClaimPreconditionFailed: the status was outside expected (the current status on a
+	//     fresh claim, the recorded prior on a repeat), the slip has no status at all (an
+	//     empty status cannot be recorded as a claim), or it is an unclaimed in_progress run
+	//     and expected did not name in_progress. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
 	ClaimSlip(
@@ -170,22 +191,33 @@ type SlipStore interface {
 	// written its own step's terminal status FIRST: this call judges quiescence from the row,
 	// so a post-job that releases before recording its step counts itself as in flight and no
 	// post-job of the run ever clears the claim. While any step or component is running or
-	// held the release is refused with ErrRunInFlight and nothing is written, so the last
-	// post-job — the one that finds nothing in flight — clears the claim. Held counts because
-	// HoldStep writes it after StartStep; a step that has not called StartStep yet is still
-	// pending and holds nothing. Today's fleet never records held — a step waiting on
-	// prerequisites reads pending. push_parsed, the library's own bookkeeping step, never
-	// counts as in flight.
-	// releasedBy is audit only. Returns the status at release.
-	//   - ErrRunInFlight: claim held, work in flight. Nothing written; not a failure. If the
-	//     run is dead — a step left running by a workflow that will never report — the exit is
-	//     a terminal status write: Client.AbandonSlip (POST /slips/{id}/abandon) ends the claim
-	//     and leaves the slip repaveable.
+	// held the claim is KEPT — ReleaseOutcome{Released: false} with nothing written, which is
+	// information rather than a failure — so the last post-job, the one that finds nothing in
+	// flight, clears it. Held counts because a held step is work the run has committed to; a
+	// step never reported at all reads pending and holds nothing. push_parsed, the library's
+	// own bookkeeping step, never counts as in flight.
+	//
+	// releasedBy is audit only. ReleaseOutcome.Status is the slip's status at decision time on
+	// BOTH arms — a release never writes status.
+	//   - Released=false, nil error: the claim is held and work is in flight. Nothing written.
+	//     If the run is DEAD — a step left running or held by a workflow that will never
+	//     report — the stuck step is what holds the claim: resolve it (complete, fail or skip
+	//     it), then release again, which now finds nothing in flight. On a NON-terminal slip
+	//     POST /v1/slips/{id}/abandon also ends it, because AbandonSlip writes the terminal
+	//     abandoned through UpdateSlipStatus; on an already-terminal slip AbandonSlip is a
+	//     deliberate no-op (I4) and clears nothing, so use the step-then-release route there.
 	//   - ErrNotClaimed: claimed_from empty — the normal outcome after a terminal status
 	//     write already ended the claim. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot release (ClickHouse).
-	ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error)
+	ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (ReleaseOutcome, error)
+
+	// ProbeSchema is the readiness gate: it checks the columns this store's SELECTs name
+	// against the live schema and returns ErrSchemaBehind when any are missing, so a process
+	// running a library ahead of its database can refuse to serve instead of failing every
+	// read at request time (DEVOPS-367). A store with no schema of its own to check —
+	// ClickHouse, which is not the operational slip store — returns nil.
+	ProbeSchema(ctx context.Context) error
 
 	// Repave atomically replaces one commit's ended run with a fresh one: it removes the
 	// routing_slips row for oldCorrelationID and its child rows (slip_component_states,

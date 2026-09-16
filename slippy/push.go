@@ -693,12 +693,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     (slippy-api → pushhookparser) detects that the returned correlation_id
 		//     differs from the one it sent and suppresses duplicate side-effects.
 		//
-		//   - Claimed (claimed_from set, DEVOPS-367): a claimant's run is in flight
-		//     whatever the status says — the claim never writes status, so a claimed
-		//     rerun of a failed slip still reads failed. Same treatment as live. Repave's
-		//     own guard would refuse the row anyway (ErrSlipWentLive → dedup below), but
-		//     deciding here skips the ancestor resolution that runs before a repave.
-		if existingSlip.Status.IsLive() || existingSlip.ClaimedFrom != "" {
+		if existingSlip.Status.IsLive() {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
 				return nil, retryErr
@@ -747,6 +742,33 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 			result.AncestryResolved = true
 			return result, nil
 		}
+
+		//   - Claimed (claimed_from set, DEVOPS-367): a claimant's run is in flight
+		//     whatever the status says — the claim never writes status, so a claimed
+		//     rerun of a failed slip still reads failed. Same treatment as live. Repave's
+		//     own guard would refuse the row anyway (ErrSlipWentLive → dedup below), but
+		//     deciding here skips the ancestor resolution that runs before a repave.
+		//
+		// This sits AFTER the empty-run guard and BEFORE the repave, and the order is
+		// load-bearing at both ends. After the guard, because a componentless push onto a
+		// claimed slip dispatches nothing: taking it through handlePushRetry would reset
+		// push_parsed and write history against a run someone else owns, where the guard
+		// returns the row read-only. Before the repave, because that is the whole point —
+		// ancestor resolution's multi-second GitHub calls are skipped for a row that can
+		// only be deduped onto. handleDuplicateSlipBackstop applies the same three in the
+		// same order, so identical inputs converge through either path.
+		if existingSlip.ClaimedFrom != "" {
+			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
+			if retryErr != nil {
+				return nil, retryErr
+			}
+			result.Slip = slip
+			// Dedup onto a pre-existing slip: nothing was (or needed to be) resolved.
+			// See CreateSlipResult.AncestryResolved's doc.
+			result.AncestryResolved = true
+			return result, nil
+		}
+
 		// Otherwise: existingSlip must be repaved. Deferred until immediately before
 		// Create (see repaveExistingSlip below) so ancestry resolution's multi-second
 		// GitHub API calls happen while the row still exists (see the doc comment on
@@ -1290,9 +1312,12 @@ func (c *Client) abandonSupersededSlipForUnsupportedRepave(
 // shared SlipStatus.IsLive() predicate (DEVOPS-231 review finding B5): a live conflicting
 // slip is deduped onto (never destroyed - its pipeline may already be dispatched, and
 // destroying it here would pull the rug out from under an in-flight run while we dispatch a
-// duplicate); an ended one is either deduped onto (componentless push: the empty-run guard,
-// mirrored from the main path so identical inputs converge on identical outcomes through
-// either path) or repaved onto slip, this push's successor.
+// duplicate); an ended one is deduped onto when the empty-run guard applies (componentless
+// push) or when a claimant holds it (claimed_from set, DEVOPS-367 — a run is in flight
+// against it whatever its status says), and repaved onto slip, this push's successor,
+// otherwise. All three checks are mirrored from the main path IN THE SAME ORDER — live,
+// empty-run guard, claimed, repave — so identical inputs converge on identical outcomes
+// through either path.
 //
 // Returns handled=true when the caller should return result directly, which now covers two
 // outcomes: the dedup cases (result.Slip is the conflicting slip) AND a successful repave of
@@ -1371,6 +1396,24 @@ func (c *Client) handleDuplicateSlipBackstop(
 				"superseding_id": opts.CorrelationID,
 				"components":     len(opts.Components),
 			}, opts.Dispatch))
+		result.Slip = conflicting
+		// Same as the live-conflict branch above: preserve the computed value.
+		return true, nil
+	}
+
+	if conflicting.ClaimedFrom != "" {
+		// A claimant's run is in flight against the conflicting row whatever its status says
+		// (DEVOPS-367). Mirrors CreateSlipForPush's main path, at the same point in the same
+		// order — live, then the empty-run guard, then claimed, then repave — so a claimed
+		// conflicting row is deduped onto rather than destroyed, and a componentless push onto
+		// one is still handled read-only by the guard above.
+		c.logger.Info(ctx, "Duplicate-create backstop: claimed conflicting slip, deduping", map[string]interface{}{
+			"conflicting_id":     conflicting.CorrelationID,
+			"commit":             shortSHA(conflicting.CommitSHA),
+			"conflicting_status": string(conflicting.Status),
+			"claimed_from":       string(conflicting.ClaimedFrom),
+			"superseding_id":     opts.CorrelationID,
+		})
 		result.Slip = conflicting
 		// Same as the live-conflict branch above: preserve the computed value.
 		return true, nil

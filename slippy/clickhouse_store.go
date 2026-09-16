@@ -946,8 +946,14 @@ func (s *ClickHouseStore) ClaimSlip(
 }
 
 // ReleaseClaim is unsupported on ClickHouse for the same reasons as ClaimSlip.
-func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID, _, _ string) (SlipStatus, error) {
-	return "", fmt.Errorf("ReleaseClaim(%s): %w", correlationID, ErrClaimUnsupported)
+func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID, _, _ string) (ReleaseOutcome, error) {
+	return ReleaseOutcome{}, fmt.Errorf("ReleaseClaim(%s): %w", correlationID, ErrClaimUnsupported)
+}
+
+// ProbeSchema is a no-op here: this store selects no claim column and its tables are managed
+// by clickhousemigrator, so it has no schema of its own for the readiness gate to check.
+func (s *ClickHouseStore) ProbeSchema(_ context.Context) error {
+	return nil
 }
 
 // ResolveAncestry walks the slip_ancestry table iteratively to reconstruct

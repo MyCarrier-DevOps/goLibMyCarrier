@@ -218,6 +218,7 @@ type MockStore struct {
 	UpdateSlipStatusError error
 	ClaimSlipError        error
 	ReleaseClaimError     error
+	ProbeSchemaError      error
 	RepaveError           error
 	AncestryLinkError     error
 	CloseError            error
@@ -462,7 +463,7 @@ func (m *MockStore) Repave(
 		// Mirrors the predecessor marker PostgresStore.Repave appends to the successor, gated
 		// on removedOld the same way so a repave that replaced nothing records nothing.
 		stored.StateHistory = append(stored.StateHistory, StateHistoryEntry{
-			Step:      "push_parsed",
+			Step:      PushParsedStep,
 			Status:    StepStatusRunning,
 			Timestamp: time.Now(),
 			Actor:     LibraryActor,
@@ -666,14 +667,11 @@ func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 		return ErrSlipNotFound
 	}
 
-	// claimed_from is SELECT-only in PostgresStore: a full-row Update never writes it —
-	// except that a terminal status ends the run and so ends the claim, as in
-	// PostgresStore.Update.
+	// claimed_from is SELECT-only in PostgresStore: a full-row Update never writes it,
+	// whatever status the snapshot carries. Only UpdateSlipStatus on a terminal status ends
+	// a claim.
 	stored := deepCopySlip(slip)
 	stored.ClaimedFrom = existing.ClaimedFrom
-	if slip.Status.IsTerminal() {
-		stored.ClaimedFrom = ""
-	}
 	m.Slips[slip.CorrelationID] = stored
 	return nil
 }
@@ -840,30 +838,42 @@ func (m *MockStore) ClaimSlip(
 	return prior, nil
 }
 
-// ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared DecideRelease:
-// refused while any step or component is in flight, clears the claim otherwise, never
-// writing status.
+// ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared DecideRelease: the
+// claim is KEPT (Released=false, nothing written) while any step or component is in flight,
+// cleared otherwise, and status is never written either way.
 func (m *MockStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
-) (SlipStatus, error) {
+) (ReleaseOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.ReleaseClaimCalls = append(m.ReleaseClaimCalls, ReleaseClaimCall{
 		CorrelationID: correlationID, ReleasedBy: releasedBy, Reason: reason,
 	})
 	if m.ReleaseClaimError != nil {
-		return "", m.ReleaseClaimError
+		return ReleaseOutcome{}, m.ReleaseClaimError
 	}
 	slip, ok := m.Slips[correlationID]
 	if !ok {
-		return "", ErrSlipNotFound
+		return ReleaseOutcome{}, ErrSlipNotFound
 	}
-	if err := DecideRelease(slip); err != nil {
-		return "", fmt.Errorf("release %s: %w", correlationID, err)
+	release, err := DecideRelease(slip)
+	if err != nil {
+		return ReleaseOutcome{}, fmt.Errorf("release %s: %w", correlationID, err)
+	}
+	if !release {
+		return ReleaseOutcome{Released: false, Status: slip.Status}, nil
 	}
 	slip.ClaimedFrom = ""
 	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(slip.Status, releasedBy, reason))
-	return slip.Status, nil
+	return ReleaseOutcome{Released: true, Status: slip.Status}, nil
+}
+
+// ProbeSchema mirrors PostgresStore.ProbeSchema's readiness gate; the double has no schema,
+// so it reports ready unless ProbeSchemaError is set.
+func (m *MockStore) ProbeSchema(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ProbeSchemaError
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.

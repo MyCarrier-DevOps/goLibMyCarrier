@@ -363,7 +363,7 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 	return postgresmigrator.Migration{
 		Version:     6,
 		Name:        "claimed_from",
-		Description: "routing_slips.claimed_from: status at claim time recorded by ClaimSlip; set while a run holds the slip, cleared by ReleaseClaim or a terminal status write (DEVOPS-367)",
+		Description: "routing_slips.claimed_from: status at claim time recorded by ClaimSlip; set while a run holds the slip, cleared by ReleaseClaim or by UpdateSlipStatus on a terminal status (DEVOPS-367)",
 		UpSQL: `
 			ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL;
 
@@ -396,6 +396,17 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 			-- The message names up to 20 held correlation ids, so the operator can act on the
 			-- refusal without a second query.
 			-- to_regclass makes a missing table or column a no-op rather than an error.
+			--
+			-- The LOCK is what closes the drain race: the count below takes ACCESS SHARE, which
+			-- does NOT conflict with ClaimSlip's ROW EXCLUSIVE, so a claim taken between the
+			-- count and the DROP COLUMN would be erased without the RAISE ever firing. Taking
+			-- ACCESS EXCLUSIVE first — the same lock the DROP will take — holds claimants out
+			-- for the rest of the transaction, so the count is the state the drop acts on.
+			-- The lock_timeout is required, not defensive: postgresmigrator runs the migration
+			-- transaction with SET LOCAL lock_timeout = 0, and an unbounded ACCESS EXCLUSIVE
+			-- request queues AHEAD of every subsequent reader, so on a busy database it would
+			-- stall all slip traffic until it were granted or the rollback were cancelled by
+			-- hand. Five seconds fails the down instead; re-run it.
 			DO $$
 			DECLARE
 				held bigint;
@@ -407,6 +418,8 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 					  AND attname = 'claimed_from'
 					  AND NOT attisdropped
 				) THEN
+					SET LOCAL lock_timeout = '5s';
+					LOCK TABLE routing_slips IN ACCESS EXCLUSIVE MODE;
 					SELECT count(*) INTO held FROM routing_slips
 					WHERE claimed_from IS NOT NULL AND claimed_from <> '';
 					IF held > 0 THEN
@@ -414,7 +427,7 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 						FROM (SELECT correlation_id FROM routing_slips
 						      WHERE claimed_from IS NOT NULL AND claimed_from <> ''
 						      ORDER BY correlation_id LIMIT 20) h;
-						RAISE EXCEPTION 'migration v6 down: % slip(s) hold a claim (claimed_from set): % — release them, let their runs end, or abandon them (POST /slips/{id}/abandon) before dropping the column', held, held_ids;
+						RAISE EXCEPTION 'migration v6 down: % slip(s) hold a claim (claimed_from set): % — resolve the step holding each claim (POST /v1/slips/{id}/steps/{step}/complete) then POST /v1/slips/{id}/release, or let the runs end; a NON-terminal slip can also be ended with POST /v1/slips/{id}/abandon, which an already-terminal one ignores', held, held_ids;
 					END IF;
 				END IF;
 			END $$;
