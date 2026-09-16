@@ -401,7 +401,18 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   *in flight*, not work that has not started. A step left `running` by a run that never
   reports (an `argo terminate`, a lost cluster) holds the claim until something writes that
   step; the rerunner still works (its claim is the idempotent no-op) and a same-commit push
-  deduplicates rather than repaving.
+  deduplicates rather than repaving. The gap is **per step, not per run**: a step that has
+  not called `StartStep` yet is `pending` — including one waiting on prerequisites, which
+  the fleet never records as `held` — and holds nothing, so once the concurrent work
+  finishes, the first post-job to exit clears the claim even though later steps of the same
+  run are still to be dispatched.
+
+  **A known resting state, pre-existing:** a partial clean rerun (some steps reset, the run
+  not carried to an end) leaves the row at `status = in_progress` by way of the reconcile
+  branch, unclaimed, with nothing running — which is not repaveable (`IsLive()`) and is also
+  refused by the rerunner, whose `if_status` names only the ended set. Nothing in the claim
+  work creates or clears that state; only a terminal status write or an operator moves the
+  row out of it.
 
   **Residual, narrowing:** ordinary stragglers from any superseded run still get a
   not-found on write, now with a message that names the likely repave. The ~13

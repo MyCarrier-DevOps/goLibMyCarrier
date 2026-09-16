@@ -392,7 +392,7 @@ func (m *MockStore) Repave(
 		// abbreviates the commit SHA using an unexported helper — so this deliberately does
 		// not try to be byte-identical.
 		stored.StateHistory = append(stored.StateHistory, slippy.StateHistoryEntry{
-			Step:      "push_parsed",
+			Step:      slippy.PushParsedStep,
 			Status:    slippy.StepStatusRunning,
 			Timestamp: time.Now(),
 			Actor:     slippy.LibraryActor,

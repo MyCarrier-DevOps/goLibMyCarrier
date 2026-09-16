@@ -68,22 +68,25 @@ func ReleaseMarker(status SlipStatus, releasedBy, reason string) StateHistoryEnt
 	}
 }
 
-// pushParsedStep is the library's own bookkeeping step: the push path writes it
+// PushParsedStep is the library's own bookkeeping step: the push path writes it
 // (handlePushRetry resets it to running on every deduplicated push) and no post-job ever
 // reports it, so it can never mean claimant work is in flight and RunInFlight ignores it.
-const pushParsedStep = "push_parsed"
+const PushParsedStep = "push_parsed"
 
 // RunInFlight reports whether any step, or any component inside an aggregate step, is
 // running or held (StepStatus.IsRunning). Components are checked as well as steps because an
 // aggregate step's own status can already read failed while a sibling component is still
-// building, and held counts because a held step's pre-job has already run and will not claim
-// again. pushParsedStep is skipped: it is the library's own bookkeeping, reset to running by
+// building. Held counts as in flight because HoldStep writes it after StartStep, so the step
+// is already under way; a step that has not called StartStep yet is still pending and holds
+// nothing. Today's fleet never records held at all — a step waiting on prerequisites reads
+// pending, because the prerequisites endpoint is read-only and the CLI polls client-side.
+// PushParsedStep is skipped: it is the library's own bookkeeping, reset to running by
 // every deduplicated push and never completed by a post-job, so counting it would make a
 // deduped claimed slip unreleasable. This is the one definition of "work in flight" the
 // claim protects.
 func RunInFlight(slip *Slip) bool {
 	for name, step := range slip.Steps {
-		if name == pushParsedStep {
+		if name == PushParsedStep {
 			continue
 		}
 		if step.Status.IsRunning() {

@@ -962,7 +962,7 @@ func (c *Client) persistSlipForPush(
 // that exists to make the state legible.
 func appendResetMarker(slip *Slip, priorStatus SlipStatus, commitSHA string) {
 	slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
-		Step:      "push_parsed",
+		Step:      PushParsedStep,
 		Status:    StepStatusRunning,
 		Timestamp: time.Now(),
 		Actor:     LibraryActor,
@@ -1993,7 +1993,7 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 
 	now := time.Now()
 	entry := StateHistoryEntry{
-		Step:      "push_parsed",
+		Step:      PushParsedStep,
 		Status:    StepStatusRunning,
 		Timestamp: now,
 		Actor:     LibraryActor,
@@ -2023,7 +2023,7 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 	if err := c.store.UpdateStepWithHistory(
 		ctx,
 		slip.CorrelationID,
-		"push_parsed",
+		PushParsedStep,
 		"",
 		StepStatusRunning,
 		entry,
@@ -2138,8 +2138,8 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 		}
 	} else {
 		// Fallback to default first step if no config (for backward compatibility)
-		firstStep = "push_parsed"
-		steps["push_parsed"] = Step{Status: StepStatusRunning, StartedAt: &now}
+		firstStep = PushParsedStep
+		steps[PushParsedStep] = Step{Status: StepStatusRunning, StartedAt: &now}
 	}
 
 	// Report the status step 0 actually received, not an assumed `running`. The gate above

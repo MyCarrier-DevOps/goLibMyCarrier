@@ -164,7 +164,10 @@ type SlipStore interface {
 	// Every post-job calls this on exit, whatever its own step's outcome. While any step or
 	// component is running or held the release is refused with ErrRunInFlight and nothing is
 	// written, so the last post-job — the one that finds nothing in flight — clears the
-	// claim. push_parsed, the library's own bookkeeping step, never counts as in flight.
+	// claim. Held counts because HoldStep writes it after StartStep; a step that has not
+	// called StartStep yet is still pending and holds nothing. Today's fleet never records
+	// held — a step waiting on prerequisites reads pending. push_parsed, the library's own
+	// bookkeeping step, never counts as in flight.
 	// releasedBy is audit only. Returns the status at release.
 	//   - ErrRunInFlight: claim held, work in flight. Nothing written; not a failure.
 	//   - ErrNotClaimed: claimed_from empty — the normal outcome after a terminal status

@@ -733,7 +733,7 @@ func (s *PostgresStore) Repave(
 			// This is NOT the history-preservation decision (DEVOPS-277) — the prior run's
 			// own state history is still destroyed. It only records that it happened.
 			if err := appendHistoryTx(ctx, tx, newSlip.CorrelationID, StateHistoryEntry{
-				Step:      "push_parsed",
+				Step:      PushParsedStep,
 				Status:    StepStatusRunning,
 				Timestamp: time.Now(),
 				// "slippy-library" matches every other library-emitted history entry

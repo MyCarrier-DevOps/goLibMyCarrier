@@ -250,8 +250,10 @@ have applied v6 before any slippy-api pod on that library serves traffic; do not
 the API image ahead of the migrator. Rolling back is guarded: v6's DownSQL refuses
 while any slip holds a claim (`claimed_from` set), because dropping the column erases the
 in-flight flag of every held claim — that run's work becomes repaveable mid-flight — and
-breaks every `Load` until the library is rolled back with it. Let the runs end or
-`ReleaseClaim` them, then re-run the down.
+breaks every `Load` until the library is rolled back with it. Because every slip-routed
+pre-job now claims, some slip usually holds a claim in a busy environment, so plan a
+rollback as a drain: expect the down to refuse until runs finish or are released. Let the
+runs end or `ReleaseClaim` them, then re-run the down.
 
 ### 3. Client Initialization Pattern
 

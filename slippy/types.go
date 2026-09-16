@@ -45,12 +45,12 @@ type Slip struct {
 	// Status is the overall slip status
 	Status SlipStatus `json:"status" ch:"status"`
 
-	// ClaimedFrom is the status this slip had immediately before an adopter claimed it
-	// (POST /slips/{id}/claim), or "" when it is not currently claimed. A non-empty value
-	// implies Status == in_progress by way of a claim rather than a pipeline transition.
-	// Set only by SlipStore.ClaimSlip and cleared only by SlipStore.ReleaseClaim, which
-	// restores this value; persisted in routing_slips.claimed_from (migration v6). The
-	// ClickHouse store does not carry it (DEVOPS-367).
+	// ClaimedFrom is the claim flag (DEVOPS-367): non-empty means a run is in flight against
+	// this slip. Its value is the status the slip had when ClaimSlip recorded the claim, kept
+	// for the audit trail only — it implies nothing about the current Status, which the claim
+	// never writes. Set by ClaimSlip; cleared by ReleaseClaim once nothing is in flight, or by
+	// a terminal status write. SELECT-only in Postgres: Create and the full-row Update never
+	// write it. Not a ClickHouse column.
 	ClaimedFrom SlipStatus `json:"claimed_from,omitempty" ch:"-"`
 
 	// Steps maps step names to their current state

@@ -310,6 +310,46 @@ func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 		assert.Equal(t, 1, countMarkers(t, store, "r-again", ReleaseMarkerStep))
 	})
 
+	// The release reads the row FOR UPDATE and decides under that lock, so a release can never
+	// interleave with a StartStep and observe a row that is neither quiescent nor in flight.
+	// Each goroutine here writes its own step event before its own release, so by the time any
+	// release takes the lock at least that goroutine's running step is visible: every release
+	// must be refused. Nothing completes the step during the wave, so the claim survives it.
+	t.Run("release racing StartStep never clears a claim with work in flight", func(t *testing.T) {
+		claimTestSlip(t, store, "r-racing", "sha-racing", SlipStatusFailed)
+		_, err := store.ClaimSlip(ctx, "r-racing", nil, "rerunner", "")
+		require.NoError(t, err)
+
+		var wg sync.WaitGroup
+		startErrs := make([]error, 8)
+		relErrs := make([]error, 8)
+		for i := range relErrs {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				startErrs[i] = store.UpdateStep(ctx, "r-racing", "unit_tests", "", StepStatusRunning)
+				_, relErrs[i] = store.ReleaseClaim(ctx, "r-racing", "post-job", "")
+			}(i)
+		}
+		wg.Wait()
+
+		for i := range relErrs {
+			require.NoError(t, startErrs[i], "racer %d: StartStep", i)
+			require.ErrorIs(t, relErrs[i], ErrRunInFlight, "racer %d: released with work in flight", i)
+		}
+		got, err := store.Load(ctx, "r-racing")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim survives the whole wave")
+		assert.Equal(t, 0, countMarkers(t, store, "r-racing", ReleaseMarkerStep))
+
+		require.NoError(t, store.UpdateStep(ctx, "r-racing", "unit_tests", "", StepStatusCompleted))
+		_, err = store.ReleaseClaim(ctx, "r-racing", "post-job", "")
+		require.NoError(t, err, "nothing in flight now")
+		got, err = store.Load(ctx, "r-racing")
+		require.NoError(t, err)
+		assert.Empty(t, got.ClaimedFrom)
+	})
+
 	t.Run("not found", func(t *testing.T) {
 		_, err := store.ReleaseClaim(ctx, "r-missing", "post-job", "")
 		require.ErrorIs(t, err, ErrSlipNotFound)
@@ -404,4 +444,26 @@ func TestPostgresStore_Update_TerminalStatusEndsTheClaim_Integration(t *testing.
 	require.NoError(t, err)
 	assert.Equal(t, SlipStatusPromoted, got.Status)
 	assert.Empty(t, got.ClaimedFrom, "a terminal Update ends the claim")
+}
+
+// Create's ON CONFLICT arm re-creates a slip that already exists — the same-correlation-ID
+// redelivery path. claimed_from is not one of the columns it writes, so a claim held by a
+// run in flight survives a redelivery that resets the row's status underneath it. If it did
+// not, a redelivery would silently drop the in-flight flag and expose the run to a repave.
+func TestPostgresStore_Create_KeepsAnExistingClaim_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+	claimTestSlip(t, store, "cr-claim", "sha-cr", SlipStatusFailed)
+	_, err := store.ClaimSlip(ctx, "cr-claim", nil, "rerunner", "")
+	require.NoError(t, err)
+
+	require.NoError(t, store.Create(ctx, &Slip{
+		CorrelationID: "cr-claim", Repository: "Owner/Repo", Branch: "main", CommitSHA: "sha-cr",
+		Status: SlipStatusInProgress,
+	}), "the ON CONFLICT arm")
+
+	got, err := store.Load(ctx, "cr-claim")
+	require.NoError(t, err)
+	assert.Equal(t, SlipStatusInProgress, got.Status, "Create still writes the columns it owns")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "but never claimed_from: the claim survives")
 }
