@@ -98,6 +98,13 @@ func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 		args = append(args, vals[i])
 		n++
 	}
+	// claimed_from is SELECT-only: a caller's snapshot never carries an authoritative claim,
+	// so it is not in slipColumns() and this write cannot clear a claim it never loaded. The
+	// one exception is the same rule UpdateSlipStatus applies — a terminal status ends the
+	// run, so it ends the claim (PromoteSlip reaches a terminal status through this path).
+	if slip.Status.IsTerminal() {
+		sets = append(sets, "claimed_from = NULL")
+	}
 	args = append(args, slip.CorrelationID)
 
 	query := fmt.Sprintf("UPDATE routing_slips SET %s WHERE correlation_id = $%d",
@@ -347,6 +354,21 @@ func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 	// Reuse the shared (backend-agnostic) timing reconstruction from the scanner.
 	NewSlipScanner(s.config).reconstructStepTimingFromHistory(slip)
 	return slip
+}
+
+// loadForUpdateTx reads the whole row under FOR UPDATE inside tx, so a decision made from it
+// (ReleaseClaim's in-flight check) holds until the transaction's own write lands.
+func (s *PostgresStore) loadForUpdateTx(ctx context.Context, tx pgx.Tx, correlationID string) (*Slip, error) {
+	sc, dest := s.newSlipScan()
+	query := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
+		strings.Join(s.slipSelectColumns(), ", "))
+	if err := tx.QueryRow(ctx, query, correlationID).Scan(dest...); err != nil {
+		if isNoRows(err) {
+			return nil, ErrSlipNotFound
+		}
+		return nil, fmt.Errorf("failed to load slip %s for update: %w", correlationID, err)
+	}
+	return s.populate(sc), nil
 }
 
 // queryOne runs a single-row SELECT and hydrates the slip, mapping no-rows to

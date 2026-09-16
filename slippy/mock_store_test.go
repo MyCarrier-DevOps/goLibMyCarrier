@@ -380,8 +380,13 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 		return err
 	}
 
-	// Deep copy the slip to avoid mutations
+	// Deep copy the slip to avoid mutations. An existing row keeps its claim: PostgresStore's
+	// Create is an ON CONFLICT DO UPDATE whose SET list is slipColumns(), which excludes the
+	// SELECT-only claimed_from, so a redelivered Create resets the row but not the claim.
 	slipCopy := deepCopySlip(slip)
+	if existing, ok := m.Slips[slip.CorrelationID]; ok {
+		slipCopy.ClaimedFrom = existing.ClaimedFrom
+	}
 	m.Slips[slip.CorrelationID] = slipCopy
 
 	return nil
@@ -661,9 +666,14 @@ func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 		return ErrSlipNotFound
 	}
 
-	// claimed_from is SELECT-only in PostgresStore: a full-row Update never writes it.
+	// claimed_from is SELECT-only in PostgresStore: a full-row Update never writes it —
+	// except that a terminal status ends the run and so ends the claim, as in
+	// PostgresStore.Update.
 	stored := deepCopySlip(slip)
 	stored.ClaimedFrom = existing.ClaimedFrom
+	if slip.Status.IsTerminal() {
+		stored.ClaimedFrom = ""
+	}
 	m.Slips[slip.CorrelationID] = stored
 	return nil
 }
@@ -801,8 +811,9 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 	return nil
 }
 
-// ClaimSlip mirrors PostgresStore.ClaimSlip in memory: precondition, idempotent repeat,
-// live-run refusal, marker append, status + ClaimedFrom write (DEVOPS-367).
+// ClaimSlip mirrors PostgresStore.ClaimSlip through the shared DecideClaim: a
+// compare-and-set on the current status, idempotent when already claimed, never writing
+// status.
 func (m *MockStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 ) (SlipStatus, error) {
@@ -818,29 +829,20 @@ func (m *MockStore) ClaimSlip(
 	if !ok {
 		return "", ErrSlipNotFound
 	}
-	if slip.ClaimedFrom != "" {
-		// Already claimed: idempotent no-op whatever the run wrote to status since.
-		if len(expected) > 0 && !slipStatusIn(expected, slip.ClaimedFrom) {
-			return "", fmt.Errorf("claim %s: already claimed out of %s, not in %v: %w",
-				correlationID, slip.ClaimedFrom, expected, ErrClaimPreconditionFailed)
-		}
-		return slip.ClaimedFrom, nil
+	prior, write, err := DecideClaim(slip.Status, slip.ClaimedFrom, expected)
+	if err != nil {
+		return "", fmt.Errorf("claim %s: %w", correlationID, err)
 	}
-	if slip.Status == SlipStatusInProgress {
-		return "", fmt.Errorf("claim %s: live run: %w", correlationID, ErrClaimPreconditionFailed)
+	if write {
+		slip.StateHistory = append(slip.StateHistory, ClaimMarker(prior, claimedBy, reason))
+		slip.ClaimedFrom = prior
 	}
-	if len(expected) > 0 && !slipStatusIn(expected, slip.Status) {
-		return "", fmt.Errorf("claim %s: status %s not in %v: %w",
-			correlationID, slip.Status, expected, ErrClaimPreconditionFailed)
-	}
-	prior := slip.Status
-	slip.StateHistory = append(slip.StateHistory, ClaimMarker(prior, claimedBy, reason))
-	slip.ClaimedFrom = prior
-	slip.Status = SlipStatusInProgress
 	return prior, nil
 }
 
-// ReleaseClaim mirrors PostgresStore.ReleaseClaim in memory (DEVOPS-367).
+// ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared DecideRelease:
+// refused while any step or component is in flight, clears the claim otherwise, never
+// writing status.
 func (m *MockStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
 ) (SlipStatus, error) {
@@ -856,15 +858,11 @@ func (m *MockStore) ReleaseClaim(
 	if !ok {
 		return "", ErrSlipNotFound
 	}
-	if slip.ClaimedFrom == "" {
-		return "", fmt.Errorf("release %s: %w", correlationID, ErrNotClaimed)
-	}
-	restored := slip.Status == SlipStatusInProgress
-	if restored {
-		slip.Status = slip.ClaimedFrom
+	if err := DecideRelease(slip); err != nil {
+		return "", fmt.Errorf("release %s: %w", correlationID, err)
 	}
 	slip.ClaimedFrom = ""
-	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(slip.Status, restored, releasedBy, reason))
+	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(slip.Status, releasedBy, reason))
 	return slip.Status, nil
 }
 

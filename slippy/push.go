@@ -692,7 +692,13 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     would double-run work that is already running. The caller
 		//     (slippy-api → pushhookparser) detects that the returned correlation_id
 		//     differs from the one it sent and suppresses duplicate side-effects.
-		if existingSlip.Status.IsLive() {
+		//
+		//   - Claimed (claimed_from set, DEVOPS-367): a claimant's run is in flight
+		//     whatever the status says — the claim never writes status, so a claimed
+		//     rerun of a failed slip still reads failed. Same treatment as live. Repave's
+		//     own guard would refuse the row anyway (ErrSlipWentLive → dedup below), but
+		//     deciding here skips the ancestor resolution that runs before a repave.
+		if existingSlip.Status.IsLive() || existingSlip.ClaimedFrom != "" {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
 				return nil, retryErr
@@ -959,7 +965,7 @@ func appendResetMarker(slip *Slip, priorStatus SlipStatus, commitSHA string) {
 		Step:      "push_parsed",
 		Status:    StepStatusRunning,
 		Timestamp: time.Now(),
-		Actor:     "slippy-library",
+		Actor:     LibraryActor,
 		Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
 			priorStatus, shortSHA(commitSHA)),
 	})
@@ -1990,7 +1996,7 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 		Step:      "push_parsed",
 		Status:    StepStatusRunning,
 		Timestamp: now,
-		Actor:     "slippy-library",
+		Actor:     LibraryActor,
 		Message:   "retry detected, resetting push_parsed",
 	}
 
@@ -2152,7 +2158,7 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 			Step:      firstStep,
 			Status:    firstStepStatus,
 			Timestamp: now,
-			Actor:     "slippy-library",
+			Actor:     LibraryActor,
 			Message:   "processing push event",
 		},
 	}

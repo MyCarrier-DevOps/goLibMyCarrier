@@ -127,17 +127,24 @@ var (
 		"store does not support Repave; caller should fall back to abandon semantics")
 
 	// ErrClaimPreconditionFailed is returned by ClaimSlip when the slip's status at write
-	// time was not one the caller agreed to claim out of — either it was outside the
-	// caller's expected set, or it was in_progress with no claim recorded, which means a
-	// genuinely live run that must never be adopted. Nothing was written. The caller
-	// decided on a stale read; the remedy is to re-read, not to retry (DEVOPS-367).
+	// time was outside the caller's expected set. Nothing was written. The caller decided on
+	// a stale read; the remedy is to re-read, not to retry (DEVOPS-367).
 	ErrClaimPreconditionFailed = errors.New("slip status did not match the claim precondition")
 
-	// ErrNotClaimed is returned by ReleaseClaim when there is no claim to release: the slip
-	// is not in_progress, or claimed_from is empty. Nothing was written. This is the normal
-	// outcome when the pipeline advanced the slip before the release ran, and callers should
-	// treat it as "nothing to undo" rather than as a failure (DEVOPS-367).
+	// ErrNotClaimed is returned by ReleaseClaim when there is no claim to release: the
+	// row's claimed_from is NULL or empty. The slip's status is not consulted — a claimed
+	// slip the run has since moved to failed or compensating is still released. Nothing
+	// was written. This is the normal outcome when a terminal status write already ended
+	// the claim, and callers should treat it as "nothing to undo" rather than as a
+	// failure (DEVOPS-367).
 	ErrNotClaimed = errors.New("slip is not currently claimed")
+
+	// ErrRunInFlight is returned by ReleaseClaim when the claim is held and the run still
+	// has a step or component running or held. Nothing was written: releasing then would
+	// expose that work to a same-commit repave. Every post-job releases on exit, so the
+	// last one — the one that finds nothing in flight — clears the claim; callers treat
+	// this as information, not failure (DEVOPS-367).
+	ErrRunInFlight = errors.New("claim held: the run still has work in flight")
 
 	// ErrClaimUnsupported indicates the store cannot perform ClaimSlip or ReleaseClaim at
 	// all: it has no claimed_from column and no transaction to make the claim atomic. The

@@ -298,8 +298,13 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 		return err
 	}
 
-	// Deep copy the slip to avoid mutations
+	// Deep copy the slip to avoid mutations. An existing row keeps its claim: PostgresStore's
+	// Create is an ON CONFLICT DO UPDATE whose SET list is slipColumns(), which excludes the
+	// SELECT-only claimed_from, so a redelivered Create resets the row but not the claim.
 	slipCopy := DeepCopySlip(slip)
+	if existing, ok := m.Slips[slip.CorrelationID]; ok {
+		slipCopy.ClaimedFrom = existing.ClaimedFrom
+	}
 	m.Slips[slip.CorrelationID] = slipCopy
 
 	return nil
@@ -390,7 +395,7 @@ func (m *MockStore) Repave(
 			Step:      "push_parsed",
 			Status:    slippy.StepStatusRunning,
 			Timestamp: time.Now(),
-			Actor:     "slippy-library",
+			Actor:     slippy.LibraryActor,
 			Message: fmt.Sprintf("repaved %s for commit %s", oldCorrelationID,
 				newSlip.CommitSHA),
 		})
@@ -576,9 +581,13 @@ func (m *MockStore) Update(ctx context.Context, slip *slippy.Slip) error {
 	}
 
 	// claimed_from is SELECT-only in PostgresStore: the full-row Update never writes it, so
-	// a caller's stale snapshot cannot clear a claim it never loaded. Mirror that here.
+	// a caller's stale snapshot cannot clear a claim it never loaded — except that a terminal
+	// status ends the run and so ends the claim, as in PostgresStore.Update.
 	stored := DeepCopySlip(slip)
 	stored.ClaimedFrom = existing.ClaimedFrom
+	if slip.Status.IsTerminal() {
+		stored.ClaimedFrom = ""
+	}
 	m.Slips[slip.CorrelationID] = stored
 
 	return nil
@@ -723,8 +732,9 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 	return nil
 }
 
-// ClaimSlip mirrors PostgresStore.ClaimSlip in memory: precondition, idempotent repeat,
-// live-run refusal, marker append, status + ClaimedFrom write (DEVOPS-367).
+// ClaimSlip mirrors PostgresStore.ClaimSlip through the shared slippy.DecideClaim: a
+// compare-and-set on the current status, idempotent when already claimed, never writing
+// status.
 func (m *MockStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []slippy.SlipStatus, claimedBy, reason string,
 ) (slippy.SlipStatus, error) {
@@ -740,30 +750,20 @@ func (m *MockStore) ClaimSlip(
 	if !ok {
 		return "", slippy.ErrSlipNotFound
 	}
-	if slip.ClaimedFrom != "" {
-		// Already claimed: idempotent no-op whatever status the run has written since;
-		// expected is checked against the status the claim was taken out of.
-		if !statusIn(expected, slip.ClaimedFrom) {
-			return "", fmt.Errorf("claim %s: already claimed out of %s, not in %v: %w",
-				correlationID, slip.ClaimedFrom, expected, slippy.ErrClaimPreconditionFailed)
-		}
-		return slip.ClaimedFrom, nil
+	prior, write, err := slippy.DecideClaim(slip.Status, slip.ClaimedFrom, expected)
+	if err != nil {
+		return "", fmt.Errorf("claim %s: %w", correlationID, err)
 	}
-	if slip.Status == slippy.SlipStatusInProgress {
-		return "", fmt.Errorf("claim %s: live run: %w", correlationID, slippy.ErrClaimPreconditionFailed)
+	if write {
+		slip.StateHistory = append(slip.StateHistory, slippy.ClaimMarker(prior, claimedBy, reason))
+		slip.ClaimedFrom = prior
 	}
-	if !statusIn(expected, slip.Status) {
-		return "", fmt.Errorf("claim %s: status %s not in %v: %w",
-			correlationID, slip.Status, expected, slippy.ErrClaimPreconditionFailed)
-	}
-	prior := slip.Status
-	slip.StateHistory = append(slip.StateHistory, slippy.ClaimMarker(prior, claimedBy, reason))
-	slip.ClaimedFrom = prior
-	slip.Status = slippy.SlipStatusInProgress
 	return prior, nil
 }
 
-// ReleaseClaim mirrors PostgresStore.ReleaseClaim in memory (DEVOPS-367).
+// ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared slippy.DecideRelease:
+// refused while any step or component is in flight, clears the claim otherwise, never
+// writing status.
 func (m *MockStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
 ) (slippy.SlipStatus, error) {
@@ -779,30 +779,12 @@ func (m *MockStore) ReleaseClaim(
 	if !ok {
 		return "", slippy.ErrSlipNotFound
 	}
-	if slip.ClaimedFrom == "" {
-		return "", fmt.Errorf("release %s: %w", correlationID, slippy.ErrNotClaimed)
-	}
-	// Restore only the claim's own in_progress; any other status was written by the run.
-	restored := slip.Status == slippy.SlipStatusInProgress
-	if restored {
-		slip.Status = slip.ClaimedFrom
+	if err := slippy.DecideRelease(slip); err != nil {
+		return "", fmt.Errorf("release %s: %w", correlationID, err)
 	}
 	slip.ClaimedFrom = ""
-	slip.StateHistory = append(slip.StateHistory, slippy.ReleaseMarker(slip.Status, restored, releasedBy, reason))
+	slip.StateHistory = append(slip.StateHistory, slippy.ReleaseMarker(slip.Status, releasedBy, reason))
 	return slip.Status, nil
-}
-
-// statusIn reports whether s is in set; an empty set admits every status.
-func statusIn(set []slippy.SlipStatus, s slippy.SlipStatus) bool {
-	if len(set) == 0 {
-		return true
-	}
-	for _, e := range set {
-		if e == s {
-			return true
-		}
-	}
-	return false
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.

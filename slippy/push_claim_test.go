@@ -8,12 +8,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A claimant's run that hits one step failure has failed written over its claim's
-// in_progress by checkPipelineCompletion. Before Repave's DELETE was claim-aware, that
-// reopened the repave window for the rest of the run: the next same-commit push saw an
-// ended status, replaced the row, and every later write from the run hit ErrSlipNotFound
-// (PR #87 review, critical). The store now refuses the DELETE while claimed_from is set and
-// the push path's existing went-live fallback dedups onto the run instead of replacing it.
+// A claimant's run is in flight against a failed slip: the claim never writes status, so
+// the row still reads failed and, before DEVOPS-367, the next same-commit push repaved it
+// and every later write from the run hit ErrSlipNotFound. The push path now dedups on a
+// set claimed_from before ancestor resolution, and the store's Repave guard refuses the
+// row as a second line of defence (see the mock tests).
 func TestClient_CreateSlipForPush_ClaimedSlipIsNotRepavedAfterAStepFailure(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
@@ -30,8 +29,6 @@ func TestClient_CreateSlipForPush_ClaimedSlipIsNotRepavedAfterAStepFailure(t *te
 	})
 	_, err := store.ClaimSlip(ctx, "corr-claimed", []SlipStatus{SlipStatusFailed}, "slippy-cli/prejob", "rerun")
 	require.NoError(t, err)
-	// One step of the rerun failed: the executor writes failed over the claim's in_progress.
-	require.NoError(t, store.UpdateSlipStatus(ctx, "corr-claimed", SlipStatusFailed))
 
 	result, err := client.CreateSlipForPush(ctx, PushOptions{
 		CorrelationID: "corr-fresh",
@@ -44,7 +41,7 @@ func TestClient_CreateSlipForPush_ClaimedSlipIsNotRepavedAfterAStepFailure(t *te
 	require.NotNil(t, result.Slip)
 	assert.Equal(t, "corr-claimed", result.Slip.CorrelationID, "the push dedups onto the claimed run")
 	assert.Empty(t, store.CreateCalls, "no fresh slip is created")
-	assert.Equal(t, []string{"corr-claimed"}, store.RepaveCalls, "the repave was attempted and the store refused it")
+	assert.Empty(t, store.RepaveCalls, "the fast path decided before any repave attempt")
 
 	_, err = store.Load(ctx, "corr-fresh")
 	require.ErrorIs(t, err, ErrSlipNotFound, "a refused repave creates no successor")

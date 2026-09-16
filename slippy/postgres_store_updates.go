@@ -68,7 +68,8 @@ func (s *PostgresStore) AppendHistory(ctx context.Context, correlationID string,
 // claim with it: nothing is left to protect, and a claim that outlived its run would refuse
 // every later repave of the commit with no client left to release it (DEVOPS-367). failed is
 // not terminal — other components of the run may still be executing — so it keeps the claim,
-// as does the reconcile path's in_progress; ReleaseClaim ends those when the run is over.
+// as does the reconcile path's in_progress; ReleaseClaim ends those once nothing is in
+// flight. The full-row Update applies the same terminal rule (PromoteSlip goes that way).
 func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID string, newStatus SlipStatus) error {
 	set := "status = $1, updated_at = now()"
 	if newStatus.IsTerminal() {
@@ -90,12 +91,9 @@ func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID stri
 // contract; this comment covers the Postgres mechanics.
 //
 // The row is read FOR UPDATE, so two concurrent claims serialise: the second sees the
-// first's claimed_from and takes the idempotent no-op arm. That arm keys on claimed_from
-// alone, not on status, because the claim outlives the pipeline's status writes (a step
-// failure writes failed over the claim's in_progress) and a later claimant must join the
-// run rather than re-claim it. The marker append and the status write are in the same
-// transaction as that read, which is the property the slippy-api adapter used to
-// approximate with a marker-then-status ordering and can now drop (DEVOPS-367).
+// first's claimed_from and takes the idempotent no-op arm. The decision itself is
+// DecideClaim, shared with the test doubles. The marker append and the claimed_from write
+// are in the same transaction as the read; status is never written (DEVOPS-367).
 func (s *PostgresStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 ) (SlipStatus, error) {
@@ -111,35 +109,26 @@ func (s *PostgresStore) ClaimSlip(
 			}
 			return fmt.Errorf("claim %s: lock: %w", correlationID, err)
 		}
-		cur := SlipStatus(status)
-		if claimedFrom != nil && *claimedFrom != "" {
-			// Already claimed: the idempotent no-op arm, whatever the run has written to
-			// status since. expected is still honoured, against the status the claim was
-			// taken out of, so a caller is never told it claimed something it refused.
-			prior = SlipStatus(*claimedFrom)
-			if len(expected) > 0 && !slipStatusIn(expected, prior) {
-				return fmt.Errorf("claim %s: already claimed out of %s, not in %v: %w",
-					correlationID, prior, expected, ErrClaimPreconditionFailed)
-			}
+		var recorded SlipStatus
+		if claimedFrom != nil {
+			recorded = SlipStatus(*claimedFrom)
+		}
+		p, write, err := DecideClaim(SlipStatus(status), recorded, expected)
+		if err != nil {
+			return fmt.Errorf("claim %s: %w", correlationID, err)
+		}
+		prior = p
+		if !write {
 			return nil
 		}
-		if cur == SlipStatusInProgress {
-			return fmt.Errorf("claim %s: in_progress with no claim recorded is a live run: %w",
-				correlationID, ErrClaimPreconditionFailed)
-		}
-		if len(expected) > 0 && !slipStatusIn(expected, cur) {
-			return fmt.Errorf("claim %s: status %s not in %v: %w",
-				correlationID, cur, expected, ErrClaimPreconditionFailed)
-		}
-		if err := appendHistoryTx(ctx, tx, correlationID, ClaimMarker(cur, claimedBy, reason)); err != nil {
+		if err := appendHistoryTx(ctx, tx, correlationID, ClaimMarker(prior, claimedBy, reason)); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx,
-			"UPDATE routing_slips SET status = $1, claimed_from = $2, updated_at = now() WHERE correlation_id = $3",
-			string(SlipStatusInProgress), status, correlationID); err != nil {
-			return fmt.Errorf("claim %s: status write: %w", correlationID, err)
+			"UPDATE routing_slips SET claimed_from = $1, updated_at = now() WHERE correlation_id = $2",
+			string(prior), correlationID); err != nil {
+			return fmt.Errorf("claim %s: claim write: %w", correlationID, err)
 		}
-		prior = cur
 		return nil
 	})
 	if err != nil {
@@ -148,56 +137,35 @@ func (s *PostgresStore) ClaimSlip(
 	return prior, nil
 }
 
-// ReleaseClaim implements SlipStore.ReleaseClaim as one transaction in the same shape as
-// ClaimSlip: lock the row, decide from what the lock returned, write. The claim ends
-// whatever the status says; the status is restored only if it is still the claim's own
-// in_progress, because any other value was written by the run and is real progress that a
-// release must never undo.
+// ReleaseClaim implements SlipStore.ReleaseClaim as one transaction: the whole row is read
+// FOR UPDATE, DecideRelease (shared with the test doubles) judges from that read whether the
+// claim exists and whether any step or component is still in flight, and the clear lands
+// under the same lock — so the quiescence it decided on cannot change before the write.
+// Status is never written (DEVOPS-367).
 func (s *PostgresStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
 ) (SlipStatus, error) {
-	var final SlipStatus
+	var status SlipStatus
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
-		var status string
-		var claimedFrom *string
-		if err := tx.QueryRow(ctx,
-			"SELECT status, claimed_from FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
-			correlationID).Scan(&status, &claimedFrom); err != nil {
-			if isNoRows(err) {
-				return ErrSlipNotFound
-			}
-			return fmt.Errorf("release %s: lock: %w", correlationID, err)
+		slip, err := s.loadForUpdateTx(ctx, tx, correlationID)
+		if err != nil {
+			return err
 		}
-		if claimedFrom == nil || *claimedFrom == "" {
-			return fmt.Errorf("release %s: %w", correlationID, ErrNotClaimed)
-		}
-		cur := SlipStatus(status)
-		restored := cur == SlipStatusInProgress
-		final = cur
-		if restored {
-			final = SlipStatus(*claimedFrom)
+		if err := DecideRelease(slip); err != nil {
+			return fmt.Errorf("release %s: %w", correlationID, err)
 		}
 		if _, err := tx.Exec(ctx,
-			"UPDATE routing_slips SET status = $1, claimed_from = NULL, updated_at = now() WHERE correlation_id = $2",
-			string(final), correlationID); err != nil {
-			return fmt.Errorf("release %s: status write: %w", correlationID, err)
+			"UPDATE routing_slips SET claimed_from = NULL, updated_at = now() WHERE correlation_id = $1",
+			correlationID); err != nil {
+			return fmt.Errorf("release %s: clear: %w", correlationID, err)
 		}
-		return appendHistoryTx(ctx, tx, correlationID, ReleaseMarker(final, restored, releasedBy, reason))
+		status = slip.Status
+		return appendHistoryTx(ctx, tx, correlationID, ReleaseMarker(status, releasedBy, reason))
 	})
 	if err != nil {
 		return "", err
 	}
-	return final, nil
-}
-
-// slipStatusIn reports whether s is one of set.
-func slipStatusIn(set []SlipStatus, s SlipStatus) bool {
-	for _, x := range set {
-		if x == s {
-			return true
-		}
-	}
-	return false
+	return status, nil
 }
 
 // SetComponentImageTag records the built image tag for a component, preserving its current
@@ -573,10 +541,10 @@ func appendHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string, entry
 const repaveableSlipStatusesSQL = "'failed','completed','abandoned','promoted','compensated'"
 
 // slipUnclaimedSQL is the claim half of Repave's guard. A row with claimed_from set has a
-// claimant's run in flight whatever its status column says — a step failure writes failed
-// over the claim's in_progress — and must survive a same-commit push exactly as a live row
-// does (DEVOPS-367). ClaimSlip and ReleaseClaim treat an empty string as unclaimed, so this
-// must too.
+// claimant's run in flight whatever its status column says — the claim never writes status,
+// so a claimed slip usually still reads failed — and must survive a same-commit push exactly
+// as a live row does (DEVOPS-367). ClaimSlip and ReleaseClaim treat an empty string as
+// unclaimed, so this must too.
 const slipUnclaimedSQL = "(claimed_from IS NULL OR claimed_from = '')"
 
 // Repave atomically replaces one commit's ended run with a fresh one. See SlipStore.Repave
@@ -773,7 +741,7 @@ func (s *PostgresStore) Repave(
 				// entry distinguishable by Actor purely by accident — worth avoiding,
 				// because a consumer would then be relying on a typo. A repave is
 				// identified by the Message, as the integration test does.
-				Actor: "slippy-library",
+				Actor: LibraryActor,
 				Message: fmt.Sprintf("repaved %s for commit %s", oldCorrelationID,
 					shortSHA(newSlip.CommitSHA)),
 			}); err != nil {
