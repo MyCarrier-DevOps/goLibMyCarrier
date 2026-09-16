@@ -25,12 +25,16 @@ ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (Sli
 
 Same posture as `Repave` below: a downstream `SlipStore` implementation fails to compile
 until both methods exist (the ClickHouse store returns `ErrClaimUnsupported`; the
-`slippytest.MockStore` and slippy-api's `mockSlipStore` implement them). `ReleaseMarker`
-also changed shape in the same release — `ReleaseMarker(status SlipStatus, restored bool,
-releasedBy, reason string)` — because a release no longer always restores: it clears the
-claim whatever the status is and restores the pre-claim status only when the run wrote
-nothing. The contract, including what `nil` means for `expected` and why the claim outlives
-status writes, is on `SlipStore.ClaimSlip` and `SlipStore.ReleaseClaim` in `interfaces.go`.
+`slippytest.MockStore` and slippy-api's `mockSlipStore` implement them). The claim is a
+**flag**: `ClaimSlip` never writes `status`, and `ReleaseClaim` clears the claim only when
+no step or component is running or held — otherwise it is `ErrRunInFlight`, a new sentinel
+callers must treat as information. Implementers should route their decisions through
+`slippy.DecideClaim` and `slippy.DecideRelease` so they cannot drift from the store.
+`ReleaseMarker(status SlipStatus, releasedBy, reason string)` changed shape in the same
+release (the earlier `restored` argument is gone: a release never restores anything). The
+contract, including what `nil` means for `expected`, is on `SlipStore.ClaimSlip` and
+`SlipStore.ReleaseClaim` in `interfaces.go`; the model is in
+`.github/STATE_MACHINE_V3.md` under DEVOPS-367.
 
 **DEVOPS-231 added `Repave` to the exported `SlipStore` interface:**
 

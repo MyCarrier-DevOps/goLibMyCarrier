@@ -348,59 +348,55 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   was observed directly — the same commit's push repaved while the slip was `failed` and
   deduplicated onto the rerun's correlation ID six seconds after the claim.
 
-  Four properties of the claim, as of DEVOPS-367 (goLibMyCarrier ≥ v1.3.103):
+  The claim, as of DEVOPS-367 (goLibMyCarrier ≥ v1.3.103), is a **flag**: `claimed_from`
+  set means a run is in flight against the slip. Four properties:
 
-  - **It is one transaction with a precondition.** `SlipStore.ClaimSlip` locks the row,
-    checks the caller's expected-status set (`if_status` on the API), appends the marker,
-    and writes `status = in_progress` plus `claimed_from = <prior>` together. A status
-    outside the set is `ErrClaimPreconditionFailed` with nothing written; the caller
-    decided on a stale read and must re-read rather than retry. An `in_progress` slip
-    with no `claimed_from` is a genuinely live run and is refused regardless of the set.
-    A repeat claim on an already-claimed slip is an idempotent no-op returning the prior
-    — no second marker, no status write — because a caller's retry after a lost response
-    *is* the recovery, and because every pre-job of one run claims the same slip. The
-    no-op still checks `if_status` against the recorded prior, so a caller is never told
-    it claimed a status it refused.
-  - **The prior status is persisted, not just logged.** `routing_slips.claimed_from`
-    (migration v6, nullable, SELECT-only) records what the slip was; the marker's message
-    names it too, built by the store from the value it read under lock. `claimed_from` is
-    written only by `ClaimSlip` and cleared when the run is over: by `ReleaseClaim`, by a
-    terminal status write (terminal ends the run, so it ends the claim), or by
-    `checkPipelineCompletion` when it writes `failed` with no step or component still
-    running — so a completed run needs no release to be repaveable again, and a failed one
-    is repaveable the moment it is quiescent. `Create` and the full-row `Update` never touch
-    it, and a non-terminal status write with work still running never clears it, so neither
-    a caller's snapshot nor the pipeline's own progress can end a claim early. Non-empty
-    `claimed_from` means a
-    claimant's run is in flight *whatever `status` says*: a step failure mid-run writes
-    `failed` over the claim's `in_progress` and the claim survives it. `Repave` refuses a
-    row with `claimed_from` set exactly as it refuses a live one (`ErrSlipWentLive`) and
-    the push path deduplicates onto it, so the claim protects the whole run — not only the
-    stretch before its first step failure. Migration v6's down refuses while any claim is
-    held, because dropping the column under one would wedge that slip for good.
-  - **A committed claim has a release.** `SlipStore.ReleaseClaim` (`POST
-    /v1/slips/{id}/release`) clears `claimed_from` and appends a `slip_released` marker
-    whatever the status is, and settles `status` in the same transaction: restored to the
-    pre-claim value if it is still the claim's own `in_progress` (the run wrote nothing),
-    kept as the run wrote it otherwise. It never writes over a status the run wrote, so it
-    is safe to call blindly; an unclaimed slip is `ErrNotClaimed`. The CLI post-job calls
-    it on every exit, so a claim never outlives its run and leaves no residue to confuse
-    the next claim or repave.
-  - **Recovery from a dead run is the workflow exit hook, never a clock.** A run that
-    dies after claiming is reconciled by Argo's workflow-level `hooks.exit` running
-    `slippy-post-job`, which every slip-routed template carries (`prod-gate` and
-    `secretscan` gained theirs under DEVOPS-367); the post-job's `slip-post` step retries
-    transient API failures. No component decides a claimed run is dead by elapsed time:
-    a long build is indistinguishable from a wedge by status, so any bound would either
-    repave live runs or be too long to matter. The residual — slippy-api unavailable for
-    longer than the post-job's retry window — is an outage, recovered by one release call.
+  - **It never writes `status`.** `SlipStore.ClaimSlip` locks the row, compare-and-sets on
+    the *current* status (`if_status` on the API; a mismatch is `ErrClaimPreconditionFailed`
+    with nothing written), appends the `slip_claimed` marker and sets `claimed_from` to the
+    status the row had — as an audit record, not as something to restore. `nil` admits any
+    status, a live `in_progress` included. A repeat claim on a held claim is an idempotent
+    no-op returning the recorded prior — no second marker — because every pre-job of one
+    run claims the same slip and a retry after a lost response *is* the recovery. The status
+    column stays the pipeline's alone, so `checkPipelineCompletion`'s terminal bypass keeps
+    protecting `completed` and `promoted` even when they are claimed.
+  - **While it is held, the row cannot be repaved.** `Repave` refuses a row with
+    `claimed_from` set exactly as it refuses a live one (`ErrSlipWentLive`), and the push
+    path deduplicates onto a claimed slip before it even resolves ancestry. This holds
+    whatever `status` says: a claimed rerun of a `failed` slip still reads `failed`, and a
+    step failure mid-run changes nothing about the claim. `Create` and the full-row
+    `Update` never write `claimed_from` (SELECT-only), so a stale snapshot cannot clear it.
+    Migration v6's down refuses while any claim is held.
+  - **It ends when the run is over, and only then.** Two ways: a **terminal status write**
+    (`UpdateSlipStatus` or a full-row `Update` with a terminal status — `PromoteSlip` takes
+    that path) clears it, because terminal ends the run; or a **release**.
+    `SlipStore.ReleaseClaim` (`POST /v1/slips/{id}/release`) reads the whole row `FOR
+    UPDATE` and clears the claim only if no step or component is running or held; otherwise
+    it is `ErrRunInFlight` with nothing written. `push_parsed`, the library's own
+    bookkeeping step, never counts as in flight. Every post-job releases on exit, so the
+    last one — the one that finds nothing in flight — clears it. A release never writes
+    `status`. Nothing else ends a claim: not a `failed` write, not the reconcile branch's
+    `in_progress`, not the passage of time. There is no claim owner; `claimed_by` and
+    `released_by` are audit strings.
+  - **Recovery from a dead run is the workflow exit hook, never a clock.** A workflow that
+    dies mid-step leaves its step `running`, which blocks release until Argo's
+    workflow-level `hooks.exit` runs `slippy-post-job` and writes the step's result (every
+    slip-routed template carries the hook; `prod-gate` and `secretscan` gained theirs under
+    DEVOPS-367); the post-job's `slip-post` step retries transient API failures (exit 75).
+    No component decides a run is dead by elapsed time: a long build is indistinguishable
+    from a wedge by status, so any bound would either repave live runs or be too long to
+    matter.
 
-  What the claim still does not do: it does not refuse `completed` or `promoted` on its
-  own. For `completed` a claim is an I4 violation by the letter, mitigated by the step
-  columns being untouched (the next terminal write re-enters `checkPipelineCompletion`)
-  and now by `claimed_from` making it reversible. For `promoted` there is no restoration
-  path through the pipeline, so a release is the only way back. Callers therefore state
-  an explicit `if_status`: the CLI pre-job claims out of `failed` only.
+  What the claim does not cover, stated plainly: the **gap between two workflows of one
+  run** — after the last post-job of one phase releases and before the next phase's pre-job
+  claims (an Argo sensor dispatch: seconds to minutes) — is a stretch with no claim held and
+  the row at a repaveable status. A same-commit push in that gap repaves and starts the
+  commit over; the later workflow's pre-job then fails to resolve its correlation id and
+  exits. That is the pre-DEVOPS-285 behaviour for that window and is accepted: the claim
+  protects work that is *in flight*, not work that has not started. A step left `running`
+  by a run that never reports (an `argo terminate`, a lost cluster) holds the claim until
+  something writes that step; the rerunner still works (its claim is the idempotent no-op)
+  and a same-commit push deduplicates rather than repaving.
 
   **Residual, narrowing:** ordinary stragglers from any superseded run still get a
   not-found on write, now with a message that names the likely repave. The ~13

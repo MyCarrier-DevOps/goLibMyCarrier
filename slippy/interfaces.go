@@ -92,6 +92,10 @@ type SlipStore interface {
 	// Update persists changes to an existing slip.
 	// With timestamp-based versioning, each update gets a unique nanosecond timestamp,
 	// so there are no version conflicts.
+	//
+	// claimed_from is SELECT-only and is not written by Update, so a caller's stale snapshot
+	// cannot clear a claim it never loaded — except that a terminal status ends the run and
+	// so ends the claim, the same rule UpdateSlipStatus applies (DEVOPS-367).
 	Update(ctx context.Context, slip *Slip) error
 
 	// UpdateStep updates a specific step's status
@@ -120,56 +124,51 @@ type SlipStore interface {
 	// (DEVOPS-367). Non-terminal statuses — failed included — leave the claim in place.
 	UpdateSlipStatus(ctx context.Context, correlationID string, status SlipStatus) error
 
-	// ClaimSlip records that an adopter has a run in flight against a slip, as ONE
-	// transaction: lock the row, check the precondition, append entry, set status to
-	// in_progress and claimed_from to the status the row had. There is no half-claimed state
-	// and nothing about the decision is trusted from the caller's earlier read (DEVOPS-367).
+	// ClaimSlip records that a run is in flight against a slip, as ONE transaction: lock
+	// the row, compare-and-set on the current status, append the marker, set claimed_from to
+	// the status the row had. It never writes status (DEVOPS-367).
 	//
-	// The claim lives from ClaimSlip until the run is over: ReleaseClaim, a terminal status
-	// write, or the library's own release once a failed pipeline has nothing running —
-	// whichever comes first. The pipeline is free to write non-terminal statuses while it is
-	// held (a step failure writes failed over the claim's in_progress); claimed_from stays
-	// set, Repave refuses the row for as long as it is, and a same-commit push dedups onto
-	// the run. A terminal status ends the run and so ends the claim without a release, and
-	// checkPipelineCompletion releases it when it writes failed with no step or component
-	// still running, so a failed run is repaveable again the moment it is quiescent.
+	// The claim is a flag. It lives until the run is over: a post-job's ReleaseClaim that finds
+	// nothing in flight, or a terminal status write (UpdateSlipStatus or the full-row Update
+	// with a terminal status). While it is held, Repave refuses the row (ErrSlipWentLive) and
+	// the push path dedups onto it, whatever status the pipeline writes meanwhile.
 	//
-	// expected is the set of statuses the caller agreed to claim out of. nil means "any
-	// status except an unclaimed in_progress" — pending and compensating included, not only
-	// the ended statuses. Whatever expected says, an in_progress slip whose claimed_from is
-	// empty is a genuinely live run and is always refused.
+	// expected is the set of statuses the caller agreed to claim out of, checked against the
+	// current status even on a repeat claim. nil admits any status, a live in_progress run
+	// included — claiming one is harmless, since in_progress is not repaveable anyway. The
+	// decision is DecideClaim, shared with the test doubles.
 	//
-	// The store builds the adoption marker itself with ClaimMarker(prior, claimedBy, reason),
-	// because only it knows the true prior status at write time; a caller-built entry could
-	// name a status that changed between its read and this write. claimedBy is audit only:
-	// it names the actor in the marker and is never a key the claim is checked against.
+	// The store builds the marker itself with ClaimMarker(prior, claimedBy, reason), because
+	// only it knows the true status at write time. claimedBy is audit only: it names the
+	// actor in the marker and is never a key the claim is checked against. There is no claim
+	// owner; every pre-job of a run claims the same slip and every post-job releases it.
 	//
 	// Returns the prior status, and:
-	//   - nil: the slip is now in_progress with claimed_from = prior, and the marker was appended.
-	//   - nil with no write: the slip was already claimed (claimed_from set, whatever status
-	//     the run has written since); the returned prior is that claimed_from, and expected
-	//     is checked against it. Repeat claims are idempotent — no second marker and no
-	//     status write, so a retried request cannot inflate the audit trail or undo the run's
-	//     progress. Every pre-job of one run claims the same slip, so this arm is the normal
-	//     path for all but the first.
-	//   - ErrClaimPreconditionFailed: the status (or, on a held claim, claimed_from) was
-	//     outside expected, or the slip is a live unclaimed run. Nothing was written.
+	//   - nil: claimed_from = prior was written and the marker appended.
+	//   - nil with no write: the slip was already claimed; the returned prior is the recorded
+	//     claimed_from. Repeat claims are idempotent — no second marker — so a retried
+	//     request cannot inflate the audit trail, and all but the first pre-job of a run
+	//     take this arm.
+	//   - ErrClaimPreconditionFailed: the current status was outside expected, or the slip
+	//     has no status at all (an empty status cannot be recorded as a claim). Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
 	ClaimSlip(
 		ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 	) (SlipStatus, error)
 
-	// ReleaseClaim ends a claim, in one transaction (DEVOPS-367): clear claimed_from, append a
-	// release marker, and settle the status — restored to claimed_from if it is still the
-	// claim's own in_progress (the run wrote nothing), otherwise kept exactly as the run wrote
-	// it. The claimant's post-job calls this on every exit, so a claim never outlives its run
-	// and no residue is left to confuse the next claim or repave.
+	// ReleaseClaim ends a claim once nothing of the run is in flight, as ONE transaction
+	// (DEVOPS-367): read the whole row FOR UPDATE, decide (DecideRelease, shared with the
+	// test doubles), clear claimed_from and append a release marker. It never writes status.
 	//
-	// What makes this safe to call blindly is that it never writes over a status the run
-	// wrote: a slip whose pipeline advanced past the claim keeps that status and only loses
-	// the claim. releasedBy is audit only, like claimedBy. Returns the status after release.
-	//   - ErrNotClaimed: claimed_from empty. Nothing written.
+	// Every post-job calls this on exit, whatever its own step's outcome. While any step or
+	// component is running or held the release is refused with ErrRunInFlight and nothing is
+	// written, so the last post-job — the one that finds nothing in flight — clears the
+	// claim. push_parsed, the library's own bookkeeping step, never counts as in flight.
+	// releasedBy is audit only. Returns the status at release.
+	//   - ErrRunInFlight: claim held, work in flight. Nothing written; not a failure.
+	//   - ErrNotClaimed: claimed_from empty — the normal outcome after a terminal status
+	//     write already ended the claim. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot release (ClickHouse).
 	ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (SlipStatus, error)
