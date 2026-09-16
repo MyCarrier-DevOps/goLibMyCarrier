@@ -49,4 +49,7 @@ func TestClient_CreateSlipForPush_ClaimedSlipIsNotRepavedAfterAStepFailure(t *te
 	require.NoError(t, err)
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim survives the push")
 	assert.Equal(t, SlipStatusFailed, got.Status, "and so does the status the run wrote")
+
+	_, err = store.ReleaseClaim(ctx, "corr-claimed", "slippy-cli/postjob", "")
+	require.NoError(t, err, "the dedup's push_parsed reset must not hold the claim")
 }

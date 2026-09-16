@@ -465,7 +465,7 @@ func (m *MockStore) Repave(
 			Step:      "push_parsed",
 			Status:    StepStatusRunning,
 			Timestamp: time.Now(),
-			Actor:     "slippy-library",
+			Actor:     LibraryActor,
 			Message:   fmt.Sprintf("repaved %s for commit %s", oldCorrelationID, shortSHA(newSlip.CommitSHA)),
 		})
 	}

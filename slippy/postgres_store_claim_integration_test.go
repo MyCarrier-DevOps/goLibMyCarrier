@@ -260,6 +260,20 @@ func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 		assert.Equal(t, 1, countMarkers(t, store, "r-two", ReleaseMarkerStep), "one release marker, from the one that cleared")
 	})
 
+	t.Run("push_parsed running does not count as in flight", func(t *testing.T) {
+		claimTestSlip(t, store, "r-push", "sha-push", SlipStatusFailed)
+		_, err := store.ClaimSlip(ctx, "r-push", nil, "rerunner", "")
+		require.NoError(t, err)
+		// Every deduplicated same-commit push resets push_parsed to running and nothing ever
+		// completes it; counting it would make the claimed slip unreleasable forever.
+		require.NoError(t, store.UpdateStep(ctx, "r-push", "push_parsed", "", StepStatusRunning))
+		_, err = store.ReleaseClaim(ctx, "r-push", "post-job", "")
+		require.NoError(t, err)
+		got, err := store.Load(ctx, "r-push")
+		require.NoError(t, err)
+		assert.Empty(t, got.ClaimedFrom)
+	})
+
 	t.Run("unclaimed slip is ErrNotClaimed and untouched", func(t *testing.T) {
 		claimTestSlip(t, store, "r-plain", "sha-p", SlipStatusFailed)
 		_, err := store.ReleaseClaim(ctx, "r-plain", "post-job", "")

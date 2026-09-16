@@ -68,13 +68,24 @@ func ReleaseMarker(status SlipStatus, releasedBy, reason string) StateHistoryEnt
 	}
 }
 
+// pushParsedStep is the library's own bookkeeping step: the push path writes it
+// (handlePushRetry resets it to running on every deduplicated push) and no post-job ever
+// reports it, so it can never mean claimant work is in flight and RunInFlight ignores it.
+const pushParsedStep = "push_parsed"
+
 // RunInFlight reports whether any step, or any component inside an aggregate step, is
 // running or held (StepStatus.IsRunning). Components are checked as well as steps because an
 // aggregate step's own status can already read failed while a sibling component is still
 // building, and held counts because a held step's pre-job has already run and will not claim
-// again. This is the one definition of "work in flight" the claim protects.
+// again. pushParsedStep is skipped: it is the library's own bookkeeping, reset to running by
+// every deduplicated push and never completed by a post-job, so counting it would make a
+// deduped claimed slip unreleasable. This is the one definition of "work in flight" the
+// claim protects.
 func RunInFlight(slip *Slip) bool {
-	for _, step := range slip.Steps {
+	for name, step := range slip.Steps {
+		if name == pushParsedStep {
+			continue
+		}
 		if step.Status.IsRunning() {
 			return true
 		}
@@ -95,8 +106,13 @@ func RunInFlight(slip *Slip) bool {
 // ErrClaimPreconditionFailed and the store writes nothing. Otherwise the claim is granted:
 // write reports whether the store must record it (claimed_from plus a marker) or the slip is
 // already claimed and this is the idempotent no-op arm. prior is the status to report — the
-// current one on a fresh claim, the recorded one on a repeat.
+// current one on a fresh claim, the recorded one on a repeat. A slip with no status at all is
+// refused outright: recording it would write claimed_from = "", which every reader — the
+// repave guard, the push fast path, DecideRelease — treats as unclaimed.
 func DecideClaim(status, claimedFrom SlipStatus, expected []SlipStatus) (prior SlipStatus, write bool, err error) {
+	if status == "" {
+		return "", false, fmt.Errorf("slip has no status: %w", ErrClaimPreconditionFailed)
+	}
 	if len(expected) > 0 && !slices.Contains(expected, status) {
 		return "", false, fmt.Errorf("status %s not in %v: %w", status, expected, ErrClaimPreconditionFailed)
 	}

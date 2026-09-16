@@ -120,6 +120,7 @@ func TestRunInFlight(t *testing.T) {
 			Aggregates: map[string][]ComponentStepData{"builds": {{Component: "api", Status: StepStatusFailed}, {Component: "web", Status: StepStatusRunning}}},
 		}, true},
 		{"completed and skipped only", Slip{Steps: map[string]Step{"builds": {Status: StepStatusCompleted}, "secretscan": {Status: StepStatusSkipped}}}, false},
+		{"push_parsed running is the library's bookkeeping, not in flight", Slip{Steps: map[string]Step{"push_parsed": {Status: StepStatusRunning}, "builds": {Status: StepStatusFailed}}}, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -140,6 +141,7 @@ func TestDecideClaim(t *testing.T) {
 		wantErr     error
 	}{
 		{"fresh claim out of failed", SlipStatusFailed, "", []SlipStatus{SlipStatusFailed}, SlipStatusFailed, true, nil},
+		{"a slip with no status cannot be claimed", "", "", nil, "", false, ErrClaimPreconditionFailed},
 		{"nil expected admits a live in_progress", SlipStatusInProgress, "", nil, SlipStatusInProgress, true, nil},
 		{"nil expected admits promoted", SlipStatusPromoted, "", nil, SlipStatusPromoted, true, nil},
 		{"mismatch writes nothing", SlipStatusAbandoned, "", []SlipStatus{SlipStatusFailed}, "", false, ErrClaimPreconditionFailed},
