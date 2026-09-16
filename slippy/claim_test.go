@@ -110,22 +110,25 @@ func TestMarkerSteps_AreNotPipelineSteps(t *testing.T) {
 func TestRunInFlight(t *testing.T) {
 	tests := []struct {
 		name string
-		slip Slip
+		slip *Slip
 		want bool
 	}{
-		{"nothing", Slip{Steps: map[string]Step{"builds": {Status: StepStatusFailed}, "unit_tests": {Status: StepStatusPending}}}, false},
-		{"a running step", Slip{Steps: map[string]Step{"builds": {Status: StepStatusRunning}}}, true},
-		{"a held step", Slip{Steps: map[string]Step{"dev_deploy": {Status: StepStatusHeld}}}, true},
-		{"a running component under a failed aggregate", Slip{
+		{"nothing", &Slip{Steps: map[string]Step{"builds": {Status: StepStatusFailed}, "unit_tests": {Status: StepStatusPending}}}, false},
+		{"a running step", &Slip{Steps: map[string]Step{"builds": {Status: StepStatusRunning}}}, true},
+		{"a held step", &Slip{Steps: map[string]Step{"dev_deploy": {Status: StepStatusHeld}}}, true},
+		{"a running component under a failed aggregate", &Slip{
 			Steps:      map[string]Step{"builds": {Status: StepStatusFailed}},
 			Aggregates: map[string][]ComponentStepData{"builds": {{Component: "api", Status: StepStatusFailed}, {Component: "web", Status: StepStatusRunning}}},
 		}, true},
-		{"completed and skipped only", Slip{Steps: map[string]Step{"builds": {Status: StepStatusCompleted}, "secretscan": {Status: StepStatusSkipped}}}, false},
-		{"push_parsed running is the library's bookkeeping, not in flight", Slip{Steps: map[string]Step{"push_parsed": {Status: StepStatusRunning}, "builds": {Status: StepStatusFailed}}}, false},
+		{"completed and skipped only", &Slip{Steps: map[string]Step{"builds": {Status: StepStatusCompleted}, "secretscan": {Status: StepStatusSkipped}}}, false},
+		{"push_parsed running is the library's bookkeeping, not in flight", &Slip{Steps: map[string]Step{"push_parsed": {Status: StepStatusRunning}, "builds": {Status: StepStatusFailed}}}, false},
+		// Exported for third-party stores to route their own release decision through, so a
+		// store that hands over nothing must get an answer rather than a panic.
+		{"a nil slip has nothing in flight", nil, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, RunInFlight(&tc.slip))
+			assert.Equal(t, tc.want, RunInFlight(tc.slip))
 		})
 	}
 }

@@ -133,3 +133,85 @@ func TestClient_CreateSlipForPush_DuplicateBackstopDedupsOntoClaimedConflictingS
 	require.NoError(t, err)
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim survives the race")
 }
+
+// A claimed row carrying THIS push's own correlation ID is not another run's row to protect:
+// it is this delivery's own retry. Both paths must reset it in place rather than dedup onto
+// it, or the caller sees returned == sent on an ENDED row and dispatches against a terminal
+// slip — the outcome persistSlipForPush's self-referential arm and the empty-run guard's
+// self-correlation exclusion both exist to prevent. Create's SET list excludes claimed_from,
+// so the reset keeps the claim (PR #87 re-review).
+func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipIsResetNotDeduped(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: testPipelineConfig()})
+
+	store.AddSlip(&Slip{
+		CorrelationID: "corr-self",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self",
+		Status:        SlipStatusFailed,
+		Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+		StateHistory:  []StateHistoryEntry{},
+	})
+	_, err := store.ClaimSlip(ctx, "corr-self", nil, "slippy-cli/prejob", "")
+	require.NoError(t, err)
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-self", // the in-delivery retry reuses its id
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Slip)
+	assert.Equal(t, "corr-self", result.Slip.CorrelationID)
+	assert.Len(t, store.CreateCalls, 1, "the claimed branch must not pre-empt the in-place reset")
+	assert.Empty(t, store.RepaveCalls, "a self-repave is still never attempted")
+
+	got, err := store.Load(ctx, "corr-self")
+	require.NoError(t, err)
+	assert.True(t, got.Status.IsLive(), "the reset makes the row live again, so the caller's dispatch is correct")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "and the claim survives: Create never writes claimed_from")
+}
+
+// The backstop orders its mirror the same way — live, empty-run guard, self-referential,
+// claimed, repave — so a lost insert race whose conflicting row is this push's own AND
+// claimed converges on the main path's in-place reset instead of a plain dedup.
+func TestClient_CreateSlipForPush_DuplicateBackstopResetsASelfCorrelationClaimedSlip(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: testPipelineConfig()})
+
+	conflicting := &Slip{
+		CorrelationID: "corr-self-backstop",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-backstop",
+		Status:        SlipStatusFailed,
+		Steps:         map[string]Step{"builds": {Status: StepStatusFailed}},
+		StateHistory:  []StateHistoryEntry{},
+		ClaimedFrom:   SlipStatusFailed,
+	}
+	store.SeedOnCreate["corr-self-backstop"] = conflicting
+	store.CreateErrorOnce["corr-self-backstop"] = ErrDuplicateSlip
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-self-backstop",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-backstop",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Slip)
+	assert.Equal(t, "corr-self-backstop", result.Slip.CorrelationID)
+	assert.Len(t, store.CreateCalls, 2, "the self-referential arm hands back to the insert retry, not a dedup")
+	assert.Empty(t, store.RepaveCalls, "and Repave is never asked to supersede a row with itself")
+
+	got, err := store.Load(ctx, "corr-self-backstop")
+	require.NoError(t, err)
+	assert.True(t, got.Status.IsLive(), "the retry's upsert reset the row")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim survives the reset")
+}

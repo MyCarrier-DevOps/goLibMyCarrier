@@ -104,6 +104,13 @@ const PushParsedStep = "push_parsed"
 // deduped claimed slip unreleasable. This is the one definition of "work in flight" the
 // claim protects.
 func RunInFlight(slip *Slip) bool {
+	// Nil is "no slip, so nothing in flight" rather than a panic: this is exported for
+	// third-party stores to route their own release decision through, and a store that hands
+	// over nothing must not take the process down. DecideRelease screens nil separately, with
+	// ErrSlipNotFound, because for a RELEASE an absent row is an error rather than quiescence.
+	if slip == nil {
+		return false
+	}
 	for name, step := range slip.Steps {
 		if name == PushParsedStep {
 			continue

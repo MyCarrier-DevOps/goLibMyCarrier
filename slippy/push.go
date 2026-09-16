@@ -755,9 +755,18 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// push_parsed and write history against a run someone else owns, where the guard
 		// returns the row read-only. Before the repave, because that is the whole point —
 		// ancestor resolution's multi-second GitHub calls are skipped for a row that can
-		// only be deduped onto. handleDuplicateSlipBackstop applies the same three in the
-		// same order, so identical inputs converge through either path.
-		if existingSlip.ClaimedFrom != "" {
+		// only be deduped onto.
+		//
+		// A SELF-CORRELATION row is carved out, the same exclusion the empty-run guard makes
+		// and for the same reason: when the existing row already carries THIS push's id there
+		// is no other run's work to protect — it is this delivery's own retry — and returning
+		// it would hand the caller returned == sent on an ENDED row, so it dispatches and then
+		// reports against a terminal slip. It falls through to persistSlipForPush's
+		// self-referential arm, which upserts the row live again; Create's SET list excludes
+		// claimed_from, so that reset keeps the claim. handleDuplicateSlipBackstop orders its
+		// mirror of these the same way — live, empty-run guard, self-referential, claimed,
+		// repave — so identical inputs converge through either path.
+		if existingSlip.ClaimedFrom != "" && existingSlip.CorrelationID != opts.CorrelationID {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
 				return nil, retryErr
@@ -1401,24 +1410,6 @@ func (c *Client) handleDuplicateSlipBackstop(
 		return true, nil
 	}
 
-	if conflicting.ClaimedFrom != "" {
-		// A claimant's run is in flight against the conflicting row whatever its status says
-		// (DEVOPS-367). Mirrors CreateSlipForPush's main path, at the same point in the same
-		// order — live, then the empty-run guard, then claimed, then repave — so a claimed
-		// conflicting row is deduped onto rather than destroyed, and a componentless push onto
-		// one is still handled read-only by the guard above.
-		c.logger.Info(ctx, "Duplicate-create backstop: claimed conflicting slip, deduping", map[string]interface{}{
-			"conflicting_id":     conflicting.CorrelationID,
-			"commit":             shortSHA(conflicting.CommitSHA),
-			"conflicting_status": string(conflicting.Status),
-			"claimed_from":       string(conflicting.ClaimedFrom),
-			"superseding_id":     opts.CorrelationID,
-		})
-		result.Slip = conflicting
-		// Same as the live-conflict branch above: preserve the computed value.
-		return true, nil
-	}
-
 	if conflicting.CorrelationID == opts.CorrelationID {
 		// Self-referential: the conflicting row already carries this push's correlation ID,
 		// so Repave would be asked to supersede a row with itself and would reject it with
@@ -1444,6 +1435,30 @@ func (c *Client) handleDuplicateSlipBackstop(
 			})
 		appendResetMarker(slip, conflicting.Status, conflicting.CommitSHA)
 		return false, nil
+	}
+
+	if conflicting.ClaimedFrom != "" {
+		// A claimant's run is in flight against the conflicting row whatever its status says
+		// (DEVOPS-367): dedup onto it rather than repaving it out from under that run.
+		//
+		// BELOW the self-referential arm, deliberately. A claimed row carrying THIS push's own
+		// correlation ID is not another run's row to protect — it is this delivery's own retry,
+		// and the claim is not what is at stake: Create's ON CONFLICT SET list excludes
+		// claimed_from, so the in-place reset above keeps the claim while making the row live
+		// again. Deduping it here instead would hand the caller returned == sent on an ENDED
+		// row, which is exactly the outcome the self-referential arm and the empty-run guard's
+		// self-correlation exclusion both exist to prevent. CreateSlipForPush's main path
+		// carves the same shape out of its own claimed branch, so the two converge.
+		c.logger.Info(ctx, "Duplicate-create backstop: claimed conflicting slip, deduping", map[string]interface{}{
+			"conflicting_id":     conflicting.CorrelationID,
+			"commit":             shortSHA(conflicting.CommitSHA),
+			"conflicting_status": string(conflicting.Status),
+			"claimed_from":       string(conflicting.ClaimedFrom),
+			"superseding_id":     opts.CorrelationID,
+		})
+		result.Slip = conflicting
+		// Same as the live-conflict branch above: preserve the computed value.
+		return true, nil
 	}
 
 	c.logger.Debug(ctx, "Duplicate-create backstop: attempting repave of ended conflicting slip",
