@@ -167,15 +167,28 @@ type SlipStore interface {
 	// AFTER the dispatch, a step has reported and the status has moved off the ended set, so
 	// the retry is REFUSED — the dispatch it is retrying already happened (PR #87, round 6).
 	//
-	// A CLAIM WITH NOTHING IN FLIGHT IS REAPABLE, and pushhookparser's stranded-slip cleanup
-	// owns that. A claim taken by a pre-job whose workflow was then never dispatched sets
-	// claimed_from with no step ever reported: RunInFlight is false, so a release WOULD clear
-	// it, but no post-job will ever run to call one, and every later same-commit push
-	// deduplicates onto the row. That cleanup used to skip a claimed slip outright; it now
-	// exempts one only while a step or component is running or held — the same evidence
-	// DecideRelease uses — so a claimed slip with nothing in flight and no marker activity is
-	// reaped exactly as an unclaimed one is. This library adds no time-based sweeper for it,
-	// deliberately: elapsed time cannot tell a long build from a wedge (DEVOPS-367).
+	// A CLAIM WITH NOTHING IN FLIGHT IS REAPABLE, and there are two routes to reaping one.
+	// The state: a claim taken by a pre-job whose workflow was then never dispatched sets
+	// claimed_from with no step ever reported. RunInFlight is false, so a release WOULD clear
+	// it — but no post-job will ever run to call one, and every later same-commit push
+	// deduplicates onto the row.
+	//
+	//   - THE OPERATOR ROUTE, which works in every case: POST /v1/slips/{id}/release. With
+	//     nothing in flight it clears the claim on the first call; there is no stuck step to
+	//     resolve first, because no step was ever reported.
+	//   - THE AUTOMATIC ROUTE, which is NARROW: pushhookparser's stranded-slip cleanup. It
+	//     used to skip a claimed slip outright and now exempts one only while a step or
+	//     component is running or held — the same evidence DecideRelease uses. But its claim
+	//     gate is reached only after its earlier gates, so what it actually reaps is a
+	//     claimed, quiescent slip whose status is pending, in_progress or compensating, on a
+	//     commit a force-push or branch delete made unreachable, on the slip's own branch,
+	//     with SLIPPY_STRANDED_CLEANUP armed. A claimed quiescent FAILED slip (the rerunner's
+	//     usual adoption) returns at its `failed` carve-out and a terminal one at its
+	//     live-status gate, both BEFORE the claim gate — neither is reaped by it. Those are
+	//     the operator route's cases.
+	//
+	// This library adds no time-based sweeper for any of it, deliberately: elapsed time cannot
+	// tell a long build from a wedge (DEVOPS-367).
 	//
 	// The store builds the marker itself with ClaimMarker(prior, claimedBy, reason), because
 	// only it knows the true status at write time. claimedBy is audit only: it names the

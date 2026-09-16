@@ -65,14 +65,23 @@ that is **in flight** — running or held steps and components. The gap between 
 last post-job and the next step's pre-job is not covered; that is tracked as **DEVOPS-371**
 (a dispatcher-held claim).
 
-**A claim with nothing in flight is reapable, and pushhookparser's stranded-slip cleanup owns
-that.** The one state no operator action reaches by itself is a claim taken by a pre-job whose
-workflow was then never dispatched: `claimed_from` is set, no step was ever reported,
-`RunInFlight` is false so a release WOULD clear it — but no post-job will ever run to call one,
-and every later same-commit push deduplicates onto the row. That cleanup used to skip any
-claimed slip; it now exempts one only while a step or component is running or held, so a
-claimed slip with nothing in flight and no marker activity is reaped exactly as an unclaimed
-one is. Do **not** add a time-based sweeper to this library for it: a long build is
+**A claim with nothing in flight is reapable, by two routes.** The state with no post-job to
+end it is a claim taken by a pre-job whose workflow was then never dispatched: `claimed_from`
+is set, no step was ever reported, `RunInFlight` is false so a release WOULD clear it — but no
+post-job will ever run to call one, and every later same-commit push deduplicates onto the row.
+
+1. **Operator, and it covers every case:** `POST /v1/slips/{id}/release`. Nothing is in flight,
+   so the first call clears it; there is no stuck step to resolve first.
+2. **Automatic, and it is narrow:** pushhookparser's stranded-slip cleanup, which used to skip
+   any claimed slip and now exempts one only while a step or component is running or held.
+   Its claim gate sits *after* its live-status gate and its `failed` carve-out, so what it
+   actually reaps is a claimed, quiescent slip at `pending`, `in_progress` or `compensating`,
+   for a commit a force-push or branch delete made unreachable, on the slip's own branch, with
+   `SLIPPY_STRANDED_CLEANUP` armed (off by default). A claimed quiescent `failed` slip — the
+   rerunner's usual adoption — and a claimed terminal one both return at earlier gates and are
+   never reaped by it; they are route 1's cases.
+
+Do **not** add a time-based sweeper to this library for any of it: a long build is
 indistinguishable from a wedge by elapsed time, which is why the exemption reads in-flight
 evidence instead (DEVOPS-367, PR #87 finding 3).
 

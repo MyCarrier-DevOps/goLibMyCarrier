@@ -424,7 +424,7 @@ func (s *PostgresStore) stepsFromStatuses(statuses []string) map[string]Step {
 // The nil matters past this function: encoding/json marshals a nil slice as `null` and an
 // empty one as `[]`, so an aggregate step with no components reaches a slippy-api response
 // body as `"builds": null`. Every reader of that field has to accept null as "no components"
-// (PR #87 finding 6). Nothing here depends on the distinction — the readers in this package
+// (PR #87 sixth review). Nothing here depends on the distinction — the readers in this package
 // range over the value, and ranging over nil is a no-op.
 func decodeAggregates(cols []string, raw [][]byte) map[string][]ComponentStepData {
 	aggregates := make(map[string][]ComponentStepData, len(cols))

@@ -429,18 +429,28 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     the operator sees success and the claim survives — and terminal-claimed rows are ordinary,
     since the rerunner claims out of the ended set, four of whose statuses are terminal. Use
     the step-then-release route there.
-  - **A claim with nothing in flight is reapable, and the stranded-slip cleanup owns that.**
-    The one state no operator action and no post-job can reach is a claim taken by a pre-job
-    whose workflow was then never dispatched: `claimed_from` is set, no step was ever
+  - **A claim with nothing in flight is reapable, by two routes — one operator, one
+    automatic and NARROW.** The state that has no post-job to end it is a claim taken by a
+    pre-job whose workflow was then never dispatched: `claimed_from` is set, no step was ever
     reported, `RunInFlight` is false — a release WOULD clear it — but no post-job will ever
-    run to call one, and every later same-commit push deduplicates onto the row. The exit is
-    pushhookparser's stranded-slip cleanup, which used to skip a claimed slip outright and
-    now exempts one only while the claim is doing something — a step or component running or
-    held, the same `RunInFlight` evidence a release decides on. A claimed slip with nothing
-    in flight is reaped exactly as an unclaimed one is. The library adds NO time-based
-    sweeper of its own — elapsed time cannot tell a long build from a wedge, which is why
-    the in-flight evidence, not a clock, is what the exemption reads (DEVOPS-367, PR #87
-    finding 3).
+    run to call one, and every later same-commit push deduplicates onto the row.
+    - **Operator, works in every case:** `POST /v1/slips/{id}/release`. With nothing in
+      flight it clears the claim on the first call — there is no stuck step to resolve first,
+      because no step was ever reported. (The step-then-release route above is for the other
+      shape: a claim held open by a step left `running` or `held`.)
+    - **Automatic:** pushhookparser's stranded-slip cleanup, which used to skip a claimed
+      slip outright and now exempts one only while the claim is doing something — a step or
+      component running or held, the same `RunInFlight` evidence a release decides on. Be
+      precise about its reach: its claim gate sits AFTER its live-status gate and its
+      `failed` carve-out, so what it actually reaps is a claimed, quiescent slip at
+      `pending`, `in_progress` or `compensating`, for a commit a force-push or branch delete
+      made unreachable, on the slip's own branch, with `SLIPPY_STRANDED_CLEANUP` armed (off
+      by default). A claimed quiescent **`failed`** slip — the rerunner's usual adoption —
+      returns at the `failed` carve-out, and a claimed **terminal** one at the live-status
+      gate; neither is reaped. Those are the operator route's cases.
+    The library adds NO time-based sweeper of its own — elapsed time cannot tell a long build
+    from a wedge, which is why the in-flight evidence, not a clock, is what the exemption
+    reads (DEVOPS-367, PR #87 finding 3).
 
   What the claim does not cover, stated plainly (tracked as **DEVOPS-371**, a
   dispatcher-held claim): the **gap between two workflows of one run** — after the last

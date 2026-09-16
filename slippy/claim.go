@@ -164,13 +164,23 @@ type ClaimOutcome struct {
 //   - A slip with no status at all is refused outright: recording it would write
 //     claimed_from = "", which every reader — the repave guard, the push fast path,
 //     DecideRelease — treats as unclaimed.
+//
 //   - A non-empty expected that does not contain the current status is refused, claimed or
 //     not. This is the compare-and-set.
+//
 //   - A LIVE status (IsLive: pending, in_progress, compensating) that expected did not name
 //     is refused, so a nil expected cannot adopt a run already in flight. pending is carved
 //     out because a pending slip is claimable by design: nothing has been dispatched onto it
 //     yet. The refusal does NOT depend on the row being unclaimed, so a live run already
 //     carrying a claim is protected by it too.
+//
+//     Its `!slices.Contains(expected, status)` clause is only ever REACHABLE for an empty
+//     expected: a non-empty one that does not contain the status has already returned at the
+//     compare-and-set above, and one that does contain it makes the clause false. It is
+//     written in full anyway so this arm states its own precondition and stays correct on its
+//     own terms if the compare-and-set above is ever moved, narrowed or reordered — which is
+//     how the arms of this decision drifted apart in the first place.
+//
 //   - Only then, a held claim is the idempotent no-op: prior is the RECORDED claimed_from and
 //     nothing is written, so a repeat cannot inflate the audit trail.
 //
