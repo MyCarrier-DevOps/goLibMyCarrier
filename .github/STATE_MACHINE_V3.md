@@ -363,15 +363,25 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   - **It never writes `status`.** `SlipStore.ClaimSlip` locks the row, compare-and-sets on
     the *current* status (`if_status` on the API; a mismatch is `ErrClaimPreconditionFailed`
     with nothing written), appends the `slip_claimed` marker and sets `claimed_from` to the
-    status the row had — as an audit record, not as something to restore. `nil` admits any
-    status EXCEPT an unclaimed `in_progress`, which is a live run nothing has adopted: a
-    caller that means to claim one lists `in_progress` in `if_status` (the Slippy CLI pre-job
-    does; the rerunner, which names only the ended set, is what the refusal protects). A slip
-    with no status at all is refused. A repeat claim on a held claim is an idempotent no-op
-    returning the recorded prior — no second marker — and `if_status` is then checked against
-    that *recorded prior* rather than the current status, so a retry after a lost response
-    passes even once the run has moved the row on, while a different claimant that never
-    agreed to the recorded prior is refused. The status column stays the pipeline's alone, so
+    status the row had — as an audit record, not as something to restore. That
+    compare-and-set is on the CURRENT status **whether or not a claim is already held**, and
+    the idempotent repeat sits behind it rather than in front of it. `nil` admits any status
+    EXCEPT a live run (`in_progress` or `compensating`; `pending` is claimable by design,
+    nothing has been dispatched onto it), and a recorded claim is no exemption from that
+    refusal: a caller that means to adopt a live run names the status in `if_status` (the
+    Slippy CLI pre-job names every non-terminal status; the rerunner, which names only the
+    ended set, is what the refusal protects). A slip with no status at all is refused. Once
+    `if_status` agrees, a claim already held is an idempotent no-op — `ClaimOutcome{Claimed:
+    false}` carrying the recorded prior, no second marker, nothing written — so a caller can
+    tell its own repeat from an existing claim without weakening the comparison.
+    The consequence for the rerunner's retry after a lost response, which is what the rule is
+    tuned for: if nothing was dispatched the status has not moved, the ended set still
+    matches, and the retry claims and dispatches; if the dispatch DID land and a step has
+    reported, the reconcile branch has written `in_progress`, the ended set misses, and the
+    retry is REFUSED — correctly, because the dispatch it is retrying already happened
+    (PR #87 round 6 reverted an earlier round that compared `if_status` against the recorded
+    prior instead, which let a second rerun request dispatch onto a live run).
+    The status column stays the pipeline's alone, so
     `checkPipelineCompletion`'s terminal bypass keeps protecting `completed` and `promoted`
     even when they are claimed.
   - **While it is held, the row cannot be repaved.** `Repave` refuses a row with
@@ -443,8 +453,12 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   pre-DEVOPS-285 behaviour for that window and is accepted: the claim protects work that is
   *in flight*, not work that has not started. A step left `running` by a run that never
   reports (an `argo terminate`, a lost cluster) holds the claim until something writes that
-  step; the rerunner still works (its claim is the idempotent no-op) and a same-commit push
-  deduplicates rather than repaving. The gap is **per step, not per run**: a step never reported at all is
+  step; a same-commit push deduplicates rather than repaving, and an operator rerun claims
+  again as long as the row still reads an ENDED status — its claim is then the idempotent
+  no-op. If the stuck run drove the row to `in_progress`, the rerunner's ended-set
+  `if_status` no longer matches and its claim is refused; that refusal is the point (a
+  dispatch has already run against this slip), and the recovery is the same one the stuck
+  step needs — resolve the step, then release. The gap is **per step, not per run**: a step never reported at all is
   `pending` and holds nothing — which is how the CLI's client-side poll of the read-only
   prerequisites endpoint leaves a step waiting on prerequisites, whereas the library's own
   `WaitForPrerequisites` writes `held` as its first action and so does hold the claim — so

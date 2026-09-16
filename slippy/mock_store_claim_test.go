@@ -70,8 +70,9 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
 	})
 
-	// A live run nothing has claimed is not adoptable by a caller that named no status.
-	t.Run("nil expected refuses an unclaimed in_progress; an explicit one claims it", func(t *testing.T) {
+	// A live run is not adoptable by a caller that named no status — claimed or not; the
+	// refusal does not depend on the row being unclaimed (see the repeat subtest above).
+	t.Run("nil expected refuses a live in_progress; an explicit one claims it", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "live", Status: SlipStatusInProgress})
 		_, err := store.ClaimSlip(ctx, "live", nil, "rerunner", "")
