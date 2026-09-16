@@ -312,8 +312,8 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 
 	down := stripSQLLineComments(v6.DownSQL)
 	assert.Contains(t, down, "DROP COLUMN IF EXISTS claimed_from")
-	// Dropping the column under a held claim wedges that slip for good: in_progress with no
-	// claim recorded and nothing left to restore from. Down must refuse, not proceed.
+	// Dropping the column under a held claim silently ends that claim and exposes the run's
+	// in-flight work to a same-commit repave, with no way back. Down must refuse, not proceed.
 	assert.Equal(t, 1, strings.Count(down, "RAISE EXCEPTION"), "down carries exactly one guard")
 	assert.Regexp(t, `claimed_from IS NOT NULL AND claimed_from <> ''`, down, "the guard counts held claims")
 	assert.Contains(t, down, "to_regclass('routing_slips')", "and is a no-op on a missing table or column")

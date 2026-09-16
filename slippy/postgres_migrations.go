@@ -342,8 +342,8 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 	}
 }
 
-// claimedFromMigration (v6) adds the nullable column a conditional claim records the slip's
-// prior status in, and a release restores from (DEVOPS-367).
+// claimedFromMigration (v6) adds the nullable column ClaimSlip records a claim in: the
+// status the row had at claim time, set for as long as a run holds the slip (DEVOPS-367).
 //
 // Shape decisions, each deliberate:
 //   - text, not the slip_status DOMAIN: the value is only ever written by ClaimSlip from a
@@ -363,7 +363,7 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 	return postgresmigrator.Migration{
 		Version:     6,
 		Name:        "claimed_from",
-		Description: "routing_slips.claimed_from: prior status recorded by ClaimSlip and restored by ReleaseClaim (DEVOPS-367)",
+		Description: "routing_slips.claimed_from: status at claim time recorded by ClaimSlip; set while a run holds the slip, cleared by ReleaseClaim or a terminal status write (DEVOPS-367)",
 		UpSQL: `
 			ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL;
 
@@ -388,11 +388,11 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 			END $$;
 		`,
 		DownSQL: `
-			-- Refuse while any claim is held. Dropping claimed_from under a held claim leaves
-			-- that slip in_progress with no claim recorded: unclaimable (a live run), unreleasable
-			-- (nothing to restore from) and unrepaveable (not an ended status), with no way back
-			-- once the column is gone — rolling forward again brings the column back NULL, which
-			-- is the same wedge. Let the runs end or release the claims, then re-run the down.
+			-- Refuse while any claim is held. Dropping claimed_from under a held claim silently
+			-- ends that claim: the run's in-flight work is exposed to a same-commit repave, and
+			-- there is no way back — rolling forward again brings the column back NULL, so the
+			-- claim is gone for good. It also breaks every Load on a library that selects the
+			-- column. Let the runs end or release the claims, then re-run the down.
 			-- to_regclass makes a missing table or column a no-op rather than an error.
 			DO $$
 			DECLARE

@@ -340,13 +340,15 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
   **Closed for the rerunner (2026-09-10), by an explicit live-status write.** slippy-api
   gained `POST /v1/slips/{correlationID}/claim`, which appends a `slip_claimed` history
-  marker and sets `slip.status = in_progress`. `in_progress` is absent from
-  `repaveableSlipStatusesSQL`, so a same-commit push arriving after the claim takes the
-  dedup path instead of the DELETE. pushhookparser's rerunner calls it before dispatching
-  and treats failure as fatal, so a rerun that does not own its slip dispatches nothing.
-  Verified in prod: a claim at `00:02:04` on a `failed` slip, and in dev the differential
-  was observed directly — the same commit's push repaved while the slip was `failed` and
-  deduplicated onto the rerun's correlation ID six seconds after the claim.
+  marker and — at the time (DEVOPS-285) — set `slip.status = in_progress`. `in_progress`
+  is absent from `repaveableSlipStatusesSQL`, so a same-commit push arriving after the
+  claim took the dedup path instead of the DELETE. Since DEVOPS-367 the claim is the flag
+  described below and `status` is untouched; the dedup is on `claimed_from` instead.
+  pushhookparser's rerunner calls it before dispatching and treats failure as fatal, so a
+  rerun that does not own its slip dispatches nothing. Verified in prod: a claim at
+  `00:02:04` on a `failed` slip, and in dev the differential was observed directly — the
+  same commit's push repaved while the slip was `failed` and deduplicated onto the rerun's
+  correlation ID six seconds after the claim.
 
   The claim, as of DEVOPS-367 (goLibMyCarrier ≥ v1.3.103), is a **flag**: `claimed_from`
   set means a run is in flight against the slip. Four properties:
@@ -355,11 +357,12 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     the *current* status (`if_status` on the API; a mismatch is `ErrClaimPreconditionFailed`
     with nothing written), appends the `slip_claimed` marker and sets `claimed_from` to the
     status the row had — as an audit record, not as something to restore. `nil` admits any
-    status, a live `in_progress` included. A repeat claim on a held claim is an idempotent
-    no-op returning the recorded prior — no second marker — because every pre-job of one
-    run claims the same slip and a retry after a lost response *is* the recovery. The status
-    column stays the pipeline's alone, so `checkPipelineCompletion`'s terminal bypass keeps
-    protecting `completed` and `promoted` even when they are claimed.
+    status, a live `in_progress` included; a slip with no status at all is refused. A repeat
+    claim on a held claim is an idempotent no-op returning the recorded prior — no second
+    marker — because every pre-job of one run claims the same slip and a retry after a lost
+    response *is* the recovery. The status column stays the pipeline's alone, so
+    `checkPipelineCompletion`'s terminal bypass keeps protecting `completed` and `promoted`
+    even when they are claimed.
   - **While it is held, the row cannot be repaved.** `Repave` refuses a row with
     `claimed_from` set exactly as it refuses a live one (`ErrSlipWentLive`), and the push
     path deduplicates onto a claimed slip before it even resolves ancestry. This holds
@@ -389,14 +392,16 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
   What the claim does not cover, stated plainly: the **gap between two workflows of one
   run** — after the last post-job of one phase releases and before the next phase's pre-job
-  claims (an Argo sensor dispatch: seconds to minutes) — is a stretch with no claim held and
-  the row at a repaveable status. A same-commit push in that gap repaves and starts the
-  commit over; the later workflow's pre-job then fails to resolve its correlation id and
-  exits. That is the pre-DEVOPS-285 behaviour for that window and is accepted: the claim
-  protects work that is *in flight*, not work that has not started. A step left `running`
-  by a run that never reports (an `argo terminate`, a lost cluster) holds the claim until
-  something writes that step; the rerunner still works (its claim is the idempotent no-op)
-  and a same-commit push deduplicates rather than repaving.
+  claims (an Argo sensor dispatch: seconds to minutes) — is a stretch with no claim held.
+  When the row also sits at a repaveable status — the `failed`-rerun case the claim was
+  built for, not the healthy run whose row sits at `in_progress` and is protected by
+  `IsLive()` — a same-commit push in that gap repaves and starts the commit over, and the
+  later workflow's pre-job then fails to resolve its correlation id and exits. That is the
+  pre-DEVOPS-285 behaviour for that window and is accepted: the claim protects work that is
+  *in flight*, not work that has not started. A step left `running` by a run that never
+  reports (an `argo terminate`, a lost cluster) holds the claim until something writes that
+  step; the rerunner still works (its claim is the idempotent no-op) and a same-commit push
+  deduplicates rather than repaving.
 
   **Residual, narrowing:** ordinary stragglers from any superseded run still get a
   not-found on write, now with a message that names the likely repave. The ~13

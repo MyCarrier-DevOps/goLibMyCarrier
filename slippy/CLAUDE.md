@@ -248,9 +248,10 @@ selects `claimed_from` (`slipSelectColumns()`), so a library at or past v1.3.103
 every `Load` with Postgres 42703 against a database still at v5. The migrator Job must
 have applied v6 before any slippy-api pod on that library serves traffic; do not roll
 the API image ahead of the migrator. Rolling back is guarded: v6's DownSQL refuses
-while any slip holds a claim (`claimed_from` set), because dropping the column would
-leave those slips `in_progress` with nothing to restore from — unclaimable, unreleasable
-and unrepaveable. Let the runs end or `ReleaseClaim` them, then re-run the down.
+while any slip holds a claim (`claimed_from` set), because dropping the column erases the
+in-flight flag of every held claim — that run's work becomes repaveable mid-flight — and
+breaks every `Load` until the library is rolled back with it. Let the runs end or
+`ReleaseClaim` them, then re-run the down.
 
 ### 3. Client Initialization Pattern
 
