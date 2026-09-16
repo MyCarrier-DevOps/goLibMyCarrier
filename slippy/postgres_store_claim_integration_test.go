@@ -190,8 +190,11 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 	})
 }
 
-// ReleaseClaim reads the whole row FOR UPDATE and decides under that lock: refused while any
+// ReleaseClaim reads the claim state FOR UPDATE and decides under that lock: refused while any
 // step or component is running or held, clears the claim otherwise. It never writes status.
+// These subtests are the behaviour pin for that read: they cover a step running, a component
+// running inside an aggregate, and push_parsed being ignored, so a read that dropped any of
+// those columns would fail here rather than silently release a run still in flight.
 func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 	store, _, _ := newMigratedStore(t)
 	ctx := context.Background()
@@ -466,4 +469,38 @@ func TestPostgresStore_Create_KeepsAnExistingClaim_Integration(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, SlipStatusInProgress, got.Status, "Create still writes the columns it owns")
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "but never claimed_from: the claim survives")
+}
+
+// ProbeSchema is the startup gate that keeps an API pod ahead of its database from serving
+// at all. slipSelectColumns() appends claimed_from unconditionally, so against a schema
+// still at v5 every read path fails with Postgres 42703 (undefined_column) — not
+// ErrSlipNotFound, which is why a caller cannot discover the problem from a Load's sentinel.
+// The probe answers the question directly, and the second subtest pins the 42703 it exists
+// for: against a v5 database Load fails, and fails with something other than "not found".
+func TestPostgresStore_ProbeSchema_Integration(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("passes against a fully migrated schema", func(t *testing.T) {
+		store, _, _ := newMigratedStore(t)
+		require.NoError(t, store.ProbeSchema(ctx), "v6 applied: the probe must pass")
+	})
+
+	t.Run("reports ErrSchemaBehind at v5, where every read fails", func(t *testing.T) {
+		pool := newPGMigrationTestPool(t)
+		cfg := pgTestPipelineConfig(t)
+		_, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 5})
+		require.NoError(t, err)
+		store, err := NewPostgresStore(pool, cfg, nil)
+		require.NoError(t, err)
+
+		err = store.ProbeSchema(ctx)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrSchemaBehind)
+		assert.Contains(t, err.Error(), ColumnClaimedFrom, "the probe names the missing column")
+
+		_, loadErr := store.Load(ctx, "anything")
+		require.Error(t, loadErr, "every read selects claimed_from, so it cannot succeed at v5")
+		assert.NotErrorIs(t, loadErr, ErrSlipNotFound,
+			"and it fails with 42703, not a sentinel the caller could mistake for an empty database")
+	})
 }

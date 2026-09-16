@@ -101,6 +101,32 @@ func TestMigrationError_IsSentinels(t *testing.T) {
 	}
 }
 
+// Unwrap adds ErrMigrationRevertFailed only for a down, and it keys that on the exact string
+// in Operation. The constants exist so a constructor site cannot drift from the key by a
+// typo; this pins the keying itself, in both directions.
+func TestMigrationError_RevertSentinelKeyedOnOperationDown(t *testing.T) {
+	base := errors.New("boom")
+
+	down := &MigrationError{Version: 3, Name: "add_col", Operation: OperationDown, Err: base}
+	if !errors.Is(down, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must match ErrMigrationRevertFailed", OperationDown)
+	}
+	if !errors.Is(down, ErrMigrationFailed) {
+		t.Error("a down failure is still a migration failure")
+	}
+	if !errors.Is(down, base) {
+		t.Error("the cause must stay reachable through errors.Is")
+	}
+
+	up := &MigrationError{Version: 3, Name: "add_col", Operation: OperationUp, Err: base}
+	if errors.Is(up, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must not match ErrMigrationRevertFailed", OperationUp)
+	}
+	if !errors.Is(up, ErrMigrationFailed) {
+		t.Error("an up failure is a migration failure")
+	}
+}
+
 func TestMigrationError_ErrorsIs(t *testing.T) {
 	underlyingErr := errors.New("underlying error")
 	migErr := &MigrationError{

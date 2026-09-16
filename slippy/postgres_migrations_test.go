@@ -317,6 +317,10 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 	assert.Equal(t, 1, strings.Count(down, "RAISE EXCEPTION"), "down carries exactly one guard")
 	assert.Regexp(t, `claimed_from IS NOT NULL AND claimed_from <> ''`, down, "the guard counts held claims")
 	assert.Contains(t, down, "to_regclass('routing_slips')", "and is a no-op on a missing table or column")
+	// The refusal must name the held slips, not just count them: an operator who cannot act
+	// without a second query against a database mid-rollback is not being helped.
+	assert.Contains(t, down, "string_agg(correlation_id",
+		"the refusal names the held correlation ids, not only how many there are")
 	assert.Less(t, strings.Index(down, "RAISE EXCEPTION"), strings.Index(down, "DROP COLUMN"),
 		"the guard must run before the drop")
 }

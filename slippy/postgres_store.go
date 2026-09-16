@@ -137,6 +137,28 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 	return s.queryOne(ctx, query, correlationID)
 }
 
+// ProbeSchema verifies that routing_slips carries every column this store's SELECTs require.
+// It exists because slipSelectColumns() appends claimed_from unconditionally: against a
+// database still at v5, Load, LoadByCommit, FindByCommits and every other read fail with
+// 42703, so an API pod that starts before the migrator has applied v6 serves no slip
+// operation at all. Callers run it once at startup and treat ErrSchemaBehind as "not ready".
+//
+// to_regclass of a missing table is NULL, so attrelid = NULL matches nothing and the probe
+// reports behind — the right answer for an unmigrated database too.
+func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
+	var present bool
+	err := s.pool.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
+			"AND attname = $1 AND NOT attisdropped)", ColumnClaimedFrom).Scan(&present)
+	if err != nil {
+		return fmt.Errorf("probe routing_slips schema: %w", err)
+	}
+	if !present {
+		return fmt.Errorf("routing_slips.%s missing (migration v6 not applied): %w", ColumnClaimedFrom, ErrSchemaBehind)
+	}
+	return nil
+}
+
 // LoadByCommit retrieves the slip for (repository, commitSHA).
 // Repository comparison is case-insensitive.
 func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
@@ -356,19 +378,76 @@ func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 	return slip
 }
 
-// loadForUpdateTx reads the whole row under FOR UPDATE inside tx, so a decision made from it
-// (ReleaseClaim's in-flight check) holds until the transaction's own write lands.
-func (s *PostgresStore) loadForUpdateTx(ctx context.Context, tx pgx.Tx, correlationID string) (*Slip, error) {
-	sc, dest := s.newSlipScan()
+// claimStateColumns returns exactly the columns DecideRelease reads, in scan order:
+// claimed_from, status, every configured step's status column (slipColumns()' naming), then
+// every aggregate column (aggregateColumns()). It is deliberately NOT slipSelectColumns():
+// state_history and step_details are the two columns that grow without bound on a busy slip,
+// and the release decision reads neither, so keeping them out of the FOR UPDATE read keeps
+// the lock held over a bounded amount of data (DEVOPS-367).
+func (s *PostgresStore) claimStateColumns() []string {
+	cols := []string{ColumnClaimedFrom, ColumnStatus}
+	for _, step := range s.config.Steps {
+		cols = append(cols, step.Name+"_status")
+	}
+	return append(cols, s.aggregateColumns()...)
+}
+
+// loadClaimStateTx reads only the claim state under FOR UPDATE inside tx, so the quiescence
+// DecideRelease judges from it holds until the transaction's own write lands. The returned
+// Slip is partial by design: beyond the CorrelationID it was asked for, only ClaimedFrom,
+// Status, Steps[name].Status and Aggregates are populated, because those are DecideRelease's
+// whole input. It does not hydrate step_details, state_history or reconstructed step timing —
+// a release neither reads nor writes them. Do not hand the result to anything but the release
+// decision.
+func (s *PostgresStore) loadClaimStateTx(ctx context.Context, tx pgx.Tx, correlationID string) (*Slip, error) {
+	cols := s.claimStateColumns()
+	aggCols := s.aggregateColumns()
+
+	var claimedFrom *string
+	var statusStr string
+	stepStatuses := make([]string, len(s.config.Steps))
+	aggregateBytes := make([][]byte, len(aggCols))
+
+	dest := []any{&claimedFrom, &statusStr}
+	for i := range stepStatuses {
+		dest = append(dest, &stepStatuses[i])
+	}
+	for i := range aggregateBytes {
+		dest = append(dest, &aggregateBytes[i])
+	}
+
 	query := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
-		strings.Join(s.slipSelectColumns(), ", "))
+		strings.Join(cols, ", "))
 	if err := tx.QueryRow(ctx, query, correlationID).Scan(dest...); err != nil {
 		if isNoRows(err) {
 			return nil, ErrSlipNotFound
 		}
-		return nil, fmt.Errorf("failed to load slip %s for update: %w", correlationID, err)
+		return nil, fmt.Errorf("failed to load claim state for slip %s: %w", correlationID, err)
 	}
-	return s.populate(sc), nil
+
+	slip := &Slip{CorrelationID: correlationID, Status: SlipStatus(statusStr)}
+	if claimedFrom != nil {
+		slip.ClaimedFrom = SlipStatus(*claimedFrom)
+	}
+	slip.Steps = make(map[string]Step, len(s.config.Steps))
+	for i, step := range s.config.Steps {
+		slip.Steps[step.Name] = Step{Status: StepStatus(stepStatuses[i])}
+	}
+	// Same {"items": [...]} wrapper populate() unmarshals, and the same tolerance: a
+	// malformed aggregate leaves that step's components unset rather than failing the read.
+	slip.Aggregates = make(map[string][]ComponentStepData, len(aggCols))
+	for i, col := range aggCols {
+		var wrapper struct {
+			Items []ComponentStepData `json:"items"`
+		}
+		if len(aggregateBytes[i]) > 0 {
+			if err := json.Unmarshal(aggregateBytes[i], &wrapper); err != nil {
+				continue
+			}
+		}
+		slip.Aggregates[col] = wrapper.Items
+	}
+	return slip, nil
 }
 
 // queryOne runs a single-row SELECT and hydrates the slip, mapping no-rows to

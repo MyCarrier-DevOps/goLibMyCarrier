@@ -101,6 +101,20 @@ When contributing:
 
 This library follows [Semantic Versioning](https://semver.org/).
 
+## Breaking changes
+
+### `postgresmigrator` / `clickhousemigrator`: `MigrationError.Unwrap()` returns `[]error` — since `v1.3.103` (DEVOPS-344)
+
+`MigrationError.Unwrap()` now returns `[]error` instead of a single `error`: the
+`ErrMigrationFailed` sentinel, plus `ErrMigrationRevertFailed` for a `clickhousemigrator`
+down, then the underlying cause. `errors.Is` and `errors.As` see all of them, so sentinel
+checks and `errors.As(err, &pgErr)` keep working — and `errors.Is(err, ErrMigrationFailed)`
+starts working, which is the point of the change.
+
+What breaks: `errors.Unwrap` only calls the single-error `Unwrap() error` form, so
+`errors.Unwrap(err)` and a direct `migErr.Unwrap()` no longer hand back the cause. Use
+`migErr.Cause()` for that.
+
 ## Support
 
 For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/MyCarrier-DevOps/go-client-langfuse).

@@ -393,10 +393,13 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 			-- there is no way back — rolling forward again brings the column back NULL, so the
 			-- claim is gone for good. It also breaks every Load on a library that selects the
 			-- column. Let the runs end or release the claims, then re-run the down.
+			-- The message names up to 20 held correlation ids, so the operator can act on the
+			-- refusal without a second query.
 			-- to_regclass makes a missing table or column a no-op rather than an error.
 			DO $$
 			DECLARE
 				held bigint;
+				held_ids text;
 			BEGIN
 				IF EXISTS (
 					SELECT 1 FROM pg_attribute
@@ -407,7 +410,11 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 					SELECT count(*) INTO held FROM routing_slips
 					WHERE claimed_from IS NOT NULL AND claimed_from <> '';
 					IF held > 0 THEN
-						RAISE EXCEPTION 'migration v6 down: % slip(s) hold a claim (claimed_from set); release them or let their runs end before dropping the column', held;
+						SELECT string_agg(correlation_id, ', ' ORDER BY correlation_id) INTO held_ids
+						FROM (SELECT correlation_id FROM routing_slips
+						      WHERE claimed_from IS NOT NULL AND claimed_from <> ''
+						      ORDER BY correlation_id LIMIT 20) h;
+						RAISE EXCEPTION 'migration v6 down: % slip(s) hold a claim (claimed_from set): % — release them, let their runs end, or abandon them (POST /slips/{id}/abandon) before dropping the column', held, held_ids;
 					END IF;
 				END IF;
 			END $$;

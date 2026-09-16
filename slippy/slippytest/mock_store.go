@@ -369,7 +369,8 @@ func (m *MockStore) Repave(
 	removedOld := false
 	if slip, ok := m.Slips[oldCorrelationID]; ok {
 		// A claimed row is refused like a live one: a claimant's run is in flight whatever
-		// the status says (a step failure writes failed over the claim's in_progress).
+		// the status says — the claim never writes status, so a claimed rerun of a failed
+		// slip still reads failed (slipUnclaimedSQL, postgres_store_updates.go).
 		if slip.Status.IsLive() || slip.ClaimedFrom != "" {
 			return slippy.ErrSlipWentLive
 		}

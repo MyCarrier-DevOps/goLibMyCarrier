@@ -131,7 +131,10 @@ type SlipStore interface {
 	// The claim is a flag. It lives until the run is over: a post-job's ReleaseClaim that finds
 	// nothing in flight, or a terminal status write (UpdateSlipStatus or the full-row Update
 	// with a terminal status). While it is held, Repave refuses the row (ErrSlipWentLive) and
-	// the push path dedups onto it, whatever status the pipeline writes meanwhile.
+	// the push path dedups onto it, whatever status the pipeline writes meanwhile. An abandon
+	// or promote is the exception: both are terminal statuses written from outside the run, so
+	// they end the claim even while steps are still running, and both are repaveable — an
+	// ancestor abandon or a promotion deliberately overrides a live claim.
 	//
 	// expected is the set of statuses the caller agreed to claim out of, checked against the
 	// current status even on a repeat claim. nil admits any status, a live in_progress run
@@ -158,18 +161,26 @@ type SlipStore interface {
 	) (SlipStatus, error)
 
 	// ReleaseClaim ends a claim once nothing of the run is in flight, as ONE transaction
-	// (DEVOPS-367): read the whole row FOR UPDATE, decide (DecideRelease, shared with the
-	// test doubles), clear claimed_from and append a release marker. It never writes status.
+	// (DEVOPS-367): read the claim state FOR UPDATE — the claim, the status and every step
+	// and aggregate column, which is DecideRelease's whole input, and nothing else — decide
+	// (DecideRelease, shared with the test doubles), clear claimed_from and append a release
+	// marker. It never writes status.
 	//
-	// Every post-job calls this on exit, whatever its own step's outcome. While any step or
-	// component is running or held the release is refused with ErrRunInFlight and nothing is
-	// written, so the last post-job — the one that finds nothing in flight — clears the
-	// claim. Held counts because HoldStep writes it after StartStep; a step that has not
-	// called StartStep yet is still pending and holds nothing. Today's fleet never records
-	// held — a step waiting on prerequisites reads pending. push_parsed, the library's own
-	// bookkeeping step, never counts as in flight.
+	// Every post-job calls this on exit, whatever its own step's outcome, and MUST have
+	// written its own step's terminal status FIRST: this call judges quiescence from the row,
+	// so a post-job that releases before recording its step counts itself as in flight and no
+	// post-job of the run ever clears the claim. While any step or component is running or
+	// held the release is refused with ErrRunInFlight and nothing is written, so the last
+	// post-job — the one that finds nothing in flight — clears the claim. Held counts because
+	// HoldStep writes it after StartStep; a step that has not called StartStep yet is still
+	// pending and holds nothing. Today's fleet never records held — a step waiting on
+	// prerequisites reads pending. push_parsed, the library's own bookkeeping step, never
+	// counts as in flight.
 	// releasedBy is audit only. Returns the status at release.
-	//   - ErrRunInFlight: claim held, work in flight. Nothing written; not a failure.
+	//   - ErrRunInFlight: claim held, work in flight. Nothing written; not a failure. If the
+	//     run is dead — a step left running by a workflow that will never report — the exit is
+	//     a terminal status write: Client.AbandonSlip (POST /slips/{id}/abandon) ends the claim
+	//     and leaves the slip repaveable.
 	//   - ErrNotClaimed: claimed_from empty — the normal outcome after a terminal status
 	//     write already ended the claim. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.

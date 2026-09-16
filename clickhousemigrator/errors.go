@@ -36,6 +36,15 @@ var (
 	ErrInvalidMigration = errors.New("invalid migration")
 )
 
+// MigrationError.Operation values: the direction a migration was being applied in when it
+// failed. Constants rather than string literals because Unwrap keys ErrMigrationRevertFailed
+// on OperationDown, so a typo at a constructor site would silently produce an error that no
+// errors.Is(err, ErrMigrationRevertFailed) check ever matches.
+const (
+	OperationUp   = "up"
+	OperationDown = "down"
+)
+
 // MigrationError represents an error that occurred during migration.
 type MigrationError struct {
 	Version     int
@@ -61,7 +70,7 @@ func (e *MigrationError) Error() string {
 // the nil case only defends a hand-built value.
 func (e *MigrationError) Unwrap() []error {
 	out := []error{ErrMigrationFailed}
-	if e.Operation == "down" {
+	if e.Operation == OperationDown {
 		out = append(out, ErrMigrationRevertFailed)
 	}
 	if e.Err != nil {

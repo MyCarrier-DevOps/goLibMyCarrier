@@ -144,13 +144,33 @@ var (
 	// expose that work to a same-commit repave. Every post-job releases on exit, so the
 	// last one — the one that finds nothing in flight — clears the claim; callers treat
 	// this as information, not failure (DEVOPS-367).
+	//
+	// A post-job must have written its own step's terminal status BEFORE it releases: this
+	// decision is read from the row, so a post-job that releases first counts itself as in
+	// flight and no post-job of the run ever clears the claim.
+	//
+	// If the run is dead — a step left running by a workflow that will never report — the
+	// exit is a terminal status write: Client.AbandonSlip (POST /slips/{id}/abandon) ends
+	// the claim and leaves the slip repaveable.
 	ErrRunInFlight = errors.New("claim held: the run still has work in flight")
 
 	// ErrClaimUnsupported indicates the store cannot perform ClaimSlip or ReleaseClaim at
 	// all: it has no claimed_from column and no transaction to make the claim atomic. The
-	// ClickHouse store returns it, wrapped with the correlation ID, since it is not the
-	// operational slip store (DEVOPS-127, removal tracked in DEVOPS-343).
+	// ClickHouse store returns it from both, wrapped with the correlation ID via %w, since it
+	// is not the operational slip store (DEVOPS-127, removal tracked in DEVOPS-343). Callers
+	// detect it with errors.Is and treat it as a failed claim — the same branch as
+	// ErrClaimPreconditionFailed: pushhookparser's rerunner dispatches nothing, the Slippy CLI
+	// pre-job proceeds unclaimed — and never as protection, since nothing was recorded and no
+	// repave is refused. A ReleaseClaim caller treats it as nothing to release, like
+	// ErrNotClaimed.
 	ErrClaimUnsupported = errors.New("store does not support ClaimSlip/ReleaseClaim")
+
+	// ErrSchemaBehind is returned by PostgresStore.ProbeSchema when routing_slips is missing a
+	// column this library's SELECTs require — today claimed_from (migration v6). Every read
+	// path selects that column, so a library ahead of its database fails every Load with
+	// Postgres 42703. Callers probe at startup and refuse to serve until the migrator has
+	// applied the schema (DEVOPS-367).
+	ErrSchemaBehind = errors.New("routing_slips schema is behind this library; apply migrations before serving")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

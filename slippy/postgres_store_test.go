@@ -56,6 +56,32 @@ func TestPostgresStore_slipColumns(t *testing.T) {
 	assert.Equal(t, []string{"builds"}, store.aggregateColumns())
 }
 
+// TestPostgresStore_claimStateColumns pins the narrow read ReleaseClaim uses: it must carry
+// DecideRelease's whole input — the claim, the status, every step's status column and every
+// aggregate column — and must NOT carry state_history or step_details, the two columns that
+// grow without bound on a busy slip and that the release decision never reads. Holding the
+// row lock over them was the cost this read exists to avoid (DEVOPS-367).
+func TestPostgresStore_claimStateColumns(t *testing.T) {
+	store, _ := newMockStore(t)
+	cols := store.claimStateColumns()
+
+	assert.Equal(t, []string{
+		"claimed_from", "status",
+		"push_parsed_status", "builds_status", "unit_tests_status", "dev_deploy_status",
+		"builds",
+	}, cols)
+	assert.NotContains(t, cols, ColumnStateHistory, "the release decision never reads state_history")
+	assert.NotContains(t, cols, ColumnStepDetails, "nor step_details")
+	// Every step's status column and every aggregate column must be present, or a step
+	// running on a column this read skipped would be invisible to DecideRelease.
+	for _, step := range store.config.Steps {
+		assert.Contains(t, cols, step.Name+"_status")
+	}
+	for _, agg := range store.aggregateColumns() {
+		assert.Contains(t, cols, agg)
+	}
+}
+
 func TestPostgresStore_Create_Upsert(t *testing.T) {
 	store, mock := newMockStore(t)
 	mock.ExpectExec("INSERT INTO routing_slips .* ON CONFLICT \\(correlation_id\\) DO UPDATE SET").

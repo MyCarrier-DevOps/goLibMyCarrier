@@ -164,11 +164,14 @@ func (c *Client) ClaimSlip(
 }
 
 // ReleaseClaim ends a claim once the claimant's run has nothing left in flight. Every post-job
-// calls it on exit: while a sibling step or component is still running or held the release is
-// refused with ErrRunInFlight and nothing is written, so the last post-job's release is the
-// one that clears it. An unclaimed slip is ErrNotClaimed — the normal outcome after a terminal
-// status write already ended the claim. The status is never changed; the returned value is
-// the status at release. See SlipStore.ReleaseClaim.
+// calls it on exit, and must have written its own step's terminal status first: quiescence is
+// judged from the row, so a post-job that releases before recording its step counts itself as
+// in flight and no post-job of the run ever clears the claim. While a sibling step or
+// component is still running or held the release is refused with ErrRunInFlight and nothing is
+// written, so the last post-job's release is the one that clears it. An unclaimed slip is
+// ErrNotClaimed — the normal outcome after a terminal status write already ended the claim.
+// The status is never changed; the returned value is the status at release.
+// See SlipStore.ReleaseClaim.
 func (c *Client) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
 ) (SlipStatus, error) {

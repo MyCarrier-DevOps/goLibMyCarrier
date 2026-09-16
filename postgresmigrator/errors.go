@@ -26,6 +26,14 @@ var (
 	ErrInvalidMigration = errors.New("invalid migration")
 )
 
+// MigrationError.Operation values: the direction a migration was being applied in when it
+// failed. Constants rather than string literals, mirroring clickhousemigrator, where Unwrap
+// keys ErrMigrationRevertFailed on OperationDown.
+const (
+	OperationUp   = "up"
+	OperationDown = "down"
+)
+
 // MigrationError represents an error that occurred while applying or reverting
 // a migration.
 type MigrationError struct {

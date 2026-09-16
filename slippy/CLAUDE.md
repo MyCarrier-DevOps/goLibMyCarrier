@@ -247,13 +247,19 @@ if currentVersion < targetVersion {
 selects `claimed_from` (`slipSelectColumns()`), so a library at or past v1.3.103 fails
 every `Load` with Postgres 42703 against a database still at v5. The migrator Job must
 have applied v6 before any slippy-api pod on that library serves traffic; do not roll
-the API image ahead of the migrator. Rolling back is guarded: v6's DownSQL refuses
-while any slip holds a claim (`claimed_from` set), because dropping the column erases the
-in-flight flag of every held claim — that run's work becomes repaveable mid-flight — and
-breaks every `Load` until the library is rolled back with it. Because every slip-routed
-pre-job now claims, some slip usually holds a claim in a busy environment, so plan a
-rollback as a drain: expect the down to refuse until runs finish or are released. Let the
-runs end or `ReleaseClaim` them, then re-run the down.
+the API image ahead of the migrator. That order is now enforced rather than merely
+documented: `PostgresStore.ProbeSchema` asks whether `routing_slips.claimed_from` exists,
+and slippy-api calls it at startup and fails readiness — the pod exits and restarts — for
+as long as it returns `ErrSchemaBehind`. An API rolled ahead of the migrator therefore
+crash-loops until v6 is applied instead of answering every slip request with a 42703.
+Rolling back is guarded: v6's DownSQL refuses while any slip holds a claim
+(`claimed_from` set), because dropping the column erases the in-flight flag of every held
+claim — that run's work becomes repaveable mid-flight — and breaks every `Load` until the
+library is rolled back with it. The refusal names up to 20 of the held correlation ids.
+Because every slip-routed pre-job now claims, some slip usually holds a claim in a busy
+environment, so plan a rollback as a drain: expect the down to refuse until runs finish or
+are released. Let the runs end, `ReleaseClaim` them, or abandon them
+(`POST /v1/slips/{id}/abandon`), then re-run the down.
 
 ### 3. Client Initialization Pattern
 

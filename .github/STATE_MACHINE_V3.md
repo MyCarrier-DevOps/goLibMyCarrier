@@ -344,8 +344,12 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   is absent from `repaveableSlipStatusesSQL`, so a same-commit push arriving after the
   claim took the dedup path instead of the DELETE. Since DEVOPS-367 the claim is the flag
   described below and `status` is untouched; the dedup is on `claimed_from` instead.
-  pushhookparser's rerunner calls it before dispatching and treats failure as fatal, so a
-  rerun that does not own its slip dispatches nothing. Verified in prod: a claim at
+  The two callers claim differently, deliberately. pushhookparser's rerunner claims once per
+  rerun message, out of the ended set, before dispatching, and treats any claim failure as
+  fatal — a rerun that does not own its slip dispatches nothing. The Slippy CLI pre-job
+  claims per step, out of every non-terminal status, and proceeds on a 409, logging it: a
+  step whose claim was refused still runs, because the claim is protection for the run, not
+  a lock the step is required to hold. Verified in prod: a claim at
   `00:02:04` on a `failed` slip, and in dev the differential was observed directly — the
   same commit's push repaved while the slip was `failed` and deduplicated onto the rerun's
   correlation ID six seconds after the claim.
@@ -369,13 +373,19 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     whatever `status` says: a claimed rerun of a `failed` slip still reads `failed`, and a
     step failure mid-run changes nothing about the claim. `Create` and the full-row
     `Update` never write `claimed_from` (SELECT-only), so a stale snapshot cannot clear it.
-    Migration v6's down refuses while any claim is held.
+    Migration v6's down refuses while any claim is held. An abandon or promote is the
+    exception: both are terminal statuses written from outside the run, so they end the claim
+    even while steps are still running, and both are repaveable — an ancestor abandon or a
+    promotion deliberately overrides a live claim.
   - **It ends when the run is over, and only then.** Two ways: a **terminal status write**
     (`UpdateSlipStatus` or a full-row `Update` with a terminal status — `PromoteSlip` takes
     that path) clears it, because terminal ends the run; or a **release**.
-    `SlipStore.ReleaseClaim` (`POST /v1/slips/{id}/release`) reads the whole row `FOR
-    UPDATE` and clears the claim only if no step or component is running or held; otherwise
-    it is `ErrRunInFlight` with nothing written. `push_parsed`, the library's own
+    `SlipStore.ReleaseClaim` (`POST /v1/slips/{id}/release`) reads the claim state — the
+    claim, the status and every step and aggregate column, and nothing else — `FOR UPDATE`
+    and clears the claim only if no step or component is running or held; otherwise it is
+    `ErrRunInFlight` with nothing written. Each post-job must write its own step's terminal
+    status before it releases, or it counts itself as in flight and no post-job of the run
+    ever clears the claim. `push_parsed`, the library's own
     bookkeeping step, never counts as in flight. Every post-job releases on exit, so the
     last one — the one that finds nothing in flight — clears it. A release never writes
     `status`. Nothing else ends a claim: not a `failed` write, not the reconcile branch's
@@ -388,7 +398,14 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     DEVOPS-367); the post-job's `slip-post` step retries transient API failures (exit 75).
     No component decides a run is dead by elapsed time: a long build is indistinguishable
     from a wedge by status, so any bound would either repave live runs or be too long to
-    matter.
+    matter. When the exit hook cannot run at all — the cluster is gone, the workflow was
+    deleted — the operator remedy is an **abandon**: `Client.AbandonSlip`
+    (`POST /v1/slips/{id}/abandon`) writes the terminal `abandoned` through
+    `UpdateSlipStatus`, which clears `claimed_from`, and `abandoned` is in
+    `repaveableSlipStatusesSQL`, so the next same-commit push repaves. Nothing else reaps
+    that state: pushhookparser's stranded-slip cleanup deliberately skips a claimed slip —
+    the claim is precisely what tells it a run owns the row — so the abandon is the only way
+    out.
 
   What the claim does not cover, stated plainly: the **gap between two workflows of one
   run** — after the last post-job of one phase releases and before the next phase's pre-job
@@ -417,8 +434,9 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   **Residual, narrowing:** ordinary stragglers from any superseded run still get a
   not-found on write, now with a message that names the likely repave. The ~13
   `slip-routed` templates that adopt a correlation ID route through one shared
-  `slippy-pre-job` step; Slippy#28 claims there (out of `failed`, after `StartStep`), and
-  is gated on DEVOPS-367 being deployed to the same environment first.
+  `slippy-pre-job` step; Slippy#28 claims there (out of every non-terminal status, after
+  `StartStep`, and releases in every post-job), and is gated on DEVOPS-367 being deployed to
+  the same environment first.
 
 - **No duplicate detection before migration v5.** Without the `uq_routing_slips_repo_sha`
   unique index (migration v5, Phase B), an insert for the same `(repository, commit_sha)`

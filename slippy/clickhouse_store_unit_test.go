@@ -168,6 +168,50 @@ func TestClickHouseStore_Repave(t *testing.T) {
 	}
 }
 
+// ClaimSlip and ReleaseClaim are unsupported on ClickHouse for the same reasons Repave is:
+// no claimed_from column, no transaction to make the claim atomic, and not the operational
+// slip store (DEVOPS-127). Both must return the typed ErrClaimUnsupported sentinel wrapped
+// with the correlation ID, so a caller detects it with errors.Is and takes its failed-claim
+// branch — the rerunner dispatches nothing, the CLI pre-job proceeds unclaimed — rather than
+// matching on a substring, and so the log names which slip was involved.
+func TestClickHouseStore_ClaimSlip_Unsupported(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	prior, err := store.ClaimSlip(context.Background(), "corr-claim-1", nil, "rerunner", "")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !errors.Is(err, ErrClaimUnsupported) {
+		t.Errorf("expected errors.Is(err, ErrClaimUnsupported) to hold, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "corr-claim-1") {
+		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
+	}
+	if prior != "" {
+		t.Errorf("expected no prior status on an unsupported claim, got %q", prior)
+	}
+}
+
+func TestClickHouseStore_ReleaseClaim_Unsupported(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	status, err := store.ReleaseClaim(context.Background(), "corr-release-1", "post-job", "")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !errors.Is(err, ErrClaimUnsupported) {
+		t.Errorf("expected errors.Is(err, ErrClaimUnsupported) to hold, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "corr-release-1") {
+		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
+	}
+	if status != "" {
+		t.Errorf("expected no status on an unsupported release, got %q", status)
+	}
+}
+
 // TestClickHouseStore_Create tests the Create method.
 func TestClickHouseStore_Create(t *testing.T) {
 	t.Run("successful create", func(t *testing.T) {

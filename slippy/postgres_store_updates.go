@@ -70,6 +70,11 @@ func (s *PostgresStore) AppendHistory(ctx context.Context, correlationID string,
 // not terminal — other components of the run may still be executing — so it keeps the claim,
 // as does the reconcile path's in_progress; ReleaseClaim ends those once nothing is in
 // flight. The full-row Update applies the same terminal rule (PromoteSlip goes that way).
+//
+// An abandon or promote is the exception to the claim's in-flight guarantee: both are
+// terminal statuses written from outside the run, so they end the claim even while steps are
+// still running, and both are repaveable — an ancestor abandon or a promotion deliberately
+// overrides a live claim.
 func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID string, newStatus SlipStatus) error {
 	set := "status = $1, updated_at = now()"
 	if newStatus.IsTerminal() {
@@ -137,17 +142,21 @@ func (s *PostgresStore) ClaimSlip(
 	return prior, nil
 }
 
-// ReleaseClaim implements SlipStore.ReleaseClaim as one transaction: the whole row is read
+// ReleaseClaim implements SlipStore.ReleaseClaim as one transaction: the claim state is read
 // FOR UPDATE, DecideRelease (shared with the test doubles) judges from that read whether the
 // claim exists and whether any step or component is still in flight, and the clear lands
 // under the same lock — so the quiescence it decided on cannot change before the write.
 // Status is never written (DEVOPS-367).
+//
+// The read is loadClaimStateTx, not a whole-row load: it selects only claimed_from, status,
+// the step status columns and the aggregate columns — DecideRelease's entire input — so the
+// unbounded state_history and step_details columns are not dragged through the row lock.
 func (s *PostgresStore) ReleaseClaim(
 	ctx context.Context, correlationID, releasedBy, reason string,
 ) (SlipStatus, error) {
 	var status SlipStatus
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
-		slip, err := s.loadForUpdateTx(ctx, tx, correlationID)
+		slip, err := s.loadClaimStateTx(ctx, tx, correlationID)
 		if err != nil {
 			return err
 		}
