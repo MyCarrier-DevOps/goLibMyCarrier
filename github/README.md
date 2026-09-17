@@ -53,6 +53,20 @@ client := session.Client()
 token := session.AuthToken()
 ```
 
+#### Request timeouts
+
+`NewGithubSession` bounds every HTTP call it makes, so a stalled GitHub cannot
+block the calling goroutine indefinitely:
+
+| Call | Overall timeout | Response header timeout |
+| --- | --- | --- |
+| Installation token mint (during authentication, and on token refresh) | 15s | 10s |
+| REST calls through the client returned by `Client()` | 30s | 10s |
+
+The dial (30s) and TLS handshake (10s) bounds of `http.DefaultTransport` are
+kept. A request that exceeds a bound fails with a timeout error rather than
+hanging; retry it in the caller if the operation is safe to repeat.
+
 ### Loading Configuration from a Caller-Provided Viper
 
 Use `GithubLoadConfigFromViper` when you want to drive configuration from your
