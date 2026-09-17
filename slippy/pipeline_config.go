@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -188,29 +189,89 @@ func (c *PipelineConfig) Validate() error {
 // the migrator reported as applied. 63 minus len("_status") is the bound.
 const MaxStepNameLen = 63 - len("_status")
 
-// validateStepIdentifier rejects the two step names that pass exact-case uniqueness and then
-// break the SCHEMA the config generates. Both are caught here, in the config, rather than in
+// stepNameIdentifierPattern matches the step names that survive being spliced UNQUOTED into
+// identifier position. It is the INTERSECTION of the two backends' unquoted-identifier rules:
+// Postgres requires a leading letter or underscore and then admits letters, digits,
+// underscores and dollar signs; ClickHouse's non-quoted identifiers must match
+// ^[a-zA-Z_][0-9a-zA-Z_]*$, which excludes the dollar sign. A config is written once and
+// generates schema for both, so the stricter of the two is what a step name has to satisfy.
+var stepNameIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// reservedStepNames is every fixed routing_slips column, folded to lower case the way Postgres
+// folds the DDL that would collide with it. DERIVED from fixedSlipColumns() plus
+// ColumnClaimedFrom — exactly the non-step part of PostgresStore.slipSelectColumns() — rather
+// than restated, so a column added to that list is reserved against step names by the same
+// edit and cannot silently stop being reserved.
+var reservedStepNames = func() map[string]struct{} {
+	cols := append(fixedSlipColumns(), ColumnClaimedFrom)
+	reserved := make(map[string]struct{}, len(cols))
+	for _, col := range cols {
+		reserved[strings.ToLower(col)] = struct{}{}
+	}
+	return reserved
+}()
+
+// validateStepIdentifier rejects the four step names that pass exact-case uniqueness and then
+// break the SCHEMA the config generates. All four are caught here, in the config, rather than in
 // PostgresStore.ProbeSchema: the probe folds case when it diffs the live catalogue against
 // slipSelectColumns(), which is correct for the probe — Postgres folded the DDL, so a configured
-// `Deploy_Dev` legitimately lands as `deploy_dev` — but that folding also hides these two faults
+// `Deploy_Dev` legitimately lands as `deploy_dev` — but that folding also hides these faults
 // from it, and the probe is the wrong place to find them anyway. A config is rejected at parse
-// time, once, before any DDL runs (PR #87 finding j6).
+// time, once, before any DDL runs (PR #87 finding j6). They are listed in the order they are
+// checked, and this list is the whole of what this function rejects.
 //
+//   - A NAME THAT IS NOT A BARE IDENTIFIER. Step names reach identifier position UNQUOTED:
+//     postgres_migrations.go's stepColumnEnsurer emits
+//     `ADD COLUMN IF NOT EXISTS {name}_status step_status ...` (plus a bare `{name}` column for
+//     an aggregate step), and slipColumns/slipSelectColumns rebuild the same identifiers into
+//     every SELECT and every SET list. So a step named `prod-deploy` emits `prod-deploy_status`
+//     and a step named `1deploy` emits `1deploy_status`, each a 42601 syntax error on the
+//     migration every consumer runs at startup — and nothing recovers, because the identifier
+//     is rebuilt from the same name on every read and write. See stepNameIdentifierPattern for
+//     the shape and for why it is stricter than either backend alone. It is also stricter than
+//     clickhouse_store.go's safeStepNameForDerivePattern, which admits a leading digit; the
+//     note there says why that one is left as it is (PR #87, pkuzmenko finding 1 arm A).
+//   - A NAME THAT TRUNCATES. See MaxStepNameLen.
+//   - A NAME THAT IS ALREADY A FIXED routing_slips COLUMN. An AGGREGATE step's jsonb column is
+//     its BARE name — slipColumns() appends step.Name and the ensurer emits
+//     `ADD COLUMN IF NOT EXISTS {name} jsonb` — so an aggregate step named `status` or
+//     `state_history` names a column that already exists. IF NOT EXISTS then silently does
+//     nothing, ProbeSchema reports the column present because it IS present, and every later
+//     write puts that column twice in one SET list: 42701, the same fault the fold arm below
+//     prevents, reached by another route. Checked for EVERY step, not only aggregate ones, even
+//     though a non-aggregate step's `{name}_status` column cannot collide with any fixed column
+//     (no fixed column ends in `_status`, and an empty name is rejected before this): adding
+//     `"aggregates"` to an existing step is a one-word config edit, and it is the only thing
+//     standing between a merely confusing name and that silent collision. The reserved set is
+//     derived from the store's own column list — see reservedStepNames (PR #87, pkuzmenko
+//     finding 1 arm B).
 //   - TWO NAMES THAT FOLD TOGETHER. Postgres folds unquoted identifiers to lower case, so
 //     `Deploy` and `deploy` are ONE column. Exact-case uniqueness above admits both, and then
 //     every write builds `SET Deploy_status = $n, deploy_status = $m` — the same column twice in
 //     one SET list, which is 42701 (duplicate column) on every update the slip ever takes.
-//   - A NAME THAT TRUNCATES. See MaxStepNameLen.
 //
 // folded is the caller's accumulator, mapping each folded identifier to the name that claimed
 // it, so the error can name BOTH colliding steps rather than only the second.
 func validateStepIdentifier(name string, folded map[string]string) error {
+	if !stepNameIdentifierPattern.MatchString(name) {
+		return fmt.Errorf(
+			"step name %q is not a bare SQL identifier (it must match %s): the generated DDL and "+
+				"every SELECT and SET list splice it unquoted as %s_status",
+			name, stepNameIdentifierPattern, name)
+	}
 	if len(name) > MaxStepNameLen {
 		return fmt.Errorf(
 			"step name %q is %d bytes; Postgres truncates the %s_status column at 63 bytes, so it must be at most %d",
 			name, len(name), name, MaxStepNameLen)
 	}
 	key := strings.ToLower(name)
+	if _, ok := reservedStepNames[key]; ok {
+		return fmt.Errorf(
+			"step name %q is already the routing_slips column %s: an aggregate step's column is its "+
+				"BARE name, so ADD COLUMN IF NOT EXISTS %s silently does nothing and every later "+
+				"update names %s twice in one SET list",
+			name, key, key, key)
+	}
 	if first, ok := folded[key]; ok {
 		return fmt.Errorf(
 			"step names '%s' and '%s' are the same Postgres identifier: unquoted names fold to lower case, "+

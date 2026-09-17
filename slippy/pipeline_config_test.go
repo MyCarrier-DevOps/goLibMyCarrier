@@ -580,3 +580,170 @@ func TestPipelineConfig_Validate_RejectsStepNamesThatTruncate(t *testing.T) {
 func repeatRune(r byte, n int) string {
 	return strings.Repeat(string(r), n)
 }
+
+// A step name reaches identifier position UNQUOTED: stepColumnEnsurer
+// (postgres_migrations.go) emits `ADD COLUMN IF NOT EXISTS {name}_status step_status ...`,
+// and slipColumns/slipSelectColumns (postgres_store.go) rebuild the same identifier into
+// every SELECT and every SET list. Postgres accepts an unquoted identifier only when it
+// BEGINS with a letter or an underscore, and ClickHouse's non-quoted identifier rule is
+// ^[a-zA-Z_][0-9a-zA-Z_]*$ — so `prod-deploy` emits `prod-deploy_status` and `1deploy`
+// emits `1deploy_status`, both 42601 on the migration every consumer runs at startup, with
+// nothing to recover them because the same identifier is rebuilt on every read and write
+// (PR #87, pkuzmenko finding 1 arm A).
+func TestValidateStepIdentifier_RejectsNamesThatAreNotBareIdentifiers(t *testing.T) {
+	tests := []struct {
+		name     string
+		stepName string
+		rejected bool
+	}{
+		{"a hyphen is a minus sign once spliced: prod-deploy_status is 42601", "prod-deploy", true},
+		{"a leading digit lexes as a numeric literal, not an identifier", "1deploy", true},
+		{"a space splits one identifier into two", "prod deploy", true},
+		{"a single quote opens a string literal", "o'brien_check", true},
+		{"a dot reads as a schema qualifier", "public.deploy", true},
+		{"a dollar sign is legal inside a Postgres identifier but not a ClickHouse one", "deploy$dev", true},
+		{"a quote character would let the name close and reopen the identifier", `deploy"`, true},
+		{"empty is not an identifier either (Validate's own empty check reaches it first)", "", true},
+		{"a leading underscore is a legal identifier start", "_deploy", false},
+		{"letters, digits and underscores after the first byte", "deploy_dev_2", false},
+		{"mixed case is legal: Postgres folds it consistently", "Deploy_Dev", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateStepIdentifier(tc.stepName, map[string]string{})
+			if tc.rejected && err == nil {
+				t.Fatalf("step name %q generates a broken identifier and must be rejected", tc.stepName)
+			}
+			if !tc.rejected && err != nil {
+				t.Fatalf("step name %q is a bare identifier and must be admitted: %v", tc.stepName, err)
+			}
+		})
+	}
+}
+
+// The same rejection through the real entry point, so a config carrying such a name never
+// reaches the migrator at all: it is refused at parse time, once, before any DDL runs.
+func TestParsePipelineConfig_RejectsStepNameThatIsNotABareIdentifier(t *testing.T) {
+	const j = `{
+		"version": "1",
+		"name": "hyphenated-step",
+		"steps": [
+			{"name": "push_parsed"},
+			{"name": "prod-deploy", "prerequisites": ["push_parsed"]}
+		]
+	}`
+	_, err := ParsePipelineConfig([]byte(j))
+	if err == nil {
+		t.Fatal("a step name that is not a bare identifier must be rejected at parse time")
+	}
+	if !strings.Contains(err.Error(), "prod-deploy") {
+		t.Errorf("the error must name the offending step; got %q", err)
+	}
+}
+
+// An AGGREGATE step's jsonb column is its BARE name — slipColumns() appends step.Name and
+// stepColumnEnsurer emits `ADD COLUMN IF NOT EXISTS <name> jsonb` — so a name that is
+// already a fixed routing_slips column silently does nothing at migration time, ProbeSchema
+// reports the column present because it IS present, and every later write then names that
+// column twice in one SET list: 42701 on every update the slip ever takes. That is the same
+// fault the case-folding arm prevents, reached by another route (PR #87, pkuzmenko
+// finding 1 arm B).
+func TestValidateStepIdentifier_RejectsNamesThatCollideWithAFixedColumn(t *testing.T) {
+	tests := []struct {
+		name     string
+		stepName string
+		rejected bool
+	}{
+		{"status is the slip's own status column", ColumnStatus, true},
+		{"correlation_id is the primary key", ColumnCorrelationID, true},
+		{"repository", ColumnRepository, true},
+		{"branch", ColumnBranch, true},
+		{"commit_sha", ColumnCommitSHA, true},
+		{"created_at", ColumnCreatedAt, true},
+		{"updated_at", ColumnUpdatedAt, true},
+		{"step_details", ColumnStepDetails, true},
+		{"state_history", ColumnStateHistory, true},
+		{"claimed_from is SELECT-only but it is still a column of the table", ColumnClaimedFrom, true},
+		{"the reservation folds, because Postgres folds the DDL that would collide", "Status", true},
+		{"a name that merely contains a reserved one is fine", "status_check", false},
+		{"a name suffixed past a reserved one is fine", "branch_protection", false},
+		{"an ordinary step name", "dev_deploy", false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateStepIdentifier(tc.stepName, map[string]string{})
+			if tc.rejected && err == nil {
+				t.Fatalf("step name %q collides with a fixed routing_slips column and must be rejected",
+					tc.stepName)
+			}
+			if !tc.rejected && err != nil {
+				t.Fatalf("step name %q collides with nothing and must be admitted: %v", tc.stepName, err)
+			}
+		})
+	}
+}
+
+// The reservation covers EVERY step, not only the aggregate ones whose bare column actually
+// collides. A non-aggregate step's {name}_status column cannot hit a fixed column — no fixed
+// column ends in _status — so the rule is stricter than the fault requires, on purpose:
+// adding "aggregates" to an existing step is a one-word config edit, and it is the only thing
+// standing between a merely confusing name and a silent 42701.
+func TestParsePipelineConfig_ReservesFixedColumnNamesForEveryStepKind(t *testing.T) {
+	for _, shape := range []struct {
+		name string
+		step string
+	}{
+		{
+			"aggregate step: the bare column is the collision",
+			`{"name": "status", "prerequisites": ["push_parsed"], "aggregates": "component_status"}`,
+		},
+		{
+			"plain step: reserved anyway, one config edit away from the collision",
+			`{"name": "status", "prerequisites": ["push_parsed"]}`,
+		},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			j := `{"version": "1", "name": "reserved", "steps": [{"name": "push_parsed"}, ` + shape.step + `]}`
+			_, err := ParsePipelineConfig([]byte(j))
+			if err == nil {
+				t.Fatal("a step named after a fixed routing_slips column must be rejected at parse time")
+			}
+			if !strings.Contains(err.Error(), "status") {
+				t.Errorf("the error must name the column; got %q", err)
+			}
+		})
+	}
+}
+
+// The reserved set is DERIVED from the column list the store actually builds, not restated
+// beside it: a column added to slipColumns()/slipSelectColumns() must become reserved in the
+// same edit. This test fails if the two ever drift, which is the whole reason the reservation
+// reads fixedSlipColumns() rather than a hand-typed list.
+func TestValidateStepIdentifier_ReservationTracksSlipSelectColumns(t *testing.T) {
+	store, _ := newMockStore(t)
+
+	fromConfig := make(map[string]bool)
+	for _, step := range store.config.Steps {
+		fromConfig[step.Name+"_status"] = true
+		if step.Aggregates != "" {
+			fromConfig[step.Name] = true
+		}
+	}
+
+	checked := 0
+	for _, col := range store.slipSelectColumns() {
+		if fromConfig[col] {
+			continue // config-derived, not a fixed column
+		}
+		checked++
+		if err := validateStepIdentifier(col, map[string]string{}); err == nil {
+			t.Errorf("%q is a fixed routing_slips column that slipSelectColumns() emits, "+
+				"but it is admitted as a step name", col)
+		}
+	}
+	if checked != len(fixedSlipColumns())+1 {
+		t.Fatalf("expected every fixed column plus claimed_from to be checked; checked %d", checked)
+	}
+}

@@ -331,10 +331,7 @@ func mapCreateError(correlationID string, err error) error {
 // step's status column, then each aggregate step's jsonb column. The order is shared by
 // SELECT, INSERT, and the scan destinations so they never drift.
 func (s *PostgresStore) slipColumns() []string {
-	cols := []string{
-		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
-		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory,
-	}
+	cols := fixedSlipColumns()
 	for _, step := range s.config.Steps {
 		cols = append(cols, step.Name+"_status")
 	}

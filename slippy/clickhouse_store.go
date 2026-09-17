@@ -1627,6 +1627,19 @@ func sqlSingleQuoteEscape(s string) string {
 // anything that doesn't match keeps this a local, defense-in-depth guard: it changes nothing for
 // any real pipeline config, and for a malformed one it falls back to the pre-fix verbatim clone
 // behavior instead of risking a broken query.
+//
+// LOOSER THAN THE CONFIG-TIME CHECK, DELIBERATELY. validateStepIdentifier (pipeline_config.go)
+// requires ^[A-Za-z_][A-Za-z0-9_]*$, and the difference is real: this pattern admits a leading
+// digit, and `1deploy` is not a legal non-quoted identifier in ClickHouse or in Postgres. That
+// is not a live hole at either of this pattern's two splice sites, because both are reached
+// only for a name that is already a configured step — buildCloneStepColumnDerive below reads
+// its step names from cfg.Steps, and PostgresStore's step-column write
+// (postgres_store_updates.go) tests config.GetStep(stepName) != nil before it consults this
+// pattern — and a configured step name has been through validateStepIdentifier at parse time.
+// Left as it is on purpose: it gates a DIFFERENT splice and fails CLOSED, falling back to a
+// verbatim clone rather than emitting anything, so tightening it here would change behaviour
+// for no reachable fault. The config is where a bad name is rejected (PR #87, pkuzmenko
+// finding 1 arm A).
 var safeStepNameForDerivePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // buildCloneStepColumnDerive builds the CLONE_DERIVED new-row SELECT expressions for
