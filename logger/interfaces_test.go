@@ -235,6 +235,25 @@ func TestStdLogger_Error(t *testing.T) {
 	assert.Contains(t, output, "code=500")
 }
 
+// TestStdLogger_Error_DoesNotMutateCallerFields pins that Error copies before adding
+// "error": the caller still owns the map it passed, and a map shared across goroutines
+// would be a concurrent-write hazard. The sibling implementations copy via mergeFields.
+func TestStdLogger_Error_DoesNotMutateCallerFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &StdLogger{
+		logger: log.New(&buf, "", 0),
+		fields: make(map[string]interface{}),
+		debug:  false,
+	}
+
+	callerFields := map[string]interface{}{"code": 500}
+	logger.Error(context.Background(), "boom", errors.New("io timeout"), callerFields)
+
+	assert.Equal(t, map[string]interface{}{"code": 500}, callerFields,
+		"Error must not write into the map the caller still owns")
+	assert.Contains(t, buf.String(), "code=500, error=io timeout")
+}
+
 func TestStdLogger_Error_NilError(t *testing.T) {
 	var buf bytes.Buffer
 	logger := &StdLogger{
@@ -1099,7 +1118,7 @@ func TestStdLogger_SanitizesRenderedFields(t *testing.T) {
 		{
 			name:         "an over-long value is truncated in the output",
 			fields:       map[string]interface{}{"big": strings.Repeat("a", maxFieldValueLen+1)},
-			wantContains: "…(truncated, 1025 runes)",
+			wantContains: fmt.Sprintf(`\…(truncated, %d of %d runes shown)`, maxFieldValueLen, maxFieldValueLen+1),
 		},
 		{
 			name:         "WithFields values are sanitised too",

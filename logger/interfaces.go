@@ -8,6 +8,23 @@ import (
 // Implementations should provide structured logging with context and field support.
 // This interface is designed to be flexible enough for use in libraries while supporting
 // context propagation for tracing and structured fields for observability.
+//
+// message versus fields. Field keys and values are caller-supplied data and are
+// escaped before rendering: a newline in a field cannot open a second line that
+// reads as a genuine log record, and a value carrying the renderer's own "key=value"
+// structure is quoted so it cannot forge a sibling field (DEVOPS-284).
+//
+// message is NOT escaped. No implementation in this package alters it — StdLogger
+// and LogAdapter interpolate it into a formatted line, ZapLogger hands it to zap as
+// the record's msg — so whether a newline in message forges a record is decided by
+// the sink, not here: zap's JSON encoder escapes it, its console encoder and
+// StdLogger's log.Logger do not.
+//
+// Callers must therefore treat message as a literal chosen by the calling code and
+// put anything derived from untrusted input — request bodies, webhook payloads,
+// branch names, commit messages, error text from a remote — in fields. Note the
+// Error methods already do this for err: it is rendered as an "error" field, not
+// folded into message.
 type Logger interface {
 	// Info logs an informational message with optional structured fields.
 	Info(ctx context.Context, message string, fields map[string]interface{})
