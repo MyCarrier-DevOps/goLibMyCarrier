@@ -44,6 +44,13 @@ type SimpleLogger interface {
 
 // LogAdapter wraps a SimpleLogger to implement the full Logger interface.
 // This allows using simpler loggers (like zap.SugaredLogger) where the full interface is expected.
+//
+// Fields are rendered by renderSanitizedFields and passed as a single pre-rendered
+// %s argument. Do not simplify this back to Infof("%s %v", message, fields):
+// folding the map into the message argument let a caller-supplied newline forge a
+// log line even when the wrapped logger was zap, whose console encoder appends the
+// message verbatim (DEVOPS-284). SimpleLogger exposes no structured path — only
+// Printf-style methods — so escaping before interpolation is the available remedy.
 type LogAdapter struct {
 	simple SimpleLogger
 	fields map[string]interface{}
@@ -61,7 +68,7 @@ func NewLogAdapter(simple SimpleLogger) *LogAdapter {
 func (a *LogAdapter) Info(ctx context.Context, message string, fields map[string]interface{}) {
 	allFields := a.mergeFields(fields)
 	if len(allFields) > 0 {
-		a.simple.Infof("%s %v", message, allFields)
+		a.simple.Infof("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Info(message)
 	}
@@ -71,7 +78,7 @@ func (a *LogAdapter) Info(ctx context.Context, message string, fields map[string
 func (a *LogAdapter) Debug(ctx context.Context, message string, fields map[string]interface{}) {
 	allFields := a.mergeFields(fields)
 	if len(allFields) > 0 {
-		a.simple.Debugf("%s %v", message, allFields)
+		a.simple.Debugf("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Debug(message)
 	}
@@ -81,7 +88,7 @@ func (a *LogAdapter) Debug(ctx context.Context, message string, fields map[strin
 func (a *LogAdapter) Warn(ctx context.Context, message string, fields map[string]interface{}) {
 	allFields := a.mergeFields(fields)
 	if len(allFields) > 0 {
-		a.simple.Warnf("%s %v", message, allFields)
+		a.simple.Warnf("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Warn(message)
 	}
@@ -102,7 +109,7 @@ func (a *LogAdapter) Error(ctx context.Context, message string, err error, field
 		allFields["error"] = err.Error()
 	}
 	if len(allFields) > 0 {
-		a.simple.Errorf("%s %v", message, allFields)
+		a.simple.Errorf("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Error(message)
 	}

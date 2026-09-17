@@ -1130,3 +1130,91 @@ func TestStdLogger_SanitizesRenderedFields(t *testing.T) {
 		})
 	}
 }
+
+// TestLogAdapter_SanitizesFields pins the DEVOPS-284 contract across all five
+// logging methods: they all fold fields the same way, so they all need the same
+// guarantee. The wrapped logger never sees a raw newline, and it receives the
+// fields as one pre-rendered argument rather than as part of the message.
+func TestLogAdapter_SanitizesFields(t *testing.T) {
+	const forged = "safe\n[INFO] forged line"
+
+	tests := []struct {
+		name     string
+		logFn    func(a *LogAdapter, fields map[string]interface{})
+		recorded func(m *mockSimpleLogger) []string
+	}{
+		{
+			name: "Info",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Info(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.infofCalls },
+		},
+		{
+			name: "Debug",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Debug(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.debugfCalls },
+		},
+		{
+			name: "Warn",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Warn(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.warnfCalls },
+		},
+		{
+			name: "Warning",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Warning(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.warnfCalls },
+		},
+		{
+			name: "Error",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Error(context.Background(), "test message", nil, fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.errorfCalls },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockSimpleLogger{}
+			adapter := NewLogAdapter(mock)
+
+			tt.logFn(adapter, map[string]interface{}{"key": forged, "another": "plain"})
+
+			calls := tt.recorded(mock)
+			require.Len(t, calls, 1)
+			assert.NotContains(t, calls[0], "\n",
+				"the wrapped logger must never be handed a raw newline, got %q", calls[0])
+			assert.Contains(t, calls[0], `another=plain, key=safe\n[INFO] forged line`)
+		})
+	}
+}
+
+// TestZapLogger_ForgedFieldCannotOpenSecondLine guards the implementation that is
+// already safe, so the property is pinned for all three and a future refactor
+// cannot quietly regress it. The console encoder is the one worth pinning: it is
+// the encoder that appends a message verbatim.
+func TestZapLogger_ForgedFieldCannotOpenSecondLine(t *testing.T) {
+	var buf bytes.Buffer
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(zap.NewProductionEncoderConfig()),
+		zapcore.AddSync(&buf),
+		zapcore.DebugLevel,
+	)
+	zapLogger := NewZapLogger(zap.New(core).Sugar())
+
+	zapLogger.Info(context.Background(), "test message", map[string]interface{}{
+		"key": "safe\n[INFO] forged line",
+	})
+
+	output := buf.String()
+	assert.Equal(t, 1, strings.Count(output, "\n"),
+		"expected a single line terminated by one newline, got %q", output)
+	assert.Contains(t, output, `safe\n[INFO] forged line`)
+}
