@@ -166,11 +166,27 @@ type SlipStore interface {
 	// the push path dedups onto it, whatever status the pipeline writes meanwhile — with ONE
 	// exception, added by finding p1: a push bearing the claimed row's OWN correlation ID is
 	// that row's in-delivery retry rather than another run, and it resets the row in place
-	// when the run is quiescent. It does not when a step or component is in flight; then the
-	// dedup applies as it does to any other push. An abandon or promote is the other
+	// when the run is quiescent AS OF THAT PUSH'S OWN READ. It does not when a step or
+	// component is in flight at that read; then the dedup applies as it does to any other
+	// push. An abandon or promote is the other
 	// exception: both are terminal statuses written from outside the run, so they end the
 	// claim even while steps are still running, and both are repaveable — an ancestor abandon
 	// or a promotion deliberately overrides a live claim.
+	//
+	// "AS OF THAT PUSH'S OWN READ" IS THE WHOLE OF THAT GUARANTEE, and the difference from "at
+	// write time" is reachable (PR #87, pkuzmenko finding 2). The push reads its claim evidence
+	// from an UNLOCKED LoadByCommit, the reset it gates is Create — the one full-row overwrite
+	// that takes no lock either — and ancestor resolution's GitHub round trips run for seconds
+	// between the two. So a row read unclaimed and quiescent can be claimed, and its first step
+	// started, before the upsert lands. The upsert then keeps claimed_from (SELECT-only, absent
+	// from the conflict arm's SET list) and replaces state_history (present in it), leaving the
+	// column set with no slip_claimed marker — the invariant stated under Create above, broken
+	// by timing rather than by a caller — and it resets a run that is in flight. Claiming does
+	// not protect against this, because ClaimSlip's own lock is released at its commit and the
+	// push never takes one. Closing it means making the reset a store operation that re-reads
+	// the claim state FOR UPDATE and refuses on RunInFlight inside the same transaction as the
+	// upsert; it is tracked with the claim-ownership work, DEVOPS-371/372/373, and the full
+	// account is on CreateSlipForPush's claimed arm in push.go.
 	//
 	// expected is the set of statuses the caller agreed to claim out of, and it is ALWAYS a
 	// compare-and-set on the CURRENT status — whether or not a claim is already held. nil

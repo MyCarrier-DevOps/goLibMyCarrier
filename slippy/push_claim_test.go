@@ -189,12 +189,23 @@ func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipIsResetNotDeduped(t 
 		"alongside the reset marker, not instead of it")
 }
 
-// The self-correlation carve-out stops at work in flight (finding p1). Create's ON CONFLICT
-// arm rewrites every step and aggregate column AND the state history, so resetting a claimed
-// row whose own dispatch is still executing destroys the state that run is writing — under an
-// unchanged correlation ID, which leaves an operator no way to tell which attempt wrote what.
-// The in-delivery retry that reaches here after its dispatch already started is exactly that
-// shape, so the claimed branch keeps it and the push dedups instead.
+// The self-correlation carve-out stops at work in flight AS OF THE PUSH'S READ (finding p1).
+// Create's ON CONFLICT arm rewrites every step and aggregate column AND the state history, so
+// resetting a claimed row whose own dispatch is still executing destroys the state that run is
+// writing — under an unchanged correlation ID, which leaves an operator no way to tell which
+// attempt wrote what. The in-delivery retry that reaches here after its dispatch already
+// started is exactly that shape, so the claimed branch keeps it and the push dedups instead.
+//
+// What this pins is the DECISION taken on the row as read, which is all the decision can be:
+// the read is unlocked and so is the Create it gates, with seconds of GitHub calls between
+// them, so a row that becomes claimed or goes in flight during that window is outside this
+// test's reach and outside the guard's (PR #87, pkuzmenko finding 2; DEVOPS-371/372/373). The
+// full account is on CreateSlipForPush's claimed arm in push.go.
+//
+// Note what the dedup returns: handlePushRetry resets push_parsed and never writes the slip's
+// top-level status, so the row comes back still reading `failed` — asserted below. A caller
+// that must not report against an ended row gates on the claim and step evidence Slip already
+// carries on the wire, not on that status.
 func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipInFlightIsDedupedNotReset(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
@@ -227,6 +238,8 @@ func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipInFlightIsDedupedNot
 	require.NoError(t, err)
 	require.NotNil(t, result.Slip)
 	assert.Equal(t, "corr-self-live", result.Slip.CorrelationID)
+	assert.Equal(t, SlipStatusFailed, result.Slip.Status,
+		"the dedup does NOT make the row live: handlePushRetry resets push_parsed and never writes status")
 	assert.Empty(t, store.CreateCalls, "no upsert: the reset would have rewritten the running run's state")
 	assert.Empty(t, store.RepaveCalls, "and a claimed row is never repaved either")
 

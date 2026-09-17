@@ -75,17 +75,36 @@ contract, including what `nil` means for `expected`, is on `SlipStore.ClaimSlip`
 `SlipStore.ReleaseClaim` and `SlipStore.ProbeSchema` in `interfaces.go`; the model is in
 `.github/STATE_MACHINE_V3.md` under DEVOPS-367.
 
-**A push never resets a claimed row whose run is in flight.** The push path's one exception to
-"a claimed row is deduped onto" is a push bearing that row's OWN correlation ID — its
-in-delivery retry — which resets the row in place via `Create`'s upsert. That carve-out now
-stops at work in flight: the upsert rewrites every step and aggregate column and the whole
-state history, so a self-correlated row with a running step is deduped like any other claimed
-row instead (finding p1). And because the upsert replaces `state_history` while `claimed_from`
-survives it, the reset re-appends the `slip_claimed` marker, keeping the invariant every reader
-depends on: **`claimed_from` and `slip_claimed` are both present or both absent** — pushhookparser
-derives "who claimed this" from the markers and gates its stranded-cleanup exemption on it, so
-a row that carried one without the other would read claimed to slippy and unclaimed to the
-parser (finding p2).
+**A push never resets a claimed row whose run is in flight _as of the push's own read_.** The
+push path's one exception to "a claimed row is deduped onto" is a push bearing that row's OWN
+correlation ID — its in-delivery retry — which resets the row in place via `Create`'s upsert.
+That carve-out now stops at work in flight: the upsert rewrites every step and aggregate column
+and the whole state history, so a self-correlated row with a running step is deduped like any
+other claimed row instead (finding p1). And because the upsert replaces `state_history` while
+`claimed_from` survives it, the reset re-appends the `slip_claimed` marker, keeping the invariant
+every reader depends on: **`claimed_from` and `slip_claimed` are both present or both absent** —
+pushhookparser derives "who claimed this" from the markers and gates its stranded-cleanup
+exemption on it, so a row that carried one without the other would read claimed to slippy and
+unclaimed to the parser (finding p2).
+
+**The qualifier is load-bearing: that guarantee is not absolute, and closing it is deferred.**
+The push reads its claim evidence from an **unlocked** `LoadByCommit` (`PostgresStore.queryOne`
+is a plain `pool.QueryRow`, no `FOR UPDATE`), and the reset it gates is `Create` — the one
+full-row overwrite that takes **no lock either** (`PostgresStore.Create` is a bare `pool.Exec`;
+`lockSlip` is called from `Update` and the step mutators, never from `Create`). Between the two,
+`resolveAndAbandonAncestors` and its progressive-depth ancestor search make real GitHub round
+trips, for seconds. So a row read unclaimed and quiescent can be claimed — and its pre-job's
+`StartStep` can land — before the upsert does, with two consequences: the reset carries an
+**empty** claim forward, so `claimed_from` survives the upsert while the `slip_claimed` marker
+does not (the invariant above, broken by timing rather than by a caller, and the row silently
+loses its stranded-cleanup exemption, since pushhookparser's `ClaimedBy` is derived from the
+markers); and the reset rewrites the step, aggregate and history columns of a run that IS in
+flight at write time.
+Closing it means making the reset a store operation that re-reads the claim state `FOR UPDATE`
+and refuses on `RunInFlight` inside the same transaction as the upsert — a store and interface
+change, tracked with the claim-ownership work under **DEVOPS-371/372/373** rather than done
+here. The account in the code is on `CreateSlipForPush`'s claimed arm in `push.go`, and the same
+qualifier is on `SlipStore.ClaimSlip` (PR #87, pkuzmenko finding 2).
 
 Exactly ONE write path ends a claim: `UpdateSlipStatus` on a terminal status. `Create` and
 the full-row `Update` never touch `claimed_from`, whatever status the caller's snapshot
