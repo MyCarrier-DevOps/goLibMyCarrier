@@ -104,15 +104,17 @@ var (
 	// else holds the row" and routes to the repave/dedup backstop (DEVOPS-231).
 	ErrDuplicateSlip = errors.New("a slip already exists for this repository and commit")
 
-	// ErrSlipWentLive indicates Repave's status guard rejected a repave: the slip became
-	// live between the repave decision and the repave itself; do not repave. Concretely,
-	// the row still exists but its status is no longer one of the ended statuses
-	// (failed, completed, abandoned, promoted, compensated) that Repave requires — for
-	// example a failed slip can recover to in_progress via executor.go's recovery branch
-	// in the window between a caller's snapshot-based "this slip is ended" decision and
-	// the Repave call. Nothing is written: the transaction rolls back, so the superseded
-	// row survives AND no successor is created. Callers must not treat the successor as
-	// existing in this case, since the row for that commit is a live run.
+	// ErrSlipWentLive indicates Repave's guard rejected a repave: the slip became live
+	// between the repave decision and the repave itself, or a claimant holds it; do not
+	// repave. Concretely, the row still exists but either its status is no longer one of
+	// the ended statuses (failed, completed, abandoned, promoted, compensated) that Repave
+	// requires — for example a failed slip can recover to in_progress via executor.go's
+	// recovery branch in the window between a caller's snapshot-based "this slip is ended"
+	// decision and the Repave call — or its claimed_from is set, meaning a claimant's run
+	// is in flight whatever the status says (DEVOPS-367). Nothing is written: the
+	// transaction rolls back, so the superseded row survives AND no successor is created.
+	// Callers must not treat the successor as existing in this case, since the row for
+	// that commit is a running slip; the push path dedups onto it.
 	ErrSlipWentLive = errors.New("slip went live between the repave decision and the repave")
 
 	// ErrRepaveUnsupported indicates the store cannot repave (replace one commit's slip
@@ -123,6 +125,51 @@ var (
 	// the successor separately) rather than treating it as a fatal, unrecoverable error.
 	ErrRepaveUnsupported = errors.New(
 		"store does not support Repave; caller should fall back to abandon semantics")
+
+	// ErrClaimPreconditionFailed is returned by ClaimSlip when the slip's status at write
+	// time was outside the caller's expected set. Nothing was written. The caller decided on
+	// a stale read; the remedy is to re-read, not to retry (DEVOPS-367).
+	ErrClaimPreconditionFailed = errors.New("slip status did not match the claim precondition")
+
+	// ErrNotClaimed is returned by ReleaseClaim when there is no claim to release: the
+	// row's claimed_from is NULL or empty. The slip's status is not consulted — a claimed
+	// slip the run has since moved to failed or compensating is still released. Nothing
+	// was written. This is the normal outcome when a terminal status write already ended
+	// the claim, and callers should treat it as "nothing to undo" rather than as a
+	// failure (DEVOPS-367).
+	//
+	// Work still in flight is NOT this error and not an error at all: the release returns
+	// ReleaseOutcome{Released: false} with nothing written, and a post-job must have written
+	// its own step's terminal status BEFORE it releases, or it counts itself as in flight and
+	// no post-job of the run ever clears the claim.
+	//
+	// Recovering a claim held by a run that will never release it: the stuck STEP is what
+	// holds the claim, so resolve it — POST /v1/slips/{id}/steps/{step}/complete, or fail or
+	// skip it — and then POST /v1/slips/{id}/release, which now finds nothing in flight. On a
+	// non-terminal slip POST /v1/slips/{id}/abandon also ends the claim, because AbandonSlip
+	// writes the terminal abandoned through UpdateSlipStatus. On an ALREADY-terminal slip it
+	// does not: AbandonSlip returns without writing (I4, terminal is monotonic), so the claim
+	// survives — use the step-then-release route there.
+	ErrNotClaimed = errors.New("slip is not currently claimed")
+
+	// ErrClaimUnsupported indicates the store cannot perform ClaimSlip or ReleaseClaim at
+	// all: it has no claimed_from column and no transaction to make the claim atomic. The
+	// ClickHouse store returns it from both, wrapped with the correlation ID via %w, since it
+	// is not the operational slip store (DEVOPS-127, removal tracked in DEVOPS-343). Callers
+	// detect it with errors.Is and treat it as a failed claim — the same branch as
+	// ErrClaimPreconditionFailed: pushhookparser's rerunner dispatches nothing, the Slippy CLI
+	// pre-job proceeds unclaimed — and never as protection, since nothing was recorded and no
+	// repave is refused. A ReleaseClaim caller treats it as nothing to release, like
+	// ErrNotClaimed.
+	ErrClaimUnsupported = errors.New("store does not support ClaimSlip/ReleaseClaim")
+
+	// ErrSchemaBehind is returned by PostgresStore.ProbeSchema when routing_slips is missing
+	// any column this library's SELECTs name — the whole slipSelectColumns() list, so
+	// claimed_from (migration v6) and every configured step's column alike. Every read path
+	// selects that list, so a library ahead of its database fails every Load with Postgres
+	// 42703. Callers probe at startup and refuse to serve until the migrator has applied the
+	// schema (DEVOPS-367).
+	ErrSchemaBehind = errors.New("routing_slips schema is behind this library; apply migrations before serving")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

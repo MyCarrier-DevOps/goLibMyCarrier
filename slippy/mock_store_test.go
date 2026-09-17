@@ -42,10 +42,16 @@ func deepCopySlip(slip *Slip) *Slip {
 		CreatedAt:     slip.CreatedAt,
 		UpdatedAt:     slip.UpdatedAt,
 		Status:        slip.Status,
-		PromotedTo:    slip.PromotedTo,
+		ClaimedFrom:   slip.ClaimedFrom,
 		Sign:          slip.Sign,
 		Version:       slip.Version,
 	}
+	// PromotedTo is deliberately NOT copied, matching slippytest.MockStore. No store persists
+	// it — there is no promoted_to column, which is why the field carries a Deprecated: marker
+	// — so a double that round-tripped it would let a consumer test assert a value that a real
+	// store silently drops: green against the double, broken against Postgres (PR #87 finding
+	// j8). The field stays on Slip only because removing it is a second breaking change for no
+	// gain; nothing reads a value that is never written.
 
 	// Deep copy steps map
 	if slip.Steps != nil {
@@ -84,6 +90,21 @@ func deepCopySlip(slip *Slip) *Slip {
 type UpdateSlipStatusCall struct {
 	CorrelationID string
 	Status        SlipStatus
+}
+
+// ReleaseClaimCall records a call to ReleaseClaim.
+type ReleaseClaimCall struct {
+	CorrelationID string
+	ReleasedBy    string
+	Reason        string
+}
+
+// ClaimSlipCall records a call to ClaimSlip.
+type ClaimSlipCall struct {
+	CorrelationID string
+	Expected      []SlipStatus
+	ClaimedBy     string
+	Reason        string
 }
 
 // supersededTerminal mirrors the SQL predicate `status NOT IN
@@ -147,6 +168,8 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	ClaimSlipCalls        []ClaimSlipCall
+	ReleaseClaimCalls     []ReleaseClaimCall
 	RepaveCalls           []string
 	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
 	// the same call (empty string when a nil successor was passed). The in-memory mock has
@@ -198,6 +221,9 @@ type MockStore struct {
 	AppendHistoryError    error
 	SetImageTagError      error
 	UpdateSlipStatusError error
+	ClaimSlipError        error
+	ReleaseClaimError     error
+	ProbeSchemaError      error
 	RepaveError           error
 	AncestryLinkError     error
 	CloseError            error
@@ -360,8 +386,13 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 		return err
 	}
 
-	// Deep copy the slip to avoid mutations
+	// Deep copy the slip to avoid mutations. An existing row keeps its claim: PostgresStore's
+	// Create is an ON CONFLICT DO UPDATE whose SET list is slipColumns(), which excludes the
+	// SELECT-only claimed_from, so a redelivered Create resets the row but not the claim.
 	slipCopy := deepCopySlip(slip)
+	if existing, ok := m.Slips[slip.CorrelationID]; ok {
+		slipCopy.ClaimedFrom = existing.ClaimedFrom
+	}
 	m.Slips[slip.CorrelationID] = slipCopy
 
 	return nil
@@ -421,9 +452,9 @@ func (m *MockStore) Repave(
 
 	removedOld := false
 	if slip, ok := m.Slips[oldCorrelationID]; ok {
-		if slip.Status.IsLive() {
-			// Went live between the caller's repave decision and this call: the
-			// superseded run survives and the successor is NOT created.
+		if slip.Status.IsLive() || slip.ClaimedFrom != "" {
+			// Went live between the caller's repave decision and this call, or a claimant
+			// holds it: the superseded run survives and the successor is NOT created.
 			return ErrSlipWentLive
 		}
 		removedOld = true
@@ -437,10 +468,10 @@ func (m *MockStore) Repave(
 		// Mirrors the predecessor marker PostgresStore.Repave appends to the successor, gated
 		// on removedOld the same way so a repave that replaced nothing records nothing.
 		stored.StateHistory = append(stored.StateHistory, StateHistoryEntry{
-			Step:      "push_parsed",
+			Step:      PushParsedStep,
 			Status:    StepStatusRunning,
 			Timestamp: time.Now(),
-			Actor:     "slippy-library",
+			Actor:     LibraryActor,
 			Message:   fmt.Sprintf("repaved %s for commit %s", oldCorrelationID, shortSHA(newSlip.CommitSHA)),
 		})
 	}
@@ -636,11 +667,17 @@ func (m *MockStore) Update(ctx context.Context, slip *Slip) error {
 		return m.UpdateError
 	}
 
-	if _, ok := m.Slips[slip.CorrelationID]; !ok {
+	existing, ok := m.Slips[slip.CorrelationID]
+	if !ok {
 		return ErrSlipNotFound
 	}
 
-	m.Slips[slip.CorrelationID] = deepCopySlip(slip)
+	// claimed_from is SELECT-only in PostgresStore: a full-row Update never writes it,
+	// whatever status the snapshot carries. Only UpdateSlipStatus on a terminal status ends
+	// a claim.
+	stored := deepCopySlip(slip)
+	stored.ClaimedFrom = existing.ClaimedFrom
+	m.Slips[slip.CorrelationID] = stored
 	return nil
 }
 
@@ -771,7 +808,86 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 	}
 
 	slip.Status = status
+	if status.IsTerminal() {
+		slip.ClaimedFrom = "" // a terminal status ends the run, so it ends the claim
+	}
 	return nil
+}
+
+// ClaimSlip mirrors PostgresStore.ClaimSlip through the shared DecideClaim: a
+// compare-and-set on the CURRENT status whether or not a claim is held, idempotent
+// (ClaimOutcome{Claimed: false}, nothing written) once one is, never writing status. The
+// in-flight evidence is read from the same stored slip the decision is made on, as the store
+// reads both from one locked row.
+func (m *MockStore) ClaimSlip(
+	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
+) (ClaimOutcome, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Copied, not aliased, for the same reason slippytest.MockStore copies it: storing the
+	// caller's slice keeps its backing array alive and lets a reused buffer rewrite calls
+	// already recorded.
+	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{
+		CorrelationID: correlationID,
+		Expected:      append([]SlipStatus(nil), expected...),
+		ClaimedBy:     claimedBy,
+		Reason:        reason,
+	})
+	if m.ClaimSlipError != nil {
+		return ClaimOutcome{}, m.ClaimSlipError
+	}
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return ClaimOutcome{}, ErrSlipNotFound
+	}
+	inFlight := RunInFlight(slip)
+	prior, write, err := DecideClaim(slip.Status, slip.ClaimedFrom, inFlight, expected)
+	if err != nil {
+		return ClaimOutcome{}, fmt.Errorf("claim %s: %w", correlationID, err)
+	}
+	if write {
+		slip.StateHistory = append(slip.StateHistory, ClaimMarker(prior, claimedBy, reason))
+		slip.ClaimedFrom = prior
+	}
+	return ClaimOutcome{Claimed: write, Prior: prior, InFlight: inFlight}, nil
+}
+
+// ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared DecideRelease: the
+// claim is KEPT (Released=false, nothing written) while any step or component is in flight,
+// cleared otherwise, and status is never written either way.
+func (m *MockStore) ReleaseClaim(
+	ctx context.Context, correlationID, releasedBy, reason string,
+) (ReleaseOutcome, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReleaseClaimCalls = append(m.ReleaseClaimCalls, ReleaseClaimCall{
+		CorrelationID: correlationID, ReleasedBy: releasedBy, Reason: reason,
+	})
+	if m.ReleaseClaimError != nil {
+		return ReleaseOutcome{}, m.ReleaseClaimError
+	}
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return ReleaseOutcome{}, ErrSlipNotFound
+	}
+	release, err := DecideRelease(slip)
+	if err != nil {
+		return ReleaseOutcome{}, fmt.Errorf("release %s: %w", correlationID, err)
+	}
+	if !release {
+		return ReleaseOutcome{Released: false, Status: slip.Status}, nil
+	}
+	slip.ClaimedFrom = ""
+	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(slip.Status, releasedBy, reason))
+	return ReleaseOutcome{Released: true, Status: slip.Status}, nil
+}
+
+// ProbeSchema mirrors PostgresStore.ProbeSchema's readiness gate; the double has no schema,
+// so it reports ready unless ProbeSchemaError is set.
+func (m *MockStore) ProbeSchema(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ProbeSchemaError
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.

@@ -8,7 +8,7 @@ require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
 	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.3.99
 	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.3.99
-	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.99
+	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.103
 	github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator v1.3.99
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/pashagolub/pgxmock/v4 v4.9.0

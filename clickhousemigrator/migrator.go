@@ -466,7 +466,7 @@ func (m *Migrator) migrateDown(ctx context.Context, currentVersion, targetVersio
 				Version:     migration.Version,
 				Name:        migration.Name,
 				Description: migration.Description,
-				Operation:   "down",
+				Operation:   OperationDown,
 				Err:         err,
 			}
 		}
@@ -520,7 +520,7 @@ func (m *Migrator) applyMigrationWithTimeout(ctx context.Context, migration Migr
 			Version:     migration.Version,
 			Name:        migration.Name,
 			Description: migration.Description,
-			Operation:   "up",
+			Operation:   OperationUp,
 			Err: fmt.Errorf(
 				"UpSQL is empty — migration %d (%s) has no SQL to apply",
 				migration.Version,
@@ -545,7 +545,7 @@ func (m *Migrator) applyMigrationWithTimeout(ctx context.Context, migration Migr
 			Version:     migration.Version,
 			Name:        migration.Name,
 			Description: migration.Description,
-			Operation:   "up",
+			Operation:   OperationUp,
 			Err:         err,
 		}
 	}

@@ -52,6 +52,7 @@ func (m *PostgresDynamicMigrationManager) GenerateMigrations() []postgresmigrato
 		m.componentStatesMigration(),
 		m.ancestryMigration(),
 		m.uniquenessMigration(),
+		m.claimedFromMigration(),
 	}
 }
 
@@ -335,8 +336,129 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 					EXECUTE format('DROP INDEX %s', idx);
 				END IF;
 			END $$;
-			ALTER TABLE slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip;
-			ALTER TABLE slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip;
+			-- IF EXISTS on the tables too, for the reason v6's down carries it: a bare ALTER
+			-- TABLE raises 42P01 on a missing relation, which would make this down fail on a
+			-- database where the tables were never created rather than do nothing.
+			ALTER TABLE IF EXISTS slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip;
+			ALTER TABLE IF EXISTS slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip;
+		`,
+	}
+}
+
+// claimedFromMigration (v6) adds the nullable column ClaimSlip records a claim in: the
+// status the row had at claim time, set for as long as a run holds the slip (DEVOPS-367).
+//
+// Shape decisions, each deliberate:
+//   - text, not the slip_status DOMAIN: the value is only ever written by ClaimSlip from a
+//     status the row already held, so it cannot be out of range, and a DOMAIN would make the
+//     v6 → v5 DownSQL depend on nothing else referencing the domain. Plain text keeps the
+//     column self-contained.
+//   - NULL means "not currently claimed". No DEFAULT: an empty string would be a second
+//     encoding of the same fact and every reader would have to treat both as unclaimed.
+//   - No index: the column is read by correlation_id (ReleaseClaim) on a row already locked
+//     FOR UPDATE, never scanned.
+//
+// Idempotent by NAME (IF NOT EXISTS), asserted by SHAPE below: the swallowed re-run proves
+// only that a column called claimed_from exists, so the post-condition checks type and
+// nullability and RAISEs, so a pre-existing same-named column of another shape fails v6
+// loudly instead of being recorded as applied — the same posture as v5's constraint checks.
+func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrator.Migration {
+	return postgresmigrator.Migration{
+		Version:     6,
+		Name:        "claimed_from",
+		Description: "routing_slips.claimed_from: status at claim time recorded by ClaimSlip; set while a run holds the slip, cleared by ReleaseClaim or by UpdateSlipStatus on a terminal status (DEVOPS-367)",
+		UpSQL: `
+			-- The lock_timeout is the FIRST statement of the up, for the same reason it is the
+			-- first statement of the down: postgresmigrator runs the migration transaction with
+			-- SET LOCAL lock_timeout = 0, and ADD COLUMN takes ACCESS EXCLUSIVE. An unbounded
+			-- request for it queues AHEAD of every subsequent reader, so on a busy database one
+			-- open transaction holding a read lock stalls all slip traffic behind this migration
+			-- until it is granted or cancelled by hand. This is the likelier of the two paths to
+			-- meet that, not the rarer: the up runs on every consumer startup while the down runs
+			-- only on a deliberate rollback. Five seconds fails the migration instead; re-run it.
+			-- SET LOCAL is scoped to the migration transaction, so it restores itself on commit
+			-- or rollback.
+			SET LOCAL lock_timeout = '5s';
+
+			ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL;
+
+			-- Post-condition: IF NOT EXISTS matched a NAME; assert the SHAPE ReleaseClaim relies on.
+			-- Resolved through the TABLE (to_regclass), as v5's post-conditions are: a query on
+			-- information_schema filtered by current_schema() answers for the first schema on
+			-- search_path, which is not necessarily the routing_slips the ALTER above touched.
+			DO $$
+			BEGIN
+				IF NOT EXISTS (
+					SELECT 1
+					FROM pg_attribute a
+					JOIN pg_type ty ON ty.oid = a.atttypid
+					WHERE a.attrelid = to_regclass('routing_slips')
+					  AND a.attname  = 'claimed_from'
+					  AND NOT a.attisdropped
+					  AND ty.typname = 'text'
+					  AND NOT a.attnotnull
+				) THEN
+					RAISE EXCEPTION 'migration v6: routing_slips.claimed_from exists but is not a nullable text column; fix or drop it and re-run v6';
+				END IF;
+			END $$;
+		`,
+		DownSQL: `
+			-- Refuse while any claim is held. Dropping claimed_from under a held claim silently
+			-- ends that claim: the run's in-flight work is exposed to a same-commit repave, and
+			-- there is no way back — rolling forward again brings the column back NULL, so the
+			-- claim is gone for good. It also breaks every Load on a library that selects the
+			-- column. Let the runs end or release the claims, then re-run the down.
+			-- The message names up to 20 held correlation ids, so the operator can act on the
+			-- refusal without a second query.
+			-- to_regclass makes a missing table or column a no-op rather than an error.
+			--
+			-- The LOCK is what closes the drain race: the count below takes ACCESS SHARE, which
+			-- does NOT conflict with ClaimSlip's ROW EXCLUSIVE, so a claim taken between the
+			-- count and the DROP COLUMN would be erased without the RAISE ever firing. Taking
+			-- ACCESS EXCLUSIVE first — the same lock the DROP will take — holds claimants out
+			-- for the rest of the transaction, so the count is the state the drop acts on.
+			--
+			-- The lock_timeout is the FIRST statement of the down, outside the DO block, so it
+			-- bounds EVERY lock request the transaction makes — the guard's LOCK TABLE and the
+			-- trailing DROP COLUMN's own ACCESS EXCLUSIVE alike. It used to sit inside the
+			-- IF EXISTS branch, which left the DROP unbounded on exactly the path where the
+			-- guard does not run (the column already absent, so no LOCK was taken either). It
+			-- is required rather than defensive: postgresmigrator runs the migration
+			-- transaction with SET LOCAL lock_timeout = 0, and an unbounded ACCESS EXCLUSIVE
+			-- request queues AHEAD of every subsequent reader, so on a busy database it would
+			-- stall all slip traffic until it were granted or the rollback were cancelled by
+			-- hand. Five seconds fails the down instead; re-run it. SET LOCAL is scoped to the
+			-- migration transaction, so it restores itself on commit or rollback.
+			SET LOCAL lock_timeout = '5s';
+
+			DO $$
+			DECLARE
+				held bigint;
+				held_ids text;
+			BEGIN
+				IF EXISTS (
+					SELECT 1 FROM pg_attribute
+					WHERE attrelid = to_regclass('routing_slips')
+					  AND attname = 'claimed_from'
+					  AND NOT attisdropped
+				) THEN
+					LOCK TABLE routing_slips IN ACCESS EXCLUSIVE MODE;
+					SELECT count(*) INTO held FROM routing_slips
+					WHERE claimed_from IS NOT NULL AND claimed_from <> '';
+					IF held > 0 THEN
+						SELECT string_agg(correlation_id, ', ' ORDER BY correlation_id) INTO held_ids
+						FROM (SELECT correlation_id FROM routing_slips
+						      WHERE claimed_from IS NOT NULL AND claimed_from <> ''
+						      ORDER BY correlation_id LIMIT 20) h;
+						RAISE EXCEPTION 'migration v6 down: % slip(s) hold a claim (claimed_from set): % — resolve the step holding each claim (POST /v1/slips/{id}/steps/{step}/complete) then POST /v1/slips/{id}/release, or let the runs end; a NON-terminal slip can also be ended with POST /v1/slips/{id}/abandon, which an already-terminal one ignores', held, held_ids;
+					END IF;
+				END IF;
+			END $$;
+			-- IF EXISTS on the TABLE as well as the column: without it a missing routing_slips
+			-- raises 42P01 and the down is not the no-op the guard above already is (its
+			-- to_regclass returns NULL and skips), nor the no-op this migration's own tests
+			-- assert it to be.
+			ALTER TABLE IF EXISTS routing_slips DROP COLUMN IF EXISTS claimed_from;
 		`,
 	}
 }

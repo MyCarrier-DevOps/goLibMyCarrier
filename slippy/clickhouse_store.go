@@ -510,6 +510,23 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 // correlation_id within the (repo, commit) scope before the status filter is
 // applied, so an abandoned latest version excludes the whole correlation rather
 // than surfacing a stale earlier-version row.
+//
+// PRECONDITION BEFORE REMOVING THE abandoned/promoted/compensated FILTER (DEVOPS-231).
+// Making terminal rows visible to the same-commit lookup is DEVOPS-231's stated goal, so this
+// filter is expected to go. Do not remove it without reading this first.
+//
+// As of 2026-09-17 pushhookparser arms SLIPPY_STRANDED_CLEANUP by default (DEVOPS-342), so
+// `abandoned` is now written routinely by force-push and branch-delete rather than never. If
+// this filter is removed while that is armed, an abandoned row becomes visible to the
+// same-commit lookup, the empty-run guard sees ended-and-not-failed, and the caller SUPPRESSES
+// the unit tests for that commit. That is a CI-gate weakening reachable by anyone who can
+// force-push a branch, and neither repository's tests would catch it because the two halves
+// live in different modules with different reviewers.
+//
+// So: before removing this filter, either extend pushhookparser's abandon-gate exclusion beyond
+// `failed` (see AbandonStrandedSlip in pushhookparser/pkg/slippy/stranded.go, which excludes
+// `failed` for exactly this reason), or disarm SLIPPY_STRANDED_CLEANUP first. Whichever of the
+// two changes lands second silently changes the other.
 func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	if s.pipelineConfig == nil {
 		return nil, fmt.Errorf("pipeline config is required for store operations")
@@ -935,6 +952,25 @@ func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, pa
 // semantics instead of silently losing the old AbandonSlip behavior.
 func (s *ClickHouseStore) Repave(_ context.Context, oldCorrelationID string, _ *Slip, _ *AncestryEntry) error {
 	return fmt.Errorf("Repave(%s): %w", oldCorrelationID, ErrRepaveUnsupported)
+}
+
+// ClaimSlip is unsupported on ClickHouse: no claimed_from column, no transaction to make
+// the claim atomic, and not the operational store (DEVOPS-127). Wrapped so errors.Is works.
+func (s *ClickHouseStore) ClaimSlip(
+	_ context.Context, correlationID string, _ []SlipStatus, _, _ string,
+) (ClaimOutcome, error) {
+	return ClaimOutcome{}, fmt.Errorf("ClaimSlip(%s): %w", correlationID, ErrClaimUnsupported)
+}
+
+// ReleaseClaim is unsupported on ClickHouse for the same reasons as ClaimSlip.
+func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID, _, _ string) (ReleaseOutcome, error) {
+	return ReleaseOutcome{}, fmt.Errorf("ReleaseClaim(%s): %w", correlationID, ErrClaimUnsupported)
+}
+
+// ProbeSchema is a no-op here: this store selects no claim column and its tables are managed
+// by clickhousemigrator, so it has no schema of its own for the readiness gate to check.
+func (s *ClickHouseStore) ProbeSchema(_ context.Context) error {
+	return nil
 }
 
 // ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
@@ -1591,6 +1627,19 @@ func sqlSingleQuoteEscape(s string) string {
 // anything that doesn't match keeps this a local, defense-in-depth guard: it changes nothing for
 // any real pipeline config, and for a malformed one it falls back to the pre-fix verbatim clone
 // behavior instead of risking a broken query.
+//
+// LOOSER THAN THE CONFIG-TIME CHECK, DELIBERATELY. validateStepIdentifier (pipeline_config.go)
+// requires ^[A-Za-z_][A-Za-z0-9_]*$, and the difference is real: this pattern admits a leading
+// digit, and `1deploy` is not a legal non-quoted identifier in ClickHouse or in Postgres. That
+// is not a live hole at either of this pattern's two splice sites, because both are reached
+// only for a name that is already a configured step — buildCloneStepColumnDerive below reads
+// its step names from cfg.Steps, and PostgresStore's step-column write
+// (postgres_store_updates.go) tests config.GetStep(stepName) != nil before it consults this
+// pattern — and a configured step name has been through validateStepIdentifier at parse time.
+// Left as it is on purpose: it gates a DIFFERENT splice and fails CLOSED, falling back to a
+// verbatim clone rather than emitting anything, so tightening it here would change behaviour
+// for no reachable fault. The config is where a bad name is rejected (PR #87, pkuzmenko
+// finding 1 arm A).
 var safeStepNameForDerivePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // buildCloneStepColumnDerive builds the CLONE_DERIVED new-row SELECT expressions for
