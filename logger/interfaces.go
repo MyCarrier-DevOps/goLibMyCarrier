@@ -8,6 +8,23 @@ import (
 // Implementations should provide structured logging with context and field support.
 // This interface is designed to be flexible enough for use in libraries while supporting
 // context propagation for tracing and structured fields for observability.
+//
+// message versus fields. Field keys and values are caller-supplied data and are
+// escaped before rendering: a newline in a field cannot open a second line that
+// reads as a genuine log record, and a value carrying the renderer's own "key=value"
+// structure is quoted so it cannot forge a sibling field (DEVOPS-284).
+//
+// message is NOT escaped. No implementation in this package alters it — StdLogger
+// and LogAdapter interpolate it into a formatted line, ZapLogger hands it to zap as
+// the record's msg — so whether a newline in message forges a record is decided by
+// the sink, not here: zap's JSON encoder escapes it, its console encoder and
+// StdLogger's log.Logger do not.
+//
+// Callers must therefore treat message as a literal chosen by the calling code and
+// put anything derived from untrusted input — request bodies, webhook payloads,
+// branch names, commit messages, error text from a remote — in fields. Note the
+// Error methods already do this for err: it is rendered as an "error" field, not
+// folded into message.
 type Logger interface {
 	// Info logs an informational message with optional structured fields.
 	Info(ctx context.Context, message string, fields map[string]interface{})
@@ -44,6 +61,13 @@ type SimpleLogger interface {
 
 // LogAdapter wraps a SimpleLogger to implement the full Logger interface.
 // This allows using simpler loggers (like zap.SugaredLogger) where the full interface is expected.
+//
+// Fields are rendered by renderSanitizedFields and passed as a single pre-rendered
+// %s argument. Do not simplify this back to Infof("%s %v", message, fields):
+// folding the map into the message argument let a caller-supplied newline forge a
+// log line even when the wrapped logger was zap, whose console encoder appends the
+// message verbatim (DEVOPS-284). SimpleLogger exposes no structured path — only
+// Printf-style methods — so escaping before interpolation is the available remedy.
 type LogAdapter struct {
 	simple SimpleLogger
 	fields map[string]interface{}
@@ -61,7 +85,7 @@ func NewLogAdapter(simple SimpleLogger) *LogAdapter {
 func (a *LogAdapter) Info(ctx context.Context, message string, fields map[string]interface{}) {
 	allFields := a.mergeFields(fields)
 	if len(allFields) > 0 {
-		a.simple.Infof("%s %v", message, allFields)
+		a.simple.Infof("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Info(message)
 	}
@@ -71,7 +95,7 @@ func (a *LogAdapter) Info(ctx context.Context, message string, fields map[string
 func (a *LogAdapter) Debug(ctx context.Context, message string, fields map[string]interface{}) {
 	allFields := a.mergeFields(fields)
 	if len(allFields) > 0 {
-		a.simple.Debugf("%s %v", message, allFields)
+		a.simple.Debugf("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Debug(message)
 	}
@@ -81,7 +105,7 @@ func (a *LogAdapter) Debug(ctx context.Context, message string, fields map[strin
 func (a *LogAdapter) Warn(ctx context.Context, message string, fields map[string]interface{}) {
 	allFields := a.mergeFields(fields)
 	if len(allFields) > 0 {
-		a.simple.Warnf("%s %v", message, allFields)
+		a.simple.Warnf("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Warn(message)
 	}
@@ -102,7 +126,7 @@ func (a *LogAdapter) Error(ctx context.Context, message string, err error, field
 		allFields["error"] = err.Error()
 	}
 	if len(allFields) > 0 {
-		a.simple.Errorf("%s %v", message, allFields)
+		a.simple.Errorf("%s %s", message, renderSanitizedFields(allFields))
 	} else {
 		a.simple.Error(message)
 	}
