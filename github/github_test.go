@@ -5,17 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/google/go-github/v82/github"
+	"github.com/jferrl/go-githubauth"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 )
 
 // Helper functions for pointer creation (replacing deprecated github.String, github.Int, github.Bool)
@@ -601,4 +605,194 @@ func TestGithubLoadConfigFromViper_NilViper(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrNilViper), "expected error to wrap ErrNilViper, got: %v", err)
 	// Belt-and-suspenders: preserve string-match check until callers migrate.
 	assert.Contains(t, err.Error(), "viper instance cannot be nil")
+}
+
+// --- DEVOPS-342: the HTTP calls made while authenticating must be bounded ---
+
+// stallSafetyValve caps how long a stalling test handler blocks. httptest's
+// Close waits for outstanding requests, so without this a regression would hang
+// the whole test binary instead of failing the one test that caught it.
+const stallSafetyValve = 30 * time.Second
+
+// stallHandler returns a handler that blocks until the client gives up. When
+// writeHeaderFirst is true it sends response headers before stalling, so the
+// caller chooses which bound is under test: ResponseHeaderTimeout (no headers
+// ever arrive) or the overall http.Client.Timeout (headers arrive, body stalls).
+func stallHandler(writeHeaderFirst bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if writeHeaderFirst {
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(stallSafetyValve):
+		}
+	}
+}
+
+// getAndDrain performs a GET and reads the body, returning the first error from
+// either step. A response whose headers arrive but whose body never does only
+// fails on the read, which is exactly what an overall timeout has to catch.
+func getAndDrain(client *http.Client, url string) error {
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, err = io.Copy(io.Discard, resp.Body)
+	return err
+}
+
+func TestBoundedHTTPClient_StalledServerDoesNotHangForever(t *testing.T) {
+	// Far longer than any bound under test: reaching it means "no bound at all".
+	const generousDeadline = 10 * time.Second
+
+	tests := []struct {
+		name                  string
+		handler               http.HandlerFunc
+		timeout               time.Duration
+		responseHeaderTimeout time.Duration
+		wantErr               bool
+	}{
+		{
+			name:                  "server stalls before sending response headers",
+			handler:               stallHandler(false),
+			timeout:               5 * time.Second,
+			responseHeaderTimeout: 100 * time.Millisecond,
+			wantErr:               true,
+		},
+		{
+			name:                  "server sends headers then stalls the body",
+			handler:               stallHandler(true),
+			timeout:               200 * time.Millisecond,
+			responseHeaderTimeout: 5 * time.Second,
+			wantErr:               true,
+		},
+		{
+			name: "responsive server is unaffected by the bounds",
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte("ok"))
+			},
+			timeout:               5 * time.Second,
+			responseHeaderTimeout: 5 * time.Second,
+			wantErr:               false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(tt.handler)
+			t.Cleanup(server.Close)
+
+			client := boundedHTTPClient(tt.timeout, tt.responseHeaderTimeout)
+
+			done := make(chan error, 1)
+			go func() { done <- getAndDrain(client, server.URL) }()
+
+			select {
+			case err := <-done:
+				if tt.wantErr {
+					require.Error(t, err, "a stalled server must surface an error, not block")
+				} else {
+					require.NoError(t, err)
+				}
+			case <-time.After(generousDeadline):
+				t.Fatalf("request did not return within %s: the client is unbounded", generousDeadline)
+			}
+		})
+	}
+}
+
+func TestBoundedHTTPClient_KeepsDialAndTLSBounds(t *testing.T) {
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	require.True(t, ok, "http.DefaultTransport is expected to be an *http.Transport")
+
+	client := boundedHTTPClient(tokenMintTimeout, tokenMintResponseHeaderTimeout)
+	require.Equal(t, tokenMintTimeout, client.Timeout, "overall timeout must be set")
+
+	transport, ok := client.Transport.(*http.Transport)
+	require.True(t, ok, "bounded client must carry its own *http.Transport")
+
+	assert.Equal(t, tokenMintResponseHeaderTimeout, transport.ResponseHeaderTimeout)
+	assert.Equal(t, defaultTransport.TLSHandshakeTimeout, transport.TLSHandshakeTimeout,
+		"TLS handshake bound must be kept, not discarded")
+	assert.Equal(t, defaultTransport.ExpectContinueTimeout, transport.ExpectContinueTimeout)
+	assert.NotNil(t, transport.DialContext, "dial bound must be kept, not discarded")
+	assert.NotNil(t, transport.Proxy, "proxy support must be kept")
+
+	assert.NotSame(t, defaultTransport, transport, "must clone rather than mutate http.DefaultTransport")
+	assert.Zero(t, defaultTransport.ResponseHeaderTimeout, "http.DefaultTransport must be left untouched")
+}
+
+// TestInstallationTokenMint_IsBounded is the regression test for the wedged
+// worker: go-githubauth's own client sets no overall timeout and no
+// ResponseHeaderTimeout, so before this bound a stalled token endpoint never
+// returned. It exercises the production constants through go-githubauth's real
+// plumbing, so it takes about tokenMintResponseHeaderTimeout to run.
+func TestInstallationTokenMint_IsBounded(t *testing.T) {
+	// Generous: anything short of this proves a bound exists, and reaching it
+	// proves one does not.
+	deadline := tokenMintTimeout + 10*time.Second
+
+	server := httptest.NewServer(stallHandler(false))
+	t.Cleanup(server.Close)
+
+	appTokenSource, err := githubauth.NewApplicationTokenSource(int64(12345), []byte(testPrivateKey(t)))
+	require.NoError(t, err)
+
+	tokenSource := githubauth.NewInstallationTokenSource(
+		int64(67890),
+		appTokenSource,
+		githubauth.WithHTTPClient(boundedHTTPClient(tokenMintTimeout, tokenMintResponseHeaderTimeout)),
+		githubauth.WithBaseURL(server.URL),
+	)
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, tokenErr := tokenSource.Token()
+		done <- tokenErr
+	}()
+
+	select {
+	case tokenErr := <-done:
+		require.Error(t, tokenErr, "a stalled token endpoint must surface an error")
+		assert.Less(t, time.Since(start), deadline)
+	case <-time.After(deadline):
+		t.Fatalf("token mint did not return within %s: the worker calling it would be wedged", deadline)
+	}
+}
+
+// TestOAuth2Client_InheritsBoundedBase pins the subtlety in authenticate():
+// oauth2.NewClient takes its base transport, and its overall timeout, from the
+// client stored in the context under oauth2.HTTPClient. Injecting there is what
+// bounds the client handed to github.NewClient.
+func TestOAuth2Client_InheritsBoundedBase(t *testing.T) {
+	const (
+		timeout               = 500 * time.Millisecond
+		responseHeaderTimeout = 200 * time.Millisecond
+		generousDeadline      = 10 * time.Second
+	)
+
+	server := httptest.NewServer(stallHandler(false))
+	t.Cleanup(server.Close)
+
+	base := boundedHTTPClient(timeout, responseHeaderTimeout)
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, base)
+	client := oauth2.NewClient(ctx, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
+
+	assert.Equal(t, timeout, client.Timeout, "oauth2 client must inherit the bounded overall timeout")
+
+	done := make(chan error, 1)
+	go func() { done <- getAndDrain(client, server.URL) }()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "a stalled API must surface an error, not block")
+	case <-time.After(generousDeadline):
+		t.Fatalf("oauth2 client did not return within %s: it is unbounded", generousDeadline)
+	}
 }

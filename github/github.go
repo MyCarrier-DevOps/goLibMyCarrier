@@ -4,13 +4,40 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/go-github/v82/github"
 	"github.com/jferrl/go-githubauth"
 	"github.com/spf13/viper"
 	"golang.org/x/oauth2"
+)
+
+// Timeouts for the HTTP calls made while authenticating as a GitHub App.
+//
+// Neither go-githubauth's default client nor the client returned by
+// oauth2.NewClient sets an overall http.Client.Timeout or a
+// ResponseHeaderTimeout: they bound the dial (30s) and the TLS handshake (10s)
+// and nothing else. A connected-but-stalled GitHub therefore has no bound at
+// all, and because the token mint runs synchronously inside a per-worker
+// message handler in pushhookparser, a stall wedges that goroutine permanently
+// rather than merely being slow.
+//
+// A token mint is a single small POST, and its caller already works to a
+// 15-second budget for its own reachability calls, so 15s overall is generous
+// for the real call and short enough that a stalled endpoint frees the worker;
+// a multi-minute bound would not. Response headers are expected far sooner, and
+// are bounded at the same 10s the transport already allows for the TLS
+// handshake. REST calls made through the authenticated client can return
+// larger payloads, so they get the 30s overall budget this module's GraphQL
+// client already uses (see NewGraphQLClient), with the same 10s on headers.
+const (
+	tokenMintTimeout               = 15 * time.Second
+	tokenMintResponseHeaderTimeout = 10 * time.Second
+	apiRequestTimeout              = 30 * time.Second
+	apiResponseHeaderTimeout       = 10 * time.Second
 )
 
 // ErrNilViper is returned by GithubLoadConfigFromViper when the caller
@@ -208,8 +235,20 @@ func (s *GithubSession) authenticate() error {
 	if err != nil {
 		return fmt.Errorf("error creating application token source: %w", err)
 	}
-	installationTokenSource := githubauth.NewInstallationTokenSource(installationID, appTokenSource)
-	httpClient := oauth2.NewClient(context.Background(), installationTokenSource)
+	installationTokenSource := githubauth.NewInstallationTokenSource(
+		installationID,
+		appTokenSource,
+		githubauth.WithHTTPClient(boundedHTTPClient(tokenMintTimeout, tokenMintResponseHeaderTimeout)),
+	)
+	// oauth2.NewClient takes the base transport, and the overall timeout, of the
+	// client it returns from the context — so the bounded client goes in there
+	// rather than around the result, which would drop the token transport.
+	ctx := context.WithValue(
+		context.Background(),
+		oauth2.HTTPClient,
+		boundedHTTPClient(apiRequestTimeout, apiResponseHeaderTimeout),
+	)
+	httpClient := oauth2.NewClient(ctx, installationTokenSource)
 	token, err := installationTokenSource.Token()
 	if err != nil {
 		return fmt.Errorf("error generating token: %w", err)
@@ -343,4 +382,27 @@ func (s *GithubSession) setMilestone(
 		}
 	}
 	return nil
+}
+
+// boundedHTTPClient returns a client that cannot block forever: an overall
+// timeout covering the whole request including the body, and a
+// ResponseHeaderTimeout for the connected-but-silent server that the dial and
+// TLS bounds never see. It starts from a clone of http.DefaultTransport so
+// those bounds, proxy support and connection pooling are kept rather than
+// discarded.
+func boundedHTTPClient(timeout, responseHeaderTimeout time.Duration) *http.Client {
+	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// http.DefaultTransport is an *http.Transport in every Go release to
+		// date; should that ever change, the overall timeout still applies.
+		return &http.Client{Timeout: timeout}
+	}
+
+	transport := defaultTransport.Clone()
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
 }
