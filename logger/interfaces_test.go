@@ -1068,3 +1068,65 @@ func BenchmarkZapLogger_WithFields(b *testing.B) {
 		_ = logger.WithFields(fields)
 	}
 }
+
+// TestStdLogger_SanitizesRenderedFields pins the DEVOPS-284 contract: a
+// caller-supplied key or value cannot forge a second log line, and fields render
+// in a deterministic order.
+func TestStdLogger_SanitizesRenderedFields(t *testing.T) {
+	const forged = "safe\n[INFO] forged line"
+
+	tests := []struct {
+		name         string
+		baseFields   map[string]interface{}
+		fields       map[string]interface{}
+		wantContains string
+	}{
+		{
+			name:         "a forged value cannot open a second line",
+			fields:       map[string]interface{}{"key": forged},
+			wantContains: `key=safe\n[INFO] forged line`,
+		},
+		{
+			name:         "a forged key is escaped the same way",
+			fields:       map[string]interface{}{"bad\nkey": "value"},
+			wantContains: `bad\nkey=value`,
+		},
+		{
+			name:         "fields render in sorted key order",
+			fields:       map[string]interface{}{"zebra": 1, "alpha": 2, "middle": 3},
+			wantContains: "alpha=2, middle=3, zebra=1",
+		},
+		{
+			name:         "an over-long value is truncated in the output",
+			fields:       map[string]interface{}{"big": strings.Repeat("a", maxFieldValueLen+1)},
+			wantContains: "…(truncated, 1025 runes)",
+		},
+		{
+			name:         "WithFields values are sanitised too",
+			baseFields:   map[string]interface{}{"base": forged},
+			fields:       map[string]interface{}{"key": "value"},
+			wantContains: `base=safe\n[INFO] forged line`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			var target Logger = &StdLogger{
+				logger: log.New(&buf, "", 0),
+				fields: make(map[string]interface{}),
+				debug:  false,
+			}
+			if tt.baseFields != nil {
+				target = target.WithFields(tt.baseFields)
+			}
+
+			target.Info(context.Background(), "test message", tt.fields)
+
+			output := buf.String()
+			assert.Equal(t, 1, strings.Count(output, "\n"),
+				"expected a single line terminated by one newline, got %q", output)
+			assert.Contains(t, output, tt.wantContains)
+		})
+	}
+}

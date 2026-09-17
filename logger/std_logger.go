@@ -2,7 +2,6 @@ package logger
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 )
@@ -135,18 +134,13 @@ func (l *StdLogger) log(level, message string, fields map[string]interface{}) {
 		allFields[k] = v
 	}
 
-	// Format fields as a string
+	// Fields are rendered escaped and key-sorted. Interpolating them raw let a
+	// caller-supplied newline open a second line that read as a genuine log
+	// entry (DEVOPS-284). The message is left alone: it is a literal chosen by
+	// the calling code, not caller-supplied data.
 	fieldsStr := ""
 	if len(allFields) > 0 {
-		fieldsStr = " "
-		first := true
-		for k, v := range allFields {
-			if !first {
-				fieldsStr += ", "
-			}
-			fieldsStr += fmt.Sprintf("%s=%v", k, v)
-			first = false
-		}
+		fieldsStr = " " + renderSanitizedFields(allFields)
 	}
 
 	l.logger.Printf("[%s] %s%s", level, message, fieldsStr)

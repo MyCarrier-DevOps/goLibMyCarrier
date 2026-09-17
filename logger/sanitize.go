@@ -2,6 +2,7 @@ package logger
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -57,6 +58,41 @@ func sanitizeField(s string) string {
 		}
 		b.WriteRune(r)
 		written++
+	}
+
+	return b.String()
+}
+
+// renderSanitizedFields renders fields as a "key=value" list joined by ", ", in
+// sorted key order, with every key and value passed through sanitizeField.
+//
+// Sorting is not cosmetic: map iteration order is randomised, so without it the
+// same call produces a different line each time and no test of the rendered output
+// can mean anything. Both the key and the value are sanitised because both are
+// caller-supplied.
+//
+// Callers must pass the result as a single pre-rendered argument. Handing the map
+// itself to a formatting logger is what DEVOPS-284 fixed: the fields then land in
+// the message, where the underlying logger's own escaping does not reach them.
+func renderSanitizedFields(fields map[string]interface{}) string {
+	if len(fields) == 0 {
+		return ""
+	}
+
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
+	var b strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(sanitizeField(k))
+		b.WriteByte('=')
+		b.WriteString(sanitizeField(fmt.Sprintf("%v", fields[k])))
 	}
 
 	return b.String()
