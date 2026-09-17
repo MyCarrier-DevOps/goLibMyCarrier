@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.5
 
 require (
-	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.99
+	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.103
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/golang-jwt/jwt/v5 v5.3.1
