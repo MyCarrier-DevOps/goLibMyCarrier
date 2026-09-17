@@ -515,7 +515,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 					len(store.CreateCalls))
 			}
 
-			// The reachable half of appendResetMarker. Its other caller — the duplicate-create
+			// The reachable half of appendResetMarkers. Its other caller — the duplicate-create
 			// backstop — is dormant until Phase B's unique index exists, so without this the
 			// only assertion on the marker sat on the arm that cannot run, and deleting the
 			// call in persistSlipForPush was green.

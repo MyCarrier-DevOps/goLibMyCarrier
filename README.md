@@ -112,6 +112,27 @@ for this release only: delete `next-version` (and `ConfiguredNextVersion`) once 
 tagged on main.** Left in place it would let the NEXT breaking `SlipStore` change ship as a
 `1.4.x` patch to consumers pinned to `1.4` — the same defect it was added to fix.
 
+### `slippy`: the claim joins `SlipStore` — since `v1.4.0` (DEVOPS-367)
+
+This is the break the `v1.4.0` floor above exists for, and it is the one a consumer meets
+first: `slippy.SlipStore` gained three methods, so any out-of-repo implementation (a
+`var _ slippy.SlipStore = (*fakeStore)(nil)` assertion, a hand-rolled test double) fails to
+compile until all three exist. Full contracts are on the interface in `slippy/interfaces.go`
+and the model is in `.github/STATE_MACHINE_V3.md`; the migrations are covered by
+`slippy/CLAUDE.md`'s rollout-order section.
+
+| What changed | Migration |
+|---|---|
+| `ClaimSlip(ctx, correlationID string, expected []SlipStatus, claimedBy, reason string) (ClaimOutcome, error)` — **new on `SlipStore`**, and it returns an outcome rather than a bare error | Implement it. Route the decision through `slippy.DecideClaim` so it cannot drift from the store; a store that cannot claim returns `ErrClaimUnsupported` (wrapped), as `ClickHouseStore` does. `ClaimOutcome{Claimed, Prior, InFlight}`: `Claimed=false` is the idempotent repeat with nothing written, not a failure, and a caller that must not dispatch onto running work branches on `InFlight`. |
+| `ReleaseClaim(ctx, correlationID, releasedBy, reason string) (ReleaseOutcome, error)` — **new on `SlipStore`**, also an outcome | Implement it via `slippy.DecideRelease`. `ReleaseOutcome{Released, Status}`: `Released=false` means work is in flight and the claim was KEPT with nothing written — the arm all but the last of a run's N post-job releases take. |
+| `ProbeSchema(ctx) error` — **new on `SlipStore`** | Implement it. A store with no schema of its own returns `nil`. Consumers reach it through `Client.ProbeSchema` and treat `ErrSchemaBehind` as "not ready". |
+| `ErrRunInFlight` — **removed** | Delete the `errors.Is(err, slippy.ErrRunInFlight)` branch and read `ReleaseOutcome.Released` instead. Work in flight stopped being an error because it is the normal outcome, not a failure. |
+| `ReleaseMarker(status SlipStatus, releasedBy, reason string)` — **signature changed** | Drop the old `restored` argument at the call site. A release never restores anything; the status it records is the slip's status at release time. |
+| `DecideClaim(status, claimedFrom SlipStatus, inFlight bool, expected []SlipStatus)` — **signature changed** within `v1.4.0` | Pass `slippy.RunInFlight(slip)` read from the same locked row, and put that same value in `ClaimOutcome.InFlight`. The live-run refusal reads that evidence rather than the status name, so a `pending` slip with a step running is refused and an `in_progress` slip with nothing running is claimable. |
+
+`slippytest.MockStore.CommitIndex` was also removed in the same release (DEVOPS-231); see
+`slippy/CLAUDE.md` for why deleting the line is usually — but not always — the whole fix.
+
 ### `postgresmigrator` / `clickhousemigrator`: `MigrationError.Unwrap()` returns `[]error` — since `v1.4.0` (DEVOPS-344)
 
 `MigrationError.Unwrap()` now returns `[]error` instead of a single `error`: the

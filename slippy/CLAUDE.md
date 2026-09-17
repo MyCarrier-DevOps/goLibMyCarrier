@@ -34,20 +34,38 @@ no step or component is running or held — otherwise it returns
 `ReleaseOutcome{Released: false}` with nothing written, which callers treat as information.
 `ErrRunInFlight` is **removed**: work in flight is an outcome, not an error, because all but
 the last of a run's N post-job releases take that arm.
-`ClaimSlip` returns `ClaimOutcome{Claimed, Prior}` for the same reason and with the same
-shape: `Claimed=false` means a claim was already held and NOTHING was written — the
+`ClaimSlip` returns `ClaimOutcome{Claimed, Prior, InFlight}` for the same reason and with the
+same shape: `Claimed=false` means a claim was already held and NOTHING was written — the
 idempotent repeat every pre-job after the first takes — and `Prior` is then the recorded
-`claimed_from` rather than the current status. Both values mean the slip is claimed on
-return; only a caller that must not duplicate work reads `Claimed`.
+`claimed_from` rather than the current status. Every non-error outcome means the slip is
+claimed on return.
 `expected` is a **compare-and-set on the slip's CURRENT status, whether or not a claim is
 already held** — the idempotent repeat sits BEHIND that check, not in front of it. A nil
-`expected` admits any status except a live one (`in_progress`, `compensating`; `pending` is
-claimable by design), and a claim already recorded on the row is no exemption from that
-refusal. This is what stops a second rerun request dispatching on top of a pipeline the
-first one already started, while still letting a retry through in the only window where a
-retry should dispatch: the one where nothing ran, and the status therefore has not moved
-(PR #87, round 6 — an earlier round compared `expected` against the recorded prior instead,
-which reopened the double dispatch). `ProbeSchema` is on the interface so
+`expected` admits any status except one whose run has a step or component **in flight**, and a
+claim already recorded on the row is no exemption from that refusal.
+
+**`InFlight` is new in the seventh review of PR #87, and it is the field a rerun caller must
+branch on.** `if_status` is NOT the double-dispatch guard, which an earlier round's comments
+claimed it was. A step write does not move the slip: `StartStep` writes `running`, which is not
+terminal, so `checkPipelineCompletion` is never reached and a slip dispatched out of `failed`
+still READS `failed` until its first post-job — minutes, for a build. A second rerun message in
+that window passes the same compare-and-set, takes the idempotent repeat arm, and on `Claimed`
+alone is indistinguishable from a retry whose response was lost before anything dispatched.
+`InFlight` — the step and aggregate columns, read under the same row lock as the status —
+separates them, and pushhookparser's rerunner dispatches only when `claimed=false` **and**
+`in_flight=false`. Known residual: two rerun messages arriving between a claim and its pre-job's
+`StartStep` both see `InFlight=false` and both dispatch; closing that needs a per-message claim
+identity end to end (`claimedBy` is audit only today).
+
+**`slippy.DecideClaim`'s signature changed with it**, which is compile-breaking for any
+out-of-repo store that routes through it:
+`DecideClaim(status, claimedFrom SlipStatus, inFlight bool, expected []SlipStatus)`. Pass
+`slippy.RunInFlight(slip)` read from the same locked row, and put the same value in
+`ClaimOutcome.InFlight` so the decision and the report cannot disagree. The refusal it drives
+now reads that evidence rather than the status NAME: a `pending` slip with a step running is
+refused (it used to be carved out as "nothing dispatched onto it", but a slip keeps `pending`
+for its whole run), and an `in_progress` slip between one step's post-job and the next step's
+pre-job is claimable (it used to be refused as "a live run"). `ProbeSchema` is on the interface so
 the readiness gate is reachable through the abstraction consumers hold (`Client.ProbeSchema`
 wraps it). Implementers should route their decisions through `slippy.DecideClaim` and
 `slippy.DecideRelease` so they cannot drift from the store.
@@ -56,6 +74,18 @@ release (the earlier `restored` argument is gone: a release never restores anyth
 contract, including what `nil` means for `expected`, is on `SlipStore.ClaimSlip`,
 `SlipStore.ReleaseClaim` and `SlipStore.ProbeSchema` in `interfaces.go`; the model is in
 `.github/STATE_MACHINE_V3.md` under DEVOPS-367.
+
+**A push never resets a claimed row whose run is in flight.** The push path's one exception to
+"a claimed row is deduped onto" is a push bearing that row's OWN correlation ID — its
+in-delivery retry — which resets the row in place via `Create`'s upsert. That carve-out now
+stops at work in flight: the upsert rewrites every step and aggregate column and the whole
+state history, so a self-correlated row with a running step is deduped like any other claimed
+row instead (finding p1). And because the upsert replaces `state_history` while `claimed_from`
+survives it, the reset re-appends the `slip_claimed` marker, keeping the invariant every reader
+depends on: **`claimed_from` and `slip_claimed` are both present or both absent** — pushhookparser
+derives "who claimed this" from the markers and gates its stranded-cleanup exemption on it, so
+a row that carried one without the other would read claimed to slippy and unclaimed to the
+parser (finding p2).
 
 Exactly ONE write path ends a claim: `UpdateSlipStatus` on a terminal status. `Create` and
 the full-row `Update` never touch `claimed_from`, whatever status the caller's snapshot
@@ -304,13 +334,16 @@ selects `claimed_from` (`slipSelectColumns()`), so a library at or past v1.4.0 f
 every `Load` with Postgres 42703 against a database still at v5. The migrator Job must
 have applied v6 before any slippy-api pod on that library serves traffic; do not roll
 the API image ahead of the migrator. This library supplies the check, but the ordering is
-enforced by the consumer that runs it — slippy-api's startup probe, not the library itself:
+enforced by the consumer that runs it — slippy-api's startup check, not the library itself:
 `PostgresStore.ProbeSchema` compares `slipSelectColumns()` (every column the SELECTs name,
 `claimed_from` and each configured step's column alike) against the live schema, and
-slippy-api calls it at startup and fails readiness — the pod exits and restarts — for as
-long as it returns `ErrSchemaBehind`. An API wired that way crash-loops until v6 is applied
-instead of answering every slip request with a 42703; a consumer that never calls the probe
-gets no such protection. `ProbeSchema` is on `SlipStore` (and `Client`), so it is reachable
+slippy-api calls it during startup and returns a fatal error on `ErrSchemaBehind`, so the
+process exits before it ever serves and Kubernetes CrashLoopBackOffs it until the
+slippy-migrator Job has applied the schema. It is a startup error, NOT a failing readiness
+probe — the two are different mechanisms and only this one is implemented; `main.go`'s own
+comment at the `ProbeSchema` call says the same. An API wired that way crash-loops until v6 is
+applied instead of answering every slip request with a 42703; a consumer that never calls the
+probe gets no such protection. `ProbeSchema` is on `SlipStore` (and `Client`), so it is reachable
 through the abstraction rather than only on the concrete Postgres store.
 Rolling back is guarded: v6's DownSQL refuses while any slip holds a claim
 (`claimed_from` set), because dropping the column erases the in-flight flag of every held
@@ -318,7 +351,10 @@ claim — that run's work becomes repaveable mid-flight — and breaks every `Lo
 library is rolled back with it. The refusal names up to 20 of the held correlation ids, and
 the guard takes an `ACCESS EXCLUSIVE` lock (bounded by a 5s `lock_timeout`, since the
 migration transaction otherwise runs with `lock_timeout = 0`) before it counts, so a claim
-taken between the count and the drop cannot slip through.
+taken between the count and the drop cannot slip through. The **up** sets the same 5s bound as
+its first statement, for the same reason and against the likelier exposure: `ADD COLUMN` takes
+`ACCESS EXCLUSIVE` too, an unbounded request for it queues ahead of every later reader, and the
+up runs on every consumer startup while the down runs only on a deliberate rollback.
 Because every slip-routed pre-job now claims, some slip usually holds a claim in a busy
 environment, so plan a rollback as a drain: expect the down to refuse until runs finish or
 are released. Let the runs end and `ReleaseClaim` them; where a step is stuck, resolve that

@@ -135,12 +135,16 @@ func (c *PipelineConfig) Validate() error {
 
 	// Check for duplicate step names
 	seen := make(map[string]bool)
+	folded := make(map[string]string, len(c.Steps))
 	for _, step := range c.Steps {
 		if step.Name == "" {
 			return fmt.Errorf("step name cannot be empty")
 		}
 		if seen[step.Name] {
 			return fmt.Errorf("duplicate step name: %s", step.Name)
+		}
+		if err := validateStepIdentifier(step.Name, folded); err != nil {
+			return err
 		}
 		seen[step.Name] = true
 	}
@@ -171,6 +175,48 @@ func (c *PipelineConfig) Validate() error {
 		}
 	}
 
+	return nil
+}
+
+// MaxStepNameLen is the longest step name a pipeline config may carry.
+//
+// Every step name becomes a Postgres column, `{name}_status` (postgres_store.go's
+// slipColumns/claimStateColumns, postgres_migrations.go's stepColumnEnsurer). Postgres
+// truncates an unquoted identifier at NAMEDATALEN-1 = 63 BYTES silently — no error, no warning
+// — so a longer name produces a column whose real name is not the one the SELECT list and the
+// UPDATE SET list are built from, and every read of that step fails with 42703 against a schema
+// the migrator reported as applied. 63 minus len("_status") is the bound.
+const MaxStepNameLen = 63 - len("_status")
+
+// validateStepIdentifier rejects the two step names that pass exact-case uniqueness and then
+// break the SCHEMA the config generates. Both are caught here, in the config, rather than in
+// PostgresStore.ProbeSchema: the probe folds case when it diffs the live catalogue against
+// slipSelectColumns(), which is correct for the probe — Postgres folded the DDL, so a configured
+// `Deploy_Dev` legitimately lands as `deploy_dev` — but that folding also hides these two faults
+// from it, and the probe is the wrong place to find them anyway. A config is rejected at parse
+// time, once, before any DDL runs (PR #87 finding j6).
+//
+//   - TWO NAMES THAT FOLD TOGETHER. Postgres folds unquoted identifiers to lower case, so
+//     `Deploy` and `deploy` are ONE column. Exact-case uniqueness above admits both, and then
+//     every write builds `SET Deploy_status = $n, deploy_status = $m` — the same column twice in
+//     one SET list, which is 42701 (duplicate column) on every update the slip ever takes.
+//   - A NAME THAT TRUNCATES. See MaxStepNameLen.
+//
+// folded is the caller's accumulator, mapping each folded identifier to the name that claimed
+// it, so the error can name BOTH colliding steps rather than only the second.
+func validateStepIdentifier(name string, folded map[string]string) error {
+	if len(name) > MaxStepNameLen {
+		return fmt.Errorf(
+			"step name %q is %d bytes; Postgres truncates the %s_status column at 63 bytes, so it must be at most %d",
+			name, len(name), name, MaxStepNameLen)
+	}
+	key := strings.ToLower(name)
+	if first, ok := folded[key]; ok {
+		return fmt.Errorf(
+			"step names '%s' and '%s' are the same Postgres identifier: unquoted names fold to lower case, "+
+				"so both generate the column %s_status", first, name, key)
+	}
+	folded[key] = name
 	return nil
 }
 

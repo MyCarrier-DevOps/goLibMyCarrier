@@ -442,12 +442,14 @@ func decodeAggregates(cols []string, raw [][]byte) map[string][]ComponentStepDat
 	return aggregates
 }
 
-// claimStateColumns returns exactly the columns DecideRelease reads, in scan order:
+// claimStateColumns returns exactly the columns the claim decisions read, in scan order:
 // claimed_from, status, every configured step's status column (slipColumns()' naming), then
-// every aggregate column (aggregateColumns()). It is deliberately NOT slipSelectColumns():
-// state_history and step_details are the two columns that grow without bound on a busy slip,
-// and the release decision reads neither, so keeping them out of the FOR UPDATE read keeps
-// the lock held over a bounded amount of data (DEVOPS-367).
+// every aggregate column (aggregateColumns()). That set is DecideRelease's whole input and
+// DecideClaim's too — the claim needs the step and aggregate columns for the same reason the
+// release does, to answer whether anything is in flight. It is deliberately NOT
+// slipSelectColumns(): state_history and step_details are the two columns that grow without
+// bound on a busy slip, and neither decision reads them, so keeping them out of the FOR UPDATE
+// read keeps the lock held over a bounded amount of data (DEVOPS-367).
 //
 // The aggregate names are returned alongside so the caller can decode the jsonb destinations
 // without recomputing them.
@@ -461,12 +463,12 @@ func (s *PostgresStore) claimStateColumns() (cols, aggregateCols []string) {
 }
 
 // loadClaimStateTx reads only the claim state under FOR UPDATE inside tx, so the quiescence
-// DecideRelease judges from it holds until the transaction's own write lands. The returned
-// Slip is partial by design: beyond the CorrelationID it was asked for, only ClaimedFrom,
-// Status, Steps[name].Status and Aggregates are populated, because those are DecideRelease's
-// whole input. It does not hydrate step_details, state_history or reconstructed step timing —
-// a release neither reads nor writes them. Do not hand the result to anything but the release
-// decision.
+// DecideClaim and DecideRelease judge from it holds until the transaction's own write lands.
+// The returned Slip is partial by design: beyond the CorrelationID it was asked for, only
+// ClaimedFrom, Status, Steps[name].Status and Aggregates are populated, because those are the
+// two decisions' whole input. It does not hydrate step_details, state_history or reconstructed
+// step timing — neither a claim nor a release reads or writes them. Do not hand the result to
+// anything but those two decisions (and RunInFlight, which is what both consult).
 func (s *PostgresStore) loadClaimStateTx(ctx context.Context, tx pgx.Tx, correlationID string) (*Slip, error) {
 	cols, aggCols := s.claimStateColumns()
 

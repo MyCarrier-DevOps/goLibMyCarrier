@@ -118,12 +118,16 @@ func TestMockStore_ClaimSlip_IsAFlag(t *testing.T) {
 		assert.Equal(t, 1, countStep(got, slippy.ClaimMarkerStep))
 	})
 
-	// Inverted deliberately (PR #87 re-review): a nil expected used to adopt an unclaimed
-	// in_progress run. That is a live run nothing has claimed; a caller that means to claim
-	// one now says so explicitly.
-	t.Run("nil expected refuses a live in_progress run; an explicit one claims it", func(t *testing.T) {
+	// Inverted deliberately, twice. First (PR #87 re-review): a nil expected used to adopt an
+	// unclaimed in_progress run, and a caller that means to adopt one now says so explicitly.
+	// Then (PR #87 seventh review): the refusal stopped reading the status NAME and started
+	// reading the step and aggregate columns, so what it refuses is a run with work IN FLIGHT
+	// — and an in_progress slip sitting between one step's post-job and the next step's
+	// pre-job, which has nothing running, is claimable.
+	t.Run("nil expected refuses a run in flight; an idle in_progress is claimable", func(t *testing.T) {
 		store := NewMockStore()
-		store.AddSlip(&slippy.Slip{CorrelationID: "c", Status: slippy.SlipStatusInProgress})
+		store.AddSlip(&slippy.Slip{CorrelationID: "c", Status: slippy.SlipStatusInProgress,
+			Steps: map[string]slippy.Step{"builds": {Status: slippy.StepStatusRunning}}})
 		_, err := store.ClaimSlip(ctx, "c", nil, "cli", "")
 		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed)
 		got, _ := store.Load(ctx, "c")
@@ -134,6 +138,14 @@ func TestMockStore_ClaimSlip_IsAFlag(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, slippy.SlipStatusInProgress, out.Prior)
 		assert.True(t, out.Claimed)
+		assert.True(t, out.InFlight, "the adopter is told it took over a run that is executing")
+
+		store.AddSlip(&slippy.Slip{CorrelationID: "idle", Status: slippy.SlipStatusInProgress,
+			Steps: map[string]slippy.Step{"builds": {Status: slippy.StepStatusCompleted}}})
+		out, err = store.ClaimSlip(ctx, "idle", nil, "cli", "")
+		require.NoError(t, err, "in_progress with nothing running is not a run in flight")
+		assert.True(t, out.Claimed)
+		assert.False(t, out.InFlight)
 	})
 }
 
@@ -146,7 +158,9 @@ func TestMockStore_ReleaseClaim_KeepsTheClaimWhileInFlight(t *testing.T) {
 		t.Helper()
 		store := NewMockStore()
 		store.AddSlip(&slippy.Slip{CorrelationID: "r", Status: slippy.SlipStatusFailed, Steps: steps, Aggregates: aggs})
-		_, err := store.ClaimSlip(ctx, "r", nil, "cli", "")
+		// Named expected, not nil: these fixtures have work in flight by construction, and a
+		// nil expected no longer adopts a run that is executing (PR #87 seventh review).
+		_, err := store.ClaimSlip(ctx, "r", []slippy.SlipStatus{slippy.SlipStatusFailed}, "cli", "")
 		require.NoError(t, err)
 		return store
 	}

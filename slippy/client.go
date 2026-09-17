@@ -194,7 +194,11 @@ func (c *Client) AbandonSlip(ctx context.Context, correlationID, supersededBy st
 // the slip's work continues in the new slip on the target branch.
 // The promotedTo parameter is recorded on the span and in the log line only — it is NOT
 // persisted, because no store has a promoted_to column and Slip.PromotedTo is deprecated for
-// that reason (DEVOPS-202); read the promotion from the state history instead.
+// that reason (DEVOPS-202). It is not recorded ANYWHERE else either: this call writes the
+// status column and nothing more, appending no state-history entry, so the promotion TARGET
+// survives only in this process's logs and traces and `status == promoted` is the only signal a
+// reader of the slip gets (PR #87 finding p4 — an earlier version of this line sent readers to
+// the state history, which holds nothing about it).
 func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo string) error {
 	// Start tracing span
 	ctx, span := StartSpan(ctx, "PromoteSlip", correlationID)

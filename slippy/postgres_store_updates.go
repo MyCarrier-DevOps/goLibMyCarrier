@@ -105,30 +105,29 @@ func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID stri
 // lock still agrees. The decision itself is DecideClaim, shared with the test doubles. The
 // marker append and the claimed_from write are in the same transaction as the read; status
 // is never written (DEVOPS-367).
+//
+// The read is loadClaimStateTx, the same narrow FOR UPDATE read ReleaseClaim uses, rather than
+// the two-column SELECT this used to run: the claim decision needs the step and aggregate
+// columns as well as the status and claimed_from, because a claim that is already held is only
+// distinguishable from a second claimant by whether anything is RUNNING (ClaimOutcome.InFlight,
+// PR #87 seventh review). One locked read answers both halves, so the evidence DecideClaim
+// judged on is the evidence the outcome reports, and the unbounded state_history and
+// step_details columns stay out of the lock exactly as they do for a release.
 func (s *PostgresStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 ) (ClaimOutcome, error) {
 	var outcome ClaimOutcome
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
-		var status string
-		var claimedFrom *string
-		if err := tx.QueryRow(ctx,
-			"SELECT status, claimed_from FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
-			correlationID).Scan(&status, &claimedFrom); err != nil {
-			if isNoRows(err) {
-				return ErrSlipNotFound
-			}
-			return fmt.Errorf("claim %s: lock: %w", correlationID, err)
+		slip, err := s.loadClaimStateTx(ctx, tx, correlationID)
+		if err != nil {
+			return err
 		}
-		var recorded SlipStatus
-		if claimedFrom != nil {
-			recorded = SlipStatus(*claimedFrom)
-		}
-		prior, write, err := DecideClaim(SlipStatus(status), recorded, expected)
+		inFlight := RunInFlight(slip)
+		prior, write, err := DecideClaim(slip.Status, slip.ClaimedFrom, inFlight, expected)
 		if err != nil {
 			return fmt.Errorf("claim %s: %w", correlationID, err)
 		}
-		outcome = ClaimOutcome{Claimed: write, Prior: prior}
+		outcome = ClaimOutcome{Claimed: write, Prior: prior, InFlight: inFlight}
 		if !write {
 			return nil
 		}

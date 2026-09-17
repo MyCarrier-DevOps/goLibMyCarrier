@@ -366,21 +366,48 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     status the row had — as an audit record, not as something to restore. That
     compare-and-set is on the CURRENT status **whether or not a claim is already held**, and
     the idempotent repeat sits behind it rather than in front of it. `nil` admits any status
-    EXCEPT a live run (`in_progress` or `compensating`; `pending` is claimable by design,
-    nothing has been dispatched onto it), and a recorded claim is no exemption from that
-    refusal: a caller that means to adopt a live run names the status in `if_status` (the
-    Slippy CLI pre-job names every non-terminal status; the rerunner, which names only the
-    ended set, is what the refusal protects). A slip with no status at all is refused. Once
-    `if_status` agrees, a claim already held is an idempotent no-op — `ClaimOutcome{Claimed:
-    false}` carrying the recorded prior, no second marker, nothing written — so a caller can
-    tell its own repeat from an existing claim without weakening the comparison.
+    EXCEPT one whose run has a step or component **in flight** (running or held), and a
+    recorded claim is no exemption from that refusal: a caller that means to adopt a running
+    run names the status in `if_status` (the Slippy CLI pre-job names every non-terminal
+    status; the rerunner, which names only the ended set, is what the refusal protects). A
+    slip with no status at all is refused. Once `if_status` agrees, a claim already held is an
+    idempotent no-op — `ClaimOutcome{Claimed: false}` carrying the recorded prior, no second
+    marker, nothing written — so a caller can tell its own repeat from an existing claim
+    without weakening the comparison.
+
+    That refusal reads the **step and aggregate columns, not the status name** (PR #87 seventh
+    review, finding j3). It used to read `IsLive() && status != pending`, which was wrong in
+    both directions: `pending` was carved out as "nothing has been dispatched onto it", but a
+    slip KEEPS `pending` for its whole run — `checkPipelineCompletion` only reconciles away
+    from `failed` — so a pending slip with three steps running was admitted by a `nil`
+    `if_status`; and `in_progress` was refused as "a live run", but between one step's post-job
+    and the next step's pre-job an `in_progress` slip has nothing running at all. The evidence
+    is read under the same `FOR UPDATE` as the status, by `PostgresStore.ClaimSlip`'s
+    `loadClaimStateTx` — the same narrow read `ReleaseClaim` uses.
+
     The consequence for the rerunner's retry after a lost response, which is what the rule is
     tuned for: if nothing was dispatched the status has not moved, the ended set still
-    matches, and the retry claims and dispatches; if the dispatch DID land and a step has
-    reported, the reconcile branch has written `in_progress`, the ended set misses, and the
-    retry is REFUSED — correctly, because the dispatch it is retrying already happened
-    (PR #87 round 6 reverted an earlier round that compared `if_status` against the recorded
-    prior instead, which let a second rerun request dispatch onto a live run).
+    matches, and the retry claims and dispatches; if the dispatch DID land and a **post-job**
+    has reported — a terminal step status, the only write that runs `checkPipelineCompletion`
+    — the reconcile branch has written `in_progress`, the ended set misses, and the retry is
+    REFUSED, correctly, because the dispatch it is retrying already happened (PR #87 round 6
+    reverted an earlier round that compared `if_status` against the recorded prior instead,
+    which let a second rerun request dispatch onto a live run).
+
+    **Between those two is the window `ClaimOutcome.InFlight` exists for, and it is not a
+    retry at all.** A pre-job's `StartStep` writes `running`, which is NOT terminal, so
+    `checkPipelineCompletion` is never reached and the slip still reads `failed` from dispatch
+    until the run's first post-job — minutes, for a build. A SECOND rerun message arriving in
+    that window passes the same compare-and-set and takes the same idempotent repeat arm as a
+    lost-response retry, so `Claimed=false` cannot tell them apart; before DEVOPS-367's seventh
+    review the rerunner dispatched a second pipeline onto the first. `ClaimOutcome` now carries
+    `InFlight`, read from the same locked row, and pushhookparser's rerunner does not dispatch
+    when `claimed=false` and `in_flight=true`. **Known residual, not closed:** between a
+    claimant's claim and its pre-job's `StartStep` nothing is running, so two rerun messages
+    arriving in *that* window both read `InFlight=false` and both dispatch. Closing it needs a
+    per-message claim identity carried end to end — the rerunner sends a constant `claimedBy`,
+    and `claimedBy` is audit only — which is a library, API and parser change.
+
     The status column stays the pipeline's alone, so
     `checkPipelineCompletion`'s terminal bypass keeps protecting `completed` and `promoted`
     even when they are claimed.
@@ -390,7 +417,19 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     whatever `status` says: a claimed rerun of a `failed` slip still reads `failed`, and a
     step failure mid-run changes nothing about the claim. `Create` and the full-row
     `Update` never write `claimed_from` (SELECT-only), so a stale snapshot cannot clear it.
-    Migration v6's down refuses while any claim is held. An abandon or promote is the
+    Migration v6's down refuses while any claim is held.
+
+    **One exception, added by PR #87's seventh review (finding p1):** a push bearing the
+    claimed row's OWN correlation ID is that delivery's in-delivery retry rather than another
+    run, and it resets the row **in place** — `Create`'s `ON CONFLICT DO UPDATE`, which
+    rewrites every step and aggregate column and the state history — when the run is
+    **quiescent**. It does NOT when a step or component is in flight; then the dedup applies as
+    to any other claimed row, because the reset would destroy the state that run is writing
+    under an unchanged correlation ID. Both guard paths spell it `claimed && (different id ||
+    RunInFlight)`. Because the reset replaces `state_history` while `claimed_from` survives it,
+    the reset also re-appends the `slip_claimed` marker (finding p2): `claimed_from` and
+    `slip_claimed` are **both present or both absent**, which is what pushhookparser's
+    stranded-cleanup exemption — keyed on the marker, not the column — depends on. An abandon or promote is the
     exception: both are terminal statuses written from outside the run, so they end the claim
     even while steps are still running, and both are repaveable — an ancestor abandon or a
     promotion deliberately overrides a live claim.

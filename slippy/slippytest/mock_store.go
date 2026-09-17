@@ -734,14 +734,22 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 
 // ClaimSlip mirrors PostgresStore.ClaimSlip through the shared slippy.DecideClaim: a
 // compare-and-set on the CURRENT status whether or not a claim is held, idempotent
-// (ClaimOutcome{Claimed: false}, nothing written) once one is, never writing status.
+// (ClaimOutcome{Claimed: false}, nothing written) once one is, never writing status. The
+// in-flight evidence is read from the same stored slip the decision is made on, as the store
+// reads both from one locked row.
 func (m *MockStore) ClaimSlip(
 	ctx context.Context, correlationID string, expected []slippy.SlipStatus, claimedBy, reason string,
 ) (slippy.ClaimOutcome, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Copied, not aliased: storing the caller's slice would keep its backing array, so a
+	// caller that reuses one buffer across claims would see every recorded call mutate
+	// together and a test would assert against whatever the last call left behind.
 	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{
-		CorrelationID: correlationID, Expected: expected, ClaimedBy: claimedBy, Reason: reason,
+		CorrelationID: correlationID,
+		Expected:      append([]slippy.SlipStatus(nil), expected...),
+		ClaimedBy:     claimedBy,
+		Reason:        reason,
 	})
 	if m.ClaimSlipError != nil {
 		return slippy.ClaimOutcome{}, m.ClaimSlipError
@@ -750,7 +758,8 @@ func (m *MockStore) ClaimSlip(
 	if !ok {
 		return slippy.ClaimOutcome{}, slippy.ErrSlipNotFound
 	}
-	prior, write, err := slippy.DecideClaim(slip.Status, slip.ClaimedFrom, expected)
+	inFlight := slippy.RunInFlight(slip)
+	prior, write, err := slippy.DecideClaim(slip.Status, slip.ClaimedFrom, inFlight, expected)
 	if err != nil {
 		return slippy.ClaimOutcome{}, fmt.Errorf("claim %s: %w", correlationID, err)
 	}
@@ -758,7 +767,7 @@ func (m *MockStore) ClaimSlip(
 		slip.StateHistory = append(slip.StateHistory, slippy.ClaimMarker(prior, claimedBy, reason))
 		slip.ClaimedFrom = prior
 	}
-	return slippy.ClaimOutcome{Claimed: write, Prior: prior}, nil
+	return slippy.ClaimOutcome{Claimed: write, Prior: prior, InFlight: inFlight}, nil
 }
 
 // ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared slippy.DecideRelease:

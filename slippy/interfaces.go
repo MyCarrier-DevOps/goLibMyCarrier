@@ -19,15 +19,32 @@ type Logger = logger.Logger
 type SlipStore interface {
 	// Create persists a new routing slip.
 	//
-	// Implementations upsert rather than reject an existing correlation ID (the Kafka
-	// redelivery path), and claimed_from is NOT among the columns the conflict arm writes:
-	// the Postgres SET list is slipColumns(), which excludes it. So a redelivered Create
-	// carrying a TERMINAL status over a claimed row resets the row's own columns and leaves
-	// the claim standing — a terminal status in a caller's snapshot never ends a claim,
-	// only UpdateSlipStatus does (DEVOPS-367). That is the safe direction: the snapshot
-	// cannot clear a claim taken after it was read. If a claim is left behind by a run that
-	// will never release it, the way out is the recovery route documented on ErrNotClaimed
-	// in errors.go — resolve the step that holds it, then release.
+	// Implementations upsert rather than reject an existing correlation ID, and claimed_from
+	// is NOT among the columns the conflict arm writes: the Postgres SET list is
+	// slipColumns(), which excludes it. So a Create carrying a TERMINAL status over a claimed
+	// row resets the row's own columns and leaves the claim standing — a terminal status in a
+	// caller's snapshot never ends a claim, only UpdateSlipStatus does (DEVOPS-367). That is
+	// the safe direction: the snapshot cannot clear a claim taken after it was read. If a
+	// claim is left behind by a run that will never release it, the way out is the recovery
+	// route documented on ErrNotClaimed in errors.go — resolve the step that holds it, then
+	// release.
+	//
+	// WHICH CALLER ACTUALLY REACHES THE CONFLICT ARM. Not a Kafka redelivery, whatever an
+	// earlier version of this comment said (finding p3): pushhookparser mints a NEW
+	// correlation ID per delivery (pkg/cmd/consumer.go), so a redelivery cannot collide on
+	// ON CONFLICT (correlation_id) at all — it collides, if anything, on the commit, which is
+	// LoadByCommit's and Repave's business. The one caller that arrives with an id already in
+	// the table is the IN-DELIVERY bounded retry, which reuses its own id; push.go names it
+	// correctly at persistSlipForPush's self-referential arm.
+	//
+	// THE CLAIM INVARIANT THIS PATH MUST PRESERVE: claimed_from and the slip_claimed marker
+	// in state_history are both present or both absent. The conflict arm does not write
+	// claimed_from but DOES write state_history (it is in slipColumns()), so an upsert over a
+	// claimed row would otherwise keep the column and destroy the marker — and pushhookparser
+	// derives "who claimed this" from the markers and gates its stranded-cleanup exemption on
+	// it, so the row would read claimed to one reader and unclaimed to the other (finding p2).
+	// A caller that upserts over a row it knows to be claimed therefore carries the claim
+	// forward in the history it writes; push.go's in-place reset paths do exactly that.
 	Create(ctx context.Context, slip *Slip) error
 
 	// Load retrieves a slip by its correlation ID (the unique slip identifier).
@@ -146,26 +163,52 @@ type SlipStore interface {
 	// The claim is a flag. It lives until the run is over: a post-job's ReleaseClaim that finds
 	// nothing in flight, or a terminal status write through UpdateSlipStatus — the one write
 	// path that ends a claim. While it is held, Repave refuses the row (ErrSlipWentLive) and
-	// the push path dedups onto it, whatever status the pipeline writes meanwhile. An abandon
-	// or promote is the exception: both are terminal statuses written from outside the run, so
-	// they end the claim even while steps are still running, and both are repaveable — an
-	// ancestor abandon or a promotion deliberately overrides a live claim.
+	// the push path dedups onto it, whatever status the pipeline writes meanwhile — with ONE
+	// exception, added by finding p1: a push bearing the claimed row's OWN correlation ID is
+	// that row's in-delivery retry rather than another run, and it resets the row in place
+	// when the run is quiescent. It does not when a step or component is in flight; then the
+	// dedup applies as it does to any other push. An abandon or promote is the other
+	// exception: both are terminal statuses written from outside the run, so they end the
+	// claim even while steps are still running, and both are repaveable — an ancestor abandon
+	// or a promotion deliberately overrides a live claim.
 	//
 	// expected is the set of statuses the caller agreed to claim out of, and it is ALWAYS a
 	// compare-and-set on the CURRENT status — whether or not a claim is already held. nil
-	// admits any status EXCEPT a live one (in_progress or compensating): a live run is never
-	// adopted by a caller that did not name it, and a claim already recorded on the row is no
-	// exemption from that. A caller that means to adopt a live run says so by listing the
-	// status (the Slippy CLI pre-job lists every non-terminal status; the rerunner, which
-	// names only the ended set, is what the refusal protects — including on its own retry,
-	// see below). pending is claimable by design: nothing has been dispatched onto it. The
-	// decision is DecideClaim, shared with the test doubles.
+	// admits any status EXCEPT one whose run has a step or component IN FLIGHT (running or
+	// held): a run that is executing is never adopted by a caller that did not name its
+	// status, and a claim already recorded on the row is no exemption from that. A caller that
+	// means to adopt a running run says so by listing the status (the Slippy CLI pre-job lists
+	// every non-terminal status; the rerunner, which names only the ended set, is what the
+	// refusal protects). The decision is DecideClaim, shared with the test doubles.
+	//
+	// That refusal reads the step and aggregate columns, NOT the status name, and the change
+	// is visible in both directions (finding j3): a `pending` slip with a step running is
+	// refused, where the old status-name rule carved `pending` out as "nothing dispatched onto
+	// it"; and an `in_progress` slip between one step's post-job and the next step's pre-job is
+	// claimable, where the old rule refused it as "a live run". A slip keeps `pending` for its
+	// whole run — checkPipelineCompletion only reconciles away from `failed` — so the name
+	// never carried the fact.
 	//
 	// A retry after a lost response therefore dispatches in exactly the window where it
 	// should. If the response was lost BEFORE the dispatch, nothing ran and the status has
 	// not moved, so the same expected still matches and the retry claims. If it was lost
-	// AFTER the dispatch, a step has reported and the status has moved off the ended set, so
-	// the retry is REFUSED — the dispatch it is retrying already happened (PR #87, round 6).
+	// AFTER the dispatch and a POST-JOB has reported — a terminal step status, the only write
+	// that runs checkPipelineCompletion — the status has moved off the ended set and the retry
+	// is REFUSED, because the dispatch it is retrying already happened (PR #87, round 6).
+	//
+	// BETWEEN THOSE TWO IS THE WINDOW ClaimOutcome.InFlight EXISTS FOR, and it is not a retry
+	// at all: a pre-job's StartStep writes `running`, which is not terminal, so nothing
+	// reconciles the status and the slip still reads `failed` from dispatch until the run's
+	// first post-job — minutes, for a build. A SECOND rerun message arriving in that window
+	// passes the same compare-and-set and takes the same idempotent repeat arm as a lost-
+	// response retry. Claimed=false cannot tell them apart; InFlight can, and a caller that
+	// must not duplicate work reads it (finding A0, PR #87 seventh review).
+	//
+	// KNOWN RESIDUAL, not closed here: between a claimant's claim and its pre-job's StartStep
+	// nothing is running, so two rerun messages arriving in THAT window both read
+	// InFlight=false and both dispatch. Closing it needs a per-message claim identity carried
+	// end to end — the rerunner sends a constant claimedBy today, and claimedBy is audit only
+	// (see below) — which is a library, API and parser change rather than a store one.
 	//
 	// A CLAIM WITH NOTHING IN FLIGHT IS REAPABLE, and there are two routes to reaping one.
 	// The state: a claim taken by a pre-job whose workflow was then never dispatched sets
@@ -201,11 +244,14 @@ type SlipStore interface {
 	//   - Claimed=false, nil error: the slip was already claimed and NOTHING was written;
 	//     Prior is the recorded claimed_from. Repeat claims are idempotent — no second marker
 	//     — so a retried request cannot inflate the audit trail, and all but the first pre-job
-	//     of a run take this arm. Both arms mean the slip is claimed on return; a caller that
-	//     must not duplicate work is the one that reads Claimed.
+	//     of a run take this arm. Both arms mean the slip is claimed on return.
+	//   - InFlight, on both of those arms: whether a step or component was running or held at
+	//     decision time, read from the SAME locked row as the status and the claim, so it
+	//     cannot disagree with what the decision was made on. A caller that must not dispatch
+	//     onto work already running reads this, not Claimed.
 	//   - ErrClaimPreconditionFailed: the CURRENT status was outside expected (claimed or
 	//     not), the slip has no status at all (an empty status cannot be recorded as a claim),
-	//     or the current status is a live run expected did not name. Nothing written.
+	//     or the run had work in flight and expected did not name its status. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
 	ClaimSlip(

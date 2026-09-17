@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -498,4 +499,84 @@ func TestPipelineConfig_initialize_Coverage(t *testing.T) {
 	if len(gates) != 1 || gates[0] != "builds_gate" {
 		t.Errorf("gateSteps should contain builds_gate, got %v", gates)
 	}
+}
+
+// Two step names that differ only in case are ONE Postgres column, because unquoted
+// identifiers fold to lower case. Exact-case uniqueness admits both, and then every write
+// builds `SET Deploy_status = $n, deploy_status = $m` — the same column twice in one SET list,
+// which is 42701 on every update the slip ever takes. The config is where that is caught, not
+// ProbeSchema: the probe folds case deliberately (a configured `Deploy_Dev` legitimately lands
+// as `deploy_dev`), and that folding is exactly what hides this (PR #87 finding j6).
+func TestPipelineConfig_Validate_RejectsStepNamesThatFoldTogether(t *testing.T) {
+	config := &PipelineConfig{
+		Version: "1",
+		Name:    "case-collision",
+		Steps: []StepConfig{
+			{Name: "push_parsed"},
+			{Name: "Deploy", Prerequisites: []string{"push_parsed"}},
+			{Name: "deploy", Prerequisites: []string{"push_parsed"}},
+		},
+	}
+	config.initialize()
+	err := config.Validate()
+	if err == nil {
+		t.Fatal("expected a case-folding collision to be rejected")
+	}
+	for _, want := range []string{"Deploy", "deploy", "deploy_status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error must name both steps and the column they share; got %q, want %q in it", err, want)
+		}
+	}
+
+	// The same two names, one of them quoted-distinct in spelling only, still differ as
+	// identifiers once folded — but names that differ outside case are fine.
+	ok := &PipelineConfig{
+		Version: "1",
+		Name:    "no-collision",
+		Steps:   []StepConfig{{Name: "push_parsed"}, {Name: "Deploy_Dev", Prerequisites: []string{"push_parsed"}}},
+	}
+	ok.initialize()
+	if err := ok.Validate(); err != nil {
+		t.Errorf("a single mixed-case name is legal (Postgres folds it consistently): %v", err)
+	}
+}
+
+// Postgres truncates an unquoted identifier at 63 bytes SILENTLY, so a step name long enough to
+// push {name}_status past that produces a column whose real name is not the one the SELECT and
+// SET lists are built from: every read of that step then fails 42703 against a schema the
+// migrator reported as applied.
+func TestPipelineConfig_Validate_RejectsStepNamesThatTruncate(t *testing.T) {
+	longest := repeatRune('a', MaxStepNameLen)
+	ok := &PipelineConfig{
+		Version: "1",
+		Name:    "at-the-limit",
+		Steps:   []StepConfig{{Name: "push_parsed"}, {Name: longest, Prerequisites: []string{"push_parsed"}}},
+	}
+	ok.initialize()
+	if err := ok.Validate(); err != nil {
+		t.Errorf("a name whose column is exactly 63 bytes is legal: %v", err)
+	}
+	if len(longest+"_status") != 63 {
+		t.Fatalf("MaxStepNameLen must be 63 minus len(\"_status\"); got a %d-byte column", len(longest+"_status"))
+	}
+
+	tooLong := repeatRune('a', MaxStepNameLen+1)
+	over := &PipelineConfig{
+		Version: "1",
+		Name:    "over-the-limit",
+		Steps:   []StepConfig{{Name: "push_parsed"}, {Name: tooLong, Prerequisites: []string{"push_parsed"}}},
+	}
+	over.initialize()
+	err := over.Validate()
+	if err == nil {
+		t.Fatal("expected a step name that truncates at 63 bytes to be rejected")
+	}
+	if !strings.Contains(err.Error(), "63 bytes") {
+		t.Errorf("the error must say what the limit is; got %q", err)
+	}
+}
+
+// repeatRune builds an n-byte step name, so the length boundary is expressed as a length.
+func repeatRune(r byte, n int) string {
+	return strings.Repeat(string(r), n)
 }

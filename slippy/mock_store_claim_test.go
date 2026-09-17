@@ -48,9 +48,14 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 	// already live matched the prior and dispatched on top of it. expected is a
 	// compare-and-set on the CURRENT status whether or not a claim is held, and the
 	// idempotent arm sits behind it.
+	//
+	// The row carries a RUNNING step throughout (PR #87 seventh review): the refusal of the
+	// nil-expected claim below is now evidence-based, so a slip with no step ever reported
+	// would be claimable at in_progress and would prove the opposite of what this asserts.
 	t.Run("claim never writes status; a repeat is idempotent once expected agrees to the CURRENT status", func(t *testing.T) {
 		store := NewMockStore()
-		store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed})
+		store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed,
+			Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
 		out, err := store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "first", "")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusFailed, out.Prior)
@@ -59,7 +64,8 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		assert.Equal(t, SlipStatusFailed, got.Status)
 		require.NoError(t, store.UpdateSlipStatus(ctx, "c", SlipStatusInProgress))
 		_, err = store.ClaimSlip(ctx, "c", nil, "second", "")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimed row is still a live run nothing named")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed,
+			"a claimed row is still a run in flight that nothing named")
 		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "the rerunner's retry after its dispatch started is refused")
 		out, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusInProgress}, "fourth", "")
@@ -70,11 +76,18 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
 	})
 
-	// A live run is not adoptable by a caller that named no status — claimed or not; the
+	// A run IN FLIGHT is not adoptable by a caller that named no status — claimed or not; the
 	// refusal does not depend on the row being unclaimed (see the repeat subtest above).
-	t.Run("nil expected refuses a live in_progress; an explicit one claims it", func(t *testing.T) {
+	//
+	// Inverted deliberately (PR #87 seventh review): the refusal used to read the status NAME,
+	// so `in_progress` was refused whether or not anything was running. The second half pins
+	// the other side of that inversion — an in_progress slip between one step's post-job and
+	// the next step's pre-job has nothing in flight and IS claimable — and the outcome now
+	// carries the evidence it decided on.
+	t.Run("nil expected refuses a run in flight; an idle in_progress is claimable", func(t *testing.T) {
 		store := NewMockStore()
-		store.AddSlip(&Slip{CorrelationID: "live", Status: SlipStatusInProgress})
+		store.AddSlip(&Slip{CorrelationID: "live", Status: SlipStatusInProgress,
+			Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
 		_, err := store.ClaimSlip(ctx, "live", nil, "rerunner", "")
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
 		got, _ := store.Load(ctx, "live")
@@ -83,6 +96,15 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusInProgress, out.Prior)
 		assert.True(t, out.Claimed)
+		assert.True(t, out.InFlight, "the adopter is told it took over a run that is executing")
+
+		store.AddSlip(&Slip{CorrelationID: "idle", Status: SlipStatusInProgress,
+			Steps: map[string]Step{"builds": {Status: StepStatusCompleted}, "unit_tests": {Status: StepStatusPending}}})
+		out, err = store.ClaimSlip(ctx, "idle", nil, "rerunner", "")
+		require.NoError(t, err, "in_progress with nothing running is not a run in flight")
+		assert.Equal(t, SlipStatusInProgress, out.Prior)
+		assert.True(t, out.Claimed)
+		assert.False(t, out.InFlight)
 	})
 
 	// Inverted deliberately (PR #87 re-review): the in-flight arm was ErrRunInFlight. It is
@@ -90,8 +112,11 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 	t.Run("release keeps the claim while in flight, clears when quiescent, never writes status", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "r", Status: SlipStatusFailed, Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
-		_, err := store.ClaimSlip(ctx, "r", nil, "cli", "")
+		// Named expected, not nil: the row has a step running, and a nil expected no longer
+		// adopts a run in flight. This is the shape a real adopter of a running run sends.
+		claim, err := store.ClaimSlip(ctx, "r", []SlipStatus{SlipStatusFailed}, "cli", "")
 		require.NoError(t, err)
+		assert.True(t, claim.InFlight, "the claim reports the evidence it was decided on")
 		out, err := store.ReleaseClaim(ctx, "r", "cli", "")
 		require.NoError(t, err)
 		assert.False(t, out.Released)

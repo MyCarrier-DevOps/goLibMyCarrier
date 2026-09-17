@@ -74,9 +74,12 @@ type Slip struct {
 	// PromotedTo held the correlation ID of the slip this was promoted to.
 	//
 	// Deprecated: no store persists this and PromoteSlip no longer sets it (DEVOPS-202); it is
-	// always empty on a loaded slip. Read the promotion from the state history instead.
-	// The field and its tags are kept because removing them is a second breaking change for
-	// no gain: nothing reads a value that is never written.
+	// always empty on a loaded slip. Nothing records the promotion target at all — PromoteSlip
+	// writes the status column and appends no history — so `Status == SlipStatusPromoted` is the
+	// only signal a reader of the slip has, and WHICH slip it was promoted to is not persisted
+	// anywhere (PR #87 finding p4). The field and its tags are kept because removing them is a
+	// second breaking change for no gain: nothing reads a value that is never written, and the
+	// test doubles drop it on copy so no consumer test can pass on one.
 	PromotedTo string `json:"promoted_to,omitempty" ch:"promoted_to"`
 
 	// Sign is used by VersionedCollapsingMergeTree for row management.

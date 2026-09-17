@@ -300,8 +300,10 @@ func TestUniquenessMigration_V5(t *testing.T) {
 		"WHERE i.indrelid = to_regclass('routing_slips')",
 		"AND ic.relname = 'uq_routing_slips_repo_sha'",
 		"EXECUTE format('DROP INDEX %s', idx)",
-		"DROP CONSTRAINT IF EXISTS fk_ancestry_slip",
-		"DROP CONSTRAINT IF EXISTS fk_component_states_slip",
+		// IF EXISTS on the tables as well as the constraints, for the reason v6's down carries
+		// it: a bare ALTER TABLE raises 42P01 on a missing relation (PR #87 finding j5).
+		"ALTER TABLE IF EXISTS slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip",
+		"ALTER TABLE IF EXISTS slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip",
 	} {
 		assert.Contains(t, down, want)
 	}
@@ -322,6 +324,15 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 
 	up := stripSQLLineComments(v6.UpSQL)
 	assert.Contains(t, up, "ADD COLUMN IF NOT EXISTS claimed_from text")
+	// The UP is the likelier of the two paths to meet a busy database — it runs on every
+	// consumer startup, where the down runs only on a deliberate rollback — and its ADD COLUMN
+	// takes ACCESS EXCLUSIVE inside a transaction postgresmigrator runs with lock_timeout = 0.
+	// An unbounded request queues ahead of every later reader and stalls all slip traffic
+	// (PR #87 finding j4). The bound must be the first statement, so it covers the ALTER.
+	assert.Regexp(t, `SET LOCAL lock_timeout = '[^']+'`, up, "the ADD COLUMN's lock request must be bounded")
+	assert.NotRegexp(t, `SET LOCAL lock_timeout = '?0'?\s*;`, up, "and the bound must not be zero")
+	assert.Less(t, strings.Index(up, "lock_timeout"), strings.Index(up, "ALTER TABLE"),
+		"the timeout is set before the ALTER that requests the lock")
 	assert.Equal(t, 1, strings.Count(up, "RAISE EXCEPTION"), "exactly one post-condition")
 	assert.Contains(t, up, "to_regclass('routing_slips')",
 		"post-condition resolves the column through the TABLE, like v5's, not via information_schema + current_schema()")
@@ -365,6 +376,11 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "DROP COLUMN"),
 		"and therefore bounds the DROP's own ACCESS EXCLUSIVE request")
 	assert.Equal(t, strings.TrimSpace(down[strings.LastIndex(down, "END $$;")+len("END $$;"):]),
-		"ALTER TABLE routing_slips DROP COLUMN IF EXISTS claimed_from;",
+		"ALTER TABLE IF EXISTS routing_slips DROP COLUMN IF EXISTS claimed_from;",
 		"the DROP is still the last statement, after the guard")
+	// IF EXISTS on the TABLE, not only on the column (PR #87 finding j5). Without it the down
+	// raises 42P01 on a database that never had routing_slips, so it is not the no-op the
+	// guard's own to_regclass already makes it and not what this test asserted above.
+	assert.Contains(t, down, "ALTER TABLE IF EXISTS routing_slips",
+		"a missing table makes the drop a no-op, not a 42P01")
 }

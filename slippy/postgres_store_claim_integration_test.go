@@ -106,6 +106,7 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusFailed, out.Prior)
 		assert.True(t, out.Claimed, "this call recorded the claim")
+		assert.False(t, out.InFlight, "nothing has been reported against this slip, so nothing is running")
 		got, err := store.Load(ctx, "c-failed")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusFailed, got.Status, "the claim never writes status")
@@ -127,45 +128,94 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		assert.Equal(t, 0, countMarkers(t, store, "c-abandoned", ClaimMarkerStep), "no marker on a refused claim")
 	})
 
-	// Inverted deliberately (PR #87 re-review): a nil expected used to claim an unclaimed
-	// in_progress row too. That row is a live run nothing has adopted, and claiming it
-	// silently is how a rerun dispatches on top of a pipeline already in flight.
-	t.Run("nil expected claims any status except a live unclaimed run", func(t *testing.T) {
-		for _, st := range []SlipStatus{SlipStatusCompleted, SlipStatusPending} {
+	// Inverted twice. First (PR #87 re-review): a nil expected used to claim an unclaimed
+	// in_progress row too. Then (PR #87 seventh review, finding j3): what it refuses stopped
+	// being a status NAME and became in-flight EVIDENCE — the step and aggregate columns, read
+	// in the same FOR UPDATE as the status by loadClaimStateTx. So an in_progress row with
+	// nothing running is claimable, and a row with a step running is refused whatever its
+	// status column reads. This is the integration-level pin that the claim's own read really
+	// does carry those columns; a narrowed read would make every cell below wrong.
+	t.Run("nil expected claims any status, except while a step is in flight", func(t *testing.T) {
+		for _, st := range []SlipStatus{SlipStatusCompleted, SlipStatusPending, SlipStatusInProgress} {
 			id := "c-any-" + string(st)
 			claimTestSlip(t, store, id, "sha-"+string(st), st)
 			out, err := store.ClaimSlip(ctx, id, nil, "rerunner", "test")
 			require.NoError(t, err, st)
 			assert.Equal(t, st, out.Prior)
 			assert.True(t, out.Claimed)
+			assert.False(t, out.InFlight, "no step was ever reported on %s", st)
 			got, err := store.Load(ctx, id)
 			require.NoError(t, err)
 			assert.Equal(t, st, got.Status, "status untouched")
 			assert.Equal(t, st, got.ClaimedFrom)
 		}
 
-		claimTestSlip(t, store, "c-live", "sha-live", SlipStatusInProgress)
+		// A step running is what the refusal reads now, and `failed` is the status that makes
+		// the point: the status column says the run ended, the step column says it has not.
+		claimTestSlip(t, store, "c-live", "sha-live", SlipStatusFailed)
+		require.NoError(t, store.UpdateStep(ctx, "c-live", "unit_tests", "", StepStatusRunning))
 		_, err := store.ClaimSlip(ctx, "c-live", nil, "rerunner", "test")
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed)
 		got, err := store.Load(ctx, "c-live")
 		require.NoError(t, err)
-		assert.Equal(t, SlipStatusInProgress, got.Status, "status untouched")
+		assert.Equal(t, SlipStatusFailed, got.Status, "status untouched")
 		assert.Empty(t, got.ClaimedFrom, "nothing written")
 		assert.Equal(t, 0, countMarkers(t, store, "c-live", ClaimMarkerStep), "and no marker")
+
+		// A component running inside an aggregate step counts too, which is the half a narrowed
+		// read would drop: the aggregate's own column can read failed while a sibling builds.
+		claimTestSlip(t, store, "c-live-comp", "sha-live-comp", SlipStatusFailed)
+		require.NoError(t, store.UpdateComponentStatus(ctx, "c-live-comp", "api", "component_builds", StepStatusRunning))
+		_, err = store.ClaimSlip(ctx, "c-live-comp", nil, "rerunner", "test")
+		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "the claim read carries the aggregate columns")
 	})
 
-	t.Run("an explicit in_progress in expected claims a live run", func(t *testing.T) {
+	t.Run("an explicit status in expected adopts a run that is in flight", func(t *testing.T) {
 		claimTestSlip(t, store, "c-live-explicit", "sha-live-explicit", SlipStatusInProgress)
+		require.NoError(t, store.UpdateStep(ctx, "c-live-explicit", "unit_tests", "", StepStatusRunning))
 		out, err := store.ClaimSlip(ctx, "c-live-explicit",
 			[]SlipStatus{SlipStatusInProgress}, "slippy-cli/prejob", "test")
 		require.NoError(t, err, "the CLI pre-job claims out of every non-terminal status")
 		assert.Equal(t, SlipStatusInProgress, out.Prior)
 		assert.True(t, out.Claimed)
+		assert.True(t, out.InFlight, "and it is told what it adopted")
 		got, err := store.Load(ctx, "c-live-explicit")
 		require.NoError(t, err)
 		assert.Equal(t, SlipStatusInProgress, got.Status, "status untouched")
 		assert.Equal(t, SlipStatusInProgress, got.ClaimedFrom)
 		assert.Equal(t, 1, countMarkers(t, store, "c-live-explicit", ClaimMarkerStep))
+	})
+
+	// THE BLOCKING CASE, against the real store (PR #87 seventh review). A rerun claims a
+	// failed slip and dispatches; the run's pre-job writes a step `running`, which is NOT
+	// terminal, so nothing reconciles the slip and it still reads `failed`. A second rerun
+	// message in that window sends the same if_status, the compare-and-set agrees, and the
+	// idempotent repeat arm answers — indistinguishable, on Claimed alone, from a retry whose
+	// response was lost before anything dispatched. InFlight is the field that separates them.
+	t.Run("the repeat arm reports the run it would have dispatched onto", func(t *testing.T) {
+		claimTestSlip(t, store, "c-window", "sha-window", SlipStatusFailed)
+		ended := []SlipStatus{SlipStatusFailed, SlipStatusCompleted, SlipStatusCompensated,
+			SlipStatusAbandoned, SlipStatusPromoted}
+
+		first, err := store.ClaimSlip(ctx, "c-window", ended, "rerunner", "test")
+		require.NoError(t, err)
+		assert.True(t, first.Claimed)
+		assert.False(t, first.InFlight, "nothing dispatched yet: this is the message that should dispatch")
+
+		// unit_tests, a pipeline-level step: this is exactly what a pre-job's StartStep writes.
+		// An aggregate step's own progress arrives through UpdateComponentStatus instead, which
+		// the "c-live-comp" cell above covers.
+		require.NoError(t, store.UpdateStep(ctx, "c-window", "unit_tests", "", StepStatusRunning))
+		got, err := store.Load(ctx, "c-window")
+		require.NoError(t, err)
+		require.Equal(t, SlipStatusFailed, got.Status, "a running step does not move the slip's status")
+
+		second, err := store.ClaimSlip(ctx, "c-window", ended, "rerunner", "test")
+		require.NoError(t, err, "if_status still agrees: it is not the double-dispatch guard")
+		assert.False(t, second.Claimed, "the idempotent repeat")
+		assert.Equal(t, SlipStatusFailed, second.Prior)
+		assert.True(t, second.InFlight, "and THIS is what stops the second dispatch")
+		assert.Equal(t, 1, countMarkers(t, store, "c-window", ClaimMarkerStep), "still one marker")
 	})
 
 	t.Run("repeat claim is an idempotent no-op returning the recorded prior", func(t *testing.T) {
@@ -534,10 +584,13 @@ func TestPostgresStore_Update_NeverEndsTheClaim_Integration(t *testing.T) {
 	assert.Empty(t, got.ClaimedFrom, "the atomic terminal status write is what ends it")
 }
 
-// Create's ON CONFLICT arm re-creates a slip that already exists — the same-correlation-ID
-// redelivery path. claimed_from is not one of the columns it writes, so a claim held by a
-// run in flight survives a redelivery that resets the row's status underneath it. If it did
-// not, a redelivery would silently drop the in-flight flag and expose the run to a repave.
+// Create's ON CONFLICT arm re-creates a slip that already exists. The caller that gets there
+// is the IN-DELIVERY bounded retry, which reuses its own correlation ID — not a Kafka
+// redelivery, which mints a NEW one (pushhookparser pkg/cmd/consumer.go) and so can never
+// collide on ON CONFLICT (correlation_id) at all (PR #87 finding p3). claimed_from is not one
+// of the columns the conflict arm writes, so a claim held by a run in flight survives a reset
+// of the row's status underneath it. If it did not, the retry would silently drop the
+// in-flight flag and expose the run to a repave.
 func TestPostgresStore_Create_KeepsAnExistingClaim_Integration(t *testing.T) {
 	store, _, _ := newMigratedStore(t)
 	ctx := context.Background()
@@ -555,14 +608,14 @@ func TestPostgresStore_Create_KeepsAnExistingClaim_Integration(t *testing.T) {
 	assert.Equal(t, SlipStatusInProgress, got.Status, "Create still writes the columns it owns")
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "but never claimed_from: the claim survives")
 
-	// A redelivery carrying a TERMINAL status is the same rule, and worth pinning separately:
-	// the SET list is slipColumns(), which has no claimed_from in it, so a terminal status in
-	// a caller's snapshot ends nothing. Only UpdateSlipStatus does — and that is the remedy
-	// when a redelivery leaves a claim nobody will release.
+	// A retry carrying a TERMINAL status is the same rule, and worth pinning separately: the
+	// SET list is slipColumns(), which has no claimed_from in it, so a terminal status in a
+	// caller's snapshot ends nothing. Only UpdateSlipStatus does — and that is the remedy when
+	// such a retry leaves a claim nobody will release.
 	require.NoError(t, store.Create(ctx, &Slip{
 		CorrelationID: "cr-claim", Repository: "Owner/Repo", Branch: "main", CommitSHA: "sha-cr",
 		Status: SlipStatusCompleted,
-	}), "a redelivered Create carrying a terminal status")
+	}), "a retried Create carrying a terminal status")
 
 	got, err = store.Load(ctx, "cr-claim")
 	require.NoError(t, err)

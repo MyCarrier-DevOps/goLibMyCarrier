@@ -336,8 +336,11 @@ func (m *PostgresDynamicMigrationManager) uniquenessMigration() postgresmigrator
 					EXECUTE format('DROP INDEX %s', idx);
 				END IF;
 			END $$;
-			ALTER TABLE slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip;
-			ALTER TABLE slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip;
+			-- IF EXISTS on the tables too, for the reason v6's down carries it: a bare ALTER
+			-- TABLE raises 42P01 on a missing relation, which would make this down fail on a
+			-- database where the tables were never created rather than do nothing.
+			ALTER TABLE IF EXISTS slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip;
+			ALTER TABLE IF EXISTS slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip;
 		`,
 	}
 }
@@ -365,6 +368,18 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 		Name:        "claimed_from",
 		Description: "routing_slips.claimed_from: status at claim time recorded by ClaimSlip; set while a run holds the slip, cleared by ReleaseClaim or by UpdateSlipStatus on a terminal status (DEVOPS-367)",
 		UpSQL: `
+			-- The lock_timeout is the FIRST statement of the up, for the same reason it is the
+			-- first statement of the down: postgresmigrator runs the migration transaction with
+			-- SET LOCAL lock_timeout = 0, and ADD COLUMN takes ACCESS EXCLUSIVE. An unbounded
+			-- request for it queues AHEAD of every subsequent reader, so on a busy database one
+			-- open transaction holding a read lock stalls all slip traffic behind this migration
+			-- until it is granted or cancelled by hand. This is the likelier of the two paths to
+			-- meet that, not the rarer: the up runs on every consumer startup while the down runs
+			-- only on a deliberate rollback. Five seconds fails the migration instead; re-run it.
+			-- SET LOCAL is scoped to the migration transaction, so it restores itself on commit
+			-- or rollback.
+			SET LOCAL lock_timeout = '5s';
+
 			ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL;
 
 			-- Post-condition: IF NOT EXISTS matched a NAME; assert the SHAPE ReleaseClaim relies on.
@@ -439,7 +454,11 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 					END IF;
 				END IF;
 			END $$;
-			ALTER TABLE routing_slips DROP COLUMN IF EXISTS claimed_from;
+			-- IF EXISTS on the TABLE as well as the column: without it a missing routing_slips
+			-- raises 42P01 and the down is not the no-op the guard above already is (its
+			-- to_regclass returns NULL and skips), nor the no-op this migration's own tests
+			-- assert it to be.
+			ALTER TABLE IF EXISTS routing_slips DROP COLUMN IF EXISTS claimed_from;
 		`,
 	}
 }

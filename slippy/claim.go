@@ -139,21 +139,44 @@ func RunInFlight(slip *Slip) bool {
 // ClaimOutcome is what a claim did. Claimed is true when THIS call recorded the claim and
 // false when one was already held — the idempotent repeat. Prior is the status the claim was
 // taken out of: the current status on a fresh claim, the recorded claimed_from on a repeat.
-// A caller that must not duplicate work keys on Claimed; a caller that only needs the slip
-// protected can ignore it, since both values mean the slip is claimed on return.
+// InFlight reports whether the slip had a step or component running or held at the moment the
+// decision was made, read under the same row lock.
+//
+// Claimed alone cannot answer the question a rerun caller actually has, which is why InFlight
+// exists. A step write does not move the slip's status: StartStep writes running, which is not
+// terminal, so checkPipelineCompletion is never reached and a slip dispatched out of failed
+// still READS failed until its first post-job. A second rerun message arriving in that window
+// passes the same compare-and-set, takes the idempotent repeat arm, and — on Claimed alone —
+// looks exactly like a retry whose response was lost before anything dispatched. InFlight is
+// what separates them: a caller that finds Claimed=false can tell a claim whose run is
+// EXECUTING (do not dispatch; the work is already running) from one whose run never started or
+// has finished (a lost response before dispatch, or a stranded claim — dispatching is the
+// recovery). DEVOPS-367, PR #87 seventh review.
+//
+// A caller that only needs the slip protected can ignore both fields, since every non-error
+// outcome means the slip is claimed on return.
 type ClaimOutcome struct {
 	// Claimed is true when this call recorded the claim, false when one was already held.
 	Claimed bool
 
 	// Prior is the status the claim was taken out of, recorded or current.
 	Prior SlipStatus
+
+	// InFlight is true when a step or component was running or held at decision time.
+	InFlight bool
 }
 
 // DecideClaim is the claim decision, shared by PostgresStore and both test doubles so the
-// three cannot drift. status is the row's current status and claimedFrom its recorded claim
-// ("" when unclaimed). prior is the status to report — the current one on a fresh claim, the
-// recorded one on a repeat — and write reports whether the store must record the claim
-// (claimed_from plus a marker) or this is the idempotent no-op arm.
+// three cannot drift. status is the row's current status, claimedFrom its recorded claim (""
+// when unclaimed), and inFlight the evidence RunInFlight read from the same locked row. prior
+// is the status to report — the current one on a fresh claim, the recorded one on a repeat —
+// and write reports whether the store must record the claim (claimed_from plus a marker) or
+// this is the idempotent no-op arm.
+//
+// inFlight is a bool rather than the *Slip it came from deliberately: the store evaluates
+// RunInFlight ONCE, hands the same value to this decision and to ClaimOutcome.InFlight, and so
+// cannot report a different answer than it decided on. It also keeps TestDecideClaim_Table a
+// table of scalars rather than 284 slip literals.
 //
 // THE RULE, in one sentence: expected is always a compare-and-set on the CURRENT status,
 // whether or not a claim is already held — a repeat claim is idempotent only once that
@@ -168,11 +191,28 @@ type ClaimOutcome struct {
 //   - A non-empty expected that does not contain the current status is refused, claimed or
 //     not. This is the compare-and-set.
 //
-//   - A LIVE status (IsLive: pending, in_progress, compensating) that expected did not name
-//     is refused, so a nil expected cannot adopt a run already in flight. pending is carved
-//     out because a pending slip is claimable by design: nothing has been dispatched onto it
-//     yet. The refusal does NOT depend on the row being unclaimed, so a live run already
-//     carrying a claim is protected by it too.
+//   - A run IN FLIGHT — a step or component running or held — that expected did not name is
+//     refused, so a nil expected cannot adopt a run that is executing. The refusal does NOT
+//     depend on the row being unclaimed, so a run already carrying a claim is protected by it
+//     too.
+//
+//     THIS ARM USED TO READ `status.IsLive() && status != SlipStatusPending`, and that was
+//     wrong in both directions (finding j3, PR #87 seventh review). `pending` was carved out
+//     as "nothing has been dispatched onto it yet" — but a slip KEEPS `pending` for its whole
+//     run, because checkPipelineCompletion only reconciles a status away from `failed`, so a
+//     pending slip with three steps running was admitted by a nil expected. And `in_progress`
+//     was refused as "a live run" — but between one step's post-job and the next step's
+//     pre-job an in_progress slip has nothing running at all, and refusing it made the
+//     stranded-claim recovery harder for no protection gained. The status name never carried
+//     the fact; the step and aggregate columns do, and they are read under the same FOR UPDATE
+//     as the status.
+//
+//     One behaviour change comes with it, stated rather than left invisible: IsLive() returns
+//     true for any status THIS BUILD DOES NOT RECOGNISE (IsTerminal's default arm is false),
+//     so an unknown future status used to be refused outright by a nil expected. It is now
+//     treated like any other name — admitted when nothing is in flight, refused when something
+//     is. The decision no longer reads the status name at all, so there is no longer a class of
+//     names it can be wrong about.
 //
 //     Its `!slices.Contains(expected, status)` clause is only ever REACHABLE for an empty
 //     expected: a non-empty one that does not contain the status has already returned at the
@@ -190,24 +230,42 @@ type ClaimOutcome struct {
 //   - The response was lost BEFORE anything dispatched. Nothing ran, so the row still reads
 //     failed, the ended set matches, and the retry claims and dispatches. Recovery works —
 //     and it is the only window in which a retry SHOULD dispatch.
-//   - The response was lost AFTER the dispatch and a step has reported, so the reconcile
-//     branch has written in_progress. The ended set no longer matches and the retry is
-//     refused. That is the desired outcome, not a bug: the dispatch it is retrying already
-//     happened, and claiming again would put a second run on top of a live one.
+//
+//   - The response was lost AFTER the dispatch and a POST-JOB has reported, so
+//     checkPipelineCompletion has run and the reconcile branch has written in_progress. The
+//     ended set no longer matches and the retry is refused. That is the desired outcome, not a
+//     bug: the dispatch it is retrying already happened, and claiming again would put a second
+//     run on top of a live one.
+//
+//     Read "a post-job has reported" exactly: it is a TERMINAL step status on a pipeline-level
+//     step that runs checkPipelineCompletion (steps.go, `status.IsTerminal() && componentName
+//     == ""`). A pre-job's StartStep writes `running`, which is not terminal, so it reaches
+//     none of that and the status does not move. Between the dispatch and the run's first
+//     post-job — minutes, for a build — the row still reads failed and this decision still
+//     agrees to the ended set. That window is real, and it is what inFlight covers.
+//
+// NEITHER worked case is the one A0 was about, and this decision does not answer that one: a
+// second rerun MESSAGE, arriving while the first's dispatch is running, sends the same expected
+// against a status that has not moved, so the compare-and-set agrees and the repeat arm answers
+// it exactly as it answers a lost-response retry. What tells the two apart is
+// ClaimOutcome.InFlight, not this function's return — see ClaimOutcome.
 //
 // A caller that cannot tell "already claimed" from "precondition failed" reads
 // ClaimOutcome.Claimed, which is what that distinction is for; it is not a reason to compare
 // expected against the recorded prior instead (PR #87, rounds 4 and 6).
-func DecideClaim(status, claimedFrom SlipStatus, expected []SlipStatus) (prior SlipStatus, write bool, err error) {
+func DecideClaim(
+	status, claimedFrom SlipStatus, inFlight bool, expected []SlipStatus,
+) (prior SlipStatus, write bool, err error) {
 	if status == "" {
 		return "", false, fmt.Errorf("slip has no status: %w", ErrClaimPreconditionFailed)
 	}
 	if len(expected) > 0 && !slices.Contains(expected, status) {
 		return "", false, fmt.Errorf("status %s not in %v: %w", status, expected, ErrClaimPreconditionFailed)
 	}
-	if status.IsLive() && status != SlipStatusPending && !slices.Contains(expected, status) {
-		return "", false, fmt.Errorf("%s is a live run; name it in expected to adopt one: %w",
-			status, ErrClaimPreconditionFailed)
+	if inFlight && !slices.Contains(expected, status) {
+		return "", false, fmt.Errorf(
+			"a step or component is in flight at status %s; name %s in expected to adopt a run: %w",
+			status, status, ErrClaimPreconditionFailed)
 	}
 	if claimedFrom != "" {
 		return claimedFrom, false, nil
@@ -259,10 +317,12 @@ func DecideRelease(slip *Slip) (release bool, err error) {
 // it never changes the slip's status, and it lives until the run is over — released by a
 // post-job once nothing is in flight, or ended by a terminal status write. expected is a
 // compare-and-set on the CURRENT status whether or not a claim is already held; nil admits
-// any status except a live one (in_progress or compensating), which a caller that means to
-// adopt names in expected. Once that compare-and-set agrees, a claim already held is an
-// idempotent no-op: ClaimOutcome{Claimed: false} carrying the RECORDED prior, with nothing
-// written. Both outcomes mean the slip is claimed on return. See SlipStore.ClaimSlip.
+// any status EXCEPT one whose run has a step or component in flight, which a caller that means
+// to adopt a running run names in expected. Once that compare-and-set agrees, a claim already
+// held is an idempotent no-op: ClaimOutcome{Claimed: false} carrying the RECORDED prior, with
+// nothing written. Every non-error outcome means the slip is claimed on return; a caller that
+// must not dispatch onto work already running reads ClaimOutcome.InFlight, not Claimed. See
+// SlipStore.ClaimSlip.
 func (c *Client) ClaimSlip(
 	ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 ) (ClaimOutcome, error) {
@@ -276,10 +336,15 @@ func (c *Client) ClaimSlip(
 	if !out.Claimed {
 		msg = "Slip already claimed: claim kept, nothing written"
 	}
+	// in_flight is logged on BOTH arms rather than only the repeat: on a fresh claim it is
+	// the evidence the caller adopted a run that is executing (only reachable when expected
+	// named the status), and on a repeat it is the field that separates a second rerun
+	// message from a retry whose response was lost.
 	c.logger.Info(ctx, msg, map[string]interface{}{
 		"correlation_id": correlationID,
 		"prior_status":   string(out.Prior),
 		"claimed":        out.Claimed,
+		"in_flight":      out.InFlight,
 		"claimed_by":     claimedBy,
 	})
 	return out, nil

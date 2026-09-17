@@ -2,6 +2,7 @@ package slippy
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -140,6 +141,8 @@ func TestClient_CreateSlipForPush_DuplicateBackstopDedupsOntoClaimedConflictingS
 // slip — the outcome persistSlipForPush's self-referential arm and the empty-run guard's
 // self-correlation exclusion both exist to prevent. Create's SET list excludes claimed_from,
 // so the reset keeps the claim (PR #87 re-review).
+//
+// This is the QUIESCENT half of the carve-out; its in-flight half is the test below.
 func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipIsResetNotDeduped(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
@@ -174,6 +177,68 @@ func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipIsResetNotDeduped(t 
 	require.NoError(t, err)
 	assert.True(t, got.Status.IsLive(), "the reset makes the row live again, so the caller's dispatch is correct")
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "and the claim survives: Create never writes claimed_from")
+	// THE INVARIANT, pinned directly (finding p2): claimed_from and the slip_claimed marker are
+	// both present or both absent. Create rewrites state_history — it is in slipColumns() —
+	// while claimed_from survives, so without appendResetMarkers carrying the claim forward the
+	// column would be set and the marker gone. pushhookparser derives ClaimedBy from the
+	// markers and gates its stranded-cleanup exemption on it, so the two readers would disagree
+	// about one row and a still-claimed slip would become reapable.
+	assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep),
+		"the reset carries the claim marker forward, so column and marker agree")
+	assert.True(t, hasHistoryMessage(got, "reset in place after failed attempt"),
+		"alongside the reset marker, not instead of it")
+}
+
+// The self-correlation carve-out stops at work in flight (finding p1). Create's ON CONFLICT
+// arm rewrites every step and aggregate column AND the state history, so resetting a claimed
+// row whose own dispatch is still executing destroys the state that run is writing — under an
+// unchanged correlation ID, which leaves an operator no way to tell which attempt wrote what.
+// The in-delivery retry that reaches here after its dispatch already started is exactly that
+// shape, so the claimed branch keeps it and the push dedups instead.
+func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipInFlightIsDedupedNotReset(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: shippedShapePipelineConfig()})
+
+	store.AddSlip(&Slip{
+		CorrelationID: "corr-self-live",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-live",
+		Status:        SlipStatusFailed,
+		Steps:         map[string]Step{"builds": {Status: StepStatusFailed}, "unit_tests": {Status: StepStatusRunning}},
+		Aggregates: map[string][]ComponentStepData{
+			"builds": {{Component: "api", Status: StepStatusFailed}, {Component: "web", Status: StepStatusRunning}},
+		},
+		StateHistory: []StateHistoryEntry{{Step: "builds", Status: StepStatusFailed, Actor: "post-job"}},
+	})
+	// The rerunner adopts a run that is executing by NAMING its status; a nil if_status no
+	// longer admits one.
+	_, err := store.ClaimSlip(ctx, "corr-self-live", []SlipStatus{SlipStatusFailed}, "pushhookparser/rerunner", "")
+	require.NoError(t, err)
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-self-live", // the in-delivery retry reuses its id
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-live",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Slip)
+	assert.Equal(t, "corr-self-live", result.Slip.CorrelationID)
+	assert.Empty(t, store.CreateCalls, "no upsert: the reset would have rewritten the running run's state")
+	assert.Empty(t, store.RepaveCalls, "and a claimed row is never repaved either")
+
+	got, err := store.Load(ctx, "corr-self-live")
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusRunning, got.Steps["unit_tests"].Status, "the running step is untouched")
+	assert.Equal(t, StepStatusFailed, got.Steps["builds"].Status, "and so is the failed one")
+	require.Len(t, got.Aggregates["builds"], 2)
+	assert.Equal(t, StepStatusRunning, got.Aggregates["builds"][1].Status, "the running component survives")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim survives")
+	assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep), "and so does its marker")
+	assert.Equal(t, 1, countHistoryStep(got, "builds"), "the run's own history is not replaced")
 }
 
 // The backstop orders its mirror the same way — live, empty-run guard, self-referential,
@@ -214,4 +279,145 @@ func TestClient_CreateSlipForPush_DuplicateBackstopResetsASelfCorrelationClaimed
 	require.NoError(t, err)
 	assert.True(t, got.Status.IsLive(), "the retry's upsert reset the row")
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim survives the reset")
+	assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep),
+		"and the marker is carried forward here too, or the two convergent paths would differ on it")
+}
+
+// The backstop's twin of the in-flight carve-out: its claimed arm now sits ABOVE its
+// self-referential arm with the same `claimed && (different id || RunInFlight)` condition, so
+// a lost insert race whose conflicting row is this push's own AND has work executing dedups
+// instead of resetting (finding p1).
+func TestClient_CreateSlipForPush_DuplicateBackstopDedupsASelfCorrelationClaimedSlipInFlight(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: shippedShapePipelineConfig()})
+
+	conflicting := &Slip{
+		CorrelationID: "corr-self-live-backstop",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-live-backstop",
+		Status:        SlipStatusFailed,
+		Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+		StateHistory:  []StateHistoryEntry{ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "")},
+		ClaimedFrom:   SlipStatusFailed,
+	}
+	store.SeedOnCreate["corr-self-live-backstop"] = conflicting
+	store.CreateErrorOnce["corr-self-live-backstop"] = ErrDuplicateSlip
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-self-live-backstop",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-self-live-backstop",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Slip)
+	assert.Equal(t, "corr-self-live-backstop", result.Slip.CorrelationID)
+	assert.Len(t, store.CreateCalls, 1, "the claimed arm answered: no insert retry, so no in-place reset")
+	assert.Empty(t, store.RepaveCalls)
+
+	got, err := store.Load(ctx, "corr-self-live-backstop")
+	require.NoError(t, err)
+	assert.Equal(t, SlipStatusFailed, got.Status, "the row is left exactly as the running run has it")
+	assert.Equal(t, StepStatusRunning, got.Steps["builds"].Status)
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom)
+	assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep))
+}
+
+// Every other push-claim test in this file runs on testPipelineConfig(), whose step 0 is
+// `push_parsed` — the ONE step RunInFlight skips by name — while both shipped configs
+// (default.json, production.json) start at `builds`, an aggregate that build post-jobs report.
+// So those tests could not observe the in-flight evidence production actually has: the step a
+// fresh push marks running there is invisible to the claim (finding p6). This one runs on a
+// config shaped like the shipped ones and asserts the step, the aggregate and the marker rather
+// than only ClaimedFrom.
+func TestClient_CreateSlipForPush_ClaimedSlipOnAShippedShapeConfigKeepsItsRunningWork(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{PipelineConfig: shippedShapePipelineConfig()})
+
+	store.AddSlip(&Slip{
+		CorrelationID: "corr-shipped",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-shipped",
+		Status:        SlipStatusFailed,
+		Steps:         map[string]Step{"builds": {Status: StepStatusRunning}, "unit_tests": {Status: StepStatusPending}},
+		Aggregates:    map[string][]ComponentStepData{"builds": {{Component: "api", Status: StepStatusRunning}}},
+		StateHistory:  []StateHistoryEntry{},
+	})
+	claim, err := store.ClaimSlip(ctx, "corr-shipped", []SlipStatus{SlipStatusFailed}, "pushhookparser/rerunner", "rerun")
+	require.NoError(t, err)
+	require.True(t, claim.InFlight, "step 0 is an aggregate here, so the claim can see the run at all")
+
+	result, err := client.CreateSlipForPush(ctx, PushOptions{
+		CorrelationID: "corr-shipped-push",
+		Repository:    "owner/repo",
+		Branch:        "main",
+		CommitSHA:     "sha-shipped",
+		Components:    []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result.Slip)
+	assert.Equal(t, "corr-shipped", result.Slip.CorrelationID, "the push dedups onto the claimed run")
+	assert.Empty(t, store.CreateCalls)
+	assert.Empty(t, store.RepaveCalls)
+
+	got, err := store.Load(ctx, "corr-shipped")
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusRunning, got.Steps["builds"].Status, "the running step is left alone")
+	require.Len(t, got.Aggregates["builds"], 1)
+	assert.Equal(t, StepStatusRunning, got.Aggregates["builds"][0].Status, "and so is the running component")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom)
+	assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep), "the claim marker is intact, so the column has its pair")
+
+	// A release from a post-job of THAT run still finds work in flight, which is the property
+	// the dedup exists to preserve.
+	out, err := store.ReleaseClaim(ctx, "corr-shipped", "pushhookparser/rerunner", "")
+	require.NoError(t, err)
+	assert.False(t, out.Released, "the deduped push did not make the run look quiescent")
+}
+
+// shippedShapePipelineConfig mirrors the SHIPPED configs' shape rather than the test config's:
+// step 0 is `builds`, an aggregate that every build post-job reports, not `push_parsed`. That
+// difference is load-bearing for anything that reads in-flight evidence, because RunInFlight
+// skips push_parsed BY NAME (see PushParsedStep) — on testPipelineConfig() the step
+// initializeSlipForPush marks running for a fresh push is precisely the step the claim cannot
+// see.
+func shippedShapePipelineConfig() *PipelineConfig {
+	config := &PipelineConfig{
+		Version:     "1",
+		Name:        "shipped-shape",
+		Description: "step 0 is an aggregate, as in default.json and production.json",
+		Steps: []StepConfig{
+			{Name: "builds", Description: "All component container builds finished", Aggregates: "build"},
+			{Name: "unit_tests", Description: "Unit tests", Prerequisites: []string{"builds"}},
+			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"unit_tests"}},
+		},
+	}
+	config.initialize()
+	return config
+}
+
+// hasHistoryMessage reports whether any state-history entry's message contains substr.
+func hasHistoryMessage(slip *Slip, substr string) bool {
+	for _, entry := range slip.StateHistory {
+		if strings.Contains(entry.Message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// countHistoryStep counts state-history entries written against one step name.
+func countHistoryStep(slip *Slip, step string) int {
+	n := 0
+	for _, entry := range slip.StateHistory {
+		if entry.Step == step {
+			n++
+		}
+	}
+	return n
 }
