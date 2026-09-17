@@ -40,7 +40,12 @@ func sanitizeField(s string) string {
 	}
 
 	var b strings.Builder
-	b.Grow(len(s))
+	// Size from the cap, not the input: sanitizeField's result is bounded by
+	// maxFieldValueLen, so growing to len(s) would reserve for the part a large
+	// value is about to have discarded. Each retained rune costs at most
+	// utf8.UTFMax bytes, plus room for the truncation marker.
+	const maxRendered = maxFieldValueLen*utf8.UTFMax + 64
+	b.Grow(min(len(s), maxRendered))
 
 	// written counts runes placed in the builder, so the cap bounds the rendered
 	// length rather than the input length. Every escape is ASCII, so its rune
@@ -110,17 +115,16 @@ func escapeRune(r rune) string {
 		return `\r`
 	case '\t':
 		return `\t`
-	default:
 	}
 
 	const (
-		del      = 0x7F
-		c1Start  = 0x80
-		c1End    = 0x9F
-		c0Length = 0x20
+		c0End   = 0x1F
+		del     = 0x7F
+		c1Start = 0x80
+		c1End   = 0x9F
 	)
 
-	if r < c0Length || r == del || (r >= c1Start && r <= c1End) {
+	if r <= c0End || r == del || (r >= c1Start && r <= c1End) {
 		return fmt.Sprintf(`\x%02x`, r)
 	}
 
