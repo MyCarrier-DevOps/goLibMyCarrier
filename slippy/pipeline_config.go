@@ -136,7 +136,7 @@ func (c *PipelineConfig) Validate() error {
 
 	// Check for duplicate step names
 	seen := make(map[string]bool)
-	folded := make(map[string]string, len(c.Steps))
+	claimed := make(map[string]string, len(c.Steps))
 	for _, step := range c.Steps {
 		if step.Name == "" {
 			return fmt.Errorf("step name cannot be empty")
@@ -144,7 +144,7 @@ func (c *PipelineConfig) Validate() error {
 		if seen[step.Name] {
 			return fmt.Errorf("duplicate step name: %s", step.Name)
 		}
-		if err := validateStepIdentifier(step.Name, folded); err != nil {
+		if err := validateStepIdentifier(step, claimed); err != nil {
 			return err
 		}
 		seen[step.Name] = true
@@ -211,14 +211,15 @@ var reservedStepNames = func() map[string]struct{} {
 	return reserved
 }()
 
-// validateStepIdentifier rejects the four step names that pass exact-case uniqueness and then
+// validateStepIdentifier rejects the four step-name shapes that pass exact-case uniqueness and then
 // break the SCHEMA the config generates. All four are caught here, in the config, rather than in
 // PostgresStore.ProbeSchema: the probe folds case when it diffs the live catalogue against
 // slipSelectColumns(), which is correct for the probe — Postgres folded the DDL, so a configured
 // `Deploy_Dev` legitimately lands as `deploy_dev` — but that folding also hides these faults
 // from it, and the probe is the wrong place to find them anyway. A config is rejected at parse
 // time, once, before any DDL runs (PR #87 finding j6). They are listed in the order they are
-// checked, and this list is the whole of what this function rejects.
+// checked, and this list is the whole of what this function rejects — see the closing note for
+// the one schema-breaking shape it still admits, which is recorded rather than left implied.
 //
 //   - A NAME THAT IS NOT A BARE IDENTIFIER. Step names reach identifier position UNQUOTED:
 //     postgres_migrations.go's stepColumnEnsurer emits
@@ -245,14 +246,29 @@ var reservedStepNames = func() map[string]struct{} {
 //     standing between a merely confusing name and that silent collision. The reserved set is
 //     derived from the store's own column list — see reservedStepNames (PR #87, pkuzmenko
 //     finding 1 arm B).
-//   - TWO NAMES THAT FOLD TOGETHER. Postgres folds unquoted identifiers to lower case, so
-//     `Deploy` and `deploy` are ONE column. Exact-case uniqueness above admits both, and then
-//     every write builds `SET Deploy_status = $n, deploy_status = $m` — the same column twice in
-//     one SET list, which is 42701 (duplicate column) on every update the slip ever takes.
+//   - TWO STEPS THAT GENERATE THE SAME COLUMN. Postgres folds unquoted identifiers to lower
+//     case, so `Deploy` and `deploy` are ONE column: exact-case uniqueness above admits both,
+//     and then every write builds `SET Deploy_status = $n, deploy_status = $m` — 42701 on every
+//     update the slip ever takes. The check keys on the identifiers a step GENERATES rather than
+//     on its name, because two unrelated names can produce one column: a step `deploy` emits
+//     `deploy_status`, and an aggregate step literally named `deploy_status` emits that same bare
+//     column, so a name-keyed check admits the pair. See generatedColumnsFor, which must stay in
+//     step with stepColumnEnsurer — an identifier it does not return is one nothing checks.
 //
-// folded is the caller's accumulator, mapping each folded identifier to the name that claimed
-// it, so the error can name BOTH colliding steps rather than only the second.
-func validateStepIdentifier(name string, folded map[string]string) error {
+// STILL ADMITTED, and deliberately: a name that is a bare identifier but a SQL RESERVED KEYWORD.
+// An aggregate step named `order`, `group`, `table` or `select` emits
+// `ADD COLUMN IF NOT EXISTS order jsonb` — 42601, the same class as the first arm above, and
+// ClickHouse's rules agree that a non-quoted identifier may not equal a keyword. It is left open
+// because the only check that fits here is a hand-typed keyword list, which is exactly the
+// drifting duplicate the reserved-column arm was written to avoid: Postgres's reserved set is
+// version-dependent and long. The fix that actually closes the class is to QUOTE the generated
+// identifiers at every splice site, using the lower-cased name so existing folded columns still
+// match — a change worth making deliberately rather than bolting onto this one.
+//
+// claimed is the caller's accumulator, mapping each generated identifier to the step name that
+// claimed it, so the error can name BOTH colliding steps rather than only the second.
+func validateStepIdentifier(step StepConfig, claimed map[string]string) error {
+	name := step.Name
 	if !stepNameIdentifierPattern.MatchString(name) {
 		return fmt.Errorf(
 			"step name %q is not a bare SQL identifier (it must match %s): the generated DDL and "+
@@ -272,13 +288,35 @@ func validateStepIdentifier(name string, folded map[string]string) error {
 				"update names %s twice in one SET list",
 			name, key, key, key)
 	}
-	if first, ok := folded[key]; ok {
-		return fmt.Errorf(
-			"step names '%s' and '%s' are the same Postgres identifier: unquoted names fold to lower case, "+
-				"so both generate the column %s_status", first, name, key)
+	// Collision is checked over the identifiers a step GENERATES, not over its name, because two
+	// different names can generate one identifier: a step `deploy` emits `deploy_status`, and an
+	// aggregate step literally named `deploy_status` emits that same bare column. Keying on the
+	// name would admit both. This also subsumes the fold case it replaces, since `Deploy` and
+	// `deploy` generate one lower-cased `deploy_status`.
+	for _, ident := range generatedColumnsFor(step) {
+		ident = strings.ToLower(ident)
+		if first, ok := claimed[ident]; ok {
+			return fmt.Errorf(
+				"step names '%s' and '%s' both generate the routing_slips column %s: unquoted "+
+					"identifiers fold to lower case, a step emits {name}_status, and an aggregate "+
+					"step also emits a bare {name} column. ADD COLUMN IF NOT EXISTS then runs once "+
+					"and every later update names %s twice in one SET list",
+				first, name, ident, ident)
+		}
+		claimed[ident] = name
 	}
-	folded[key] = name
 	return nil
+}
+
+// generatedColumnsFor returns every routing_slips identifier a step puts into the schema, in the
+// order postgres_migrations.go's stepColumnEnsurer emits them. Keep the two in step: an identifier
+// this function does not return is one nothing validates against collision.
+func generatedColumnsFor(step StepConfig) []string {
+	cols := []string{step.Name + "_status"}
+	if step.Aggregates != "" {
+		cols = append(cols, step.Name)
+	}
+	return cols
 }
 
 // GetStep returns a step by name, or nil if not found.

@@ -611,7 +611,7 @@ func TestValidateStepIdentifier_RejectsNamesThatAreNotBareIdentifiers(t *testing
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateStepIdentifier(tc.stepName, map[string]string{})
+			err := validateStepIdentifier(StepConfig{Name: tc.stepName}, map[string]string{})
 			if tc.rejected && err == nil {
 				t.Fatalf("step name %q generates a broken identifier and must be rejected", tc.stepName)
 			}
@@ -673,7 +673,7 @@ func TestValidateStepIdentifier_RejectsNamesThatCollideWithAFixedColumn(t *testi
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateStepIdentifier(tc.stepName, map[string]string{})
+			err := validateStepIdentifier(StepConfig{Name: tc.stepName}, map[string]string{})
 			if tc.rejected && err == nil {
 				t.Fatalf("step name %q collides with a fixed routing_slips column and must be rejected",
 					tc.stepName)
@@ -738,12 +738,98 @@ func TestValidateStepIdentifier_ReservationTracksSlipSelectColumns(t *testing.T)
 			continue // config-derived, not a fixed column
 		}
 		checked++
-		if err := validateStepIdentifier(col, map[string]string{}); err == nil {
+		if err := validateStepIdentifier(StepConfig{Name: col}, map[string]string{}); err == nil {
 			t.Errorf("%q is a fixed routing_slips column that slipSelectColumns() emits, "+
 				"but it is admitted as a step name", col)
 		}
 	}
 	if checked != len(fixedSlipColumns())+1 {
 		t.Fatalf("expected every fixed column plus claimed_from to be checked; checked %d", checked)
+	}
+}
+
+// A step's generated columns, not its name, are what can collide. Two unrelated names can
+// produce one identifier: `deploy` emits `deploy_status`, and an aggregate step literally
+// named `deploy_status` emits that same bare column. Keying the collision check on the step
+// NAME admits the pair, and the failure is the silent one — ADD COLUMN IF NOT EXISTS runs
+// once, ProbeSchema reports the column present because it is, and 42701 arrives on every
+// later update. Raised as an adjacent shape while fixing PR #87's finding 1.
+func TestValidateStepIdentifier_CollidesOnGeneratedColumnsNotOnName(t *testing.T) {
+	tests := []struct {
+		name     string
+		steps    []StepConfig
+		rejected bool
+	}{
+		{
+			name: "a plain step and an aggregate named after its status column collide",
+			steps: []StepConfig{
+				{Name: "deploy"},
+				{Name: "deploy_status", Aggregates: "component"},
+			},
+			rejected: true,
+		},
+		{
+			name: "order does not matter: the aggregate first still collides",
+			steps: []StepConfig{
+				{Name: "deploy_status", Aggregates: "component"},
+				{Name: "deploy"},
+			},
+			rejected: true,
+		},
+		{
+			name: "case folding still collides, which the replaced check already caught",
+			steps: []StepConfig{
+				{Name: "Deploy"},
+				{Name: "deploy"},
+			},
+			rejected: true,
+		},
+		{
+			name: "a NON-aggregate deploy_status emits no bare column, so there is nothing to collide",
+			steps: []StepConfig{
+				{Name: "deploy"},
+				{Name: "deploy_status"},
+			},
+			rejected: false,
+		},
+		{
+			name: "unrelated aggregate and plain steps are admitted",
+			steps: []StepConfig{
+				{Name: "build", Aggregates: "component"},
+				{Name: "deploy"},
+			},
+			rejected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			claimed := map[string]string{}
+			var err error
+			for _, step := range tt.steps {
+				if err = validateStepIdentifier(step, claimed); err != nil {
+					break
+				}
+			}
+			if tt.rejected && err == nil {
+				t.Fatal("these steps generate the same routing_slips column and must be rejected")
+			}
+			if !tt.rejected && err != nil {
+				t.Fatalf("these steps generate distinct columns and must be admitted: %v", err)
+			}
+		})
+	}
+}
+
+// generatedColumnsFor must stay in step with stepColumnEnsurer: an identifier the ensurer
+// emits but this function does not return is one nothing validates against collision.
+func TestGeneratedColumnsFor_MatchesWhatTheEnsurerEmits(t *testing.T) {
+	plain := generatedColumnsFor(StepConfig{Name: "deploy"})
+	if len(plain) != 1 || plain[0] != "deploy_status" {
+		t.Fatalf("a plain step emits only its status column, got %v", plain)
+	}
+	agg := generatedColumnsFor(StepConfig{Name: "build", Aggregates: "component"})
+	if len(agg) != 2 || agg[0] != "build_status" || agg[1] != "build" {
+		t.Fatalf("an aggregate step emits its status column and a bare jsonb column, got %v", agg)
 	}
 }
