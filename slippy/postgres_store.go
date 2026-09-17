@@ -246,6 +246,23 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 
 // LoadLiveByCommit returns the live slip for (repository, commitSHA),
 // excluding terminal-superseded statuses (abandoned, promoted, compensated).
+//
+// PRECONDITION BEFORE REMOVING THE abandoned/promoted/compensated FILTER (DEVOPS-231).
+// Making terminal rows visible to the same-commit lookup is DEVOPS-231's stated goal, so this
+// filter is expected to go. Do not remove it without reading this first.
+//
+// As of 2026-09-17 pushhookparser arms SLIPPY_STRANDED_CLEANUP by default (DEVOPS-342), so
+// `abandoned` is now written routinely by force-push and branch-delete rather than never. If
+// this filter is removed while that is armed, an abandoned row becomes visible to the
+// same-commit lookup, the empty-run guard sees ended-and-not-failed, and the caller SUPPRESSES
+// the unit tests for that commit. That is a CI-gate weakening reachable by anyone who can
+// force-push a branch, and neither repository's tests would catch it because the two halves
+// live in different modules with different reviewers.
+//
+// So: before removing this filter, either extend pushhookparser's abandon-gate exclusion beyond
+// `failed` (see AbandonStrandedSlip in pushhookparser/pkg/slippy/stranded.go, which excludes
+// `failed` for exactly this reason), or disarm SLIPPY_STRANDED_CLEANUP first. Whichever of the
+// two changes lands second silently changes the other.
 func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	// Ordered live-first then updated_at DESC for the same reason as LoadByCommit, and the
 	// status filter is not a substitute for it: the filter excludes abandoned/promoted/
