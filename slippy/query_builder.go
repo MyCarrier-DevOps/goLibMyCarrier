@@ -62,7 +62,7 @@ func (b *SlipQueryBuilder) BuildSelectColumns() []string {
 	// Add aggregate JSON columns (column name is the step name, e.g., "builds")
 	for _, step := range b.config.Steps {
 		if step.Aggregates != "" {
-			columns = append(columns, step.Name)
+			columns = append(columns, b.AggregateColumn(step.Name))
 		}
 	}
 
@@ -87,15 +87,16 @@ func (b *SlipQueryBuilder) BuildInsertQuery(columns, placeholders []string) stri
 	`, b.database, strings.Join(columns, ", "), strings.Join(placeholders, ", "))
 }
 
-// StepStatusColumn returns the column name for a step's status.
+// StepStatusColumn returns the column name for a step's status. It is the package convention
+// (stepStatusColumn, columns.go) reached through the builder, not a second copy of it.
 func (b *SlipQueryBuilder) StepStatusColumn(stepName string) string {
-	return fmt.Sprintf("%s_status", stepName)
+	return stepStatusColumn(stepName)
 }
 
 // AggregateColumn returns the JSON column name for a step with component-level data.
 // The column name is just the step name (e.g., "builds" for the builds step).
 func (b *SlipQueryBuilder) AggregateColumn(stepName string) string {
-	return stepName
+	return aggregateColumn(stepName)
 }
 
 // BuildFindByCommitsQuery builds a query to find a slip by a list of commits.

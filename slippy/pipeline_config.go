@@ -312,9 +312,9 @@ func validateStepIdentifier(step StepConfig, claimed map[string]string) error {
 // order postgres_migrations.go's stepColumnEnsurer emits them. Keep the two in step: an identifier
 // this function does not return is one nothing validates against collision.
 func generatedColumnsFor(step StepConfig) []string {
-	cols := []string{step.Name + "_status"}
+	cols := []string{stepStatusColumn(step.Name)}
 	if step.Aggregates != "" {
-		cols = append(cols, step.Name)
+		cols = append(cols, aggregateColumn(step.Name))
 	}
 	return cols
 }

@@ -466,7 +466,7 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 // stepColumnEnsurer builds the idempotent ALTER TABLE for a step's columns: always a
 // {step}_status column, plus a {step} jsonb column when the step aggregates components.
 func (m *PostgresDynamicMigrationManager) stepColumnEnsurer(step StepConfig) postgresmigrator.SchemaEnsurer {
-	statusColumn := fmt.Sprintf("%s_status", step.Name)
+	statusColumn := stepStatusColumn(step.Name)
 
 	var sql strings.Builder
 	fmt.Fprintf(&sql,
@@ -475,11 +475,11 @@ func (m *PostgresDynamicMigrationManager) stepColumnEnsurer(step StepConfig) pos
 
 	description := fmt.Sprintf("Ensures %s column exists for step '%s'", statusColumn, step.Name)
 	if step.Aggregates != "" {
-		// Aggregate column name is the step name (e.g. "builds").
+		aggColumn := aggregateColumn(step.Name)
 		fmt.Fprintf(&sql,
 			",\n\tADD COLUMN IF NOT EXISTS %s jsonb NOT NULL DEFAULT '{\"items\":[]}'",
-			step.Name)
-		description += fmt.Sprintf(" and %s jsonb column for component data", step.Name)
+			aggColumn)
+		description += fmt.Sprintf(" and %s jsonb column for component data", aggColumn)
 	}
 
 	return postgresmigrator.SchemaEnsurer{
@@ -519,9 +519,9 @@ func (m *PostgresDynamicMigrationManager) indexEnsurer() postgresmigrator.Schema
 	// for steps that exist in the config (the columns are created by their step ensurers).
 	for _, stepName := range []string{"dev_deploy", "preprod_deploy", "prod_deploy"} {
 		if m.config.GetStep(stepName) != nil {
+			col := stepStatusColumn(stepName)
 			fmt.Fprintf(&sql,
-				"CREATE INDEX IF NOT EXISTS idx_%s_status ON routing_slips (%s_status);\n",
-				stepName, stepName)
+				"CREATE INDEX IF NOT EXISTS idx_%s ON routing_slips (%s);\n", col, col)
 		}
 	}
 

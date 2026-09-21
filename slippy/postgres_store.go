@@ -342,11 +342,11 @@ func mapCreateError(correlationID string, err error) error {
 func (s *PostgresStore) slipColumns() []string {
 	cols := fixedSlipColumns()
 	for _, step := range s.config.Steps {
-		cols = append(cols, step.Name+"_status")
+		cols = append(cols, stepStatusColumn(step.Name))
 	}
 	for _, step := range s.config.Steps {
 		if step.Aggregates != "" {
-			cols = append(cols, step.Name)
+			cols = append(cols, aggregateColumn(step.Name))
 		}
 	}
 	return cols
@@ -479,7 +479,7 @@ func decodeAggregates(cols []string, raw [][]byte) map[string][]ComponentStepDat
 func (s *PostgresStore) claimStateColumns() (cols, aggregateCols []string) {
 	cols = []string{ColumnClaimedFrom, ColumnStatus}
 	for _, step := range s.config.Steps {
-		cols = append(cols, step.Name+"_status")
+		cols = append(cols, stepStatusColumn(step.Name))
 	}
 	aggregateCols = s.aggregateColumns()
 	return append(cols, aggregateCols...), aggregateCols

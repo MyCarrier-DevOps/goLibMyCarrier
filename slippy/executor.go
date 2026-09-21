@@ -420,9 +420,8 @@ func buildStepOverridesFromSlip(slip *Slip, stepNames []string) []stepStatusOver
 		if !ok {
 			continue
 		}
-		// Column name convention: <step_name>_status (matches QueryBuilder.StepStatusColumn).
 		overrides = append(overrides, stepStatusOverride{
-			columnName: name + "_status",
+			columnName: stepStatusColumn(name),
 			status:     step.Status,
 		})
 	}

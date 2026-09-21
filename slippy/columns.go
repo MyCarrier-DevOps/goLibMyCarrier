@@ -58,3 +58,31 @@ func fixedSlipColumns() []string {
 		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory,
 	}
 }
+
+// stepStatusColumn returns the column that carries one step's status: the step's name with a
+// `_status` suffix. Together with aggregateColumn below it is the WHOLE of what a configured
+// step puts into the schema (generatedColumnsFor), and both stores follow the same convention.
+//
+// It exists because that convention was spelled out at seven sites, each asking the reader to
+// keep it in step with the others (PR #87, jhicks review): slipColumns and claimStateColumns
+// (postgres_store.go), generatedColumnsFor (pipeline_config.go), stepColumnEnsurer and
+// indexEnsurer (postgres_migrations.go), updateStepTx (postgres_store_updates.go),
+// buildStepOverridesFromSlip (executor.go) and SlipQueryBuilder.StepStatusColumn
+// (query_builder.go). Drift between any two of them is exactly what generatedColumnsFor's
+// collision validator was added to catch, and a validator that can be outvoted by a copy is
+// weaker than one convention with one definition.
+//
+// It does NOT validate or quote. A step name reaches a SQL identifier either from a config
+// that passed validateStepIdentifier or through an explicit bare-identifier check at the one
+// site that splices caller-supplied input (updateStepTx); both remain each caller's business.
+func stepStatusColumn(stepName string) string {
+	return stepName + "_status"
+}
+
+// aggregateColumn returns the column that carries an aggregate step's component rollup, which
+// is the step's BARE name (e.g. "builds"). Stated as a function beside stepStatusColumn rather
+// than left implicit at each call site because the bare name is the reason fixedSlipColumns is
+// the reserved-name set: a step named after a fixed column names a column that already exists.
+func aggregateColumn(stepName string) string {
+	return stepName
+}

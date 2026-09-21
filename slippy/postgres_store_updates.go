@@ -279,7 +279,7 @@ func (s *PostgresStore) updateStepTx(
 			// unsafe step name skips this column write; its slip_component_states event was
 			// already recorded above, matching ClickHouse (which materializes only
 			// config-known columns rather than erroring on unknown steps).
-			col := stepName + "_status"
+			col := stepStatusColumn(stepName)
 			upd := fmt.Sprintf("UPDATE routing_slips SET %s = $1, updated_at = now() WHERE correlation_id = $2", col)
 			if _, err := tx.Exec(ctx, upd, string(status), correlationID); err != nil {
 				return fmt.Errorf("failed to update step %s: %w", stepName, err)
