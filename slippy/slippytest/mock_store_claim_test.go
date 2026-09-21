@@ -59,7 +59,15 @@ func TestMockStore_Update_ClaimSemantics(t *testing.T) {
 
 // PostgresStore.Create is an ON CONFLICT DO UPDATE whose SET list excludes claimed_from, so a
 // redelivered Create for an existing correlation ID resets the row but keeps the claim.
-func TestMockStore_Create_KeepsAnExistingClaim(t *testing.T) {
+//
+// A FRESH INSERT CANNOT CARRY A CLAIM EITHER, and that is the half this double used to get
+// wrong (PR #87, jhicks review). buildCreateQuery derives its INSERT column list from
+// slipColumns(), which excludes claimed_from entirely rather than only excluding it from the
+// ON CONFLICT SET list, so a first insert always leaves the column NULL whatever the caller's
+// Slip carried. A double that stored the caller's value instead made a consumer test of
+// "Repave refuses a claimed row" pass against a row Postgres would have left unclaimed and
+// repaved - green here, the opposite outcome there.
+func TestMockStore_Create_KeepsAnExistingClaimAndNeverTakesOneFromTheCaller(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
 	require.NoError(t, store.Create(ctx, &slippy.Slip{CorrelationID: "c", Status: slippy.SlipStatusFailed}))
@@ -72,7 +80,27 @@ func TestMockStore_Create_KeepsAnExistingClaim(t *testing.T) {
 	assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom, "the claim survived, as in Postgres")
 	require.NoError(t, store.Create(ctx, &slippy.Slip{CorrelationID: "fresh", Status: slippy.SlipStatusFailed, ClaimedFrom: slippy.SlipStatusFailed}))
 	fresh, _ := store.Load(ctx, "fresh")
-	assert.Equal(t, slippy.SlipStatusFailed, fresh.ClaimedFrom, "a new row takes what it is given")
+	assert.Empty(t, fresh.ClaimedFrom, "a fresh insert never records a claim: claimed_from is not an INSERT column")
+	require.ErrorIs(t, func() error { _, e := store.ReleaseClaim(ctx, "fresh", "cli", ""); return e }(),
+		slippy.ErrNotClaimed, "and the row really is unclaimed, not merely reported so")
+}
+
+// Repave's successor goes through the same slipColumns() insert (PostgresStore.createTx), so
+// the replacement row is always unclaimed too, whatever ClaimedFrom the caller's newSlip
+// carried. Same defect, same consequence: a consumer asserting ErrSlipWentLive on the
+// successor would pass here and repave against Postgres (PR #87, jhicks review).
+func TestMockStore_Repave_SuccessorIsNeverClaimed(t *testing.T) {
+	ctx := context.Background()
+	store := NewMockStore()
+	store.AddSlip(&slippy.Slip{CorrelationID: "old", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: slippy.SlipStatusFailed})
+	successor := repaveSuccessorSlip("new", "o/r", "main", "s")
+	successor.ClaimedFrom = slippy.SlipStatusFailed
+	require.NoError(t, store.Repave(ctx, "old", successor, nil))
+	got, err := store.Load(ctx, "new")
+	require.NoError(t, err)
+	assert.Empty(t, got.ClaimedFrom, "the successor is inserted unclaimed, as in Postgres")
+	require.ErrorIs(t, func() error { _, e := store.ReleaseClaim(ctx, "new", "cli", ""); return e }(),
+		slippy.ErrNotClaimed)
 }
 
 // The claim is a flag: it never writes status, and it lives until released with nothing in

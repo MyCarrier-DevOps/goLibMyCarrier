@@ -299,10 +299,22 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 		return err
 	}
 
-	// Deep copy the slip to avoid mutations. An existing row keeps its claim: PostgresStore's
-	// Create is an ON CONFLICT DO UPDATE whose SET list is slipColumns(), which excludes the
-	// SELECT-only claimed_from, so a redelivered Create resets the row but not the claim.
+	// Deep copy the slip to avoid mutations, and let the STORE own claimed_from on both arms
+	// of the upsert — a Create never takes a claim from its caller, on either.
+	//
+	// An existing row keeps the claim it already had: PostgresStore's Create is an ON CONFLICT
+	// DO UPDATE whose SET list is slipColumns(), which excludes the SELECT-only claimed_from,
+	// so a redelivered Create resets the row but not the claim.
+	//
+	// A FRESH INSERT IS ALWAYS UNCLAIMED, which is the half this double used to get wrong (PR
+	// #87, jhicks review): claimed_from is absent from the INSERT column list too, not merely
+	// from the conflict arm's SET list — buildCreateQuery builds both from slipColumns() —
+	// so the column is NULL on a first insert whatever the caller's Slip carried. Storing the
+	// caller's value here made a consumer test that Creates a claimed Slip and then asserts
+	// ErrSlipWentLive on Repave pass against a row Postgres would have left unclaimed and
+	// repaved: green on the double, the opposite outcome in production.
 	slipCopy := DeepCopySlip(slip)
+	slipCopy.ClaimedFrom = ""
 	if existing, ok := m.Slips[slip.CorrelationID]; ok {
 		slipCopy.ClaimedFrom = existing.ClaimedFrom
 	}
@@ -381,7 +393,13 @@ func (m *MockStore) Repave(
 
 	// A missing superseded row is not an error, matching PostgresStore: the successor is
 	// still created, so a redelivery converges rather than failing forever.
+	//
+	// The successor is inserted UNCLAIMED whatever newSlip carries, for the same reason Create
+	// discards a caller-supplied claim above: PostgresStore.Repave inserts through createTx ->
+	// buildCreateQuery -> slipColumns(), which has no claimed_from column, so the replacement
+	// row's claimed_from is NULL in Postgres (PR #87, jhicks review).
 	stored := DeepCopySlip(newSlip)
+	stored.ClaimedFrom = ""
 	if removedOld {
 		// Mirrors the state-history entry PostgresStore.Repave appends to the successor so
 		// the replacement is visible on the row afterwards — without it the successor carries

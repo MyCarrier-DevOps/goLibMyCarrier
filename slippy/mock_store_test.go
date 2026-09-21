@@ -386,10 +386,14 @@ func (m *MockStore) Create(ctx context.Context, slip *Slip) error {
 		return err
 	}
 
-	// Deep copy the slip to avoid mutations. An existing row keeps its claim: PostgresStore's
-	// Create is an ON CONFLICT DO UPDATE whose SET list is slipColumns(), which excludes the
-	// SELECT-only claimed_from, so a redelivered Create resets the row but not the claim.
+	// Deep copy the slip to avoid mutations, and let the STORE own claimed_from on both arms
+	// of the upsert, exactly as slippytest.MockStore.Create does (PR #87, jhicks review).
+	// An existing row keeps the claim it had: PostgresStore's Create is an ON CONFLICT DO
+	// UPDATE whose SET list is slipColumns(), which excludes the SELECT-only claimed_from. A
+	// fresh insert is always unclaimed: claimed_from is absent from the INSERT column list
+	// too, so the column is NULL on a first insert whatever the caller's Slip carried.
 	slipCopy := deepCopySlip(slip)
+	slipCopy.ClaimedFrom = ""
 	if existing, ok := m.Slips[slip.CorrelationID]; ok {
 		slipCopy.ClaimedFrom = existing.ClaimedFrom
 	}
@@ -462,8 +466,11 @@ func (m *MockStore) Repave(
 	}
 
 	// A missing superseded row is not an error: the successor is still created, so a
-	// redelivery converges rather than failing forever.
+	// redelivery converges rather than failing forever. The successor is inserted UNCLAIMED
+	// whatever newSlip carries, because PostgresStore.Repave inserts through the same
+	// slipColumns() create (PR #87, jhicks review).
 	stored := deepCopySlip(newSlip)
+	stored.ClaimedFrom = ""
 	if removedOld {
 		// Mirrors the predecessor marker PostgresStore.Repave appends to the successor, gated
 		// on removedOld the same way so a repave that replaced nothing records nothing.
