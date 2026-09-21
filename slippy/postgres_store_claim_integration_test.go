@@ -186,6 +186,32 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		assert.Equal(t, 1, countMarkers(t, store, "c-live-explicit", ClaimMarkerStep))
 	})
 
+	// Finding j-claim (PR #87, jhicks round): the in-flight refusal guards ADOPTION, so a row
+	// that is ALREADY claimed takes the idempotent repeat in front of it even for a nil
+	// expected. This is the reported shape at the level it was reported on — pre-job 1 claims
+	// with no if_status, its StartStep puts the run in flight, and pre-job 2 of the SAME run
+	// repeats with no if_status and must get the documented no-op rather than
+	// ErrClaimPreconditionFailed on a slip its own run holds.
+	t.Run("a nil expected repeats a claim the caller's own run already holds", func(t *testing.T) {
+		claimTestSlip(t, store, "c-repeat-live", "sha-repeat-live", SlipStatusPending)
+		first, err := store.ClaimSlip(ctx, "c-repeat-live", nil, "slippy-cli/prejob", "test")
+		require.NoError(t, err)
+		require.True(t, first.Claimed)
+		require.False(t, first.InFlight, "nothing has been reported yet")
+		require.NoError(t, store.UpdateStep(ctx, "c-repeat-live", "unit_tests", "", StepStatusRunning))
+
+		second, err := store.ClaimSlip(ctx, "c-repeat-live", nil, "slippy-cli/prejob", "test")
+		require.NoError(t, err, "an already-claimed row has nothing left to adopt")
+		assert.False(t, second.Claimed, "nothing written")
+		assert.Equal(t, SlipStatusPending, second.Prior, "the RECORDED prior, not the current status")
+		assert.True(t, second.InFlight, "and the evidence a caller branches on to not dispatch twice")
+		got, err := store.Load(ctx, "c-repeat-live")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusPending, got.Status, "status untouched")
+		assert.Equal(t, SlipStatusPending, got.ClaimedFrom, "the claim did not move")
+		assert.Equal(t, 1, countMarkers(t, store, "c-repeat-live", ClaimMarkerStep), "still exactly one marker")
+	})
+
 	// THE BLOCKING CASE, against the real store (PR #87 seventh review). A rerun claims a
 	// failed slip and dispatches; the run's pre-job writes a step `running`, which is NOT
 	// terminal, so nothing reconciles the slip and it still reads `failed`. A second rerun

@@ -191,10 +191,30 @@ type ClaimOutcome struct {
 //   - A non-empty expected that does not contain the current status is refused, claimed or
 //     not. This is the compare-and-set.
 //
+//   - Then a held claim is the idempotent no-op: prior is the RECORDED claimed_from and
+//     nothing is written, so a repeat cannot inflate the audit trail.
+//
+//     IT SITS AHEAD OF THE IN-FLIGHT REFUSAL BELOW, and that order is the fix for finding
+//     j-claim (PR #87, jhicks round). The refusal exists to stop a caller ADOPTING a run it
+//     does not hold — and adopting is the WRITE, which only the last arm reaches. On an
+//     already-claimed row there is nothing left to adopt: the claim stays exactly where it
+//     was, nothing is written either way, and the only thing the ordering decides is whether
+//     the caller is handed the recorded prior or ErrClaimPreconditionFailed. With the refusal
+//     in front, `all but the first pre-job of a run takes the idempotent repeat` — the
+//     idempotency SlipStore.ClaimSlip documents — was false for every caller sending a nil
+//     expected, because pre-job 1's StartStep makes the run in-flight and
+//     slices.Contains(nil, status) is always false. It is true of the code now.
+//
+//     Protection is not weakened by the move, because the only arm that records a claim is
+//     the last one and it is still BEHIND the refusal: a fresh claim onto a run that is
+//     executing still requires the caller to name that run's status in expected. What the
+//     repeat arm hands back instead of an error is strictly more information — the recorded
+//     prior, plus ClaimOutcome.InFlight read off the same locked row — and InFlight, not the
+//     error, is what a caller that must not double-dispatch branches on (see ClaimOutcome).
+//
 //   - A run IN FLIGHT — a step or component running or held — that expected did not name is
-//     refused, so a nil expected cannot adopt a run that is executing. The refusal does NOT
-//     depend on the row being unclaimed, so a run already carrying a claim is protected by it
-//     too.
+//     refused, so a nil expected cannot record a claim on a run that is executing. Reached
+//     only for an UNCLAIMED row, per the arm above.
 //
 //     THIS ARM USED TO READ `status.IsLive() && status != SlipStatusPending`, and that was
 //     wrong in both directions (finding j3, PR #87 seventh review). `pending` was carved out
@@ -221,8 +241,8 @@ type ClaimOutcome struct {
 //     own terms if the compare-and-set above is ever moved, narrowed or reordered — which is
 //     how the arms of this decision drifted apart in the first place.
 //
-//   - Only then, a held claim is the idempotent no-op: prior is the RECORDED claimed_from and
-//     nothing is written, so a repeat cannot inflate the audit trail.
+//   - Only then, an unclaimed row whose current status the caller agreed to is claimed:
+//     prior is that status, and the store records it.
 //
 // THE TWO WORKED CASES the rule exists for, both of them the rerunner retrying a claim whose
 // response it lost, with expected = the ended set:
@@ -262,13 +282,13 @@ func DecideClaim(
 	if len(expected) > 0 && !slices.Contains(expected, status) {
 		return "", false, fmt.Errorf("status %s not in %v: %w", status, expected, ErrClaimPreconditionFailed)
 	}
+	if claimedFrom != "" {
+		return claimedFrom, false, nil
+	}
 	if inFlight && !slices.Contains(expected, status) {
 		return "", false, fmt.Errorf(
 			"a step or component is in flight at status %s; name %s in expected to adopt a run: %w",
 			status, status, ErrClaimPreconditionFailed)
-	}
-	if claimedFrom != "" {
-		return claimedFrom, false, nil
 	}
 	return status, true, nil
 }
@@ -316,11 +336,12 @@ func DecideRelease(slip *Slip) (release bool, err error) {
 // deduplicates onto it instead of repaving it (DEVOPS-285, DEVOPS-367). The claim is a flag:
 // it never changes the slip's status, and it lives until the run is over — released by a
 // post-job once nothing is in flight, or ended by a terminal status write. expected is a
-// compare-and-set on the CURRENT status whether or not a claim is already held; nil admits
-// any status EXCEPT one whose run has a step or component in flight, which a caller that means
-// to adopt a running run names in expected. Once that compare-and-set agrees, a claim already
-// held is an idempotent no-op: ClaimOutcome{Claimed: false} carrying the RECORDED prior, with
-// nothing written. Every non-error outcome means the slip is claimed on return; a caller that
+// compare-and-set on the CURRENT status whether or not a claim is already held; on an
+// UNCLAIMED row nil admits any status EXCEPT one whose run has a step or component in flight,
+// which a caller that means to adopt a running run names in expected. Once that
+// compare-and-set agrees, a claim already held is an idempotent no-op: ClaimOutcome{Claimed:
+// false} carrying the RECORDED prior, with nothing written — including while that claim's own
+// run is executing, which is the arm every pre-job after the first takes. Every non-error outcome means the slip is claimed on return; a caller that
 // must not dispatch onto work already running reads ClaimOutcome.InFlight, not Claimed. See
 // SlipStore.ClaimSlip.
 func (c *Client) ClaimSlip(

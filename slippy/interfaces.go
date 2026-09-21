@@ -189,13 +189,22 @@ type SlipStore interface {
 	// account is on CreateSlipForPush's claimed arm in push.go.
 	//
 	// expected is the set of statuses the caller agreed to claim out of, and it is ALWAYS a
-	// compare-and-set on the CURRENT status — whether or not a claim is already held. nil
-	// admits any status EXCEPT one whose run has a step or component IN FLIGHT (running or
-	// held): a run that is executing is never adopted by a caller that did not name its
-	// status, and a claim already recorded on the row is no exemption from that. A caller that
-	// means to adopt a running run says so by listing the status (the Slippy CLI pre-job lists
-	// every non-terminal status; the rerunner, which names only the ended set, is what the
-	// refusal protects). The decision is DecideClaim, shared with the test doubles.
+	// compare-and-set on the CURRENT status — whether or not a claim is already held. On an
+	// UNCLAIMED row, nil admits any status EXCEPT one whose run has a step or component IN
+	// FLIGHT (running or held): a run that is executing is never ADOPTED by a caller that did
+	// not name its status. A caller that means to adopt a running run says so by listing the
+	// status (the Slippy CLI pre-job lists every non-terminal status; the rerunner, which
+	// names only the ended set, is what the refusal protects). The decision is DecideClaim,
+	// shared with the test doubles.
+	//
+	// THAT REFUSAL DOES NOT APPLY TO A ROW THAT IS ALREADY CLAIMED, and the qualifier is the
+	// fix for finding j-claim (PR #87, jhicks round). Adoption is the WRITE; on a claimed row
+	// there is nothing to adopt, the claim stays where it is, and nothing is written on either
+	// ordering — so refusing there bought no protection and made the idempotency promised
+	// below false for every caller sending a nil expected: pre-job 1's StartStep puts the run
+	// in flight, and a nil expected names nothing, so pre-job 2 of the SAME run got
+	// ErrClaimPreconditionFailed on a slip its own run held. The repeat arm now sits ahead of
+	// the refusal; the arm that RECORDS a claim still sits behind it.
 	//
 	// That refusal reads the step and aggregate columns, NOT the status name, and the change
 	// is visible in both directions (finding j3): a `pending` slip with a step running is
@@ -260,14 +269,17 @@ type SlipStore interface {
 	//   - Claimed=false, nil error: the slip was already claimed and NOTHING was written;
 	//     Prior is the recorded claimed_from. Repeat claims are idempotent — no second marker
 	//     — so a retried request cannot inflate the audit trail, and all but the first pre-job
-	//     of a run take this arm. Both arms mean the slip is claimed on return.
+	//     of a run take this arm. That holds for EVERY expected, nil included, and while the
+	//     claim's own run is executing; it is the one statement finding j-claim showed the
+	//     code did not keep. Both arms mean the slip is claimed on return.
 	//   - InFlight, on both of those arms: whether a step or component was running or held at
 	//     decision time, read from the SAME locked row as the status and the claim, so it
 	//     cannot disagree with what the decision was made on. A caller that must not dispatch
 	//     onto work already running reads this, not Claimed.
 	//   - ErrClaimPreconditionFailed: the CURRENT status was outside expected (claimed or
 	//     not), the slip has no status at all (an empty status cannot be recorded as a claim),
-	//     or the run had work in flight and expected did not name its status. Nothing written.
+	//     or the row was UNCLAIMED with work in flight and expected did not name its status.
+	//     Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
 	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
 	ClaimSlip(

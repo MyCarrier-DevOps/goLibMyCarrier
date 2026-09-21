@@ -63,9 +63,15 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		got, _ := store.Load(ctx, "c")
 		assert.Equal(t, SlipStatusFailed, got.Status)
 		require.NoError(t, store.UpdateSlipStatus(ctx, "c", SlipStatusInProgress))
-		_, err = store.ClaimSlip(ctx, "c", nil, "second", "")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed,
-			"a claimed row is still a run in flight that nothing named")
+		// Inverted again for finding j-claim (PR #87, jhicks round): the in-flight refusal
+		// guards ADOPTION, and this row is already claimed, so a nil expected reaches the
+		// idempotent repeat rather than ErrClaimPreconditionFailed. The compare-and-set above
+		// it is unaffected, which the `third` and `fifth` claims below still pin.
+		out, err = store.ClaimSlip(ctx, "c", nil, "second", "")
+		require.NoError(t, err, "a claimed row has nothing left to adopt, so the repeat arm answers")
+		assert.False(t, out.Claimed, "nothing written")
+		assert.Equal(t, SlipStatusFailed, out.Prior, "the recorded prior, not the current status")
+		assert.True(t, out.InFlight, "and the caller is told the claim's run is executing")
 		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "the rerunner's retry after its dispatch started is refused")
 		out, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusInProgress}, "fourth", "")

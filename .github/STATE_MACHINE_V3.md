@@ -365,15 +365,25 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     with nothing written), appends the `slip_claimed` marker and sets `claimed_from` to the
     status the row had — as an audit record, not as something to restore. That
     compare-and-set is on the CURRENT status **whether or not a claim is already held**, and
-    the idempotent repeat sits behind it rather than in front of it. `nil` admits any status
-    EXCEPT one whose run has a step or component **in flight** (running or held), and a
-    recorded claim is no exemption from that refusal: a caller that means to adopt a running
-    run names the status in `if_status` (the Slippy CLI pre-job names every non-terminal
-    status; the rerunner, which names only the ended set, is what the refusal protects). A
-    slip with no status at all is refused. Once `if_status` agrees, a claim already held is an
-    idempotent no-op — `ClaimOutcome{Claimed: false}` carrying the recorded prior, no second
-    marker, nothing written — so a caller can tell its own repeat from an existing claim
-    without weakening the comparison.
+    the idempotent repeat sits behind it rather than in front of it. On an **unclaimed** row
+    `nil` admits any status EXCEPT one whose run has a step or component **in flight**
+    (running or held): a caller that means to adopt a running run names the status in
+    `if_status` (the Slippy CLI pre-job names every non-terminal status; the rerunner, which
+    names only the ended set, is what the refusal protects). A slip with no status at all is
+    refused. Once `if_status` agrees, a claim already held is an idempotent no-op —
+    `ClaimOutcome{Claimed: false}` carrying the recorded prior, no second marker, nothing
+    written — so a caller can tell its own repeat from an existing claim without weakening the
+    comparison.
+
+    **The in-flight refusal does not apply to a row that is already claimed** (PR #87, jhicks
+    round, finding j-claim), so the arm order is: empty status → compare-and-set → held claim
+    → in-flight refusal → fresh claim. The refusal guards *adoption*, and adoption is the
+    write: on a claimed row the claim stays where it is and nothing is written on either
+    ordering, so refusing there protected nothing and made the documented idempotency false
+    for every caller sending a `nil` `if_status` — pre-job 1's `StartStep` puts the run in
+    flight, a `nil` `if_status` names nothing, and pre-job 2 of the **same** run was refused on
+    a slip its own run held. The arm that RECORDS a claim still sits behind the refusal, so a
+    `nil` `if_status` still cannot claim a run that is executing.
 
     That refusal reads the **step and aggregate columns, not the status name** (PR #87 seventh
     review, finding j3). It used to read `IsLive() && status != pending`, which was wrong in

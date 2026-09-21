@@ -40,9 +40,19 @@ idempotent repeat every pre-job after the first takes — and `Prior` is then th
 `claimed_from` rather than the current status. Every non-error outcome means the slip is
 claimed on return.
 `expected` is a **compare-and-set on the slip's CURRENT status, whether or not a claim is
-already held** — the idempotent repeat sits BEHIND that check, not in front of it. A nil
-`expected` admits any status except one whose run has a step or component **in flight**, and a
-claim already recorded on the row is no exemption from that refusal.
+already held** — the idempotent repeat sits BEHIND that check, not in front of it. On an
+**unclaimed** row a nil `expected` admits any status except one whose run has a step or
+component **in flight**; a caller that means to adopt a running run names its status.
+
+**That in-flight refusal does NOT apply to a row that is already claimed** (PR #87, jhicks
+round, finding j-claim). It guards *adoption*, and adoption is the write: on a claimed row the
+claim stays where it is and nothing is written on either ordering, so refusing there bought no
+protection while making the idempotency above false for every caller sending a nil `expected` —
+pre-job 1's `StartStep` puts the run in flight, a nil `expected` names nothing, so pre-job 2 of
+the **same** run got `ErrClaimPreconditionFailed` on a slip its own run held. The arm order in
+`DecideClaim` is now: empty status → compare-and-set → held claim (idempotent repeat) →
+in-flight refusal → fresh claim. The arm that RECORDS a claim is still behind the refusal, so a
+nil `expected` still cannot claim a run that is executing.
 
 **`InFlight` is new in the seventh review of PR #87, and it is the field a rerun caller must
 branch on.** `if_status` is NOT the double-dispatch guard, which an earlier round's comments
