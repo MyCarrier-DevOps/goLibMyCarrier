@@ -95,7 +95,12 @@ other claimed row instead (finding p1). And because the upsert replaces `state_h
 every reader depends on: **`claimed_from` and `slip_claimed` are both present or both absent** —
 pushhookparser derives "who claimed this" from the markers and gates its stranded-cleanup
 exemption on it, so a row that carried one without the other would read claimed to slippy and
-unclaimed to the parser (finding p2).
+unclaimed to the parser (finding p2). The re-appended marker names the **original claimant**,
+read off the prior row's own history by the same backwards scan that parser makes, because
+`ClaimedBy` there IS the marker's actor: writing the library's actor restored the exemption
+while renaming the adopter to `slippy-library` for every marker-based reader (PR #87, jhicks
+review). `slippy-library` is left as the fallback for the one row that has no claimant to
+name — `claimed_from` set with no marker, the timing hole below.
 
 **The qualifier is load-bearing: that guarantee is not absolute, and closing it is deferred.**
 The push reads its claim evidence from an **unlocked** `LoadByCommit` (`PostgresStore.queryOne`

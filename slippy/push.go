@@ -767,7 +767,9 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// reports against a terminal slip. It falls through to persistSlipForPush's
 		// self-referential arm, which upserts the row live again; Create's SET list excludes
 		// claimed_from, so that reset keeps the claim, and the reset carries the slip_claimed
-		// marker forward so the column and the marker cannot disagree (appendResetMarkers).
+		// marker forward — with the ORIGINAL claimant's actor, read off the prior row's own
+		// history — so neither the column nor the claimant's identity is lost
+		// (appendResetMarkers).
 		//
 		// THE CARVE-OUT IS ITSELF CARVED OUT WHEN THE RUN IS IN FLIGHT (finding p1). "No other
 		// run's work to protect" holds only while nothing is executing. Create's ON CONFLICT
@@ -1060,7 +1062,7 @@ func (c *Client) persistSlipForPush(
 				"commit":         shortSHA(opts.CommitSHA),
 				"prior_status":   string(existingSlip.Status),
 			})
-		appendResetMarkers(slip, existingSlip.Status, existingSlip.ClaimedFrom, opts.CommitSHA)
+		appendResetMarkers(slip, existingSlip, opts.CommitSHA)
 		return c.createFreshSlip(ctx, opts, slip, parent, result)
 	}
 
@@ -1089,23 +1091,43 @@ func (c *Client) persistSlipForPush(
 // or both absent. The marker's prior is the RECORDED claimed_from, not the row's status, because
 // that is what the column holds and what a later reader compares against.
 //
+// AND IT CARRIES THE CLAIMANT, NOT JUST THE CLAIM (PR #87, jhicks review). The reader this
+// marker exists for derives ClaimedBy from the marker's ACTOR, so re-appending with the
+// library's own actor restored the row's exemption while renaming its adopter to
+// LibraryActor for pushhookparser and for every audit query on who adopted the slip. The
+// actor therefore comes from prior's own history, by the same backwards scan that reader
+// makes (claimantFromHistory) — so identity survives the reset, not only presence.
+//
+// LibraryActor remains the FALLBACK, and it is honest rather than a placeholder: a prior row
+// with claimed_from set and no claim marker in its history is the timing hole documented on
+// CreateSlipForPush's claimed arm (a row claimed during the unlocked window between this
+// push's read and its write), and there is no claimant recorded anywhere to name. The
+// invariant needs the marker's PRESENCE, and the library really is what wrote it.
+//
 // Both in-place reset arms call it — persistSlipForPush's and the duplicate-create backstop's —
 // because this file asserts in two places that those paths converge on the same outcome for the
 // same inputs, and a marker written by only one of them is a divergence on the very observable
-// that exists to make the state legible.
-func appendResetMarkers(slip *Slip, priorStatus, claimedFrom SlipStatus, commitSHA string) {
+// that exists to make the state legible. prior is the ROW BEING RESET: its status, its
+// claimed_from and its history are three facts about one row, and taking the row rather than
+// three arguments is what stops a caller pairing one of them with another row's.
+func appendResetMarkers(slip, prior *Slip, commitSHA string) {
 	slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
 		Step:      PushParsedStep,
 		Status:    StepStatusRunning,
 		Timestamp: time.Now(),
 		Actor:     LibraryActor,
 		Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
-			priorStatus, shortSHA(commitSHA)),
+			prior.Status, shortSHA(commitSHA)),
 	})
-	if claimedFrom != "" {
-		slip.StateHistory = append(slip.StateHistory,
-			ClaimMarker(claimedFrom, LibraryActor, "carried forward across an in-delivery retry reset"))
+	if prior.ClaimedFrom == "" {
+		return
 	}
+	claimedBy := claimantFromHistory(prior.StateHistory)
+	if claimedBy == "" {
+		claimedBy = LibraryActor
+	}
+	slip.StateHistory = append(slip.StateHistory,
+		ClaimMarker(prior.ClaimedFrom, claimedBy, "carried forward across an in-delivery retry reset"))
 }
 
 // createFreshSlip inserts slip and writes its parent link, for the paths where there is no
@@ -1612,7 +1634,7 @@ func (c *Client) handleDuplicateSlipBackstop(
 				"commit":         shortSHA(conflicting.CommitSHA),
 				"prior_status":   string(conflicting.Status),
 			})
-		appendResetMarkers(slip, conflicting.Status, conflicting.ClaimedFrom, conflicting.CommitSHA)
+		appendResetMarkers(slip, conflicting, conflicting.CommitSHA)
 		return false, nil
 	}
 

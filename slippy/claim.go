@@ -49,6 +49,30 @@ func ClaimMarker(prior SlipStatus, claimedBy, reason string) StateHistoryEntry {
 	}
 }
 
+// claimantFromHistory returns the actor of the most recent ClaimMarkerStep entry in entries,
+// or "" when there is none or when a ReleaseMarkerStep entry follows the most recent claim.
+//
+// It is deliberately the SAME derivation pushhookparser makes for its ClaimedBy
+// (claimedBy in pkg/slippy/http_client.go: scan backwards, a claim marker answers, a release
+// marker answers ""), because the only reason this library reads the markers is to hand that
+// reader back what a state_history rewrite would otherwise have cost it. A different reading
+// here would restore a marker naming someone the parser never saw.
+//
+// Not exported: the derivation belongs to whoever owns the markers, and a consumer that needs
+// the claimant reads claimed_from plus its own history scan rather than a second library
+// entry point that could drift from the parser's.
+func claimantFromHistory(entries []StateHistoryEntry) string {
+	for i := len(entries) - 1; i >= 0; i-- {
+		switch entries[i].Step {
+		case ClaimMarkerStep:
+			return entries[i].Actor
+		case ReleaseMarkerStep:
+			return ""
+		}
+	}
+	return ""
+}
+
 // ReleaseMarker builds the release history entry. status is the slip's status at release,
 // which the release never changes; it is recorded because the claim's own record
 // (claimed_from) is cleared by the same write. releasedBy is the entry's actor and is audit

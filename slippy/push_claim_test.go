@@ -187,6 +187,13 @@ func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipIsResetNotDeduped(t 
 		"the reset carries the claim marker forward, so column and marker agree")
 	assert.True(t, hasHistoryMessage(got, "reset in place after failed attempt"),
 		"alongside the reset marker, not instead of it")
+	// AND IT CARRIES THE CLAIMANT, not just the claim (PR #87, jhicks review). The invariant
+	// this marker restores is what pushhookparser's ClaimedBy reads, and ClaimedBy IS the
+	// actor of the most recent slip_claimed marker — so writing the library's own actor here
+	// keeps the row exempt from the stranded cleanup while renaming its adopter to
+	// "slippy-library" for that reader and for every audit query on who adopted the slip.
+	assert.Equal(t, "slippy-cli/prejob", lastHistoryActor(got, ClaimMarkerStep),
+		"the carried-forward marker names the original claimant, not the library")
 }
 
 // The self-correlation carve-out stops at work in flight AS OF THE PUSH'S READ (finding p1).
@@ -433,4 +440,66 @@ func countHistoryStep(slip *Slip, step string) int {
 		}
 	}
 	return n
+}
+
+// lastHistoryActor returns the actor of the last state-history entry written against step,
+// or "" when there is none. It is the reader's half of claimantFromHistory: the tests assert
+// on the actor a later reader would derive, not on the one this library happened to pass.
+func lastHistoryActor(slip *Slip, step string) string {
+	actor := ""
+	for _, entry := range slip.StateHistory {
+		if entry.Step == step {
+			actor = entry.Actor
+		}
+	}
+	return actor
+}
+
+// appendResetMarkers must keep BOTH halves of what a state_history rewrite would cost a
+// marker-reading consumer: that a claim exists at all, and who holds it (PR #87, jhicks
+// review). The fallback arm is the one worth pinning directly, because it is reached by the
+// timing hole this PR documents rather than by any caller: a row whose claimed_from was set
+// during the unlocked window between the push's read and its write carries the column with no
+// marker to read a claimant out of, and the invariant still needs a marker.
+func TestAppendResetMarkers_CarriesTheClaimantForward(t *testing.T) {
+	t.Run("a prior with a claim marker: its actor", func(t *testing.T) {
+		slip := &Slip{CorrelationID: "c"}
+		prior := &Slip{
+			Status:      SlipStatusFailed,
+			ClaimedFrom: SlipStatusFailed,
+			StateHistory: []StateHistoryEntry{
+				{Step: "builds", Status: StepStatusFailed, Actor: "post-job"},
+				ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "rerun scope=all"),
+			},
+		}
+		appendResetMarkers(slip, prior, "0123456789abcdef")
+		assert.Equal(t, 1, countHistoryStep(slip, ClaimMarkerStep))
+		assert.Equal(t, "pushhookparser/rerunner", lastHistoryActor(slip, ClaimMarkerStep))
+		assert.True(t, hasHistoryMessage(slip, "adopted failed slip"), "the prior is the RECORDED claimed_from")
+		assert.True(t, hasHistoryMessage(slip, "reset in place after failed attempt"))
+	})
+
+	t.Run("a prior claimed with no marker: LibraryActor, and the marker is still written", func(t *testing.T) {
+		slip := &Slip{CorrelationID: "c"}
+		prior := &Slip{Status: SlipStatusFailed, ClaimedFrom: SlipStatusPending}
+		appendResetMarkers(slip, prior, "0123456789abcdef")
+		assert.Equal(t, 1, countHistoryStep(slip, ClaimMarkerStep),
+			"presence is the invariant; an unnameable claimant does not excuse dropping it")
+		assert.Equal(t, LibraryActor, lastHistoryActor(slip, ClaimMarkerStep))
+	})
+
+	t.Run("a prior whose claim was released: no marker at all", func(t *testing.T) {
+		slip := &Slip{CorrelationID: "c"}
+		prior := &Slip{
+			Status: SlipStatusFailed,
+			StateHistory: []StateHistoryEntry{
+				ClaimMarker(SlipStatusFailed, "slippy-cli/prejob", ""),
+				ReleaseMarker(SlipStatusFailed, "slippy-cli/postjob", ""),
+			},
+		}
+		appendResetMarkers(slip, prior, "0123456789abcdef")
+		assert.Equal(t, 0, countHistoryStep(slip, ClaimMarkerStep),
+			"claimed_from is empty, so the reset carries no claim: both absent, as the invariant says")
+		assert.Equal(t, 1, countHistoryStep(slip, PushParsedStep), "the reset marker is still written")
+	})
 }

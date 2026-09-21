@@ -641,3 +641,53 @@ func TestDecideRelease_ReadsOnlyClaimStateFields(t *testing.T) {
 		})
 	}
 }
+
+// claimantFromHistory is the derivation pushhookparser makes for its ClaimedBy, reproduced
+// here so the claim marker an in-delivery retry reset re-appends can name the ORIGINAL
+// claimant rather than the library (PR #87, jhicks review). The cases that matter are the
+// ordering ones: a release after the most recent claim means unclaimed, and a claim after a
+// release means claimed again.
+func TestClaimantFromHistory(t *testing.T) {
+	claim := func(actor string) StateHistoryEntry {
+		return StateHistoryEntry{Step: ClaimMarkerStep, Actor: actor}
+	}
+	release := func(actor string) StateHistoryEntry {
+		return StateHistoryEntry{Step: ReleaseMarkerStep, Actor: actor}
+	}
+	step := StateHistoryEntry{Step: "builds", Actor: "post-job"}
+
+	tests := []struct {
+		name    string
+		entries []StateHistoryEntry
+		want    string
+	}{
+		{"no history at all", nil, ""},
+		{"no markers: a claim was never recorded here", []StateHistoryEntry{step, step}, ""},
+		{"one claim: its actor", []StateHistoryEntry{step, claim("slippy-cli/prejob")}, "slippy-cli/prejob"},
+		{
+			"claim then unrelated step entries: still its actor",
+			[]StateHistoryEntry{claim("pushhookparser/rerunner"), step, step},
+			"pushhookparser/rerunner",
+		},
+		{
+			"a release AFTER the claim ends it, as the parser reads it",
+			[]StateHistoryEntry{claim("slippy-cli/prejob"), release("slippy-cli/postjob")},
+			"",
+		},
+		{
+			"claimed again after a release: the newer claim answers",
+			[]StateHistoryEntry{claim("first"), release("first"), claim("second")},
+			"second",
+		},
+		{
+			"two claims with no release between them: the most recent",
+			[]StateHistoryEntry{claim("first"), claim("second")},
+			"second",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, claimantFromHistory(tc.entries))
+		})
+	}
+}
