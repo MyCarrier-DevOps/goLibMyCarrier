@@ -752,13 +752,32 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//     own guard would refuse the row anyway (ErrSlipWentLive → dedup below), but
 		//     deciding here skips the ancestor resolution that runs before a repave.
 		//
-		// This sits AFTER the empty-run guard and BEFORE the repave, and the order is
-		// load-bearing at both ends. After the guard, because a componentless push onto a
-		// claimed slip dispatches nothing: taking it through handlePushRetry would reset
-		// push_parsed and write history against a run someone else owns, where the guard
-		// returns the row read-only. Before the repave, because that is the whole point —
-		// ancestor resolution's multi-second GitHub calls are skipped for a row that can
-		// only be deduped onto.
+		// This sits AFTER the empty-run guard and BEFORE the repave. Before the repave is the
+		// load-bearing half, and it is the whole point: ancestor resolution's multi-second
+		// GitHub calls are skipped for a row that can only be deduped onto.
+		//
+		// AFTER THE GUARD BUYS LESS THAN AN EARLIER REVISION OF THIS COMMENT CLAIMED, and the
+		// correction matters because what it claimed was the dominant case (PR #87, jhicks
+		// review). The claim was that a componentless push onto a claimed slip dispatches
+		// nothing and so is returned READ-ONLY by the guard, instead of taking
+		// handlePushRetry's push_parsed reset and "retry detected" entry against a run someone
+		// else owns. That holds only where the guard applies, and it does not apply to a
+		// claimed `failed` slip under DispatchIntentUnspecified: emptyRunGuardApplies returns
+		// false at its `failed` carve-out, every real push arrives Unspecified until slippy-api
+		// and pushhookparser forward the field, and a claimed `failed` slip is the rerunner's
+		// usual adoption. So the common shape does reach this arm, and handlePushRetry does
+		// write to it.
+		//
+		// What the order does buy is the remainder — a claimed TERMINAL slip, and any push
+		// stating a recognized DispatchIntentNothing, come back untouched from the guard rather
+		// than written to here — and what it costs where it does not apply is bounded:
+		// handlePushRetry resets push_parsed, the library's own bookkeeping step that
+		// RunInFlight ignores BY NAME, and appends one history entry. It never touches
+		// claimed_from, the run's steps, its aggregates or its status, so it cannot disturb the
+		// work the claim protects. The write the claim exists to stop is the repave below, and
+		// keeping this arm in front of that is what stops it. Moving the claimed arm ABOVE the
+		// guard would only add handlePushRetry's write to the cases the guard handles read-only
+		// today, which is the wrong direction.
 		//
 		// A SELF-CORRELATION row is carved out, the same exclusion the empty-run guard makes
 		// and for the same reason: when the existing row already carries THIS push's id there
@@ -1583,6 +1602,28 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// self-correlated row whose own dispatch is still executing would have that state
 		// destroyed under an unchanged correlation ID. RunInFlight is the disjunct that keeps
 		// such a row here, on the dedup arm, instead.
+		//
+		// WHAT THAT COSTS, said here rather than only on the main path (PR #87, jhicks review).
+		// On that disjunct the dedup hands the caller returned == sent on a row whose status
+		// was never made live — still `failed` or ended — which is the very shape the
+		// self-referential arm below and the empty-run guard's self-correlation exclusion exist
+		// to avoid, and the paragraph above says so. It is chosen knowingly: the alternative is
+		// the reset, and destroying the state of a run that is executing, under an unchanged
+		// correlation ID, is worse than returning that state unchanged. It is also not a
+		// dispatch regression, because a self-correlated push has always come back with
+		// returned == sent — the condition callers suppress on — so this disjunct changed only
+		// the STATUS the returned row carries, not whether the caller dispatches. A caller that
+		// must not report against an ended row gates on the claim and the step evidence Slip
+		// already carries on the wire (types.go). The main path's arm has the same shape and
+		// the same account, in full, on CreateSlipForPush's claimed arm.
+		//
+		// Its reachability HERE is narrower than on the main path, which is why the full
+		// account lives there: this function is entered only after this push's Create raised
+		// ErrDuplicateSlip on uq_routing_slips_repo_sha, meaning another correlation ID holds
+		// this (repository, commit_sha) — so a conflicting row carrying THIS push's id needs a
+		// third row for the same commit, which that same unique index prevents. The
+		// self-correlation disjunct is here for convergence with the main path, where the shape
+		// IS routine, and is dormant before migration v5 in any case.
 		//
 		// The two paths do NOT do the same thing on the way out, and the difference is on
 		// purpose: the main path calls handlePushRetry here (push_parsed reset, "retry
