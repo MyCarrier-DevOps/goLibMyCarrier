@@ -515,18 +515,27 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 // Making terminal rows visible to the same-commit lookup is DEVOPS-231's stated goal, so this
 // filter is expected to go. Do not remove it without reading this first.
 //
-// As of 2026-09-17 pushhookparser arms SLIPPY_STRANDED_CLEANUP by default (DEVOPS-342), so
-// `abandoned` is now written routinely by force-push and branch-delete rather than never. If
-// this filter is removed while that is armed, an abandoned row becomes visible to the
-// same-commit lookup, the empty-run guard sees ended-and-not-failed, and the caller SUPPRESSES
-// the unit tests for that commit. That is a CI-gate weakening reachable by anyone who can
-// force-push a branch, and neither repository's tests would catch it because the two halves
-// live in different modules with different reviewers.
+// SLIPPY_STRANDED_CLEANUP is OFF by default in the pushhookparser that is DEPLOYED:
+// StrandedCleanupEnabled (pkg/slippy/config.go) is `env == "true"`, and that repository's
+// README documents the default as false. So `abandoned` is written by force-push and
+// branch-delete only where an operator armed it. DEVOPS-342 (pushhookparser#56) inverts that
+// default and is OPEN and UNMERGED as of 2026-09-21. An earlier revision of this note stated
+// the inverted default as shipped fact; it was not, and this paragraph replaces it (PR #87,
+// jhicks review).
+//
+// THE PRECONDITION HOLDS EITHER WAY, which is why it is stated against the armed state rather
+// than against the fleet. Wherever the cleanup IS armed — today by opt-in, after #56 anywhere
+// that has not pulled the kill switch — removing this filter makes an abandoned row visible to
+// the same-commit lookup, the empty-run guard sees ended-and-not-failed, and the caller
+// SUPPRESSES the unit tests for that commit. That is a CI-gate weakening reachable by anyone
+// who can force-push a branch, and neither repository's tests would catch it because the two
+// halves live in different modules with different reviewers.
 //
 // So: before removing this filter, either extend pushhookparser's abandon-gate exclusion beyond
 // `failed` (see AbandonStrandedSlip in pushhookparser/pkg/slippy/stranded.go, which excludes
-// `failed` for exactly this reason), or disarm SLIPPY_STRANDED_CLEANUP first. Whichever of the
-// two changes lands second silently changes the other.
+// `failed` for exactly this reason), or establish that SLIPPY_STRANDED_CLEANUP is disarmed
+// everywhere it runs — which is its default today and would stop being one if #56 merges.
+// Whichever of the two changes lands second silently changes the other.
 func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	if s.pipelineConfig == nil {
 		return nil, fmt.Errorf("pipeline config is required for store operations")

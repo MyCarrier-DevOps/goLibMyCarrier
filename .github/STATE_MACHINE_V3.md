@@ -493,8 +493,11 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
       precise about its reach: its claim gate sits AFTER its live-status gate and its
       `failed` carve-out, so what it actually reaps is a claimed, quiescent slip at
       `pending`, `in_progress` or `compensating`, for a commit a force-push or branch delete
-      made unreachable, on the slip's own branch, with `SLIPPY_STRANDED_CLEANUP` armed (off
-      by default). A claimed quiescent **`failed`** slip — the rerunner's usual adoption —
+      made unreachable, on the slip's own branch, with `SLIPPY_STRANDED_CLEANUP` armed. That
+      flag is **off by default in the deployed parser** (`StrandedCleanupEnabled` is
+      `env == "true"`); pushhookparser#56 (DEVOPS-342) inverts the default and is **open and
+      unmerged**, so today this route runs only where an operator armed it.
+      A claimed quiescent **`failed`** slip — the rerunner's usual adoption —
       returns at the `failed` carve-out, and a claimed **terminal** one at the live-status
       gate; neither is reaped. Those are the operator route's cases.
     The library adds NO time-based sweeper of its own — elapsed time cannot tell a long build

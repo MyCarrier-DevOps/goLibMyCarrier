@@ -136,7 +136,10 @@ post-job will ever run to call one, and every later same-commit push deduplicate
    Its claim gate sits *after* its live-status gate and its `failed` carve-out, so what it
    actually reaps is a claimed, quiescent slip at `pending`, `in_progress` or `compensating`,
    for a commit a force-push or branch delete made unreachable, on the slip's own branch, with
-   `SLIPPY_STRANDED_CLEANUP` armed (off by default). A claimed quiescent `failed` slip — the
+   `SLIPPY_STRANDED_CLEANUP` armed. That flag is **off by default in the deployed parser**
+   (`StrandedCleanupEnabled` is `env == "true"`); pushhookparser#56 (DEVOPS-342) inverts the
+   default and is **open and unmerged**, so today the automatic route runs only where an
+   operator armed it. A claimed quiescent `failed` slip — the
    rerunner's usual adoption — and a claimed terminal one both return at earlier gates and are
    never reaped by it; they are route 1's cases.
 
