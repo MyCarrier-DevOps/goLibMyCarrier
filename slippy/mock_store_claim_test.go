@@ -185,23 +185,26 @@ func TestMockStore_ResetSlipInPlace(t *testing.T) {
 		require.NoError(t, err)
 
 		err = store.ResetSlipInPlace(ctx, successor("m1"))
-		assert.ErrorIs(t, err, ErrSlipClaimedInFlight)
+		assert.ErrorIs(t, err, ErrSlipClaimed)
 		got, loadErr := store.Load(ctx, "m1")
 		require.NoError(t, loadErr)
 		assert.Equal(t, SlipStatusFailed, got.Status)
 		assert.Equal(t, StepStatusRunning, got.Steps["builds"].Status)
 	})
 
-	t.Run("claimed and quiescent: reset, claim and claimant carried", func(t *testing.T) {
+	t.Run("claimed and quiescent: refused, nothing written", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&Slip{CorrelationID: "m2", Repository: "o/r", CommitSHA: "s-m2", Status: SlipStatusFailed})
 		_, err := store.ClaimSlip(ctx, "m2", nil, "slippy-cli/prejob", "")
 		require.NoError(t, err)
 
-		require.NoError(t, store.ResetSlipInPlace(ctx, successor("m2")))
+		err = store.ResetSlipInPlace(ctx, successor("m2"))
+		require.Error(t, err, "a claim with no step reported yet is a queued run, not an absent one")
+		assert.ErrorIs(t, err, ErrSlipClaimed)
+
 		got, loadErr := store.Load(ctx, "m2")
 		require.NoError(t, loadErr)
-		assert.Equal(t, SlipStatusPending, got.Status)
+		assert.Equal(t, SlipStatusFailed, got.Status, "the refused reset left the row exactly as it was")
 		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom)
 		assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep))
 		assert.Equal(t, "slippy-cli/prejob", lastHistoryActor(got, ClaimMarkerStep))

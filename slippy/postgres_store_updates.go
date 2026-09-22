@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -84,20 +83,64 @@ func (s *PostgresStore) AppendHistory(ctx context.Context, correlationID string,
 // still running, and both are repaveable — an ancestor abandon or a promotion deliberately
 // overrides a live claim.
 func (s *PostgresStore) UpdateSlipStatus(ctx context.Context, correlationID string, newStatus SlipStatus) error {
-	set := "status = $1, updated_at = now()"
-	if newStatus.IsTerminal() {
-		set = "status = $1, claimed_from = NULL, updated_at = now()"
+	if !newStatus.IsTerminal() {
+		// Non-terminal: the claim is untouched, so there is no marker to write and no reason to
+		// open a transaction for a single statement.
+		tag, err := s.pool.Exec(ctx,
+			"UPDATE routing_slips SET status = $1, updated_at = now() WHERE correlation_id = $2",
+			string(newStatus), correlationID)
+		if err != nil {
+			return fmt.Errorf("failed to update status for %s: %w", correlationID, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return ErrSlipNotFound
+		}
+		return nil
 	}
-	tag, err := s.pool.Exec(ctx,
-		"UPDATE routing_slips SET "+set+" WHERE correlation_id = $2",
-		string(newStatus), correlationID)
-	if err != nil {
-		return fmt.Errorf("failed to update status for %s: %w", correlationID, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrSlipNotFound
-	}
-	return nil
+
+	// A terminal status ends any claim, and ending a claim has to be VISIBLE to the reader that
+	// derives claim identity from the markers (PR #87 review, jhicks). Clearing claimed_from
+	// with no marker left the row in exactly the shape GuardReservedStepWrite exists to prevent
+	// a caller forging: column empty, newest marker still slip_claimed, so pushhookparser's
+	// ClaimedBy still names the old claimant while the column says nobody holds it.
+	//
+	// It was not reachable — IsTerminal and the parser's isLiveSlipStatus are exact complements
+	// over all eight statuses, so a terminal row returns at its live-status gate before the
+	// claim gate — but "unreachable in the consumer we happen to have" is a weaker guarantee
+	// than the invariant this library states, and the library was the one breaking it.
+	//
+	// Transactional because the two writes are one fact: a status that ended a claim, and the
+	// release that records it. The marker is appended only when a claim was actually held, so
+	// an ordinary terminal write on an unclaimed slip still costs one statement's worth of work
+	// and adds no history.
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		// Read the claim BEFORE clearing it: RETURNING yields the row's NEW values, so it could
+		// only ever report the NULL this statement just wrote. FOR UPDATE because the marker
+		// must describe the claim this write actually ended.
+		var claimedFrom *string
+		if err := tx.QueryRow(ctx,
+			"SELECT claimed_from FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
+			correlationID,
+		).Scan(&claimedFrom); err != nil {
+			if isNoRows(err) {
+				return ErrSlipNotFound
+			}
+			return fmt.Errorf("failed to read the claim for %s: %w", correlationID, err)
+		}
+
+		if _, err := tx.Exec(ctx,
+			"UPDATE routing_slips SET status = $1, claimed_from = NULL, updated_at = now() "+
+				"WHERE correlation_id = $2",
+			string(newStatus), correlationID); err != nil {
+			return fmt.Errorf("failed to update status for %s: %w", correlationID, err)
+		}
+
+		if claimedFrom == nil || *claimedFrom == "" {
+			return nil
+		}
+		return appendHistoryTx(ctx, tx, correlationID,
+			ReleaseMarker(newStatus, LibraryActor, "claim ended by a terminal status write"))
+	})
 }
 
 // ClaimSlip implements SlipStore.ClaimSlip as one transaction. See the interface for the
@@ -253,51 +296,11 @@ func (s *PostgresStore) ResetSlipInPlace(ctx context.Context, slip *Slip) error 
 			return err
 		}
 
-		carryClaim, err := DecideReset(prior.ClaimedFrom, RunInFlight(prior))
-		if err != nil {
+		if err := DecideReset(prior.ClaimedFrom, RunInFlight(prior)); err != nil {
 			return fmt.Errorf("reset %s in place: %w", slip.CorrelationID, err)
 		}
-		if !carryClaim {
-			return s.createTx(ctx, tx, slip)
-		}
-
-		// The locked row is claimed and quiescent, so the upsert may proceed — but it
-		// replaces state_history while claimed_from survives it, and the claim marker has to
-		// survive with the column (DecideReset). The marker is built from the row's OWN
-		// history, read here rather than in claimStateColumns because that read is the
-		// decision's input and state_history is one of the two columns that grow without
-		// bound: it is fetched only once the decision has already said a claim exists, on a
-		// row this transaction already holds the lock on, so it costs one round trip and no
-		// additional lock.
-		priorHistory, err := loadStateHistoryTx(ctx, tx, slip.CorrelationID)
-		if err != nil {
-			return fmt.Errorf("reset %s in place: reading the prior history: %w", slip.CorrelationID, err)
-		}
-
-		// Copied rather than appended in place: the caller's Slip is its own value, and a
-		// reset that is later retried (redelivery, the duplicate backstop's second pass) must
-		// not accumulate a marker per attempt.
-		reset := *slip
-		reset.StateHistory = append(slices.Clone(slip.StateHistory),
-			ResetClaimMarker(prior.ClaimedFrom, priorHistory))
-		return s.createTx(ctx, tx, &reset)
+		return s.createTx(ctx, tx, slip)
 	})
-}
-
-// loadStateHistoryTx reads one row's state_history inside tx. ResetSlipInPlace uses it to name
-// the claimant a re-stated claim marker must carry (ResetClaimMarker). It takes no lock of its
-// own: its only caller has already locked this row FOR UPDATE in the same transaction.
-func loadStateHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string) ([]StateHistoryEntry, error) {
-	var raw []byte
-	if err := tx.QueryRow(ctx,
-		"SELECT state_history FROM routing_slips WHERE correlation_id = $1", correlationID,
-	).Scan(&raw); err != nil {
-		if isNoRows(err) {
-			return nil, ErrSlipNotFound
-		}
-		return nil, fmt.Errorf("failed to read state history for slip %s: %w", correlationID, err)
-	}
-	return decodeStateHistory(raw), nil
 }
 
 // SetComponentImageTag records the built image tag for a component, preserving its current
@@ -474,7 +477,7 @@ func (s *PostgresStore) upsertComponentState(
 // the slip's row lock.
 func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, correlationID, aggStep string) error {
 	var itemsBytes []byte
-	sel := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1", aggStep)
+	sel := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1", aggregateColumn(aggStep))
 	if err := tx.QueryRow(ctx, sel, correlationID).Scan(&itemsBytes); err != nil {
 		if isNoRows(err) {
 			return ErrSlipNotFound

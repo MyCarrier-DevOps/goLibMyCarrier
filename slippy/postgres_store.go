@@ -176,37 +176,10 @@ func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, 
 // names are reported AS CONFIGURED rather than folded, so the operator sees the string their
 // pipeline config carries.
 func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
-	rows, err := s.pool.Query(ctx,
-		"SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
-			"AND NOT attisdropped AND attnum > 0")
-	if err != nil {
-		return fmt.Errorf("probe routing_slips schema: %w", err)
+	if err := s.probeRoutingSlipColumns(ctx); err != nil {
+		return err
 	}
-	defer rows.Close()
-
-	present := make(map[string]struct{})
-	for rows.Next() {
-		var name string
-		if scanErr := rows.Scan(&name); scanErr != nil {
-			return fmt.Errorf("probe routing_slips schema: %w", scanErr)
-		}
-		present[strings.ToLower(name)] = struct{}{}
-	}
-	if rows.Err() != nil {
-		return fmt.Errorf("probe routing_slips schema: %w", rows.Err())
-	}
-
-	var missing []string
-	for _, col := range s.slipSelectColumns() {
-		if _, ok := present[strings.ToLower(col)]; !ok {
-			missing = append(missing, col)
-		}
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("routing_slips missing columns %v (apply migrations before serving): %w",
-			missing, ErrSchemaBehind)
-	}
-	return nil
+	return s.probeChildTables(ctx)
 }
 
 // LoadByCommit retrieves the slip for (repository, commitSHA).
@@ -298,6 +271,77 @@ func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commit
 // createTx is Create against an open transaction. Repave uses it so the superseded row's
 // removal and the successor's insert commit or roll back together; both paths go through
 // buildCreateQuery/mapCreateError so a transactional create writes an identical row and
+// probeRoutingSlipColumns diffs every column the store's SELECTs name against the live
+// catalogue. Case-insensitive because Postgres folded the unquoted DDL the ensurer emitted, so
+// a configured `Deploy_Dev` legitimately lands as `deploy_dev`; the missing names are reported
+// as CONFIGURED, since that is the spelling an operator has to go and fix.
+func (s *PostgresStore) probeRoutingSlipColumns(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx,
+		"SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
+			"AND NOT attisdropped AND attnum > 0")
+	if err != nil {
+		return fmt.Errorf("probe routing_slips schema: %w", err)
+	}
+	defer rows.Close()
+
+	present := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if scanErr := rows.Scan(&name); scanErr != nil {
+			return fmt.Errorf("probe routing_slips schema: %w", scanErr)
+		}
+		present[strings.ToLower(name)] = struct{}{}
+	}
+	if rows.Err() != nil {
+		return fmt.Errorf("probe routing_slips schema: %w", rows.Err())
+	}
+
+	var missing []string
+	for _, col := range s.slipSelectColumns() {
+		if _, ok := present[strings.ToLower(col)]; !ok {
+			missing = append(missing, col)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("routing_slips missing columns %v (apply migrations before serving): %w",
+			missing, ErrSchemaBehind)
+	}
+	return nil
+}
+
+// probeChildTables confirms the tables this store writes besides routing_slips actually exist
+// (PR #87 review, jhicks).
+//
+// Checking one table was too narrow for what the gate promises: a database current on
+// routing_slips but missing slip_component_states or slip_ancestry passed the probe and then
+// failed every component write, every ancestry insert and every repave at request time — which
+// is precisely the class the probe was added to turn into a refusal to start.
+//
+// Scoped to table PRESENCE deliberately. Indexes and constraints are not checked here because
+// the migrations that create them assert their own shape and RAISE on a mismatch (v5's
+// uq_routing_slips_repo_sha and fk_ancestry_slip do exactly that), so re-deriving the expected
+// definitions here would be a second, drifting copy of the same rule — the fault the reserved
+// column set was restructured to avoid. A missing table is different: nothing else reports it
+// until the first write fails.
+func (s *PostgresStore) probeChildTables(ctx context.Context) error {
+	var missing []string
+	for _, table := range []string{TableSlipComponentStates, TableSlipAncestry} {
+		var present bool
+		if err := s.pool.QueryRow(ctx,
+			"SELECT to_regclass($1) IS NOT NULL", table).Scan(&present); err != nil {
+			return fmt.Errorf("probe %s: %w", table, err)
+		}
+		if !present {
+			missing = append(missing, table)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing tables %v (apply migrations before serving): %w",
+			missing, ErrSchemaBehind)
+	}
+	return nil
+}
+
 // reports identical sentinels to a standalone one.
 func (s *PostgresStore) createTx(ctx context.Context, tx pgx.Tx, slip *Slip) error {
 	query, vals, err := s.buildCreateQuery(slip)

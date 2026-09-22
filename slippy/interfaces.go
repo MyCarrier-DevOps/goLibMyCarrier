@@ -186,7 +186,7 @@ type SlipStore interface {
 	// unclaimed and quiescent can be claimed, and its first step started, before the write
 	// lands. That write is now ResetSlipInPlace, which re-reads the claim state FOR UPDATE,
 	// evaluates RunInFlight on that read and either upserts or refuses with
-	// ErrSlipClaimedInFlight, all in one transaction — so a claim taken in the window is seen,
+	// ErrSlipClaimed, all in one transaction — so a claim taken in the window is seen,
 	// a step started in the window is seen, and the push deduplicates onto the live row
 	// instead of resetting it. The marker is re-stated from the locked row too, so
 	// claimed_from and slip_claimed stay both present or both absent (the invariant stated
@@ -469,12 +469,14 @@ type SlipStore interface {
 	// Implementations MUST:
 	//   - take a row lock on slip.CorrelationID and make the decision from what it reads
 	//     under that lock, not from anything the caller passed;
-	//   - return an error wrapping ErrSlipClaimedInFlight, having written NOTHING, when the
-	//     locked row is claimed and a step or component of that run is running or held;
-	//   - preserve claimed_from across the upsert (it is Create's invariant: a reset never
-	//     ends a claim) and re-state the slip_claimed marker in the state_history it writes
-	//     whenever the LOCKED row was claimed, naming the recorded claimant. The caller cannot
-	//     supply that marker, which is the point: its snapshot may predate the claim;
+	//   - return an error wrapping ErrSlipClaimed, having written NOTHING, whenever the locked
+	//     row is claimed — in flight or not. A claim reports no step until its run's first
+	//     post-job, so a quiescent claim is a run that was dispatched and is queued, not an
+	//     absent one, and the upsert would wipe it before it reports. This is deliberately
+	//     wider than it was (PR #87 review): the old rule allowed a quiescent claim on the
+	//     premise that a row carrying the caller's own correlation ID could only be that
+	//     caller's retry, which is false — the rerunner adopts the slip it looked up and
+	//     claims under the ORIGINAL push's id;
 	//   - upsert slip unchanged otherwise, identically to Create, including the case where the
 	//     row has gone (a concurrent repave) — a reset whose target is absent is simply the
 	//     insert a first push would have made, so redelivery converges.
@@ -491,8 +493,9 @@ type SlipStore interface {
 	// ordering on PostgresStore.ResetSlipInPlace.
 	//
 	// Returns:
-	//   - nil: the row now holds slip, with the claim (and its marker) intact if one was held.
-	//   - ErrSlipClaimedInFlight (wrapped): refused, nothing written. The caller deduplicates
+	//   - nil: the row now holds slip. The locked row was unclaimed, which is the only case
+	//     this operation writes in, so there is no claim or marker to preserve.
+	//   - ErrSlipClaimed (wrapped): refused, nothing written. The caller deduplicates
 	//     onto the live row rather than failing the push — the claimant's run owns that slip
 	//     and the desired end state, one run for this commit, already holds.
 	//   - ErrDuplicateSlip (wrapped): the row was gone and another correlation ID now holds

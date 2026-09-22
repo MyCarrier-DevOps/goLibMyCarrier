@@ -714,6 +714,10 @@ func (m *MockStore) UpdateStep(
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
+	if err := GuardReservedStepWrite(stepName, nil); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -753,6 +757,11 @@ func (m *MockStore) UpdateComponentStatus(
 	correlationID, componentName, stepType string,
 	status StepStatus,
 ) error {
+	// stepType is the step name here, so it enters the same namespace UpdateStep guards.
+	if err := GuardReservedStepWrite(stepType, nil); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -916,7 +925,7 @@ func (m *MockStore) ReleaseClaim(
 // ResetSlipInPlace mirrors PostgresStore.ResetSlipInPlace through the shared DecideReset, the
 // same way slippytest.MockStore does, so neither double can drift from the store: the decision
 // is made from the STORED row at call time rather than from anything the caller passed or last
-// read, a refusal writes nothing and returns ErrSlipClaimedInFlight wrapped, an allowed reset
+// read, a refusal writes nothing and returns ErrSlipClaimed wrapped, an allowed reset
 // keeps claimed_from and re-states the slip_claimed marker naming the recorded claimant, and an
 // absent row is upserted rather than refused.
 func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *Slip) error {
@@ -941,15 +950,14 @@ func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *Slip) error {
 		return nil
 	}
 
-	carryClaim, err := DecideReset(existing.ClaimedFrom, RunInFlight(existing))
-	if err != nil {
+	// Refused on ANY claim, matching PostgresStore: the reset rewrites every step, aggregate
+	// and the whole history, and a claimed row belongs to a run that was already dispatched
+	// even when it has not reported a step yet.
+	if err := DecideReset(existing.ClaimedFrom, RunInFlight(existing)); err != nil {
 		return fmt.Errorf("reset %s in place: %w", slip.CorrelationID, err)
 	}
-	slipCopy.ClaimedFrom = existing.ClaimedFrom
-	if carryClaim {
-		slipCopy.StateHistory = append(slipCopy.StateHistory,
-			ResetClaimMarker(existing.ClaimedFrom, existing.StateHistory))
-	}
+	// Unclaimed by the decision above, so there is no claim to carry and none to restore.
+	slipCopy.ClaimedFrom = ""
 	m.Slips[slip.CorrelationID] = slipCopy
 	return nil
 }
@@ -970,6 +978,10 @@ func (m *MockStore) UpdateStepWithHistory(
 	status StepStatus,
 	entry StateHistoryEntry,
 ) error {
+	if err := GuardReservedStepWrite(stepName, &entry); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

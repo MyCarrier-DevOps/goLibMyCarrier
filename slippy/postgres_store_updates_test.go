@@ -43,20 +43,59 @@ func TestComputeAggregateStatus(t *testing.T) {
 	}
 }
 
-func TestPostgresStore_UpdateSlipStatus(t *testing.T) {
+// A terminal status runs in a transaction: read the claim under the row lock, clear it with the
+// status, and append a release marker only if a claim was actually held.
+func TestPostgresStore_UpdateSlipStatus_TerminalWithNoClaim(t *testing.T) {
 	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT claimed_from FROM routing_slips WHERE correlation_id = \$1 FOR UPDATE`).
+		WithArgs("c1").
+		WillReturnRows(pgxmock.NewRows([]string{"claimed_from"}).AddRow(nil))
 	mock.ExpectExec("UPDATE routing_slips SET status").
 		WithArgs("completed", "c1").
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
 	require.NoError(t, store.UpdateSlipStatus(context.Background(), "c1", SlipStatusCompleted))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// With a claim held, the same write also records the release — otherwise the row would read
+// unclaimed by its column and still claimed by its newest marker (PR #87 review, jhicks).
+func TestPostgresStore_UpdateSlipStatus_TerminalWritesTheReleaseMarker(t *testing.T) {
+	store, mock := newMockStore(t)
+	claimed := string(SlipStatusFailed)
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT claimed_from FROM routing_slips WHERE correlation_id = \$1 FOR UPDATE`).
+		WithArgs("c1").
+		WillReturnRows(pgxmock.NewRows([]string{"claimed_from"}).AddRow(&claimed))
+	mock.ExpectExec("UPDATE routing_slips SET status").
+		WithArgs("completed", "c1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectExec(`UPDATE routing_slips`).
+		WithArgs(pgxmock.AnyArg(), "c1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	mock.ExpectCommit()
+	require.NoError(t, store.UpdateSlipStatus(context.Background(), "c1", SlipStatusCompleted))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// A non-terminal status keeps the claim, so it stays a single statement with no transaction.
+func TestPostgresStore_UpdateSlipStatus_NonTerminalIsOneStatement(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectExec("UPDATE routing_slips SET status").
+		WithArgs("in_progress", "c1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	require.NoError(t, store.UpdateSlipStatus(context.Background(), "c1", SlipStatusInProgress))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestPostgresStore_UpdateSlipStatus_NotFound(t *testing.T) {
 	store, mock := newMockStore(t)
-	mock.ExpectExec("UPDATE routing_slips SET status").
-		WithArgs("completed", "nope").
-		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`SELECT claimed_from FROM routing_slips WHERE correlation_id = \$1 FOR UPDATE`).
+		WithArgs("nope").
+		WillReturnError(pgx.ErrNoRows)
+	mock.ExpectRollback()
 	require.ErrorIs(t, store.UpdateSlipStatus(context.Background(), "nope", SlipStatusCompleted), ErrSlipNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -1100,40 +1139,30 @@ func TestPostgresStore_ResetSlipInPlace_RefusesAClaimWithWorkInFlight(t *testing
 
 	err := store.ResetSlipInPlace(context.Background(), repaveSuccessor())
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrSlipClaimedInFlight)
+	assert.ErrorIs(t, err, ErrSlipClaimed)
 	assert.Contains(t, err.Error(), "new-id", "the error names the slip it refused")
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-// A claim with nothing in flight is carried: the history read runs, and the upsert's
-// state_history argument carries a slip_claimed marker naming the RECORDED claimant. The
-// caller supplied no such marker — it cannot, since its snapshot may predate the claim.
-func TestPostgresStore_ResetSlipInPlace_CarriesTheClaimAndItsClaimant(t *testing.T) {
+// A claimed row is refused under the lock whether or not its run has reported a step, so the
+// upsert never runs and the history is never read (PR #87 review, pkuzmenko). This replaces a
+// test that asserted the opposite — that a quiescent claim was reset and its marker carried —
+// which pinned the behaviour that let a redelivery wipe a dispatched rerun.
+func TestPostgresStore_ResetSlipInPlace_RefusesAQuiescentClaim(t *testing.T) {
 	store, mock := newMockStore(t)
-	prior, err := json.Marshal(struct {
-		Entries []StateHistoryEntry `json:"entries"`
-	}{Entries: []StateHistoryEntry{ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "rerun")}})
-	require.NoError(t, err)
 
 	mock.ExpectBegin()
 	expectResetClaimStateRead(mock, "new-id").
 		WillReturnRows(resetClaimStateRows(store, string(SlipStatusFailed), string(SlipStatusFailed), nil, nil))
-	mock.ExpectQuery(`SELECT state_history FROM routing_slips WHERE correlation_id = \$1`).
-		WithArgs("new-id").
-		WillReturnRows(pgxmock.NewRows([]string{"state_history"}).AddRow(prior))
-	// state_history is fixedSlipColumns()' last entry, so it is the 9th bind of the upsert.
-	args := anyArgs(len(store.slipColumns()))
-	args[len(fixedSlipColumns())-1] = historyCarryingClaimMarker{claimedBy: "pushhookparser/rerunner"}
-	mock.ExpectExec(`INSERT INTO routing_slips .* ON CONFLICT \(correlation_id\) DO UPDATE SET`).
-		WithArgs(args...).
-		WillReturnResult(pgxmock.NewResult("INSERT", 1))
-	mock.ExpectCommit()
+	// No state_history read and no upsert: the decision refuses before either.
+	mock.ExpectRollback()
 
 	successor := repaveSuccessor()
-	require.NoError(t, store.ResetSlipInPlace(context.Background(), successor))
+	err := store.ResetSlipInPlace(context.Background(), successor)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSlipClaimed)
 	require.NoError(t, mock.ExpectationsWereMet())
-	assert.Empty(t, successor.StateHistory,
-		"the marker goes on a copy: a retried reset must not accumulate one marker per attempt")
+	assert.Empty(t, successor.StateHistory, "a refusal writes nothing, here or on the caller's value")
 }
 
 // A row that has GONE between the caller's read and this lock (a concurrent repave) is not an

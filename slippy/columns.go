@@ -72,9 +72,15 @@ func fixedSlipColumns() []string {
 //	NO CALLER BUILDS A STEP'S COLUMN NAME BY HAND. Every `<name>_status` and every bare
 //	aggregate column comes from these two helpers, on BOTH backends.
 //
-// `grep -rn '%s_status' --include='*.go' slippy/` is the check, and it should return only
-// error-message text. That is a grep a reviewer can run; a site list is only ever as good as
-// the last edit that remembered to update it.
+// Two greps are the check, because the invariant has two clauses and the obvious grep only
+// sees one of them (PR #87 review, pkuzmenko) — the bare aggregate form contains no `_status`
+// literal at all:
+//
+//	grep -rn '%s_status' --include='*.go' slippy/
+//	grep -rnE 'Sprintf\(.*(SELECT|UPDATE|ALTER|SET) .*%s' --include='*.go' slippy/
+//
+// Both should return only error-message text. Those are greps a reviewer can run; a site list
+// is only ever as good as the last edit that remembered to update it.
 //
 // This matters beyond tidiness because generatedColumnsFor's collision validator pins itself
 // to stepColumnEnsurer's emission: an identifier produced anywhere else is one the validator

@@ -678,6 +678,11 @@ func (m *MockStore) UpdateComponentStatus(
 	correlationID, componentName, stepType string,
 	status slippy.StepStatus,
 ) error {
+	// stepType is the step name here, so it enters the same namespace UpdateStep guards.
+	if err := slippy.GuardReservedStepWrite(stepType, nil); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -854,7 +859,7 @@ func (m *MockStore) ReleaseClaim(
 //     closes (DEVOPS-367): a consumer can claim the slip between its LoadByCommit and its
 //     push's write and see the reset refused, exactly as Postgres refuses it under the row
 //     lock.
-//   - A refusal writes NOTHING and returns slippy.ErrSlipClaimedInFlight wrapped, so a
+//   - A refusal writes NOTHING and returns slippy.ErrSlipClaimed wrapped, so a
 //     consumer asserting with errors.Is sees the same sentinel production raises.
 //   - An allowed reset keeps claimed_from (Create's SET list excludes it) and re-states the
 //     slip_claimed marker naming the recorded claimant, so the invariant a marker-reading
@@ -885,15 +890,14 @@ func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *slippy.Slip) err
 		return nil
 	}
 
-	carryClaim, err := slippy.DecideReset(existing.ClaimedFrom, slippy.RunInFlight(existing))
-	if err != nil {
+	// Refused on ANY claim, matching PostgresStore: the reset rewrites every step, aggregate
+	// and the whole history, and a claimed row belongs to a run that was already dispatched
+	// even when it has not reported a step yet.
+	if err := slippy.DecideReset(existing.ClaimedFrom, slippy.RunInFlight(existing)); err != nil {
 		return fmt.Errorf("reset %s in place: %w", slip.CorrelationID, err)
 	}
-	slipCopy.ClaimedFrom = existing.ClaimedFrom
-	if carryClaim {
-		slipCopy.StateHistory = append(slipCopy.StateHistory,
-			slippy.ResetClaimMarker(existing.ClaimedFrom, existing.StateHistory))
-	}
+	// Unclaimed by the decision above, so there is no claim to carry and none to restore.
+	slipCopy.ClaimedFrom = ""
 	m.Slips[slip.CorrelationID] = slipCopy
 	return nil
 }
@@ -914,6 +918,10 @@ func (m *MockStore) UpdateStepWithHistory(
 	status slippy.StepStatus,
 	entry slippy.StateHistoryEntry,
 ) error {
+	if err := slippy.GuardReservedStepWrite(stepName, &entry); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

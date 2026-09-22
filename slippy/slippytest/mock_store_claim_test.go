@@ -305,7 +305,7 @@ func TestMockStore_ResetSlipInPlace(t *testing.T) {
 
 		err = store.ResetSlipInPlace(ctx, successor("r1"))
 		require.Error(t, err)
-		assert.ErrorIs(t, err, slippy.ErrSlipClaimedInFlight)
+		assert.ErrorIs(t, err, slippy.ErrSlipClaimed)
 
 		got, loadErr := store.Load(ctx, "r1")
 		require.NoError(t, loadErr)
@@ -313,7 +313,7 @@ func TestMockStore_ResetSlipInPlace(t *testing.T) {
 		assert.Equal(t, slippy.StepStatusRunning, got.Steps["builds"].Status)
 	})
 
-	t.Run("claimed and quiescent: reset, with the claim and its claimant carried", func(t *testing.T) {
+	t.Run("claimed and quiescent: refused, nothing written", func(t *testing.T) {
 		store := NewMockStore()
 		store.AddSlip(&slippy.Slip{
 			CorrelationID: "r2", Repository: "o/r", CommitSHA: "s-r2", Status: slippy.SlipStatusFailed,
@@ -321,11 +321,14 @@ func TestMockStore_ResetSlipInPlace(t *testing.T) {
 		_, err := store.ClaimSlip(ctx, "r2", nil, "pushhookparser/rerunner", "")
 		require.NoError(t, err)
 
-		require.NoError(t, store.ResetSlipInPlace(ctx, successor("r2")))
+		resetErr := store.ResetSlipInPlace(ctx, successor("r2"))
+		require.Error(t, resetErr, "a claim with no step reported yet is a queued run, not an absent one")
+		assert.ErrorIs(t, resetErr, slippy.ErrSlipClaimed)
+
 		got, loadErr := store.Load(ctx, "r2")
 		require.NoError(t, loadErr)
-		assert.Equal(t, slippy.SlipStatusPending, got.Status, "the row is live again")
-		assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom, "claimed_from survives the upsert")
+		assert.Equal(t, slippy.SlipStatusFailed, got.Status, "the refused reset left the row as it was")
+		assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom, "claimed_from untouched")
 		marker := 0
 		actor := ""
 		for _, e := range got.StateHistory {
@@ -334,8 +337,8 @@ func TestMockStore_ResetSlipInPlace(t *testing.T) {
 				actor = e.Actor
 			}
 		}
-		assert.Equal(t, 1, marker, "and the marker goes with it, or the two readers disagree")
-		assert.Equal(t, "pushhookparser/rerunner", actor, "naming the recorded claimant, not the library")
+		assert.Equal(t, 1, marker, "exactly the marker the claim wrote; nothing added, nothing carried")
+		assert.Equal(t, "pushhookparser/rerunner", actor, "still naming the original claimant")
 	})
 
 	t.Run("unclaimed: reset however its steps read", func(t *testing.T) {

@@ -779,16 +779,19 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// guard would only add handlePushRetry's write to the cases the guard handles read-only
 		// today, which is the wrong direction.
 		//
-		// A SELF-CORRELATION row is carved out, the same exclusion the empty-run guard makes
-		// and for the same reason: when the existing row already carries THIS push's id there
-		// is no other run's work to protect — it is this delivery's own retry — and returning
-		// it would hand the caller returned == sent on an ENDED row, so it dispatches and then
-		// reports against a terminal slip. It falls through to persistSlipForPush's
-		// self-referential arm, which resets the row live again through
-		// SlipStore.ResetSlipInPlace; Create's SET list excludes claimed_from, so that reset
-		// keeps the claim, and the store re-states the slip_claimed marker — with the ORIGINAL
-		// claimant's actor, read off the row it has LOCKED — so neither the column nor the
-		// claimant's identity is lost (ResetClaimMarker).
+		// A SELF-CORRELATION row falls through here rather than deduping at this gate, because
+		// returning it would hand the caller returned == sent on an ENDED row, so the caller
+		// dispatches and then reports against a terminal slip. It reaches
+		// persistSlipForPush's self-referential arm, which asks SlipStore.ResetSlipInPlace to
+		// decide under the row lock.
+		//
+		// WHAT IT DOES NOT MEAN is "this delivery's own retry, so there is nothing to protect"
+		// — the premise this comment used to state (PR #87 review). The rerunner adopts the
+		// slip it looked up and claims under the ORIGINAL push's correlation ID, and the CLI
+		// pre-job claims the slip its workflow was dispatched for, so a self-correlated row is
+		// routinely held by someone else's run. The store is what settles it: it refuses the
+		// reset on ANY claim under the lock, and this push then deduplicates onto the live
+		// row. Falling through costs one round trip and never a rewrite.
 		//
 		// THE CARVE-OUT IS ITSELF CARVED OUT WHEN THE RUN IS IN FLIGHT (finding p1). "No other
 		// run's work to protect" holds only while nothing is executing. Create's ON CONFLICT
@@ -816,7 +819,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//
 		// Neither one decides the outcome any more. The write those arms reach is
 		// SlipStore.ResetSlipInPlace, which re-reads the row FOR UPDATE, evaluates RunInFlight
-		// on THAT read and either upserts or refuses with ErrSlipClaimedInFlight, inside the
+		// on THAT read and either upserts or refuses with ErrSlipClaimed, inside the
 		// transaction the upsert itself lands in. The refusal comes back as a dedup onto the
 		// live row (resetSlipInPlace), and a claim taken during the window has its marker
 		// re-stated from the locked row, so claimed_from and slip_claimed stay both-present-
@@ -1031,7 +1034,7 @@ func (c *Client) persistSlipForPush(
 	// 2). The write below is SlipStore.ResetSlipInPlace, which re-reads the row FOR UPDATE,
 	// evaluates RunInFlight on that locked read and either upserts or refuses inside one
 	// transaction. A claim taken during the window is seen; a step started during the window
-	// is seen; and a refusal comes back as ErrSlipClaimedInFlight, which resetSlipInPlace turns
+	// is seen; and a refusal comes back as ErrSlipClaimed, which resetSlipInPlace turns
 	// into a dedup onto the live row rather than a failed push. The claim marker is re-stated
 	// from the locked row too, so claimed_from and slip_claimed stay both-present-or-both-absent
 	// even for a claim this push never saw — which is why appendResetMarker no longer carries
@@ -1116,11 +1119,10 @@ func (c *Client) persistSlipForPush(
 // changed is WHO can tell. This function only ever saw `prior` — a snapshot LoadByCommit took
 // before resolveAndAbandonAncestors' GitHub round trips — so it could re-state a claim the
 // snapshot had already recorded and nothing else. The reachable half of the race is a claim
-// taken AFTER that read, which no snapshot can show; carrying the marker from here was
-// therefore a fix for the half that was never the problem. SlipStore.ResetSlipInPlace re-states
-// the marker from the row it has locked, which is the only evidence that cannot be stale, and
-// it names the recorded claimant through the shared ResetClaimMarker. Appending here as well
-// would now write the marker twice on the common path.
+// taken AFTER that read, which no snapshot can show. That half is now settled by refusal rather
+// than by carrying anything: SlipStore.ResetSlipInPlace refuses the reset outright when the row
+// it locked is claimed, so a reset only ever writes onto an UNCLAIMED row and there is no claim
+// marker for either layer to carry.
 //
 // What is left is one marker about one fact this function does own: the prior attempt's STATUS,
 // which belongs to the row the push decided against and is audit, not an invariant. prior is
@@ -1131,14 +1133,28 @@ func (c *Client) persistSlipForPush(
 // because this file asserts in two places that those paths converge on the same outcome for the
 // same inputs, and a marker written by only one of them is a divergence on the very observable
 // that exists to make the state legible.
+// Idempotent per successor: the main arm appends this marker and then, on ErrDuplicateSlip,
+// hands the SAME *Slip to handleDuplicateSlipBackstop, whose self-referential arm resets again
+// — so without this guard one push could record two "reset in place" entries for one row
+// (PR #87 review, jhicks). ResetSlipInPlace guards the analogous case for the claim marker by
+// cloning before it appends; this one is appended by the push layer, so the guard belongs here.
+// resetMarkerMessagePrefix is the stable head of the reset marker's message. It is a constant
+// so the idempotence check below and the message itself cannot drift apart.
+const resetMarkerMessagePrefix = "reset in place after "
+
 func appendResetMarker(slip, prior *Slip, commitSHA string) {
+	for _, e := range slip.StateHistory {
+		if e.Step == PushParsedStep && strings.HasPrefix(e.Message, resetMarkerMessagePrefix) {
+			return
+		}
+	}
 	slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
 		Step:      PushParsedStep,
 		Status:    StepStatusRunning,
 		Timestamp: time.Now(),
 		Actor:     LibraryActor,
-		Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
-			prior.Status, shortSHA(commitSHA)),
+		Message: fmt.Sprintf("%s%s attempt for commit %s",
+			resetMarkerMessagePrefix, prior.Status, shortSHA(commitSHA)),
 	})
 }
 
@@ -1196,9 +1212,30 @@ func (c *Client) resetSlipInPlace(
 	switch {
 	case resetErr == nil:
 		c.writeAncestryLink(ctx, slip, parent, result)
+		// RELOADED for the same reason the refusal arm below reloads: the value the caller
+		// holds is not the row that was written (PR #87 review, pkuzmenko). ResetSlipInPlace
+		// upserts through createTx, whose SET list omits claimed_from, and it may append to a
+		// history the caller's copy does not carry — so returning the caller's Slip reports a
+		// state known to be incomplete. Slip.ClaimedFrom is `omitempty`, so an unreloaded
+		// value drops the field from the 201 entirely, and this PR tells callers to gate their
+		// dispatch on exactly that field plus the step evidence in the body they already hold.
+		//
+		// Best-effort: the write is committed either way, so a failed reload must not fail the
+		// push. The caller's value is left in place and the warning says why it may be thin.
+		live, loadErr := c.store.Load(ctx, slip.CorrelationID)
+		if loadErr != nil {
+			c.logger.Warn(ctx, "In-place reset committed but the reload failed; "+
+				"the returned slip may understate the row's claim and history",
+				map[string]interface{}{
+					"correlation_id": slip.CorrelationID,
+					"error":          loadErr.Error(),
+				})
+			return false, nil //nolint:nilerr // best-effort: the reset is committed, so a failed reload must not fail the push
+		}
+		*slip = *live
 		return false, nil
 
-	case errors.Is(resetErr, ErrSlipClaimedInFlight):
+	case errors.Is(resetErr, ErrSlipClaimed):
 		c.logger.Info(ctx, "In-place reset refused under the row lock: a claimant's run is in flight; deduping",
 			map[string]interface{}{
 				"correlation_id": slip.CorrelationID,

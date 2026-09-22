@@ -225,8 +225,8 @@ var reservedStepNames = func() map[string]struct{} {
 	return reserved
 }()
 
-// validateStepIdentifier rejects the four step-name shapes that pass exact-case uniqueness and then
-// break the SCHEMA the config generates. All five are caught here, in the config, rather than in
+// validateStepIdentifier rejects the five step-name shapes that pass exact-case uniqueness and
+// then break either the SCHEMA the config generates or the claim's audit record. All five are caught here, in the config, rather than in
 // PostgresStore.ProbeSchema: the probe folds case when it diffs the live catalogue against
 // slipSelectColumns(), which is correct for the probe — Postgres folded the DDL, so a configured
 // `Deploy_Dev` legitimately lands as `deploy_dev` — but that folding also hides these faults
@@ -271,7 +271,7 @@ var reservedStepNames = func() map[string]struct{} {
 //     step with stepColumnEnsurer — an identifier it does not return is one nothing checks.
 //   - A NAME THAT IS ONE OF THE LIBRARY'S OWN state_history MARKERS. Unlike the four above this
 //     one breaks no SQL: it is caught here because it forges or suppresses the claim's audit
-//     record, which claimantFromHistory and pushhookparser's ClaimedBy both derive by scanning
+//     record, which pushhookparser's ClaimedBy derives by scanning state_history backwards
 //     for those names. See reservedMarkerSteps for the set and for why PushParsedStep is
 //     deliberately NOT in it, and ErrReservedStepName for what a marker-named entry costs a
 //     reader. The same names are refused on the caller-supplied WRITE paths by
@@ -318,7 +318,7 @@ func validateStepIdentifier(step StepConfig, claimed map[string]string) error {
 	if reservedMarkerStep(name) {
 		return fmt.Errorf(
 			"step name %q is a state_history marker the library owns (%s and %s): "+
-				"claimantFromHistory and pushhookparser's ClaimedBy both derive who holds a claim "+
+				"pushhookparser's ClaimedBy derives who holds a claim "+
 				"by scanning for these names, so a step reporting under one would forge or "+
 				"suppress that signal: %w",
 			name, ClaimMarkerStep, ReleaseMarkerStep, ErrReservedStepName)

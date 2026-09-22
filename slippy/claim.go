@@ -45,16 +45,41 @@ func clampActor(actor string) string {
 	return clampRunes(actor, MaxMarkerActorLen)
 }
 
-// clampRunes truncates s to limit runes, marking the cut with an ellipsis.
+// maxMarkerFieldBytes is the byte ceiling a single clamped marker field may contribute to
+// state_history, independent of its rune bound.
 //
-// Rune-based rather than byte-based on purpose: state_history is a jsonb column, so a cut that
-// lands mid-rune produces invalid UTF-8 and fails at marshal rather than truncating gracefully.
+// Both bounds are needed and neither implies the other (PR #87 review, jhicks). The rune bound
+// is what makes the cut safe — state_history is jsonb, so a cut landing mid-rune produces
+// invalid UTF-8 and fails at marshal rather than truncating gracefully. But runes are not the
+// metric the column is sized in: 512 runes of 4-byte UTF-8 is ~2 KB, so a rune bound alone does
+// not deliver the "cannot grow state_history without limit" guarantee MaxMarkerReasonLen's doc
+// states. clampRunes therefore cuts on a rune boundary and keeps cutting until the result fits
+// this many bytes.
+//
+// 1 KiB is chosen to sit above the worst case for the bounds actually in use (512 ASCII runes
+// of reason plus 128 of actor) so no realistic caller is truncated by it, while still capping
+// the pathological all-4-byte case at something the column can absorb.
+const maxMarkerFieldBytes = 1024
+
+// clampRunes truncates s to limit runes AND to maxMarkerFieldBytes bytes, marking the cut with
+// an ellipsis. It always cuts on a rune boundary.
+//
+// Rune boundaries rather than byte offsets on purpose: state_history is a jsonb column, so a
+// cut that lands mid-rune produces invalid UTF-8 and fails at marshal rather than truncating
+// gracefully. The byte ceiling is applied by dropping whole runes, never by slicing bytes.
 func clampRunes(s string, limit int) string {
-	if utf8.RuneCountInString(s) <= limit {
+	if utf8.RuneCountInString(s) <= limit && len(s) <= maxMarkerFieldBytes {
 		return s
 	}
 	runes := []rune(s)
-	return string(runes[:limit-1]) + "…"
+	if len(runes) > limit {
+		runes = runes[:limit-1]
+	}
+	// The ellipsis is itself 3 bytes, so the budget it has to fit inside is that much smaller.
+	for len(string(runes)) > maxMarkerFieldBytes-len("…") {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
 }
 
 // ClaimMarker builds the adoption history entry every caller writes, so the marker's shape
@@ -90,54 +115,17 @@ func ClaimMarker(prior SlipStatus, claimedBy, reason string) StateHistoryEntry {
 // MaxMarkerReasonLen's own doc says it holds, for the direct caller it names.
 //
 // The empty case matters more than the long one. Actor is overloaded as the claim's PRESENCE
-// signal: claimantFromHistory returns the newest claim marker's Actor, and returns "" both for
-// "no claim marker" and for "a release follows it" — the same derivation pushhookparser makes
-// for its ClaimedBy. So an empty actor would set claimed_from while reading UNCLAIMED to the
+// signal: pushhookparser derives its ClaimedBy by scanning state_history backwards and taking
+// the newest claim marker's Actor, answering "" both for "no claim marker" and for "a release
+// follows it". So an empty actor would set claimed_from while reading UNCLAIMED to the
 // marker reader, which is the column-present/marker-absent direction the reset path goes to
-// some length to avoid. LibraryActor is the same honest fallback ResetClaimMarker already uses.
+// some length to avoid. LibraryActor is honest rather than a placeholder: a caller that named
+// nobody really was the library, as far as any later reader can tell.
 func markerActor(actor string) string {
 	if actor = clampActor(actor); actor == "" {
 		return LibraryActor
 	}
 	return actor
-}
-
-// claimantFromHistory returns the actor of the most recent ClaimMarkerStep entry in entries,
-// or "" when there is none or when a ReleaseMarkerStep entry follows the most recent claim.
-//
-// It is deliberately the SAME derivation pushhookparser makes for its ClaimedBy
-// (claimedBy in pkg/slippy/http_client.go: scan backwards, a claim marker answers, a release
-// marker answers ""), because the only reason this library reads the markers is to hand that
-// reader back what a state_history rewrite would otherwise have cost it. A different reading
-// here would restore a marker naming someone the parser never saw.
-//
-// THE PARITY IS WITH pushhookparser#55, NOT WITH ITS MAIN (PR #87 review, pkuzmenko). That
-// branch's claimedBy switches on both markers; main's scans for the claim marker only and has
-// no concept of a release, so against main the release arm here is a DIVERGENCE rather than a
-// match. The two converge when the train lands, which is the same ordering SlipStore.ClaimSlip
-// documents for the claim itself.
-//
-// Worth knowing which way the divergence points while it lasts, because it is the safe one: a
-// row whose history ends in a release after its last claim reads unclaimed HERE and still
-// names the original claimant THERE, so the parser is the more conservative of the two and
-// keeps its cleanup exemption a little longer than this library would. No path produces that
-// row anyway — ReleaseClaim clears claimed_from and appends the marker in one transaction, a
-// re-claim appends a newer claim marker the backwards scan hits first, appendResetMarkers
-// returns early on an empty ClaimedFrom, and a repaved successor starts with no history.
-//
-// Not exported: the derivation belongs to whoever owns the markers, and a consumer that needs
-// the claimant reads claimed_from plus its own history scan rather than a second library
-// entry point that could drift from the parser's.
-func claimantFromHistory(entries []StateHistoryEntry) string {
-	for i := len(entries) - 1; i >= 0; i-- {
-		switch entries[i].Step {
-		case ClaimMarkerStep:
-			return entries[i].Actor
-		case ReleaseMarkerStep:
-			return ""
-		}
-	}
-	return ""
 }
 
 // ReleaseMarker builds the release history entry. status is the slip's status at release,
@@ -525,74 +513,57 @@ func DecideRelease(slip *Slip) (release bool, err error) {
 // DecideReset is the in-place reset decision, shared by PostgresStore.ResetSlipInPlace and
 // both test doubles so the three cannot drift, exactly as DecideClaim and DecideRelease are.
 // claimedFrom is the target row's recorded claim ("" when unclaimed) and inFlight the evidence
-// RunInFlight read from the SAME locked row — both of them read under the FOR UPDATE that the
-// upsert then lands beneath, which is the whole reason this decision exists as a store
-// operation rather than as a push-side branch on an unlocked snapshot (DEVOPS-367).
+// RunInFlight read from the SAME locked row — both read under the FOR UPDATE that the upsert
+// then lands beneath, which is the whole reason this decision exists as a store operation
+// rather than as a push-side branch on an unlocked snapshot (DEVOPS-367).
 //
-// Two outcomes:
+// THE RULE, in one sentence: an in-place reset is allowed only onto an UNCLAIMED row.
 //
-//   - REFUSED, ErrSlipClaimedInFlight, when the row is claimed and something of that claim's
-//     run is running or held. The reset is Create's ON CONFLICT arm, which rewrites every step
-//     and aggregate column and the whole state history; performing it would destroy the state
-//     that run is writing, under an unchanged correlation ID, leaving an operator no way to
-//     tell which attempt wrote what. The caller deduplicates onto the live row instead.
+//   - ALLOWED when claimedFrom is empty. Nobody holds the row, so there is no other run's
+//     state for the upsert to destroy.
 //
-//   - ALLOWED otherwise, and carryClaim reports whether the store must re-state the claim in
-//     the history it is about to overwrite. It is true exactly when the locked row is claimed
-//     and quiescent: claimed_from SURVIVES the upsert (it is absent from slipColumns(), so
-//     neither the INSERT list nor the conflict arm's SET list names it) while state_history
-//     does NOT (ColumnStateHistory is in that list), so a reset that wrote nothing back would
-//     leave the column set with the slip_claimed marker gone. pushhookparser derives "who
-//     claimed this" from the markers and gates its stranded-cleanup exemption on it, so that
-//     row would read claimed to slippy and unclaimed to the parser. Create's contract states
-//     the invariant this keeps: claimed_from and slip_claimed are both present or both absent.
+//   - REFUSED, ErrSlipClaimed, whenever the row is claimed — whether or not anything of that
+//     claim's run is running yet. The reset is Create's ON CONFLICT arm, which rewrites every
+//     step and aggregate column and the whole state history; performing it would destroy the
+//     state that run is about to write, under an unchanged correlation ID, leaving an operator
+//     no way to tell which attempt wrote what. The caller deduplicates onto the live row.
 //
-// inFlight is a bool rather than the *Slip it came from for DecideClaim's reason: the store
-// evaluates RunInFlight once on the locked read, and a table test of this decision is four
-// rows of scalars rather than four slip literals.
+// THE QUIESCENT CLAIM USED TO BE ALLOWED, and that was the bug (PR #87 review, pkuzmenko).
+// The carve-out's premise was that a row carrying THIS push's correlation ID must be this
+// delivery's own retry, so there was no other run's work to protect. That does not hold: the
+// rerunner adopts the slip it looked up and claims under the ORIGINAL push's correlation ID
+// (pushhookparser#55 sets correlationID = lookup.CorrelationID), and the Slippy CLI pre-job
+// claims the slip its workflow was dispatched for. So a self-correlated row is routinely
+// claimed by SOMEONE ELSE'S run.
 //
-// An UNCLAIMED row is never refused, whatever its steps say. That is deliberate and is the
-// same line the push arms draw: an unclaimed row has no other run to protect, and the caller
-// reaching this operation is resetting its OWN correlation ID — its in-delivery retry — so
-// there is nobody else's work to destroy. Widening the refusal to any in-flight row would
-// change which pushes converge, which is not what this decision is for.
-func DecideReset(claimedFrom SlipStatus, inFlight bool) (carryClaim bool, err error) {
+// The window was not a race either. A claim records no step: the claimant's status stays where
+// it was until its first post-job, and RunInFlight stays false for the whole time its workflow
+// sits in the queue. A redelivery of the original push landing in that window found
+// claimed && !inFlight, was allowed, and reset every step, aggregate and the history of a run
+// that was already dispatched.
+//
+// inFlight is therefore no longer part of the DECISION, and is kept only so the refusal can
+// tell an operator which shape it refused. Keeping the parameter also means a third-party
+// store that already routes through this function does not have to change its call.
+//
+// This aligns the three encodings of "claimed means protected" that used to disagree:
+// slipUnclaimedSQL refuses on a set claimed_from full stop, Repave's guard does the same, and
+// this now matches them. The remaining difference is CreateSlipForPush's dedup gate, which
+// lets a self-correlated claimed row fall through to here rather than deduping at the push
+// layer — that is a round trip, not a divergence, because this refusal sends it to the same
+// dedup.
+func DecideReset(claimedFrom SlipStatus, inFlight bool) error {
 	if claimedFrom == "" {
-		return false, nil
+		return nil
 	}
 	if inFlight {
-		return false, fmt.Errorf(
+		return fmt.Errorf(
 			"a step or component is in flight under the claim taken out of %s: %w",
-			claimedFrom, ErrSlipClaimedInFlight)
+			claimedFrom, ErrSlipClaimed)
 	}
-	return true, nil
-}
-
-// ResetClaimMarker builds the claim marker an in-place reset re-states, for a row whose
-// recorded claim is claimedFrom and whose own state history is priorHistory. It is exported
-// for the same reason DecideReset is: the store and both test doubles must write the identical
-// marker, or a consumer's assertion about a reset row would pass against a double and fail
-// against Postgres.
-//
-// The actor is the ORIGINAL claimant, read off the prior row's history by the same backwards
-// scan pushhookparser makes, because the reader this marker exists for derives ClaimedBy from
-// the marker's actor: writing the library's own actor would restore the row's stranded-cleanup
-// exemption while renaming its adopter (PR #87, jhicks review). LibraryActor is the fallback,
-// and it is honest rather than a placeholder — a row whose claimed_from is set with no marker
-// left to read has no claimant recorded anywhere to name, and the invariant needs the marker's
-// PRESENCE. The library really is what wrote it. That fallback now lives in markerActor, which
-// ClaimMarker applies to EVERY claim marker rather than to this one path, so a reset and a
-// fresh claim cannot disagree about what an unnameable claimant is called.
-//
-// claimantFromHistory stays unexported behind this: what a third-party store needs is the
-// marker a reset must write, not a second general entry point for "who claimed this" that
-// could drift from the parser's own derivation.
-func ResetClaimMarker(claimedFrom SlipStatus, priorHistory []StateHistoryEntry) StateHistoryEntry {
-	return ClaimMarker(
-		claimedFrom,
-		claimantFromHistory(priorHistory),
-		"carried forward across an in-delivery retry reset",
-	)
+	return fmt.Errorf(
+		"the row is claimed out of %s; its run has not reported a step yet, which is not "+
+			"evidence that nothing was dispatched: %w", claimedFrom, ErrSlipClaimed)
 }
 
 // ClaimSlip records that a run is in flight against a slip, so a same-commit push

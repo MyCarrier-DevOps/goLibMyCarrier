@@ -700,6 +700,10 @@ func (s *ClickHouseStore) UpdateStep(
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
+	if err := GuardReservedStepWrite(stepName, nil); err != nil {
+		return err
+	}
+
 	// Capture the write timestamp before the INSERT so the overlay uses the
 	// same logical time as the row being written (within clock granularity).
 	//
@@ -767,6 +771,10 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	status StepStatus,
 	entry StateHistoryEntry,
 ) error {
+	if err := GuardReservedStepWrite(stepName, &entry); err != nil {
+		return err
+	}
+
 	// Capture the write timestamp before the INSERT so the overlay uses the
 	// same logical time as the row being written (within clock granularity).
 	//
@@ -895,6 +903,10 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 // This prevents a concurrent step-status update from being overwritten in the
 // routing_slips cache by an in-flight AppendHistory that loaded a stale snapshot.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
+	if err := GuardReservedStepWrite("", &entry); err != nil {
+		return err
+	}
+
 	return s.appendHistoryWithOverrides(ctx, correlationID, entry)
 }
 

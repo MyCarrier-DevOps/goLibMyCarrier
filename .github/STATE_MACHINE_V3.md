@@ -451,13 +451,15 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     even while steps are still running, and both are repaveable — an ancestor abandon or a
     promotion deliberately overrides a live claim.
 
-    **"Quiescent" means under the row lock the reset itself takes** (DEVOPS-367, PR #87,
-    closing pkuzmenko finding 2). The reset is `SlipStore.ResetSlipInPlace`, one transaction
-    that re-reads the target row `FOR UPDATE`, evaluates `RunInFlight` on **that** read through
-    the shared `DecideReset`, and either performs the upsert or refuses with
-    `ErrSlipClaimedInFlight` having written nothing; the re-stated `slip_claimed` marker is
-    built from the locked row's own history, so it names the recorded claimant even for a claim
-    the push never read. It replaced a bare `Create` — an unlocked upsert — gated on an
+    **A reset writes only onto an UNCLAIMED row, decided under the row lock the reset itself
+    takes** (DEVOPS-367, PR #87). The reset is `SlipStore.ResetSlipInPlace`, one transaction
+    that re-reads the target row `FOR UPDATE`, runs the shared `DecideReset`, and either
+    performs the upsert or refuses with `ErrSlipClaimed` having written nothing. The refusal
+    covers a quiescent claim as well as an in-flight one: a claim records no step until its
+    run's first post-job, so a claimed row with nothing running is a dispatched run sitting in
+    the queue, not an absent one. Allowing that case let a redelivery wipe a live rerun, because
+    the rerunner claims under the ORIGINAL push's correlation ID and so a self-correlated row is
+    routinely someone else's. It replaced a bare `Create` — an unlocked upsert — gated on an
     unlocked `LoadByCommit`, with `resolveAndAbandonAncestors`' GitHub round trips in between:
     a row read unclaimed and quiescent could be claimed and start executing in that window, and
     the upsert then kept `claimed_from`, replaced `state_history` (leaving the column set with

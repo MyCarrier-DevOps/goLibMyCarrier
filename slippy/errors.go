@@ -166,9 +166,9 @@ var (
 	// ErrReservedStepName indicates a caller tried to write a state_history entry under a step
 	// name the LIBRARY owns: ClaimMarkerStep or ReleaseMarkerStep.
 	//
-	// Neither is a pipeline step. The two ARE the claim's audit record — claimantFromHistory
-	// scans backwards for them, and pushhookparser derives its ClaimedBy by the identical rule
-	// against the same wire strings — so a caller-supplied entry under either does not merely
+	// Neither is a pipeline step. The two ARE the claim's audit record — pushhookparser derives
+	// its ClaimedBy by scanning state_history backwards for them, against these exact wire
+	// strings — so a caller-supplied entry under either does not merely
 	// add a confusing row: it forges or suppresses the signal a different repository gates an
 	// irreversible write on. A `slip_released` entry appended after a genuine claim makes a
 	// still-claimed row read UNCLAIMED to that reader, which is the
@@ -184,10 +184,10 @@ var (
 	// It is returned by the caller-supplied write paths only — UpdateStep, UpdateStepWithHistory,
 	// UpdateComponentStatus and AppendHistory. The library's OWN marker writes (ClaimSlip,
 	// ReleaseClaim, and the push path's push_parsed bookkeeping) construct their entries
-	// internally and are unaffected, which is the distinction reservedMarkerStepFor draws.
+	// internally and are unaffected, which is the distinction GuardReservedStepWrite draws.
 	ErrReservedStepName = errors.New("step name is reserved by the slippy library")
 
-	// ErrSlipClaimedInFlight is returned by SlipStore.ResetSlipInPlace when the row it locked
+	// ErrSlipClaimed is returned by SlipStore.ResetSlipInPlace when the row it locked
 	// is claimed AND a step or component of that claim's run is running or held. The reset is
 	// an upsert that rewrites every step and aggregate column and the whole state history, so
 	// performing it would destroy the state that run is still writing, under an unchanged
@@ -199,7 +199,7 @@ var (
 	// both in-place reset arms deduplicate onto the live row instead of failing the push
 	// (DEVOPS-367). Callers detect it with errors.Is; the reloaded row carries claimed_from
 	// and the step evidence a caller needs to decide whether to dispatch.
-	ErrSlipClaimedInFlight = errors.New(
+	ErrSlipClaimed = errors.New(
 		"slip is claimed and its run has work in flight; the in-place reset was refused")
 
 	// ErrResetUnsupported indicates the store cannot perform the locked in-place reset at

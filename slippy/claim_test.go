@@ -81,17 +81,38 @@ func TestReleaseMarker_RecordsStatusAndReason(t *testing.T) {
 
 // A caller-supplied reason is bounded so state_history cannot grow without limit through the
 // markers; slippy-api enforces the same bound on its bodies, this is the library's own.
+// The reason is bounded on BOTH metrics: runes, so the cut is always on a rune boundary and
+// state_history stays valid UTF-8, and bytes, because runes are not the metric the column is
+// sized in (PR #87 review, jhicks). Either bound may be the binding one depending on the
+// content, which is the point — a rune bound alone lets 512 four-byte runes through as ~2 KB.
 func TestMarkers_ClampTheReason(t *testing.T) {
-	long := strings.Repeat("é", MaxMarkerReasonLen+40)
-	claim := ClaimMarker(SlipStatusFailed, "a", long)
-	release := ReleaseMarker(SlipStatusFailed, "a", long)
-	for _, m := range []string{claim.Message, release.Message} {
-		reason := m[strings.Index(m, ": ")+2:]
-		assert.Len(t, []rune(reason), MaxMarkerReasonLen, "clamped to MaxMarkerReasonLen runes")
-		assert.True(t, strings.HasSuffix(reason, "…"), "the cut is marked")
+	for _, tc := range []struct {
+		name string
+		char string
+	}{
+		{"ascii", "x"},
+		{"two-byte runes", "é"},
+		{"four-byte runes", "😀"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			long := strings.Repeat(tc.char, MaxMarkerReasonLen+40)
+			for _, m := range []string{
+				ClaimMarker(SlipStatusFailed, "a", long).Message,
+				ReleaseMarker(SlipStatusFailed, "a", long).Message,
+			} {
+				reason := m[strings.Index(m, ": ")+2:]
+				assert.True(t, utf8.ValidString(reason), "never cut mid-rune: state_history is jsonb")
+				assert.LessOrEqual(t, utf8.RuneCountInString(reason), MaxMarkerReasonLen,
+					"within the rune bound")
+				assert.LessOrEqual(t, len(reason), maxMarkerFieldBytes, "and within the byte ceiling")
+				assert.True(t, strings.HasSuffix(reason, "…"), "the cut is marked")
+			}
+		})
 	}
+
 	exact := strings.Repeat("x", MaxMarkerReasonLen)
-	assert.True(t, strings.HasSuffix(ClaimMarker(SlipStatusFailed, "a", exact).Message, exact), "at the bound, untouched")
+	assert.True(t, strings.HasSuffix(ClaimMarker(SlipStatusFailed, "a", exact).Message, exact),
+		"at the bound, untouched")
 }
 
 // Neither marker may name a real pipeline step, or an aggregate or phase reader would take
@@ -572,49 +593,53 @@ func TestDecideRelease(t *testing.T) {
 
 // DecideReset is the whole of the in-place reset decision, shared by PostgresStore and both
 // doubles. Four rows because there are exactly two inputs, and each row states what a caller
-// does with the answer: the claimed+in-flight row is the ONLY refusal, and carryClaim is the
-// obligation to re-state the slip_claimed marker in the history the upsert is about to replace.
+// does with the answer: the reset is allowed onto an UNCLAIMED row and refused onto a claimed
+// one, whether or not that claim's run has reported a step yet.
+//
+// The claimed+quiescent row is the one that changed (PR #87 review, pkuzmenko). It used to be
+// allowed, on the premise that a row carrying this push's own correlation ID could only be
+// this delivery's retry — but the rerunner claims under the ORIGINAL push's id, so that row is
+// routinely someone else's dispatched run, and a claim reports no step until its first
+// post-job. The old arm reset every step, aggregate and the history of a live rerun.
 func TestDecideReset(t *testing.T) {
 	tests := []struct {
 		name        string
 		claimedFrom SlipStatus
 		inFlight    bool
-		wantCarry   bool
 		wantRefusal bool
 		why         string
 	}{
 		{
 			name: "unclaimed and quiescent", claimedFrom: "", inFlight: false,
-			wantCarry: false, wantRefusal: false,
-			why: "the ordinary in-delivery retry: reset, and there is no claim to carry",
+			wantRefusal: false,
+			why:         "the ordinary in-delivery retry: nobody holds the row, so reset it",
 		},
 		{
 			name: "unclaimed with work in flight", claimedFrom: "", inFlight: true,
-			wantCarry: false, wantRefusal: false,
-			why: "an unclaimed row has no other run to protect; the caller is resetting its own id",
+			wantRefusal: false,
+			why:         "an unclaimed row has no other run to protect; the caller is resetting its own id",
 		},
 		{
 			name: "claimed and quiescent", claimedFrom: SlipStatusFailed, inFlight: false,
-			wantCarry: true, wantRefusal: false,
-			why: "nothing to destroy, so the reset proceeds — and the marker must go with the column",
+			wantRefusal: true,
+			why: "a claim with no step reported yet is a run that was dispatched and is queued, " +
+				"not an absent run; resetting would wipe it before it reports",
 		},
 		{
 			name: "claimed with work in flight", claimedFrom: SlipStatusFailed, inFlight: true,
-			wantCarry: false, wantRefusal: true,
-			why: "the upsert would rewrite the state that run is writing, under an unchanged id",
+			wantRefusal: true,
+			why:         "the upsert would rewrite the state that run is writing, under an unchanged id",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			carry, err := DecideReset(tc.claimedFrom, tc.inFlight)
+			err := DecideReset(tc.claimedFrom, tc.inFlight)
 			if tc.wantRefusal {
 				require.Error(t, err, tc.why)
-				assert.ErrorIs(t, err, ErrSlipClaimedInFlight)
-				assert.False(t, carry, "a refusal writes nothing, so there is nothing to carry")
+				assert.ErrorIs(t, err, ErrSlipClaimed)
 				return
 			}
 			require.NoError(t, err, tc.why)
-			assert.Equal(t, tc.wantCarry, carry, tc.why)
 		})
 	}
 }
@@ -699,56 +724,6 @@ func TestDecideRelease_ReadsOnlyClaimStateFields(t *testing.T) {
 			assert.Equal(t, fullRelease, bareRelease, "DecideRelease must read nothing outside claimStateColumns()")
 			assert.Equal(t, fullErr, bareErr)
 			assert.Equal(t, RunInFlight(tc.full), RunInFlight(bare), "nor may RunInFlight")
-		})
-	}
-}
-
-// claimantFromHistory is the derivation pushhookparser makes for its ClaimedBy, reproduced
-// here so the claim marker an in-delivery retry reset re-appends can name the ORIGINAL
-// claimant rather than the library (PR #87, jhicks review). The cases that matter are the
-// ordering ones: a release after the most recent claim means unclaimed, and a claim after a
-// release means claimed again.
-func TestClaimantFromHistory(t *testing.T) {
-	claim := func(actor string) StateHistoryEntry {
-		return StateHistoryEntry{Step: ClaimMarkerStep, Actor: actor}
-	}
-	release := func(actor string) StateHistoryEntry {
-		return StateHistoryEntry{Step: ReleaseMarkerStep, Actor: actor}
-	}
-	step := StateHistoryEntry{Step: "builds", Actor: "post-job"}
-
-	tests := []struct {
-		name    string
-		entries []StateHistoryEntry
-		want    string
-	}{
-		{"no history at all", nil, ""},
-		{"no markers: a claim was never recorded here", []StateHistoryEntry{step, step}, ""},
-		{"one claim: its actor", []StateHistoryEntry{step, claim("slippy-cli/prejob")}, "slippy-cli/prejob"},
-		{
-			"claim then unrelated step entries: still its actor",
-			[]StateHistoryEntry{claim("pushhookparser/rerunner"), step, step},
-			"pushhookparser/rerunner",
-		},
-		{
-			"a release AFTER the claim ends it, as the parser reads it",
-			[]StateHistoryEntry{claim("slippy-cli/prejob"), release("slippy-cli/postjob")},
-			"",
-		},
-		{
-			"claimed again after a release: the newer claim answers",
-			[]StateHistoryEntry{claim("first"), release("first"), claim("second")},
-			"second",
-		},
-		{
-			"two claims with no release between them: the most recent",
-			[]StateHistoryEntry{claim("first"), claim("second")},
-			"second",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, claimantFromHistory(tc.entries))
 		})
 	}
 }
