@@ -158,6 +158,11 @@ jobs:
       # serialises behind a concurrent claim, refuses one taken after the caller's read, carries
       # one that must be carried, and handles the unclaimed and absent rows — the FOR UPDATE race
       # ResetSlipInPlace exists to close, which is exactly what pgxmock cannot exercise.
+      # TestPostgresStore_SatisfiesTheClaimContract_Integration runs the SHARED claim contract
+      # (slippytest.RunClaimContract) against real Postgres. The same cases run against both
+      # test doubles in the unit job, so a divergence between an implementer and the store
+      # fails one job or the other — which is the guard three rounds of PR #87 review had to
+      # do by hand.
       # TestPostgresStore_ProbeSchema_Integration is included for the same reason: it asserts
       # the probe reports ErrSchemaBehind against a real v5 schema AND that Load there fails
       # with the 42703 the probe exists to pre-empt, which only real DDL produces.
@@ -166,7 +171,7 @@ jobs:
         run: |
           go mod download
           go test -tags integration \
-            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry|TestPostgresStore_Claim|TestPostgresStore_ReleaseClaim|TestPostgresStore_ResetSlipInPlace.*_Integration|TestPostgresStore_Create_KeepsAnExistingClaim_Integration|TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration|TestPostgresStore_Update_NeverEndsTheClaim_Integration|TestPostgresStore_ProbeSchema_Integration|TestClaimedFromMigration_V6' \
+            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry|TestPostgresStore_Claim|TestPostgresStore_ReleaseClaim|TestPostgresStore_ResetSlipInPlace.*_Integration|TestPostgresStore_Create_KeepsAnExistingClaim_Integration|TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration|TestPostgresStore_Update_NeverEndsTheClaim_Integration|TestPostgresStore_ProbeSchema_Integration|TestPostgresStore_SatisfiesTheClaimContract_Integration|TestClaimedFromMigration_V6' \
             -count=1 -timeout 10m ./...
 
   lint:

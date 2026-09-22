@@ -849,7 +849,14 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 
 	slip.Status = status
 	if status.IsTerminal() {
-		slip.ClaimedFrom = "" // a terminal status ends the run, so it ends the claim
+		// Ends the claim AND records the release, matching PostgresStore: the marker is what
+		// the claim's readers derive identity from, so clearing the column alone would make
+		// this double disagree with the store about a claimed row's audit trail.
+		if slip.ClaimedFrom != "" {
+			slip.StateHistory = append(slip.StateHistory,
+				ReleaseMarker(status, LibraryActor, "claim ended by a terminal status write"))
+		}
+		slip.ClaimedFrom = ""
 	}
 	return nil
 }

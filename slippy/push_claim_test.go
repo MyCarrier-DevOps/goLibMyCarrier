@@ -182,12 +182,21 @@ func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipIsDedupedNotReset(t 
 	// The store now refuses under the row lock and the push deduplicates onto the live row.
 	assert.Empty(t, store.CreateCalls, "a claimed row is never overwritten by a push")
 	assert.Empty(t, store.RepaveCalls, "a self-repave is still never attempted")
+	assert.Empty(t, store.ResetInPlaceCalls,
+		"and the reset is not even attempted: the gate deduped before resolveAndAbandonAncestors, "+
+			"which would otherwise have abandoned this push's ancestors on behalf of a push that "+
+			"then deduplicates onto someone else's run (PR #87 review, jhicks)")
 
 	got, err := store.Load(ctx, "corr-self")
 	require.NoError(t, err)
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim is untouched")
-	assert.Equal(t, map[string]Step{"builds": {Status: StepStatusFailed}}, got.Steps,
+	assert.Equal(t, StepStatusFailed, got.Steps["builds"].Status,
 		"and so is every step the claimant's run owns")
+	// handlePushRetry runs on this arm and resets push_parsed, which is the library's own
+	// bookkeeping step — RunInFlight ignores it BY NAME, so it can never make the claimant's
+	// run look in flight, and it touches nothing else the claim protects.
+	assert.Equal(t, StepStatusRunning, got.Steps[PushParsedStep].Status,
+		"push_parsed is the one step the claimed arm writes, and it is not the claimant's")
 	assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep),
 		"exactly the marker the claim wrote: nothing carried, because nothing was rewritten")
 	assert.Equal(t, "slippy-cli/prejob", lastHistoryActor(got, ClaimMarkerStep),
@@ -293,8 +302,9 @@ func TestClient_CreateSlipForPush_DuplicateBackstopDedupsASelfCorrelationClaimed
 	require.NotNil(t, result.Slip)
 	assert.Equal(t, "corr-self-backstop", result.Slip.CorrelationID)
 	assert.Len(t, store.CreateCalls, 1, "one Create: the one that lost the race and raised ErrDuplicateSlip")
-	assert.Len(t, store.ResetInPlaceCalls, 1,
-		"the backstop's self-referential arm still goes through the shared reset helper")
+	assert.Empty(t, store.ResetInPlaceCalls,
+		"the backstop's claimed arm now dedups before reaching the self-referential arm, so no "+
+			"reset is attempted at all — it mirrors the main path's gate (PR #87 review, jhicks)")
 	assert.Empty(t, store.RepaveCalls, "and Repave is never asked to supersede a row with itself")
 
 	// The backstop converges on the same answer as the main path (PR #87 review, pkuzmenko):

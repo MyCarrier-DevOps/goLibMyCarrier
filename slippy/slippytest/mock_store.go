@@ -774,7 +774,16 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 
 	slip.Status = status
 	if status.IsTerminal() {
-		// A terminal status ends the run, so it ends the claim (see PostgresStore).
+		// A terminal status ends the run, so it ends the claim — and ending a claim has to be
+		// VISIBLE, because the readers that derive claim identity read the markers, not the
+		// column (see PostgresStore.UpdateSlipStatus). Clearing the column without appending
+		// the release would leave this double reporting claimed_from empty with slip_claimed
+		// still newest: the exact shape GuardReservedStepWrite refuses a caller for forging,
+		// and a divergence from Postgres that a consumer test could not see (PR #87 review).
+		if slip.ClaimedFrom != "" {
+			slip.StateHistory = append(slip.StateHistory,
+				slippy.ReleaseMarker(status, slippy.LibraryActor, "claim ended by a terminal status write"))
+		}
 		slip.ClaimedFrom = ""
 	}
 	return nil

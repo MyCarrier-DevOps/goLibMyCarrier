@@ -819,7 +819,7 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		//
 		// Neither one decides the outcome any more. The write those arms reach is
 		// SlipStore.ResetSlipInPlace, which re-reads the row FOR UPDATE, evaluates RunInFlight
-		// on THAT read and either upserts or refuses with ErrSlipClaimed, inside the
+		// on THAT read and refuses on any claim it finds, with ErrSlipClaimed, inside the
 		// transaction the upsert itself lands in. The refusal comes back as a dedup onto the
 		// live row (resetSlipInPlace), and a claim taken during the window has its marker
 		// re-stated from the locked row, so claimed_from and slip_claimed stay both-present-
@@ -860,8 +860,23 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// without contradicting result.Warnings (see its branches' own comments, DEVOPS-231
 		// D3.2). PR #87 finding 8: the divergence is real and stated here rather than
 		// papered over with a convergence claim the code does not make.
-		if existingSlip.ClaimedFrom != "" &&
-			(existingSlip.CorrelationID != opts.CorrelationID || RunInFlight(existingSlip)) {
+		// A CLAIMED ROW IS DEDUPED, FULL STOP — no self-correlation carve-out and no in-flight
+		// disjunct (PR #87 review, jhicks). Both became vestigial when DecideReset started
+		// refusing on any claim: a self-correlated claimed row could still fall through here,
+		// but the store would refuse the reset and the push would deduplicate anyway.
+		//
+		// Leaving them in was not free, which is why this is a fix and not a tidy-up. The
+		// fall-through runs resolveAndAbandonAncestors first, and that does not merely cost
+		// the GitHub round trips this fast path exists to skip — it ABANDONS every
+		// non-terminal ancestor slip. Under the old carve-out those abandons were legitimate,
+		// because the push went on to reset the row and become the live run for the commit.
+		// Now the reset is refused and the push deduplicates onto someone else's run, having
+		// already written on its own behalf.
+		//
+		// This is also the gate the claim's three encodings finally agree on: slipUnclaimedSQL
+		// and Repave's guard both refuse on a set claimed_from, and so now do this and
+		// DecideReset.
+		if existingSlip.ClaimedFrom != "" {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {
 				return nil, retryErr
@@ -1032,7 +1047,7 @@ func (c *Client) persistSlipForPush(
 	//
 	// THAT STALENESS NO LONGER DECIDES ANYTHING (DEVOPS-367, closing PR #87 pkuzmenko finding
 	// 2). The write below is SlipStore.ResetSlipInPlace, which re-reads the row FOR UPDATE,
-	// evaluates RunInFlight on that locked read and either upserts or refuses inside one
+	// refuses on any claim that locked read finds, and otherwise upserts, inside one
 	// transaction. A claim taken during the window is seen; a step started during the window
 	// is seen; and a refusal comes back as ErrSlipClaimed, which resetSlipInPlace turns
 	// into a dedup onto the live row rather than a failed push. The claim marker is re-stated
@@ -1163,7 +1178,7 @@ func appendResetMarker(slip, prior *Slip, commitSHA string) {
 // outcome this file asserts in two places is shared.
 //
 // It hands the successor to SlipStore.ResetSlipInPlace, which re-reads the target row FOR
-// UPDATE, evaluates RunInFlight on THAT read and either upserts or refuses, all in one
+// UPDATE, refuses on any claim THAT read finds, and otherwise upserts, all in one
 // transaction (DEVOPS-367). The decision is therefore made on evidence that cannot change
 // before the write, which is what neither call site could do for itself: both reached here on
 // an UNLOCKED LoadByCommit taken before resolveAndAbandonAncestors' GitHub round trips, so
@@ -1710,8 +1725,12 @@ func (c *Client) handleDuplicateSlipBackstop(
 		return true, nil
 	}
 
-	if conflicting.ClaimedFrom != "" &&
-		(conflicting.CorrelationID != opts.CorrelationID || RunInFlight(conflicting)) {
+	// Mirrors the main path's gate, which dropped the same two disjuncts: a claimed row is
+	// deduped whatever its correlation ID and whether or not anything is running. The cost
+	// here is lower than on the main path — resolution has already happened by the time the
+	// backstop runs — but the two must agree on the DECISION or identical inputs would take
+	// different arms depending on which path raced first.
+	if conflicting.ClaimedFrom != "" {
 		// A claimant's run holds the conflicting row whatever its status says (DEVOPS-367):
 		// dedup onto it rather than repaving it out from under that run.
 		//

@@ -342,7 +342,11 @@ func (s *PostgresStore) probeChildTables(ctx context.Context) error {
 	return nil
 }
 
-// reports identical sentinels to a standalone one.
+// createTx is Create against an open transaction. Repave uses it so the superseded row's
+// removal and the successor's insert commit or roll back together, and ResetSlipInPlace uses
+// it so the locked claim decision and the upsert it authorises land in one transaction; all
+// three paths go through buildCreateQuery/mapCreateError so a transactional create writes an
+// identical row and reports identical sentinels to a standalone one.
 func (s *PostgresStore) createTx(ctx context.Context, tx pgx.Tx, slip *Slip) error {
 	query, vals, err := s.buildCreateQuery(slip)
 	if err != nil {

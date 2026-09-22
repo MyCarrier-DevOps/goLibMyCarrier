@@ -72,15 +72,16 @@ func fixedSlipColumns() []string {
 //	NO CALLER BUILDS A STEP'S COLUMN NAME BY HAND. Every `<name>_status` and every bare
 //	aggregate column comes from these two helpers, on BOTH backends.
 //
-// Two greps are the check, because the invariant has two clauses and the obvious grep only
-// sees one of them (PR #87 review, pkuzmenko) — the bare aggregate form contains no `_status`
-// literal at all:
+// TestStepColumnConvention_NoNewHandBuiltIdentifiers is the check, and it runs in CI rather
+// than waiting for a reviewer to think of it. It was a pair of greps in the comment here; the
+// second matched five legitimate column-LIST splices, so a reviewer running it could not
+// separate those from a regression (PR #87 review, jhicks) — which is the property that made
+// the first grep worth having in the first place.
 //
-//	grep -rn '%s_status' --include='*.go' slippy/
-//	grep -rnE 'Sprintf\(.*(SELECT|UPDATE|ALTER|SET) .*%s' --include='*.go' slippy/
-//
-// Both should return only error-message text. Those are greps a reviewer can run; a site list
-// is only ever as good as the last edit that remembered to update it.
+// The test keeps both clauses: the `<name>_status` form is checked absolutely, and the bare
+// aggregate form — indistinguishable from a legitimate list splice to a regex — is checked
+// against a named baseline, so a sixth site fails the build until it is either routed through
+// these helpers or added with a reason.
 //
 // This matters beyond tidiness because generatedColumnsFor's collision validator pins itself
 // to stepColumnEnsurer's emission: an identifier produced anywhere else is one the validator

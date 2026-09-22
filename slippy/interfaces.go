@@ -185,12 +185,16 @@ type SlipStore interface {
 	// resolution's GitHub round trips run for seconds before it writes, so a row it read
 	// unclaimed and quiescent can be claimed, and its first step started, before the write
 	// lands. That write is now ResetSlipInPlace, which re-reads the claim state FOR UPDATE,
-	// evaluates RunInFlight on that read and either upserts or refuses with
-	// ErrSlipClaimed, all in one transaction — so a claim taken in the window is seen,
-	// a step started in the window is seen, and the push deduplicates onto the live row
-	// instead of resetting it. The marker is re-stated from the locked row too, so
-	// claimed_from and slip_claimed stay both present or both absent (the invariant stated
-	// under Create above) even for a claim the push never read. The claim itself still does
+	// and refuses on ANY claim it finds there, all in one transaction — so a claim taken in
+	// the window is seen and the push deduplicates onto the live row instead of resetting it.
+	// It does not matter whether that claim's run has reported a step yet: a claim records
+	// none until its first post-job, so a quiescent claim is a dispatched run sitting in the
+	// queue.
+	//
+	// Nothing is re-stated across the reset any more, and that is a stronger guarantee rather
+	// than a lost one: a reset can only ever write onto an UNCLAIMED row, so there is no claim
+	// to preserve and no marker to carry. The invariant stated under Create above holds by
+	// construction — nothing overwrites the history of a claimed row. The claim itself still does
 	// not protect against this — ClaimSlip's own lock is released at its commit — the reset's
 	// lock does. The full account is on CreateSlipForPush's claimed arm in push.go.
 	//

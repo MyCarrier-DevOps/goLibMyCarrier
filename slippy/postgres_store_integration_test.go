@@ -15,6 +15,17 @@ import (
 
 // newMigratedStore starts a Postgres container, runs the slippy migrations, and returns
 // a PostgresStore over the resulting schema.
+// NewMigratedStoreForContract exposes a migrated store to the slippy_test package, which is
+// where the shared claim-contract suite has to live: slippytest imports slippy, so an
+// in-package file cannot reach slippytest.RunClaimContract without an import cycle.
+//
+// Exported only inside the integration build tag, and only for that one caller.
+func NewMigratedStoreForContract(t *testing.T) *PostgresStore {
+	t.Helper()
+	store, _, _ := newMigratedStore(t)
+	return store
+}
+
 func newMigratedStore(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig) {
 	t.Helper()
 	pool := newPGMigrationTestPool(t)
