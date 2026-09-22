@@ -212,10 +212,12 @@ func TestClient_CreateSlipForPush_SelfCorrelationClaimedSlipIsDedupedNotReset(t 
 //
 // What this pins is the DECISION taken on the row as read — the FAST PATH, which is all a
 // snapshot can decide: the read is unlocked, with seconds of GitHub calls before the write.
-// A row that becomes claimed or goes in flight during that window is outside this test's
-// reach, and is caught instead by the row lock SlipStore.ResetSlipInPlace takes —
-// TestClient_CreateSlipForPush_ResetRefusedWhenAClaimLandsAfterTheRead is that case
-// (DEVOPS-367, closing PR #87 pkuzmenko finding 2). The full account is on
+// A row that becomes claimed during that window is outside this test's reach, and is caught
+// instead by the row lock SlipStore.ResetSlipInPlace takes — see
+// TestClient_CreateSlipForPush_ResetSlipInPlaceArms, whose "a quiescent claim landing
+// mid-window is refused under the lock" and "a refusal whose reload fails is fatal" subtests
+// are those cases (DEVOPS-367; the citation here named a test that had been deleted, PR #87
+// review, pkuzmenko). The full account is on
 // CreateSlipForPush's claimed arm in push.go.
 //
 // Note what the dedup returns: handlePushRetry resets push_parsed and never writes the slip's
@@ -481,3 +483,221 @@ func lastHistoryActor(slip *Slip, step string) string {
 // this function only ever saw the push's snapshot, so it could restore a claim the snapshot had
 // already recorded and nothing else — while the reachable half of the race is a claim taken
 // after that read, which no snapshot can show. Pinned here so a well-meaning restoration of the
+
+// SlipStore.ResetSlipInPlace closes (DEVOPS-367).
+// claimQuiescentDuringTheWindow is the same interleaving with NO step started — the shape that
+// used to be allowed through and reset a dispatched run, and the reason DecideReset refuses on
+// any claim (PR #87 review, pkuzmenko).
+func claimQuiescentDuringTheWindow(correlationID string) func(*MockStore) {
+	fired := false
+	return func(m *MockStore) {
+		if fired {
+			return
+		}
+		fired = true
+		slip, ok := m.Slips[correlationID]
+		if !ok {
+			return
+		}
+		slip.ClaimedFrom = SlipStatusFailed
+		slip.StateHistory = append(slip.StateHistory,
+			ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "rerun scope=all"))
+	}
+}
+
+func claimDuringTheWindow(correlationID string) func(*MockStore) {
+	fired := false
+	return func(m *MockStore) {
+		if fired {
+			return
+		}
+		fired = true
+		slip, ok := m.Slips[correlationID]
+		if !ok {
+			return
+		}
+		slip.ClaimedFrom = SlipStatusFailed
+		slip.StateHistory = append(slip.StateHistory,
+			ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "rerun scope=all"))
+		slip.Steps["builds"] = Step{Status: StepStatusRunning}
+	}
+}
+
+// differ on purpose: one falls back, one dedups through a different route, two are fatal.
+func TestClient_CreateSlipForPush_ResetSlipInPlaceArms(t *testing.T) {
+	ctx := context.Background()
+
+	endedSelfRow := func(store *MockStore, id, sha string) {
+		store.AddSlip(&Slip{
+			CorrelationID: id, Repository: "owner/repo", Branch: "main", CommitSHA: sha,
+			Status: SlipStatusFailed, Steps: map[string]Step{"builds": {Status: StepStatusFailed}},
+			StateHistory: []StateHistoryEntry{},
+		})
+	}
+	push := func(client *Client, id, sha string) (*CreateSlipResult, error) {
+		return client.CreateSlipForPush(ctx, PushOptions{
+			CorrelationID: id, Repository: "owner/repo", Branch: "main", CommitSHA: sha,
+			Components: []ComponentDefinition{{Name: "api", DockerfilePath: "src/MC.Api"}},
+		})
+	}
+
+	// A store that cannot decide under a lock (ClickHouseStore) must not fail the push: it has
+	// no claimed_from column either, so there is no claim for the refused decision to protect
+	// and the plain upsert is exactly what this arm did before the decision moved into the
+	// store. Same shape as repaveExistingSlip's ErrRepaveUnsupported fallback.
+	t.Run("ErrResetUnsupported falls back to a plain Create", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: shippedShapePipelineConfig()})
+		endedSelfRow(store, "corr-unsupported", "sha-unsupported")
+		store.ResetInPlaceError = ErrResetUnsupported
+
+		result, err := push(client, "corr-unsupported", "sha-unsupported")
+		require.NoError(t, err)
+		require.NotNil(t, result.Slip)
+		assert.Len(t, store.CreateCalls, 1, "the fallback is the plain upsert")
+		got, loadErr := store.Load(ctx, "corr-unsupported")
+		require.NoError(t, loadErr)
+		assert.True(t, got.Status.IsLive(), "and it still resets the row, as it always did")
+	})
+
+	// A duplicate means the target row was gone when the reset locked it and another
+	// correlation ID now holds this (repository, commit_sha) — a concurrent repave. The main
+	// path routes that to the same backstop createFreshSlip uses for the same sentinel, and
+	// here the backstop finds the winner's live row and dedups onto it.
+	t.Run("ErrDuplicateSlip routes to the duplicate backstop", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: shippedShapePipelineConfig()})
+		endedSelfRow(store, "corr-dup", "sha-dup")
+		store.ResetInPlaceError = ErrDuplicateSlip
+		// The concurrent repave, landing in the same window: our row is gone and the winner's
+		// successor holds the commit.
+		swapped := false
+		store.AfterLoadByCommit = func(m *MockStore) {
+			if swapped {
+				return
+			}
+			swapped = true
+			delete(m.Slips, "corr-dup")
+			m.Slips["corr-winner"] = &Slip{
+				CorrelationID: "corr-winner", Repository: "owner/repo", Branch: "main",
+				CommitSHA: "sha-dup", Status: SlipStatusInProgress,
+			}
+		}
+
+		result, err := push(client, "corr-dup", "sha-dup")
+		require.NoError(t, err, "the backstop resolves it; the push does not fail")
+		require.NotNil(t, result.Slip)
+		assert.Equal(t, "corr-winner", result.Slip.CorrelationID,
+			"deduped onto the row that won the commit, so the caller sees returned != sent")
+		assert.Len(t, store.ResetInPlaceCalls, 1, "and the reset was not retried after the backstop answered")
+	})
+
+	// Any other store failure is fatal, as a failed Create always was: nothing was written, so
+	// there is no successor to fall through to, and Kafka redelivery converges.
+	t.Run("any other error fails the push", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: shippedShapePipelineConfig()})
+		endedSelfRow(store, "corr-boom", "sha-boom")
+		store.ResetInPlaceError = ErrStoreConnection
+
+		_, err := push(client, "corr-boom", "sha-boom")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrStoreConnection)
+	})
+
+	// The refusal's own failure mode: the dedup has to RELOAD the row, because the snapshot
+	// the push still holds says unclaimed and quiescent and returning it would report a state
+	// known to be false. If that reload fails there is nothing truthful left to return.
+	t.Run("a refusal whose reload fails is fatal", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: shippedShapePipelineConfig()})
+		endedSelfRow(store, "corr-reload", "sha-reload")
+		claim := claimDuringTheWindow("corr-reload")
+		store.AfterLoadByCommit = func(m *MockStore) {
+			claim(m)
+			m.LoadError = ErrStoreConnection
+		}
+
+		_, err := push(client, "corr-reload", "sha-reload")
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrStoreConnection)
+		assert.Contains(t, err.Error(), "after a refused in-place reset")
+	})
+
+	// The claim that lands mid-window with NOTHING started. This is the case the reset used to
+	// allow through, and the one the client-level suite lost when its apparatus was deleted
+	// (PR #87 review, pkuzmenko): the push's snapshot is taken before the hook fires, so the
+	// gate sees an unclaimed row and falls through, and only the store's locked read sees the
+	// claim. Nothing but this exercises that path outside the integration build tag.
+	t.Run("a quiescent claim landing mid-window is refused under the lock", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: shippedShapePipelineConfig()})
+		endedSelfRow(store, "corr-midwindow", "sha-midwindow")
+		store.AfterLoadByCommit = claimQuiescentDuringTheWindow("corr-midwindow")
+
+		result, err := push(client, "corr-midwindow", "sha-midwindow")
+		require.NoError(t, err, "a refusal deduplicates; it does not fail the push")
+		require.NotNil(t, result.Slip)
+		assert.Len(t, store.ResetInPlaceCalls, 1, "the reset was attempted and refused under the lock")
+		assert.Empty(t, store.CreateCalls, "and nothing overwrote the claimant's row")
+
+		got, loadErr := store.Load(ctx, "corr-midwindow")
+		require.NoError(t, loadErr)
+		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim the push never saw survives")
+		assert.Equal(t, StepStatusFailed, got.Steps["builds"].Status, "and so does its step state")
+	})
+}
+
+// old behaviour shows up as a doubled marker rather than as a silent duplicate.
+func TestAppendResetMarker_RecordsThePriorAttemptOnly(t *testing.T) {
+	t.Run("the prior attempt's status, on the successor's history", func(t *testing.T) {
+		slip := &Slip{CorrelationID: "c"}
+		prior := &Slip{Status: SlipStatusFailed}
+		appendResetMarker(slip, prior, "0123456789abcdef")
+		assert.Equal(t, 1, countHistoryStep(slip, PushParsedStep))
+		assert.True(t, hasHistoryMessage(slip, "reset in place after failed attempt"))
+		assert.Equal(t, LibraryActor, lastHistoryActor(slip, PushParsedStep))
+	})
+
+	t.Run("a claimed prior: no claim marker here, because the store writes it under the lock", func(t *testing.T) {
+		slip := &Slip{CorrelationID: "c"}
+		prior := &Slip{
+			Status:      SlipStatusFailed,
+			ClaimedFrom: SlipStatusFailed,
+			StateHistory: []StateHistoryEntry{
+				ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "rerun scope=all"),
+			},
+		}
+		appendResetMarker(slip, prior, "0123456789abcdef")
+		assert.Equal(t, 0, countHistoryStep(slip, ClaimMarkerStep),
+			"the claim is re-stated from the locked row, not from this snapshot: appending here too would double it")
+		assert.Equal(t, 1, countHistoryStep(slip, PushParsedStep))
+	})
+}
+
+// The idempotency guard on appendResetMarker had no test of its own — it was added for a
+// reviewer and its dedicated test was deleted in the same commit, so removing the guard would
+// have failed nothing (PR #87 review, pkuzmenko).
+func TestAppendResetMarker_IsIdempotentPerSuccessor(t *testing.T) {
+	prior := &Slip{CorrelationID: "p", Status: SlipStatusFailed}
+	slip := &Slip{CorrelationID: "p"}
+
+	appendResetMarker(slip, prior, "abcdef1234")
+	require.Len(t, slip.StateHistory, 1, "the first append records the prior attempt")
+
+	// The second call is the real interleaving: the main arm appends, hands the SAME *Slip to
+	// handleDuplicateSlipBackstop on ErrDuplicateSlip, and its self-referential arm appends
+	// again. One push must not record two resets for one row.
+	appendResetMarker(slip, prior, "abcdef1234")
+	assert.Len(t, slip.StateHistory, 1, "a second reset attempt on the same successor adds nothing")
+
+	// A different successor is a different row and keeps its own marker.
+	other := &Slip{CorrelationID: "q"}
+	appendResetMarker(other, prior, "abcdef1234")
+	assert.Len(t, other.StateHistory, 1)
+}

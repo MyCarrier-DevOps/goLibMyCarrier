@@ -932,8 +932,8 @@ func (m *MockStore) ReleaseClaim(
 // ResetSlipInPlace mirrors PostgresStore.ResetSlipInPlace through the shared DecideReset, the
 // same way slippytest.MockStore does, so neither double can drift from the store: the decision
 // is made from the STORED row at call time rather than from anything the caller passed or last
-// read, a refusal writes nothing and returns ErrSlipClaimed wrapped, an allowed reset
-// keeps claimed_from and re-states the slip_claimed marker naming the recorded claimant, and an
+// read, a refusal writes nothing and returns ErrSlipClaimed wrapped, an allowed reset is
+// reached only for an unclaimed row so there is no claim to keep and no marker to carry, and an
 // absent row is upserted rather than refused.
 func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *Slip) error {
 	m.mu.Lock()

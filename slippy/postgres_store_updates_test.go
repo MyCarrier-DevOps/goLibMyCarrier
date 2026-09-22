@@ -1081,31 +1081,6 @@ func expectResetClaimStateRead(mock pgxmock.PgxPoolIface, id string) *pgxmock.Ex
 		WithArgs(id)
 }
 
-// historyCarryingClaimMarker matches the marshalled state_history ResetSlipInPlace writes when
-// the LOCKED row was claimed: the successor's own entries plus a re-stated slip_claimed marker
-// naming the recorded claimant. Asserting on the argument rather than on the SQL is what makes
-// this statement identifiable as the carry — the SQL is byte-identical to any other upsert.
-type historyCarryingClaimMarker struct{ claimedBy string }
-
-func (h historyCarryingClaimMarker) Match(v interface{}) bool {
-	payload, ok := v.(string)
-	if !ok {
-		return false
-	}
-	var wrapper struct {
-		Entries []StateHistoryEntry `json:"entries"`
-	}
-	if json.Unmarshal([]byte(payload), &wrapper) != nil {
-		return false
-	}
-	for _, e := range wrapper.Entries {
-		if e.Step == ClaimMarkerStep && e.Actor == h.claimedBy {
-			return true
-		}
-	}
-	return false
-}
-
 // The statement order ResetSlipInPlace promises: the claim state is read FOR UPDATE FIRST, and
 // the upsert lands inside the same transaction. An unclaimed row needs no history read — that
 // second read exists only to name a claimant — so a plain reset is two statements.
@@ -1183,4 +1158,18 @@ func TestPostgresStore_ResetSlipInPlace_AbsentRowIsInserted(t *testing.T) {
 func TestPostgresStore_ResetSlipInPlace_RejectsANilSuccessor(t *testing.T) {
 	store, _ := newMockStore(t)
 	assert.ErrorIs(t, store.ResetSlipInPlace(context.Background(), nil), ErrInvalidConfiguration)
+}
+
+// The non-terminal arm's not-found branch. Its coverage was lost when UpdateSlipStatus split
+// into terminal and non-terminal paths: the old _NotFound test used a terminal status, and its
+// successor still does, so nothing exercised the single-statement arm's zero-rows case
+// (PR #87 review, pkuzmenko).
+func TestPostgresStore_UpdateSlipStatus_NonTerminalNotFound(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectExec("UPDATE routing_slips SET status").
+		WithArgs("in_progress", "nope").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 0))
+	require.ErrorIs(t,
+		store.UpdateSlipStatus(context.Background(), "nope", SlipStatusInProgress), ErrSlipNotFound)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

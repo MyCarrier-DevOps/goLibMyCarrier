@@ -870,10 +870,10 @@ func (m *MockStore) ReleaseClaim(
 //     lock.
 //   - A refusal writes NOTHING and returns slippy.ErrSlipClaimed wrapped, so a
 //     consumer asserting with errors.Is sees the same sentinel production raises.
-//   - An allowed reset keeps claimed_from (Create's SET list excludes it) and re-states the
-//     slip_claimed marker naming the recorded claimant, so the invariant a marker-reading
-//     consumer depends on — claimed_from and slip_claimed both present or both absent —
-//     holds here too.
+//   - An allowed reset is reached ONLY for an unclaimed row, since the decision refuses on any
+//     claim, so there is no claim to keep across it and no marker to carry. The invariant a
+//     marker-reading consumer depends on — a set claimed_from always has a slip_claimed
+//     marker — holds here by construction: nothing overwrites the history of a claimed row.
 //   - An absent row is upserted rather than refused, matching the store's behaviour when a
 //     concurrent repave removed the target between the caller's read and this write.
 func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *slippy.Slip) error {

@@ -1227,27 +1227,22 @@ func (c *Client) resetSlipInPlace(
 	switch {
 	case resetErr == nil:
 		c.writeAncestryLink(ctx, slip, parent, result)
-		// RELOADED for the same reason the refusal arm below reloads: the value the caller
-		// holds is not the row that was written (PR #87 review, pkuzmenko). ResetSlipInPlace
-		// upserts through createTx, whose SET list omits claimed_from, and it may append to a
-		// history the caller's copy does not carry — so returning the caller's Slip reports a
-		// state known to be incomplete. Slip.ClaimedFrom is `omitempty`, so an unreloaded
-		// value drops the field from the 201 entirely, and this PR tells callers to gate their
-		// dispatch on exactly that field plus the step evidence in the body they already hold.
+		// NOT reloaded, deliberately, and this arm briefly was (PR #87 review, pkuzmenko,
+		// who asked for the reload and then showed it does not earn its place).
 		//
-		// Best-effort: the write is committed either way, so a failed reload must not fail the
-		// push. The caller's value is left in place and the warning says why it may be thin.
-		live, loadErr := c.store.Load(ctx, slip.CorrelationID)
-		if loadErr != nil {
-			c.logger.Warn(ctx, "In-place reset committed but the reload failed; "+
-				"the returned slip may understate the row's claim and history",
-				map[string]interface{}{
-					"correlation_id": slip.CorrelationID,
-					"error":          loadErr.Error(),
-				})
-			return false, nil //nolint:nilerr // best-effort: the reset is committed, so a failed reload must not fail the push
-		}
-		*slip = *live
+		// Nothing it would fetch differs from what the caller already holds. This arm is
+		// reached only through DecideReset returning nil, which happens only for an UNCLAIMED
+		// row, so the row's claimed_from is empty and so is the successor's — and the allowed
+		// arm is a bare createTx that appends nothing, since the marker-carrying arm went with
+		// the rule that needed it.
+		//
+		// The reload also COST something, which is the part that settles it: Slip.Ancestry has
+		// no `omitempty` and populate never hydrates it — ancestry lives in a child table and
+		// is absent from slipSelectColumns() — so overwriting the caller's value with a loaded
+		// row turned a resolved chain into "ancestry": null on the 201, on this path alone.
+		//
+		// The refusal arm below still reloads, and must: there the row the caller holds is NOT
+		// the row in the database, because a claimant owns it.
 		return false, nil
 
 	case errors.Is(resetErr, ErrSlipClaimed):
