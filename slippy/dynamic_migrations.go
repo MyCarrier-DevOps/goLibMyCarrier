@@ -181,7 +181,7 @@ func (m *DynamicMigrationManager) GetMigrationsForClickhouseMigrator(
 func (m *DynamicMigrationManager) GetCurrentStepColumns() []string {
 	columns := make([]string, len(m.config.Steps))
 	for i, step := range m.config.Steps {
-		columns[i] = fmt.Sprintf("%s_status", step.Name)
+		columns[i] = stepStatusColumn(step.Name)
 	}
 	return columns
 }

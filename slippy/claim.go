@@ -111,6 +111,20 @@ func markerActor(actor string) string {
 // reader back what a state_history rewrite would otherwise have cost it. A different reading
 // here would restore a marker naming someone the parser never saw.
 //
+// THE PARITY IS WITH pushhookparser#55, NOT WITH ITS MAIN (PR #87 review, pkuzmenko). That
+// branch's claimedBy switches on both markers; main's scans for the claim marker only and has
+// no concept of a release, so against main the release arm here is a DIVERGENCE rather than a
+// match. The two converge when the train lands, which is the same ordering SlipStore.ClaimSlip
+// documents for the claim itself.
+//
+// Worth knowing which way the divergence points while it lasts, because it is the safe one: a
+// row whose history ends in a release after its last claim reads unclaimed HERE and still
+// names the original claimant THERE, so the parser is the more conservative of the two and
+// keeps its cleanup exemption a little longer than this library would. No path produces that
+// row anyway — ReleaseClaim clears claimed_from and appends the marker in one transaction, a
+// re-claim appends a newer claim marker the backwards scan hits first, appendResetMarkers
+// returns early on an empty ClaimedFrom, and a repaved successor starts with no history.
+//
 // Not exported: the derivation belongs to whoever owns the markers, and a consumer that needs
 // the claimant reads claimed_from plus its own history scan rather than a second library
 // entry point that could drift from the parser's.
@@ -306,8 +320,19 @@ func RunInFlight(slip *Slip) bool {
 // has finished (a lost response before dispatch, or a stranded claim — dispatching is the
 // recovery). DEVOPS-367, PR #87 seventh review.
 //
-// A caller that only needs the slip protected can ignore both fields, since every non-error
-// outcome means the slip is claimed on return.
+// WHICH FIELDS A CALLER MAY IGNORE DEPENDS ENTIRELY ON WHAT IT DOES NEXT, and an earlier
+// version of this paragraph said only the permissive half (PR #87 review, pkuzmenko):
+//
+//   - A caller that only needs the slip PROTECTED can ignore both fields, since every
+//     non-error outcome means the slip is claimed on return. A pre-job that claims and then
+//     runs its own step is this caller.
+//   - A caller that may DISPATCH work can ignore neither, and must branch on InFlight rather
+//     than on Claimed. Claimed=false with InFlight=true means another run is already
+//     executing against this slip and dispatching would double it; Claimed=false with
+//     InFlight=false is the lost-response or stranded-claim window where dispatching IS the
+//     recovery. The two are indistinguishable on Claimed alone, for the reason above. This is
+//     the rule slippy-api#59 states on its own endpoint ("BRANCH ON in_flight, NOT ON
+//     claimed") and the one pushhookparser#55's rerunner implements.
 type ClaimOutcome struct {
 	// Claimed is true when this call recorded the claim, false when one was already held.
 	Claimed bool
@@ -364,6 +389,18 @@ type ClaimOutcome struct {
 //     repeat arm hands back instead of an error is strictly more information — the recorded
 //     prior, plus ClaimOutcome.InFlight read off the same locked row — and InFlight, not the
 //     error, is what a caller that must not double-dispatch branches on (see ClaimOutcome).
+//
+//     THAT PROTECTION IS ONLY REAL IF InFlight REACHES THE CALLER, which for an out-of-process
+//     adopter means it has to be on the wire (PR #87 review, pkuzmenko). It is, in the same
+//     release train as this change and not after it: slippy-api#59 answers the claim 200 with
+//     a body carrying {claimed, prior, in_flight} — in_flight is a REQUIRED field of that
+//     response, not an optional one — and takes if_status in, which is this expected. Its two
+//     adopters read it: pushhookparser#55's client returns (claimed, inFlight, err) and its
+//     rerunner dispatches only when both are false, and Slippy#28's pre-job sends if_status
+//     from prejobClaimIfStatus(). Until that train lands, the consumers' main branches carry
+//     a 3-argument ClaimSlip and a 204, where a nil expected would be the flipped class with
+//     nothing to read — which is why this library must not be bumped into a consumer ahead of
+//     its own claim PR.
 //
 //   - A run IN FLIGHT — a step or component running or held — that expected did not name is
 //     refused, so a nil expected cannot record a claim on a run that is executing. Reached

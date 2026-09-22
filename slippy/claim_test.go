@@ -193,11 +193,22 @@ func TestDecideClaim_Table(t *testing.T) {
 	var anyStatus []SlipStatus // nil: the caller agreed to claim out of anything
 	onlyFailed := []SlipStatus{SlipStatusFailed}
 	onlyInProgress := []SlipStatus{SlipStatusInProgress}
-	// The Slippy CLI pre-job's set: every non-terminal status (slipStatusTable, app.go).
+	// The two sets below are the real adopters' if_status lists, named so the table is not
+	// only a branch sweep but a check against what actually gets sent.
+	//
+	// BOTH ARE ON UNMERGED BRANCHES OF THE COORDINATED RELEASE TRAIN, not on their repos'
+	// main, so `git grep` against a default checkout will not find either symbol. That is
+	// expected until the train lands, and it is why they are cited with their PR (PR #87
+	// review, pkuzmenko): this library releases first and the consumers repoint onto it.
+	//
+	// The Slippy CLI pre-job's set: every non-terminal status. slipStatusTable feeds
+	// prejobClaimIfStatus(), which is what app.go passes as if_status
+	// (internal/app/app.go, Slippy#28).
 	nonTerminal := []SlipStatus{
 		SlipStatusPending, SlipStatusInProgress, SlipStatusFailed, SlipStatusCompensating,
 	}
-	// pushhookparser's rerunner set: every ended status (rerunClaimIfStatus, rerunner.go).
+	// pushhookparser's rerunner set: every ended status (rerunClaimIfStatus, pkg/rerunner/
+	// rerunner.go, pushhookparser#55).
 	ended := []SlipStatus{
 		SlipStatusFailed, SlipStatusCompleted, SlipStatusCompensated, SlipStatusAbandoned, SlipStatusPromoted,
 	}

@@ -544,8 +544,8 @@ func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, corre
 	}
 
 	upd := fmt.Sprintf(
-		"UPDATE routing_slips SET %s_status = $1, %s = $2, updated_at = now() WHERE correlation_id = $3",
-		aggStep, aggStep)
+		"UPDATE routing_slips SET %s = $1, %s = $2, updated_at = now() WHERE correlation_id = $3",
+		stepStatusColumn(aggStep), aggregateColumn(aggStep))
 	if _, err := tx.Exec(ctx, upd, string(status), string(itemsJSON), correlationID); err != nil {
 		return fmt.Errorf("failed to write aggregate %s: %w", aggStep, err)
 	}

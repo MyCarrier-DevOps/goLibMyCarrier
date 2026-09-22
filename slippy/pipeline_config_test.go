@@ -4,6 +4,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // testPipelineConfigForTests creates a full pipeline config for testing helper methods.
@@ -832,4 +835,80 @@ func TestGeneratedColumnsFor_MatchesWhatTheEnsurerEmits(t *testing.T) {
 	if len(agg) != 2 || agg[0] != "build_status" || agg[1] != "build" {
 		t.Fatalf("an aggregate step emits its status column and a bare jsonb column, got %v", agg)
 	}
+}
+
+// TestGeneratedColumnsFor_TracksStepColumnEnsurerSQL reads the ensurer's ACTUAL SQL, which is
+// the coupling the test above is named for but never exercises (PR #87 review, pkuzmenko).
+//
+// The validator's safety argument rests entirely on generatedColumnsFor returning exactly the
+// identifiers stepColumnEnsurer emits — stated in both places, at generatedColumnsFor's godoc
+// ("an identifier this function does not return is one nothing validates against collision")
+// and at validateStepIdentifier's collision arm. Comparing generatedColumnsFor against
+// hardcoded literals cannot detect a drift in the ensurer: add a third ADD COLUMN there and
+// the literal test stays green while the new identifier is validated against nothing.
+//
+// So this asserts the two agree in BOTH directions — same count, and every returned column
+// actually present in the emitted DDL — against the SQL rather than against a copy of it.
+// stepColumnEnsurer reads neither field of its receiver, so a zero-value manager is enough.
+func TestGeneratedColumnsFor_TracksStepColumnEnsurerSQL(t *testing.T) {
+	const addColumn = "ADD COLUMN IF NOT EXISTS"
+	mgr := &PostgresDynamicMigrationManager{}
+
+	for _, tt := range []struct {
+		name string
+		step StepConfig
+	}{
+		{"plain step", StepConfig{Name: "deploy"}},
+		{"aggregate step", StepConfig{Name: "build", Aggregates: "component"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sql := mgr.stepColumnEnsurer(tt.step).SQL
+			cols := generatedColumnsFor(tt.step)
+
+			assert.Equal(t, strings.Count(sql, addColumn), len(cols),
+				"stepColumnEnsurer emits %d columns but generatedColumnsFor returns %d (%v): an "+
+					"identifier the validator does not return is one nothing checks for collision\nSQL:\n%s",
+				strings.Count(sql, addColumn), len(cols), cols, sql)
+
+			for _, col := range cols {
+				assert.Contains(t, sql, addColumn+" "+col,
+					"generatedColumnsFor returned %q but the ensurer does not emit it", col)
+			}
+		})
+	}
+}
+
+// TestValidateStepIdentifier_ReservesClickHouseFixedColumns pins the three fixed columns that
+// exist only on the ClickHouse side of the schema (PR #87 review, pkuzmenko).
+//
+// The sibling drift test walks a *PostgresStore column list, so by construction it can never
+// fail for a ClickHouse-only column — which is exactly how `sign`, `version` and `ancestry`
+// went unreserved. An aggregate step's column is its BARE name, so a step named after one of
+// them collides on ClickHouse the way a step named `status` collides on Postgres, and it
+// passes every other arm because none of the three is a SQL keyword.
+//
+// Pinned by CONSTANT rather than by literal so renaming one of the constants keeps the
+// reservation rather than silently dropping it.
+func TestValidateStepIdentifier_ReservesClickHouseFixedColumns(t *testing.T) {
+	for _, col := range []string{ColumnSign, ColumnVersion, ColumnAncestry} {
+		t.Run(col, func(t *testing.T) {
+			// As an aggregate step, which is the shape that actually collides: its column is
+			// the bare name, so ADD COLUMN IF NOT EXISTS silently does nothing and every later
+			// write names the column twice in one SET list.
+			err := validateStepIdentifier(
+				StepConfig{Name: col, Aggregates: "component"}, map[string]string{})
+			require.Error(t, err, "an aggregate step named %q must be rejected", col)
+			assert.Contains(t, err.Error(), col)
+
+			// And as a plain step, since adding "aggregates" to an existing step is a one-word
+			// config edit — the same reason the fixed-column arm checks every step, not just
+			// aggregate ones.
+			err = validateStepIdentifier(StepConfig{Name: col}, map[string]string{})
+			require.Error(t, err, "a plain step named %q must be rejected too", col)
+		})
+	}
+
+	// Case folding, matching how Postgres folds the DDL that would collide.
+	err := validateStepIdentifier(StepConfig{Name: "Version"}, map[string]string{})
+	require.Error(t, err, "the reservation must fold case")
 }

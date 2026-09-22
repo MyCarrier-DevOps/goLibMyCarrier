@@ -63,22 +63,23 @@ func fixedSlipColumns() []string {
 // `_status` suffix. Together with aggregateColumn below it is the WHOLE of what a configured
 // step puts into the schema (generatedColumnsFor), and both stores follow the same convention.
 //
-// It exists because that convention was spelled out at ELEVEN sites, each asking the reader to
-// keep it in step with the others (PR #87, jhicks review): slipColumns and claimStateColumns
-// (postgres_store.go), generatedColumnsFor (pipeline_config.go), stepColumnEnsurer and
-// indexEnsurer (postgres_migrations.go), updateStepTx (postgres_store_updates.go),
-// buildStepOverridesFromSlip (executor.go), SlipQueryBuilder.StepStatusColumn and
-// SlipQueryBuilder.AggregateColumn (query_builder.go, now one-line delegations to these
-// helpers), and generateStepColumnEnsurer and generateIndexEnsurer (dynamic_migrations.go) —
-// the ClickHouse half, which the first pass of this refactor missed and which mattered most,
-// because generatedColumnsFor's collision validator pins itself to the POSTGRES ensurer only,
-// so an un-converted ClickHouse emitter was a third definition of identifiers the validator is
-// supposed to be authoritative over. Drift between any two of them is exactly what that
-// validator was added to catch, and a validator that can be outvoted by a copy is weaker than
-// one convention with one definition.
+// It exists because that convention was open-coded at every site that needed it, each asking
+// the reader to keep it in step with the others (PR #87, jhicks review). Rather than enumerate
+// them — a list that has now been wrong twice, first by miscounting and then by omitting five
+// sites, two of them on the operational backend (PR #87 review, pkuzmenko) — the invariant is
+// stated as something checkable instead:
 //
-// The count and the list are meant to agree; they did not before (it said seven and named
-// eight), and a reader finishing this job needs the list to be the record, not the number.
+//	NO CALLER BUILDS A STEP'S COLUMN NAME BY HAND. Every `<name>_status` and every bare
+//	aggregate column comes from these two helpers, on BOTH backends.
+//
+// `grep -rn '%s_status' --include='*.go' slippy/` is the check, and it should return only
+// error-message text. That is a grep a reviewer can run; a site list is only ever as good as
+// the last edit that remembered to update it.
+//
+// This matters beyond tidiness because generatedColumnsFor's collision validator pins itself
+// to stepColumnEnsurer's emission: an identifier produced anywhere else is one the validator
+// never sees, so every hand-rolled splice was a second definition able to outvote it. A
+// validator that can be outvoted by a copy is weaker than one convention with one definition.
 //
 // It does NOT validate or quote. A step name reaches a SQL identifier either from a config
 // that passed validateStepIdentifier or through an explicit bare-identifier check at the one

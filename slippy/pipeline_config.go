@@ -197,13 +197,27 @@ const MaxStepNameLen = 63 - len("_status")
 // generates schema for both, so the stricter of the two is what a step name has to satisfy.
 var stepNameIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// reservedStepNames is every fixed routing_slips column, folded to lower case the way Postgres
-// folds the DDL that would collide with it. DERIVED from fixedSlipColumns() plus
-// ColumnClaimedFrom — exactly the non-step part of PostgresStore.slipSelectColumns() — rather
-// than restated, so a column added to that list is reserved against step names by the same
-// edit and cannot silently stop being reserved.
+// reservedStepNames is every fixed routing_slips column on EITHER backend, folded to lower
+// case the way Postgres folds the DDL that would collide with it. DERIVED from
+// fixedSlipColumns() plus ColumnClaimedFrom — exactly the non-step part of
+// PostgresStore.slipSelectColumns() — rather than restated, so a column added to that list is
+// reserved against step names by the same edit and cannot silently stop being reserved.
+//
+// The three ClickHouse-only columns are appended explicitly because no Postgres-derived list
+// contains them (PR #87 review, pkuzmenko): ColumnSign and ColumnVersion are the unconditional
+// base-schema columns of the VersionedCollapsingMergeTree(sign, version) engine, and
+// ColumnAncestry is the v3 inline column. An aggregate step's jsonb/JSON column is its BARE
+// name, so an aggregate step named `version` collides with one of them on ClickHouse exactly
+// as one named `status` collides on Postgres — and it passes every other arm, since none of
+// the three is a SQL keyword.
+//
+// Reserving them on BOTH backends rather than only where they exist is the same choice
+// stepNameIdentifierPattern makes one paragraph below: a config is written once and generates
+// schema for both, so it must satisfy the stricter of the two. The cost is three step names
+// nobody wants; the alternative is a validator whose answer depends on which store the reader
+// happens to be looking at.
 var reservedStepNames = func() map[string]struct{} {
-	cols := append(fixedSlipColumns(), ColumnClaimedFrom)
+	cols := append(fixedSlipColumns(), ColumnClaimedFrom, ColumnSign, ColumnVersion, ColumnAncestry)
 	reserved := make(map[string]struct{}, len(cols))
 	for _, col := range cols {
 		reserved[strings.ToLower(col)] = struct{}{}
@@ -212,7 +226,7 @@ var reservedStepNames = func() map[string]struct{} {
 }()
 
 // validateStepIdentifier rejects the four step-name shapes that pass exact-case uniqueness and then
-// break the SCHEMA the config generates. All four are caught here, in the config, rather than in
+// break the SCHEMA the config generates. All five are caught here, in the config, rather than in
 // PostgresStore.ProbeSchema: the probe folds case when it diffs the live catalogue against
 // slipSelectColumns(), which is correct for the probe — Postgres folded the DDL, so a configured
 // `Deploy_Dev` legitimately lands as `deploy_dev` — but that folding also hides these faults
@@ -220,6 +234,7 @@ var reservedStepNames = func() map[string]struct{} {
 // time, once, before any DDL runs (PR #87 finding j6). They are listed in the order they are
 // checked, and this list is the whole of what this function rejects — see the closing note for
 // the one schema-breaking shape it still admits, which is recorded rather than left implied.
+// The list, the count and the arms are meant to agree; keep all three in step when adding one.
 //
 //   - A NAME THAT IS NOT A BARE IDENTIFIER. Step names reach identifier position UNQUOTED:
 //     postgres_migrations.go's stepColumnEnsurer emits
@@ -254,6 +269,14 @@ var reservedStepNames = func() map[string]struct{} {
 //     `deploy_status`, and an aggregate step literally named `deploy_status` emits that same bare
 //     column, so a name-keyed check admits the pair. See generatedColumnsFor, which must stay in
 //     step with stepColumnEnsurer — an identifier it does not return is one nothing checks.
+//   - A NAME THAT IS ONE OF THE LIBRARY'S OWN state_history MARKERS. Unlike the four above this
+//     one breaks no SQL: it is caught here because it forges or suppresses the claim's audit
+//     record, which claimantFromHistory and pushhookparser's ClaimedBy both derive by scanning
+//     for those names. See reservedMarkerSteps for the set and for why PushParsedStep is
+//     deliberately NOT in it, and ErrReservedStepName for what a marker-named entry costs a
+//     reader. The same names are refused on the caller-supplied WRITE paths by
+//     GuardReservedStepWrite, because a step name need not be in the config to reach
+//     state_history.
 //
 // STILL ADMITTED, and deliberately: a name that is a bare identifier but a SQL RESERVED KEYWORD.
 // An aggregate step named `order`, `group`, `table` or `select` emits

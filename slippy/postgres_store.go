@@ -375,7 +375,7 @@ func (s *PostgresStore) aggregateColumns() []string {
 	var cols []string
 	for _, step := range s.config.Steps {
 		if step.Aggregates != "" {
-			cols = append(cols, step.Name)
+			cols = append(cols, aggregateColumn(step.Name))
 		}
 	}
 	return cols
