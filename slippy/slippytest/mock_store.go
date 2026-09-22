@@ -396,12 +396,24 @@ func (m *MockStore) Repave(
 	// A missing superseded row is not an error, matching PostgresStore: the successor is
 	// still created, so a redelivery converges rather than failing forever.
 	//
-	// The successor is inserted UNCLAIMED whatever newSlip carries, for the same reason Create
-	// discards a caller-supplied claim above: PostgresStore.Repave inserts through createTx ->
-	// buildCreateQuery -> slipColumns(), which has no claimed_from column, so the replacement
-	// row's claimed_from is NULL in Postgres (PR #87, jhicks review).
+	// The successor discards a caller-supplied claim and then restores any claim already
+	// recorded under the successor's OWN id — the identical two steps Create takes above, and
+	// for the identical reason, because this is the identical write: PostgresStore.Repave
+	// inserts through createTx -> buildCreateQuery -> slipColumns(), whose INSERT list and
+	// conflict arm both omit claimed_from. So the replacement row's claimed_from is NULL on a
+	// fresh insert, and an existing row under that id KEEPS its claim through the ON CONFLICT
+	// arm (PR #87, jhicks review; the restore half added in the PR #87 review).
+	//
+	// Modelling only the discard made this method contradict Create about one write path. It is
+	// unreachable in production — Repave rejects oldCorrelationID == newSlip.CorrelationID, and
+	// correlation IDs are minted per delivery, so the conflict arm never fires — but a consumer
+	// test that seeds a slip and repaves onto that same id got opposite answers from the two
+	// methods, with no way to tell which one Postgres would have given.
 	stored := DeepCopySlip(newSlip)
 	stored.ClaimedFrom = ""
+	if existing, ok := m.Slips[newSlip.CorrelationID]; ok {
+		stored.ClaimedFrom = existing.ClaimedFrom
+	}
 	if removedOld {
 		// Mirrors the state-history entry PostgresStore.Repave appends to the successor so
 		// the replacement is visible on the row afterwards — without it the successor carries
@@ -619,6 +631,13 @@ func (m *MockStore) UpdateStep(
 	correlationID, stepName, componentName string,
 	status slippy.StepStatus,
 ) error {
+	// Refused before the call is recorded, matching PostgresStore.updateStepTx, which refuses
+	// before its transaction opens: a consumer asserting on the rejection must see the same
+	// answer and the same (empty) call log from the double as from the real store.
+	if err := slippy.GuardReservedStepWrite(stepName, nil); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -699,6 +718,10 @@ func (m *MockStore) UpdateComponentStatus(
 
 // AppendHistory adds a state history entry to the slip.
 func (m *MockStore) AppendHistory(ctx context.Context, correlationID string, entry slippy.StateHistoryEntry) error {
+	if err := slippy.GuardReservedStepWrite("", &entry); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1032,6 +1055,13 @@ func (m *MockStore) Reset() {
 	m.SetImageTagCalls = nil
 	m.UpdateSlipStatusCalls = nil
 	m.ResetInPlaceCalls = nil
+	// Claim state. Omitted when the claim recorders were added (PR #87), the third instance of
+	// the identical class documented for Repave below — and the one most likely to be hit,
+	// since claim assertions are what a consumer writes against this double now that claims are
+	// the shipped feature. TestReset_ClearsEveryCallRecorder walks these fields by reflection so
+	// the fourth instance fails a test instead of reaching a consumer.
+	m.ClaimSlipCalls = nil
+	m.ReleaseClaimCalls = nil
 	// Repave state. Omitted before, which broke this method's own "clears all stored data
 	// and call tracking" contract: a consumer that Resets between scenarios kept stale
 	// repave records, so len(RepaveCalls) assertions passed or failed on the previous

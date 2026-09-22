@@ -477,9 +477,16 @@ func (m *MockStore) Repave(
 	// A missing superseded row is not an error: the successor is still created, so a
 	// redelivery converges rather than failing forever. The successor is inserted UNCLAIMED
 	// whatever newSlip carries, because PostgresStore.Repave inserts through the same
-	// slipColumns() create (PR #87, jhicks review).
+	// slipColumns() create (PR #87, jhicks review) — and then restores any claim already held
+	// under the successor's OWN id, exactly as Create above does, because it IS that same
+	// create: buildCreateQuery's conflict arm omits claimed_from, so an existing row under that
+	// id keeps its claim. Modelling only the discard made this method contradict Create about
+	// one write path (PR #87 review).
 	stored := deepCopySlip(newSlip)
 	stored.ClaimedFrom = ""
+	if existing, ok := m.Slips[newSlip.CorrelationID]; ok {
+		stored.ClaimedFrom = existing.ClaimedFrom
+	}
 	if removedOld {
 		// Mirrors the predecessor marker PostgresStore.Repave appends to the successor, gated
 		// on removedOld the same way so a repave that replaced nothing records nothing.
@@ -784,6 +791,10 @@ func (m *MockStore) UpdateComponentStatus(
 
 // AppendHistory adds a state history entry to the slip.
 func (m *MockStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
+	if err := GuardReservedStepWrite("", &entry); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1139,6 +1150,10 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.UpdateSlipStatusCalls = nil
+	m.FindAllByCommitsCalls = nil
+	m.ClaimSlipCalls = nil
+	m.ReleaseClaimCalls = nil
+	m.ResetInPlaceCalls = nil
 	m.RepaveCalls = nil
 	m.RepaveSuccessorCalls = nil
 	m.RepaveParents = nil
@@ -1151,6 +1166,12 @@ func (m *MockStore) Reset() {
 	m.CreateErrorOnce = make(map[string]error)
 	m.SeedOnCreate = make(map[string]*Slip)
 	m.LoadByCommitNilOnCall = 0
+	// AfterLoadByCommit is NOT one-shot, which makes a survivor worse than the entries above
+	// rather than equivalent: LoadByCommit fires it on every call with no disarm, so a hook
+	// left armed corrupts every subsequent lookup in the next scenario, not just the first.
+	// The one-shot-ness callers rely on lives in the helpers that install it (claimDuringTheWindow
+	// self-disarms through a `fired` flag), never in the hook itself.
+	m.AfterLoadByCommit = nil
 	m.CloseCalls = 0
 	m.PingCalls = 0
 }

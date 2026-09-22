@@ -163,6 +163,30 @@ var (
 	// ErrNotClaimed.
 	ErrClaimUnsupported = errors.New("store does not support ClaimSlip/ReleaseClaim")
 
+	// ErrReservedStepName indicates a caller tried to write a state_history entry under a step
+	// name the LIBRARY owns: ClaimMarkerStep or ReleaseMarkerStep.
+	//
+	// Neither is a pipeline step. The two ARE the claim's audit record — claimantFromHistory
+	// scans backwards for them, and pushhookparser derives its ClaimedBy by the identical rule
+	// against the same wire strings — so a caller-supplied entry under either does not merely
+	// add a confusing row: it forges or suppresses the signal a different repository gates an
+	// irreversible write on. A `slip_released` entry appended after a genuine claim makes a
+	// still-claimed row read UNCLAIMED to that reader, which is the
+	// column-present/marker-absent direction the whole reset path exists to prevent.
+	//
+	// PushParsedStep is deliberately NOT reserved: it is a real pipeline step a config may
+	// declare and a post-job may report. See reservedMarkerSteps.
+	//
+	// The realistic trigger is a config rename or a typo reaching the step endpoints, not an
+	// attacker: anyone holding the write key has shorter routes to the same end state. That is
+	// why this is a name check at the write rather than an authorization control.
+	//
+	// It is returned by the caller-supplied write paths only — UpdateStep, UpdateStepWithHistory,
+	// UpdateComponentStatus and AppendHistory. The library's OWN marker writes (ClaimSlip,
+	// ReleaseClaim, and the push path's push_parsed bookkeeping) construct their entries
+	// internally and are unaffected, which is the distinction reservedMarkerStepFor draws.
+	ErrReservedStepName = errors.New("step name is reserved by the slippy library")
+
 	// ErrSlipClaimedInFlight is returned by SlipStore.ResetSlipInPlace when the row it locked
 	// is claimed AND a step or component of that claim's run is running or held. The reset is
 	// an upsert that rewrites every step and aggregate column and the whole state history, so

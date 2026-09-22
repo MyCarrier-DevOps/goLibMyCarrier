@@ -288,6 +288,18 @@ func validateStepIdentifier(step StepConfig, claimed map[string]string) error {
 				"update names %s twice in one SET list",
 			name, key, key, key)
 	}
+	// Checked separately from the column set above, and with its own message, because this is a
+	// different fault with a different fix: the name does not collide with a column, it enters
+	// the state_history namespace the claim's audit record is derived from. See
+	// reservedMarkerSteps and ErrReservedStepName.
+	if reservedMarkerStep(name) {
+		return fmt.Errorf(
+			"step name %q is a state_history marker the library owns (%s and %s): "+
+				"claimantFromHistory and pushhookparser's ClaimedBy both derive who holds a claim "+
+				"by scanning for these names, so a step reporting under one would forge or "+
+				"suppress that signal: %w",
+			name, ClaimMarkerStep, ReleaseMarkerStep, ErrReservedStepName)
+	}
 	// Collision is checked over the identifiers a step GENERATES, not over its name, because two
 	// different names can generate one identifier: a step `deploy` emits `deploy_status`, and an
 	// aggregate step literally named `deploy_status` emits that same bare column. Keying on the

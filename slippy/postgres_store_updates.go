@@ -55,6 +55,9 @@ func (s *PostgresStore) UpdateStepWithHistory(
 
 // AppendHistory appends a state-history entry to the slip.
 func (s *PostgresStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
+	if err := GuardReservedStepWrite("", &entry); err != nil {
+		return err
+	}
 	return s.inTx(ctx, func(tx pgx.Tx) error {
 		if err := lockSlip(ctx, tx, correlationID); err != nil {
 			return err
@@ -351,6 +354,15 @@ func (s *PostgresStore) updateStepTx(
 	status StepStatus,
 	entry *StateHistoryEntry,
 ) error {
+	// Refused before the transaction opens, because the fault is in the request rather than in
+	// the row: stepName arrives from unvalidated HTTP/CI input (see the splice note below), and
+	// the history append further down is NOT behind the same config gate the status-column write
+	// is — so without this an arbitrary name reaches state_history whether or not it is a
+	// configured step. See ErrReservedStepName for what a marker-named entry costs a reader.
+	if err := GuardReservedStepWrite(stepName, entry); err != nil {
+		return err
+	}
+
 	message := ""
 	if entry != nil {
 		message = entry.Message

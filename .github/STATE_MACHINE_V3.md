@@ -439,9 +439,14 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     reset would destroy the state that run is writing under an unchanged correlation ID. Both
     guard paths spell it `claimed && (different id || RunInFlight)`. Because the reset replaces
     `state_history` while `claimed_from` survives it, the reset also re-states the
-    `slip_claimed` marker (finding p2): `claimed_from` and `slip_claimed` are **both present or
-    both absent**, which is what pushhookparser's stranded-cleanup exemption — keyed on the
-    marker, not the column — depends on. An abandon or promote is the
+    `slip_claimed` marker (finding p2): **a `claimed_from` that is SET always has a
+    `slip_claimed` marker**, which is what pushhookparser's stranded-cleanup exemption — keyed
+    on the marker, not the column — depends on. Stated in that direction deliberately: the
+    converse does not hold, because `UpdateSlipStatus` clears the column on a terminal status
+    and appends no marker, leaving marker-present/column-absent. That direction is fail-safe —
+    `IsTerminal` and the parser's `isLiveSlipStatus` are exact complements over all eight
+    statuses, so such a row returns at the live-status gate before the claim gate — whereas
+    column-present/marker-absent is the fault this whole path exists to prevent. An abandon or promote is the
     exception: both are terminal statuses written from outside the run, so they end the claim
     even while steps are still running, and both are repaveable — an ancestor abandon or a
     promotion deliberately overrides a live claim.

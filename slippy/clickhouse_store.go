@@ -990,8 +990,14 @@ func (s *ClickHouseStore) ResetSlipInPlace(_ context.Context, slip *Slip) error 
 	return fmt.Errorf("ResetSlipInPlace(%s): %w", correlationID, ErrResetUnsupported)
 }
 
-// ProbeSchema is a no-op here: this store selects no claim column and its tables are managed
-// by clickhousemigrator, so it has no schema of its own for the readiness gate to check.
+// ProbeSchema returns nil here because this store is not an operational slip store, NOT
+// because it has no schema to check — it has one, generated per configured step by
+// generateStepColumnEnsurer and named on every read by SlipQueryBuilder.BuildSelectColumns,
+// which is the same config-vs-schema drift PostgresStore.ProbeSchema diffs for. Nothing
+// outside this package's tests constructs this store (DEVOPS-127; removal tracked in
+// DEVOPS-343), so the gate has no caller to protect here. Reviving it means implementing this
+// against system.columns for the database and table, using BuildSelectColumns() as the
+// expected list, exactly as the Postgres implementation uses slipSelectColumns().
 func (s *ClickHouseStore) ProbeSchema(_ context.Context) error {
 	return nil
 }

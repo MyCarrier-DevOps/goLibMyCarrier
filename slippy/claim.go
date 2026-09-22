@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -22,19 +23,49 @@ const ReleaseMarkerStep = "slip_released"
 // own defence, so a direct caller cannot grow state_history without limit.
 const MaxMarkerReasonLen = 512
 
+// MaxMarkerActorLen bounds the caller-supplied actor recorded in a claim or release marker.
+//
+// It is deliberately NOT MaxMarkerReasonLen. slippy-api constrains ClaimedBy and ReleasedBy to
+// maxLength 128 with pattern ^[A-Za-z0-9._:/-]+$, so reusing the 512-rune reason bound would
+// make the library's own backstop four times looser than the only caller it backstops. 128
+// RUNES is the looser-charset equivalent of that caller's 128 ASCII characters, which is the
+// right relationship for a defence that sits behind a stricter boundary rather than beside it.
+const MaxMarkerActorLen = 128
+
 // clampReason truncates reason to MaxMarkerReasonLen runes, marking the cut.
 func clampReason(reason string) string {
-	if utf8.RuneCountInString(reason) <= MaxMarkerReasonLen {
-		return reason
+	return clampRunes(reason, MaxMarkerReasonLen)
+}
+
+// clampActor truncates a marker's caller-supplied actor to MaxMarkerActorLen runes.
+//
+// Separate from clampReason because the two bounds differ and must keep differing; both route
+// through clampRunes so neither can acquire a byte-based truncation by drift.
+func clampActor(actor string) string {
+	return clampRunes(actor, MaxMarkerActorLen)
+}
+
+// clampRunes truncates s to limit runes, marking the cut with an ellipsis.
+//
+// Rune-based rather than byte-based on purpose: state_history is a jsonb column, so a cut that
+// lands mid-rune produces invalid UTF-8 and fails at marshal rather than truncating gracefully.
+func clampRunes(s string, limit int) string {
+	if utf8.RuneCountInString(s) <= limit {
+		return s
 	}
-	runes := []rune(reason)
-	return string(runes[:MaxMarkerReasonLen-1]) + "…"
+	runes := []rune(s)
+	return string(runes[:limit-1]) + "…"
 }
 
 // ClaimMarker builds the adoption history entry every caller writes, so the marker's shape
 // is defined once here rather than per client. prior is the slip's status when the claim was
 // taken; it goes in the message because an operator reading the history needs to know what
 // was adopted. claimedBy is the entry's actor and is audit only.
+//
+// The actor is clamped and then defaulted, and that order is load-bearing: clamping a
+// non-empty string can never yield "", so clamp-then-default is the only order in which both
+// guarantees hold. It is markerActor's job, shared with ReleaseMarker so the pair cannot
+// acquire different rules.
 func ClaimMarker(prior SlipStatus, claimedBy, reason string) StateHistoryEntry {
 	msg := fmt.Sprintf("adopted %s slip before dispatching", prior)
 	if reason = clampReason(reason); reason != "" {
@@ -44,9 +75,31 @@ func ClaimMarker(prior SlipStatus, claimedBy, reason string) StateHistoryEntry {
 		Step:      ClaimMarkerStep,
 		Status:    StepStatusRunning,
 		Timestamp: time.Now(),
-		Actor:     claimedBy,
+		Actor:     markerActor(claimedBy),
 		Message:   msg,
 	}
+}
+
+// markerActor bounds and defaults a marker's caller-supplied actor.
+//
+// Both halves defend the same field for the same reason MaxMarkerReasonLen exists: the marker
+// path writes state_history WITHOUT going through Client.AppendHistoryEntry, which is the only
+// other place that defaults an empty actor, so a direct Go consumer reaches this field with
+// neither bound nor default applied. slippy-api's minLength:"1" maxLength:"128" means neither
+// half is reachable through the deployed API — this is the library holding the line
+// MaxMarkerReasonLen's own doc says it holds, for the direct caller it names.
+//
+// The empty case matters more than the long one. Actor is overloaded as the claim's PRESENCE
+// signal: claimantFromHistory returns the newest claim marker's Actor, and returns "" both for
+// "no claim marker" and for "a release follows it" — the same derivation pushhookparser makes
+// for its ClaimedBy. So an empty actor would set claimed_from while reading UNCLAIMED to the
+// marker reader, which is the column-present/marker-absent direction the reset path goes to
+// some length to avoid. LibraryActor is the same honest fallback ResetClaimMarker already uses.
+func markerActor(actor string) string {
+	if actor = clampActor(actor); actor == "" {
+		return LibraryActor
+	}
+	return actor
 }
 
 // claimantFromHistory returns the actor of the most recent ClaimMarkerStep entry in entries,
@@ -78,6 +131,10 @@ func claimantFromHistory(entries []StateHistoryEntry) string {
 // (claimed_from) is cleared by the same write. releasedBy is the entry's actor and is audit
 // only. StepStatusCompleted because a release is the claim's normal end, not a failure; it is
 // never read as a pipeline step because the step name is not one.
+//
+// The actor goes through markerActor for ClaimMarker's reasons; the pair is deliberately
+// symmetric, because a bound or default applied to one and not the other is a latent bug
+// rather than a smaller version of the same defence.
 func ReleaseMarker(status SlipStatus, releasedBy, reason string) StateHistoryEntry {
 	msg := fmt.Sprintf("released claim; slip is %s", status)
 	if reason = clampReason(reason); reason != "" {
@@ -87,7 +144,7 @@ func ReleaseMarker(status SlipStatus, releasedBy, reason string) StateHistoryEnt
 		Step:      ReleaseMarkerStep,
 		Status:    StepStatusCompleted,
 		Timestamp: time.Now(),
-		Actor:     releasedBy,
+		Actor:     markerActor(releasedBy),
 		Message:   msg,
 	}
 }
@@ -103,6 +160,78 @@ func ReleaseMarker(status SlipStatus, releasedBy, reason string) StateHistoryEnt
 // non-aggregate step that nothing ever reports would hold the claim open the same way; such
 // a slip also never completes, which initializeSlipForPush already documents.
 const PushParsedStep = "push_parsed"
+
+// reservedMarkerSteps is every state_history step name the library OWNS, folded to lower case
+// the way a step name is folded everywhere else it is compared.
+//
+// DERIVED from the constants rather than restated, so renaming one of them reserves the new
+// name by the same edit. TestReservedMarkerSteps_MatchesTheMarkerConstants pins that.
+//
+// PushParsedStep is deliberately NOT in this set, and the distinction is the whole reason the
+// set exists as its own list rather than as "the three constants at the top of this file".
+// `push_parsed` is a REAL pipeline step: a config may declare it, the library's own fixtures
+// do, and a post-job may legitimately report it. RunInFlight skips it by name because nothing
+// ever completes it, not because a caller may not write it — reserving it would reject a valid
+// config at parse time and refuse a legitimate step update. ClaimMarkerStep and
+// ReleaseMarkerStep are different in kind: they are not pipeline steps at all, they are the
+// claim's audit record, and a caller writing one forges or suppresses the signal a different
+// repository gates an irreversible write on.
+//
+// This is also a different family from reservedStepNames in pipeline_config.go, which reserves
+// the fixed routing_slips COLUMNS: that set prevents a generated identifier from colliding with
+// an existing column, while this one prevents a caller from entering the marker NAMESPACE.
+// validateStepIdentifier checks both, with its own message for each, because the two faults
+// look nothing alike to whoever has to fix the config.
+var reservedMarkerSteps = func() map[string]struct{} {
+	names := []string{ClaimMarkerStep, ReleaseMarkerStep}
+	reserved := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		reserved[strings.ToLower(name)] = struct{}{}
+	}
+	return reserved
+}()
+
+// reservedMarkerStep reports whether name is one of the library's own marker steps.
+//
+// It exists as one predicate so the config check and every write-path check cannot disagree
+// about what is reserved — the drift that let the namespace go undefended in the first place,
+// when this file asserted ClaimMarkerStep "is deliberately not a pipeline step name" and
+// nothing enforced it.
+func reservedMarkerStep(name string) bool {
+	_, ok := reservedMarkerSteps[strings.ToLower(name)]
+	return ok
+}
+
+// GuardReservedStepWrite refuses a CALLER-SUPPLIED write into the library's marker namespace,
+// checking both the step name the caller addressed and the Step of any entry it supplied.
+// It returns an error wrapping ErrReservedStepName, or nil when the write may proceed.
+//
+// Exported for the reason DecideClaim, DecideRelease and DecideReset are: PostgresStore,
+// slippytest.MockStore and the in-package double must all refuse the same names, or a
+// consumer's assertion about a rejected step would pass against a double and fail against
+// Postgres. This is the one definition of "a caller may not write this step".
+//
+// It guards the ENTRY POINTS — UpdateStep, UpdateComponentStatus, UpdateStepWithHistory and
+// AppendHistory — and deliberately not appendHistoryTx, the shared plumbing beneath them:
+// ClaimSlip appends a ClaimMarker through that plumbing, ReleaseClaim a ReleaseMarker, and
+// Repave its push_parsed bookkeeping entry. Guarding the plumbing would refuse the library's
+// own writes; guarding the entry points refuses exactly the input that should never have
+// named a marker in the first place.
+//
+// An empty stepName means the caller addressed no step (the AppendHistory shape), not that the
+// check is skipped — the entry's own Step is checked either way.
+func GuardReservedStepWrite(stepName string, entry *StateHistoryEntry) error {
+	if stepName != "" && reservedMarkerStep(stepName) {
+		return fmt.Errorf(
+			"step %q is a state_history marker the library owns: %w", stepName, ErrReservedStepName)
+	}
+	if entry != nil && entry.Step != "" && reservedMarkerStep(entry.Step) {
+		return fmt.Errorf(
+			"history entry step %q is a state_history marker the library owns: %w",
+			entry.Step, ErrReservedStepName)
+	}
+	return nil
+}
 
 // RunInFlight reports whether any step, or any component inside an aggregate step, is
 // running or held (StepStatus.IsRunning). Components are checked as well as steps because an
@@ -414,17 +543,19 @@ func DecideReset(claimedFrom SlipStatus, inFlight bool) (carryClaim bool, err er
 // exemption while renaming its adopter (PR #87, jhicks review). LibraryActor is the fallback,
 // and it is honest rather than a placeholder — a row whose claimed_from is set with no marker
 // left to read has no claimant recorded anywhere to name, and the invariant needs the marker's
-// PRESENCE. The library really is what wrote it.
+// PRESENCE. The library really is what wrote it. That fallback now lives in markerActor, which
+// ClaimMarker applies to EVERY claim marker rather than to this one path, so a reset and a
+// fresh claim cannot disagree about what an unnameable claimant is called.
 //
 // claimantFromHistory stays unexported behind this: what a third-party store needs is the
 // marker a reset must write, not a second general entry point for "who claimed this" that
 // could drift from the parser's own derivation.
 func ResetClaimMarker(claimedFrom SlipStatus, priorHistory []StateHistoryEntry) StateHistoryEntry {
-	claimedBy := claimantFromHistory(priorHistory)
-	if claimedBy == "" {
-		claimedBy = LibraryActor
-	}
-	return ClaimMarker(claimedFrom, claimedBy, "carried forward across an in-delivery retry reset")
+	return ClaimMarker(
+		claimedFrom,
+		claimantFromHistory(priorHistory),
+		"carried forward across an in-delivery retry reset",
+	)
 }
 
 // ClaimSlip records that a run is in flight against a slip, so a same-commit push

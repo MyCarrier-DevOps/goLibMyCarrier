@@ -96,10 +96,24 @@ reset is an upsert that rewrites every step and aggregate column and the whole s
 a self-correlated row with a running step is deduped like any other claimed row instead
 (finding p1). And because the upsert replaces `state_history` while `claimed_from` survives it,
 the reset re-states the `slip_claimed` marker, keeping the invariant every reader depends on:
-**`claimed_from` and `slip_claimed` are both present or both absent** — pushhookparser derives
+**a `claimed_from` that is SET always has a `slip_claimed` marker** — pushhookparser derives
 "who claimed this" from the markers and gates its stranded-cleanup exemption on it, so a row
-that carried one without the other would read claimed to slippy and unclaimed to the parser
-(finding p2). The re-stated marker names the **original claimant**, read off the row's own
+whose column was set with the marker gone would read claimed to slippy and unclaimed to the
+parser, losing that exemption (finding p2).
+
+State the invariant in that DIRECTION, not as "both present or both absent", because the
+converse does not hold and is not meant to: `UpdateSlipStatus` clears `claimed_from` on a
+terminal status and appends nothing, so after every terminal write a row holds the
+`slip_claimed` marker with no column. That asymmetry is deliberate and safe — it is the
+fail-safe direction, in which the parser merely over-exempts a row it never reaches, because
+`SlipStatus.IsTerminal()` and the parser's `isLiveSlipStatus` are exact complements across all
+eight statuses (and both default to false), so a terminal slip returns at that gate before the
+claim gate is consulted. The harmful direction is the other one, and it is the one this
+sentence constrains. Do not "fix" the terminal write's asymmetry to restore the symmetric
+wording: that would reintroduce the column-set/marker-absent state, which is the fault the
+whole reset path exists to prevent (PR #87 review).
+
+The re-stated marker names the **original claimant**, read off the row's own
 history by the same backwards scan that parser makes, because `ClaimedBy` there IS the marker's
 actor: writing the library's actor would restore the exemption while renaming the adopter to
 `slippy-library` for every marker-based reader (PR #87, jhicks review). `slippy-library` is left

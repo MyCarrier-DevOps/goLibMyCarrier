@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -739,4 +740,106 @@ func TestClaimantFromHistory(t *testing.T) {
 			assert.Equal(t, tc.want, claimantFromHistory(tc.entries))
 		})
 	}
+}
+
+// TestReservedMarkerSteps_MatchesTheMarkerConstants pins the set against the constants it is
+// derived from, so a renamed constant cannot silently stop being reserved — the same drift
+// guard reservedStepNames carries for the column list.
+//
+// It also pins the deliberate EXCLUSION of PushParsedStep, which is the part most likely to be
+// "fixed" by a later reader who sees three marker constants and two reserved names: push_parsed
+// is a real pipeline step a config may declare and a post-job may report, so reserving it would
+// reject valid configs and refuse legitimate step updates.
+func TestReservedMarkerSteps_MatchesTheMarkerConstants(t *testing.T) {
+	assert.True(t, reservedMarkerStep(ClaimMarkerStep), "ClaimMarkerStep must be reserved")
+	assert.True(t, reservedMarkerStep(ReleaseMarkerStep), "ReleaseMarkerStep must be reserved")
+	assert.False(t, reservedMarkerStep(PushParsedStep),
+		"PushParsedStep must NOT be reserved: it is a real pipeline step, not a marker")
+	assert.Len(t, reservedMarkerSteps, 2, "exactly the two marker constants are reserved")
+
+	// Folded, because every other step-name comparison in the library folds.
+	assert.True(t, reservedMarkerStep("SLIP_CLAIMED"))
+	assert.True(t, reservedMarkerStep("Slip_Released"))
+
+	assert.False(t, reservedMarkerStep("builds"))
+	assert.False(t, reservedMarkerStep(""))
+}
+
+func TestGuardReservedStepWrite(t *testing.T) {
+	tests := []struct {
+		name     string
+		stepName string
+		entry    *StateHistoryEntry
+		wantErr  bool
+	}{
+		{name: "ordinary step, no entry", stepName: "unit_tests"},
+		{name: "ordinary step with ordinary entry", stepName: "unit_tests",
+			entry: &StateHistoryEntry{Step: "unit_tests"}},
+		{name: "push_parsed is allowed", stepName: PushParsedStep},
+		{name: "push_parsed entry is allowed", entry: &StateHistoryEntry{Step: PushParsedStep}},
+		{name: "empty step name and nil entry", stepName: ""},
+		{name: "claim marker as step name", stepName: ClaimMarkerStep, wantErr: true},
+		{name: "release marker as step name", stepName: ReleaseMarkerStep, wantErr: true},
+		{name: "case folded marker as step name", stepName: "Slip_Claimed", wantErr: true},
+		{name: "claim marker as entry step", entry: &StateHistoryEntry{Step: ClaimMarkerStep}, wantErr: true},
+		{name: "release marker as entry step", entry: &StateHistoryEntry{Step: ReleaseMarkerStep}, wantErr: true},
+		{name: "ordinary step smuggling a marker entry", stepName: "unit_tests",
+			entry: &StateHistoryEntry{Step: ReleaseMarkerStep}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := GuardReservedStepWrite(tt.stepName, tt.entry)
+			if !tt.wantErr {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrReservedStepName)
+		})
+	}
+}
+
+// TestMarkerActor covers both halves of the marker actor's defence and, critically, their
+// ORDER: clamp then default. Clamping a non-empty string can never yield "", so the reverse
+// order would leave an over-long actor clamped but an empty one undefaulted.
+func TestMarkerActor(t *testing.T) {
+	t.Run("empty defaults to LibraryActor", func(t *testing.T) {
+		assert.Equal(t, LibraryActor, ClaimMarker(SlipStatusFailed, "", "").Actor)
+		assert.Equal(t, LibraryActor, ReleaseMarker(SlipStatusFailed, "", "").Actor)
+	})
+
+	t.Run("ordinary actor passes through", func(t *testing.T) {
+		assert.Equal(t, "pushhookparser/rerunner",
+			ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "").Actor)
+		assert.Equal(t, "slippy-cli", ReleaseMarker(SlipStatusFailed, "slippy-cli", "").Actor)
+	})
+
+	t.Run("over-long actor is clamped to MaxMarkerActorLen runes", func(t *testing.T) {
+		for _, marker := range []struct {
+			name  string
+			actor string
+		}{
+			{"claim", ClaimMarker(SlipStatusFailed, strings.Repeat("a", MaxMarkerActorLen*2), "").Actor},
+			{"release", ReleaseMarker(SlipStatusFailed, strings.Repeat("a", MaxMarkerActorLen*2), "").Actor},
+		} {
+			assert.Equal(t, MaxMarkerActorLen, utf8.RuneCountInString(marker.actor), marker.name)
+			assert.True(t, strings.HasSuffix(marker.actor, "…"), marker.name)
+		}
+	})
+
+	t.Run("clamping is rune-based, so state_history stays valid UTF-8", func(t *testing.T) {
+		// Multi-byte runes: a byte-based cut would land mid-rune and produce invalid UTF-8 in
+		// a jsonb column, which fails at marshal rather than truncating gracefully.
+		actor := ClaimMarker(SlipStatusFailed, strings.Repeat("é", MaxMarkerActorLen*2), "").Actor
+		assert.True(t, utf8.ValidString(actor), "clamped actor must remain valid UTF-8")
+		assert.Equal(t, MaxMarkerActorLen, utf8.RuneCountInString(actor))
+	})
+
+	t.Run("the actor bound is tighter than the reason bound", func(t *testing.T) {
+		// Regression guard for the specific miscalibration this replaced: reusing
+		// MaxMarkerReasonLen would make the library's backstop 4x looser than the only caller
+		// it backstops (slippy-api bounds both actor fields at 128).
+		assert.Less(t, MaxMarkerActorLen, MaxMarkerReasonLen)
+		assert.Equal(t, 128, MaxMarkerActorLen)
+	})
 }

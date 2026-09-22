@@ -326,8 +326,16 @@ type SlipStore interface {
 	// ProbeSchema is the readiness gate: it checks the columns this store's SELECTs name
 	// against the live schema and returns ErrSchemaBehind when any are missing, so a process
 	// running a library ahead of its database can refuse to serve instead of failing every
-	// read at request time (DEVOPS-367). A store with no schema of its own to check —
-	// ClickHouse, which is not the operational slip store — returns nil.
+	// read at request time (DEVOPS-367).
+	//
+	// ClickHouse returns nil, and the honest reason is NOT that it has no schema to check — it
+	// generates per-step columns from the same config Postgres does (generateStepColumnEnsurer
+	// in dynamic_migrations.go, rebuilt on every read by SlipQueryBuilder.BuildSelectColumns),
+	// so the config-ahead-of-migration drift this probe exists to catch exists there too. It
+	// returns nil because it is no longer an operational slip store: nothing outside this
+	// package's tests constructs one, the slip path is Postgres-only (DEVOPS-127), and its
+	// removal is tracked as DEVOPS-343. An implementer reviving it owes this method a real
+	// answer — a nil from a store with a live caller would make the gate unable to say no.
 	ProbeSchema(ctx context.Context) error
 
 	// Repave atomically replaces one commit's ended run with a fresh one: it removes the
