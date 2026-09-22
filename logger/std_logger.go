@@ -2,7 +2,6 @@ package logger
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 )
@@ -89,11 +88,16 @@ func (l *StdLogger) Warning(ctx context.Context, message string, fields map[stri
 
 // Error logs an error message.
 func (l *StdLogger) Error(ctx context.Context, message string, err error, fields map[string]interface{}) {
-	if fields == nil {
-		fields = make(map[string]interface{})
-	}
 	if err != nil {
-		fields["error"] = err.Error()
+		// Copy rather than write into the caller's map: the caller still owns it,
+		// and a shared map would also be a concurrent-write hazard. The sibling
+		// implementations both copy via mergeFields.
+		merged := make(map[string]interface{}, len(fields)+1)
+		for k, v := range fields {
+			merged[k] = v
+		}
+		merged["error"] = err.Error()
+		fields = merged
 	}
 	l.log("ERROR", message, fields)
 }
@@ -135,18 +139,15 @@ func (l *StdLogger) log(level, message string, fields map[string]interface{}) {
 		allFields[k] = v
 	}
 
-	// Format fields as a string
+	// Fields are rendered escaped, quoted where they carry the "key=value"
+	// structure, and key-sorted. Interpolating them raw let a caller-supplied
+	// newline open a second line that read as a genuine log entry (DEVOPS-284).
+	// The message is interpolated as given: Logger's contract puts caller-supplied
+	// data in fields and requires message to be a literal, so it is not escaped
+	// here.
 	fieldsStr := ""
 	if len(allFields) > 0 {
-		fieldsStr = " "
-		first := true
-		for k, v := range allFields {
-			if !first {
-				fieldsStr += ", "
-			}
-			fieldsStr += fmt.Sprintf("%s=%v", k, v)
-			first = false
-		}
+		fieldsStr = " " + renderSanitizedFields(allFields)
 	}
 
 	l.logger.Printf("[%s] %s%s", level, message, fieldsStr)
