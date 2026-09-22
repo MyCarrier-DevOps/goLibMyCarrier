@@ -6,6 +6,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -70,6 +71,22 @@ func TestPostgresStore_ClaimedFrom_IsScannedOnEveryReadPath_Integration(t *testi
 		assert.Equal(t, "renamed", again.Branch, "Update still writes the columns it owns")
 		assert.Equal(t, SlipStatusFailed, again.ClaimedFrom, "but never claimed_from")
 	})
+}
+
+// lastActorFor returns the actor of the LAST state-history entry written against step, which
+// is the actor a marker-reading consumer would derive. Tests assert on that rather than on
+// what this library happened to pass in.
+func lastActorFor(t *testing.T, store *PostgresStore, corr, step string) string {
+	t.Helper()
+	slip, err := store.Load(context.Background(), corr)
+	require.NoError(t, err)
+	actor := ""
+	for _, e := range slip.StateHistory {
+		if e.Step == step {
+			actor = e.Actor
+		}
+	}
+	return actor
 }
 
 // claimTestSlip creates a slip in the given status and returns it.
@@ -721,4 +738,188 @@ func TestPostgresStore_ProbeSchema_Integration(t *testing.T) {
 		assert.NotErrorIs(t, loadErr, ErrSlipNotFound,
 			"and it fails with 42703, not a sentinel the caller could mistake for an empty database")
 	})
+}
+
+// resetSuccessor builds what initializeSlipForPush hands the store for an in-delivery retry:
+// the SAME correlation ID as the row being reset, live again, carrying the reset marker
+// push.go appends and nothing else. Keeping it here rather than inline is what lets these
+// tests assert on which history the upsert wrote — the successor's own, plus whatever
+// ResetSlipInPlace re-stated under the lock.
+func resetSuccessor(corr, sha string) *Slip {
+	return &Slip{
+		CorrelationID: corr,
+		Repository:    "Owner/Repo",
+		Branch:        "main",
+		CommitSHA:     sha,
+		Status:        SlipStatusPending,
+		Steps:         map[string]Step{PushParsedStep: {Status: StepStatusRunning}},
+		StateHistory: []StateHistoryEntry{{
+			Step: PushParsedStep, Status: StepStatusRunning, Actor: LibraryActor,
+			Message: "reset in place after failed attempt for commit " + shortSHA(sha),
+		}},
+	}
+}
+
+// The race this method exists to close, driven end to end against a real schema (DEVOPS-367).
+//
+// The push decides to reset from an UNLOCKED LoadByCommit and then spends seconds in
+// resolveAndAbandonAncestors' GitHub round trips before it writes. Here those three moments are
+// explicit: the caller reads an ended, unclaimed, quiescent row; a claimant then claims it and
+// its pre-job starts a step; only then does the caller write. Before this method the write was
+// a bare pool.Exec upsert that took no lock and re-read nothing, so it landed on the claimant's
+// run — keeping claimed_from (absent from slipColumns()) while replacing state_history (present
+// in it) and rewriting the step and aggregate columns that run was still writing. The decision
+// now happens under the same FOR UPDATE the write lands beneath, so the stale snapshot cannot
+// authorise anything.
+func TestPostgresStore_ResetSlipInPlace_RefusesAClaimTakenAfterTheCallersRead_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+	claimTestSlip(t, store, "c-reset-race", "sha-reset-race", SlipStatusFailed)
+
+	// 1. What the push's LoadByCommit saw: ended, unclaimed, nothing in flight.
+	snapshot, err := store.LoadByCommit(ctx, "owner/repo", "sha-reset-race")
+	require.NoError(t, err)
+	require.Empty(t, snapshot.ClaimedFrom, "the snapshot the reset decision was made on is unclaimed")
+	require.False(t, RunInFlight(snapshot), "and quiescent")
+
+	// 2. The GitHub window: a rerunner claims the slip and its pre-job starts a step.
+	_, err = store.ClaimSlip(ctx, "c-reset-race", nil, "pushhookparser/rerunner", "rerun scope=all")
+	require.NoError(t, err)
+	require.NoError(t, store.UpdateStep(ctx, "c-reset-race", "builds", "api", StepStatusRunning))
+
+	// 3. The push's write, still holding the stale snapshot.
+	err = store.ResetSlipInPlace(ctx, resetSuccessor("c-reset-race", "sha-reset-race"))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSlipClaimedInFlight,
+		"the locked read, not the caller's snapshot, decides")
+
+	got, loadErr := store.Load(ctx, "c-reset-race")
+	require.NoError(t, loadErr)
+	assert.Equal(t, SlipStatusFailed, got.Status, "nothing was written: the status is untouched")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "the claim is untouched")
+	require.Len(t, got.Aggregates["builds"], 1)
+	assert.Equal(t, StepStatusRunning, got.Aggregates["builds"][0].Status,
+		"and so is the component the claimant's run is building")
+	assert.Equal(t, 1, countMarkers(t, store, "c-reset-race", ClaimMarkerStep),
+		"the claim marker survives, so claimed_from and slip_claimed are still both present")
+	assert.Equal(t, 0, countMarkers(t, store, "c-reset-race", PushParsedStep),
+		"and the successor's own reset marker was never written")
+}
+
+// The other half of the same window, and the half appendResetMarkers could never cover: the
+// claim lands after the caller's read but nothing of that run has started. The reset is
+// allowed — there is no work to destroy — and the claim it never saw is carried across the
+// upsert anyway, naming the ORIGINAL claimant, because the marker is built from the row's own
+// history under the lock rather than from the caller's snapshot.
+func TestPostgresStore_ResetSlipInPlace_CarriesAClaimTakenAfterTheCallersRead_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+	claimTestSlip(t, store, "c-reset-carry", "sha-reset-carry", SlipStatusFailed)
+
+	snapshot, err := store.LoadByCommit(ctx, "owner/repo", "sha-reset-carry")
+	require.NoError(t, err)
+	require.Empty(t, snapshot.ClaimedFrom)
+
+	_, err = store.ClaimSlip(ctx, "c-reset-carry", nil, "pushhookparser/rerunner", "rerun scope=all")
+	require.NoError(t, err)
+
+	require.NoError(t, store.ResetSlipInPlace(ctx, resetSuccessor("c-reset-carry", "sha-reset-carry")))
+
+	got, err := store.Load(ctx, "c-reset-carry")
+	require.NoError(t, err)
+	assert.Equal(t, SlipStatusPending, got.Status, "the row is live again")
+	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "claimed_from survives the upsert")
+	require.Equal(t, 1, countMarkers(t, store, "c-reset-carry", ClaimMarkerStep),
+		"and the marker is re-stated, so the two readers still agree")
+	assert.Equal(t, "pushhookparser/rerunner", lastActorFor(t, store, "c-reset-carry", ClaimMarkerStep),
+		"named for the claimant the caller never saw, not for the library")
+	assert.Equal(t, 1, countMarkers(t, store, "c-reset-carry", PushParsedStep),
+		"the successor's own reset marker is written too")
+}
+
+// The two arms that are not about a claim at all, pinned so the refusal cannot quietly widen:
+// an UNCLAIMED row is reset however its steps read, and a row that has GONE (a concurrent
+// repave removed it between the caller's read and this lock) is inserted rather than refused,
+// so redelivery converges.
+func TestPostgresStore_ResetSlipInPlace_UnclaimedAndAbsentRows_Integration(t *testing.T) {
+	store, _, _ := newMigratedStore(t)
+	ctx := context.Background()
+
+	t.Run("an unclaimed row with a step running is still reset", func(t *testing.T) {
+		claimTestSlip(t, store, "c-reset-unclaimed", "sha-reset-unclaimed", SlipStatusFailed)
+		require.NoError(t, store.UpdateStep(ctx, "c-reset-unclaimed", "unit_tests", "", StepStatusRunning))
+
+		require.NoError(t, store.ResetSlipInPlace(ctx,
+			resetSuccessor("c-reset-unclaimed", "sha-reset-unclaimed")))
+
+		got, err := store.Load(ctx, "c-reset-unclaimed")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusPending, got.Status)
+		assert.Empty(t, got.ClaimedFrom)
+		assert.Equal(t, 0, countMarkers(t, store, "c-reset-unclaimed", ClaimMarkerStep),
+			"no claim, no marker: both absent, as the invariant says")
+	})
+
+	t.Run("an absent row is inserted", func(t *testing.T) {
+		require.NoError(t, store.ResetSlipInPlace(ctx, resetSuccessor("c-reset-absent", "sha-reset-absent")))
+		got, err := store.Load(ctx, "c-reset-absent")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusPending, got.Status)
+		assert.Empty(t, got.ClaimedFrom, "a fresh insert is always unclaimed")
+	})
+}
+
+// The lock itself, not just the decision: a claim that commits while the reset is ALREADY
+// waiting on the row must still be seen by it.
+//
+// The concurrent transaction takes the row lock first and only then claims and starts a step,
+// so the reset blocks inside loadClaimStateTx before it has read anything. If the decision were
+// made anywhere but under that lock — on the caller's snapshot, or on a read taken before the
+// wait — the reset would proceed and overwrite a run that started while it waited. This is the
+// interleaving the race is made of, driven by a lock rather than by a sleep.
+func TestPostgresStore_ResetSlipInPlace_SerialisesBehindAConcurrentClaim_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+	claimTestSlip(t, store, "c-reset-serial", "sha-reset-serial", SlipStatusFailed)
+
+	tx, err := pool.Begin(ctx)
+	require.NoError(t, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var locked string
+	require.NoError(t, tx.QueryRow(ctx,
+		"SELECT correlation_id FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
+		"c-reset-serial").Scan(&locked))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- store.ResetSlipInPlace(ctx, resetSuccessor("c-reset-serial", "sha-reset-serial"))
+	}()
+
+	select {
+	case resetErr := <-done:
+		t.Fatalf("the reset must block on the row lock, not decide around it; it returned %v", resetErr)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// The claimant's work, committed while the reset is already waiting.
+	_, err = tx.Exec(ctx,
+		"UPDATE routing_slips SET claimed_from = 'failed', builds_status = 'running' WHERE correlation_id = $1",
+		"c-reset-serial")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+
+	select {
+	case resetErr := <-done:
+		require.Error(t, resetErr)
+		assert.ErrorIs(t, resetErr, ErrSlipClaimedInFlight,
+			"the reset read the row AFTER the claim committed, because it waited for the lock")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the reset never returned after the lock was released")
+	}
+
+	got, err := store.Load(ctx, "c-reset-serial")
+	require.NoError(t, err)
+	assert.Equal(t, SlipStatusFailed, got.Status, "and wrote nothing")
+	assert.Equal(t, StepStatusRunning, got.Steps["builds"].Status)
 }

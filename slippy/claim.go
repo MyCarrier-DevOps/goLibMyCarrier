@@ -356,6 +356,77 @@ func DecideRelease(slip *Slip) (release bool, err error) {
 	return true, nil
 }
 
+// DecideReset is the in-place reset decision, shared by PostgresStore.ResetSlipInPlace and
+// both test doubles so the three cannot drift, exactly as DecideClaim and DecideRelease are.
+// claimedFrom is the target row's recorded claim ("" when unclaimed) and inFlight the evidence
+// RunInFlight read from the SAME locked row — both of them read under the FOR UPDATE that the
+// upsert then lands beneath, which is the whole reason this decision exists as a store
+// operation rather than as a push-side branch on an unlocked snapshot (DEVOPS-367).
+//
+// Two outcomes:
+//
+//   - REFUSED, ErrSlipClaimedInFlight, when the row is claimed and something of that claim's
+//     run is running or held. The reset is Create's ON CONFLICT arm, which rewrites every step
+//     and aggregate column and the whole state history; performing it would destroy the state
+//     that run is writing, under an unchanged correlation ID, leaving an operator no way to
+//     tell which attempt wrote what. The caller deduplicates onto the live row instead.
+//
+//   - ALLOWED otherwise, and carryClaim reports whether the store must re-state the claim in
+//     the history it is about to overwrite. It is true exactly when the locked row is claimed
+//     and quiescent: claimed_from SURVIVES the upsert (it is absent from slipColumns(), so
+//     neither the INSERT list nor the conflict arm's SET list names it) while state_history
+//     does NOT (ColumnStateHistory is in that list), so a reset that wrote nothing back would
+//     leave the column set with the slip_claimed marker gone. pushhookparser derives "who
+//     claimed this" from the markers and gates its stranded-cleanup exemption on it, so that
+//     row would read claimed to slippy and unclaimed to the parser. Create's contract states
+//     the invariant this keeps: claimed_from and slip_claimed are both present or both absent.
+//
+// inFlight is a bool rather than the *Slip it came from for DecideClaim's reason: the store
+// evaluates RunInFlight once on the locked read, and a table test of this decision is four
+// rows of scalars rather than four slip literals.
+//
+// An UNCLAIMED row is never refused, whatever its steps say. That is deliberate and is the
+// same line the push arms draw: an unclaimed row has no other run to protect, and the caller
+// reaching this operation is resetting its OWN correlation ID — its in-delivery retry — so
+// there is nobody else's work to destroy. Widening the refusal to any in-flight row would
+// change which pushes converge, which is not what this decision is for.
+func DecideReset(claimedFrom SlipStatus, inFlight bool) (carryClaim bool, err error) {
+	if claimedFrom == "" {
+		return false, nil
+	}
+	if inFlight {
+		return false, fmt.Errorf(
+			"a step or component is in flight under the claim taken out of %s: %w",
+			claimedFrom, ErrSlipClaimedInFlight)
+	}
+	return true, nil
+}
+
+// ResetClaimMarker builds the claim marker an in-place reset re-states, for a row whose
+// recorded claim is claimedFrom and whose own state history is priorHistory. It is exported
+// for the same reason DecideReset is: the store and both test doubles must write the identical
+// marker, or a consumer's assertion about a reset row would pass against a double and fail
+// against Postgres.
+//
+// The actor is the ORIGINAL claimant, read off the prior row's history by the same backwards
+// scan pushhookparser makes, because the reader this marker exists for derives ClaimedBy from
+// the marker's actor: writing the library's own actor would restore the row's stranded-cleanup
+// exemption while renaming its adopter (PR #87, jhicks review). LibraryActor is the fallback,
+// and it is honest rather than a placeholder — a row whose claimed_from is set with no marker
+// left to read has no claimant recorded anywhere to name, and the invariant needs the marker's
+// PRESENCE. The library really is what wrote it.
+//
+// claimantFromHistory stays unexported behind this: what a third-party store needs is the
+// marker a reset must write, not a second general entry point for "who claimed this" that
+// could drift from the parser's own derivation.
+func ResetClaimMarker(claimedFrom SlipStatus, priorHistory []StateHistoryEntry) StateHistoryEntry {
+	claimedBy := claimantFromHistory(priorHistory)
+	if claimedBy == "" {
+		claimedBy = LibraryActor
+	}
+	return ClaimMarker(claimedFrom, claimedBy, "carried forward across an in-delivery retry reset")
+}
+
 // ClaimSlip records that a run is in flight against a slip, so a same-commit push
 // deduplicates onto it instead of repaving it (DEVOPS-285, DEVOPS-367). The claim is a flag:
 // it never changes the slip's status, and it lives until the run is over — released by a

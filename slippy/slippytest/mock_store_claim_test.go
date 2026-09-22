@@ -277,3 +277,94 @@ func countStep(slip *slippy.Slip, step string) int {
 	}
 	return n
 }
+
+// The published double's ResetSlipInPlace must decide the way PostgresStore decides — from the
+// STORED row at call time, through the shared slippy.DecideReset — or a consumer's test of the
+// in-delivery retry passes here and behaves differently in production (DEVOPS-367).
+func TestMockStore_ResetSlipInPlace(t *testing.T) {
+	ctx := context.Background()
+
+	successor := func(id string) *slippy.Slip {
+		return &slippy.Slip{
+			CorrelationID: id, Repository: "o/r", CommitSHA: "s-" + id, Status: slippy.SlipStatusPending,
+			Steps: map[string]slippy.Step{slippy.PushParsedStep: {Status: slippy.StepStatusRunning}},
+		}
+	}
+
+	t.Run("claimed with work in flight: refused, nothing written", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&slippy.Slip{
+			CorrelationID: "r1", Repository: "o/r", CommitSHA: "s-r1", Status: slippy.SlipStatusFailed,
+			Steps: map[string]slippy.Step{"builds": {Status: slippy.StepStatusRunning}},
+		})
+		// A run that is EXECUTING is adopted only by naming its status, which is what the
+		// rerunner does: a nil expected is refused by DecideClaim's in-flight arm.
+		_, err := store.ClaimSlip(ctx, "r1", []slippy.SlipStatus{slippy.SlipStatusFailed},
+			"pushhookparser/rerunner", "")
+		require.NoError(t, err)
+
+		err = store.ResetSlipInPlace(ctx, successor("r1"))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, slippy.ErrSlipClaimedInFlight)
+
+		got, loadErr := store.Load(ctx, "r1")
+		require.NoError(t, loadErr)
+		assert.Equal(t, slippy.SlipStatusFailed, got.Status, "the claimant's run is untouched")
+		assert.Equal(t, slippy.StepStatusRunning, got.Steps["builds"].Status)
+	})
+
+	t.Run("claimed and quiescent: reset, with the claim and its claimant carried", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&slippy.Slip{
+			CorrelationID: "r2", Repository: "o/r", CommitSHA: "s-r2", Status: slippy.SlipStatusFailed,
+		})
+		_, err := store.ClaimSlip(ctx, "r2", nil, "pushhookparser/rerunner", "")
+		require.NoError(t, err)
+
+		require.NoError(t, store.ResetSlipInPlace(ctx, successor("r2")))
+		got, loadErr := store.Load(ctx, "r2")
+		require.NoError(t, loadErr)
+		assert.Equal(t, slippy.SlipStatusPending, got.Status, "the row is live again")
+		assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom, "claimed_from survives the upsert")
+		marker := 0
+		actor := ""
+		for _, e := range got.StateHistory {
+			if e.Step == slippy.ClaimMarkerStep {
+				marker++
+				actor = e.Actor
+			}
+		}
+		assert.Equal(t, 1, marker, "and the marker goes with it, or the two readers disagree")
+		assert.Equal(t, "pushhookparser/rerunner", actor, "naming the recorded claimant, not the library")
+	})
+
+	t.Run("unclaimed: reset however its steps read", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&slippy.Slip{
+			CorrelationID: "r3", Repository: "o/r", CommitSHA: "s-r3", Status: slippy.SlipStatusFailed,
+			Steps: map[string]slippy.Step{"builds": {Status: slippy.StepStatusRunning}},
+		})
+		require.NoError(t, store.ResetSlipInPlace(ctx, successor("r3")))
+		got, err := store.Load(ctx, "r3")
+		require.NoError(t, err)
+		assert.Equal(t, slippy.SlipStatusPending, got.Status)
+		assert.Empty(t, got.ClaimedFrom)
+	})
+
+	t.Run("absent row: inserted, unclaimed, rather than refused", func(t *testing.T) {
+		store := NewMockStore()
+		require.NoError(t, store.ResetSlipInPlace(ctx, successor("r4")))
+		got, err := store.Load(ctx, "r4")
+		require.NoError(t, err)
+		assert.Equal(t, slippy.SlipStatusPending, got.Status)
+		assert.Empty(t, got.ClaimedFrom, "a fresh insert is always unclaimed")
+		assert.Equal(t, []string{"r4"}, store.ResetInPlaceCalls)
+	})
+
+	t.Run("a nil successor is refused, and the injected error short-circuits", func(t *testing.T) {
+		store := NewMockStore()
+		assert.ErrorIs(t, store.ResetSlipInPlace(ctx, nil), slippy.ErrInvalidConfiguration)
+		store.ResetInPlaceError = slippy.ErrStoreConnection
+		assert.ErrorIs(t, store.ResetSlipInPlace(ctx, successor("r5")), slippy.ErrStoreConnection)
+	})
+}

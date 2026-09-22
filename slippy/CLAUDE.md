@@ -16,19 +16,23 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ## Breaking changes
 
-**DEVOPS-367 added `ClaimSlip`, `ReleaseClaim` and `ProbeSchema` to the exported
-`SlipStore` interface:**
+**DEVOPS-367 added `ClaimSlip`, `ReleaseClaim`, `ProbeSchema` and `ResetSlipInPlace` to the
+exported `SlipStore` interface:**
 
 ```go
 ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (ClaimOutcome, error)
 ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (ReleaseOutcome, error)
 ProbeSchema(ctx context.Context) error
+ResetSlipInPlace(ctx context.Context, slip *Slip) error
 ```
 
 Same posture as `Repave` below: a downstream `SlipStore` implementation fails to compile
-until all three methods exist (the ClickHouse store returns `ErrClaimUnsupported` from the
-first two and `nil` from `ProbeSchema`, having no schema of its own; the
-`slippytest.MockStore` and slippy-api's `mockSlipStore` implement them). The claim is a
+until all four methods exist (the ClickHouse store returns `ErrClaimUnsupported` from the
+first two, `nil` from `ProbeSchema`, having no schema of its own, and `ErrResetUnsupported`
+from `ResetSlipInPlace`; the `slippytest.MockStore` and slippy-api's `mockSlipStore`
+implement them). `ResetSlipInPlace` is the in-place reset the push path used to perform with
+a bare `Create` — see "A push never resets a claimed row whose run is in flight" below for
+what it decides and why it has to be the store that decides it. The claim is a
 **flag**: `ClaimSlip` never writes `status`, and `ReleaseClaim` clears the claim only when
 no step or component is running or held — otherwise it returns
 `ReleaseOutcome{Released: false}` with nothing written, which callers treat as information.
@@ -77,49 +81,56 @@ refused (it used to be carved out as "nothing dispatched onto it", but a slip ke
 for its whole run), and an `in_progress` slip between one step's post-job and the next step's
 pre-job is claimable (it used to be refused as "a live run"). `ProbeSchema` is on the interface so
 the readiness gate is reachable through the abstraction consumers hold (`Client.ProbeSchema`
-wraps it). Implementers should route their decisions through `slippy.DecideClaim` and
-`slippy.DecideRelease` so they cannot drift from the store.
+wraps it). Implementers should route their decisions through `slippy.DecideClaim`,
+`slippy.DecideRelease` and `slippy.DecideReset` so they cannot drift from the store.
 `ReleaseMarker(status SlipStatus, releasedBy, reason string)` changed shape in the same
 release (the earlier `restored` argument is gone: a release never restores anything). The
 contract, including what `nil` means for `expected`, is on `SlipStore.ClaimSlip`,
-`SlipStore.ReleaseClaim` and `SlipStore.ProbeSchema` in `interfaces.go`; the model is in
-`.github/STATE_MACHINE_V3.md` under DEVOPS-367.
+`SlipStore.ReleaseClaim`, `SlipStore.ProbeSchema` and `SlipStore.ResetSlipInPlace` in
+`interfaces.go`; the model is in `.github/STATE_MACHINE_V3.md` under DEVOPS-367.
 
-**A push never resets a claimed row whose run is in flight _as of the push's own read_.** The
-push path's one exception to "a claimed row is deduped onto" is a push bearing that row's OWN
-correlation ID — its in-delivery retry — which resets the row in place via `Create`'s upsert.
-That carve-out now stops at work in flight: the upsert rewrites every step and aggregate column
-and the whole state history, so a self-correlated row with a running step is deduped like any
-other claimed row instead (finding p1). And because the upsert replaces `state_history` while
-`claimed_from` survives it, the reset re-appends the `slip_claimed` marker, keeping the invariant
-every reader depends on: **`claimed_from` and `slip_claimed` are both present or both absent** —
-pushhookparser derives "who claimed this" from the markers and gates its stranded-cleanup
-exemption on it, so a row that carried one without the other would read claimed to slippy and
-unclaimed to the parser (finding p2). The re-appended marker names the **original claimant**,
-read off the prior row's own history by the same backwards scan that parser makes, because
-`ClaimedBy` there IS the marker's actor: writing the library's actor restored the exemption
-while renaming the adopter to `slippy-library` for every marker-based reader (PR #87, jhicks
-review). `slippy-library` is left as the fallback for the one row that has no claimant to
-name — `claimed_from` set with no marker, the timing hole below.
+**A push never resets a claimed row whose run is in flight.** The push path's one exception to
+"a claimed row is deduped onto" is a push bearing that row's OWN correlation ID — its
+in-delivery retry — which resets the row in place. That carve-out stops at work in flight: the
+reset is an upsert that rewrites every step and aggregate column and the whole state history, so
+a self-correlated row with a running step is deduped like any other claimed row instead
+(finding p1). And because the upsert replaces `state_history` while `claimed_from` survives it,
+the reset re-states the `slip_claimed` marker, keeping the invariant every reader depends on:
+**`claimed_from` and `slip_claimed` are both present or both absent** — pushhookparser derives
+"who claimed this" from the markers and gates its stranded-cleanup exemption on it, so a row
+that carried one without the other would read claimed to slippy and unclaimed to the parser
+(finding p2). The re-stated marker names the **original claimant**, read off the row's own
+history by the same backwards scan that parser makes, because `ClaimedBy` there IS the marker's
+actor: writing the library's actor would restore the exemption while renaming the adopter to
+`slippy-library` for every marker-based reader (PR #87, jhicks review). `slippy-library` is left
+as the fallback for a row with `claimed_from` set and no marker left to name a claimant from.
 
-**The qualifier is load-bearing: that guarantee is not absolute, and closing it is deferred.**
-The push reads its claim evidence from an **unlocked** `LoadByCommit` (`PostgresStore.queryOne`
-is a plain `pool.QueryRow`, no `FOR UPDATE`), and the reset it gates is `Create` — the one
-full-row overwrite that takes **no lock either** (`PostgresStore.Create` is a bare `pool.Exec`;
-`lockSlip` is called from `Update` and the step mutators, never from `Create`). Between the two,
-`resolveAndAbandonAncestors` and its progressive-depth ancestor search make real GitHub round
-trips, for seconds. So a row read unclaimed and quiescent can be claimed — and its pre-job's
-`StartStep` can land — before the upsert does, with two consequences: the reset carries an
-**empty** claim forward, so `claimed_from` survives the upsert while the `slip_claimed` marker
-does not (the invariant above, broken by timing rather than by a caller, and the row silently
-loses its stranded-cleanup exemption, since pushhookparser's `ClaimedBy` is derived from the
-markers); and the reset rewrites the step, aggregate and history columns of a run that IS in
-flight at write time.
-Closing it means making the reset a store operation that re-reads the claim state `FOR UPDATE`
-and refuses on `RunInFlight` inside the same transaction as the upsert — a store and interface
-change, tracked with the claim-ownership work under **DEVOPS-371/372/373** rather than done
-here. The account in the code is on `CreateSlipForPush`'s claimed arm in `push.go`, and the same
-qualifier is on `SlipStore.ClaimSlip` (PR #87, pkuzmenko finding 2).
+**Both halves of that are decided under the row lock, by the store, not by the push.**
+`SlipStore.ResetSlipInPlace` (DEVOPS-367, PR #87) is the in-place reset: it re-reads the target
+row `FOR UPDATE`, evaluates `RunInFlight` on **that** read, and either performs the upsert or
+refuses with `ErrSlipClaimedInFlight` — all in one transaction, so the evidence cannot change
+before the write it authorises. `DecideReset(claimedFrom, inFlight) (carryClaim bool, err error)`
+is the shared decision, beside `DecideClaim` and `DecideRelease`, and `ResetClaimMarker` builds
+the marker, so the store and both test doubles cannot drift. The ClickHouse store returns
+`ErrResetUnsupported`, which the push path falls back from to a plain `Create` — it has no
+claim column, so there is no claim for the refused decision to protect.
+
+It replaced an unlocked `Create` gated on an unlocked `LoadByCommit`, with
+`resolveAndAbandonAncestors`' GitHub round trips in between — seconds during which a row read
+unclaimed and quiescent could be claimed and start executing. The upsert then kept
+`claimed_from` and replaced `state_history`, leaving the column set with the marker gone, and
+reset a run that was in flight. The push's own snapshot check survives as a **fast path**: it
+decides which route to attempt, and a dedup decided there skips ancestor resolution entirely,
+but a stale snapshot now costs one round trip and a dedup rather than a destroyed run.
+
+**What a refusal does:** both in-place reset arms — `persistSlipForPush`'s and the
+duplicate-create backstop's — converge on `resetSlipInPlace` in `push.go`, which on
+`ErrSlipClaimedInFlight` **deduplicates onto the existing live row** rather than failing the
+push: the claimant's run owns that slip and the desired end state, one run for this commit,
+already holds. The row is RELOADED for the result, because the snapshot the push still holds
+says unclaimed and quiescent. `AncestryResolved` is untouched on every arm (both call sites run
+after resolution). Neither arm calls `handlePushRetry` on a refusal — the reset was refused
+precisely because another run's work is executing under that row.
 
 Exactly ONE write path ends a claim: `UpdateSlipStatus` on a terminal status. `Create` and
 the full-row `Update` never touch `claimed_from`, whatever status the caller's snapshot

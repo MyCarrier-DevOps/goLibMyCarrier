@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -188,6 +189,112 @@ func (s *PostgresStore) ReleaseClaim(
 		return ReleaseOutcome{}, err
 	}
 	return outcome, nil
+}
+
+// ResetSlipInPlace implements SlipStore.ResetSlipInPlace as one transaction. See the
+// interface for the contract; this comment covers the Postgres mechanics and the lock order.
+//
+// The row is read FOR UPDATE by loadClaimStateTx — the same narrow read ClaimSlip and
+// ReleaseClaim use, so the unbounded state_history and step_details columns stay out of the
+// lock — DecideReset (shared with both test doubles) judges from that read, and the upsert
+// lands under the same lock. That is the whole point of the method: the push decides to reset
+// from an unlocked LoadByCommit taken seconds of GitHub round trips earlier, and a claim taken
+// in that window is invisible to it. Here the evidence cannot change before the write.
+//
+// LOCK ORDERING, stated because this is the fourth FOR UPDATE site on routing_slips
+// (ClaimSlip, ReleaseClaim and lockSlip's step-update path are the other three). The rule the
+// four share: every writer takes the routing_slips row lock for ONE correlation_id FIRST, and
+// only then touches that slip's child rows (slip_component_states, slip_ancestry). Repave is
+// the only writer that holds two routing_slips row locks, and only ever old-then-new.
+//
+// This transaction is the narrowest of the four: it touches exactly one table and exactly one
+// row — loadClaimStateTx locks it, the optional state_history read re-reads that same locked
+// row, and createTx's ON CONFLICT arm updates it — and then commits. A transaction that holds
+// one lock and waits for nothing else cannot be a participant in a deadlock cycle, and this one
+// has exactly one way to wait for anything else: the successor's (repository, commit_sha)
+// differing from the locked row's, which would make the ON CONFLICT arm's update maintain a new
+// uq_routing_slips_repo_sha entry and possibly block on another transaction's uncommitted one.
+// No in-repo caller does that (push.go builds the successor for the commit it looked up), and
+// even if one did, no cycle forms: closing it needs a transaction that INSERTS a routing_slips
+// row and THEN waits for a different routing_slips row lock, and no writer here does — Repave,
+// the only one that touches two rows, takes the delete's lock before its insert.
+//
+// The successor's ancestry link stays OUTSIDE this transaction, in the caller (push.go's
+// writeAncestryLink), and that is deliberate rather than incidental. Repave writes its link
+// INSIDE its own transaction under a SAVEPOINT (insertAncestryLinkBestEffort), so a repave can
+// hold routing_slips row locks while taking slip_ancestry ones. Keeping this transaction free
+// of slip_ancestry means the two can never take those two tables in opposite orders; and since
+// a repave already takes the parent row lock before any child-table write, the orders agree
+// anyway. The link write itself is one autocommit statement, so under migration v5's
+// fk_ancestry_slip it takes FOR KEY SHARE on the parent row — which this transaction's FOR
+// UPDATE does conflict with, so a link write for a slip being reset simply waits for the reset
+// to commit while holding nothing. The reset's link failure stays a warning on the same footing
+// as createFreshSlip's.
+//
+// A row that has GONE between the caller's read and this lock (a concurrent repave that
+// deleted it and inserted its own successor) is not an error: there is no claim left to
+// refuse, so the upsert runs as the plain insert a first push would have made. If that
+// successor now holds this (repository, commit_sha), the insert raises ErrDuplicateSlip
+// through mapCreateError exactly as Create does, and the caller's duplicate backstop handles
+// it.
+func (s *PostgresStore) ResetSlipInPlace(ctx context.Context, slip *Slip) error {
+	if slip == nil {
+		return fmt.Errorf("%w: ResetSlipInPlace requires a successor slip", ErrInvalidConfiguration)
+	}
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		prior, err := s.loadClaimStateTx(ctx, tx, slip.CorrelationID)
+		if err != nil {
+			if errors.Is(err, ErrSlipNotFound) {
+				return s.createTx(ctx, tx, slip)
+			}
+			return err
+		}
+
+		carryClaim, err := DecideReset(prior.ClaimedFrom, RunInFlight(prior))
+		if err != nil {
+			return fmt.Errorf("reset %s in place: %w", slip.CorrelationID, err)
+		}
+		if !carryClaim {
+			return s.createTx(ctx, tx, slip)
+		}
+
+		// The locked row is claimed and quiescent, so the upsert may proceed — but it
+		// replaces state_history while claimed_from survives it, and the claim marker has to
+		// survive with the column (DecideReset). The marker is built from the row's OWN
+		// history, read here rather than in claimStateColumns because that read is the
+		// decision's input and state_history is one of the two columns that grow without
+		// bound: it is fetched only once the decision has already said a claim exists, on a
+		// row this transaction already holds the lock on, so it costs one round trip and no
+		// additional lock.
+		priorHistory, err := loadStateHistoryTx(ctx, tx, slip.CorrelationID)
+		if err != nil {
+			return fmt.Errorf("reset %s in place: reading the prior history: %w", slip.CorrelationID, err)
+		}
+
+		// Copied rather than appended in place: the caller's Slip is its own value, and a
+		// reset that is later retried (redelivery, the duplicate backstop's second pass) must
+		// not accumulate a marker per attempt.
+		reset := *slip
+		reset.StateHistory = append(slices.Clone(slip.StateHistory),
+			ResetClaimMarker(prior.ClaimedFrom, priorHistory))
+		return s.createTx(ctx, tx, &reset)
+	})
+}
+
+// loadStateHistoryTx reads one row's state_history inside tx. ResetSlipInPlace uses it to name
+// the claimant a re-stated claim marker must carry (ResetClaimMarker). It takes no lock of its
+// own: its only caller has already locked this row FOR UPDATE in the same transaction.
+func loadStateHistoryTx(ctx context.Context, tx pgx.Tx, correlationID string) ([]StateHistoryEntry, error) {
+	var raw []byte
+	if err := tx.QueryRow(ctx,
+		"SELECT state_history FROM routing_slips WHERE correlation_id = $1", correlationID,
+	).Scan(&raw); err != nil {
+		if isNoRows(err) {
+			return nil, ErrSlipNotFound
+		}
+		return nil, fmt.Errorf("failed to read state history for slip %s: %w", correlationID, err)
+	}
+	return decodeStateHistory(raw), nil
 }
 
 // SetComponentImageTag records the built image tag for a component, preserving its current

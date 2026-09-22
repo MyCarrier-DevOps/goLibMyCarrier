@@ -212,6 +212,30 @@ func TestClickHouseStore_ReleaseClaim_Unsupported(t *testing.T) {
 	}
 }
 
+// ResetSlipInPlace is unsupported for the same reasons: the reset's whole contract is that it
+// DECIDES under a row lock, and this store has neither the claimed_from column to read nor the
+// transaction to hold the decision and the write together. It must return ErrResetUnsupported
+// — not ErrClaimUnsupported — because the push path's fallback for it is a plain Create, not
+// the failed-claim branch, and it must not panic on a nil successor since it reads nothing.
+func TestClickHouseStore_ResetSlipInPlace_Unsupported(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	err := store.ResetSlipInPlace(context.Background(), &Slip{CorrelationID: "corr-reset-1"})
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !errors.Is(err, ErrResetUnsupported) {
+		t.Errorf("expected errors.Is(err, ErrResetUnsupported) to hold, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "corr-reset-1") {
+		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
+	}
+	if nilErr := store.ResetSlipInPlace(context.Background(), nil); !errors.Is(nilErr, ErrResetUnsupported) {
+		t.Errorf("a nil successor must still refuse rather than panic, got %v", nilErr)
+	}
+}
+
 // ProbeSchema is the readiness gate on SlipStore. ClickHouse has no schema of its own to
 // check for it, so it reports ready rather than failing a caller's startup probe.
 func TestClickHouseStore_ProbeSchema_ReportsReady(t *testing.T) {

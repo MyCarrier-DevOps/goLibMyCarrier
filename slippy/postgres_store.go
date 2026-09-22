@@ -66,6 +66,15 @@ func (s *PostgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx
 
 // Create upserts a slip. Matches ClickHouse last-write-wins (and the in-memory
 // reference store): an existing correlation_id is overwritten rather than rejected.
+//
+// It is the one full-row write in this store that takes NO row lock — a bare pool.Exec, where
+// Update and every step mutator go through lockSlip — and it never writes claimed_from, which
+// slipColumns() excludes from both the INSERT list and the conflict arm's SET list. Those two
+// facts together are why an upsert over a row that MIGHT be claimed does not come through
+// here: the conflict arm would keep claimed_from while replacing state_history, and with no
+// lock there is no moment at which "is this row claimed, and is its run in flight?" can be
+// answered and acted on together. ResetSlipInPlace is that operation (DEVOPS-367); this method
+// is for a row the caller knows is its own to write.
 func (s *PostgresStore) Create(ctx context.Context, slip *Slip) error {
 	query, vals, err := s.buildCreateQuery(slip)
 	if err != nil {
@@ -413,14 +422,7 @@ func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 
 	slip.Aggregates = decodeAggregates(sc.aggregateCols, sc.aggregateBytes)
 
-	if len(sc.stateHistory) > 0 {
-		var wrapper struct {
-			Entries []StateHistoryEntry `json:"entries"`
-		}
-		if json.Unmarshal(sc.stateHistory, &wrapper) == nil {
-			slip.StateHistory = wrapper.Entries
-		}
-	}
+	slip.StateHistory = decodeStateHistory(sc.stateHistory)
 
 	// Reuse the shared (backend-agnostic) timing reconstruction from the scanner.
 	NewSlipScanner(s.config).reconstructStepTimingFromHistory(slip)
@@ -463,6 +465,24 @@ func decodeAggregates(cols []string, raw [][]byte) map[string][]ComponentStepDat
 		aggregates[col] = wrapper.Items
 	}
 	return aggregates
+}
+
+// decodeStateHistory unwraps the {"entries": [...]} envelope the state_history jsonb column
+// holds. A NULL, empty or malformed column yields a nil slice rather than an error, matching
+// what populate did inline before ResetSlipInPlace needed the same decode under a row lock:
+// a history that cannot be read is not a reason to fail a write that does not depend on it.
+// One definition so the two readers cannot disagree about the envelope.
+func decodeStateHistory(raw []byte) []StateHistoryEntry {
+	if len(raw) == 0 {
+		return nil
+	}
+	var wrapper struct {
+		Entries []StateHistoryEntry `json:"entries"`
+	}
+	if json.Unmarshal(raw, &wrapper) != nil {
+		return nil
+	}
+	return wrapper.Entries
 }
 
 // claimStateColumns returns exactly the columns the claim decisions read, in scan order:

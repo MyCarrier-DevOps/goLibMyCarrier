@@ -1004,3 +1004,154 @@ func TestRepaveableSlipStatusesSQL_MatchesIsLive(t *testing.T) {
 		})
 	}
 }
+
+// resetClaimStateRows is the FOR UPDATE claim-state read ResetSlipInPlace makes: claimed_from,
+// status, every configured step's status column, then every aggregate column — claimStateColumns()
+// order, which is the whole of DecideReset's input. Built from the store so a config change
+// cannot leave the expectation describing a different read.
+func resetClaimStateRows(store *PostgresStore, claimedFrom, status string, steps map[string]string,
+	aggregates map[string]string) *pgxmock.Rows {
+	cols, aggCols := store.claimStateColumns()
+	rows := pgxmock.NewRows(cols)
+	// claimed_from scans into a *string (it is nullable), so an unclaimed row is a nil
+	// pointer here rather than an empty string.
+	var claimPtr *string
+	if claimedFrom != "" {
+		claimPtr = &claimedFrom
+	}
+	values := []any{claimPtr, status}
+	for _, step := range store.config.Steps {
+		st, ok := steps[step.Name]
+		if !ok {
+			st = string(StepStatusPending)
+		}
+		values = append(values, st)
+	}
+	for _, agg := range aggCols {
+		items, ok := aggregates[agg]
+		if !ok {
+			items = `{"items":[]}`
+		}
+		values = append(values, []byte(items))
+	}
+	return rows.AddRow(values...)
+}
+
+func expectResetClaimStateRead(mock pgxmock.PgxPoolIface, id string) *pgxmock.ExpectedQuery {
+	return mock.ExpectQuery(`SELECT claimed_from, status, .* FROM routing_slips WHERE correlation_id = \$1 FOR UPDATE`).
+		WithArgs(id)
+}
+
+// historyCarryingClaimMarker matches the marshalled state_history ResetSlipInPlace writes when
+// the LOCKED row was claimed: the successor's own entries plus a re-stated slip_claimed marker
+// naming the recorded claimant. Asserting on the argument rather than on the SQL is what makes
+// this statement identifiable as the carry — the SQL is byte-identical to any other upsert.
+type historyCarryingClaimMarker struct{ claimedBy string }
+
+func (h historyCarryingClaimMarker) Match(v interface{}) bool {
+	payload, ok := v.(string)
+	if !ok {
+		return false
+	}
+	var wrapper struct {
+		Entries []StateHistoryEntry `json:"entries"`
+	}
+	if json.Unmarshal([]byte(payload), &wrapper) != nil {
+		return false
+	}
+	for _, e := range wrapper.Entries {
+		if e.Step == ClaimMarkerStep && e.Actor == h.claimedBy {
+			return true
+		}
+	}
+	return false
+}
+
+// The statement order ResetSlipInPlace promises: the claim state is read FOR UPDATE FIRST, and
+// the upsert lands inside the same transaction. An unclaimed row needs no history read — that
+// second read exists only to name a claimant — so a plain reset is two statements.
+func TestPostgresStore_ResetSlipInPlace_UnclaimedRowUpsertsUnderTheLock(t *testing.T) {
+	store, mock := newMockStore(t)
+	successor := repaveSuccessor()
+
+	mock.ExpectBegin()
+	expectResetClaimStateRead(mock, "new-id").
+		WillReturnRows(resetClaimStateRows(store, "", string(SlipStatusFailed),
+			map[string]string{"builds": string(StepStatusRunning)}, nil))
+	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.ResetSlipInPlace(context.Background(), successor))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// The refusal: the locked read shows a claim with a component still building, so nothing is
+// written and the transaction rolls back. No INSERT is queued, so pgxmock would fail the test
+// if one were issued.
+func TestPostgresStore_ResetSlipInPlace_RefusesAClaimWithWorkInFlight(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectBegin()
+	expectResetClaimStateRead(mock, "new-id").
+		WillReturnRows(resetClaimStateRows(store, string(SlipStatusFailed), string(SlipStatusFailed),
+			map[string]string{"builds": string(StepStatusFailed)},
+			map[string]string{"builds": `{"items":[{"component":"api","status":"running"}]}`}))
+	mock.ExpectRollback()
+
+	err := store.ResetSlipInPlace(context.Background(), repaveSuccessor())
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrSlipClaimedInFlight)
+	assert.Contains(t, err.Error(), "new-id", "the error names the slip it refused")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// A claim with nothing in flight is carried: the history read runs, and the upsert's
+// state_history argument carries a slip_claimed marker naming the RECORDED claimant. The
+// caller supplied no such marker — it cannot, since its snapshot may predate the claim.
+func TestPostgresStore_ResetSlipInPlace_CarriesTheClaimAndItsClaimant(t *testing.T) {
+	store, mock := newMockStore(t)
+	prior, err := json.Marshal(struct {
+		Entries []StateHistoryEntry `json:"entries"`
+	}{Entries: []StateHistoryEntry{ClaimMarker(SlipStatusFailed, "pushhookparser/rerunner", "rerun")}})
+	require.NoError(t, err)
+
+	mock.ExpectBegin()
+	expectResetClaimStateRead(mock, "new-id").
+		WillReturnRows(resetClaimStateRows(store, string(SlipStatusFailed), string(SlipStatusFailed), nil, nil))
+	mock.ExpectQuery(`SELECT state_history FROM routing_slips WHERE correlation_id = \$1`).
+		WithArgs("new-id").
+		WillReturnRows(pgxmock.NewRows([]string{"state_history"}).AddRow(prior))
+	// state_history is fixedSlipColumns()' last entry, so it is the 9th bind of the upsert.
+	args := anyArgs(len(store.slipColumns()))
+	args[len(fixedSlipColumns())-1] = historyCarryingClaimMarker{claimedBy: "pushhookparser/rerunner"}
+	mock.ExpectExec(`INSERT INTO routing_slips .* ON CONFLICT \(correlation_id\) DO UPDATE SET`).
+		WithArgs(args...).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	successor := repaveSuccessor()
+	require.NoError(t, store.ResetSlipInPlace(context.Background(), successor))
+	require.NoError(t, mock.ExpectationsWereMet())
+	assert.Empty(t, successor.StateHistory,
+		"the marker goes on a copy: a retried reset must not accumulate one marker per attempt")
+}
+
+// A row that has GONE between the caller's read and this lock (a concurrent repave) is not an
+// error and not a refusal: there is no claim left to protect, so the upsert runs as the insert
+// a first push would have made and redelivery converges.
+func TestPostgresStore_ResetSlipInPlace_AbsentRowIsInserted(t *testing.T) {
+	store, mock := newMockStore(t)
+
+	mock.ExpectBegin()
+	expectResetClaimStateRead(mock, "new-id").WillReturnError(pgx.ErrNoRows)
+	expectRepaveSuccessorInsert(store, mock).WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectCommit()
+
+	require.NoError(t, store.ResetSlipInPlace(context.Background(), repaveSuccessor()))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPostgresStore_ResetSlipInPlace_RejectsANilSuccessor(t *testing.T) {
+	store, _ := newMockStore(t)
+	assert.ErrorIs(t, store.ResetSlipInPlace(context.Background(), nil), ErrInvalidConfiguration)
+}

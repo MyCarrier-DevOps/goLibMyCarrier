@@ -132,6 +132,7 @@ type MockStore struct {
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
 	ClaimSlipCalls        []ClaimSlipCall
 	ReleaseClaimCalls     []ReleaseClaimCall
+	ResetInPlaceCalls     []string
 	RepaveCalls           []string
 	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
 	// the same call (empty string when a nil successor was passed). The in-memory mock has
@@ -165,6 +166,7 @@ type MockStore struct {
 	UpdateSlipStatusError error
 	ClaimSlipError        error
 	ReleaseClaimError     error
+	ResetInPlaceError     error
 	ProbeSchemaError      error
 	RepaveError           error
 	CloseError            error
@@ -818,6 +820,61 @@ func (m *MockStore) ReleaseClaim(
 	return slippy.ReleaseOutcome{Released: true, Status: slip.Status}, nil
 }
 
+// ResetSlipInPlace mirrors PostgresStore.ResetSlipInPlace through the shared
+// slippy.DecideReset, so this double and the real store cannot disagree about when an
+// in-delivery retry's reset is refused.
+//
+// What it models, and why each half matters to a consumer test:
+//
+//   - The decision is made from the STORED row at call time, never from what the caller
+//     passed or last read. That is the whole behaviour under test in the race this method
+//     closes (DEVOPS-367): a consumer can claim the slip between its LoadByCommit and its
+//     push's write and see the reset refused, exactly as Postgres refuses it under the row
+//     lock.
+//   - A refusal writes NOTHING and returns slippy.ErrSlipClaimedInFlight wrapped, so a
+//     consumer asserting with errors.Is sees the same sentinel production raises.
+//   - An allowed reset keeps claimed_from (Create's SET list excludes it) and re-states the
+//     slip_claimed marker naming the recorded claimant, so the invariant a marker-reading
+//     consumer depends on — claimed_from and slip_claimed both present or both absent —
+//     holds here too.
+//   - An absent row is upserted rather than refused, matching the store's behaviour when a
+//     concurrent repave removed the target between the caller's read and this write.
+func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *slippy.Slip) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if slip == nil {
+		return fmt.Errorf("%w: ResetSlipInPlace requires a successor slip", slippy.ErrInvalidConfiguration)
+	}
+	m.ResetInPlaceCalls = append(m.ResetInPlaceCalls, slip.CorrelationID)
+	if m.ResetInPlaceError != nil {
+		return m.ResetInPlaceError
+	}
+
+	slipCopy := DeepCopySlip(slip)
+	existing, ok := m.Slips[slip.CorrelationID]
+	if !ok {
+		// No row to decide about: the upsert degenerates to a fresh insert, which is always
+		// unclaimed — claimed_from is absent from the INSERT column list, not merely from the
+		// conflict arm's SET list (see Create).
+		slipCopy.ClaimedFrom = ""
+		m.Slips[slip.CorrelationID] = slipCopy
+		return nil
+	}
+
+	carryClaim, err := slippy.DecideReset(existing.ClaimedFrom, slippy.RunInFlight(existing))
+	if err != nil {
+		return fmt.Errorf("reset %s in place: %w", slip.CorrelationID, err)
+	}
+	slipCopy.ClaimedFrom = existing.ClaimedFrom
+	if carryClaim {
+		slipCopy.StateHistory = append(slipCopy.StateHistory,
+			slippy.ResetClaimMarker(existing.ClaimedFrom, existing.StateHistory))
+	}
+	m.Slips[slip.CorrelationID] = slipCopy
+	return nil
+}
+
 // ProbeSchema mirrors PostgresStore.ProbeSchema's readiness gate. The double has no schema,
 // so it reports ready unless ProbeSchemaError is set.
 func (m *MockStore) ProbeSchema(ctx context.Context) error {
@@ -974,6 +1031,7 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.UpdateSlipStatusCalls = nil
+	m.ResetInPlaceCalls = nil
 	// Repave state. Omitted before, which broke this method's own "clears all stored data
 	// and call tracking" contract: a consumer that Resets between scenarios kept stale
 	// repave records, so len(RepaveCalls) assertions passed or failed on the previous

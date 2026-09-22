@@ -160,3 +160,76 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+// The internal double's ResetSlipInPlace, held to the same contract as the published one and
+// as PostgresStore: the decision comes from the STORED row through the shared DecideReset, so
+// the client tests that drive the race against this double prove something (DEVOPS-367).
+func TestMockStore_ResetSlipInPlace(t *testing.T) {
+	ctx := context.Background()
+	successor := func(id string) *Slip {
+		return &Slip{
+			CorrelationID: id, Repository: "o/r", CommitSHA: "s-" + id, Status: SlipStatusPending,
+			Steps: map[string]Step{PushParsedStep: {Status: StepStatusRunning}},
+		}
+	}
+
+	t.Run("claimed with work in flight: refused, nothing written", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&Slip{
+			CorrelationID: "m1", Repository: "o/r", CommitSHA: "s-m1", Status: SlipStatusFailed,
+			Steps: map[string]Step{"builds": {Status: StepStatusRunning}},
+		})
+		// A run that is EXECUTING is adopted only by naming its status, which is what the
+		// rerunner does: a nil expected is refused by DecideClaim's in-flight arm.
+		_, err := store.ClaimSlip(ctx, "m1", []SlipStatus{SlipStatusFailed}, "pushhookparser/rerunner", "")
+		require.NoError(t, err)
+
+		err = store.ResetSlipInPlace(ctx, successor("m1"))
+		assert.ErrorIs(t, err, ErrSlipClaimedInFlight)
+		got, loadErr := store.Load(ctx, "m1")
+		require.NoError(t, loadErr)
+		assert.Equal(t, SlipStatusFailed, got.Status)
+		assert.Equal(t, StepStatusRunning, got.Steps["builds"].Status)
+	})
+
+	t.Run("claimed and quiescent: reset, claim and claimant carried", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&Slip{CorrelationID: "m2", Repository: "o/r", CommitSHA: "s-m2", Status: SlipStatusFailed})
+		_, err := store.ClaimSlip(ctx, "m2", nil, "slippy-cli/prejob", "")
+		require.NoError(t, err)
+
+		require.NoError(t, store.ResetSlipInPlace(ctx, successor("m2")))
+		got, loadErr := store.Load(ctx, "m2")
+		require.NoError(t, loadErr)
+		assert.Equal(t, SlipStatusPending, got.Status)
+		assert.Equal(t, SlipStatusFailed, got.ClaimedFrom)
+		assert.Equal(t, 1, countHistoryStep(got, ClaimMarkerStep))
+		assert.Equal(t, "slippy-cli/prejob", lastHistoryActor(got, ClaimMarkerStep))
+	})
+
+	t.Run("unclaimed, and absent", func(t *testing.T) {
+		store := NewMockStore()
+		store.AddSlip(&Slip{
+			CorrelationID: "m3", Repository: "o/r", CommitSHA: "s-m3", Status: SlipStatusFailed,
+			Steps: map[string]Step{"builds": {Status: StepStatusRunning}},
+		})
+		require.NoError(t, store.ResetSlipInPlace(ctx, successor("m3")))
+		got, err := store.Load(ctx, "m3")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusPending, got.Status, "an unclaimed row is reset however its steps read")
+		assert.Empty(t, got.ClaimedFrom)
+
+		require.NoError(t, store.ResetSlipInPlace(ctx, successor("m4")))
+		got, err = store.Load(ctx, "m4")
+		require.NoError(t, err)
+		assert.Equal(t, SlipStatusPending, got.Status, "an absent row is inserted, not refused")
+		assert.Empty(t, got.ClaimedFrom)
+	})
+
+	t.Run("a nil successor is refused, and the injected error short-circuits", func(t *testing.T) {
+		store := NewMockStore()
+		assert.ErrorIs(t, store.ResetSlipInPlace(ctx, nil), ErrInvalidConfiguration)
+		store.ResetInPlaceError = ErrStoreConnection
+		assert.ErrorIs(t, store.ResetSlipInPlace(ctx, successor("m5")), ErrStoreConnection)
+	})
+}

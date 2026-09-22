@@ -558,6 +558,55 @@ func TestDecideRelease(t *testing.T) {
 	assert.True(t, release, "no steps at all is quiescent")
 }
 
+// DecideReset is the whole of the in-place reset decision, shared by PostgresStore and both
+// doubles. Four rows because there are exactly two inputs, and each row states what a caller
+// does with the answer: the claimed+in-flight row is the ONLY refusal, and carryClaim is the
+// obligation to re-state the slip_claimed marker in the history the upsert is about to replace.
+func TestDecideReset(t *testing.T) {
+	tests := []struct {
+		name        string
+		claimedFrom SlipStatus
+		inFlight    bool
+		wantCarry   bool
+		wantRefusal bool
+		why         string
+	}{
+		{
+			name: "unclaimed and quiescent", claimedFrom: "", inFlight: false,
+			wantCarry: false, wantRefusal: false,
+			why: "the ordinary in-delivery retry: reset, and there is no claim to carry",
+		},
+		{
+			name: "unclaimed with work in flight", claimedFrom: "", inFlight: true,
+			wantCarry: false, wantRefusal: false,
+			why: "an unclaimed row has no other run to protect; the caller is resetting its own id",
+		},
+		{
+			name: "claimed and quiescent", claimedFrom: SlipStatusFailed, inFlight: false,
+			wantCarry: true, wantRefusal: false,
+			why: "nothing to destroy, so the reset proceeds — and the marker must go with the column",
+		},
+		{
+			name: "claimed with work in flight", claimedFrom: SlipStatusFailed, inFlight: true,
+			wantCarry: false, wantRefusal: true,
+			why: "the upsert would rewrite the state that run is writing, under an unchanged id",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			carry, err := DecideReset(tc.claimedFrom, tc.inFlight)
+			if tc.wantRefusal {
+				require.Error(t, err, tc.why)
+				assert.ErrorIs(t, err, ErrSlipClaimedInFlight)
+				assert.False(t, carry, "a refusal writes nothing, so there is nothing to carry")
+				return
+			}
+			require.NoError(t, err, tc.why)
+			assert.Equal(t, tc.wantCarry, carry, tc.why)
+		})
+	}
+}
+
 // PostgresStore.ReleaseClaim hands DecideRelease a Slip hydrated from claimStateColumns()
 // alone — ClaimedFrom, Status, each step's Status and the aggregate components — while both
 // test doubles hand it a fully loaded row. The two agree today only because DecideRelease

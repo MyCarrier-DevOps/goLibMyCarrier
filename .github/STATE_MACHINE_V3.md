@@ -204,11 +204,13 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     the caller protocol reads as "this is your slip, proceed" rather than as a dedup.
 
     Being excluded from the guard does **not** mean falling through to a repave. That push is
-    diverted to an **in-place upsert**: `persistSlipForPush` resets the row to live under the
-    SAME correlation ID, keeping its component children and replacing its state history, and
-    records a `reset in place after <status> attempt` marker so an operator can tell a reset
-    from a first attempt. This is the ordinary in-delivery retry, not an exotic shape — so
-    "repaved under a new correlation ID" describes only pushes carrying a DIFFERENT id.
+    diverted to an **in-place reset**: `persistSlipForPush` calls `SlipStore.ResetSlipInPlace`,
+    which upserts the row back to live under the SAME correlation ID, keeping its component
+    children and replacing its state history, and records a `reset in place after <status>
+    attempt` marker so an operator can tell a reset from a first attempt. The reset decides
+    under the row lock and refuses when a claimant's run is in flight (see the claim section
+    below). This is the ordinary in-delivery retry, not an exotic shape — so "repaved under a
+    new correlation ID" describes only pushes carrying a DIFFERENT id.
 
   See "the guard no longer infers intent from component count" below for the failure this
   fixed, and `DispatchIntent` in `push.go` for what setting it opts a componentless push
@@ -431,18 +433,37 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
     **One exception, added by PR #87's seventh review (finding p1):** a push bearing the
     claimed row's OWN correlation ID is that delivery's in-delivery retry rather than another
-    run, and it resets the row **in place** — `Create`'s `ON CONFLICT DO UPDATE`, which
-    rewrites every step and aggregate column and the state history — when the run is
-    **quiescent**. It does NOT when a step or component is in flight; then the dedup applies as
-    to any other claimed row, because the reset would destroy the state that run is writing
-    under an unchanged correlation ID. Both guard paths spell it `claimed && (different id ||
-    RunInFlight)`. Because the reset replaces `state_history` while `claimed_from` survives it,
-    the reset also re-appends the `slip_claimed` marker (finding p2): `claimed_from` and
-    `slip_claimed` are **both present or both absent**, which is what pushhookparser's
-    stranded-cleanup exemption — keyed on the marker, not the column — depends on. An abandon or promote is the
+    run, and it resets the row **in place** — an upsert that rewrites every step and aggregate
+    column and the state history — when the run is **quiescent**. It does NOT when a step or
+    component is in flight; then the dedup applies as to any other claimed row, because the
+    reset would destroy the state that run is writing under an unchanged correlation ID. Both
+    guard paths spell it `claimed && (different id || RunInFlight)`. Because the reset replaces
+    `state_history` while `claimed_from` survives it, the reset also re-states the
+    `slip_claimed` marker (finding p2): `claimed_from` and `slip_claimed` are **both present or
+    both absent**, which is what pushhookparser's stranded-cleanup exemption — keyed on the
+    marker, not the column — depends on. An abandon or promote is the
     exception: both are terminal statuses written from outside the run, so they end the claim
     even while steps are still running, and both are repaveable — an ancestor abandon or a
     promotion deliberately overrides a live claim.
+
+    **"Quiescent" means under the row lock the reset itself takes** (DEVOPS-367, PR #87,
+    closing pkuzmenko finding 2). The reset is `SlipStore.ResetSlipInPlace`, one transaction
+    that re-reads the target row `FOR UPDATE`, evaluates `RunInFlight` on **that** read through
+    the shared `DecideReset`, and either performs the upsert or refuses with
+    `ErrSlipClaimedInFlight` having written nothing; the re-stated `slip_claimed` marker is
+    built from the locked row's own history, so it names the recorded claimant even for a claim
+    the push never read. It replaced a bare `Create` — an unlocked upsert — gated on an
+    unlocked `LoadByCommit`, with `resolveAndAbandonAncestors`' GitHub round trips in between:
+    a row read unclaimed and quiescent could be claimed and start executing in that window, and
+    the upsert then kept `claimed_from`, replaced `state_history` (leaving the column set with
+    the marker gone, so the row lost its stranded-cleanup exemption) and rewrote the step
+    columns of a run that was in flight. The push's snapshot check survives as a fast path that
+    decides which route to attempt — a dedup decided there skips ancestor resolution entirely —
+    while the locked read decides what actually happens. On a refusal both in-place reset arms
+    **deduplicate onto the live row** rather than failing the push: the claimant's run owns the
+    slip and the desired end state, one run for this commit, already holds. The ClickHouse
+    store returns `ErrResetUnsupported` and the push falls back to a plain `Create`, which
+    loses nothing there — it has no `claimed_from` column, so it has no claim to protect.
   - **It ends when the run is over, and only then.** Two ways: a **terminal status write**
     through `UpdateSlipStatus` — the ONE write path that ends a claim, which `AbandonSlip`,
     `PromoteSlip` and `checkPipelineCompletion` all take — clears it, because terminal ends

@@ -163,6 +163,32 @@ var (
 	// ErrNotClaimed.
 	ErrClaimUnsupported = errors.New("store does not support ClaimSlip/ReleaseClaim")
 
+	// ErrSlipClaimedInFlight is returned by SlipStore.ResetSlipInPlace when the row it locked
+	// is claimed AND a step or component of that claim's run is running or held. The reset is
+	// an upsert that rewrites every step and aggregate column and the whole state history, so
+	// performing it would destroy the state that run is still writing, under an unchanged
+	// correlation ID. Nothing is written: the transaction rolls back, so the claimant's run is
+	// exactly as the caller found it.
+	//
+	// It is a REFUSAL, not a failure, and the push path treats it as one: the claimant's run
+	// owns that slip and the desired end state — one run for this commit — already holds, so
+	// both in-place reset arms deduplicate onto the live row instead of failing the push
+	// (DEVOPS-367). Callers detect it with errors.Is; the reloaded row carries claimed_from
+	// and the step evidence a caller needs to decide whether to dispatch.
+	ErrSlipClaimedInFlight = errors.New(
+		"slip is claimed and its run has work in flight; the in-place reset was refused")
+
+	// ErrResetUnsupported indicates the store cannot perform the locked in-place reset at
+	// all: it has no claimed_from column to read under a row lock and no transaction to hold
+	// the decision and the upsert together. The ClickHouse store returns it from
+	// ResetSlipInPlace, wrapped with the correlation ID via %w, since it is not the
+	// operational slip store (DEVOPS-127). Callers detect it with errors.Is and fall back to
+	// a plain Create, exactly as they fall back to abandon semantics on ErrRepaveUnsupported
+	// — and that fallback loses nothing, because a store with no claim column has no claim
+	// for the refused decision to protect.
+	ErrResetUnsupported = errors.New(
+		"store does not support ResetSlipInPlace; caller should fall back to a plain Create")
+
 	// ErrSchemaBehind is returned by PostgresStore.ProbeSchema when routing_slips is missing
 	// any column this library's SELECTs name — the whole slipSelectColumns() list, so
 	// claimed_from (migration v6) and every configured step's column alike. Every read path

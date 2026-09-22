@@ -442,8 +442,13 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.RepaveCalls) != 0 {
 			t.Errorf("no repave may be attempted for a self-referential id, got %v", store.RepaveCalls)
 		}
-		if len(store.CreateCalls) != 1 {
-			t.Errorf("expected exactly one Create (the upsert), got %d", len(store.CreateCalls))
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("the in-place reset goes through ResetSlipInPlace, not the unlocked Create, "+
+				"got %d Create calls", len(store.CreateCalls))
+		}
+		if len(store.ResetInPlaceCalls) != 1 {
+			t.Errorf("expected exactly one ResetSlipInPlace (the locked upsert), got %d",
+				len(store.ResetInPlaceCalls))
 		}
 		stored, loadErr := store.Load(ctx, "corr-same-delivery")
 		if loadErr != nil {
@@ -510,12 +515,16 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 				t.Errorf("no repave may be attempted for a self-referential id, got %v",
 					store.RepaveCalls)
 			}
-			if len(store.CreateCalls) != 1 {
-				t.Errorf("expected exactly one Create (the in-place upsert), got %d",
-					len(store.CreateCalls))
+			if len(store.CreateCalls) != 0 {
+				t.Errorf("the in-place reset goes through ResetSlipInPlace, not the unlocked "+
+					"Create, got %d Create calls", len(store.CreateCalls))
+			}
+			if len(store.ResetInPlaceCalls) != 1 {
+				t.Errorf("expected exactly one ResetSlipInPlace (the locked upsert), got %d",
+					len(store.ResetInPlaceCalls))
 			}
 
-			// The reachable half of appendResetMarkers. Its other caller — the duplicate-create
+			// The reachable half of appendResetMarker. Its other caller — the duplicate-create
 			// backstop — is dormant until Phase B's unique index exists, so without this the
 			// only assertion on the marker sat on the arm that cannot run, and deleting the
 			// call in persistSlipForPush was green.

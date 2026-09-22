@@ -784,11 +784,11 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// is no other run's work to protect — it is this delivery's own retry — and returning
 		// it would hand the caller returned == sent on an ENDED row, so it dispatches and then
 		// reports against a terminal slip. It falls through to persistSlipForPush's
-		// self-referential arm, which upserts the row live again; Create's SET list excludes
-		// claimed_from, so that reset keeps the claim, and the reset carries the slip_claimed
-		// marker forward — with the ORIGINAL claimant's actor, read off the prior row's own
-		// history — so neither the column nor the claimant's identity is lost
-		// (appendResetMarkers).
+		// self-referential arm, which resets the row live again through
+		// SlipStore.ResetSlipInPlace; Create's SET list excludes claimed_from, so that reset
+		// keeps the claim, and the store re-states the slip_claimed marker — with the ORIGINAL
+		// claimant's actor, read off the row it has LOCKED — so neither the column nor the
+		// claimant's identity is lost (ResetClaimMarker).
 		//
 		// THE CARVE-OUT IS ITSELF CARVED OUT WHEN THE RUN IS IN FLIGHT (finding p1). "No other
 		// run's work to protect" holds only while nothing is executing. Create's ON CONFLICT
@@ -796,41 +796,36 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// claimed row with a RUNNING step down that path resets the very state the claim
 		// exists to protect — under the same correlation ID, leaving an operator no way to
 		// tell which attempt wrote what. The in-delivery retry that reaches here after its
-		// own dispatch already started is exactly that shape. So: reset in place only when the
-		// snapshot below says RunInFlight is false; when it says true, dedup like any other
-		// claimed row.
+		// own dispatch already started is exactly that shape. So: attempt the reset in place
+		// only when the snapshot below says RunInFlight is false; when it says true, dedup
+		// like any other claimed row.
 		//
-		// AS OF THE READ, AND NOT LATER (PR #87, pkuzmenko finding 2). Both halves of that
-		// decision — ClaimedFrom and RunInFlight — are read off existingSlip, which
-		// LoadByCommit produced with a plain UNLOCKED pool read (PostgresStore.queryOne is
-		// s.pool.QueryRow; there is no FOR UPDATE anywhere on that path), and the write they
-		// gate is Create, the one full-row overwrite that takes no lock either
-		// (PostgresStore.Create is a bare s.pool.Exec; lockSlip is called from Update and
-		// from the step mutators, never from Create). Between the read and the write run
-		// resolveAndAbandonAncestors and its progressive-depth ancestor search — real GitHub
-		// round trips, seconds of them. So this arm judges a snapshot that can be stale by the
-		// time the upsert lands, and it is stale in both directions:
+		// WHAT THIS ARM DECIDES, AND WHAT IT NO LONGER DECIDES (DEVOPS-367, closing PR #87
+		// pkuzmenko finding 2). Both halves of the condition — ClaimedFrom and RunInFlight —
+		// are read off existingSlip, which LoadByCommit produced with a plain UNLOCKED pool
+		// read (PostgresStore.queryOne is s.pool.QueryRow; there is no FOR UPDATE anywhere on
+		// that path), and resolveAndAbandonAncestors' progressive-depth ancestor search runs
+		// real GitHub round trips — seconds of them — before anything is written. So this
+		// snapshot can be stale by the time the write lands, in both directions:
 		//
-		//   - READ UNCLAIMED, CLAIMED DURING THE WINDOW. The push never enters this arm; it
-		//     falls through to persistSlipForPush's self-referential arm carrying an EMPTY
-		//     claim, so appendResetMarkers appends no claim marker. claimed_from SURVIVES the
-		//     upsert (slipColumns() excludes it) and state_history does NOT (ColumnStateHistory
-		//     is in that list), so the row ends up with the column set and the slip_claimed
-		//     marker gone — exactly the invariant appendResetMarkers exists to keep.
-		//     pushhookparser derives "who claimed this" from the markers, so that row silently
-		//     loses its stranded-cleanup exemption.
-		//   - READ QUIESCENT, A STEP STARTED DURING THE WINDOW. The reset then rewrites the
-		//     step, aggregate and history columns of a run that IS in flight at write time —
-		//     the outcome the RunInFlight disjunct exists to prevent, reached around it.
+		//   - READ UNCLAIMED, CLAIMED DURING THE WINDOW. The push does not enter this arm; it
+		//     falls through to persistSlipForPush's self-referential arm carrying an empty
+		//     claim.
+		//   - READ QUIESCENT, A STEP STARTED DURING THE WINDOW. The push enters the reset arm
+		//     believing there is nothing to disturb.
 		//
-		// NOT CLOSED HERE, deliberately. Closing it means making the reset a store operation
-		// that re-reads the claim state FOR UPDATE and refuses on RunInFlight inside the same
-		// transaction as the upsert, which is a store and interface change rather than a push
-		// one. It is recorded with the claim-ownership work tracked as DEVOPS-371 (a
-		// dispatcher-held claim), DEVOPS-372 and DEVOPS-373, which is where closing it
-		// belongs. Until then this guarantee is stated as "quiescent
-		// AS OF THE READ" everywhere it appears — here, in CLAUDE.md, and on
-		// SlipStore.ClaimSlip — and not as an absolute.
+		// Neither one decides the outcome any more. The write those arms reach is
+		// SlipStore.ResetSlipInPlace, which re-reads the row FOR UPDATE, evaluates RunInFlight
+		// on THAT read and either upserts or refuses with ErrSlipClaimedInFlight, inside the
+		// transaction the upsert itself lands in. The refusal comes back as a dedup onto the
+		// live row (resetSlipInPlace), and a claim taken during the window has its marker
+		// re-stated from the locked row, so claimed_from and slip_claimed stay both-present-
+		// or-both-absent even though no reader on this side ever saw the claim.
+		//
+		// What the snapshot still decides is which route to ATTEMPT, and that is worth having:
+		// a row this arm can answer skips ancestor resolution's multi-second GitHub calls
+		// entirely. A snapshot that was wrong costs one extra round trip and a dedup, not a
+		// destroyed run.
 		//
 		// WHAT THE IN-FLIGHT HALF RETURNS, for a reader following it out of this arm: the row
 		// comes back through handlePushRetry, which writes push_parsed = running and reloads.
@@ -843,14 +838,16 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// needs no library change either: Slip already carries claimed_from, steps and
 		// aggregates on the wire (types.go), so a caller that must not double-dispatch can gate
 		// on the claim plus the step evidence in the 201 body it already holds rather than on
-		// the top-level status.
+		// the top-level status. A reset REFUSED under the lock returns the same shape, for the
+		// same reason — see resetSlipInPlace.
 		//
 		// WHAT CONVERGES WITH handleDuplicateSlipBackstop, AND WHAT DOES NOT. The backstop
 		// orders its mirror of these arms the same way — live, empty-run guard, claimed,
 		// self-referential, repave — so identical inputs reach the same DECISION
-		// (dedup vs repave) through either path, and that ordering is what the two paths
-		// promise each other. The SIDE EFFECTS of a dedup differ, deliberately and on every
-		// backstop dedup arm rather than this one shape: this branch routes through
+		// (dedup vs reset) through either path, and both self-referential arms now converge on
+		// one helper (resetSlipInPlace) for the reset itself, so they cannot differ on what a
+		// refusal does either. The SIDE EFFECTS of a dedup still differ, deliberately and on
+		// every backstop dedup arm rather than this one shape: this branch routes through
 		// handlePushRetry, resetting push_parsed and writing the "retry detected" marker,
 		// while the backstop's live and claimed arms return the conflicting row untouched.
 		// Two reasons, both structural. The backstop is reached AFTER this push's Create lost
@@ -1023,44 +1020,36 @@ func (c *Client) persistSlipForPush(
 	// dispatch, and then report against a slip whose top-level status is still failed. The
 	// upsert is what makes the returned slip genuinely live.
 	//
-	// Reachable only when the prior row's run was QUIESCENT AS OF THE READ. CreateSlipForPush's
-	// claimed branch keeps a self-correlated row whose run has a step or component in flight,
-	// because the upsert below would rewrite the step, aggregate and history columns that run is
-	// still writing (finding p1). What still reaches here with a claim is the retry whose
-	// dispatch never started or has finished; appendResetMarkers carries that claim's marker
-	// across the upsert so the surviving claimed_from column keeps its marker (finding p2).
+	// The push-side claim check that routed here is a FAST PATH, not the guarantee.
+	// CreateSlipForPush's claimed branch keeps a self-correlated row whose run its SNAPSHOT
+	// showed in flight, so it can dedup without paying for ancestor resolution (finding p1).
+	// What reaches here is everything that snapshot did not catch — including a row it read
+	// unclaimed that has since been claimed, because that read is an unlocked LoadByCommit
+	// taken before resolveAndAbandonAncestors' GitHub round trips and can be seconds stale.
 	//
-	// "As of the read" is the whole of the guarantee, and it is not the same as "at write time"
-	// (PR #87, pkuzmenko finding 2). The claim evidence that routed the push here came from an
-	// UNLOCKED LoadByCommit, this upsert takes no lock either, and resolveAndAbandonAncestors'
-	// GitHub calls run for seconds in between — so a row read unclaimed and quiescent can be
-	// claimed and executing by the time the upsert lands. It then keeps claimed_from (excluded
-	// from slipColumns()) and loses state_history (included), leaving the column set with no
-	// slip_claimed marker, and it resets a run that is in flight. Closing that needs the reset
-	// to become a store operation re-reading FOR UPDATE inside the upsert's own transaction;
-	// tracked with DEVOPS-371/372/373. The full account is on CreateSlipForPush's claimed arm.
+	// THAT STALENESS NO LONGER DECIDES ANYTHING (DEVOPS-367, closing PR #87 pkuzmenko finding
+	// 2). The write below is SlipStore.ResetSlipInPlace, which re-reads the row FOR UPDATE,
+	// evaluates RunInFlight on that locked read and either upserts or refuses inside one
+	// transaction. A claim taken during the window is seen; a step started during the window
+	// is seen; and a refusal comes back as ErrSlipClaimedInFlight, which resetSlipInPlace turns
+	// into a dedup onto the live row rather than a failed push. The claim marker is re-stated
+	// from the locked row too, so claimed_from and slip_claimed stay both-present-or-both-absent
+	// even for a claim this push never saw — which is why appendResetMarker no longer carries
+	// one forward from the snapshot.
 	//
 	// Caveat 1, unchanged from the pre-Repave behaviour this matches: the row is rewritten but
 	// its slip_component_states children are not deleted, so the new attempt inherits the
 	// previous attempt's component rows under the same id.
 	//
-	// Caveat 2: Create is the one full-row overwrite in PostgresStore that does NOT take the
-	// per-slip FOR UPDATE lock (postgres_store.go, Create; contrast Update, whose comment says
-	// the lock exists to stop a concurrent updateStepTx commit being clobbered).
-	// AbandonSlip/PromoteSlip also write unlocked but go through UpdateSlipStatus, a
-	// single-column SET that cannot clobber anything else; Create can.
-	//
-	// Not a torn write: lockSlip is SELECT ... FOR UPDATE and a conflicting INSERT ... ON
-	// CONFLICT blocks behind it, so the two statements serialize. It is last-write-wins — and
-	// if a component of this same run is still reporting when the upsert lands second, its step
-	// columns and state_history are discarded, under a correlation ID that gives an operator no
-	// way to tell which attempt wrote what.
-	//
-	// Accepted deliberately, and recorded here because this arm is now the DESIGNED route to
-	// that write rather than an incidental fall-through: at merge base all five ended statuses
-	// reached the identical unlocked Create anyway, and because the conflict target is
-	// correlation_id, every write at risk belongs to the id this arm is resetting on purpose.
-	// The reset marker appended below is what makes the overwrite legible afterwards.
+	// Caveat 2, now bounded rather than accepted: the reset is still Create's full-row
+	// overwrite, and it is still last-write-wins against a concurrent step write for the same
+	// id. What changed is that it can no longer land on a run it was never allowed to touch —
+	// the row lock the decision is made under is the same lock lockSlip takes, so a step write
+	// either commits before the reset reads (and is seen, refusing it when a claim holds) or
+	// blocks behind the reset's own transaction. For an UNCLAIMED row the overwrite is still
+	// the designed outcome: every write at risk belongs to the id this arm is resetting on
+	// purpose, since the conflict target is correlation_id. The reset marker appended below is
+	// what makes the overwrite legible afterwards.
 	//
 	// That is the same child-row state the upsert-collision note on SlipStore.Repave
 	// describes, but do NOT carry that note's reachability over: it is about a CROSS-RUN
@@ -1081,16 +1070,34 @@ func (c *Client) persistSlipForPush(
 				"commit":         shortSHA(opts.CommitSHA),
 				"prior_status":   string(existingSlip.Status),
 			})
-		appendResetMarkers(slip, existingSlip, opts.CommitSHA)
-		return c.createFreshSlip(ctx, opts, slip, parent, result)
+		appendResetMarker(slip, existingSlip, opts.CommitSHA)
+		handled, resetErr := c.resetSlipInPlace(ctx, opts, slip, parent, result)
+		if resetErr == nil || !errors.Is(resetErr, ErrDuplicateSlip) {
+			return handled, resetErr
+		}
+
+		// Unique-index backstop, the same one createFreshSlip runs for the same sentinel from
+		// its own Create: the target row was gone by the time the reset locked it (a
+		// concurrent repave) and another correlation ID now holds this (repository,
+		// commit_sha). Route to the backstop and, if it did not resolve the push itself, make
+		// exactly ONE more attempt — bounded the way createFreshSlip's single Create retry is,
+		// and for the same reason: a second conflict means the row is genuinely someone
+		// else's and there is nothing left to converge on.
+		backstopHandled, backstopErr := c.handleDuplicateSlipBackstop(ctx, opts, slip, parent, result)
+		if backstopErr != nil {
+			return false, backstopErr
+		}
+		if backstopHandled {
+			return true, nil
+		}
+		return c.resetSlipInPlace(ctx, opts, slip, parent, result)
 	}
 
 	return c.repaveExistingSlip(ctx, existingSlip, opts, slip, parent, result)
 }
 
-// appendResetMarkers records that a prior attempt for this commit existed, on a slip that is
-// about to be upserted in place under its own correlation ID — and re-states the prior row's
-// claim when it had one.
+// appendResetMarker records that a prior attempt for this commit existed, on a slip that is
+// about to be upserted in place under its own correlation ID.
 //
 // Create upserts state_history along with every other non-PK column, so without this the
 // previous attempt is replaced by initializeSlipForPush's single seed entry and the row carries
@@ -1100,36 +1107,31 @@ func (c *Client) persistSlipForPush(
 // store's self-repave guard cites as its reason for existing. Every other supersede path leaves a
 // marker (Repave appends one, handlePushRetry writes "retry detected").
 //
-// THE CLAIM MARKER IS NOT COSMETIC (finding p2). claimed_from SURVIVES the upsert — Create's
-// SET list excludes it — while state_history does NOT, so a reset of a claimed row would leave
-// the column set and the slip_claimed marker gone. Two readers then disagree about one row:
-// slippy reads the column, and pushhookparser derives "who claimed this" from the markers
-// (pkg/slippy/http_client.go) and gates its stranded-cleanup exemption on it, so a claimed slip
-// would lose that exemption the moment its own in-delivery retry reset it. Re-appending the
-// claim keeps SlipStore.Create's invariant true: claimed_from and slip_claimed are both present
-// or both absent. The marker's prior is the RECORDED claimed_from, not the row's status, because
-// that is what the column holds and what a later reader compares against.
+// IT USED TO CARRY THE CLAIM MARKER FORWARD TOO, AND NO LONGER DOES — that half moved into the
+// store, and the move is the point rather than a tidy-up. The invariant is unchanged and still
+// load-bearing: claimed_from SURVIVES the upsert (Create's SET list excludes it) while
+// state_history does NOT, so a reset of a claimed row must re-state the slip_claimed marker or
+// the row reads claimed to slippy and unclaimed to pushhookparser, which derives "who claimed
+// this" from the markers and gates its stranded-cleanup exemption on it (finding p2). What
+// changed is WHO can tell. This function only ever saw `prior` — a snapshot LoadByCommit took
+// before resolveAndAbandonAncestors' GitHub round trips — so it could re-state a claim the
+// snapshot had already recorded and nothing else. The reachable half of the race is a claim
+// taken AFTER that read, which no snapshot can show; carrying the marker from here was
+// therefore a fix for the half that was never the problem. SlipStore.ResetSlipInPlace re-states
+// the marker from the row it has locked, which is the only evidence that cannot be stale, and
+// it names the recorded claimant through the shared ResetClaimMarker. Appending here as well
+// would now write the marker twice on the common path.
 //
-// AND IT CARRIES THE CLAIMANT, NOT JUST THE CLAIM (PR #87, jhicks review). The reader this
-// marker exists for derives ClaimedBy from the marker's ACTOR, so re-appending with the
-// library's own actor restored the row's exemption while renaming its adopter to
-// LibraryActor for pushhookparser and for every audit query on who adopted the slip. The
-// actor therefore comes from prior's own history, by the same backwards scan that reader
-// makes (claimantFromHistory) — so identity survives the reset, not only presence.
-//
-// LibraryActor remains the FALLBACK, and it is honest rather than a placeholder: a prior row
-// with claimed_from set and no claim marker in its history is the timing hole documented on
-// CreateSlipForPush's claimed arm (a row claimed during the unlocked window between this
-// push's read and its write), and there is no claimant recorded anywhere to name. The
-// invariant needs the marker's PRESENCE, and the library really is what wrote it.
+// What is left is one marker about one fact this function does own: the prior attempt's STATUS,
+// which belongs to the row the push decided against and is audit, not an invariant. prior is
+// still the ROW BEING RESET rather than a bare status, because both callers already hold it and
+// passing the row is what stops a caller pairing one row's status with another row's identity.
 //
 // Both in-place reset arms call it — persistSlipForPush's and the duplicate-create backstop's —
 // because this file asserts in two places that those paths converge on the same outcome for the
 // same inputs, and a marker written by only one of them is a divergence on the very observable
-// that exists to make the state legible. prior is the ROW BEING RESET: its status, its
-// claimed_from and its history are three facts about one row, and taking the row rather than
-// three arguments is what stops a caller pairing one of them with another row's.
-func appendResetMarkers(slip, prior *Slip, commitSHA string) {
+// that exists to make the state legible.
+func appendResetMarker(slip, prior *Slip, commitSHA string) {
 	slip.StateHistory = append(slip.StateHistory, StateHistoryEntry{
 		Step:      PushParsedStep,
 		Status:    StepStatusRunning,
@@ -1138,15 +1140,100 @@ func appendResetMarkers(slip, prior *Slip, commitSHA string) {
 		Message: fmt.Sprintf("reset in place after %s attempt for commit %s",
 			prior.Status, shortSHA(commitSHA)),
 	})
-	if prior.ClaimedFrom == "" {
-		return
+}
+
+// resetSlipInPlace is the one route both in-place reset arms take — persistSlipForPush's
+// self-referential arm and handleDuplicateSlipBackstop's — so the two cannot drift on an
+// outcome this file asserts in two places is shared.
+//
+// It hands the successor to SlipStore.ResetSlipInPlace, which re-reads the target row FOR
+// UPDATE, evaluates RunInFlight on THAT read and either upserts or refuses, all in one
+// transaction (DEVOPS-367). The decision is therefore made on evidence that cannot change
+// before the write, which is what neither call site could do for itself: both reached here on
+// an UNLOCKED LoadByCommit taken before resolveAndAbandonAncestors' GitHub round trips, so
+// each one's claim and in-flight evidence can be seconds stale. The push-side check on that
+// snapshot is now a FAST PATH — it decides which route to attempt and, when it says "dedup",
+// skips the ancestry resolution entirely — and the store's locked read is what decides what
+// actually happens.
+//
+// Returns persistSlipForPush's convention:
+//   - handled=false, err=nil: the row now holds slip; the caller's own contract decides what
+//     to do with it (the main path lets CreateSlipForPush set result.Slip = slip; the backstop
+//     sets it and reports handled=true, since a written row leaves its caller nothing to
+//     insert). The ancestry link is written here, outside the store's transaction, so both
+//     arms write exactly one link and the reset transaction never holds a routing_slips lock
+//     while taking a slip_ancestry one.
+//   - handled=true, err=nil: the reset was REFUSED because the locked row is claimed with work
+//     in flight. result.Slip is that row, RELOADED — the snapshot the caller still holds says
+//     unclaimed and quiescent, and returning it would report a state that is known to be
+//     false. This is a dedup, not a failure: the claimant's run owns the slip and the desired
+//     end state, one run for this commit, already holds.
+//   - err != nil: fatal for this push. ErrDuplicateSlip is included, and each caller routes it
+//     the way it already routes that sentinel from its own write: the main path to the
+//     duplicate backstop (as createFreshSlip does), the backstop itself fatally, since it is
+//     already the last-resort convergence path.
+//
+// AncestryResolved is deliberately not touched on any arm. Both call sites run AFTER
+// resolveAndAbandonAncestors, so the field already holds this push's real resolution outcome
+// and forcing it true would contradict result.Warnings (see CreateSlipResult.AncestryResolved).
+//
+// THE REFUSAL DOES NOT ROUTE THROUGH handlePushRetry, and that is a choice with a live tension
+// either way. The main path's claimed arm DOES call it when the snapshot already showed the
+// in-flight claim, so the same shape discovered at read time gets a push_parsed reset and a
+// "retry detected" entry while the same shape discovered under the lock does not. The backstop's
+// dedup arms, by contrast, never write to the conflicting row at all. Converging THESE two arms
+// is what this file asserts, so they behave alike: neither writes. That also keeps the refusal
+// honest — it was refused precisely because another run's work is executing under this row —
+// and the dedup is still recorded, in the log line below.
+func (c *Client) resetSlipInPlace(
+	ctx context.Context,
+	opts PushOptions,
+	slip *Slip,
+	parent *AncestryEntry,
+	result *CreateSlipResult,
+) (handled bool, err error) {
+	resetErr := c.store.ResetSlipInPlace(ctx, slip)
+	switch {
+	case resetErr == nil:
+		c.writeAncestryLink(ctx, slip, parent, result)
+		return false, nil
+
+	case errors.Is(resetErr, ErrSlipClaimedInFlight):
+		c.logger.Info(ctx, "In-place reset refused under the row lock: a claimant's run is in flight; deduping",
+			map[string]interface{}{
+				"correlation_id": slip.CorrelationID,
+				"commit":         shortSHA(opts.CommitSHA),
+			})
+		live, loadErr := c.store.Load(ctx, slip.CorrelationID)
+		if loadErr != nil {
+			return false, fmt.Errorf("failed to reload slip %s after a refused in-place reset: %w",
+				slip.CorrelationID, loadErr)
+		}
+		result.Slip = live
+		return true, nil
+
+	case errors.Is(resetErr, ErrResetUnsupported):
+		// The store cannot decide under a row lock (ClickHouseStore: no claimed_from column,
+		// no transaction). Falling back to the plain upsert is what this arm did before the
+		// decision moved into the store, and it loses nothing on such a store — with no claim
+		// column there is no claim for the refused decision to protect. Mirrors
+		// repaveExistingSlip's ErrRepaveUnsupported fallback.
+		//
+		// The Create here is deliberately NOT routed through createFreshSlip: that would send
+		// an ErrDuplicateSlip into the duplicate backstop, whose own self-referential arm
+		// comes back to this function — a loop with no bound for a store that returned both
+		// sentinels. No store in this repo can (ClickHouse raises neither ErrDuplicateSlip nor
+		// anything from a unique index), but the shape should not depend on that.
+		if createErr := c.store.Create(ctx, slip); createErr != nil {
+			return false, fmt.Errorf("failed to reset slip %s in place on a store without the locked reset: %w",
+				slip.CorrelationID, createErr)
+		}
+		c.writeAncestryLink(ctx, slip, parent, result)
+		return false, nil
+
+	default:
+		return false, fmt.Errorf("failed to reset slip %s in place: %w", slip.CorrelationID, resetErr)
 	}
-	claimedBy := claimantFromHistory(prior.StateHistory)
-	if claimedBy == "" {
-		claimedBy = LibraryActor
-	}
-	slip.StateHistory = append(slip.StateHistory,
-		ClaimMarker(prior.ClaimedFrom, claimedBy, "carried forward across an in-delivery retry reset"))
 }
 
 // createFreshSlip inserts slip and writes its parent link, for the paths where there is no
@@ -1470,7 +1557,8 @@ func (c *Client) abandonSupersededSlipForUnsupportedRepave(
 // destroying it here would pull the rug out from under an in-flight run while we dispatch a
 // duplicate); an ended one is deduped onto when the empty-run guard applies (componentless
 // push) or when a claimant holds it (claimed_from set, DEVOPS-367), reset in place when it
-// already carries THIS push's correlation ID and its run is quiescent as read, and repaved onto
+// already carries THIS push's correlation ID and its run is quiescent under the row lock the
+// reset takes, and repaved onto
 // slip,
 // this push's successor, otherwise. Those checks are mirrored from the main path IN THE SAME
 // ORDER — live, empty-run guard, claimed, self-referential, repave — so identical inputs reach
@@ -1481,12 +1569,14 @@ func (c *Client) abandonSupersededSlipForUnsupportedRepave(
 // push's own id is this delivery's retry and is reset in place, UNLESS its run has a step or
 // component in flight, in which case the reset would destroy the state that run is writing
 // (finding p1). Both paths spell that as `claimed && (different id || RunInFlight)`, and on
-// both the evidence is an UNLOCKED read gating an UNLOCKED write, so the condition is judged as
-// of that read rather than at write time. The window differs: this backstop's own LoadByCommit
-// runs after ancestor resolution, immediately before the caller's insert retry, while the main
-// path's snapshot predates resolveAndAbandonAncestors' GitHub round trips and so can be stale
-// by seconds. Neither is closed here (PR #87, pkuzmenko finding 2; DEVOPS-371/372/373) — the
-// full account is on CreateSlipForPush's claimed arm.
+// both the evidence is an UNLOCKED read. That evidence no longer decides the outcome: both
+// self-referential arms perform the reset through the shared resetSlipInPlace, and
+// SlipStore.ResetSlipInPlace re-reads the row FOR UPDATE and refuses on a claim with work in
+// flight inside the upsert's own transaction (DEVOPS-367). So the snapshot picks the route —
+// and a dedup decided here still skips work the reset would have paid for — while the locked
+// read decides what happens. The windows differ in length (this backstop's own LoadByCommit
+// runs after ancestor resolution, immediately before the write, while the main path's snapshot
+// predates resolveAndAbandonAncestors' GitHub round trips) and neither has to be zero.
 //
 // The ORDER and the decision are what converge; the dedup's side effects do not, and that is
 // deliberate (PR #87 finding 8). The main path routes its live and claimed dedups through
@@ -1500,12 +1590,13 @@ func (c *Client) abandonSupersededSlipForUnsupportedRepave(
 // one arm: the live arm and the claimed arm are the same shape, and changing one of them
 // makes this function inconsistent with itself rather than with the main path.
 //
-// Returns handled=true when the caller should return result directly, which now covers two
-// outcomes: the dedup cases (result.Slip is the conflicting slip) AND a successful repave of
-// the conflicting row (result.Slip is slip, already persisted by that repave — there is
-// nothing left for the caller to insert). Returns handled=false only when nothing was
-// written and the caller should retry its own insert: no conflicting row was found or
-// loadable, or the store cannot repave. Returns a non-nil err on a fatal repave failure.
+// Returns handled=true when the caller should return result directly, which now covers three
+// outcomes: the dedup cases (result.Slip is the conflicting slip), a successful repave of the
+// conflicting row, and a successful in-place reset of it (result.Slip is slip in both, already
+// persisted — there is nothing left for the caller to insert). Returns handled=false only when
+// nothing was written and the caller should retry its own insert: no conflicting row was found
+// or loadable, or the store cannot repave. Returns a non-nil err on a fatal repave or reset
+// failure.
 //
 // D3.1 (DEVOPS-231 review): the conflicting row's repave below applies the SAME
 // live-vs-ended decision as repaveExistingSlip's sentinel handling, not just a bare fatal
@@ -1654,17 +1745,23 @@ func (c *Client) handleDuplicateSlipBackstop(
 		// file asserts elsewhere that the two guard paths converge on the same outcome for
 		// the same inputs.
 		//
-		// handled=false hands control back to createFreshSlip's retry, whose Create is an
-		// upsert on correlation_id — the same in-place reset the main path performs, markers
-		// included: the retry's Create upserts state_history too, so without appending here the
-		// two convergent paths would differ on the one observable added to make a reset legible,
-		// and a claimed row would come out with claimed_from set and no slip_claimed marker.
+		// It performs that reset HERE, through the shared resetSlipInPlace, rather than handing
+		// control back to createFreshSlip's insert retry as it used to. The retry's Create was
+		// an unlocked upsert that re-read nothing; the shared helper's is a store operation
+		// that re-reads the row FOR UPDATE and refuses on a claim with work in flight, and
+		// routing both arms through it is what keeps the two paths' outcomes identical for
+		// identical inputs (DEVOPS-367). handled=true either way afterwards: a written row
+		// leaves the caller nothing to insert, and a refusal has already populated result.
 		//
-		// Reached with a claim only when that claim's run was QUIESCENT AS OF THE READ: the
-		// claimed arm above now keeps a self-correlated row whose run is in flight (finding p1).
-		// Same caveat as that arm's: the evidence is an unlocked snapshot taken seconds of
-		// GitHub calls before this write, so it can be stale by the time the upsert lands
-		// (PR #87, pkuzmenko finding 2; DEVOPS-371/372/373).
+		// The claim evidence in the arm above is a snapshot and can be stale — this backstop's
+		// own LoadByCommit runs after ancestor resolution, so its window is short, but it is
+		// not zero. It no longer has to be: what the snapshot decides is which route to
+		// attempt, and what the locked read decides is what happens.
+		//
+		// An error here is fatal, including ErrDuplicateSlip, and that is the one place this
+		// arm deliberately differs from the main path's (which routes that sentinel back into
+		// this function). This backstop IS that route; re-entering it from inside itself is a
+		// loop, not a convergence.
 		//
 		// Dormant until migration v5 is applied: ErrDuplicateSlip is what routes here, and no
 		// unique index exists before then to raise it.
@@ -1675,8 +1772,15 @@ func (c *Client) handleDuplicateSlipBackstop(
 				"commit":         shortSHA(conflicting.CommitSHA),
 				"prior_status":   string(conflicting.Status),
 			})
-		appendResetMarkers(slip, conflicting, conflicting.CommitSHA)
-		return false, nil
+		appendResetMarker(slip, conflicting, conflicting.CommitSHA)
+		deduped, resetErr := c.resetSlipInPlace(ctx, opts, slip, parent, result)
+		if resetErr != nil {
+			return false, resetErr
+		}
+		if !deduped {
+			result.Slip = slip
+		}
+		return true, nil
 	}
 
 	c.logger.Debug(ctx, "Duplicate-create backstop: attempting repave of ended conflicting slip",

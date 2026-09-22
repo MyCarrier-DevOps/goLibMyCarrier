@@ -170,7 +170,15 @@ type MockStore struct {
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
 	ClaimSlipCalls        []ClaimSlipCall
 	ReleaseClaimCalls     []ReleaseClaimCall
+	ResetInPlaceCalls     []string
 	RepaveCalls           []string
+	// AfterLoadByCommit runs at the END of LoadByCommit, once the returned copy has been
+	// taken and with the mutex STILL HELD, so it must mutate m.Slips directly and must not
+	// call a method that locks. It is how a test drives the interleaving ResetSlipInPlace
+	// exists to close: a claimant claims the row, and its pre-job starts a step, in the window
+	// between the push's read and the push's write. In production that window is
+	// resolveAndAbandonAncestors' GitHub round trips; here the hook IS that window.
+	AfterLoadByCommit func(*MockStore)
 	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
 	// the same call (empty string when a nil successor was passed). The in-memory mock has
 	// no slip_ancestry-equivalent table to repoint (InsertAncestryLink/ResolveAncestry are
@@ -223,6 +231,7 @@ type MockStore struct {
 	UpdateSlipStatusError error
 	ClaimSlipError        error
 	ReleaseClaimError     error
+	ResetInPlaceError     error
 	ProbeSchemaError      error
 	RepaveError           error
 	AncestryLinkError     error
@@ -555,7 +564,11 @@ func (m *MockStore) LoadByCommit(ctx context.Context, repository, commitSHA stri
 	}
 	loadOrder(rows)
 
-	return deepCopySlip(rows[0]), nil
+	got := deepCopySlip(rows[0])
+	if m.AfterLoadByCommit != nil {
+		m.AfterLoadByCommit(m)
+	}
+	return got, nil
 }
 
 // LoadLiveByCommit retrieves the most recent live slip by repository and commit SHA,
@@ -887,6 +900,47 @@ func (m *MockStore) ReleaseClaim(
 	slip.ClaimedFrom = ""
 	slip.StateHistory = append(slip.StateHistory, ReleaseMarker(slip.Status, releasedBy, reason))
 	return ReleaseOutcome{Released: true, Status: slip.Status}, nil
+}
+
+// ResetSlipInPlace mirrors PostgresStore.ResetSlipInPlace through the shared DecideReset, the
+// same way slippytest.MockStore does, so neither double can drift from the store: the decision
+// is made from the STORED row at call time rather than from anything the caller passed or last
+// read, a refusal writes nothing and returns ErrSlipClaimedInFlight wrapped, an allowed reset
+// keeps claimed_from and re-states the slip_claimed marker naming the recorded claimant, and an
+// absent row is upserted rather than refused.
+func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *Slip) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if slip == nil {
+		return fmt.Errorf("%w: ResetSlipInPlace requires a successor slip", ErrInvalidConfiguration)
+	}
+	m.ResetInPlaceCalls = append(m.ResetInPlaceCalls, slip.CorrelationID)
+	if m.ResetInPlaceError != nil {
+		return m.ResetInPlaceError
+	}
+
+	slipCopy := deepCopySlip(slip)
+	existing, ok := m.Slips[slip.CorrelationID]
+	if !ok {
+		// Nothing to decide about: the upsert degenerates to a fresh insert, which is always
+		// unclaimed (see Create).
+		slipCopy.ClaimedFrom = ""
+		m.Slips[slip.CorrelationID] = slipCopy
+		return nil
+	}
+
+	carryClaim, err := DecideReset(existing.ClaimedFrom, RunInFlight(existing))
+	if err != nil {
+		return fmt.Errorf("reset %s in place: %w", slip.CorrelationID, err)
+	}
+	slipCopy.ClaimedFrom = existing.ClaimedFrom
+	if carryClaim {
+		slipCopy.StateHistory = append(slipCopy.StateHistory,
+			ResetClaimMarker(existing.ClaimedFrom, existing.StateHistory))
+	}
+	m.Slips[slip.CorrelationID] = slipCopy
+	return nil
 }
 
 // ProbeSchema mirrors PostgresStore.ProbeSchema's readiness gate; the double has no schema,

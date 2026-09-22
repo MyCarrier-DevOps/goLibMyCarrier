@@ -976,6 +976,20 @@ func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID, _, _ st
 	return ReleaseOutcome{}, fmt.Errorf("ReleaseClaim(%s): %w", correlationID, ErrClaimUnsupported)
 }
 
+// ResetSlipInPlace is unsupported on ClickHouse for the same reasons as ClaimSlip: no
+// claimed_from column to read under a row lock, and no transaction to hold the decision and
+// the upsert together. Wrapped so errors.Is works; the push path falls back to a plain Create,
+// which loses nothing here because a store with no claim column has no claim to protect.
+// The nil guard is not defensive clutter: this method refuses before reading anything, so a
+// nil successor must not turn a refusal into a panic.
+func (s *ClickHouseStore) ResetSlipInPlace(_ context.Context, slip *Slip) error {
+	var correlationID string
+	if slip != nil {
+		correlationID = slip.CorrelationID
+	}
+	return fmt.Errorf("ResetSlipInPlace(%s): %w", correlationID, ErrResetUnsupported)
+}
+
 // ProbeSchema is a no-op here: this store selects no claim column and its tables are managed
 // by clickhousemigrator, so it has no schema of its own for the readiness gate to check.
 func (s *ClickHouseStore) ProbeSchema(_ context.Context) error {
