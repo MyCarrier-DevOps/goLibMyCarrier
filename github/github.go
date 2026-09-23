@@ -314,12 +314,6 @@ func (s *GithubSession) authenticate() error {
 	installationTokenSource, httpClient := newInstallationClient(appTokenSource, installationID, s.cfg)
 	token, err := installationTokenSource.Token()
 	if err != nil {
-		// A throttled mint also carries this package's own ErrRateLimited, so a caller that
-		// retries on it need not name the auth library's sentinel; errors.As still reaches
-		// *githubauth.RateLimitError for the wait GitHub asked for.
-		if errors.Is(err, githubauth.ErrRateLimited) {
-			return fmt.Errorf("error generating token: %w: %w", ErrRateLimited, err)
-		}
 		return fmt.Errorf("error generating token: %w", err)
 	}
 	s.client = github.NewClient(httpClient)
@@ -462,9 +456,8 @@ func (s *GithubSession) setMilestone(
 // cfg.ctx, and is not retried when GitHub throttles it. go-githubauth otherwise
 // sleeps up to 60s on a 429 or a rate-limit 403 and tries again, outside any
 // client timeout, so a mint's worst case would be that sleep plus a second
-// request. A throttled mint instead fails at once with an error wrapping
-// githubauth.ErrRateLimited (and, out of NewGithubSession, this package's ErrRateLimited), and
-// the caller decides whether to retry.
+// request. A throttled mint instead fails at once with an error wrapping this package's
+// ErrRateLimited and githubauth.ErrRateLimited, and the caller decides whether to retry.
 // go-githubauth's default client is not used: its 30s header bound could never
 // fire inside the mint's shorter overall one.
 //
@@ -484,11 +477,26 @@ func newInstallationClient(
 	if cfg.mintBaseURL != "" {
 		mintOpts = append(mintOpts, githubauth.WithBaseURL(cfg.mintBaseURL))
 	}
-	tokenSource := githubauth.NewInstallationTokenSource(installationID, app, mintOpts...)
+	tokenSource := rateLimitJoiner{githubauth.NewInstallationTokenSource(installationID, app, mintOpts...)}
 
 	base := &http.Client{Transport: cfg.transport, Timeout: cfg.requestTimeout}
 	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, base)
 	return tokenSource, oauth2.NewClient(ctx, tokenSource)
+}
+
+// rateLimitJoiner adds this package's ErrRateLimited to a throttled mint's error, so a caller
+// can branch on this package's sentinel rather than on its auth library's. It wraps the token
+// source once, so both mint paths carry it: the mint in NewGithubSession, and a refresh inside a
+// REST call, which oauth2.Transport returns unchanged. errors.As still reaches
+// *githubauth.RateLimitError for the wait GitHub asked for.
+type rateLimitJoiner struct{ oauth2.TokenSource }
+
+func (r rateLimitJoiner) Token() (*oauth2.Token, error) {
+	token, err := r.TokenSource.Token()
+	if err != nil && errors.Is(err, githubauth.ErrRateLimited) {
+		return nil, fmt.Errorf("%w: %w", ErrRateLimited, err)
+	}
+	return token, err
 }
 
 // sharedTransport returns the one transport every HTTP call in this package goes
@@ -520,10 +528,12 @@ func newBoundedTransport(responseHeaderTimeout time.Duration) http.RoundTripper 
 	transport := defaultTransport.Clone()
 	transport.ResponseHeaderTimeout = responseHeaderTimeout
 	// Every call this package makes goes to one host, so the per-host idle limit is the
-	// transport's whole idle limit (MaxIdleConns, 100 on the clone). The clone's default
-	// per-host limit is 2, and go-githubauth's own client uses GOMAXPROCS+1: both are sized
-	// by something other than how many sessions a consumer runs at once, and pushhookparser's
-	// pod has GOMAXPROCS 2 against 10 workers.
+	// transport's whole idle limit (MaxIdleConns, 100 on the clone) rather than the clone's
+	// default of 2. This governs HTTP/1.1 connections only: api.github.com negotiates HTTP/2,
+	// where a pooled connection is not consumed by the request using it, so one connection
+	// carries a whole burst and this limit does not decide whether the next one re-handshakes.
+	// A cold burst dials one connection per pending request on either protocol. Kept as a
+	// cheap default for an HTTP/1.1 endpoint, or a proxy that downgrades to one.
 	transport.MaxIdleConnsPerHost = transport.MaxIdleConns
 	return transport
 }

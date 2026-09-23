@@ -441,6 +441,46 @@ func TestNewGithubSessionWithOptions_AppliesTheSessionConfig(t *testing.T) {
 	})
 }
 
+// TestNewInstallationClient_ThrottledRefreshIsThisPackagesErrRateLimited pins the second
+// go-githubauth path: a token refresh inside a REST call. oauth2.Transport returns the token
+// source's error unchanged, so unless the source itself joins the sentinel, a consumer that keeps
+// one session for its whole life (MC.TestEngine does) sees only the library's sentinel on a
+// throttle (PR #89 review, bcarlock).
+func TestNewInstallationClient_ThrottledRefreshIsThisPackagesErrRateLimited(t *testing.T) {
+	var mints atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc(testTokenPath, func(w http.ResponseWriter, _ *http.Request) {
+		if mints.Add(1) == 1 {
+			// The first mint hands out a token that is already expired, so the next REST call
+			// refreshes it.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"token":      testAccessToken,
+				"expires_at": time.Now().Add(-time.Minute).UTC().Format(time.RFC3339),
+			})
+			return
+		}
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
+	server := newStallServer(t, mux)
+
+	tokenSource, client := newInstallationClient(testAppTokenSource(t), testInstallationID, testSessionConfig(server.URL))
+	_, err := tokenSource.Token()
+	require.NoError(t, err, "the first mint succeeds")
+
+	err = getAndDrain(client, server.URL+"/ok")
+
+	require.Error(t, err, "the refresh inside the call is throttled")
+	assert.ErrorIs(t, err, ErrRateLimited, "this package's own sentinel, on the refresh path too")
+	assert.ErrorIs(t, err, githubauth.ErrRateLimited)
+	var rateLimit *githubauth.RateLimitError
+	require.ErrorAs(t, err, &rateLimit)
+	assert.Equal(t, 3*time.Second, rateLimit.RetryAfter)
+}
+
 // TestNewGithubSession_ThrottledMintIsThisPackagesErrRateLimited pins that a caller can
 // branch on this package's own sentinel rather than on its auth library's, and still reach
 // the wait GitHub asked for. A branch written against a transitive dependency's sentinel
@@ -533,14 +573,17 @@ func TestGraphQLClient_SharesTheConnectionPool(t *testing.T) {
 }
 
 // TestNewBoundedTransport_KeepsAConcurrentBurstPooled pins the idle pool's size against
-// concurrency rather than CPU count. A consumer runs its sessions from worker goroutines, and
-// pushhookparser's pod has GOMAXPROCS 2 against 10 workers, so a pool sized from GOMAXPROCS
-// kept 3 connections and re-handshaked the rest on every burst. Every call here goes to one
-// host, so the per-host idle limit is the transport's whole idle limit.
+// concurrency rather than CPU count: with the clone's default of 2, or go-githubauth's
+// GOMAXPROCS+1, a burst wider than that re-handshakes the surplus on the next burst. Every
+// call here goes to one host, so the per-host idle limit is the transport's whole idle limit.
+//
+// That is an HTTP/1.1 property, which is what httptest serves. api.github.com negotiates
+// HTTP/2, where a pooled connection is not consumed by the request using it, so one
+// connection carries a whole burst and the limit makes no difference there.
 //
 // 25 requests are held open together, so the burst needs 25 connections at once; a second
-// identical burst must find all 25 idle and open none. 25 is above GOMAXPROCS+1 on any CI runner
-// this runs on, which is what makes the old sizing fail here.
+// identical burst must find all 25 idle and open none. 25 is above GOMAXPROCS+1 on any runner
+// with fewer than 24 cores, which is what makes the old sizing fail here.
 func TestNewBoundedTransport_KeepsAConcurrentBurstPooled(t *testing.T) {
 	const burst = 25
 

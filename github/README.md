@@ -72,14 +72,17 @@ All of them share one connection pool, and keep `http.DefaultTransport`'s dial
 and TLS handshake bounds.
 
 - **A throttled mint is not retried.** A 429 or a rate-limit 403 fails at once
-  with an error wrapping this package's `ErrRateLimited` (and
-  `githubauth.ErrRateLimited`), rather than sleeping out GitHub's retry hint, so
-  a mint costs one bounded request. Retry in the caller if the operation is safe
-  to repeat, and honour the hint: GitHub asks for at least a minute on a
-  rate-limit 403 that carries no `Retry-After`, so a caller whose own backoff is
-  shorter exhausts its attempts inside the same window and fails the operation.
-  `errors.As` into a `*githubauth.RateLimitError` yields the wait GitHub asked
-  for, in `RetryAfter`.
+  rather than sleeping out GitHub's retry hint, so a mint costs one bounded
+  request. Which sentinel a caller can match depends on where the mint ran: a
+  `GithubSession` mint, in `NewGithubSession` or on a refresh inside a REST
+  call, returns an error wrapping this package's `ErrRateLimited` and
+  `githubauth.ErrRateLimited`; a `GraphQLClient` mints through ghinstallation,
+  which has no rate-limit sentinel of its own, so neither matches there. Retry in
+  the caller if the operation is safe to repeat, and honour the hint: GitHub asks
+  for at least a minute on a rate-limit 403 that carries no `Retry-After`, so a
+  caller whose own backoff is shorter exhausts its attempts inside the same
+  window and fails the operation. On a `GithubSession` mint, `errors.As` into a
+  `*githubauth.RateLimitError` yields the wait GitHub asked for, in `RetryAfter`.
 - **A token refresh inside a REST call** is bounded by `TokenMintTimeout` and by
   the session's context (see `WithContext`), not by that call's own context.
 
