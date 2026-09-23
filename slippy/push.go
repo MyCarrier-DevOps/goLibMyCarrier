@@ -779,103 +779,66 @@ func (c *Client) CreateSlipForPush(ctx context.Context, opts PushOptions) (*Crea
 		// guard would only add handlePushRetry's write to the cases the guard handles read-only
 		// today, which is the wrong direction.
 		//
-		// A SELF-CORRELATION row falls through here rather than deduping at this gate, because
-		// returning it would hand the caller returned == sent on an ENDED row, so the caller
-		// dispatches and then reports against a terminal slip. It reaches
-		// persistSlipForPush's self-referential arm, which asks SlipStore.ResetSlipInPlace to
-		// decide under the row lock.
+		// WHAT THIS GATE DECIDES. Any claimed row is deduped here, full stop — no
+		// self-correlation carve-out and no in-flight disjunct. Both were dropped when
+		// DecideReset began refusing on any claim (PR #87 review, jhicks), and this is the gate
+		// the claim's encodings finally agree on: slipUnclaimedSQL, Repave's guard, DecideReset
+		// and this one all refuse on a set claimed_from.
 		//
-		// WHAT IT DOES NOT MEAN is "this delivery's own retry, so there is nothing to protect"
-		// — the premise this comment used to state (PR #87 review). The rerunner adopts the
-		// slip it looked up and claims under the ORIGINAL push's correlation ID, and the CLI
-		// pre-job claims the slip its workflow was dispatched for, so a self-correlated row is
-		// routinely held by someone else's run. The store is what settles it: it refuses the
-		// reset on ANY claim under the lock, and this push then deduplicates onto the live
-		// row. Falling through costs one round trip and never a rewrite.
+		// Dropping them was a fix, not a tidy-up. A self-correlated claimed row used to fall
+		// through to persistSlipForPush's reset arm, and the route there runs
+		// resolveAndAbandonAncestors first — which does not merely spend the GitHub round trips
+		// this fast path exists to skip, it ABANDONS every non-terminal ancestor slip. Under the
+		// old carve-out those abandons were legitimate, because the push went on to reset the row
+		// and become the live run for the commit. Once the reset is refused, the push abandons the
+		// ancestors on its own behalf and then deduplicates onto someone else's run.
 		//
-		// THE CARVE-OUT IS ITSELF CARVED OUT WHEN THE RUN IS IN FLIGHT (finding p1). "No other
-		// run's work to protect" holds only while nothing is executing. Create's ON CONFLICT
-		// arm rewrites every step and aggregate column and the state history, so taking a
-		// claimed row with a RUNNING step down that path resets the very state the claim
-		// exists to protect — under the same correlation ID, leaving an operator no way to
-		// tell which attempt wrote what. The in-delivery retry that reaches here after its
-		// own dispatch already started is exactly that shape. So: attempt the reset in place
-		// only when the snapshot below says RunInFlight is false; when it says true, dedup
-		// like any other claimed row.
+		// NOT EQUIVALENT IN ONE CLASS, stated so it is not "simplified" away later. This gate
+		// reads existingSlip from LoadByCommit — a plain UNLOCKED pool read, with
+		// resolveAndAbandonAncestors' real GitHub round trips between it and any write. Wherever
+		// the claim is STILL HELD at the store's lock, a fall-through would be refused and the
+		// push would deduplicate anyway, so the two gates agree. But a claim RELEASED inside that
+		// window — the claimant's post-job firing while this push resolves ancestry — used to
+		// reach DecideReset with an empty claimed_from and be ALLOWED, correctly, because nothing
+		// held the row by then. That reset is now skipped on the stale snapshot.
 		//
-		// WHAT THIS ARM DECIDES, AND WHAT IT NO LONGER DECIDES (DEVOPS-367, closing PR #87
-		// pkuzmenko finding 2). Both halves of the condition — ClaimedFrom and RunInFlight —
-		// are read off existingSlip, which LoadByCommit produced with a plain UNLOCKED pool
-		// read (PostgresStore.queryOne is s.pool.QueryRow; there is no FOR UPDATE anywhere on
-		// that path), and resolveAndAbandonAncestors' progressive-depth ancestor search runs
-		// real GitHub round trips — seconds of them — before anything is written. So this
-		// snapshot can be stale by the time the write lands, in both directions:
+		// Accepted deliberately: the abandons above are paid on EVERY claimed row, this is paid
+		// only inside that window, and the outcome is a dedup rather than a destroyed run.
 		//
-		//   - READ UNCLAIMED, CLAIMED DURING THE WINDOW. The push does not enter this arm; it
-		//     falls through to persistSlipForPush's self-referential arm carrying an empty
-		//     claim.
-		//   - READ QUIESCENT, A STEP STARTED DURING THE WINDOW. The push enters the reset arm
-		//     believing there is nothing to disturb.
+		// WHAT THE SNAPSHOT NO LONGER DECIDES (DEVOPS-367). It cannot authorise a write. The
+		// write the reset arms reach is SlipStore.ResetSlipInPlace, which re-reads the row FOR
+		// UPDATE and refuses on any claim it finds there, inside the transaction the upsert lands
+		// in — so a claim taken after this read is seen by the decision that matters, and a
+		// refusal comes back as a dedup onto the live row (resetSlipInPlace). What the snapshot
+		// still decides is which route to ATTEMPT, and that is worth having: a dedup decided here
+		// skips ancestor resolution entirely, while a stale snapshot costs one round trip.
 		//
-		// Neither one decides the outcome any more. The write those arms reach is
-		// SlipStore.ResetSlipInPlace, which re-reads the row FOR UPDATE, evaluates RunInFlight
-		// on THAT read and refuses on any claim it finds, with ErrSlipClaimed, inside the
-		// transaction the upsert itself lands in. The refusal comes back as a dedup onto the
-		// live row (resetSlipInPlace), and a claim taken during the window has its marker
-		// re-stated from the locked row, so claimed_from and slip_claimed stay both-present-
-		// or-both-absent even though no reader on this side ever saw the claim.
+		// WHAT THE DEDUP RETURNS, for a reader following it out of this arm: the row comes back
+		// through handlePushRetry, which resets push_parsed and appends its retry entry. It never
+		// writes the slip's top-level status, so a `failed` row is still `failed` on return and a
+		// caller reports its step results against a row reading failed.
 		//
-		// What the snapshot still decides is which route to ATTEMPT, and that is worth having:
-		// a row this arm can answer skips ancestor resolution's multi-second GitHub calls
-		// entirely. A snapshot that was wrong costs one extra round trip and a dedup, not a
-		// destroyed run.
+		// That is not a dispatch regression, but mind the polarity: returned == sent is the
+		// condition on which a caller DISPATCHES — the guard's contract, stated at the empty-run
+		// guard above and in STATE_MACHINE_V3.md, is that returned != sent is what makes a caller
+		// suppress. A self-correlated push has always come back with returned == sent, so this arm
+		// did not change whether the caller dispatches; what it changed is the status the returned
+		// row carries. It needs no library change either: Slip carries claimed_from, steps and
+		// aggregates on the wire (types.go), so a caller that must not double-dispatch gates on
+		// the claim plus the step evidence in the 201 body it already holds rather than on the
+		// top-level status.
 		//
-		// WHAT THE IN-FLIGHT HALF RETURNS, for a reader following it out of this arm: the row
-		// comes back through handlePushRetry, which writes push_parsed = running and reloads.
-		// It never writes the slip's top-level status, so a `failed` row is still `failed` on
-		// return and a caller reports its step results against a row reading failed. That is
-		// not a dispatch regression — a self-correlated retry has always come back with
-		// returned == sent, which is the condition callers suppress on, so this arm did not
-		// change whether it dispatches; what it changed is the status the returned row carries,
-		// because before it the same input took the in-place reset that made the row live. It
-		// needs no library change either: Slip already carries claimed_from, steps and
-		// aggregates on the wire (types.go), so a caller that must not double-dispatch can gate
-		// on the claim plus the step evidence in the 201 body it already holds rather than on
-		// the top-level status. A reset REFUSED under the lock returns the same shape, for the
-		// same reason — see resetSlipInPlace.
-		//
-		// WHAT CONVERGES WITH handleDuplicateSlipBackstop, AND WHAT DOES NOT. The backstop
-		// orders its mirror of these arms the same way — live, empty-run guard, claimed,
-		// self-referential, repave — so identical inputs reach the same DECISION
-		// (dedup vs reset) through either path, and both self-referential arms now converge on
-		// one helper (resetSlipInPlace) for the reset itself, so they cannot differ on what a
-		// refusal does either. The SIDE EFFECTS of a dedup still differ, deliberately and on
-		// every backstop dedup arm rather than this one shape: this branch routes through
-		// handlePushRetry, resetting push_parsed and writing the "retry detected" marker,
-		// while the backstop's live and claimed arms return the conflicting row untouched.
-		// Two reasons, both structural. The backstop is reached AFTER this push's Create lost
-		// the repo:sha race, so it never became that row's owner — the winner's own push runs
-		// whatever retry it needs. And resolveAndAbandonAncestors has already run by then, so
-		// the backstop cannot set AncestryResolved = true the way these early returns do
-		// without contradicting result.Warnings (see its branches' own comments, DEVOPS-231
-		// D3.2). PR #87 finding 8: the divergence is real and stated here rather than
-		// papered over with a convergence claim the code does not make.
-		// A CLAIMED ROW IS DEDUPED, FULL STOP — no self-correlation carve-out and no in-flight
-		// disjunct (PR #87 review, jhicks). Both became vestigial when DecideReset started
-		// refusing on any claim: a self-correlated claimed row could still fall through here,
-		// but the store would refuse the reset and the push would deduplicate anyway.
-		//
-		// Leaving them in was not free, which is why this is a fix and not a tidy-up. The
-		// fall-through runs resolveAndAbandonAncestors first, and that does not merely cost
-		// the GitHub round trips this fast path exists to skip — it ABANDONS every
-		// non-terminal ancestor slip. Under the old carve-out those abandons were legitimate,
-		// because the push went on to reset the row and become the live run for the commit.
-		// Now the reset is refused and the push deduplicates onto someone else's run, having
-		// already written on its own behalf.
-		//
-		// This is also the gate the claim's three encodings finally agree on: slipUnclaimedSQL
-		// and Repave's guard both refuse on a set claimed_from, and so now do this and
-		// DecideReset.
+		// WHAT CONVERGES WITH handleDuplicateSlipBackstop, AND WHAT DOES NOT. The backstop orders
+		// its mirror of these arms the same way and carries the same bare ClaimedFrom check, so
+		// identical inputs reach the same DECISION through either path, and both reset arms share
+		// one helper (resetSlipInPlace) so they cannot differ on what a refusal does. The SIDE
+		// EFFECTS of a dedup still differ, deliberately: this branch routes through
+		// handlePushRetry, while the backstop's live and claimed arms return the conflicting row
+		// untouched. Two reasons, both structural. The backstop is reached AFTER this push's
+		// Create lost the repo:sha race, so it never became that row's owner — the winner's own
+		// push runs whatever retry it needs. And resolveAndAbandonAncestors has already run by
+		// then, so the backstop cannot set AncestryResolved = true the way these early returns do
+		// without contradicting result.Warnings (DEVOPS-231 D3.2).
 		if existingSlip.ClaimedFrom != "" {
 			slip, retryErr := c.handlePushRetry(ctx, existingSlip)
 			if retryErr != nil {

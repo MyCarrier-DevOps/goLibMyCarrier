@@ -268,9 +268,6 @@ func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commit
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
-// createTx is Create against an open transaction. Repave uses it so the superseded row's
-// removal and the successor's insert commit or roll back together; both paths go through
-// buildCreateQuery/mapCreateError so a transactional create writes an identical row and
 // probeRoutingSlipColumns diffs every column the store's SELECTs name against the live
 // catalogue. Case-insensitive because Postgres folded the unquoted DDL the ensurer emitted, so
 // a configured `Deploy_Dev` legitimately lands as `deploy_dev`; the missing names are reported

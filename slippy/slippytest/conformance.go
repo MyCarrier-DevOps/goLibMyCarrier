@@ -15,19 +15,28 @@ type ClaimContractCase struct {
 	// Run performs the operation. Returning an error is part of the expected outcome, so it
 	// is handed to Check rather than failing the case.
 	Run func(ctx context.Context, store slippy.SlipStore) error
-	// Check asserts on the error and on the row as the store reports it.
+	// Check asserts on the error and on the seeded row as the store reports it.
 	Check func(t *testing.T, err error, slip *slippy.Slip)
+	// CheckOther is for a case whose subject is a row other than the seeded one, and runs
+	// after Check. Optional.
+	CheckOther func(ctx context.Context, t *testing.T, store slippy.SlipStore)
 }
 
 // RunClaimContract runs the claim, release, reset and terminal-write sequence against any
 // SlipStore and asserts the observable state after each step.
 //
 // It exists because three separate rounds of PR #87 review found the same class of defect: a
-// fix landed on PostgresStore and one or both test doubles kept the old behaviour. Create and
-// Repave preserving a caller's ClaimedFrom, GuardReservedStepWrite reaching 5 of 16 entry
-// points, and the slip_released marker on a terminal write were each caught by a human
-// reading the diff, because nothing in the suite asserted the three implementers agree. Every
-// one of them would have failed here at the commit that introduced it.
+// fix landed on PostgresStore and one or both test doubles kept the old behaviour. Create
+// preserving a caller's ClaimedFrom, GuardReservedStepWrite reaching 5 of 16 entry points, and
+// the slip_released marker on a terminal write were each caught by a human reading the diff,
+// because nothing in the suite asserted the three implementers agree.
+//
+// All three now fail here, and it is worth recording that they did not at first: an earlier
+// version of this paragraph claimed they would, while the sequence called neither Create nor
+// UpdateComponentStatus, so it covered one of the three it named (PR #87 review, jhicks). The
+// cases for the other two were added in response. What this suite covers is exactly the method
+// calls below — when the next divergence is found in a method the sequence does not exercise,
+// the case belongs here before the fix does.
 //
 // The point is that it is STORE-AGNOSTIC: run it against slippytest.MockStore, against the
 // in-package double from a package slippy_test file, and against PostgresStore from the
@@ -41,24 +50,35 @@ func RunClaimContract(t *testing.T, newStore func(t *testing.T) (slippy.SlipStor
 	t.Helper()
 	ctx := context.Background()
 
-	for _, tc := range claimContractSequence() {
-		t.Run(tc.Name, func(t *testing.T) {
+	for _, name := range contractCaseNames() {
+		t.Run(name, func(t *testing.T) {
 			store, id := newStore(t)
+			tc := caseByName(claimContractSequence(id), name)
 			err := tc.Run(ctx, store)
 			slip, loadErr := store.Load(ctx, id)
 			if loadErr != nil {
 				t.Fatalf("loading the slip after %q: %v", tc.Name, loadErr)
 			}
 			tc.Check(t, err, slip)
+			if tc.CheckOther != nil {
+				tc.CheckOther(ctx, t, store)
+			}
 		})
 	}
 }
 
 // claimContractSequence is the contract itself, as data, so the cases are the same for every
 // implementer by construction.
-func claimContractSequence() []ClaimContractCase {
-	const id = "conformance-1"
-
+//
+// id is the correlation ID the FACTORY seeded, threaded in rather than hardcoded. It was a
+// package-level literal once, shadowed by the runner's own `id` from newStore, and the two
+// agreed only because every in-repo wiring happened to return the same string (PR #87 review,
+// pkuzmenko and jhicks). A downstream that honoured the documented contract and seeded its own
+// ID — which a Postgres factory wants to do anyway, to avoid collisions between runs — had
+// every operation run against a row that did not exist in its store: five cases failing with
+// messages that pointed at the wrong thing, and the reserved-name case passing VACUOUSLY,
+// because ErrSlipNotFound satisfied its only assertion.
+func claimContractSequence(id string) []ClaimContractCase {
 	return []ClaimContractCase{
 		{
 			Name: "a claim sets claimed_from and appends a marker naming the claimant",
@@ -160,6 +180,60 @@ func claimContractSequence() []ClaimContractCase {
 			},
 		},
 		{
+			// Defect A spanned four methods; the reserved-name case below exercises only
+			// UpdateStepWithHistory. UpdateComponentStatus was unguarded on BOTH doubles
+			// pre-fix and an implementation with that gap passed this contract until this
+			// case existed (PR #87 review, jhicks).
+			Name: "a caller may not address a reserved marker name as a step either",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.UpdateComponentStatus(ctx, id, "api", slippy.ClaimMarkerStep,
+					slippy.StepStatusRunning)
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				if err == nil {
+					t.Fatal("a reserved marker name as the step type must be refused")
+				}
+				if !errors.Is(err, slippy.ErrReservedStepName) {
+					t.Errorf("the refusal must wrap ErrReservedStepName, got %v", err)
+				}
+				if n := contractCountStep(slip, slippy.ClaimMarkerStep); n != 0 {
+					t.Errorf("the refusal must write nothing, got %d forged markers", n)
+				}
+			},
+		},
+		{
+			// The FIRST divergence this harness's godoc claims it would have caught, and the
+			// one it could not see until now: a fresh insert must not persist a ClaimedFrom
+			// the store's INSERT column list cannot write. Both doubles kept the caller's
+			// value once, so a consumer asserting ErrSlipWentLive on a later Repave passed
+			// against a row Postgres would have left unclaimed (PR #87 review, jhicks).
+			Name: "Create never persists a caller-supplied claim",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.Create(ctx, &slippy.Slip{
+					CorrelationID: id + "-fresh",
+					Repository:    "owner/repo",
+					Branch:        "main",
+					CommitSHA:     "conformance-create-sha",
+					Status:        slippy.SlipStatusPending,
+					ClaimedFrom:   slippy.SlipStatusFailed,
+				})
+			},
+			Check: func(t *testing.T, err error, _ *slippy.Slip) {
+				contractRequireNoErr(t, err, "create")
+			},
+			// The assertion is on the row Create wrote, not on the seeded one.
+			CheckOther: func(ctx context.Context, t *testing.T, s slippy.SlipStore) {
+				fresh, loadErr := s.Load(ctx, id+"-fresh")
+				if loadErr != nil {
+					t.Fatalf("loading the created slip: %v", loadErr)
+				}
+				if fresh.ClaimedFrom != "" {
+					t.Errorf("claimed_from is absent from the INSERT column list, so a fresh "+
+						"insert is always unclaimed; got %q", fresh.ClaimedFrom)
+				}
+			},
+		},
+		{
 			Name: "a caller may not write a step under a reserved marker name",
 			Run: func(ctx context.Context, s slippy.SlipStore) error {
 				return s.UpdateStepWithHistory(ctx, id, "builds", "", slippy.StepStatusRunning,
@@ -168,6 +242,12 @@ func claimContractSequence() []ClaimContractCase {
 			Check: func(t *testing.T, err error, slip *slippy.Slip) {
 				if err == nil {
 					t.Fatal("a caller-supplied entry under a marker name must be refused")
+				}
+				// The SENTINEL, not merely a non-nil error. Accepting any error let this case
+				// report conformance for an unrelated failure — and it is what made the case
+				// pass against a store the sequence was never operating on.
+				if !errors.Is(err, slippy.ErrReservedStepName) {
+					t.Errorf("the refusal must wrap ErrReservedStepName, got %v", err)
 				}
 				if n := contractCountStep(slip, slippy.ReleaseMarkerStep); n != 0 {
 					t.Errorf("the refusal must write nothing, got %d forged markers", n)
@@ -181,6 +261,27 @@ func claimContractSequence() []ClaimContractCase {
 // still satisfies the contract as long as errors.Is reaches it.
 func isClaimedRefusal(err error) bool {
 	return errors.Is(err, slippy.ErrSlipClaimed)
+}
+
+// contractCaseNames lists the cases without needing a real id: names do not depend on it, and
+// the runner has to iterate before it has called the factory.
+func contractCaseNames() []string {
+	seq := claimContractSequence("")
+	names := make([]string, 0, len(seq))
+	for _, c := range seq {
+		names = append(names, c.Name)
+	}
+	return names
+}
+
+// caseByName finds the case to run once the sequence has been rebuilt with the factory's id.
+func caseByName(seq []ClaimContractCase, name string) ClaimContractCase {
+	for _, c := range seq {
+		if c.Name == name {
+			return c
+		}
+	}
+	panic("slippytest: unknown claim-contract case " + name)
 }
 
 func contractCountStep(slip *slippy.Slip, step string) int {

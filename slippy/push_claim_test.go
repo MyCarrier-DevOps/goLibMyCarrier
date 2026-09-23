@@ -608,6 +608,42 @@ func TestClient_CreateSlipForPush_ResetSlipInPlaceArms(t *testing.T) {
 		assert.ErrorIs(t, err, ErrStoreConnection)
 	})
 
+	// THE SUCCESS ARM DOES NOT RELOAD, and nothing tested that until this case (PR #87
+	// review, jhicks). The decision has flipped twice in three commits — a reload was added to
+	// close a review finding, then reverted once that finding's premise became unreachable —
+	// so the next reader of the earlier thread has a well-argued case for re-adding it and
+	// needs a failing test rather than a comment to stop them.
+	//
+	// The damage a reload does is silent: Slip.Ancestry has no `omitempty` and populate never
+	// hydrates it, because ancestry lives in a child table and is absent from
+	// slipSelectColumns(). So overwriting the caller's value with a loaded row turns a resolved
+	// chain into "ancestry": null on the 201 — a valid field value, not an error.
+	t.Run("a successful reset returns the caller's resolved ancestry, not a reloaded nil", func(t *testing.T) {
+		store := NewMockStore()
+		client := NewClientWithDependencies(store, NewMockGitHubAPI(),
+			Config{PipelineConfig: shippedShapePipelineConfig()})
+		endedSelfRow(store, "corr-ancestry", "sha-ancestry")
+
+		result, err := push(client, "corr-ancestry", "sha-ancestry")
+		require.NoError(t, err)
+		require.NotNil(t, result.Slip)
+		require.Len(t, store.ResetInPlaceCalls, 1, "the reset was performed: the row is unclaimed")
+
+		// Asserted on the MECHANISM rather than on a field value, because a fixture whose
+		// ancestry happens to be empty would make a value assertion vacuously true. A reload
+		// is a Load against this correlation ID; the success arm must make none.
+		assert.NotContains(t, store.LoadCalls, "corr-ancestry",
+			"the success arm must not reload: Load drops Ancestry, which has no omitempty, "+
+				"so reloading turns a resolved chain into \"ancestry\": null on the 201")
+
+		// And the precondition that makes a reload lossy, pinned here so the reason survives
+		// even if someone changes the arm: no store hydrates Ancestry on load.
+		reloaded, loadErr := store.Load(ctx, "corr-ancestry")
+		require.NoError(t, loadErr)
+		assert.Nil(t, reloaded.Ancestry,
+			"a loaded row carries no Ancestry — it lives in a child table, absent from slipSelectColumns()")
+	})
+
 	// The refusal's own failure mode: the dedup has to RELOAD the row, because the snapshot
 	// the push still holds says unclaimed and quiescent and returning it would report a state
 	// known to be false. If that reload fails there is nothing truthful left to return.
