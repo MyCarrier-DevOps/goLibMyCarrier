@@ -54,7 +54,11 @@ func TestPostgresStore_ClaimedFrom_IsScannedOnEveryReadPath_Integration(t *testi
 	})
 	t.Run("unclaimed slip reads empty", func(t *testing.T) {
 		require.NoError(t, store.Create(ctx, &Slip{
-			CorrelationID: "c-plain", Repository: "Owner/Repo", Branch: "main", CommitSHA: "sha-plain", Status: SlipStatusInProgress,
+			CorrelationID: "c-plain",
+			Repository:    "Owner/Repo",
+			Branch:        "main",
+			CommitSHA:     "sha-plain",
+			Status:        SlipStatusInProgress,
 		}))
 		got, err := store.Load(ctx, "c-plain")
 		require.NoError(t, err)
@@ -182,7 +186,10 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 		// A component running inside an aggregate step counts too, which is the half a narrowed
 		// read would drop: the aggregate's own column can read failed while a sibling builds.
 		claimTestSlip(t, store, "c-live-comp", "sha-live-comp", SlipStatusFailed)
-		require.NoError(t, store.UpdateComponentStatus(ctx, "c-live-comp", "api", "component_builds", StepStatusRunning))
+		require.NoError(
+			t,
+			store.UpdateComponentStatus(ctx, "c-live-comp", "api", "component_builds", StepStatusRunning),
+		)
 		_, err = store.ClaimSlip(ctx, "c-live-comp", nil, "rerunner", "test")
 		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "the claim read carries the aggregate columns")
 	})
@@ -277,25 +284,37 @@ func TestPostgresStore_ClaimSlip_Integration(t *testing.T) {
 	// had already gone live matched the prior and dispatched on top of it. The compare-and-set
 	// is on the CURRENT status whether or not a claim is held; the idempotent arm sits behind
 	// it and is reached by a caller that names the status the row reads now.
-	t.Run("repeat claim after the run moved status: expected is checked against the CURRENT status", func(t *testing.T) {
-		claimTestSlip(t, store, "c-moved", "sha-m", SlipStatusFailed)
-		_, err := store.ClaimSlip(ctx, "c-moved", nil, "first", "test")
-		require.NoError(t, err)
-		require.NoError(t, store.UpdateSlipStatus(ctx, "c-moved", SlipStatusInProgress), "the reconcile branch wrote it")
-		_, err = store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusFailed}, "second", "test")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed,
-			"the dispatch this retry is repeating already started: refused, not handed the claim")
-		out, err := store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusInProgress}, "third", "test")
-		require.NoError(t, err, "a caller that names the current status reaches the idempotent arm")
-		assert.False(t, out.Claimed, "nothing written")
-		assert.Equal(t, SlipStatusFailed, out.Prior, "and the prior is the recorded one")
-		_, err = store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusCompleted}, "fourth", "test")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
-		got, err := store.Load(ctx, "c-moved")
-		require.NoError(t, err)
-		assert.Equal(t, SlipStatusInProgress, got.Status, "the no-op arm writes nothing")
-		assert.Equal(t, 1, countMarkers(t, store, "c-moved", ClaimMarkerStep), "still exactly one marker")
-	})
+	t.Run(
+		"repeat claim after the run moved status: expected is checked against the CURRENT status",
+		func(t *testing.T) {
+			claimTestSlip(t, store, "c-moved", "sha-m", SlipStatusFailed)
+			_, err := store.ClaimSlip(ctx, "c-moved", nil, "first", "test")
+			require.NoError(t, err)
+			require.NoError(
+				t,
+				store.UpdateSlipStatus(ctx, "c-moved", SlipStatusInProgress),
+				"the reconcile branch wrote it",
+			)
+			_, err = store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusFailed}, "second", "test")
+			require.ErrorIs(t, err, ErrClaimPreconditionFailed,
+				"the dispatch this retry is repeating already started: refused, not handed the claim")
+			out, err := store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusInProgress}, "third", "test")
+			require.NoError(t, err, "a caller that names the current status reaches the idempotent arm")
+			assert.False(t, out.Claimed, "nothing written")
+			assert.Equal(t, SlipStatusFailed, out.Prior, "and the prior is the recorded one")
+			_, err = store.ClaimSlip(ctx, "c-moved", []SlipStatus{SlipStatusCompleted}, "fourth", "test")
+			require.ErrorIs(
+				t,
+				err,
+				ErrClaimPreconditionFailed,
+				"a claimant that never agreed to in_progress is refused",
+			)
+			got, err := store.Load(ctx, "c-moved")
+			require.NoError(t, err)
+			assert.Equal(t, SlipStatusInProgress, got.Status, "the no-op arm writes nothing")
+			assert.Equal(t, 1, countMarkers(t, store, "c-moved", ClaimMarkerStep), "still exactly one marker")
+		},
+	)
 
 	t.Run("not found", func(t *testing.T) {
 		_, err := store.ClaimSlip(ctx, "c-missing", nil, "rerunner", "test")
@@ -426,7 +445,12 @@ func TestPostgresStore_ReleaseClaim_Integration(t *testing.T) {
 		got, err := store.Load(ctx, "r-two")
 		require.NoError(t, err)
 		assert.Empty(t, got.ClaimedFrom)
-		assert.Equal(t, 1, countMarkers(t, store, "r-two", ReleaseMarkerStep), "one release marker, from the one that cleared")
+		assert.Equal(
+			t,
+			1,
+			countMarkers(t, store, "r-two", ReleaseMarkerStep),
+			"one release marker, from the one that cleared",
+		)
 	})
 
 	t.Run("push_parsed running does not count as in flight", func(t *testing.T) {
@@ -612,7 +636,12 @@ func TestPostgresStore_Update_NeverEndsTheClaim_Integration(t *testing.T) {
 	require.NoError(t, store.Update(ctx, snapshot))
 	got, err := store.Load(ctx, "u-claim")
 	require.NoError(t, err)
-	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "a non-terminal Update cannot clear the claim, whatever the snapshot says")
+	assert.Equal(
+		t,
+		SlipStatusFailed,
+		got.ClaimedFrom,
+		"a non-terminal Update cannot clear the claim, whatever the snapshot says",
+	)
 
 	snapshot.Status = SlipStatusPromoted
 	require.NoError(t, store.Update(ctx, snapshot))

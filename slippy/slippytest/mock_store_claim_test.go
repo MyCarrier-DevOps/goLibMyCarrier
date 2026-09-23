@@ -23,7 +23,9 @@ func TestMockStore_Update_ClaimSemantics(t *testing.T) {
 	ctx := context.Background()
 	t.Run("a stale snapshot cannot clear the claim", func(t *testing.T) {
 		store := NewMockStore()
-		store.AddSlip(&slippy.Slip{CorrelationID: "u", Repository: "o/r", CommitSHA: "s", Status: slippy.SlipStatusFailed})
+		store.AddSlip(
+			&slippy.Slip{CorrelationID: "u", Repository: "o/r", CommitSHA: "s", Status: slippy.SlipStatusFailed},
+		)
 		_, err := store.ClaimSlip(ctx, "u", nil, "cli", "")
 		require.NoError(t, err)
 		snapshot, err := store.Load(ctx, "u")
@@ -78,7 +80,13 @@ func TestMockStore_Create_KeepsAnExistingClaimAndNeverTakesOneFromTheCaller(t *t
 	require.NoError(t, err)
 	assert.Equal(t, slippy.SlipStatusInProgress, got.Status, "the row was reset")
 	assert.Equal(t, slippy.SlipStatusFailed, got.ClaimedFrom, "the claim survived, as in Postgres")
-	require.NoError(t, store.Create(ctx, &slippy.Slip{CorrelationID: "fresh", Status: slippy.SlipStatusFailed, ClaimedFrom: slippy.SlipStatusFailed}))
+	require.NoError(
+		t,
+		store.Create(
+			ctx,
+			&slippy.Slip{CorrelationID: "fresh", Status: slippy.SlipStatusFailed, ClaimedFrom: slippy.SlipStatusFailed},
+		),
+	)
 	fresh, _ := store.Load(ctx, "fresh")
 	assert.Empty(t, fresh.ClaimedFrom, "a fresh insert never records a claim: claimed_from is not an INSERT column")
 	require.ErrorIs(t, func() error { _, e := store.ReleaseClaim(ctx, "fresh", "cli", ""); return e }(),
@@ -92,7 +100,15 @@ func TestMockStore_Create_KeepsAnExistingClaimAndNeverTakesOneFromTheCaller(t *t
 func TestMockStore_Repave_SuccessorIsNeverClaimed(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
-	store.AddSlip(&slippy.Slip{CorrelationID: "old", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: slippy.SlipStatusFailed})
+	store.AddSlip(
+		&slippy.Slip{
+			CorrelationID: "old",
+			Repository:    "o/r",
+			Branch:        "main",
+			CommitSHA:     "s",
+			Status:        slippy.SlipStatusFailed,
+		},
+	)
 	successor := repaveSuccessorSlip("new", "o/r", "main", "s")
 	successor.ClaimedFrom = slippy.SlipStatusFailed
 	require.NoError(t, store.Repave(ctx, "old", successor, nil))
@@ -141,7 +157,12 @@ func TestMockStore_ClaimSlip_IsAFlag(t *testing.T) {
 		assert.False(t, out.Claimed, "nothing written: the claim was already held")
 		assert.Equal(t, slippy.SlipStatusFailed, out.Prior, "and the prior is the RECORDED one")
 		_, err = store.ClaimSlip(ctx, "c", []slippy.SlipStatus{slippy.SlipStatusCompleted}, "fourth", "")
-		require.ErrorIs(t, err, slippy.ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
+		require.ErrorIs(
+			t,
+			err,
+			slippy.ErrClaimPreconditionFailed,
+			"a claimant that never agreed to in_progress is refused",
+		)
 		got, _ := store.Load(ctx, "c")
 		assert.Equal(t, 1, countStep(got, slippy.ClaimMarkerStep))
 	})
@@ -210,14 +231,29 @@ func TestMockStore_ReleaseClaim_KeepsTheClaimWhileInFlight(t *testing.T) {
 		assert.False(t, out.Released)
 	})
 	t.Run("a running component under a failed aggregate counts as in flight", func(t *testing.T) {
-		store := claimed(t, map[string]slippy.Step{"builds": {Status: slippy.StepStatusFailed}},
-			map[string][]slippy.ComponentStepData{"builds": {{Component: "api", Status: slippy.StepStatusFailed}, {Component: "web", Status: slippy.StepStatusRunning}}})
+		store := claimed(
+			t,
+			map[string]slippy.Step{"builds": {Status: slippy.StepStatusFailed}},
+			map[string][]slippy.ComponentStepData{
+				"builds": {
+					{Component: "api", Status: slippy.StepStatusFailed},
+					{Component: "web", Status: slippy.StepStatusRunning},
+				},
+			},
+		)
 		out, err := store.ReleaseClaim(ctx, "r", "cli", "")
 		require.NoError(t, err)
 		assert.False(t, out.Released)
 	})
 	t.Run("nothing in flight: cleared, status untouched, one marker, repeat is ErrNotClaimed", func(t *testing.T) {
-		store := claimed(t, map[string]slippy.Step{"builds": {Status: slippy.StepStatusFailed}, "unit_tests": {Status: slippy.StepStatusPending}}, nil)
+		store := claimed(
+			t,
+			map[string]slippy.Step{
+				"builds":     {Status: slippy.StepStatusFailed},
+				"unit_tests": {Status: slippy.StepStatusPending},
+			},
+			nil,
+		)
 		out, err := store.ReleaseClaim(ctx, "r", "cli", "run over")
 		require.NoError(t, err)
 		assert.True(t, out.Released)
@@ -252,7 +288,15 @@ func TestMockStore_ReleaseClaim_KeepsTheClaimWhileInFlight(t *testing.T) {
 func TestMockStore_Repave_ClaimedSlip_ReturnsErrSlipWentLive(t *testing.T) {
 	store := NewMockStore()
 	ctx := context.Background()
-	store.AddSlip(&slippy.Slip{CorrelationID: "old", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: slippy.SlipStatusFailed})
+	store.AddSlip(
+		&slippy.Slip{
+			CorrelationID: "old",
+			Repository:    "o/r",
+			Branch:        "main",
+			CommitSHA:     "s",
+			Status:        slippy.SlipStatusFailed,
+		},
+	)
 	_, err := store.ClaimSlip(ctx, "old", nil, "cli", "")
 	require.NoError(t, err)
 

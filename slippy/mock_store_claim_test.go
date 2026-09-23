@@ -52,35 +52,48 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 	// The row carries a RUNNING step throughout (PR #87 seventh review): the refusal of the
 	// nil-expected claim below is now evidence-based, so a slip with no step ever reported
 	// would be claimable at in_progress and would prove the opposite of what this asserts.
-	t.Run("claim never writes status; a repeat is idempotent once expected agrees to the CURRENT status", func(t *testing.T) {
-		store := NewMockStore()
-		store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed,
-			Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
-		out, err := store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "first", "")
-		require.NoError(t, err)
-		assert.Equal(t, SlipStatusFailed, out.Prior)
-		assert.True(t, out.Claimed)
-		got, _ := store.Load(ctx, "c")
-		assert.Equal(t, SlipStatusFailed, got.Status)
-		require.NoError(t, store.UpdateSlipStatus(ctx, "c", SlipStatusInProgress))
-		// Inverted again for finding j-claim (PR #87, jhicks round): the in-flight refusal
-		// guards ADOPTION, and this row is already claimed, so a nil expected reaches the
-		// idempotent repeat rather than ErrClaimPreconditionFailed. The compare-and-set above
-		// it is unaffected, which the `third` and `fifth` claims below still pin.
-		out, err = store.ClaimSlip(ctx, "c", nil, "second", "")
-		require.NoError(t, err, "a claimed row has nothing left to adopt, so the repeat arm answers")
-		assert.False(t, out.Claimed, "nothing written")
-		assert.Equal(t, SlipStatusFailed, out.Prior, "the recorded prior, not the current status")
-		assert.True(t, out.InFlight, "and the caller is told the claim's run is executing")
-		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "the rerunner's retry after its dispatch started is refused")
-		out, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusInProgress}, "fourth", "")
-		require.NoError(t, err, "a caller that names the current status reaches the idempotent arm")
-		assert.False(t, out.Claimed, "nothing written")
-		assert.Equal(t, SlipStatusFailed, out.Prior, "the recorded prior")
-		_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusCompleted}, "fifth", "")
-		require.ErrorIs(t, err, ErrClaimPreconditionFailed, "a claimant that never agreed to in_progress is refused")
-	})
+	t.Run(
+		"claim never writes status; a repeat is idempotent once expected agrees to the CURRENT status",
+		func(t *testing.T) {
+			store := NewMockStore()
+			store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed,
+				Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
+			out, err := store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "first", "")
+			require.NoError(t, err)
+			assert.Equal(t, SlipStatusFailed, out.Prior)
+			assert.True(t, out.Claimed)
+			got, _ := store.Load(ctx, "c")
+			assert.Equal(t, SlipStatusFailed, got.Status)
+			require.NoError(t, store.UpdateSlipStatus(ctx, "c", SlipStatusInProgress))
+			// Inverted again for finding j-claim (PR #87, jhicks round): the in-flight refusal
+			// guards ADOPTION, and this row is already claimed, so a nil expected reaches the
+			// idempotent repeat rather than ErrClaimPreconditionFailed. The compare-and-set above
+			// it is unaffected, which the `third` and `fifth` claims below still pin.
+			out, err = store.ClaimSlip(ctx, "c", nil, "second", "")
+			require.NoError(t, err, "a claimed row has nothing left to adopt, so the repeat arm answers")
+			assert.False(t, out.Claimed, "nothing written")
+			assert.Equal(t, SlipStatusFailed, out.Prior, "the recorded prior, not the current status")
+			assert.True(t, out.InFlight, "and the caller is told the claim's run is executing")
+			_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "third", "")
+			require.ErrorIs(
+				t,
+				err,
+				ErrClaimPreconditionFailed,
+				"the rerunner's retry after its dispatch started is refused",
+			)
+			out, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusInProgress}, "fourth", "")
+			require.NoError(t, err, "a caller that names the current status reaches the idempotent arm")
+			assert.False(t, out.Claimed, "nothing written")
+			assert.Equal(t, SlipStatusFailed, out.Prior, "the recorded prior")
+			_, err = store.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusCompleted}, "fifth", "")
+			require.ErrorIs(
+				t,
+				err,
+				ErrClaimPreconditionFailed,
+				"a claimant that never agreed to in_progress is refused",
+			)
+		},
+	)
 
 	// A run IN FLIGHT is not adoptable by a caller that named no status — claimed or not; the
 	// refusal does not depend on the row being unclaimed (see the repeat subtest above).
@@ -117,7 +130,13 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 	// ReleaseOutcome{Released: false} with nothing written — information, not a failure.
 	t.Run("release keeps the claim while in flight, clears when quiescent, never writes status", func(t *testing.T) {
 		store := NewMockStore()
-		store.AddSlip(&Slip{CorrelationID: "r", Status: SlipStatusFailed, Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
+		store.AddSlip(
+			&Slip{
+				CorrelationID: "r",
+				Status:        SlipStatusFailed,
+				Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+			},
+		)
 		// Named expected, not nil: the row has a step running, and a nil expected no longer
 		// adopts a run in flight. This is the shape a real adopter of a running run sends.
 		claim, err := store.ClaimSlip(ctx, "r", []SlipStatus{SlipStatusFailed}, "cli", "")
@@ -151,10 +170,18 @@ func TestMockStore_ClaimIsAFlag(t *testing.T) {
 
 	t.Run("repave refuses a claimed row", func(t *testing.T) {
 		store := NewMockStore()
-		store.AddSlip(&Slip{CorrelationID: "old", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: SlipStatusFailed})
+		store.AddSlip(
+			&Slip{CorrelationID: "old", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: SlipStatusFailed},
+		)
 		_, err := store.ClaimSlip(ctx, "old", nil, "cli", "")
 		require.NoError(t, err)
-		successor := &Slip{CorrelationID: "new", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: SlipStatusInProgress}
+		successor := &Slip{
+			CorrelationID: "new",
+			Repository:    "o/r",
+			Branch:        "main",
+			CommitSHA:     "s",
+			Status:        SlipStatusInProgress,
+		}
 		require.ErrorIs(t, store.Repave(ctx, "old", successor, nil), ErrSlipWentLive)
 		_, err = store.Load(ctx, "old")
 		require.NoError(t, err)

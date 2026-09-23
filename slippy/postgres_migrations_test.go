@@ -334,8 +334,12 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 	assert.Less(t, strings.Index(up, "lock_timeout"), strings.Index(up, "ALTER TABLE"),
 		"the timeout is set before the ALTER that requests the lock")
 	assert.Equal(t, 1, strings.Count(up, "RAISE EXCEPTION"), "exactly one post-condition")
-	assert.Contains(t, up, "to_regclass('routing_slips')",
-		"post-condition resolves the column through the TABLE, like v5's, not via information_schema + current_schema()")
+	assert.Contains(
+		t,
+		up,
+		"to_regclass('routing_slips')",
+		"post-condition resolves the column through the TABLE, like v5's, not via information_schema + current_schema()",
+	)
 	assert.NotContains(t, up, "current_schema()")
 	assert.Regexp(t, `NOT a\.attnotnull`, up, "the column must be nullable: NULL means unclaimed")
 	assert.NotContains(t, up, "DEFAULT", "no default: NULL is the only correct unclaimed value")

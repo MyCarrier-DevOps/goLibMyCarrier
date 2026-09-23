@@ -386,11 +386,20 @@ func TestClient_CreateSlipForPush_ClaimedSlipOnAShippedShapeConfigKeepsItsRunnin
 		Branch:        "main",
 		CommitSHA:     "sha-shipped",
 		Status:        SlipStatusFailed,
-		Steps:         map[string]Step{"builds": {Status: StepStatusRunning}, "unit_tests": {Status: StepStatusPending}},
-		Aggregates:    map[string][]ComponentStepData{"builds": {{Component: "api", Status: StepStatusRunning}}},
-		StateHistory:  []StateHistoryEntry{},
+		Steps: map[string]Step{
+			"builds":     {Status: StepStatusRunning},
+			"unit_tests": {Status: StepStatusPending},
+		},
+		Aggregates:   map[string][]ComponentStepData{"builds": {{Component: "api", Status: StepStatusRunning}}},
+		StateHistory: []StateHistoryEntry{},
 	})
-	claim, err := store.ClaimSlip(ctx, "corr-shipped", []SlipStatus{SlipStatusFailed}, "pushhookparser/rerunner", "rerun")
+	claim, err := store.ClaimSlip(
+		ctx,
+		"corr-shipped",
+		[]SlipStatus{SlipStatusFailed},
+		"pushhookparser/rerunner",
+		"rerun",
+	)
 	require.NoError(t, err)
 	require.True(t, claim.InFlight, "step 0 is an aggregate here, so the claim can see the run at all")
 

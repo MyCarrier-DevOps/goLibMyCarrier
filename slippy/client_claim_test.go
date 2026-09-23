@@ -18,7 +18,9 @@ func TestClient_PromoteSlip_EndsTheClaim(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
 	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{})
-	store.AddSlip(&Slip{CorrelationID: "p", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: SlipStatusFailed})
+	store.AddSlip(
+		&Slip{CorrelationID: "p", Repository: "o/r", Branch: "main", CommitSHA: "s", Status: SlipStatusFailed},
+	)
 	_, err := store.ClaimSlip(ctx, "p", nil, "rerunner", "")
 	require.NoError(t, err)
 
@@ -37,7 +39,13 @@ func TestClient_ClaimAndRelease_SurfaceStoreDecisions(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()
 	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{})
-	store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusFailed, Steps: map[string]Step{"builds": {Status: StepStatusRunning}}})
+	store.AddSlip(
+		&Slip{
+			CorrelationID: "c",
+			Status:        SlipStatusFailed,
+			Steps:         map[string]Step{"builds": {Status: StepStatusRunning}},
+		},
+	)
 
 	claim, err := client.ClaimSlip(ctx, "c", []SlipStatus{SlipStatusFailed}, "cli", "")
 	require.NoError(t, err)
