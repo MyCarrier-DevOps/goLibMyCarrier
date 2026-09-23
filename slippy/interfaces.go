@@ -37,21 +37,23 @@ type SlipStore interface {
 	// the table is the IN-DELIVERY bounded retry, which reuses its own id; push.go names it
 	// correctly at persistSlipForPush's self-referential arm.
 	//
-	// THE CLAIM INVARIANT THIS PATH MUST PRESERVE: claimed_from and the slip_claimed marker
-	// in state_history are both present or both absent. The conflict arm does not write
-	// claimed_from but DOES write state_history (it is in slipColumns()), so an upsert over a
-	// claimed row would otherwise keep the column and destroy the marker — and pushhookparser
-	// derives "who claimed this" from the markers and gates its stranded-cleanup exemption on
-	// it, so the row would read claimed to one reader and unclaimed to the other (finding p2).
+	// THE CLAIM INVARIANT THIS PATH MUST NOT BREAK: a claimed_from that is SET always has a
+	// slip_claimed marker in state_history. It holds in that direction only: markers are
+	// append-only, so a released row keeps its slip_claimed marker, followed by slip_released,
+	// with claimed_from cleared. The conflict arm does not write claimed_from but DOES write
+	// state_history (it is in slipColumns()), so an upsert over a claimed row would keep the
+	// column and destroy the marker — and pushhookparser derives "who claimed this" from the
+	// markers and gates its stranded-cleanup exemption on it, so the row would read claimed to
+	// one reader and unclaimed to the other (finding p2).
 	//
 	// A CALLER CANNOT KEEP THAT INVARIANT THROUGH THIS METHOD, and that is why
 	// ResetSlipInPlace exists rather than a convention about what to write here. Whether the
 	// row is claimed is knowable only under a row lock this method never takes, and the push
-	// path's own evidence is an unlocked read taken seconds of GitHub calls earlier — so a
-	// caller carrying the claim forward from its snapshot restores the marker only for a claim
-	// it happened to see. Any caller upserting over a row that may be claimed uses
-	// ResetSlipInPlace, which re-states the marker from the row it has locked; push.go's
-	// in-place reset arms both do.
+	// path's own evidence is an unlocked read taken seconds of GitHub calls earlier. Any
+	// caller upserting over a row that may be claimed uses ResetSlipInPlace instead, which
+	// refuses with ErrSlipClaimed, writing nothing, whenever the row it has locked is claimed.
+	// A reset therefore only ever lands on an unclaimed row, where there is no marker to
+	// preserve; push.go's in-place reset arms both route through it.
 	Create(ctx context.Context, slip *Slip) error
 
 	// Load retrieves a slip by its correlation ID (the unique slip identifier).
