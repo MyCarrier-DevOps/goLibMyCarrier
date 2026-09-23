@@ -66,6 +66,15 @@ func (s *PostgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx
 
 // Create upserts a slip. Matches ClickHouse last-write-wins (and the in-memory
 // reference store): an existing correlation_id is overwritten rather than rejected.
+//
+// It is the one full-row write in this store that takes NO row lock — a bare pool.Exec, where
+// Update and every step mutator go through lockSlip — and it never writes claimed_from, which
+// slipColumns() excludes from both the INSERT list and the conflict arm's SET list. Those two
+// facts together are why an upsert over a row that MIGHT be claimed does not come through
+// here: the conflict arm would keep claimed_from while replacing state_history, and with no
+// lock there is no moment at which "is this row claimed, and is its run in flight?" can be
+// answered and acted on together. ResetSlipInPlace is that operation (DEVOPS-367); this method
+// is for a row the caller knows is its own to write.
 func (s *PostgresStore) Create(ctx context.Context, slip *Slip) error {
 	query, vals, err := s.buildCreateQuery(slip)
 	if err != nil {
@@ -79,6 +88,13 @@ func (s *PostgresStore) Create(ctx context.Context, slip *Slip) error {
 
 // Update writes the slip's current state to its existing row. Returns ErrSlipNotFound if
 // no row exists for the correlation ID.
+//
+// NOTHING IN THIS LIBRARY CALLS IT ANY MORE. The last caller was PromoteSlip, and DEVOPS-367
+// rerouted that through the atomic UpdateSlipStatus so a promotion cannot clobber concurrent
+// history appends or end a claim from a stale snapshot; AbandonSlip and checkPipelineCompletion
+// were moved for the same reason. It remains on SlipStore for external callers that really do
+// own the whole row, and it keeps the two properties that make it safe for them: the per-slip
+// FOR UPDATE lock below, and claimed_from's exclusion from slipColumns().
 func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 	cols := s.slipColumns()
 	vals, err := s.slipValues(slip, false)
@@ -98,6 +114,13 @@ func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 		args = append(args, vals[i])
 		n++
 	}
+	// The correlation_id WHERE key is the last bind, after every SET value.
+	//
+	// Note what is NOT in this statement: claimed_from. It is SELECT-only — slipColumns()
+	// omits it — so a full-row write never ends a claim WHATEVER STATUS THE SNAPSHOT CARRIES.
+	// That status came from the caller's own read, and a claim may have been taken since, so
+	// clearing on it would end a claim this caller never saw. Terminal transitions go through
+	// UpdateSlipStatus instead: AbandonSlip, PromoteSlip and checkPipelineCompletion all do.
 	args = append(args, slip.CorrelationID)
 
 	query := fmt.Sprintf("UPDATE routing_slips SET %s WHERE correlation_id = $%d",
@@ -126,8 +149,37 @@ func (s *PostgresStore) Update(ctx context.Context, slip *Slip) error {
 // Load retrieves a slip by correlation ID.
 func (s *PostgresStore) Load(ctx context.Context, correlationID string) (*Slip, error) {
 	query := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1",
-		strings.Join(s.slipColumns(), ", "))
+		strings.Join(s.slipSelectColumns(), ", "))
 	return s.queryOne(ctx, query, correlationID)
+}
+
+// ProbeSchema verifies that routing_slips carries every column this store's SELECTs name —
+// the whole slipSelectColumns() list, not one column of it. It exists because every read path
+// selects that list verbatim, so a single missing column fails Load, LoadByCommit,
+// FindByCommits and the rest with Postgres 42703: a process that starts before the migrator
+// has caught up serves no slip operation at all. Callers run it once at startup and treat
+// ErrSchemaBehind as "not ready".
+//
+// Checking the full list rather than claimed_from alone covers the other producible ordering
+// too: slipColumns() derives its step columns from the pipeline config, so a config deployed
+// ahead of the migration that adds that step's _status column is the same failure, and this
+// probe catches it with the same answer.
+//
+// to_regclass of a missing table is NULL, so attrelid = NULL matches nothing, every column
+// reads as absent and the probe reports behind — the right answer for an unmigrated database.
+//
+// Identifiers are compared CASE-INSENSITIVELY. Postgres folds an unquoted identifier to lower
+// case, and stepColumnEnsurer emits its DDL unquoted, so a configured step named `Deploy_Dev`
+// lands in pg_attribute as `deploy_dev` while slipSelectColumns() still names it as
+// configured. A case-sensitive diff would report that migrated column missing and crash-loop
+// the consumer's readiness gate against a schema that is in fact up to date. The missing
+// names are reported AS CONFIGURED rather than folded, so the operator sees the string their
+// pipeline config carries.
+func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
+	if err := s.probeRoutingSlipColumns(ctx); err != nil {
+		return err
+	}
+	return s.probeChildTables(ctx)
 }
 
 // LoadByCommit retrieves the slip for (repository, commitSHA).
@@ -170,12 +222,38 @@ func (s *PostgresStore) LoadByCommit(ctx context.Context, repository, commitSHA 
 	query := fmt.Sprintf(
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
-		strings.Join(s.slipColumns(), ", "))
+		strings.Join(s.slipSelectColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
 // LoadLiveByCommit returns the live slip for (repository, commitSHA),
 // excluding terminal-superseded statuses (abandoned, promoted, compensated).
+//
+// PRECONDITION BEFORE REMOVING THE abandoned/promoted/compensated FILTER (DEVOPS-231).
+// Making terminal rows visible to the same-commit lookup is DEVOPS-231's stated goal, so this
+// filter is expected to go. Do not remove it without reading this first.
+//
+// SLIPPY_STRANDED_CLEANUP is OFF by default in the pushhookparser that is DEPLOYED:
+// StrandedCleanupEnabled (pkg/slippy/config.go) is `env == "true"`, and that repository's
+// README documents the default as false. So `abandoned` is written by force-push and
+// branch-delete only where an operator armed it. DEVOPS-342 (pushhookparser#56) inverts that
+// default and is OPEN and UNMERGED as of 2026-09-21. An earlier revision of this note stated
+// the inverted default as shipped fact; it was not, and this paragraph replaces it (PR #87,
+// jhicks review).
+//
+// THE PRECONDITION HOLDS EITHER WAY, which is why it is stated against the armed state rather
+// than against the fleet. Wherever the cleanup IS armed — today by opt-in, after #56 anywhere
+// that has not pulled the kill switch — removing this filter makes an abandoned row visible to
+// the same-commit lookup, the empty-run guard sees ended-and-not-failed, and the caller
+// SUPPRESSES the unit tests for that commit. That is a CI-gate weakening reachable by anyone
+// who can force-push a branch, and neither repository's tests would catch it because the two
+// halves live in different modules with different reviewers.
+//
+// So: before removing this filter, either extend pushhookparser's abandon-gate exclusion beyond
+// `failed` (see AbandonStrandedSlip in pushhookparser/pkg/slippy/stranded.go, which excludes
+// `failed` for exactly this reason), or establish that SLIPPY_STRANDED_CLEANUP is disarmed
+// everywhere it runs — which is its default today and would stop being one if #56 merges.
+// Whichever of the two changes lands second silently changes the other.
 func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	// Ordered live-first then updated_at DESC for the same reason as LoadByCommit, and the
 	// status filter is not a substitute for it: the filter excludes abandoned/promoted/
@@ -186,14 +264,86 @@ func (s *PostgresStore) LoadLiveByCommit(ctx context.Context, repository, commit
 		"SELECT %s FROM routing_slips WHERE lower(repository) = lower($1) AND commit_sha = $2 "+
 			"AND status NOT IN ('abandoned', 'promoted', 'compensated') "+
 			"ORDER BY (status IN ("+repaveableSlipStatusesSQL+")) ASC, updated_at DESC LIMIT 1",
-		strings.Join(s.slipColumns(), ", "))
+		strings.Join(s.slipSelectColumns(), ", "))
 	return s.queryOne(ctx, query, repository, commitSHA)
 }
 
+// probeRoutingSlipColumns diffs every column the store's SELECTs name against the live
+// catalogue. Case-insensitive because Postgres folded the unquoted DDL the ensurer emitted, so
+// a configured `Deploy_Dev` legitimately lands as `deploy_dev`; the missing names are reported
+// as CONFIGURED, since that is the spelling an operator has to go and fix.
+func (s *PostgresStore) probeRoutingSlipColumns(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx,
+		"SELECT attname FROM pg_attribute WHERE attrelid = to_regclass('routing_slips') "+
+			"AND NOT attisdropped AND attnum > 0")
+	if err != nil {
+		return fmt.Errorf("probe routing_slips schema: %w", err)
+	}
+	defer rows.Close()
+
+	present := make(map[string]struct{})
+	for rows.Next() {
+		var name string
+		if scanErr := rows.Scan(&name); scanErr != nil {
+			return fmt.Errorf("probe routing_slips schema: %w", scanErr)
+		}
+		present[strings.ToLower(name)] = struct{}{}
+	}
+	if rows.Err() != nil {
+		return fmt.Errorf("probe routing_slips schema: %w", rows.Err())
+	}
+
+	var missing []string
+	for _, col := range s.slipSelectColumns() {
+		if _, ok := present[strings.ToLower(col)]; !ok {
+			missing = append(missing, col)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("routing_slips missing columns %v (apply migrations before serving): %w",
+			missing, ErrSchemaBehind)
+	}
+	return nil
+}
+
+// probeChildTables confirms the tables this store writes besides routing_slips actually exist
+// (PR #87 review, jhicks).
+//
+// Checking one table was too narrow for what the gate promises: a database current on
+// routing_slips but missing slip_component_states or slip_ancestry passed the probe and then
+// failed every component write, every ancestry insert and every repave at request time — which
+// is precisely the class the probe was added to turn into a refusal to start.
+//
+// Scoped to table PRESENCE deliberately. Indexes and constraints are not checked here because
+// the migrations that create them assert their own shape and RAISE on a mismatch (v5's
+// uq_routing_slips_repo_sha and fk_ancestry_slip do exactly that), so re-deriving the expected
+// definitions here would be a second, drifting copy of the same rule — the fault the reserved
+// column set was restructured to avoid. A missing table is different: nothing else reports it
+// until the first write fails.
+func (s *PostgresStore) probeChildTables(ctx context.Context) error {
+	var missing []string
+	for _, table := range []string{TableSlipComponentStates, TableSlipAncestry} {
+		var present bool
+		if err := s.pool.QueryRow(ctx,
+			"SELECT to_regclass($1) IS NOT NULL", table).Scan(&present); err != nil {
+			return fmt.Errorf("probe %s: %w", table, err)
+		}
+		if !present {
+			missing = append(missing, table)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("missing tables %v (apply migrations before serving): %w",
+			missing, ErrSchemaBehind)
+	}
+	return nil
+}
+
 // createTx is Create against an open transaction. Repave uses it so the superseded row's
-// removal and the successor's insert commit or roll back together; both paths go through
-// buildCreateQuery/mapCreateError so a transactional create writes an identical row and
-// reports identical sentinels to a standalone one.
+// removal and the successor's insert commit or roll back together, and ResetSlipInPlace uses
+// it so the locked claim decision and the upsert it authorises land in one transaction; all
+// three paths go through buildCreateQuery/mapCreateError so a transactional create writes an
+// identical row and reports identical sentinels to a standalone one.
 func (s *PostgresStore) createTx(ctx context.Context, tx pgx.Tx, slip *Slip) error {
 	query, vals, err := s.buildCreateQuery(slip)
 	if err != nil {
@@ -244,19 +394,25 @@ func mapCreateError(correlationID string, err error) error {
 // step's status column, then each aggregate step's jsonb column. The order is shared by
 // SELECT, INSERT, and the scan destinations so they never drift.
 func (s *PostgresStore) slipColumns() []string {
-	cols := []string{
-		ColumnCorrelationID, ColumnRepository, ColumnBranch, ColumnCommitSHA,
-		ColumnCreatedAt, ColumnUpdatedAt, ColumnStatus, ColumnStepDetails, ColumnStateHistory,
-	}
+	cols := fixedSlipColumns()
 	for _, step := range s.config.Steps {
-		cols = append(cols, step.Name+"_status")
+		cols = append(cols, stepStatusColumn(step.Name))
 	}
 	for _, step := range s.config.Steps {
 		if step.Aggregates != "" {
-			cols = append(cols, step.Name)
+			cols = append(cols, aggregateColumn(step.Name))
 		}
 	}
 	return cols
+}
+
+// slipSelectColumns is slipColumns() plus the read-only columns a hydrated Slip carries but
+// no caller may write through Create or the full-row Update. claimed_from is the first:
+// it is owned by ClaimSlip and ReleaseClaim (DEVOPS-367), and letting a snapshot Update
+// write it back would let a caller that never loaded the claim silently clear it. Keep this
+// list and newSlipScan's trailing destinations in the same order.
+func (s *PostgresStore) slipSelectColumns() []string {
+	return append(s.slipColumns(), ColumnClaimedFrom)
 }
 
 // aggregateColumns returns the ordered aggregate (jsonb) column names.
@@ -264,7 +420,7 @@ func (s *PostgresStore) aggregateColumns() []string {
 	var cols []string
 	for _, step := range s.config.Steps {
 		if step.Aggregates != "" {
-			cols = append(cols, step.Name)
+			cols = append(cols, aggregateColumn(step.Name))
 		}
 	}
 	return cols
@@ -289,6 +445,8 @@ func (s *PostgresStore) newSlipScan(extra ...any) (sc *pgSlipScan, dest []any) {
 	for i := range sc.aggregateBytes {
 		dest = append(dest, &sc.aggregateBytes[i])
 	}
+	// Read-only trailing columns from slipSelectColumns(), in the same order.
+	dest = append(dest, &sc.claimedFrom)
 	dest = append(dest, extra...)
 	return sc, dest
 }
@@ -300,39 +458,137 @@ func (s *PostgresStore) newSlipScan(extra ...any) (sc *pgSlipScan, dest []any) {
 func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 	slip := sc.slip
 	slip.Status = SlipStatus(sc.statusStr)
-
-	slip.Steps = make(map[string]Step, len(s.config.Steps))
-	for i, step := range s.config.Steps {
-		slip.Steps[step.Name] = Step{Status: StepStatus(sc.stepStatuses[i])}
+	if sc.claimedFrom != nil {
+		slip.ClaimedFrom = SlipStatus(*sc.claimedFrom)
 	}
+
+	slip.Steps = s.stepsFromStatuses(sc.stepStatuses)
 	mergeStepDetailsJSON(slip, sc.stepDetails)
 
-	slip.Aggregates = make(map[string][]ComponentStepData, len(sc.aggregateCols))
-	for i, col := range sc.aggregateCols {
-		var wrapper struct {
-			Items []ComponentStepData `json:"items"`
-		}
-		if len(sc.aggregateBytes[i]) > 0 {
-			if err := json.Unmarshal(sc.aggregateBytes[i], &wrapper); err != nil {
-				// Leave this aggregate unset on malformed JSON, matching the CH scanner.
-				continue
-			}
-		}
-		slip.Aggregates[col] = wrapper.Items
-	}
+	slip.Aggregates = decodeAggregates(sc.aggregateCols, sc.aggregateBytes)
 
-	if len(sc.stateHistory) > 0 {
-		var wrapper struct {
-			Entries []StateHistoryEntry `json:"entries"`
-		}
-		if json.Unmarshal(sc.stateHistory, &wrapper) == nil {
-			slip.StateHistory = wrapper.Entries
-		}
-	}
+	slip.StateHistory = decodeStateHistory(sc.stateHistory)
 
 	// Reuse the shared (backend-agnostic) timing reconstruction from the scanner.
 	NewSlipScanner(s.config).reconstructStepTimingFromHistory(slip)
 	return slip
+}
+
+// stepsFromStatuses turns the scanned per-step status strings — always in s.config.Steps
+// order, the order slipColumns() and claimStateColumns() both emit — into the Steps map.
+// Shared by populate and loadClaimStateTx so the two reads cannot disagree about the mapping.
+func (s *PostgresStore) stepsFromStatuses(statuses []string) map[string]Step {
+	steps := make(map[string]Step, len(s.config.Steps))
+	for i, step := range s.config.Steps {
+		steps[step.Name] = Step{Status: StepStatus(statuses[i])}
+	}
+	return steps
+}
+
+// decodeAggregates unwraps the {"items": [...]} envelope each aggregate jsonb column holds,
+// for cols and raw in the same order. A NULL or empty column leaves that aggregate as a NIL
+// slice — the key is present in the map with a nil value, not an empty one — and a malformed
+// one leaves it unset rather than failing the read, matching the ClickHouse scanner. Shared
+// by populate and loadClaimStateTx.
+//
+// The nil matters past this function: encoding/json marshals a nil slice as `null` and an
+// empty one as `[]`, so an aggregate step with no components reaches a slippy-api response
+// body as `"builds": null`. Every reader of that field has to accept null as "no components"
+// (PR #87 sixth review). Nothing here depends on the distinction — the readers in this package
+// range over the value, and ranging over nil is a no-op.
+func decodeAggregates(cols []string, raw [][]byte) map[string][]ComponentStepData {
+	aggregates := make(map[string][]ComponentStepData, len(cols))
+	for i, col := range cols {
+		var wrapper struct {
+			Items []ComponentStepData `json:"items"`
+		}
+		if len(raw[i]) > 0 {
+			if err := json.Unmarshal(raw[i], &wrapper); err != nil {
+				continue
+			}
+		}
+		aggregates[col] = wrapper.Items
+	}
+	return aggregates
+}
+
+// decodeStateHistory unwraps the {"entries": [...]} envelope the state_history jsonb column
+// holds. A NULL, empty or malformed column yields a nil slice rather than an error, matching
+// what populate did inline before ResetSlipInPlace needed the same decode under a row lock:
+// a history that cannot be read is not a reason to fail a write that does not depend on it.
+// One definition so the two readers cannot disagree about the envelope.
+func decodeStateHistory(raw []byte) []StateHistoryEntry {
+	if len(raw) == 0 {
+		return nil
+	}
+	var wrapper struct {
+		Entries []StateHistoryEntry `json:"entries"`
+	}
+	if json.Unmarshal(raw, &wrapper) != nil {
+		return nil
+	}
+	return wrapper.Entries
+}
+
+// claimStateColumns returns exactly the columns the claim decisions read, in scan order:
+// claimed_from, status, every configured step's status column (slipColumns()' naming), then
+// every aggregate column (aggregateColumns()). That set is DecideRelease's whole input and
+// DecideClaim's too — the claim needs the step and aggregate columns for the same reason the
+// release does, to answer whether anything is in flight. It is deliberately NOT
+// slipSelectColumns(): state_history and step_details are the two columns that grow without
+// bound on a busy slip, and neither decision reads them, so keeping them out of the FOR UPDATE
+// read keeps the lock held over a bounded amount of data (DEVOPS-367).
+//
+// The aggregate names are returned alongside so the caller can decode the jsonb destinations
+// without recomputing them.
+func (s *PostgresStore) claimStateColumns() (cols, aggregateCols []string) {
+	cols = []string{ColumnClaimedFrom, ColumnStatus}
+	for _, step := range s.config.Steps {
+		cols = append(cols, stepStatusColumn(step.Name))
+	}
+	aggregateCols = s.aggregateColumns()
+	return append(cols, aggregateCols...), aggregateCols
+}
+
+// loadClaimStateTx reads only the claim state under FOR UPDATE inside tx, so the quiescence
+// DecideClaim and DecideRelease judge from it holds until the transaction's own write lands.
+// The returned Slip is partial by design: beyond the CorrelationID it was asked for, only
+// ClaimedFrom, Status, Steps[name].Status and Aggregates are populated, because those are the
+// two decisions' whole input. It does not hydrate step_details, state_history or reconstructed
+// step timing — neither a claim nor a release reads or writes them. Do not hand the result to
+// anything but those two decisions (and RunInFlight, which is what both consult).
+func (s *PostgresStore) loadClaimStateTx(ctx context.Context, tx pgx.Tx, correlationID string) (*Slip, error) {
+	cols, aggCols := s.claimStateColumns()
+
+	var claimedFrom *string
+	var statusStr string
+	stepStatuses := make([]string, len(s.config.Steps))
+	aggregateBytes := make([][]byte, len(aggCols))
+
+	dest := []any{&claimedFrom, &statusStr}
+	for i := range stepStatuses {
+		dest = append(dest, &stepStatuses[i])
+	}
+	for i := range aggregateBytes {
+		dest = append(dest, &aggregateBytes[i])
+	}
+
+	query := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1 FOR UPDATE",
+		strings.Join(cols, ", "))
+	if err := tx.QueryRow(ctx, query, correlationID).Scan(dest...); err != nil {
+		if isNoRows(err) {
+			return nil, ErrSlipNotFound
+		}
+		return nil, fmt.Errorf("failed to load claim state for slip %s: %w", correlationID, err)
+	}
+
+	slip := &Slip{CorrelationID: correlationID, Status: SlipStatus(statusStr)}
+	if claimedFrom != nil {
+		slip.ClaimedFrom = SlipStatus(*claimedFrom)
+	}
+	slip.Steps = s.stepsFromStatuses(stepStatuses)
+	slip.Aggregates = decodeAggregates(aggCols, aggregateBytes)
+	return slip, nil
 }
 
 // queryOne runs a single-row SELECT and hydrates the slip, mapping no-rows to
@@ -420,6 +676,7 @@ type pgSlipScan struct {
 	stepStatuses   []string
 	aggregateCols  []string
 	aggregateBytes [][]byte
+	claimedFrom    *string // NULL when unclaimed
 }
 
 // buildStepDetailsMap builds the step_details JSON object from a slip. Mirrors

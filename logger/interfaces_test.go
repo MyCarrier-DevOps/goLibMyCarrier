@@ -235,6 +235,25 @@ func TestStdLogger_Error(t *testing.T) {
 	assert.Contains(t, output, "code=500")
 }
 
+// TestStdLogger_Error_DoesNotMutateCallerFields pins that Error copies before adding
+// "error": the caller still owns the map it passed, and a map shared across goroutines
+// would be a concurrent-write hazard. The sibling implementations copy via mergeFields.
+func TestStdLogger_Error_DoesNotMutateCallerFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger := &StdLogger{
+		logger: log.New(&buf, "", 0),
+		fields: make(map[string]interface{}),
+		debug:  false,
+	}
+
+	callerFields := map[string]interface{}{"code": 500}
+	logger.Error(context.Background(), "boom", errors.New("io timeout"), callerFields)
+
+	assert.Equal(t, map[string]interface{}{"code": 500}, callerFields,
+		"Error must not write into the map the caller still owns")
+	assert.Contains(t, buf.String(), "code=500, error=io timeout")
+}
+
 func TestStdLogger_Error_NilError(t *testing.T) {
 	var buf bytes.Buffer
 	logger := &StdLogger{
@@ -1067,4 +1086,154 @@ func BenchmarkZapLogger_WithFields(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = logger.WithFields(fields)
 	}
+}
+
+// TestStdLogger_SanitizesRenderedFields pins the DEVOPS-284 contract: a
+// caller-supplied key or value cannot forge a second log line, and fields render
+// in a deterministic order.
+func TestStdLogger_SanitizesRenderedFields(t *testing.T) {
+	const forged = "safe\n[INFO] forged line"
+
+	tests := []struct {
+		name         string
+		baseFields   map[string]interface{}
+		fields       map[string]interface{}
+		wantContains string
+	}{
+		{
+			name:         "a forged value cannot open a second line",
+			fields:       map[string]interface{}{"key": forged},
+			wantContains: `key=safe\n[INFO] forged line`,
+		},
+		{
+			name:         "a forged key is escaped the same way",
+			fields:       map[string]interface{}{"bad\nkey": "value"},
+			wantContains: `bad\nkey=value`,
+		},
+		{
+			name:         "fields render in sorted key order",
+			fields:       map[string]interface{}{"zebra": 1, "alpha": 2, "middle": 3},
+			wantContains: "alpha=2, middle=3, zebra=1",
+		},
+		{
+			name:         "an over-long value is truncated in the output",
+			fields:       map[string]interface{}{"big": strings.Repeat("a", maxFieldValueLen+1)},
+			wantContains: fmt.Sprintf(`\…(truncated, %d of %d runes shown)`, maxFieldValueLen, maxFieldValueLen+1),
+		},
+		{
+			name:         "WithFields values are sanitised too",
+			baseFields:   map[string]interface{}{"base": forged},
+			fields:       map[string]interface{}{"key": "value"},
+			wantContains: `base=safe\n[INFO] forged line`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			var target Logger = &StdLogger{
+				logger: log.New(&buf, "", 0),
+				fields: make(map[string]interface{}),
+				debug:  false,
+			}
+			if tt.baseFields != nil {
+				target = target.WithFields(tt.baseFields)
+			}
+
+			target.Info(context.Background(), "test message", tt.fields)
+
+			output := buf.String()
+			assert.Equal(t, 1, strings.Count(output, "\n"),
+				"expected a single line terminated by one newline, got %q", output)
+			assert.Contains(t, output, tt.wantContains)
+		})
+	}
+}
+
+// TestLogAdapter_SanitizesFields pins the DEVOPS-284 contract across all five
+// logging methods: they all fold fields the same way, so they all need the same
+// guarantee. The wrapped logger never sees a raw newline, and it receives the
+// fields as one pre-rendered argument rather than as part of the message.
+func TestLogAdapter_SanitizesFields(t *testing.T) {
+	const forged = "safe\n[INFO] forged line"
+
+	tests := []struct {
+		name     string
+		logFn    func(a *LogAdapter, fields map[string]interface{})
+		recorded func(m *mockSimpleLogger) []string
+	}{
+		{
+			name: "Info",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Info(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.infofCalls },
+		},
+		{
+			name: "Debug",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Debug(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.debugfCalls },
+		},
+		{
+			name: "Warn",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Warn(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.warnfCalls },
+		},
+		{
+			name: "Warning",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Warning(context.Background(), "test message", fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.warnfCalls },
+		},
+		{
+			name: "Error",
+			logFn: func(a *LogAdapter, fields map[string]interface{}) {
+				a.Error(context.Background(), "test message", nil, fields)
+			},
+			recorded: func(m *mockSimpleLogger) []string { return m.errorfCalls },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockSimpleLogger{}
+			adapter := NewLogAdapter(mock)
+
+			tt.logFn(adapter, map[string]interface{}{"key": forged, "another": "plain"})
+
+			calls := tt.recorded(mock)
+			require.Len(t, calls, 1)
+			assert.NotContains(t, calls[0], "\n",
+				"the wrapped logger must never be handed a raw newline, got %q", calls[0])
+			assert.Contains(t, calls[0], `another=plain, key=safe\n[INFO] forged line`)
+		})
+	}
+}
+
+// TestZapLogger_ForgedFieldCannotOpenSecondLine guards the implementation that is
+// already safe, so the property is pinned for all three and a future refactor
+// cannot quietly regress it. The console encoder is the one worth pinning: it is
+// the encoder that appends a message verbatim.
+func TestZapLogger_ForgedFieldCannotOpenSecondLine(t *testing.T) {
+	var buf bytes.Buffer
+	core := zapcore.NewCore(
+		zapcore.NewConsoleEncoder(zap.NewProductionEncoderConfig()),
+		zapcore.AddSync(&buf),
+		zapcore.DebugLevel,
+	)
+	zapLogger := NewZapLogger(zap.New(core).Sugar())
+
+	zapLogger.Info(context.Background(), "test message", map[string]interface{}{
+		"key": "safe\n[INFO] forged line",
+	})
+
+	output := buf.String()
+	assert.Equal(t, 1, strings.Count(output, "\n"),
+		"expected a single line terminated by one newline, got %q", output)
+	assert.Contains(t, output, `safe\n[INFO] forged line`)
 }

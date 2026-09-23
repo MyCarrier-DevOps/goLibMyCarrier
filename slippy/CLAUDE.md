@@ -16,6 +16,179 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ## Breaking changes
 
+**DEVOPS-367 added `ClaimSlip`, `ReleaseClaim`, `ProbeSchema` and `ResetSlipInPlace` to the
+exported `SlipStore` interface:**
+
+```go
+ClaimSlip(ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string) (ClaimOutcome, error)
+ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (ReleaseOutcome, error)
+ProbeSchema(ctx context.Context) error
+ResetSlipInPlace(ctx context.Context, slip *Slip) error
+```
+
+Same posture as `Repave` below: a downstream `SlipStore` implementation fails to compile
+until all four methods exist (the ClickHouse store returns `ErrClaimUnsupported` from the
+first two, `nil` from `ProbeSchema`, having no schema of its own, and `ErrResetUnsupported`
+from `ResetSlipInPlace`; the `slippytest.MockStore` and slippy-api's `mockSlipStore`
+implement them). `ResetSlipInPlace` is the in-place reset the push path used to perform with
+a bare `Create` — see "A push never resets a claimed row whose run is in flight" below for
+what it decides and why it has to be the store that decides it. The claim is a
+**flag**: `ClaimSlip` never writes `status`, and `ReleaseClaim` clears the claim only when
+no step or component is running or held — otherwise it returns
+`ReleaseOutcome{Released: false}` with nothing written, which callers treat as information.
+`ErrRunInFlight` is **removed**: work in flight is an outcome, not an error, because all but
+the last of a run's N post-job releases take that arm.
+`ClaimSlip` returns `ClaimOutcome{Claimed, Prior, InFlight}` for the same reason and with the
+same shape: `Claimed=false` means a claim was already held and NOTHING was written — the
+idempotent repeat every pre-job after the first takes — and `Prior` is then the recorded
+`claimed_from` rather than the current status. Every non-error outcome means the slip is
+claimed on return.
+`expected` is a **compare-and-set on the slip's CURRENT status, whether or not a claim is
+already held** — the idempotent repeat sits BEHIND that check, not in front of it. On an
+**unclaimed** row a nil `expected` admits any status except one whose run has a step or
+component **in flight**; a caller that means to adopt a running run names its status.
+
+**That in-flight refusal does NOT apply to a row that is already claimed** (PR #87, jhicks
+round, finding j-claim). It guards *adoption*, and adoption is the write: on a claimed row the
+claim stays where it is and nothing is written on either ordering, so refusing there bought no
+protection while making the idempotency above false for every caller sending a nil `expected` —
+pre-job 1's `StartStep` puts the run in flight, a nil `expected` names nothing, so pre-job 2 of
+the **same** run got `ErrClaimPreconditionFailed` on a slip its own run held. The arm order in
+`DecideClaim` is now: empty status → compare-and-set → held claim (idempotent repeat) →
+in-flight refusal → fresh claim. The arm that RECORDS a claim is still behind the refusal, so a
+nil `expected` still cannot claim a run that is executing.
+
+**`InFlight` is new in the seventh review of PR #87, and it is the field a rerun caller must
+branch on.** `if_status` is NOT the double-dispatch guard, which an earlier round's comments
+claimed it was. A step write does not move the slip: `StartStep` writes `running`, which is not
+terminal, so `checkPipelineCompletion` is never reached and a slip dispatched out of `failed`
+still READS `failed` until its first post-job — minutes, for a build. A second rerun message in
+that window passes the same compare-and-set, takes the idempotent repeat arm, and on `Claimed`
+alone is indistinguishable from a retry whose response was lost before anything dispatched.
+`InFlight` — the step and aggregate columns, read under the same row lock as the status —
+separates them, and pushhookparser's rerunner dispatches only when `claimed=false` **and**
+`in_flight=false`. Known residual: two rerun messages arriving between a claim and its pre-job's
+`StartStep` both see `InFlight=false` and both dispatch; closing that needs a per-message claim
+identity end to end (`claimedBy` is audit only today).
+
+**`slippy.DecideClaim`'s signature changed with it**, which is compile-breaking for any
+out-of-repo store that routes through it:
+`DecideClaim(status, claimedFrom SlipStatus, inFlight bool, expected []SlipStatus)`. Pass
+`slippy.RunInFlight(slip)` read from the same locked row, and put the same value in
+`ClaimOutcome.InFlight` so the decision and the report cannot disagree. The refusal it drives
+now reads that evidence rather than the status NAME: a `pending` slip with a step running is
+refused (it used to be carved out as "nothing dispatched onto it", but a slip keeps `pending`
+for its whole run), and an `in_progress` slip between one step's post-job and the next step's
+pre-job is claimable (it used to be refused as "a live run"). `ProbeSchema` is on the interface so
+the readiness gate is reachable through the abstraction consumers hold (`Client.ProbeSchema`
+wraps it). Implementers should route their decisions through `slippy.DecideClaim`,
+`slippy.DecideRelease` and `slippy.DecideReset` so they cannot drift from the store.
+`ReleaseMarker(status SlipStatus, releasedBy, reason string)` changed shape in the same
+release (the earlier `restored` argument is gone: a release never restores anything). The
+contract, including what `nil` means for `expected`, is on `SlipStore.ClaimSlip`,
+`SlipStore.ReleaseClaim`, `SlipStore.ProbeSchema` and `SlipStore.ResetSlipInPlace` in
+`interfaces.go`; the model is in `.github/STATE_MACHINE_V3.md` under DEVOPS-367.
+
+**A push never resets a CLAIMED row, full stop.** The push path's one exception to "a claimed
+row is deduped onto" is a push bearing that row's OWN correlation ID — its in-delivery retry —
+which falls through the dedup gate and asks the store to reset the row in place. The store then
+refuses whenever the row it locked is claimed, and the push deduplicates onto the live row.
+
+That refusal used to stop at work *in flight*, allowing a reset onto a claimed but quiescent
+row. The premise was that a row carrying this push's own correlation ID could only be this
+delivery's retry, so there was no other run's work to protect. **That premise is false** (PR #87
+review): the rerunner adopts the slip it looked up and claims under the ORIGINAL push's
+correlation ID, and the Slippy CLI pre-job claims the slip its workflow was dispatched for — so
+a self-correlated row is routinely held by someone else's run. And a claim records no step, so
+`RunInFlight` stays false for the whole time the claimant's workflow sits in the queue. A
+redelivery landing in that window was allowed through and rewrote every step, aggregate and
+history entry of a run that had already been dispatched.
+
+Refusing on any claim also aligns the three encodings of "claimed means protected" that used to
+disagree: `slipUnclaimedSQL` refuses on a set `claimed_from` full stop, `Repave`'s guard does
+the same, and `DecideReset` now matches them.
+
+Because a reset now only ever writes onto an UNCLAIMED row, there is no claim to preserve
+across it and no marker to carry — `ResetClaimMarker` and the carry arm are gone with the rule
+that needed them. The invariant they existed to keep still holds, and more simply: **a
+`claimed_from` that is SET always has a `slip_claimed` marker**, because nothing overwrites the
+history of a claimed row any more.
+
+State that invariant in that DIRECTION, not as "both present or both absent". The converse is
+what a terminal status write used to break: it cleared `claimed_from` and appended nothing, so
+the row kept a `slip_claimed` marker with no column. That was fail-safe — `IsTerminal()` and
+the parser's `isLiveSlipStatus` are exact complements across all eight statuses, so a terminal
+slip returns at the parser's live-status gate before its claim gate — but the library was still
+leaving a row in the shape `GuardReservedStepWrite` exists to stop a caller forging. So
+`UpdateSlipStatus` now appends a `slip_released` marker in the same transaction whenever the
+write actually ended a claim (PR #87 review, jhicks).
+
+**Both halves of that are decided under the row lock, by the store, not by the push.**
+`SlipStore.ResetSlipInPlace` (DEVOPS-367, PR #87) is the in-place reset: it re-reads the target
+row `FOR UPDATE`, and either performs the upsert onto an unclaimed row or refuses with
+`ErrSlipClaimed` — all in one transaction, so the evidence cannot change before the write it
+authorises. `DecideReset(claimedFrom, inFlight) error` is the shared decision, beside
+`DecideClaim` and `DecideRelease`, so the store and both test doubles cannot drift. `inFlight`
+no longer changes the answer — any claim refuses — and is kept only so the refusal can tell an
+operator which shape it refused. The ClickHouse store returns
+`ErrResetUnsupported`, which the push path falls back from to a plain `Create` — it has no
+claim column, so there is no claim for the refused decision to protect.
+
+It replaced an unlocked `Create` gated on an unlocked `LoadByCommit`, with
+`resolveAndAbandonAncestors`' GitHub round trips in between — seconds during which a row read
+unclaimed and quiescent could be claimed and start executing. The upsert then kept
+`claimed_from` and replaced `state_history`, leaving the column set with the marker gone, and
+reset a run that was in flight. The push's own snapshot check survives as a **fast path**: it
+decides which route to attempt, and a dedup decided there skips ancestor resolution entirely,
+but a stale snapshot now costs one round trip and a dedup rather than a destroyed run.
+
+**What a refusal does:** both in-place reset arms — `persistSlipForPush`'s and the
+duplicate-create backstop's — converge on `resetSlipInPlace` in `push.go`, which on
+`ErrSlipClaimed` **deduplicates onto the existing live row** rather than failing the
+push: the claimant's run owns that slip and the desired end state, one run for this commit,
+already holds. The row is RELOADED for the result, because the snapshot the push still holds
+says unclaimed and quiescent. `AncestryResolved` is untouched on every arm (both call sites run
+after resolution). Neither arm calls `handlePushRetry` on a refusal — the reset was refused
+precisely because another run's work is executing under that row.
+
+Exactly ONE write path ends a claim: `UpdateSlipStatus` on a terminal status. `Create` and
+the full-row `Update` never touch `claimed_from`, whatever status the caller's snapshot
+carries, so a Load-then-Update can no longer clear a claim taken after its read;
+`PromoteSlip` goes through the atomic status write for that reason. The claim protects work
+that is **in flight** — running or held steps and components. The gap between one step's
+last post-job and the next step's pre-job is not covered; that is tracked as **DEVOPS-371**
+(a dispatcher-held claim).
+
+**A claim with nothing in flight is reapable, by two routes.** The state with no post-job to
+end it is a claim taken by a pre-job whose workflow was then never dispatched: `claimed_from`
+is set, no step was ever reported, `RunInFlight` is false so a release WOULD clear it — but no
+post-job will ever run to call one, and every later same-commit push deduplicates onto the row.
+
+1. **Operator, and it covers every case:** `POST /v1/slips/{id}/release`. Nothing is in flight,
+   so the first call clears it; there is no stuck step to resolve first.
+2. **Automatic, and it is narrow:** pushhookparser's stranded-slip cleanup, which used to skip
+   any claimed slip and now exempts one only while a step or component is running or held.
+   Its claim gate sits *after* its live-status gate and its `failed` carve-out, so what it
+   actually reaps is a claimed, quiescent slip at `pending`, `in_progress` or `compensating`,
+   for a commit a force-push or branch delete made unreachable, on the slip's own branch, with
+   `SLIPPY_STRANDED_CLEANUP` armed. That flag is **off by default in the deployed parser**
+   (`StrandedCleanupEnabled` is `env == "true"`); pushhookparser#56 (DEVOPS-342) inverts the
+   default and is **open and unmerged**, so today the automatic route runs only where an
+   operator armed it. A claimed quiescent `failed` slip — the
+   rerunner's usual adoption — and a claimed terminal one both return at earlier gates and are
+   never reaped by it; they are route 1's cases.
+
+Do **not** add a time-based sweeper to this library for any of it: a long build is
+indistinguishable from a wedge by elapsed time, which is why the exemption reads in-flight
+evidence instead (DEVOPS-367, PR #87 finding 3).
+
+When a claim is left behind by a run that will never release it, the **stuck step holds it**:
+resolve that step (`POST /v1/slips/{id}/steps/{step}/complete`, or fail or skip it), then
+`POST /v1/slips/{id}/release`, which then finds nothing in flight. On a non-terminal slip
+`POST /v1/slips/{id}/abandon` also ends it (`AbandonSlip` writes the terminal `abandoned`
+through `UpdateSlipStatus`); on an already-terminal slip it is a deliberate no-op (I4) and
+clears nothing, so use the step-then-release route there.
+
 **DEVOPS-231 added `Repave` to the exported `SlipStore` interface:**
 
 ```go
@@ -222,6 +395,39 @@ if currentVersion < targetVersion {
     logger.Info("Schema validation passed, no migrations needed")
 }
 ```
+
+**Migration v6 (`claimed_from`, DEVOPS-367) rollout order.** Every Postgres read path
+selects `claimed_from` (`slipSelectColumns()`), so a library at or past v1.4.0 fails
+every `Load` with Postgres 42703 against a database still at v5. The migrator Job must
+have applied v6 before any slippy-api pod on that library serves traffic; do not roll
+the API image ahead of the migrator. This library supplies the check, but the ordering is
+enforced by the consumer that runs it — slippy-api's startup check, not the library itself:
+`PostgresStore.ProbeSchema` compares `slipSelectColumns()` (every column the SELECTs name,
+`claimed_from` and each configured step's column alike) against the live schema, and
+slippy-api calls it during startup and returns a fatal error on `ErrSchemaBehind`, so the
+process exits before it ever serves and Kubernetes CrashLoopBackOffs it until the
+slippy-migrator Job has applied the schema. It is a startup error, NOT a failing readiness
+probe — the two are different mechanisms and only this one is implemented; `main.go`'s own
+comment at the `ProbeSchema` call says the same. An API wired that way crash-loops until v6 is
+applied instead of answering every slip request with a 42703; a consumer that never calls the
+probe gets no such protection. `ProbeSchema` is on `SlipStore` (and `Client`), so it is reachable
+through the abstraction rather than only on the concrete Postgres store.
+Rolling back is guarded: v6's DownSQL refuses while any slip holds a claim
+(`claimed_from` set), because dropping the column erases the in-flight flag of every held
+claim — that run's work becomes repaveable mid-flight — and breaks every `Load` until the
+library is rolled back with it. The refusal names up to 20 of the held correlation ids, and
+the guard takes an `ACCESS EXCLUSIVE` lock (bounded by a 5s `lock_timeout`, since the
+migration transaction otherwise runs with `lock_timeout = 0`) before it counts, so a claim
+taken between the count and the drop cannot slip through. The **up** sets the same 5s bound as
+its first statement, for the same reason and against the likelier exposure: `ADD COLUMN` takes
+`ACCESS EXCLUSIVE` too, an unbounded request for it queues ahead of every later reader, and the
+up runs on every consumer startup while the down runs only on a deliberate rollback.
+Because every slip-routed pre-job now claims, some slip usually holds a claim in a busy
+environment, so plan a rollback as a drain: expect the down to refuse until runs finish or
+are released. Let the runs end and `ReleaseClaim` them; where a step is stuck, resolve that
+step (`POST /v1/slips/{id}/steps/{step}/complete`) and then release. A NON-terminal slip can
+also be ended with `POST /v1/slips/{id}/abandon`; an already-terminal one ignores that call
+(I4) and keeps its claim, so use the step-then-release route there. Then re-run the down.
 
 ### 3. Client Initialization Pattern
 

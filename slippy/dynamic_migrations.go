@@ -181,7 +181,7 @@ func (m *DynamicMigrationManager) GetMigrationsForClickhouseMigrator(
 func (m *DynamicMigrationManager) GetCurrentStepColumns() []string {
 	columns := make([]string, len(m.config.Steps))
 	for i, step := range m.config.Steps {
-		columns[i] = fmt.Sprintf("%s_status", step.Name)
+		columns[i] = stepStatusColumn(step.Name)
 	}
 	return columns
 }
@@ -551,7 +551,7 @@ func (m *DynamicMigrationManager) generateHistoryViewMigration() clickhousemigra
 // generateStepColumnEnsurer creates an idempotent ensurer for a step's columns.
 // Uses ADD COLUMN IF NOT EXISTS so it's safe to run every time.
 func (m *DynamicMigrationManager) generateStepColumnEnsurer(step StepConfig) clickhousemigrator.SchemaEnsurer {
-	statusColumn := fmt.Sprintf("%s_status", step.Name)
+	statusColumn := stepStatusColumn(step.Name)
 
 	var sql strings.Builder
 	fmt.Fprintf(&sql, `
@@ -564,10 +564,12 @@ func (m *DynamicMigrationManager) generateStepColumnEnsurer(step StepConfig) cli
 	// If this is an aggregate step, add a JSON column for component data
 	// Array wrapped in object for ClickHouse JSON compatibility
 	if step.Aggregates != "" {
-		// Column name is the step name (e.g., "builds")
-		aggregateColumn := step.Name
+		// Column name is the step name (e.g., "builds"). Named aggCol rather than
+		// aggregateColumn because the latter is now the package-level helper being called
+		// here: shadowing it would make the helper uncallable by name inside this very block.
+		aggCol := aggregateColumn(step.Name)
 		fmt.Fprintf(&sql, `,
-		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '{"items":[]}'`, aggregateColumn)
+		ADD COLUMN IF NOT EXISTS %s JSON DEFAULT '{"items":[]}'`, aggCol)
 	}
 
 	description := fmt.Sprintf("Ensures %s column exists for step '%s'", statusColumn, step.Name)
@@ -631,7 +633,7 @@ func (m *DynamicMigrationManager) generateIndexEnsurer() clickhousemigrator.Sche
 	deploySteps := []string{"dev_deploy", "preprod_deploy", "prod_deploy"}
 	for _, stepName := range deploySteps {
 		if m.config.GetStep(stepName) != nil {
-			statusColumn := fmt.Sprintf("%s_status", stepName)
+			statusColumn := stepStatusColumn(stepName)
 			indexName := fmt.Sprintf("idx_%s_held", stepName)
 
 			fmt.Fprintf(&sql, `,

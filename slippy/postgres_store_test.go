@@ -7,7 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/pashagolub/pgxmock/v4"
+	"github.com/pashagolub/pgxmock/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -54,6 +54,34 @@ func TestPostgresStore_slipColumns(t *testing.T) {
 	}, cols[9:13])
 	assert.Equal(t, "builds", cols[13], "aggregate column comes last")
 	assert.Equal(t, []string{"builds"}, store.aggregateColumns())
+}
+
+// TestPostgresStore_claimStateColumns pins the narrow read ReleaseClaim uses: it must carry
+// DecideRelease's whole input — the claim, the status, every step's status column and every
+// aggregate column — and must NOT carry state_history or step_details, the two columns that
+// grow without bound on a busy slip and that the release decision never reads. Holding the
+// row lock over them was the cost this read exists to avoid (DEVOPS-367).
+func TestPostgresStore_claimStateColumns(t *testing.T) {
+	store, _ := newMockStore(t)
+	cols, aggCols := store.claimStateColumns()
+
+	assert.Equal(t, []string{
+		"claimed_from", "status",
+		"push_parsed_status", "builds_status", "unit_tests_status", "dev_deploy_status",
+		"builds",
+	}, cols)
+	assert.Equal(t, store.aggregateColumns(), aggCols,
+		"the aggregate names are returned alongside so the read need not recompute them")
+	assert.NotContains(t, cols, ColumnStateHistory, "the release decision never reads state_history")
+	assert.NotContains(t, cols, ColumnStepDetails, "nor step_details")
+	// Every step's status column and every aggregate column must be present, or a step
+	// running on a column this read skipped would be invisible to DecideRelease.
+	for _, step := range store.config.Steps {
+		assert.Contains(t, cols, step.Name+"_status")
+	}
+	for _, agg := range store.aggregateColumns() {
+		assert.Contains(t, cols, agg)
+	}
 }
 
 func TestPostgresStore_Create_Upsert(t *testing.T) {
@@ -187,11 +215,12 @@ func TestPostgresStore_Load_Hydrates(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)
 	updated := time.Date(2026, 1, 2, 4, 0, 0, 0, time.UTC)
 
-	rows := pgxmock.NewRows(store.slipColumns()).AddRow(
+	rows := pgxmock.NewRows(store.slipSelectColumns()).AddRow(
 		"c1", "owner/repo", "main", "sha1", created, updated,
 		"in_progress", stepDetails, stateHistory,
 		"pending", "completed", "pending", "pending", // push_parsed, builds, unit_tests, dev_deploy
 		buildsAgg,
+		nil, // claimed_from
 	)
 	mock.ExpectQuery("SELECT .* FROM routing_slips WHERE correlation_id").
 		WithArgs("c1").WillReturnRows(rows)
@@ -222,7 +251,7 @@ func TestPostgresStore_Load_Hydrates(t *testing.T) {
 // the terms cannot be dropped or reordered silently.
 func TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
 	store, mock := newMockStore(t)
-	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
+	rows := pgxmock.NewRows(store.slipSelectColumns()).AddRow(slipRowValues("c1", "sha1")...)
 	mock.ExpectQuery(
 		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
 			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
@@ -241,7 +270,7 @@ func TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.
 // duplicate can still surface ahead of the live row on updated_at DESC alone.
 func TestPostgresStore_LoadLiveByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.T) {
 	store, mock := newMockStore(t)
-	rows := pgxmock.NewRows(store.slipColumns()).AddRow(slipRowValues("c1", "sha1")...)
+	rows := pgxmock.NewRows(store.slipSelectColumns()).AddRow(slipRowValues("c1", "sha1")...)
 	mock.ExpectQuery(
 		`SELECT .* FROM routing_slips WHERE lower\(repository\) = lower\(\$1\) AND commit_sha = \$2 `+
 			`AND status NOT IN \('abandoned', 'promoted', 'compensated'\) `+

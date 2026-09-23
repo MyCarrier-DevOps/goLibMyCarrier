@@ -168,6 +168,85 @@ func TestClickHouseStore_Repave(t *testing.T) {
 	}
 }
 
+// ClaimSlip and ReleaseClaim are unsupported on ClickHouse for the same reasons Repave is:
+// no claimed_from column, no transaction to make the claim atomic, and not the operational
+// slip store (DEVOPS-127). Both must return the typed ErrClaimUnsupported sentinel wrapped
+// with the correlation ID, so a caller detects it with errors.Is and takes its failed-claim
+// branch — the rerunner dispatches nothing, the CLI pre-job proceeds unclaimed — rather than
+// matching on a substring, and so the log names which slip was involved.
+func TestClickHouseStore_ClaimSlip_Unsupported(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	out, err := store.ClaimSlip(context.Background(), "corr-claim-1", nil, "rerunner", "")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !errors.Is(err, ErrClaimUnsupported) {
+		t.Errorf("expected errors.Is(err, ErrClaimUnsupported) to hold, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "corr-claim-1") {
+		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
+	}
+	if out.Claimed || out.Prior != "" {
+		t.Errorf("expected a zero ClaimOutcome on an unsupported claim, got %+v", out)
+	}
+}
+
+func TestClickHouseStore_ReleaseClaim_Unsupported(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	out, err := store.ReleaseClaim(context.Background(), "corr-release-1", "post-job", "")
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !errors.Is(err, ErrClaimUnsupported) {
+		t.Errorf("expected errors.Is(err, ErrClaimUnsupported) to hold, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "corr-release-1") {
+		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
+	}
+	if out.Released || out.Status != "" {
+		t.Errorf("expected a zero outcome on an unsupported release, got %+v", out)
+	}
+}
+
+// ResetSlipInPlace is unsupported for the same reasons: the reset's whole contract is that it
+// DECIDES under a row lock, and this store has neither the claimed_from column to read nor the
+// transaction to hold the decision and the write together. It must return ErrResetUnsupported
+// — not ErrClaimUnsupported — because the push path's fallback for it is a plain Create, not
+// the failed-claim branch, and it must not panic on a nil successor since it reads nothing.
+func TestClickHouseStore_ResetSlipInPlace_Unsupported(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	err := store.ResetSlipInPlace(context.Background(), &Slip{CorrelationID: "corr-reset-1"})
+	if err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	if !errors.Is(err, ErrResetUnsupported) {
+		t.Errorf("expected errors.Is(err, ErrResetUnsupported) to hold, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "corr-reset-1") {
+		t.Errorf("expected error to name the correlation ID, got %q", err.Error())
+	}
+	if nilErr := store.ResetSlipInPlace(context.Background(), nil); !errors.Is(nilErr, ErrResetUnsupported) {
+		t.Errorf("a nil successor must still refuse rather than panic, got %v", nilErr)
+	}
+}
+
+// ProbeSchema is the readiness gate on SlipStore. ClickHouse has no schema of its own to
+// check for it, so it reports ready rather than failing a caller's startup probe.
+func TestClickHouseStore_ProbeSchema_ReportsReady(t *testing.T) {
+	mockSession := &clickhousetest.MockSession{}
+	store := NewClickHouseStoreFromSession(mockSession, testPipelineConfig(), "ci")
+
+	if err := store.ProbeSchema(context.Background()); err != nil {
+		t.Errorf("expected ProbeSchema to report ready on ClickHouse, got %v", err)
+	}
+}
+
 // TestClickHouseStore_Create tests the Create method.
 func TestClickHouseStore_Create(t *testing.T) {
 	t.Run("successful create", func(t *testing.T) {

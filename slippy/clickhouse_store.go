@@ -510,6 +510,32 @@ func (s *ClickHouseStore) LoadByCommit(ctx context.Context, repository, commitSH
 // correlation_id within the (repo, commit) scope before the status filter is
 // applied, so an abandoned latest version excludes the whole correlation rather
 // than surfacing a stale earlier-version row.
+//
+// PRECONDITION BEFORE REMOVING THE abandoned/promoted/compensated FILTER (DEVOPS-231).
+// Making terminal rows visible to the same-commit lookup is DEVOPS-231's stated goal, so this
+// filter is expected to go. Do not remove it without reading this first.
+//
+// SLIPPY_STRANDED_CLEANUP is OFF by default in the pushhookparser that is DEPLOYED:
+// StrandedCleanupEnabled (pkg/slippy/config.go) is `env == "true"`, and that repository's
+// README documents the default as false. So `abandoned` is written by force-push and
+// branch-delete only where an operator armed it. DEVOPS-342 (pushhookparser#56) inverts that
+// default and is OPEN and UNMERGED as of 2026-09-21. An earlier revision of this note stated
+// the inverted default as shipped fact; it was not, and this paragraph replaces it (PR #87,
+// jhicks review).
+//
+// THE PRECONDITION HOLDS EITHER WAY, which is why it is stated against the armed state rather
+// than against the fleet. Wherever the cleanup IS armed — today by opt-in, after #56 anywhere
+// that has not pulled the kill switch — removing this filter makes an abandoned row visible to
+// the same-commit lookup, the empty-run guard sees ended-and-not-failed, and the caller
+// SUPPRESSES the unit tests for that commit. That is a CI-gate weakening reachable by anyone
+// who can force-push a branch, and neither repository's tests would catch it because the two
+// halves live in different modules with different reviewers.
+//
+// So: before removing this filter, either extend pushhookparser's abandon-gate exclusion beyond
+// `failed` (see AbandonStrandedSlip in pushhookparser/pkg/slippy/stranded.go, which excludes
+// `failed` for exactly this reason), or establish that SLIPPY_STRANDED_CLEANUP is disarmed
+// everywhere it runs — which is its default today and would stop being one if #56 merges.
+// Whichever of the two changes lands second silently changes the other.
 func (s *ClickHouseStore) LoadLiveByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error) {
 	if s.pipelineConfig == nil {
 		return nil, fmt.Errorf("pipeline config is required for store operations")
@@ -674,6 +700,10 @@ func (s *ClickHouseStore) UpdateStep(
 	correlationID, stepName, componentName string,
 	status StepStatus,
 ) error {
+	if err := GuardReservedStepWrite(stepName, nil); err != nil {
+		return err
+	}
+
 	// Capture the write timestamp before the INSERT so the overlay uses the
 	// same logical time as the row being written (within clock granularity).
 	//
@@ -741,6 +771,10 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 	status StepStatus,
 	entry StateHistoryEntry,
 ) error {
+	if err := GuardReservedStepWrite(stepName, &entry); err != nil {
+		return err
+	}
+
 	// Capture the write timestamp before the INSERT so the overlay uses the
 	// same logical time as the row being written (within clock granularity).
 	//
@@ -869,6 +903,10 @@ func (s *ClickHouseStore) UpdateStepWithHistory(
 // This prevents a concurrent step-status update from being overwritten in the
 // routing_slips cache by an in-flight AppendHistory that loaded a stale snapshot.
 func (s *ClickHouseStore) AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error {
+	if err := GuardReservedStepWrite("", &entry); err != nil {
+		return err
+	}
+
 	return s.appendHistoryWithOverrides(ctx, correlationID, entry)
 }
 
@@ -935,6 +973,45 @@ func (s *ClickHouseStore) InsertAncestryLink(ctx context.Context, slip *Slip, pa
 // semantics instead of silently losing the old AbandonSlip behavior.
 func (s *ClickHouseStore) Repave(_ context.Context, oldCorrelationID string, _ *Slip, _ *AncestryEntry) error {
 	return fmt.Errorf("Repave(%s): %w", oldCorrelationID, ErrRepaveUnsupported)
+}
+
+// ClaimSlip is unsupported on ClickHouse: no claimed_from column, no transaction to make
+// the claim atomic, and not the operational store (DEVOPS-127). Wrapped so errors.Is works.
+func (s *ClickHouseStore) ClaimSlip(
+	_ context.Context, correlationID string, _ []SlipStatus, _, _ string,
+) (ClaimOutcome, error) {
+	return ClaimOutcome{}, fmt.Errorf("ClaimSlip(%s): %w", correlationID, ErrClaimUnsupported)
+}
+
+// ReleaseClaim is unsupported on ClickHouse for the same reasons as ClaimSlip.
+func (s *ClickHouseStore) ReleaseClaim(_ context.Context, correlationID, _, _ string) (ReleaseOutcome, error) {
+	return ReleaseOutcome{}, fmt.Errorf("ReleaseClaim(%s): %w", correlationID, ErrClaimUnsupported)
+}
+
+// ResetSlipInPlace is unsupported on ClickHouse for the same reasons as ClaimSlip: no
+// claimed_from column to read under a row lock, and no transaction to hold the decision and
+// the upsert together. Wrapped so errors.Is works; the push path falls back to a plain Create,
+// which loses nothing here because a store with no claim column has no claim to protect.
+// The nil guard is not defensive clutter: this method refuses before reading anything, so a
+// nil successor must not turn a refusal into a panic.
+func (s *ClickHouseStore) ResetSlipInPlace(_ context.Context, slip *Slip) error {
+	var correlationID string
+	if slip != nil {
+		correlationID = slip.CorrelationID
+	}
+	return fmt.Errorf("ResetSlipInPlace(%s): %w", correlationID, ErrResetUnsupported)
+}
+
+// ProbeSchema returns nil here because this store is not an operational slip store, NOT
+// because it has no schema to check — it has one, generated per configured step by
+// generateStepColumnEnsurer and named on every read by SlipQueryBuilder.BuildSelectColumns,
+// which is the same config-vs-schema drift PostgresStore.ProbeSchema diffs for. Nothing
+// outside this package's tests constructs this store (DEVOPS-127; removal tracked in
+// DEVOPS-343), so the gate has no caller to protect here. Reviving it means implementing this
+// against system.columns for the database and table, using BuildSelectColumns() as the
+// expected list, exactly as the Postgres implementation uses slipSelectColumns().
+func (s *ClickHouseStore) ProbeSchema(_ context.Context) error {
+	return nil
 }
 
 // ResolveAncestry walks the slip_ancestry table iteratively to reconstruct
@@ -1591,6 +1668,19 @@ func sqlSingleQuoteEscape(s string) string {
 // anything that doesn't match keeps this a local, defense-in-depth guard: it changes nothing for
 // any real pipeline config, and for a malformed one it falls back to the pre-fix verbatim clone
 // behavior instead of risking a broken query.
+//
+// LOOSER THAN THE CONFIG-TIME CHECK, DELIBERATELY. validateStepIdentifier (pipeline_config.go)
+// requires ^[A-Za-z_][A-Za-z0-9_]*$, and the difference is real: this pattern admits a leading
+// digit, and `1deploy` is not a legal non-quoted identifier in ClickHouse or in Postgres. That
+// is not a live hole at either of this pattern's two splice sites, because both are reached
+// only for a name that is already a configured step — buildCloneStepColumnDerive below reads
+// its step names from cfg.Steps, and PostgresStore's step-column write
+// (postgres_store_updates.go) tests config.GetStep(stepName) != nil before it consults this
+// pattern — and a configured step name has been through validateStepIdentifier at parse time.
+// Left as it is on purpose: it gates a DIFFERENT splice and fails CLOSED, falling back to a
+// verbatim clone rather than emitting anything, so tightening it here would change behaviour
+// for no reachable fault. The config is where a bad name is rejected (PR #87, pkuzmenko
+// finding 1 arm A).
 var safeStepNameForDerivePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // buildCloneStepColumnDerive builds the CLONE_DERIVED new-row SELECT expressions for

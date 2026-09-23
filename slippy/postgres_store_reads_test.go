@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/pashagolub/pgxmock/v4"
+	"github.com/pashagolub/pgxmock/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -20,6 +20,7 @@ func slipRowValues(id, commit string) []any {
 		"in_progress", []byte("{}"), []byte(`{"entries":[]}`),
 		"pending", "pending", "pending", "pending",
 		[]byte(`{"items":[]}`),
+		nil, // claimed_from: NULL = unclaimed (SELECT-only column, DEVOPS-367)
 	}
 }
 
@@ -42,7 +43,7 @@ func TestPostgresStore_FindByCommits_NotFound(t *testing.T) {
 
 func TestPostgresStore_FindByCommits_OK(t *testing.T) {
 	store, mock := newMockStore(t)
-	cols := append(store.slipColumns(), "matched_commit")
+	cols := append(store.slipSelectColumns(), "matched_commit")
 	rows := pgxmock.NewRows(cols).AddRow(append(slipRowValues("c1", "sha1"), "sha1")...)
 	mock.ExpectQuery("JOIN unnest").
 		WithArgs(anyArgs(2)...).
@@ -64,7 +65,7 @@ func TestPostgresStore_FindAllByCommits_Empty(t *testing.T) {
 
 func TestPostgresStore_FindAllByCommits_OK(t *testing.T) {
 	store, mock := newMockStore(t)
-	cols := append(store.slipColumns(), "matched_commit")
+	cols := append(store.slipSelectColumns(), "matched_commit")
 	rows := pgxmock.NewRows(cols).
 		AddRow(append(slipRowValues("c1", "sha1"), "sha1")...).
 		AddRow(append(slipRowValues("c2", "sha2"), "sha2")...)

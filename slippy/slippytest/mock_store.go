@@ -130,6 +130,9 @@ type MockStore struct {
 	AppendHistoryCalls    []AppendHistoryCall
 	SetImageTagCalls      []SetImageTagCall
 	UpdateSlipStatusCalls []UpdateSlipStatusCall
+	ClaimSlipCalls        []ClaimSlipCall
+	ReleaseClaimCalls     []ReleaseClaimCall
+	ResetInPlaceCalls     []string
 	RepaveCalls           []string
 	// RepaveSuccessorCalls parallels RepaveCalls with the successor's correlation ID from
 	// the same call (empty string when a nil successor was passed). The in-memory mock has
@@ -161,6 +164,10 @@ type MockStore struct {
 	AppendHistoryError    error
 	SetImageTagError      error
 	UpdateSlipStatusError error
+	ClaimSlipError        error
+	ReleaseClaimError     error
+	ResetInPlaceError     error
+	ProbeSchemaError      error
 	RepaveError           error
 	CloseError            error
 
@@ -251,6 +258,21 @@ type UpdateSlipStatusCall struct {
 	Status        slippy.SlipStatus
 }
 
+// ReleaseClaimCall records a call to ReleaseClaim.
+type ReleaseClaimCall struct {
+	CorrelationID string
+	ReleasedBy    string
+	Reason        string
+}
+
+// ClaimSlipCall records a call to ClaimSlip.
+type ClaimSlipCall struct {
+	CorrelationID string
+	Expected      []slippy.SlipStatus
+	ClaimedBy     string
+	Reason        string
+}
+
 // NewMockStore creates a new MockStore with initialized maps.
 func NewMockStore() *MockStore {
 	return &MockStore{
@@ -279,8 +301,25 @@ func (m *MockStore) Create(ctx context.Context, slip *slippy.Slip) error {
 		return err
 	}
 
-	// Deep copy the slip to avoid mutations
+	// Deep copy the slip to avoid mutations, and let the STORE own claimed_from on both arms
+	// of the upsert — a Create never takes a claim from its caller, on either.
+	//
+	// An existing row keeps the claim it already had: PostgresStore's Create is an ON CONFLICT
+	// DO UPDATE whose SET list is slipColumns(), which excludes the SELECT-only claimed_from,
+	// so a redelivered Create resets the row but not the claim.
+	//
+	// A FRESH INSERT IS ALWAYS UNCLAIMED, which is the half this double used to get wrong (PR
+	// #87, jhicks review): claimed_from is absent from the INSERT column list too, not merely
+	// from the conflict arm's SET list — buildCreateQuery builds both from slipColumns() —
+	// so the column is NULL on a first insert whatever the caller's Slip carried. Storing the
+	// caller's value here made a consumer test that Creates a claimed Slip and then asserts
+	// ErrSlipWentLive on Repave pass against a row Postgres would have left unclaimed and
+	// repaved: green on the double, the opposite outcome in production.
 	slipCopy := DeepCopySlip(slip)
+	slipCopy.ClaimedFrom = ""
+	if existing, ok := m.Slips[slip.CorrelationID]; ok {
+		slipCopy.ClaimedFrom = existing.ClaimedFrom
+	}
 	m.Slips[slip.CorrelationID] = slipCopy
 
 	return nil
@@ -344,7 +383,10 @@ func (m *MockStore) Repave(
 
 	removedOld := false
 	if slip, ok := m.Slips[oldCorrelationID]; ok {
-		if slip.Status.IsLive() {
+		// A claimed row is refused like a live one: a claimant's run is in flight whatever
+		// the status says — the claim never writes status, so a claimed rerun of a failed
+		// slip still reads failed (slipUnclaimedSQL, postgres_store_updates.go).
+		if slip.Status.IsLive() || slip.ClaimedFrom != "" {
 			return slippy.ErrSlipWentLive
 		}
 		removedOld = true
@@ -353,7 +395,25 @@ func (m *MockStore) Repave(
 
 	// A missing superseded row is not an error, matching PostgresStore: the successor is
 	// still created, so a redelivery converges rather than failing forever.
+	//
+	// The successor discards a caller-supplied claim and then restores any claim already
+	// recorded under the successor's OWN id — the identical two steps Create takes above, and
+	// for the identical reason, because this is the identical write: PostgresStore.Repave
+	// inserts through createTx -> buildCreateQuery -> slipColumns(), whose INSERT list and
+	// conflict arm both omit claimed_from. So the replacement row's claimed_from is NULL on a
+	// fresh insert, and an existing row under that id KEEPS its claim through the ON CONFLICT
+	// arm (PR #87, jhicks review; the restore half added in the PR #87 review).
+	//
+	// Modelling only the discard made this method contradict Create about one write path. It is
+	// unreachable in production — Repave rejects oldCorrelationID == newSlip.CorrelationID, and
+	// correlation IDs are minted per delivery, so the conflict arm never fires — but a consumer
+	// test that seeds a slip and repaves onto that same id got opposite answers from the two
+	// methods, with no way to tell which one Postgres would have given.
 	stored := DeepCopySlip(newSlip)
+	stored.ClaimedFrom = ""
+	if existing, ok := m.Slips[newSlip.CorrelationID]; ok {
+		stored.ClaimedFrom = existing.ClaimedFrom
+	}
 	if removedOld {
 		// Mirrors the state-history entry PostgresStore.Repave appends to the successor so
 		// the replacement is visible on the row afterwards — without it the successor carries
@@ -366,10 +426,10 @@ func (m *MockStore) Repave(
 		// abbreviates the commit SHA using an unexported helper — so this deliberately does
 		// not try to be byte-identical.
 		stored.StateHistory = append(stored.StateHistory, slippy.StateHistoryEntry{
-			Step:      "push_parsed",
+			Step:      slippy.PushParsedStep,
 			Status:    slippy.StepStatusRunning,
 			Timestamp: time.Now(),
-			Actor:     "slippy-library",
+			Actor:     slippy.LibraryActor,
 			Message: fmt.Sprintf("repaved %s for commit %s", oldCorrelationID,
 				newSlip.CommitSHA),
 		})
@@ -549,11 +609,18 @@ func (m *MockStore) Update(ctx context.Context, slip *slippy.Slip) error {
 		return m.UpdateError
 	}
 
-	if _, ok := m.Slips[slip.CorrelationID]; !ok {
+	existing, ok := m.Slips[slip.CorrelationID]
+	if !ok {
 		return slippy.ErrSlipNotFound
 	}
 
-	m.Slips[slip.CorrelationID] = DeepCopySlip(slip)
+	// claimed_from is SELECT-only in PostgresStore: the full-row Update never writes it,
+	// whatever status the snapshot carries, so a caller's stale snapshot can clear neither a
+	// claim it never loaded nor one taken after its read. Only UpdateSlipStatus on a terminal
+	// status ends a claim.
+	stored := DeepCopySlip(slip)
+	stored.ClaimedFrom = existing.ClaimedFrom
+	m.Slips[slip.CorrelationID] = stored
 
 	return nil
 }
@@ -564,6 +631,13 @@ func (m *MockStore) UpdateStep(
 	correlationID, stepName, componentName string,
 	status slippy.StepStatus,
 ) error {
+	// Refused before the call is recorded, matching PostgresStore.updateStepTx, which refuses
+	// before its transaction opens: a consumer asserting on the rejection must see the same
+	// answer and the same (empty) call log from the double as from the real store.
+	if err := slippy.GuardReservedStepWrite(stepName, nil); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -604,6 +678,11 @@ func (m *MockStore) UpdateComponentStatus(
 	correlationID, componentName, stepType string,
 	status slippy.StepStatus,
 ) error {
+	// stepType is the step name here, so it enters the same namespace UpdateStep guards.
+	if err := slippy.GuardReservedStepWrite(stepType, nil); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -644,6 +723,10 @@ func (m *MockStore) UpdateComponentStatus(
 
 // AppendHistory adds a state history entry to the slip.
 func (m *MockStore) AppendHistory(ctx context.Context, correlationID string, entry slippy.StateHistoryEntry) error {
+	if err := slippy.GuardReservedStepWrite("", &entry); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -690,7 +773,150 @@ func (m *MockStore) UpdateSlipStatus(ctx context.Context, correlationID string, 
 	}
 
 	slip.Status = status
+	if status.IsTerminal() {
+		// A terminal status ends the run, so it ends the claim — and ending a claim has to be
+		// VISIBLE, because the readers that derive claim identity read the markers, not the
+		// column (see PostgresStore.UpdateSlipStatus). Clearing the column without appending
+		// the release would leave this double reporting claimed_from empty with slip_claimed
+		// still newest: the exact shape GuardReservedStepWrite refuses a caller for forging,
+		// and a divergence from Postgres that a consumer test could not see (PR #87 review).
+		if slip.ClaimedFrom != "" {
+			slip.StateHistory = append(slip.StateHistory,
+				slippy.ReleaseMarker(status, slippy.LibraryActor, "claim ended by a terminal status write"))
+		}
+		slip.ClaimedFrom = ""
+	}
 	return nil
+}
+
+// ClaimSlip mirrors PostgresStore.ClaimSlip through the shared slippy.DecideClaim: a
+// compare-and-set on the CURRENT status whether or not a claim is held, idempotent
+// (ClaimOutcome{Claimed: false}, nothing written) once one is, never writing status. The
+// in-flight evidence is read from the same stored slip the decision is made on, as the store
+// reads both from one locked row.
+func (m *MockStore) ClaimSlip(
+	ctx context.Context, correlationID string, expected []slippy.SlipStatus, claimedBy, reason string,
+) (slippy.ClaimOutcome, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Copied, not aliased: storing the caller's slice would keep its backing array, so a
+	// caller that reuses one buffer across claims would see every recorded call mutate
+	// together and a test would assert against whatever the last call left behind.
+	m.ClaimSlipCalls = append(m.ClaimSlipCalls, ClaimSlipCall{
+		CorrelationID: correlationID,
+		Expected:      append([]slippy.SlipStatus(nil), expected...),
+		ClaimedBy:     claimedBy,
+		Reason:        reason,
+	})
+	if m.ClaimSlipError != nil {
+		return slippy.ClaimOutcome{}, m.ClaimSlipError
+	}
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return slippy.ClaimOutcome{}, slippy.ErrSlipNotFound
+	}
+	inFlight := slippy.RunInFlight(slip)
+	prior, write, err := slippy.DecideClaim(slip.Status, slip.ClaimedFrom, inFlight, expected)
+	if err != nil {
+		return slippy.ClaimOutcome{}, fmt.Errorf("claim %s: %w", correlationID, err)
+	}
+	if write {
+		slip.StateHistory = append(slip.StateHistory, slippy.ClaimMarker(prior, claimedBy, reason))
+		slip.ClaimedFrom = prior
+	}
+	return slippy.ClaimOutcome{Claimed: write, Prior: prior, InFlight: inFlight}, nil
+}
+
+// ReleaseClaim mirrors PostgresStore.ReleaseClaim through the shared slippy.DecideRelease:
+// the claim is KEPT (Released=false, nothing written) while any step or component is in
+// flight, cleared otherwise, and status is never written either way.
+func (m *MockStore) ReleaseClaim(
+	ctx context.Context, correlationID, releasedBy, reason string,
+) (slippy.ReleaseOutcome, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ReleaseClaimCalls = append(m.ReleaseClaimCalls, ReleaseClaimCall{
+		CorrelationID: correlationID, ReleasedBy: releasedBy, Reason: reason,
+	})
+	if m.ReleaseClaimError != nil {
+		return slippy.ReleaseOutcome{}, m.ReleaseClaimError
+	}
+	slip, ok := m.Slips[correlationID]
+	if !ok {
+		return slippy.ReleaseOutcome{}, slippy.ErrSlipNotFound
+	}
+	release, err := slippy.DecideRelease(slip)
+	if err != nil {
+		return slippy.ReleaseOutcome{}, fmt.Errorf("release %s: %w", correlationID, err)
+	}
+	if !release {
+		return slippy.ReleaseOutcome{Released: false, Status: slip.Status}, nil
+	}
+	slip.ClaimedFrom = ""
+	slip.StateHistory = append(slip.StateHistory, slippy.ReleaseMarker(slip.Status, releasedBy, reason))
+	return slippy.ReleaseOutcome{Released: true, Status: slip.Status}, nil
+}
+
+// ResetSlipInPlace mirrors PostgresStore.ResetSlipInPlace through the shared
+// slippy.DecideReset, so this double and the real store cannot disagree about when an
+// in-delivery retry's reset is refused.
+//
+// What it models, and why each half matters to a consumer test:
+//
+//   - The decision is made from the STORED row at call time, never from what the caller
+//     passed or last read. That is the whole behaviour under test in the race this method
+//     closes (DEVOPS-367): a consumer can claim the slip between its LoadByCommit and its
+//     push's write and see the reset refused, exactly as Postgres refuses it under the row
+//     lock.
+//   - A refusal writes NOTHING and returns slippy.ErrSlipClaimed wrapped, so a
+//     consumer asserting with errors.Is sees the same sentinel production raises.
+//   - An allowed reset is reached ONLY for an unclaimed row, since the decision refuses on any
+//     claim, so there is no claim to keep across it and no marker to carry. The invariant a
+//     marker-reading consumer depends on — a set claimed_from always has a slip_claimed
+//     marker — holds here by construction: nothing overwrites the history of a claimed row.
+//   - An absent row is upserted rather than refused, matching the store's behaviour when a
+//     concurrent repave removed the target between the caller's read and this write.
+func (m *MockStore) ResetSlipInPlace(ctx context.Context, slip *slippy.Slip) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if slip == nil {
+		return fmt.Errorf("%w: ResetSlipInPlace requires a successor slip", slippy.ErrInvalidConfiguration)
+	}
+	m.ResetInPlaceCalls = append(m.ResetInPlaceCalls, slip.CorrelationID)
+	if m.ResetInPlaceError != nil {
+		return m.ResetInPlaceError
+	}
+
+	slipCopy := DeepCopySlip(slip)
+	existing, ok := m.Slips[slip.CorrelationID]
+	if !ok {
+		// No row to decide about: the upsert degenerates to a fresh insert, which is always
+		// unclaimed — claimed_from is absent from the INSERT column list, not merely from the
+		// conflict arm's SET list (see Create).
+		slipCopy.ClaimedFrom = ""
+		m.Slips[slip.CorrelationID] = slipCopy
+		return nil
+	}
+
+	// Refused on ANY claim, matching PostgresStore: the reset rewrites every step, aggregate
+	// and the whole history, and a claimed row belongs to a run that was already dispatched
+	// even when it has not reported a step yet.
+	if err := slippy.DecideReset(existing.ClaimedFrom, slippy.RunInFlight(existing)); err != nil {
+		return fmt.Errorf("reset %s in place: %w", slip.CorrelationID, err)
+	}
+	// Unclaimed by the decision above, so there is no claim to carry and none to restore.
+	slipCopy.ClaimedFrom = ""
+	m.Slips[slip.CorrelationID] = slipCopy
+	return nil
+}
+
+// ProbeSchema mirrors PostgresStore.ProbeSchema's readiness gate. The double has no schema,
+// so it reports ready unless ProbeSchemaError is set.
+func (m *MockStore) ProbeSchema(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ProbeSchemaError
 }
 
 // UpdateStepWithHistory updates a step's status AND appends a history entry atomically.
@@ -701,6 +927,10 @@ func (m *MockStore) UpdateStepWithHistory(
 	status slippy.StepStatus,
 	entry slippy.StateHistoryEntry,
 ) error {
+	if err := slippy.GuardReservedStepWrite(stepName, &entry); err != nil {
+		return err
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -841,6 +1071,14 @@ func (m *MockStore) Reset() {
 	m.AppendHistoryCalls = nil
 	m.SetImageTagCalls = nil
 	m.UpdateSlipStatusCalls = nil
+	m.ResetInPlaceCalls = nil
+	// Claim state. Omitted when the claim recorders were added (PR #87), the third instance of
+	// the identical class documented for Repave below — and the one most likely to be hit,
+	// since claim assertions are what a consumer writes against this double now that claims are
+	// the shipped feature. TestReset_ClearsEveryCallRecorder walks these fields by reflection so
+	// the fourth instance fails a test instead of reaching a consumer.
+	m.ClaimSlipCalls = nil
+	m.ReleaseClaimCalls = nil
 	// Repave state. Omitted before, which broke this method's own "clears all stored data
 	// and call tracking" contract: a consumer that Resets between scenarios kept stale
 	// repave records, so len(RepaveCalls) assertions passed or failed on the previous
@@ -890,6 +1128,7 @@ func DeepCopySlip(slip *slippy.Slip) *slippy.Slip {
 		CreatedAt:     slip.CreatedAt,
 		UpdatedAt:     slip.UpdatedAt,
 		Status:        slip.Status,
+		ClaimedFrom:   slip.ClaimedFrom,
 	}
 
 	// Deep copy steps map

@@ -410,7 +410,7 @@ func (m *Migrator) applyMigrationWithTimeout(ctx context.Context, migration Migr
 			Version:     migration.Version,
 			Name:        migration.Name,
 			Description: migration.Description,
-			Operation:   "up",
+			Operation:   OperationUp,
 			Err: fmt.Errorf(
 				"UpSQL is empty — migration %d (%s) has no SQL to apply",
 				migration.Version,
@@ -438,7 +438,7 @@ func (m *Migrator) applyMigrationWithTimeout(ctx context.Context, migration Migr
 	}); err != nil {
 		return &MigrationError{
 			Version: migration.Version, Name: migration.Name, Description: migration.Description,
-			Operation: "up", Err: err,
+			Operation: OperationUp, Err: err,
 		}
 	}
 
@@ -470,7 +470,7 @@ func (m *Migrator) revertMigration(ctx context.Context, migration Migration, pre
 	}); err != nil {
 		return &MigrationError{
 			Version: migration.Version, Name: migration.Name, Description: migration.Description,
-			Operation: "down", Err: err,
+			Operation: OperationDown, Err: err,
 		}
 	}
 	return nil
