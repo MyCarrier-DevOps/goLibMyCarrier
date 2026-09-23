@@ -55,9 +55,12 @@ token := session.AuthToken()
 
 #### Request timeouts
 
-Every HTTP request a `GithubSession` or a `GraphQLClient` makes is bounded, so a
-stalled GitHub fails the call instead of holding the calling goroutine. The
-bounds apply **per HTTP request** and are this package's exported constants:
+Every HTTP request a `GithubSession` or a `GraphQLClient` makes to the GitHub
+API is bounded, so a stalled GitHub fails the call instead of holding the
+calling goroutine. The git operations in `git.go` (`CloneRepository`,
+`CommitChangesWithToken`, `CommitAllChangesWithToken`) go through go-git's own
+HTTP client and are **not** covered by any of this. The bounds apply **per HTTP
+request** and are this package's exported constants:
 
 | Request | Overall bound | Response headers |
 | --- | --- | --- |
@@ -69,9 +72,14 @@ All of them share one connection pool, and keep `http.DefaultTransport`'s dial
 and TLS handshake bounds.
 
 - **A throttled mint is not retried.** A 429 or a rate-limit 403 fails at once
-  with an error wrapping `githubauth.ErrRateLimited`, rather than sleeping out
-  GitHub's retry hint, so a mint costs one bounded request. Retry in the caller
-  if the operation is safe to repeat.
+  with an error wrapping this package's `ErrRateLimited` (and
+  `githubauth.ErrRateLimited`), rather than sleeping out GitHub's retry hint, so
+  a mint costs one bounded request. Retry in the caller if the operation is safe
+  to repeat, and honour the hint: GitHub asks for at least a minute on a
+  rate-limit 403 that carries no `Retry-After`, so a caller whose own backoff is
+  shorter exhausts its attempts inside the same window and fails the operation.
+  `errors.As` into a `*githubauth.RateLimitError` yields the wait GitHub asked
+  for, in `RetryAfter`.
 - **A token refresh inside a REST call** is bounded by `TokenMintTimeout` and by
   the session's context (see `WithContext`), not by that call's own context.
 

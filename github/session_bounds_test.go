@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -406,6 +407,62 @@ func TestNewGithubSessionWithOptions_RejectsAnInvalidOptionBeforeAuthenticating(
 	require.ErrorContains(t, err, "WithRequestTimeout")
 }
 
+// withMintBaseURLForTest points a session's mint at a local server. These tests
+// are in the package, so a SessionOption can reach the same field production
+// leaves empty, and the public constructor can be driven end to end.
+func withMintBaseURLForTest(baseURL string) SessionOption {
+	return func(cfg *sessionConfig) { cfg.mintBaseURL = baseURL }
+}
+
+// TestNewGithubSessionWithOptions_AppliesTheSessionConfig pins that
+// authenticate() hands the session's own config to newInstallationClient: the
+// request timeout reaches the REST client, and the context reaches the mint.
+func TestNewGithubSessionWithOptions_AppliesTheSessionConfig(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(testTokenPath, tokenHandler)
+	server := newStallServer(t, mux)
+	pem := testPrivateKey(t)
+
+	t.Run("the request timeout reaches the REST client", func(t *testing.T) {
+		session, err := NewGithubSessionWithOptions(pem, "12345", "67890",
+			withMintBaseURLForTest(server.URL), WithRequestTimeout(7*time.Second))
+		require.NoError(t, err)
+		assert.Equal(t, 7*time.Second, session.Client().Client().Timeout)
+	})
+
+	t.Run("the session context reaches the mint", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := NewGithubSessionWithOptions(pem, "12345", "67890",
+			withMintBaseURLForTest(server.URL), WithContext(ctx))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+}
+
+// TestNewGithubSession_ThrottledMintIsThisPackagesErrRateLimited pins that a caller can
+// branch on this package's own sentinel rather than on its auth library's, and still reach
+// the wait GitHub asked for. A branch written against a transitive dependency's sentinel
+// would keep compiling but stop firing if the package ever changed auth library.
+func TestNewGithubSession_ThrottledMintIsThisPackagesErrRateLimited(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(testTokenPath, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "3")
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+	server := newStallServer(t, mux)
+
+	_, err := NewGithubSessionWithOptions(testPrivateKey(t), "12345", "67890", withMintBaseURLForTest(server.URL))
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrRateLimited, "this package's own sentinel")
+	assert.ErrorIs(t, err, githubauth.ErrRateLimited, "and the library's, for callers already branching on it")
+	var rateLimit *githubauth.RateLimitError
+	require.ErrorAs(t, err, &rateLimit, "the wait GitHub asked for stays reachable")
+	assert.Equal(t, 3*time.Second, rateLimit.RetryAfter)
+}
+
 func TestNewBoundedTransport_KeepsTheDefaultTransportBounds(t *testing.T) {
 	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
 	require.True(t, ok, "http.DefaultTransport is expected to be an *http.Transport")
@@ -419,8 +476,8 @@ func TestNewBoundedTransport_KeepsTheDefaultTransportBounds(t *testing.T) {
 	assert.Equal(t, defaultTransport.IdleConnTimeout, transport.IdleConnTimeout)
 	assert.NotNil(t, transport.DialContext, "the dial bound and keep-alive must be kept")
 	assert.NotNil(t, transport.Proxy, "proxy support must be kept")
-	assert.Greater(t, transport.MaxIdleConnsPerHost, http.DefaultMaxIdleConnsPerHost,
-		"every call goes to one host, so its idle pool must be larger than the default")
+	assert.Equal(t, transport.MaxIdleConns, transport.MaxIdleConnsPerHost,
+		"every call goes to one host, so the per-host idle limit is the whole idle limit")
 	assert.NotSame(t, defaultTransport, transport, "must clone rather than mutate http.DefaultTransport")
 }
 
@@ -473,4 +530,65 @@ func TestGraphQLClient_SharesTheConnectionPool(t *testing.T) {
 	}
 
 	assert.Equal(t, int32(1), newConns.Load(), "discovery, mint and queries must reuse one connection")
+}
+
+// TestNewBoundedTransport_KeepsAConcurrentBurstPooled pins the idle pool's size against
+// concurrency rather than CPU count. A consumer runs its sessions from worker goroutines, and
+// pushhookparser's pod has GOMAXPROCS 2 against 10 workers, so a pool sized from GOMAXPROCS
+// kept 3 connections and re-handshaked the rest on every burst. Every call here goes to one
+// host, so the per-host idle limit is the transport's whole idle limit.
+//
+// 25 requests are held open together, so the burst needs 25 connections at once; a second
+// identical burst must find all 25 idle and open none. 25 is above GOMAXPROCS+1 on any CI runner
+// this runs on, which is what makes the old sizing fail here.
+func TestNewBoundedTransport_KeepsAConcurrentBurstPooled(t *testing.T) {
+	const burst = 25
+
+	// Each burst gets its own gate, which holds every request until the whole burst has
+	// arrived, so none can finish and hand its connection to another request of the burst.
+	type gate struct {
+		arrived atomic.Int32
+		release chan struct{}
+		once    sync.Once
+	}
+	var current atomic.Pointer[gate]
+
+	var newConns atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ok", func(w http.ResponseWriter, _ *http.Request) {
+		g := current.Load()
+		if g.arrived.Add(1) == burst {
+			g.once.Do(func() { close(g.release) })
+		}
+		select {
+		case <-g.release:
+		case <-time.After(testDeadline):
+		}
+		_, _ = w.Write([]byte("ok"))
+	})
+	server := newConnCountingServer(t, mux, &newConns)
+	client := &http.Client{Transport: newBoundedTransport(ResponseHeaderTimeout), Timeout: testDeadline}
+
+	runBurst := func() {
+		current.Store(&gate{release: make(chan struct{})})
+		var wg sync.WaitGroup
+		for range burst {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				assert.NoError(t, getAndDrain(client, server.URL+"/ok"))
+			}()
+		}
+		wg.Wait()
+	}
+
+	runBurst()
+	require.Equal(t, int32(burst), newConns.Load(), "the first burst opens one connection per request")
+
+	// The transport returns a drained connection to its idle pool from its own read loop,
+	// just after the caller sees EOF; give the last few a moment to land there.
+	time.Sleep(100 * time.Millisecond)
+	runBurst()
+
+	assert.Equal(t, int32(burst), newConns.Load(), "a second burst must reuse every pooled connection")
 }
