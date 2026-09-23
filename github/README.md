@@ -53,6 +53,53 @@ client := session.Client()
 token := session.AuthToken()
 ```
 
+#### Request timeouts
+
+Every HTTP request a `GithubSession` or a `GraphQLClient` makes to the GitHub
+API is bounded, so a stalled GitHub fails the call instead of holding the
+calling goroutine. The git operations in `git.go` (`CloneRepository`,
+`CommitChangesWithToken`, `CommitAllChangesWithToken`) go through go-git's own
+HTTP client and are **not** covered by any of this. The bounds apply **per HTTP
+request** and are this package's exported constants:
+
+| Request | Overall bound | Response headers |
+| --- | --- | --- |
+| Installation-token mint (in `NewGithubSession`, and on each later refresh) | `TokenMintTimeout` | `ResponseHeaderTimeout` |
+| REST calls through `Client()` | `DefaultRequestTimeout`, or `WithRequestTimeout` | `ResponseHeaderTimeout` |
+| `GraphQLClient` installation discovery and queries | `DefaultRequestTimeout` | `ResponseHeaderTimeout` |
+
+All of them share one connection pool, and keep `http.DefaultTransport`'s dial
+and TLS handshake bounds.
+
+- **A throttled mint is not retried.** A 429 or a rate-limit 403 fails at once
+  rather than sleeping out GitHub's retry hint, so a mint costs one bounded
+  request. Which sentinel a caller can match depends on where the mint ran: a
+  `GithubSession` mint, in `NewGithubSession` or on a refresh inside a REST
+  call, returns an error wrapping this package's `ErrRateLimited` and
+  `githubauth.ErrRateLimited`; a `GraphQLClient` mints through ghinstallation,
+  which has no rate-limit sentinel of its own, so neither matches there. Retry in
+  the caller if the operation is safe to repeat, and honour the hint: GitHub asks
+  for at least a minute on a rate-limit 403 that carries no `Retry-After`, so a
+  caller whose own backoff is shorter exhausts its attempts inside the same
+  window and fails the operation. On a `GithubSession` mint, `errors.As` into a
+  `*githubauth.RateLimitError` yields the wait GitHub asked for, in `RetryAfter`.
+- **A token refresh inside a REST call** is bounded by `TokenMintTimeout` and by
+  the session's context (see `WithContext`), not by that call's own context.
+
+`NewGithubSessionWithOptions` takes options for both:
+
+```go
+session, err := github_handler.NewGithubSessionWithOptions(
+    config.Pem, config.AppId, config.InstallId,
+    // Mints run under ctx: cancelling it aborts one in flight and fails later ones,
+    // so pass a context that lives as long as the session.
+    github_handler.WithContext(ctx),
+    // For calls that legitimately take longer, such as large downloads.
+    // Zero removes the overall bound, leaving the request's context.
+    github_handler.WithRequestTimeout(2*time.Minute),
+)
+```
+
 ### Loading Configuration from a Caller-Provided Viper
 
 Use `GithubLoadConfigFromViper` when you want to drive configuration from your

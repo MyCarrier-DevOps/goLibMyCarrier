@@ -56,9 +56,10 @@ type GraphQLClient struct {
 	enterpriseURL string
 	logger        logger.Logger
 
-	// httpClient is used for REST API calls (e.g. installation discovery).
-	// Defaults to a client with a 30-second timeout to prevent hung goroutines
-	// if the GitHub API becomes unresponsive.
+	// httpClient is used for REST API calls (e.g. installation discovery), and
+	// its transport and timeout also bound every per-organization GraphQL client
+	// (see GetClientForOrg). Defaults to the package's shared transport with
+	// DefaultRequestTimeout.
 	httpClient *http.Client
 
 	// Cache of org -> installation ID mappings
@@ -112,7 +113,7 @@ func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, err
 		privateKey:        privateKey,
 		enterpriseURL:     cfg.EnterpriseURL,
 		logger:            log,
-		httpClient:        &http.Client{Timeout: 30 * time.Second},
+		httpClient:        &http.Client{Transport: sharedTransport(), Timeout: DefaultRequestTimeout},
 		installationCache: make(map[string]int64),
 		clientCache:       make(map[string]*githubv4.Client),
 	}, nil
@@ -252,9 +253,17 @@ func (g *GraphQLClient) GetClientForOrg(ctx context.Context, org string) (*githu
 		return nil, err
 	}
 
-	// Create installation-authenticated transport
+	// Create installation-authenticated transport. It and the client around it
+	// take their transport and overall bound from g.httpClient, so a GraphQL call
+	// is bounded the way installation discovery is, and so is the token refresh
+	// ghinstallation performs inside one: it runs on the same transport, under the
+	// request's context, which the client's timeout bounds.
+	base := g.httpClient.Transport
+	if base == nil {
+		base = http.DefaultTransport
+	}
 	transport, err := ghinstallation.New(
-		http.DefaultTransport,
+		base,
 		g.appID,
 		installationID,
 		g.privateKey,
@@ -268,7 +277,7 @@ func (g *GraphQLClient) GetClientForOrg(ctx context.Context, org string) (*githu
 		transport.BaseURL = g.GetAPIBaseURL()
 	}
 
-	httpClient := &http.Client{Transport: transport}
+	httpClient := &http.Client{Transport: transport, Timeout: g.httpClient.Timeout}
 
 	var client *githubv4.Client
 	if g.enterpriseURL != "" {
