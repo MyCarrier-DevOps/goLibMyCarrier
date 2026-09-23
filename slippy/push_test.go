@@ -442,8 +442,13 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		if len(store.RepaveCalls) != 0 {
 			t.Errorf("no repave may be attempted for a self-referential id, got %v", store.RepaveCalls)
 		}
-		if len(store.CreateCalls) != 1 {
-			t.Errorf("expected exactly one Create (the upsert), got %d", len(store.CreateCalls))
+		if len(store.CreateCalls) != 0 {
+			t.Errorf("the in-place reset goes through ResetSlipInPlace, not the unlocked Create, "+
+				"got %d Create calls", len(store.CreateCalls))
+		}
+		if len(store.ResetInPlaceCalls) != 1 {
+			t.Errorf("expected exactly one ResetSlipInPlace (the locked upsert), got %d",
+				len(store.ResetInPlaceCalls))
 		}
 		stored, loadErr := store.Load(ctx, "corr-same-delivery")
 		if loadErr != nil {
@@ -510,9 +515,13 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 				t.Errorf("no repave may be attempted for a self-referential id, got %v",
 					store.RepaveCalls)
 			}
-			if len(store.CreateCalls) != 1 {
-				t.Errorf("expected exactly one Create (the in-place upsert), got %d",
-					len(store.CreateCalls))
+			if len(store.CreateCalls) != 0 {
+				t.Errorf("the in-place reset goes through ResetSlipInPlace, not the unlocked "+
+					"Create, got %d Create calls", len(store.CreateCalls))
+			}
+			if len(store.ResetInPlaceCalls) != 1 {
+				t.Errorf("expected exactly one ResetSlipInPlace (the locked upsert), got %d",
+					len(store.ResetInPlaceCalls))
 			}
 
 			// The reachable half of appendResetMarker. Its other caller — the duplicate-create
@@ -4584,13 +4593,16 @@ func TestClient_PromoteSlip(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		// Verify status was updated
+		// Verify status was updated. PromotedTo is deliberately NOT asserted: no store has a
+		// promoted_to column, so the full-row Update this replaced never persisted it either —
+		// it only added a Load-then-Update snapshot race. The atomic status write is what ends
+		// the claim (DEVOPS-367); persisting PromotedTo at all remains DEVOPS-202.
 		updated := store.Slips["corr-to-promote"]
 		if updated.Status != SlipStatusPromoted {
 			t.Errorf("expected status 'promoted', got '%s'", updated.Status)
 		}
-		if updated.PromotedTo != "corr-target" {
-			t.Errorf("expected PromotedTo 'corr-target', got '%s'", updated.PromotedTo)
+		if updated.ClaimedFrom != "" {
+			t.Errorf("expected the terminal status write to end any claim, got %q", updated.ClaimedFrom)
 		}
 	})
 
@@ -4642,11 +4654,11 @@ func TestClient_PromoteSlip(t *testing.T) {
 			Status:        SlipStatusInProgress,
 		}
 		store.Slips["corr-update-fail"] = slip
-		store.UpdateError = errors.New("database error")
+		store.UpdateSlipStatusError = errors.New("database error")
 
 		err := client.PromoteSlip(ctx, "corr-update-fail", "corr-target")
 		if err == nil {
-			t.Fatal("expected error when update fails")
+			t.Fatal("expected error when the status write fails")
 		}
 	})
 }
@@ -4687,8 +4699,10 @@ func TestClient_PromoteSlip_Immutable(t *testing.T) {
 		if loaded.Status != SlipStatusPromoted {
 			t.Errorf("expected slip.status %q after PromoteSlip, got %q", SlipStatusPromoted, loaded.Status)
 		}
-		if loaded.PromotedTo != "corr-main-merge" {
-			t.Errorf("expected PromotedTo %q, got %q", "corr-main-merge", loaded.PromotedTo)
+		// PromotedTo is not asserted: no store persists it (there is no column), so the
+		// full-row Update this replaced never carried it to the database either.
+		if loaded.ClaimedFrom != "" {
+			t.Errorf("expected the terminal status write to end any claim, got %q", loaded.ClaimedFrom)
 		}
 	})
 
@@ -5010,8 +5024,10 @@ func TestClient_CreateSlipForPush_SquashMergePromotion(t *testing.T) {
 		if promotedSlip.Status != SlipStatusPromoted {
 			t.Errorf("expected feature slip status 'promoted', got '%s'", promotedSlip.Status)
 		}
-		if promotedSlip.PromotedTo != "corr-merge-commit" {
-			t.Errorf("expected PromotedTo 'corr-merge-commit', got '%s'", promotedSlip.PromotedTo)
+		// PromotedTo is not asserted: PromoteSlip writes the status atomically through
+		// UpdateSlipStatus and no store has a promoted_to column to carry the link.
+		if promotedSlip.ClaimedFrom != "" {
+			t.Errorf("expected the terminal status write to end any claim, got %q", promotedSlip.ClaimedFrom)
 		}
 	})
 

@@ -15,6 +15,17 @@ import (
 
 // newMigratedStore starts a Postgres container, runs the slippy migrations, and returns
 // a PostgresStore over the resulting schema.
+// NewMigratedStoreForContract exposes a migrated store to the slippy_test package, which is
+// where the shared claim-contract suite has to live: slippytest imports slippy, so an
+// in-package file cannot reach slippytest.RunClaimContract without an import cycle.
+//
+// Exported only inside the integration build tag, and only for that one caller.
+func NewMigratedStoreForContract(t *testing.T) *PostgresStore {
+	t.Helper()
+	store, _, _ := newMigratedStore(t)
+	return store
+}
+
 func newMigratedStore(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig) {
 	t.Helper()
 	pool := newPGMigrationTestPool(t)
@@ -39,6 +50,12 @@ func newMigratedStore(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineCon
 func newStoreAtV4(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig) {
 	t.Helper()
 	pool, cfg := v5PoolAtV4(t)
+	// v4 pins the schema to permit duplicate rows per commit, which is what these tests need.
+	// Every slip SELECT now also names claimed_from (v6, read-only), so add just that column
+	// here; it is orthogonal to the duplicate-ordering behaviour under test.
+	_, err := pool.Exec(context.Background(),
+		"ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL")
+	require.NoError(t, err)
 	store, err := NewPostgresStore(pool, cfg, nil)
 	require.NoError(t, err)
 	return store, pool, cfg

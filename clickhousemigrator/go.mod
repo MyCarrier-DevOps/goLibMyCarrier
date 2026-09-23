@@ -6,7 +6,7 @@ toolchain go1.26.5
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
-	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.99
+	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.3.103
 )
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger

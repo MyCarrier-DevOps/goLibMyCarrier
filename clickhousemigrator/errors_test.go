@@ -59,8 +59,71 @@ func TestMigrationError_Unwrap(t *testing.T) {
 	}
 
 	unwrapped := migErr.Unwrap()
-	if unwrapped != underlyingErr {
-		t.Error("expected Unwrap to return the underlying error")
+	if len(unwrapped) != 2 || unwrapped[0] != ErrMigrationFailed || unwrapped[1] != underlyingErr {
+		t.Errorf("expected Unwrap to expose the sentinel then the underlying error, got %v", unwrapped)
+	}
+	if migErr.Cause() != underlyingErr {
+		t.Error("expected Cause to return the underlying error")
+	}
+	if (&MigrationError{}).Cause() != nil {
+		t.Error("expected Cause of a nil Err to be nil")
+	}
+}
+
+// ErrMigrationFailed and ErrMigrationRevertFailed were declared and never wrapped, so
+// errors.Is against either was always false — the defect DEVOPS-344 fixed in
+// postgresmigrator, whose MigrationError is byte-identical to this one. Both sentinels are
+// now reachable: every failure is ErrMigrationFailed, and a down failure is additionally
+// ErrMigrationRevertFailed, so the sentinel docs finally describe what the package does.
+func TestMigrationError_IsSentinels(t *testing.T) {
+	base := errors.New("code: 60, DB::Exception: table does not exist")
+	for _, op := range []string{"up", "down"} {
+		var err error = &MigrationError{Version: 3, Name: "x", Operation: op, Err: base}
+		if !errors.Is(err, ErrMigrationFailed) {
+			t.Errorf("%s: errors.Is(err, ErrMigrationFailed) = false; the sentinel is unreachable", op)
+		}
+		if errors.Is(err, ErrMigrationRevertFailed) != (op == "down") {
+			t.Errorf("%s: ErrMigrationRevertFailed must match down failures only", op)
+		}
+		if !errors.Is(err, base) {
+			t.Errorf("%s: the underlying error must stay reachable", op)
+		}
+		var me *MigrationError
+		if !errors.As(err, &me) || me.Version != 3 {
+			t.Errorf("%s: errors.As(*MigrationError) must still work", op)
+		}
+	}
+	if errors.Unwrap(&MigrationError{Err: base}) != nil {
+		t.Error("errors.Unwrap sees no single wrapped error; callers use Cause()")
+	}
+	if !errors.Is(&MigrationError{Operation: "up"}, ErrMigrationFailed) {
+		t.Error("a hand-built MigrationError with nil Err must still be ErrMigrationFailed")
+	}
+}
+
+// Unwrap adds ErrMigrationRevertFailed only for a down, and it keys that on the exact string
+// in Operation. The constants exist so a constructor site cannot drift from the key by a
+// typo; this pins the keying itself, in both directions.
+func TestMigrationError_RevertSentinelKeyedOnOperationDown(t *testing.T) {
+	base := errors.New("boom")
+
+	down := &MigrationError{Version: 3, Name: "add_col", Operation: OperationDown, Err: base}
+	if !errors.Is(down, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must match ErrMigrationRevertFailed", OperationDown)
+	}
+	if !errors.Is(down, ErrMigrationFailed) {
+		t.Error("a down failure is still a migration failure")
+	}
+	if !errors.Is(down, base) {
+		t.Error("the cause must stay reachable through errors.Is")
+	}
+
+	up := &MigrationError{Version: 3, Name: "add_col", Operation: OperationUp, Err: base}
+	if errors.Is(up, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must not match ErrMigrationRevertFailed", OperationUp)
+	}
+	if !errors.Is(up, ErrMigrationFailed) {
+		t.Error("an up failure is a migration failure")
 	}
 }
 

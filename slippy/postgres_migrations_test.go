@@ -28,6 +28,26 @@ func pgTestPipelineConfig(t *testing.T) *PipelineConfig {
 	return cfg
 }
 
+// pgMixedCasePipelineConfig is pgTestPipelineConfig with one step name carrying uppercase
+// letters. Postgres folds the ensurer's unquoted DDL, so this config is what proves the
+// column-name comparisons fold with it rather than against it (PR #87 finding 4).
+func pgMixedCasePipelineConfig(t *testing.T) *PipelineConfig {
+	t.Helper()
+	const j = `{
+		"version": "1.0",
+		"name": "pg-test-mixed-case",
+		"steps": [
+			{"name": "push_parsed", "description": "push received"},
+			{"name": "builds", "description": "container builds", "aggregates": "component_builds", "prerequisites": ["push_parsed"]},
+			{"name": "unit_tests", "description": "unit tests", "prerequisites": ["builds"], "is_gate": true},
+			{"name": "Dev_Deploy", "description": "deploy to dev", "prerequisites": ["unit_tests"]}
+		]
+	}`
+	cfg, err := ParsePipelineConfig([]byte(j))
+	require.NoError(t, err)
+	return cfg
+}
+
 func TestPostgresDynamicMigrations_Generate(t *testing.T) {
 	cfg := pgTestPipelineConfig(t)
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
@@ -221,12 +241,12 @@ func TestUniquenessMigration_V5(t *testing.T) {
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
 
 	migs := mgr.GenerateMigrations()
-	require.Len(t, migs, 5, "Phase B adds migration v5 on top of v1-v4")
+	require.Len(t, migs, 6, "v1-v4, v5 (DEVOPS-231 Phase B), v6 (DEVOPS-367)")
 	v5 := migs[4]
 	assert.Equal(t, 5, v5.Version)
 	assert.Equal(t, "one_slip_per_commit", v5.Name)
-	assert.Equal(t, 5, mgr.LatestVersion())
-	assert.Equal(t, 5, GetPostgresDynamicMigrationVersion(cfg))
+	assert.Equal(t, 6, mgr.LatestVersion(), "v6 (DEVOPS-367) is now latest; v5's own version is asserted above")
+	assert.Equal(t, 6, GetPostgresDynamicMigrationVersion(cfg))
 
 	// Every assertion below runs against the SQL with -- comments stripped, because they are all
 	// about what the migration EXECUTES, not how it is documented. No comment supplies any of
@@ -280,9 +300,87 @@ func TestUniquenessMigration_V5(t *testing.T) {
 		"WHERE i.indrelid = to_regclass('routing_slips')",
 		"AND ic.relname = 'uq_routing_slips_repo_sha'",
 		"EXECUTE format('DROP INDEX %s', idx)",
-		"DROP CONSTRAINT IF EXISTS fk_ancestry_slip",
-		"DROP CONSTRAINT IF EXISTS fk_component_states_slip",
+		// IF EXISTS on the tables as well as the constraints, for the reason v6's down carries
+		// it: a bare ALTER TABLE raises 42P01 on a missing relation (PR #87 finding j5).
+		"ALTER TABLE IF EXISTS slip_ancestry DROP CONSTRAINT IF EXISTS fk_ancestry_slip",
+		"ALTER TABLE IF EXISTS slip_component_states DROP CONSTRAINT IF EXISTS fk_component_states_slip",
 	} {
 		assert.Contains(t, down, want)
 	}
+}
+
+// TestClaimedFromMigration_V6 asserts the SHAPE of v6, not merely that it exists: an
+// `IF NOT EXISTS` add-column is idempotent by name only, so the post-condition must assert
+// the column's type and nullability, or a pre-existing same-named column of another shape
+// would be recorded as v6 (the same reasoning as v5's constraint post-conditions).
+func TestClaimedFromMigration_V6(t *testing.T) {
+	cfg := pgTestPipelineConfig(t)
+	migs := NewPostgresDynamicMigrationManager(cfg, nil).GenerateMigrations()
+	require.Len(t, migs, 6, "DEVOPS-367 adds migration v6 on top of v1-v5")
+	v6 := migs[5]
+
+	assert.Equal(t, 6, v6.Version)
+	assert.Equal(t, "claimed_from", v6.Name)
+
+	up := stripSQLLineComments(v6.UpSQL)
+	assert.Contains(t, up, "ADD COLUMN IF NOT EXISTS claimed_from text")
+	// The UP is the likelier of the two paths to meet a busy database — it runs on every
+	// consumer startup, where the down runs only on a deliberate rollback — and its ADD COLUMN
+	// takes ACCESS EXCLUSIVE inside a transaction postgresmigrator runs with lock_timeout = 0.
+	// An unbounded request queues ahead of every later reader and stalls all slip traffic
+	// (PR #87 finding j4). The bound must be the first statement, so it covers the ALTER.
+	assert.Regexp(t, `SET LOCAL lock_timeout = '[^']+'`, up, "the ADD COLUMN's lock request must be bounded")
+	assert.NotRegexp(t, `SET LOCAL lock_timeout = '?0'?\s*;`, up, "and the bound must not be zero")
+	assert.Less(t, strings.Index(up, "lock_timeout"), strings.Index(up, "ALTER TABLE"),
+		"the timeout is set before the ALTER that requests the lock")
+	assert.Equal(t, 1, strings.Count(up, "RAISE EXCEPTION"), "exactly one post-condition")
+	assert.Contains(t, up, "to_regclass('routing_slips')",
+		"post-condition resolves the column through the TABLE, like v5's, not via information_schema + current_schema()")
+	assert.NotContains(t, up, "current_schema()")
+	assert.Regexp(t, `NOT a\.attnotnull`, up, "the column must be nullable: NULL means unclaimed")
+	assert.NotContains(t, up, "DEFAULT", "no default: NULL is the only correct unclaimed value")
+	assert.NotContains(t, up, "INDEX", "claimed_from is read by correlation_id only; no index")
+
+	down := stripSQLLineComments(v6.DownSQL)
+	assert.Contains(t, down, "DROP COLUMN IF EXISTS claimed_from")
+	// Dropping the column under a held claim silently ends that claim and exposes the run's
+	// in-flight work to a same-commit repave, with no way back. Down must refuse, not proceed.
+	assert.Equal(t, 1, strings.Count(down, "RAISE EXCEPTION"), "down carries exactly one guard")
+	assert.Regexp(t, `claimed_from IS NOT NULL AND claimed_from <> ''`, down, "the guard counts held claims")
+	assert.Contains(t, down, "to_regclass('routing_slips')", "and is a no-op on a missing table or column")
+	// The refusal must name the held slips, not just count them: an operator who cannot act
+	// without a second query against a database mid-rollback is not being helped.
+	assert.Contains(t, down, "string_agg(correlation_id",
+		"the refusal names the held correlation ids, not only how many there are")
+	assert.Less(t, strings.Index(down, "RAISE EXCEPTION"), strings.Index(down, "DROP COLUMN"),
+		"the guard must run before the drop")
+	// The count alone takes ACCESS SHARE, which does not conflict with ClaimSlip's ROW
+	// EXCLUSIVE: a claim taken between the count and the drop would be erased without the
+	// RAISE firing. The table lock closes that window, and must precede the count to do it.
+	assert.Contains(t, down, "LOCK TABLE routing_slips IN ACCESS EXCLUSIVE MODE",
+		"the guard must hold claimants out while it counts")
+	assert.Less(t, strings.Index(down, "LOCK TABLE"), strings.Index(down, "count(*)"),
+		"the lock must be taken before the count it protects")
+	// postgresmigrator runs the migration transaction with lock_timeout = 0, so an unbounded
+	// ACCESS EXCLUSIVE request would queue ahead of every reader and stall slip traffic.
+	assert.Regexp(t, `SET LOCAL lock_timeout = '[^']+'`, down, "the lock request must be bounded")
+	assert.NotRegexp(t, `SET LOCAL lock_timeout = '?0'?\s*;`, down, "and the bound must not be zero")
+	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "LOCK TABLE"),
+		"the timeout must be set before the lock is requested")
+	// It must bound the DROP's own ACCESS EXCLUSIVE too, not just the guard's LOCK TABLE
+	// (PR #87 finding 7). Inside the IF EXISTS branch it bounded neither on the path where
+	// the column is already absent — the branch is skipped and the DROP still requests the
+	// lock unbounded. Hoisting it to the first statement of the down covers every request.
+	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "DO $$"),
+		"the timeout precedes the DO block, so it is not scoped to the guard's branch")
+	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "DROP COLUMN"),
+		"and therefore bounds the DROP's own ACCESS EXCLUSIVE request")
+	assert.Equal(t, strings.TrimSpace(down[strings.LastIndex(down, "END $$;")+len("END $$;"):]),
+		"ALTER TABLE IF EXISTS routing_slips DROP COLUMN IF EXISTS claimed_from;",
+		"the DROP is still the last statement, after the guard")
+	// IF EXISTS on the TABLE, not only on the column (PR #87 finding j5). Without it the down
+	// raises 42P01 on a database that never had routing_slips, so it is not the no-op the
+	// guard's own to_regclass already makes it and not what this test asserted above.
+	assert.Contains(t, down, "ALTER TABLE IF EXISTS routing_slips",
+		"a missing table makes the drop a no-op, not a 42P01")
 }

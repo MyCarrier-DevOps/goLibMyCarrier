@@ -1,3 +1,16 @@
+# DEVOPS-367 is a breaking change to slippy's exported SlipStore interface, and main's
+# increment is Patch, so without a floor it would land on consumers pinned to v1.3.x as a
+# patch bump with no signal. Every module in this repo releases at one shared version, and
+# slippy/v1.4.0-* prerelease tags already exist, so 1.4.0 is the right floor.
+#
+# REMOVE THIS FLOOR (delete next-version, and ConfiguredNextVersion with it) ONCE v1.4.0 IS
+# TAGGED ON MAIN. It is a one-release device, not a setting. Left in place it stops being a
+# floor and starts being a ceiling on the signal: main's Patch increment would then produce
+# 1.4.1, 1.4.2, … and the NEXT breaking SlipStore change would ship as a 1.4.x patch to
+# consumers pinned to 1.4 — exactly the defect this floor was added to fix, with nothing left
+# to catch it. Raise it instead of removing it only if the next minor is already known.
+next-version: 1.4.0
+
 assembly-versioning-scheme: MajorMinorPatch
 assembly-file-versioning-scheme: MajorMinorPatchTag
 commit-date-format: yyyy-MM-dd
@@ -5,6 +18,9 @@ update-build-number: true
 tag-prefix: '[vV]?'
 
 strategies:
+  # ConfiguredNextVersion is what makes next-version above effective: with TaggedCommit alone
+  # the floor is parsed and ignored, and the breaking release would still ship as 1.3.x.
+  - ConfiguredNextVersion
   - TaggedCommit
 
 branches:

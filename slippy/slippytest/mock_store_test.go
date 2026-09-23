@@ -3,6 +3,7 @@ package slippytest
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1356,5 +1357,79 @@ func TestMockStore_CommitLookups_DuplicateRowsPerCommit(t *testing.T) {
 			assert.Equal(t, tt.wantFindAll, gotAll,
 				"FindAllByCommits must return every row for the commit, newest first")
 		})
+	}
+}
+
+// TestReset_ClearsEveryCallRecorder is the durable guard behind Reset's "clears all stored
+// data and call tracking" contract.
+//
+// It exists because that contract has now been broken three separate times by the same
+// mechanism: a PR adds a call recorder, and the Reset clause is not extended with it. Repave
+// was the first (two fields), the claim recorders the third (ClaimSlipCalls,
+// ReleaseClaimCalls, PR #87). Each time the fix was to add the missing lines, which does
+// nothing about the next one — and this is published API, so the cost lands on a consumer
+// whose assertion silently reads the previous scenario's calls against a store that looks
+// clean.
+//
+// So this walks every exported field whose name ends in "Calls" by REFLECTION rather than
+// naming them: a recorder added in a later PR is covered the moment it is declared, and a
+// Reset that forgets it fails here instead of reaching a consumer. Both shapes are handled —
+// the slice recorders and the two counters (CloseCalls, PingCalls).
+//
+// It deliberately does NOT assert anything about the injected error fields. Their survival
+// across Reset is documented and intentional (see Reset), so folding them in here would pin
+// the opposite of the contract.
+func TestReset_ClearsEveryCallRecorder(t *testing.T) {
+	store := NewMockStore()
+
+	v := reflect.ValueOf(store).Elem()
+	typ := v.Type()
+
+	seeded := 0
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if !strings.HasSuffix(field.Name, "Calls") || !field.IsExported() {
+			continue
+		}
+		fv := v.Field(i)
+		switch fv.Kind() {
+		case reflect.Slice:
+			// One zero-valued element is enough; the assertion is on length, and building it
+			// reflectively keeps this agnostic to each recorder's element type.
+			fv.Set(reflect.MakeSlice(fv.Type(), 1, 1))
+		case reflect.Int:
+			fv.SetInt(1)
+		default:
+			t.Fatalf(
+				"field %s ends in \"Calls\" but is a %s, which this test cannot seed; "+
+					"extend the switch when adding a recorder of a new shape",
+				field.Name, fv.Kind())
+		}
+		seeded++
+	}
+
+	// Guards the guard: a rename that broke the "Calls" convention would otherwise make this
+	// test vacuously green while covering nothing.
+	require.GreaterOrEqual(t, seeded, 15,
+		"expected to seed every *Calls recorder; found only %d, so the naming convention this "+
+			"test walks has drifted and it is no longer covering what it claims", seeded)
+
+	store.Reset()
+
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if !strings.HasSuffix(field.Name, "Calls") || !field.IsExported() {
+			continue
+		}
+		fv := v.Field(i)
+		switch fv.Kind() {
+		case reflect.Slice:
+			assert.Zero(t, fv.Len(),
+				"Reset() left %s populated; add it to Reset, which documents itself as clearing "+
+					"all call tracking", field.Name)
+		case reflect.Int:
+			assert.Zero(t, fv.Int(),
+				"Reset() left the %s counter set; add it to Reset", field.Name)
+		}
 	}
 }

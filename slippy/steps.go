@@ -68,7 +68,7 @@ func (c *Client) UpdateStepWithStatus(
 		Component: componentName,
 		Status:    status,
 		Timestamp: time.Now(),
-		Actor:     "slippy-library",
+		Actor:     LibraryActor,
 		Message:   message,
 	}
 

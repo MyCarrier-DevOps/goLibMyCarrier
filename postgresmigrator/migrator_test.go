@@ -326,3 +326,73 @@ func TestMigrator_Integration(t *testing.T) {
 	require.NoError(t, m.DropTables(ctx))
 	assert.False(t, colExists(t, pool, "things", "id"), "things dropped by DropTables")
 }
+
+// ErrMigrationFailed's doc promises errors.Is matches every real migration failure. Before
+// DEVOPS-344 the sentinel was declared and never wrapped, so that was permanently false —
+// and a reviewer proposing errors.Is against it would have shipped an assertion that never
+// fires. This pins the promise for both operations while keeping the underlying driver
+// error reachable, so errors.As on a *pgconn.PgError keeps working too.
+func TestMigrationError_IsErrMigrationFailed(t *testing.T) {
+	base := errors.New("pq: relation does not exist")
+	for _, op := range []string{"up", "down"} {
+		var err error = &MigrationError{Version: 7, Name: "x", Operation: op, Err: base}
+		if !errors.Is(err, ErrMigrationFailed) {
+			t.Errorf("%s: errors.Is(err, ErrMigrationFailed) = false; the sentinel is unreachable", op)
+		}
+		if !errors.Is(err, base) {
+			t.Errorf("%s: the underlying error must stay reachable through Unwrap", op)
+		}
+		var me *MigrationError
+		if !errors.As(err, &me) || me.Version != 7 {
+			t.Errorf("%s: errors.As(*MigrationError) must still work", op)
+		}
+	}
+	// No constructor in this package produces a nil Err (the empty-UpSQL guard sets one too);
+	// a hand-built value can, and must not panic and must still match.
+	var bare error = &MigrationError{Version: 1, Operation: "up"}
+	if !errors.Is(bare, ErrMigrationFailed) {
+		t.Error("a MigrationError with nil Err must still be ErrMigrationFailed")
+	}
+}
+
+// A revert failure is singled out by its own sentinel, keyed on OperationDown — the reason
+// Operation is a constant rather than a string literal at each constructor site. slippy's
+// migration v6 down refuses while any claim is held, and an operator's tooling needs to tell
+// that refused rollback from a failed roll-forward. Mirrors clickhousemigrator's test of the
+// same name.
+func TestMigrationError_RevertSentinelKeyedOnOperationDown(t *testing.T) {
+	base := errors.New("boom")
+
+	down := &MigrationError{Version: 3, Name: "add_col", Operation: OperationDown, Err: base}
+	if !errors.Is(down, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must match ErrMigrationRevertFailed", OperationDown)
+	}
+	if !errors.Is(down, ErrMigrationFailed) {
+		t.Error("a down failure is still a migration failure")
+	}
+	if !errors.Is(down, base) {
+		t.Error("the cause must stay reachable through errors.Is")
+	}
+
+	up := &MigrationError{Version: 3, Name: "add_col", Operation: OperationUp, Err: base}
+	if errors.Is(up, ErrMigrationRevertFailed) {
+		t.Errorf("Operation %q must not match ErrMigrationRevertFailed", OperationUp)
+	}
+	if !errors.Is(up, ErrMigrationFailed) {
+		t.Error("an up failure is a migration failure")
+	}
+}
+
+// Unwrap() []error is the shape errors.Is and errors.As need to see both the sentinel and
+// the cause, but errors.Unwrap only calls the single-error form and returns nil for it. A
+// caller that reached the driver error with errors.Unwrap(err) or migErr.Unwrap() before
+// DEVOPS-344 therefore gets nil now; Cause() is the replacement, and this pins both halves.
+func TestMigrationError_CauseReplacesErrorsUnwrap(t *testing.T) {
+	base := errors.New("pq: relation does not exist")
+	var err error = &MigrationError{Version: 7, Name: "x", Operation: "up", Err: base}
+	assert.Nil(t, errors.Unwrap(err), "the multi-error Unwrap is invisible to errors.Unwrap")
+	var me *MigrationError
+	require.True(t, errors.As(err, &me))
+	assert.Same(t, base, me.Cause())
+	assert.NoError(t, (&MigrationError{}).Cause(), "a nil Err has no cause")
+}
