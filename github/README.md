@@ -55,17 +55,39 @@ token := session.AuthToken()
 
 #### Request timeouts
 
-`NewGithubSession` bounds every HTTP call it makes, so a stalled GitHub cannot
-block the calling goroutine indefinitely:
+Every HTTP request a `GithubSession` or a `GraphQLClient` makes is bounded, so a
+stalled GitHub fails the call instead of holding the calling goroutine. The
+bounds apply **per HTTP request** and are this package's exported constants:
 
-| Call | Overall timeout | Response header timeout |
+| Request | Overall bound | Response headers |
 | --- | --- | --- |
-| Installation token mint (during authentication, and on token refresh) | 15s | 10s |
-| REST calls through the client returned by `Client()` | 30s | 10s |
+| Installation-token mint (in `NewGithubSession`, and on each later refresh) | `TokenMintTimeout` | `ResponseHeaderTimeout` |
+| REST calls through `Client()` | `DefaultRequestTimeout`, or `WithRequestTimeout` | `ResponseHeaderTimeout` |
+| `GraphQLClient` installation discovery and queries | `DefaultRequestTimeout` | `ResponseHeaderTimeout` |
 
-The dial (30s) and TLS handshake (10s) bounds of `http.DefaultTransport` are
-kept. A request that exceeds a bound fails with a timeout error rather than
-hanging; retry it in the caller if the operation is safe to repeat.
+All of them share one connection pool, and keep `http.DefaultTransport`'s dial
+and TLS handshake bounds.
+
+- **A throttled mint is not retried.** A 429 or a rate-limit 403 fails at once
+  with an error wrapping `githubauth.ErrRateLimited`, rather than sleeping out
+  GitHub's retry hint, so a mint costs one bounded request. Retry in the caller
+  if the operation is safe to repeat.
+- **A token refresh inside a REST call** is bounded by `TokenMintTimeout` and by
+  the session's context (see `WithContext`), not by that call's own context.
+
+`NewGithubSessionWithOptions` takes options for both:
+
+```go
+session, err := github_handler.NewGithubSessionWithOptions(
+    config.Pem, config.AppId, config.InstallId,
+    // Mints run under ctx: cancelling it aborts one in flight and fails later ones,
+    // so pass a context that lives as long as the session.
+    github_handler.WithContext(ctx),
+    // For calls that legitimately take longer, such as large downloads.
+    // Zero removes the overall bound, leaving the request's context.
+    github_handler.WithRequestTimeout(2*time.Minute),
+)
+```
 
 ### Loading Configuration from a Caller-Provided Viper
 

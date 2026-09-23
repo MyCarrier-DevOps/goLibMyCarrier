@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -15,29 +17,28 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Timeouts for the HTTP calls made while authenticating as a GitHub App.
-//
-// Neither go-githubauth's default client nor the client returned by
-// oauth2.NewClient sets an overall http.Client.Timeout or a
-// ResponseHeaderTimeout: they bound the dial (30s) and the TLS handshake (10s)
-// and nothing else. A connected-but-stalled GitHub therefore has no bound at
-// all, and because the token mint runs synchronously inside a per-worker
-// message handler in pushhookparser, a stall wedges that goroutine permanently
-// rather than merely being slow.
-//
-// A token mint is a single small POST, and its caller already works to a
-// 15-second budget for its own reachability calls, so 15s overall is generous
-// for the real call and short enough that a stalled endpoint frees the worker;
-// a multi-minute bound would not. Response headers are expected far sooner, and
-// are bounded at the same 10s the transport already allows for the TLS
-// handshake. REST calls made through the authenticated client can return
-// larger payloads, so they get the 30s overall budget this module's GraphQL
-// client already uses (see NewGraphQLClient), with the same 10s on headers.
+// Bounds on the HTTP calls this package makes to GitHub. Every call goes
+// through one shared transport (see sharedTransport), which bounds the wait for
+// response headers and keeps http.DefaultTransport's dial and TLS handshake
+// bounds; each client adds an overall timeout, which also covers a body that
+// stalls after its headers arrive. The bounds are per HTTP request.
 const (
-	tokenMintTimeout               = 15 * time.Second
-	tokenMintResponseHeaderTimeout = 10 * time.Second
-	apiRequestTimeout              = 30 * time.Second
-	apiResponseHeaderTimeout       = 10 * time.Second
+	// TokenMintTimeout bounds one installation-token mint, end to end. A mint is
+	// a single small POST and a throttled one is not retried (see
+	// newInstallationClient), so this is the whole of what a mint can cost: in
+	// NewGithubSession, and on every later refresh.
+	TokenMintTimeout = 15 * time.Second
+
+	// DefaultRequestTimeout bounds each REST request made through
+	// GithubSession.Client(), and each GraphQLClient request. A session can
+	// replace it with WithRequestTimeout.
+	DefaultRequestTimeout = 30 * time.Second
+
+	// ResponseHeaderTimeout bounds the wait for a response's headers on every
+	// connection this package opens, so a server that accepts the connection and
+	// then says nothing fails here rather than holding the caller until the
+	// overall bound.
+	ResponseHeaderTimeout = 10 * time.Second
 )
 
 // ErrNilViper is returned by GithubLoadConfigFromViper when the caller
@@ -49,8 +50,71 @@ type GithubSession struct {
 	pem       string
 	appID     string
 	installID string
+	cfg       sessionConfig
 	auth      *oauth2.Token
 	client    *github.Client
+}
+
+// SessionOption configures a session built by NewGithubSessionWithOptions.
+type SessionOption func(*sessionConfig)
+
+// WithContext sets the context the session mints installation tokens under: the
+// mint NewGithubSessionWithOptions performs, and every refresh after it.
+// Cancelling it aborts a mint in flight and fails every later one, so it must
+// live as long as the session does; for a session built per unit of work, that
+// work's context is the right one. The default is context.Background().
+//
+// A refresh that falls inside a REST call is bounded by this context and by
+// TokenMintTimeout, not by that call's own context: the oauth2 transport fetches
+// the token before it reads the request's context.
+func WithContext(ctx context.Context) SessionOption {
+	return func(cfg *sessionConfig) { cfg.ctx = ctx }
+}
+
+// WithRequestTimeout replaces DefaultRequestTimeout as the overall bound on each
+// REST request made through Client(), for a session whose calls legitimately
+// take longer, such as large content or archive downloads. Zero removes the
+// overall bound, leaving the request's own context and ResponseHeaderTimeout.
+func WithRequestTimeout(timeout time.Duration) SessionOption {
+	return func(cfg *sessionConfig) { cfg.requestTimeout = timeout }
+}
+
+// sessionConfig holds what a session's HTTP calls are bounded by. mintTimeout,
+// transport and mintBaseURL are not options: tests set them to exercise the real
+// wiring against a local server with short bounds.
+type sessionConfig struct {
+	ctx            context.Context
+	mintTimeout    time.Duration
+	requestTimeout time.Duration
+	transport      http.RoundTripper
+	mintBaseURL    string // "": github.com
+}
+
+func defaultSessionConfig() sessionConfig {
+	return sessionConfig{
+		ctx:            context.Background(),
+		mintTimeout:    TokenMintTimeout,
+		requestTimeout: DefaultRequestTimeout,
+		transport:      sharedTransport(),
+	}
+}
+
+// newSessionConfig applies opts to the default config and rejects the values no
+// option may leave behind.
+func newSessionConfig(opts ...SessionOption) (sessionConfig, error) {
+	cfg := defaultSessionConfig()
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if cfg.ctx == nil {
+		return sessionConfig{}, errors.New("WithContext: context must not be nil")
+	}
+	if cfg.requestTimeout < 0 {
+		return sessionConfig{}, fmt.Errorf(
+			"WithRequestTimeout: timeout must not be negative, got %s", cfg.requestTimeout,
+		)
+	}
+	return cfg, nil
 }
 
 type GithubConfig struct {
@@ -124,16 +188,29 @@ func validateConfig(config *GithubConfig) error {
 	return nil
 }
 
-// NewGithubSession creates a new Github session using the provided PEM file, App ID, and Install ID
+// NewGithubSession creates a new Github session using the provided PEM file, App ID, and Install ID.
+// It is NewGithubSessionWithOptions with no options.
 func NewGithubSession(pem, appID, installID string) (*GithubSession, error) {
+	return NewGithubSessionWithOptions(pem, appID, installID)
+}
+
+// NewGithubSessionWithOptions creates a new Github session, configured by opts;
+// see WithContext and WithRequestTimeout. It is a separate function rather than a
+// variadic NewGithubSession because consumers hold NewGithubSession as a typed
+// function value, which an added parameter would stop compiling.
+func NewGithubSessionWithOptions(pem, appID, installID string, opts ...SessionOption) (*GithubSession, error) {
+	cfg, err := newSessionConfig(opts...)
+	if err != nil {
+		return nil, err
+	}
 	session := &GithubSession{
 		pem:       pem,
 		appID:     appID,
 		installID: installID,
+		cfg:       cfg,
 	}
 
-	err := session.authenticate()
-	if err != nil {
+	if err := session.authenticate(); err != nil {
 		return nil, err
 	}
 
@@ -235,20 +312,7 @@ func (s *GithubSession) authenticate() error {
 	if err != nil {
 		return fmt.Errorf("error creating application token source: %w", err)
 	}
-	installationTokenSource := githubauth.NewInstallationTokenSource(
-		installationID,
-		appTokenSource,
-		githubauth.WithHTTPClient(boundedHTTPClient(tokenMintTimeout, tokenMintResponseHeaderTimeout)),
-	)
-	// oauth2.NewClient takes the base transport, and the overall timeout, of the
-	// client it returns from the context — so the bounded client goes in there
-	// rather than around the result, which would drop the token transport.
-	ctx := context.WithValue(
-		context.Background(),
-		oauth2.HTTPClient,
-		boundedHTTPClient(apiRequestTimeout, apiResponseHeaderTimeout),
-	)
-	httpClient := oauth2.NewClient(ctx, installationTokenSource)
+	installationTokenSource, httpClient := newInstallationClient(appTokenSource, installationID, s.cfg)
 	token, err := installationTokenSource.Token()
 	if err != nil {
 		return fmt.Errorf("error generating token: %w", err)
@@ -384,25 +448,73 @@ func (s *GithubSession) setMilestone(
 	return nil
 }
 
-// boundedHTTPClient returns a client that cannot block forever: an overall
-// timeout covering the whole request including the body, and a
-// ResponseHeaderTimeout for the connected-but-silent server that the dial and
-// TLS bounds never see. It starts from a clone of http.DefaultTransport so
-// those bounds, proxy support and connection pooling are kept rather than
-// discarded.
-func boundedHTTPClient(timeout, responseHeaderTimeout time.Duration) *http.Client {
+// newInstallationClient builds the installation-token source and the
+// authenticated REST client a session uses. authenticate() calls it with the
+// session's config, and the tests call it with the same config shortened, so
+// what they exercise is this wiring rather than a copy of it.
+//
+// The mint runs on cfg.transport with an overall bound of cfg.mintTimeout, under
+// cfg.ctx, and is not retried when GitHub throttles it. go-githubauth otherwise
+// sleeps up to 60s on a 429 or a rate-limit 403 and tries again, outside any
+// client timeout, so a mint's worst case would be that sleep plus a second
+// request. A throttled mint instead fails at once with an error wrapping
+// githubauth.ErrRateLimited, and the caller decides whether to retry.
+// go-githubauth's default client is not used: its 30s header bound could never
+// fire inside the mint's shorter overall one.
+//
+// The REST client takes its transport and overall timeout from the client stored
+// under oauth2.HTTPClient, because oauth2.NewClient copies both from there;
+// wrapping its result instead would drop the token transport.
+func newInstallationClient(
+	app oauth2.TokenSource,
+	installationID int64,
+	cfg sessionConfig,
+) (oauth2.TokenSource, *http.Client) {
+	mintOpts := []githubauth.InstallationTokenSourceOpt{
+		githubauth.WithHTTPClient(&http.Client{Transport: cfg.transport, Timeout: cfg.mintTimeout}),
+		githubauth.WithContext(cfg.ctx),
+		githubauth.WithRetryOnThrottle(false),
+	}
+	if cfg.mintBaseURL != "" {
+		mintOpts = append(mintOpts, githubauth.WithBaseURL(cfg.mintBaseURL))
+	}
+	tokenSource := githubauth.NewInstallationTokenSource(installationID, app, mintOpts...)
+
+	base := &http.Client{Transport: cfg.transport, Timeout: cfg.requestTimeout}
+	ctx := context.WithValue(context.Background(), oauth2.HTTPClient, base)
+	return tokenSource, oauth2.NewClient(ctx, tokenSource)
+}
+
+// sharedTransport returns the one transport every HTTP call in this package goes
+// through, so all sessions and GraphQL clients in a process share one connection
+// pool to GitHub. A transport per session would cost a consumer that builds a
+// session per message a TCP and TLS handshake on every one, and leave each
+// session's idle connections behind until they time out. ghinstallation asks for
+// the same sharing of the transport it is given.
+//
+// It is package state because sessions are built independently and share
+// nothing else; it is built on first use, so it clones http.DefaultTransport as
+// it stands then.
+var sharedTransport = sync.OnceValue(func() http.RoundTripper {
+	return newBoundedTransport(ResponseHeaderTimeout)
+})
+
+// newBoundedTransport returns a clone of http.DefaultTransport that bounds the
+// wait for response headers. The clone keeps its proxy support, its dial bound
+// (30s, with 30s keep-alive) and its TLS handshake bound (10s).
+func newBoundedTransport(responseHeaderTimeout time.Duration) http.RoundTripper {
 	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
 		// http.DefaultTransport is an *http.Transport in every Go release to
-		// date; should that ever change, the overall timeout still applies.
-		return &http.Client{Timeout: timeout}
+		// date; should that ever change, the clients' overall timeouts still apply.
+		return http.DefaultTransport
 	}
 
 	transport := defaultTransport.Clone()
 	transport.ResponseHeaderTimeout = responseHeaderTimeout
-
-	return &http.Client{
-		Transport: transport,
-		Timeout:   timeout,
-	}
+	// Every call this package makes goes to one host, and the clone would keep
+	// only http.DefaultMaxIdleConnsPerHost (2) idle connections to it.
+	// go-githubauth's own client keeps GOMAXPROCS+1; so does this.
+	transport.MaxIdleConnsPerHost = runtime.GOMAXPROCS(0) + 1
+	return transport
 }
