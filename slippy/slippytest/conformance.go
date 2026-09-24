@@ -79,7 +79,7 @@ func RunClaimContract(t *testing.T, newStore func(t *testing.T) (slippy.SlipStor
 // messages that pointed at the wrong thing, and the reserved-name case passing VACUOUSLY,
 // because ErrSlipNotFound satisfied its only assertion.
 func claimContractSequence(id string) []ClaimContractCase {
-	return []ClaimContractCase{
+	cases := []ClaimContractCase{
 		{
 			Name: "a claim sets claimed_from and appends a marker naming the claimant",
 			Run: func(ctx context.Context, s slippy.SlipStore) error {
@@ -179,6 +179,103 @@ func claimContractSequence(id string) []ClaimContractCase {
 				}
 			},
 		},
+	}
+
+	// Grouped in their own function (below) to keep this literal's cyclomatic complexity under
+	// the repo's gocyclo gate; see componentlessAggregateContractCases for why they exist.
+	cases = append(cases, componentlessAggregateContractCases(id)...)
+
+	cases = append(cases,
+		ClaimContractCase{
+			// Defect A spanned four methods; the reserved-name case below exercises only
+			// UpdateStepWithHistory. UpdateComponentStatus was unguarded on BOTH doubles
+			// pre-fix and an implementation with that gap passed this contract until this
+			// case existed (PR #87 review, jhicks).
+			Name: "a caller may not address a reserved marker name as a step either",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.UpdateComponentStatus(ctx, id, "api", slippy.ClaimMarkerStep,
+					slippy.StepStatusRunning)
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				if err == nil {
+					t.Fatal("a reserved marker name as the step type must be refused")
+				}
+				if !errors.Is(err, slippy.ErrReservedStepName) {
+					t.Errorf("the refusal must wrap ErrReservedStepName, got %v", err)
+				}
+				if n := contractCountStep(slip, slippy.ClaimMarkerStep); n != 0 {
+					t.Errorf("the refusal must write nothing, got %d forged markers", n)
+				}
+			},
+		},
+		ClaimContractCase{
+			// The FIRST divergence this harness's godoc claims it would have caught, and the
+			// one it could not see until now: a fresh insert must not persist a ClaimedFrom
+			// the store's INSERT column list cannot write. Both doubles kept the caller's
+			// value once, so a consumer asserting ErrSlipWentLive on a later Repave passed
+			// against a row Postgres would have left unclaimed (PR #87 review, jhicks).
+			Name: "Create never persists a caller-supplied claim",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.Create(ctx, &slippy.Slip{
+					CorrelationID: id + "-fresh",
+					Repository:    "owner/repo",
+					Branch:        "main",
+					CommitSHA:     "conformance-create-sha",
+					Status:        slippy.SlipStatusPending,
+					ClaimedFrom:   slippy.SlipStatusFailed,
+				})
+			},
+			Check: func(t *testing.T, err error, _ *slippy.Slip) {
+				contractRequireNoErr(t, err, "create")
+			},
+			// The assertion is on the row Create wrote, not on the seeded one.
+			CheckOther: func(ctx context.Context, t *testing.T, s slippy.SlipStore) {
+				fresh, loadErr := s.Load(ctx, id+"-fresh")
+				if loadErr != nil {
+					t.Fatalf("loading the created slip: %v", loadErr)
+				}
+				if fresh.ClaimedFrom != "" {
+					t.Errorf("claimed_from is absent from the INSERT column list, so a fresh "+
+						"insert is always unclaimed; got %q", fresh.ClaimedFrom)
+				}
+			},
+		},
+		ClaimContractCase{
+			Name: "a caller may not write a step under a reserved marker name",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.UpdateStepWithHistory(ctx, id, "builds", "", slippy.StepStatusRunning,
+					slippy.StateHistoryEntry{Step: slippy.ReleaseMarkerStep, Actor: "impostor"})
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				if err == nil {
+					t.Fatal("a caller-supplied entry under a marker name must be refused")
+				}
+				// The SENTINEL, not merely a non-nil error. Accepting any error let this case
+				// report conformance for an unrelated failure — and it is what made the case
+				// pass against a store the sequence was never operating on.
+				if !errors.Is(err, slippy.ErrReservedStepName) {
+					t.Errorf("the refusal must wrap ErrReservedStepName, got %v", err)
+				}
+				if n := contractCountStep(slip, slippy.ReleaseMarkerStep); n != 0 {
+					t.Errorf("the refusal must write nothing, got %d forged markers", n)
+				}
+			},
+		},
+	)
+
+	return cases
+}
+
+// componentlessAggregateContractCases are the three DEVOPS-373 cases, kept in their own
+// function (rather than inline in claimContractSequence's literal) purely to keep that
+// function's cyclomatic complexity under the repo's gocyclo gate (a growing case table pushed
+// it past the threshold; splitting the literal is mechanical and changes no case's behavior).
+//
+// DEVOPS-373: the three implementers diverged on a componentless write to an aggregate step —
+// both test doubles set the step's own status on every write, while PostgresStore silently
+// dropped one before any component had reported. These pin that all three now agree.
+func componentlessAggregateContractCases(id string) []ClaimContractCase {
+	return []ClaimContractCase{
 		{
 			// DEVOPS-373. The three implementers diverged here unseen: both doubles set the step's
 			// status on every write, while Postgres dropped a componentless aggregate write.
@@ -244,81 +341,6 @@ func claimContractSequence(id string) []ClaimContractCase {
 				if got := slip.Steps["builds"].Status; got != slippy.StepStatusCompleted {
 					t.Errorf("a componentless completion must land on the aggregate step's own "+
 						"status, got %q", got)
-				}
-			},
-		},
-		{
-			// Defect A spanned four methods; the reserved-name case below exercises only
-			// UpdateStepWithHistory. UpdateComponentStatus was unguarded on BOTH doubles
-			// pre-fix and an implementation with that gap passed this contract until this
-			// case existed (PR #87 review, jhicks).
-			Name: "a caller may not address a reserved marker name as a step either",
-			Run: func(ctx context.Context, s slippy.SlipStore) error {
-				return s.UpdateComponentStatus(ctx, id, "api", slippy.ClaimMarkerStep,
-					slippy.StepStatusRunning)
-			},
-			Check: func(t *testing.T, err error, slip *slippy.Slip) {
-				if err == nil {
-					t.Fatal("a reserved marker name as the step type must be refused")
-				}
-				if !errors.Is(err, slippy.ErrReservedStepName) {
-					t.Errorf("the refusal must wrap ErrReservedStepName, got %v", err)
-				}
-				if n := contractCountStep(slip, slippy.ClaimMarkerStep); n != 0 {
-					t.Errorf("the refusal must write nothing, got %d forged markers", n)
-				}
-			},
-		},
-		{
-			// The FIRST divergence this harness's godoc claims it would have caught, and the
-			// one it could not see until now: a fresh insert must not persist a ClaimedFrom
-			// the store's INSERT column list cannot write. Both doubles kept the caller's
-			// value once, so a consumer asserting ErrSlipWentLive on a later Repave passed
-			// against a row Postgres would have left unclaimed (PR #87 review, jhicks).
-			Name: "Create never persists a caller-supplied claim",
-			Run: func(ctx context.Context, s slippy.SlipStore) error {
-				return s.Create(ctx, &slippy.Slip{
-					CorrelationID: id + "-fresh",
-					Repository:    "owner/repo",
-					Branch:        "main",
-					CommitSHA:     "conformance-create-sha",
-					Status:        slippy.SlipStatusPending,
-					ClaimedFrom:   slippy.SlipStatusFailed,
-				})
-			},
-			Check: func(t *testing.T, err error, _ *slippy.Slip) {
-				contractRequireNoErr(t, err, "create")
-			},
-			// The assertion is on the row Create wrote, not on the seeded one.
-			CheckOther: func(ctx context.Context, t *testing.T, s slippy.SlipStore) {
-				fresh, loadErr := s.Load(ctx, id+"-fresh")
-				if loadErr != nil {
-					t.Fatalf("loading the created slip: %v", loadErr)
-				}
-				if fresh.ClaimedFrom != "" {
-					t.Errorf("claimed_from is absent from the INSERT column list, so a fresh "+
-						"insert is always unclaimed; got %q", fresh.ClaimedFrom)
-				}
-			},
-		},
-		{
-			Name: "a caller may not write a step under a reserved marker name",
-			Run: func(ctx context.Context, s slippy.SlipStore) error {
-				return s.UpdateStepWithHistory(ctx, id, "builds", "", slippy.StepStatusRunning,
-					slippy.StateHistoryEntry{Step: slippy.ReleaseMarkerStep, Actor: "impostor"})
-			},
-			Check: func(t *testing.T, err error, slip *slippy.Slip) {
-				if err == nil {
-					t.Fatal("a caller-supplied entry under a marker name must be refused")
-				}
-				// The SENTINEL, not merely a non-nil error. Accepting any error let this case
-				// report conformance for an unrelated failure — and it is what made the case
-				// pass against a store the sequence was never operating on.
-				if !errors.Is(err, slippy.ErrReservedStepName) {
-					t.Errorf("the refusal must wrap ErrReservedStepName, got %v", err)
-				}
-				if n := contractCountStep(slip, slippy.ReleaseMarkerStep); n != 0 {
-					t.Errorf("the refusal must write nothing, got %d forged markers", n)
 				}
 			},
 		},
