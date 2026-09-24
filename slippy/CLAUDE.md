@@ -326,6 +326,24 @@ dispatch, `DispatchIntentNothing` when it will not; see `DispatchIntent` for why
 count cannot answer this. The fix is only live once slippy-api and pushhookparser also pass
 it through.
 
+### Not breaking, but behaviour changes: componentless aggregate writes (DEVOPS-373)
+
+Before any component has reported, a write to an aggregate step with no component name now
+lands on that step's own `<step>_status` column, the same as a pure pipeline step's write —
+it no longer stays `pending`. Once a component has reported, the component rollup is
+authoritative again and a later componentless write does not override it. This is also what
+makes `RunInFlight` see a componentless `StartStep` on an aggregate step as in flight: it
+counts the step's own status through the same loop it uses for a pure pipeline step.
+
+The visible effect is on pushhookparser's no-build skip, `SkipStep(ctx, correlationID,
+"builds", "", "no builds triggered")`: it now lands, so a no-build slip reads `builds`
+`skipped` instead of `pending`, and any gate downstream of `builds` sees a satisfied
+prerequisite instead of one that never resolves (D1, decided on DEVOPS-373 2026-09-24). Both
+the published `slippytest.MockStore` and the in-package double already behaved this way — they
+set the step's status on every componentless write, and only `PostgresStore` dropped it — so
+only the Postgres store needed the fix. Consumers bumping past this release should expect
+no-build slips to complete instead of sitting `pending` on `builds`.
+
 ---
 
 

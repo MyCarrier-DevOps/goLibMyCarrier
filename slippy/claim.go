@@ -259,6 +259,11 @@ func GuardReservedStepWrite(stepName string, entry *StateHistoryEntry) error {
 // deduplicated push and never completed by a post-job, so counting it would make a deduped
 // claimed slip unreleasable. This is the one definition of "work in flight" the claim
 // protects.
+//
+// An aggregate step's own status counts through the Steps loop above. Before any component
+// has reported, a componentless write to the step sets that status directly, so a step started
+// without a component is in flight (DEVOPS-373); once a component has reported, the status is
+// the component rollup.
 func RunInFlight(slip *Slip) bool {
 	// Nil is "no slip, so nothing in flight" rather than a panic: this is exported for
 	// third-party stores to route their own release decision through, and a store that hands
