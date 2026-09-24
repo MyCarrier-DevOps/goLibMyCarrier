@@ -261,6 +261,35 @@ func TestPostgresStore_UpdateStep_AggregateNoComponents_WritesTheStepsOwnStatus(
 	}
 }
 
+// An error writing the aggregate step's own status column (the DEVOPS-373 branch) must surface
+// wrapped, and the transaction must roll back rather than leave the component-state insert
+// committed without the column it is meant to be visible through.
+func TestPostgresStore_UpdateStep_AggregateNoComponents_StepStatusWriteErrorRollsBack(t *testing.T) {
+	store, mock := newMockStore(t)
+	boom := errors.New("connection reset")
+	mock.ExpectBegin()
+	expectLock(mock, "c1")
+	mock.ExpectExec("INSERT INTO slip_component_states").
+		WithArgs("c1", "builds", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery("SELECT builds FROM routing_slips").
+		WithArgs("c1").
+		WillReturnRows(pgxmock.NewRows([]string{"builds"}).AddRow([]byte(`{"items":[]}`)))
+	mock.ExpectQuery("FROM slip_component_states").
+		WithArgs("c1", pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"component", "status", "message", "image_tag", "updated_at"}))
+	mock.ExpectExec(`UPDATE routing_slips SET builds_status = \$1, updated_at`).
+		WithArgs("running", "c1").
+		WillReturnError(boom)
+	mock.ExpectRollback()
+
+	err := store.UpdateStep(context.Background(), "c1", "builds", "", StepStatusRunning)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, boom)
+	assert.Contains(t, err.Error(), "failed to update step builds")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 // Once a component has reported, the rollup is authoritative and a componentless write does not
 // touch the step column: recomputeAggregate's own UPDATE is the only one.
 func TestPostgresStore_UpdateStep_AggregateWithComponents_RollupStillWins(t *testing.T) {

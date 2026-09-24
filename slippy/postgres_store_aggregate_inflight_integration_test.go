@@ -61,3 +61,42 @@ func TestPostgresStore_ComponentlessAggregateWrite_RollupWinsOnceAComponentRepor
 	require.NoError(t, err)
 	assert.Equal(t, StepStatusCompleted, got.Steps["builds"].Status)
 }
+
+// TestPostgresStore_ComponentlessAggregateWrite_ViaClientSkipStep_Integration pins D1 through
+// the ONE live caller that depends on it: pushhookparser's no-build skip is
+// Client.SkipStep(ctx, id, "builds", "", "no builds triggered") -> UpdateStepWithHistory (which
+// appends the history entry after the column write) -> checkPipelineCompletion. Every other test
+// in this file drives store.UpdateStep directly, which never exercises the history append or the
+// pipeline-completion re-check that sit around it in the real caller's path.
+//
+// This must FAIL against ddc373a (pre-fix): builds stays pending there, not skipped.
+func TestPostgresStore_ComponentlessAggregateWrite_ViaClientSkipStep_Integration(t *testing.T) {
+	store, _, cfg := newMigratedStore(t)
+	ctx := context.Background()
+	mustCreate(t, store, "c1")
+
+	client := NewClientWithDependencies(store, newMockGitHubAPIForE2E(), Config{
+		PipelineConfig: cfg,
+		Logger:         &e2eTestLogger{t: t},
+	})
+
+	require.NoError(t, client.SkipStep(ctx, "c1", "builds", "", "no builds triggered"))
+
+	got, err := store.Load(ctx, "c1")
+	require.NoError(t, err)
+
+	assert.Equal(t, StepStatusSkipped, got.Steps["builds"].Status,
+		"a componentless SkipStep on the aggregate step must land on its own status column")
+
+	var sawSkippedHistory bool
+	for _, entry := range got.StateHistory {
+		if entry.Step == "builds" && entry.Status == StepStatusSkipped {
+			sawSkippedHistory = true
+			break
+		}
+	}
+	assert.True(t, sawSkippedHistory, "expected a skipped history entry for builds, got %+v", got.StateHistory)
+
+	assert.Equal(t, SlipStatusInProgress, got.Status,
+		"a no-build skip does not complete the slip; only prod_steady_state does")
+}
