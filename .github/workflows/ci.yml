@@ -171,7 +171,7 @@ jobs:
         run: |
           go mod download
           go test -tags integration \
-            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry|TestPostgresStore_Claim|TestPostgresStore_ReleaseClaim|TestPostgresStore_ResetSlipInPlace.*_Integration|TestPostgresStore_Create_KeepsAnExistingClaim_Integration|TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration|TestPostgresStore_Update_NeverEndsTheClaim_Integration|TestPostgresStore_ProbeSchema_Integration|TestPostgresStore_SatisfiesTheClaimContract_Integration|TestClaimedFromMigration_V6' \
+            -run 'TestStaleCloneDerive|TestPostgresStore_Repave|TestPostgresStore_Load|TestUniquenessMigration_V5_Integration|TestPostgresStore_Ancestry|TestPostgresStore_Claim|TestPostgresStore_ReleaseClaim|TestPostgresStore_ResetSlipInPlace.*_Integration|TestPostgresStore_Create_KeepsAnExistingClaim_Integration|TestPostgresStore_UpdateSlipStatus_TerminalWriteEndsTheClaim_Integration|TestPostgresStore_Update_NeverEndsTheClaim_Integration|TestPostgresStore_ProbeSchema_Integration|TestPostgresStore_SatisfiesTheClaimContract_Integration|TestPostgresStore_ComponentlessAggregateWrite|TestClaimedFromMigration_V6' \
             -count=1 -timeout 10m ./...
 
   lint:

@@ -45,7 +45,8 @@ type ClaimContractCase struct {
 // than kept in the library's own tests.
 //
 // newStore must return an empty store and a seeded slip's correlation ID. The slip must exist,
-// be unclaimed, and carry a non-terminal status.
+// be unclaimed, and carry a non-terminal status. The store's pipeline config must define
+// "builds" as an aggregate step; the componentless-aggregate cases write it.
 func RunClaimContract(t *testing.T, newStore func(t *testing.T) (slippy.SlipStore, string)) {
 	t.Helper()
 	ctx := context.Background()
@@ -79,7 +80,7 @@ func RunClaimContract(t *testing.T, newStore func(t *testing.T) (slippy.SlipStor
 // messages that pointed at the wrong thing, and the reserved-name case passing VACUOUSLY,
 // because ErrSlipNotFound satisfied its only assertion.
 func claimContractSequence(id string) []ClaimContractCase {
-	return []ClaimContractCase{
+	cases := []ClaimContractCase{
 		{
 			Name: "a claim sets claimed_from and appends a marker naming the claimant",
 			Run: func(ctx context.Context, s slippy.SlipStore) error {
@@ -179,7 +180,14 @@ func claimContractSequence(id string) []ClaimContractCase {
 				}
 			},
 		},
-		{
+	}
+
+	// Grouped in their own function (below) to keep this literal's cyclomatic complexity under
+	// the repo's gocyclo gate; see componentlessAggregateContractCases for why they exist.
+	cases = append(cases, componentlessAggregateContractCases(id)...)
+
+	cases = append(cases,
+		ClaimContractCase{
 			// Defect A spanned four methods; the reserved-name case below exercises only
 			// UpdateStepWithHistory. UpdateComponentStatus was unguarded on BOTH doubles
 			// pre-fix and an implementation with that gap passed this contract until this
@@ -201,7 +209,7 @@ func claimContractSequence(id string) []ClaimContractCase {
 				}
 			},
 		},
-		{
+		ClaimContractCase{
 			// The FIRST divergence this harness's godoc claims it would have caught, and the
 			// one it could not see until now: a fresh insert must not persist a ClaimedFrom
 			// the store's INSERT column list cannot write. Both doubles kept the caller's
@@ -233,7 +241,7 @@ func claimContractSequence(id string) []ClaimContractCase {
 				}
 			},
 		},
-		{
+		ClaimContractCase{
 			Name: "a caller may not write a step under a reserved marker name",
 			Run: func(ctx context.Context, s slippy.SlipStore) error {
 				return s.UpdateStepWithHistory(ctx, id, "builds", "", slippy.StepStatusRunning,
@@ -251,6 +259,89 @@ func claimContractSequence(id string) []ClaimContractCase {
 				}
 				if n := contractCountStep(slip, slippy.ReleaseMarkerStep); n != 0 {
 					t.Errorf("the refusal must write nothing, got %d forged markers", n)
+				}
+			},
+		},
+	)
+
+	return cases
+}
+
+// componentlessAggregateContractCases are the three DEVOPS-373 cases, kept in their own
+// function (rather than inline in claimContractSequence's literal) purely to keep that
+// function's cyclomatic complexity under the repo's gocyclo gate (a growing case table pushed
+// it past the threshold; splitting the literal is mechanical and changes no case's behavior).
+//
+// DEVOPS-373: the three implementers diverged on a componentless write to an aggregate step —
+// both test doubles set the step's own status on every write, while PostgresStore silently
+// dropped one before any component had reported. These pin that all three now agree.
+func componentlessAggregateContractCases(id string) []ClaimContractCase {
+	return []ClaimContractCase{
+		{
+			// DEVOPS-373. The three implementers diverged here unseen: both doubles set the step's
+			// status on every write, while Postgres dropped a componentless aggregate write.
+			Name: "a componentless start of an aggregate step is in flight",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusRunning)
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "componentless start")
+				if !slippy.RunInFlight(slip) {
+					t.Error("a componentless start of the aggregate step must count as in flight")
+				}
+			},
+		},
+		{
+			Name: "a claim is not released while a componentless aggregate start is in flight",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				if _, err := s.ClaimSlip(ctx, id, nil, "conformance/claimant", ""); err != nil {
+					return err
+				}
+				if err := s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusRunning); err != nil {
+					return err
+				}
+				out, err := s.ReleaseClaim(ctx, id, "conformance/claimant", "")
+				if err == nil && out.Released {
+					return errors.New("release cleared a claim with a step in flight")
+				}
+				return err
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "claim, start, release")
+				if slip.ClaimedFrom == "" {
+					t.Error("the claim must survive a release while the aggregate step is running")
+				}
+			},
+		},
+		{
+			Name: "a componentless completion lands on the aggregate step and the claim releases",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				if _, err := s.ClaimSlip(ctx, id, nil, "conformance/claimant", ""); err != nil {
+					return err
+				}
+				if err := s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusRunning); err != nil {
+					return err
+				}
+				if err := s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusCompleted); err != nil {
+					return err
+				}
+				out, err := s.ReleaseClaim(ctx, id, "conformance/claimant", "")
+				if err == nil && !out.Released {
+					return errors.New("release refused with nothing in flight")
+				}
+				return err
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "claim, start, complete, release")
+				if slip.ClaimedFrom != "" {
+					t.Error("the release must clear the claim once the aggregate step completed")
+				}
+				if slippy.RunInFlight(slip) {
+					t.Error("nothing is in flight after the componentless completion")
+				}
+				if got := slip.Steps["builds"].Status; got != slippy.StepStatusCompleted {
+					t.Errorf("a componentless completion must land on the aggregate step's own "+
+						"status, got %q", got)
 				}
 			},
 		},
