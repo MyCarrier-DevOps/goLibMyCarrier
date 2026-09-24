@@ -342,7 +342,8 @@ func (s *PostgresStore) SetComponentImageTag(
 		}
 
 		if aggStep := s.resolveAggregateStep(dbStep); aggStep != "" {
-			return s.recomputeAggregate(ctx, tx, correlationID, aggStep)
+			_, err := s.recomputeAggregate(ctx, tx, correlationID, aggStep)
+			return err
 		}
 		return nil
 	})
@@ -388,24 +389,23 @@ func (s *PostgresStore) updateStepTx(
 
 		if componentName != "" || s.config.IsAggregateStep(stepName) {
 			if aggStep := s.resolveAggregateStep(stepName); aggStep != "" {
-				if err := s.recomputeAggregate(ctx, tx, correlationID, aggStep); err != nil {
+				rolledUp, err := s.recomputeAggregate(ctx, tx, correlationID, aggStep)
+				if err != nil {
 					return err
 				}
+				// DEVOPS-373: a componentless write to the aggregate step itself, before any
+				// component has reported, has no rollup to land in. It lands on the step's own
+				// status column instead, as a pipeline step's does, so RunInFlight can see the
+				// start and a later componentless completion can end it. Once a component has
+				// reported, the rollup above is authoritative and this does not run.
+				if !rolledUp && componentName == "" && aggStep == stepName {
+					if err := s.writeStepStatusColumn(ctx, tx, correlationID, stepName, status); err != nil {
+						return err
+					}
+				}
 			}
-		} else if s.config.GetStep(stepName) != nil && safeStepNameForDerivePattern.MatchString(stepName) {
-			// Pure pipeline step: the status column on routing_slips is authoritative.
-			// stepName arrives from unvalidated HTTP/CI input through the SlipStore
-			// interface, and is interpolated into the column identifier — so it is spliced
-			// in ONLY after confirming it is a configured step AND a bare identifier
-			// (^[A-Za-z0-9_]+$), which blocks SQL identifier injection. An unknown or
-			// unsafe step name skips this column write; its slip_component_states event was
-			// already recorded above, matching ClickHouse (which materializes only
-			// config-known columns rather than erroring on unknown steps).
-			col := stepStatusColumn(stepName)
-			upd := fmt.Sprintf("UPDATE routing_slips SET %s = $1, updated_at = now() WHERE correlation_id = $2", col)
-			if _, err := tx.Exec(ctx, upd, string(status), correlationID); err != nil {
-				return fmt.Errorf("failed to update step %s: %w", stepName, err)
-			}
+		} else if err := s.writeStepStatusColumn(ctx, tx, correlationID, stepName, status); err != nil {
+			return err
 		}
 
 		if entry != nil {
@@ -413,6 +413,28 @@ func (s *PostgresStore) updateStepTx(
 		}
 		return nil
 	})
+}
+
+// writeStepStatusColumn writes one step's <step>_status column. stepName arrives from
+// unvalidated HTTP/CI input through the SlipStore interface and is interpolated into the column
+// identifier, so it is spliced in ONLY after confirming it is a configured step AND a bare
+// identifier (^[A-Za-z0-9_]+$), which blocks SQL identifier injection. An unknown or unsafe
+// step name writes nothing; its slip_component_states event was already recorded by the caller.
+func (s *PostgresStore) writeStepStatusColumn(
+	ctx context.Context,
+	tx pgx.Tx,
+	correlationID, stepName string,
+	status StepStatus,
+) error {
+	if s.config.GetStep(stepName) == nil || !safeStepNameForDerivePattern.MatchString(stepName) {
+		return nil
+	}
+	upd := fmt.Sprintf("UPDATE routing_slips SET %s = $1, updated_at = now() WHERE correlation_id = $2",
+		stepStatusColumn(stepName))
+	if _, err := tx.Exec(ctx, upd, string(status), correlationID); err != nil {
+		return fmt.Errorf("failed to update step %s: %w", stepName, err)
+	}
+	return nil
 }
 
 // upsertComponentState writes the current state for one (step, component), returning
@@ -475,14 +497,16 @@ func (s *PostgresStore) upsertComponentState(
 // rows, merging into the existing items (preserving StartedAt across transitions) and
 // recomputing the status column over the active components. The caller must already hold
 // the slip's row lock.
-func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, correlationID, aggStep string) error {
+func (s *PostgresStore) recomputeAggregate(
+	ctx context.Context, tx pgx.Tx, correlationID, aggStep string,
+) (bool, error) {
 	var itemsBytes []byte
 	sel := fmt.Sprintf("SELECT %s FROM routing_slips WHERE correlation_id = $1", aggregateColumn(aggStep))
 	if err := tx.QueryRow(ctx, sel, correlationID).Scan(&itemsBytes); err != nil {
 		if isNoRows(err) {
-			return ErrSlipNotFound
+			return false, ErrSlipNotFound
 		}
-		return fmt.Errorf("failed to read aggregate %s: %w", aggStep, err)
+		return false, fmt.Errorf("failed to read aggregate %s: %w", aggStep, err)
 	}
 
 	var wrapper struct {
@@ -504,7 +528,7 @@ func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, corre
 			"WHERE correlation_id = $1 AND step = ANY($2) AND component <> ''",
 		correlationID, s.aggregateStepAliases(aggStep))
 	if err != nil {
-		return fmt.Errorf("failed to read component states for %s: %w", aggStep, err)
+		return false, fmt.Errorf("failed to read component states for %s: %w", aggStep, err)
 	}
 	defer rows.Close()
 
@@ -512,7 +536,7 @@ func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, corre
 	for rows.Next() {
 		var row componentStateRow
 		if err := rows.Scan(&row.Component, &row.Status, &row.Message, &row.ImageTag, &row.Timestamp); err != nil {
-			return fmt.Errorf("failed to scan component state: %w", err)
+			return false, fmt.Errorf("failed to scan component state: %w", err)
 		}
 		cd := buildComponentData(row.Component, row)
 		active = append(active, cd)
@@ -524,15 +548,15 @@ func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, corre
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("failed to iterate component states for %s: %w", aggStep, err)
+		return false, fmt.Errorf("failed to iterate component states for %s: %w", aggStep, err)
 	}
 
-	// No component has reported yet (e.g. a pipeline-level StartStep on the aggregate step
-	// before its components exist). Aggregating over an empty set would vacuously resolve to
-	// "completed" and could mis-gate a downstream prerequisite, so leave the aggregate at its
-	// current value. Matches the ClickHouse store, which only aggregates a non-empty set.
+	// No component has reported yet. Aggregating over an empty set would vacuously resolve to
+	// "completed", so the jsonb aggregate is left alone and the caller is told nothing was
+	// rolled up: a componentless write then lands on the step's own column (updateStepTx,
+	// DEVOPS-373).
 	if len(active) == 0 {
-		return nil
+		return false, nil
 	}
 
 	// Status is computed over the active components only (excludes any config placeholders
@@ -543,16 +567,16 @@ func (s *PostgresStore) recomputeAggregate(ctx context.Context, tx pgx.Tx, corre
 		Items []ComponentStepData `json:"items"`
 	}{Items: items})
 	if err != nil {
-		return fmt.Errorf("failed to marshal aggregate %s: %w", aggStep, err)
+		return false, fmt.Errorf("failed to marshal aggregate %s: %w", aggStep, err)
 	}
 
 	upd := fmt.Sprintf(
 		"UPDATE routing_slips SET %s = $1, %s = $2, updated_at = now() WHERE correlation_id = $3",
 		stepStatusColumn(aggStep), aggregateColumn(aggStep))
 	if _, err := tx.Exec(ctx, upd, string(status), string(itemsJSON), correlationID); err != nil {
-		return fmt.Errorf("failed to write aggregate %s: %w", aggStep, err)
+		return false, fmt.Errorf("failed to write aggregate %s: %w", aggStep, err)
 	}
-	return nil
+	return true, nil
 }
 
 // resolveAggregateStep maps a step name to its aggregate step: the aggregate a component
