@@ -350,11 +350,12 @@ only via `prod_steady_state` (`executor.go`), and a no-build slip has no `dev_de
 `preprod_deploy` state.
 
 The consumer-visible instance is pr-merge-sync's slip-based PR checks, which poll
-`steps.builds.status` (slippy-api `pkg/slipchecks/slip_resolver.go`). Today a no-build slip on
-a `Buildable` repo with `AllowSlipWithNoBuilds=true` leaves `builds` `pending` on an
-`in_progress` slip, which is not a settled state, so the check polls out its 15-minute timeout
-and then records a slip-resolution error rather than running any build, deploy or test checks
-from the slip path. After consumers bump past this release, `builds` reads `skipped` — a
+`steps.builds.status` (pr-merge-sync `pkg/slipchecks/slip_resolver.go`, reading through
+slippy-api). Today a no-build slip on a `Buildable` repo with `AllowSlipWithNoBuilds=true`
+leaves `builds` `pending` on an `in_progress` slip, which is not a settled state, so the
+check polls out its 15-minute timeout and then records a slip-resolution error rather than
+running any build, deploy or test checks from the slip path. After consumers bump past this
+release, `builds` reads `skipped` — a
 terminal state — so the check resolves at once and takes pr-merge-sync's designed no-builds
 path instead.
 
