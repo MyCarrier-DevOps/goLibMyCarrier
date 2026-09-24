@@ -180,6 +180,70 @@ func claimContractSequence(id string) []ClaimContractCase {
 			},
 		},
 		{
+			// DEVOPS-373. The three implementers diverged here unseen: both doubles set the step's
+			// status on every write, while Postgres dropped a componentless aggregate write.
+			Name: "a componentless start of an aggregate step is in flight",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusRunning)
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "componentless start")
+				if !slippy.RunInFlight(slip) {
+					t.Error("a componentless start of the aggregate step must count as in flight")
+				}
+			},
+		},
+		{
+			Name: "a claim is not released while a componentless aggregate start is in flight",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				if _, err := s.ClaimSlip(ctx, id, nil, "conformance/claimant", ""); err != nil {
+					return err
+				}
+				if err := s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusRunning); err != nil {
+					return err
+				}
+				out, err := s.ReleaseClaim(ctx, id, "conformance/claimant", "")
+				if err == nil && out.Released {
+					return errors.New("release cleared a claim with a step in flight")
+				}
+				return err
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "claim, start, release")
+				if slip.ClaimedFrom == "" {
+					t.Error("the claim must survive a release while the aggregate step is running")
+				}
+			},
+		},
+		{
+			Name: "a componentless completion ends that start and the claim releases",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				if _, err := s.ClaimSlip(ctx, id, nil, "conformance/claimant", ""); err != nil {
+					return err
+				}
+				if err := s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusRunning); err != nil {
+					return err
+				}
+				if err := s.UpdateStep(ctx, id, "builds", "", slippy.StepStatusCompleted); err != nil {
+					return err
+				}
+				out, err := s.ReleaseClaim(ctx, id, "conformance/claimant", "")
+				if err == nil && !out.Released {
+					return errors.New("release refused with nothing in flight")
+				}
+				return err
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "claim, start, complete, release")
+				if slip.ClaimedFrom != "" {
+					t.Error("the release must clear the claim once the aggregate step completed")
+				}
+				if slippy.RunInFlight(slip) {
+					t.Error("nothing is in flight after the componentless completion")
+				}
+			},
+		},
+		{
 			// Defect A spanned four methods; the reserved-name case below exercises only
 			// UpdateStepWithHistory. UpdateComponentStatus was unguarded on BOTH doubles
 			// pre-fix and an implementation with that gap passed this contract until this
