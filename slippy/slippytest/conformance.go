@@ -241,6 +241,10 @@ func claimContractSequence(id string) []ClaimContractCase {
 				if slippy.RunInFlight(slip) {
 					t.Error("nothing is in flight after the componentless completion")
 				}
+				if got := slip.Steps["builds"].Status; got != slippy.StepStatusCompleted {
+					t.Errorf("a componentless completion must land on the aggregate step's own "+
+						"status, got %q", got)
+				}
 			},
 		},
 		{
