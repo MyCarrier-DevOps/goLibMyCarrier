@@ -21,8 +21,9 @@ const (
 )
 
 // UpdateStep updates a step's status. Component-level updates (componentName != "") and
-// aggregate steps roll up into the aggregate columns; pure pipeline steps write their
-// status column directly. Every update is guarded by terminal-monotonicity.
+// aggregate steps roll up into the aggregate columns once any component has reported; before
+// that, a componentless write to the aggregate step writes its status column directly, like a
+// pure pipeline step's (DEVOPS-373). Every update is guarded by terminal-monotonicity.
 func (s *PostgresStore) UpdateStep(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
@@ -351,7 +352,10 @@ func (s *PostgresStore) SetComponentImageTag(
 
 // updateStepTx performs a step update (optionally with a history entry) inside one
 // transaction: lock the slip, upsert the component-state row under the terminal guard,
-// then either recompute the affected aggregate or write the pipeline step's status column.
+// then either recompute the affected aggregate or write the pipeline step's status column. On
+// an aggregate step, when the recompute rolls nothing up (no component has reported) and the
+// write is itself componentless on the aggregate step, the step's own status column is written
+// too (DEVOPS-373) — that is the aggregate branch's write, not the pure-pipeline-step branch's.
 func (s *PostgresStore) updateStepTx(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
@@ -398,6 +402,11 @@ func (s *PostgresStore) updateStepTx(
 				// status column instead, as a pipeline step's does, so RunInFlight can see the
 				// start and a later componentless completion can end it. Once a component has
 				// reported, the rollup above is authoritative and this does not run.
+				//
+				// aggStep == stepName only differs from true when stepName is also another
+				// aggregate's component type (a chained config); that aggregate's components are
+				// not this step's, so deciding from aggStep here would be deciding from the
+				// wrong aggregate.
 				if !rolledUp && componentName == "" && aggStep == stepName {
 					if err := s.writeStepStatusColumn(ctx, tx, correlationID, stepName, status); err != nil {
 						return err

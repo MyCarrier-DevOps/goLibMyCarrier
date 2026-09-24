@@ -339,10 +339,24 @@ The visible effect is on pushhookparser's no-build skip, `SkipStep(ctx, correlat
 "builds", "", "no builds triggered")`: it now lands, so a no-build slip reads `builds`
 `skipped` instead of `pending`, and any gate downstream of `builds` sees a satisfied
 prerequisite instead of one that never resolves (D1, decided on DEVOPS-373 2026-09-24). Both
-the published `slippytest.MockStore` and the in-package double already behaved this way — they
-set the step's status on every componentless write, and only `PostgresStore` dropped it — so
-only the Postgres store needed the fix. Consumers bumping past this release should expect
-no-build slips to complete instead of sitting `pending` on `builds`.
+the published `slippytest.MockStore` and the in-package double already behaved this way before
+any component reports, so only `PostgresStore` needed the fix — but that parity is only
+half the rule: both doubles set `Steps[stepName]` on every write, including component-scoped
+ones and ones made after a component has reported, so neither models the rollup and neither
+implements the "rollup wins once a component reports" half. Consumers bumping past this
+release should expect no-build slips to read `builds` `skipped` instead of `pending`, so
+anything gated on `builds` stops waiting on them. They stay `in_progress`: a slip completes
+only via `prod_steady_state` (`executor.go`), and a no-build slip has no `dev_deploy` or
+`preprod_deploy` state.
+
+The consumer-visible instance is pr-merge-sync's slip-based PR checks, which poll
+`steps.builds.status` (slippy-api `pkg/slipchecks/slip_resolver.go`). Today a no-build slip on
+a `Buildable` repo with `AllowSlipWithNoBuilds=true` leaves `builds` `pending` on an
+`in_progress` slip, which is not a settled state, so the check polls out its 15-minute timeout
+and then records a slip-resolution error rather than running any build, deploy or test checks
+from the slip path. After consumers bump past this release, `builds` reads `skipped` — a
+terminal state — so the check resolves at once and takes pr-merge-sync's designed no-builds
+path instead.
 
 ---
 

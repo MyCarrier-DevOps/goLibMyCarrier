@@ -45,7 +45,8 @@ type ClaimContractCase struct {
 // than kept in the library's own tests.
 //
 // newStore must return an empty store and a seeded slip's correlation ID. The slip must exist,
-// be unclaimed, and carry a non-terminal status.
+// be unclaimed, and carry a non-terminal status. The store's pipeline config must define
+// "builds" as an aggregate step; the componentless-aggregate cases write it.
 func RunClaimContract(t *testing.T, newStore func(t *testing.T) (slippy.SlipStore, string)) {
 	t.Helper()
 	ctx := context.Background()
@@ -313,7 +314,7 @@ func componentlessAggregateContractCases(id string) []ClaimContractCase {
 			},
 		},
 		{
-			Name: "a componentless completion ends that start and the claim releases",
+			Name: "a componentless completion lands on the aggregate step and the claim releases",
 			Run: func(ctx context.Context, s slippy.SlipStore) error {
 				if _, err := s.ClaimSlip(ctx, id, nil, "conformance/claimant", ""); err != nil {
 					return err

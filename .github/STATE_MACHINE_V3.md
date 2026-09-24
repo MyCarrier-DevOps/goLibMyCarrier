@@ -362,7 +362,8 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   is what `RunInFlight` counts. This is what makes a componentless start of an aggregate step
   count as in flight too (DEVOPS-373): before any component has reported, the write lands on
   the step's own status column, the same as a pure pipeline step's, so `RunInFlight` sees it
-  through the same Steps loop. It protects *that*, and nothing wider: the gap between one
+  through the same Steps loop. It protects running or held steps and components, and nothing
+  wider: the gap between one
   step's last post-job and the next step's pre-job is not covered, and closing it is tracked
   as **DEVOPS-371** (a dispatcher-held claim). Four properties:
 
@@ -1041,7 +1042,7 @@ checkPipelineCompletion(ctx, correlationID):
 | Category | `componentName` | Example | Update path in store |
 |----------|-----------------|---------|---------------------|
 | Pure pipeline | `""` | `unit_tests`, `dev_deploy`, `prod_gate` | `appendHistoryWithOverrides` - atomic INSERT SELECT, one column override |
-| Aggregate | `""` (rollup) | `builds` | `updateAggregateStatusFromComponentStatesWithHistory` - full Load+hydrateSlip+Update |
+| Aggregate | `""` (rollup; before any component reports: writes the step column, DEVOPS-373) | `builds` | `updateAggregateStatusFromComponentStatesWithHistory` - full Load+hydrateSlip+Update |
 | Component | `"mc.x.y"` | individual build | `insertComponentState` + triggers aggregate recalc |
 
 ### Step Status Reference
