@@ -122,7 +122,7 @@ stay in this repo). Full list in `slippy/CLAUDE.md`'s Breaking changes section.
 | What changed | Migration |
 |---|---|
 | `NewClient(Config)` — **removed** | Build the store and inject it: `store, err := slippy.NewPostgresStore(pool, pipelineConfig, logger)` (check `err`), then `slippy.NewClientWithDependencies(store, githubClient, config)`. |
-| `ClickHouseStore`, `RunMigrations`, `GetCurrentSchemaVersion` and the rest of the ClickHouse schema API — **removed** | Use `PostgresStore` and `RunPostgresMigrations`. A consumer that still reads the frozen ClickHouse slip schema version calls `clickhousemigrator.NewMigrator(conn, nil, WithMigrations(nil), WithDatabase(db), WithTablePrefix("slippy")).GetSchemaVersion(ctx)` itself. |
+| `ClickHouseStore`, `RunMigrations`, `GetCurrentSchemaVersion` and the rest of the ClickHouse schema API — **removed** | Use `PostgresStore` and `RunPostgresMigrations`. A consumer that still reads the frozen ClickHouse slip schema version calls `m, err := clickhousemigrator.NewMigrator(conn, nil, clickhousemigrator.WithDatabase(db), clickhousemigrator.WithTablePrefix("slippy"))` (check `err`), then `m.GetSchemaVersion(ctx)` itself. |
 | `Config.ClickHouseConfig`, `Config.Database`, `Config.SkipMigrations`, `Config.WithDatabase`, `Config.Validate`, `Config.ValidateMinimal` — **removed** | Delete the references. `DefaultConfig().Database` was `"ci_test"` in `-test`/`-dev`/`feature*`/`dev` namespaces and `"ci"` otherwise; a consumer that needs that name computes it. |
 | `Slip.Sign`, `Slip.Version` — **deprecated**, always zero | Stop reading them. |
 
