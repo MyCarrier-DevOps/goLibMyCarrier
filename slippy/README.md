@@ -32,7 +32,7 @@ Slippy implements the **Routing Slip** pattern for distributed pipeline orchestr
 
 ### Key Features
 
-- **ClickHouse-backed persistence** for high-performance queries and analytics
+- **Postgres-backed persistence** (`PostgresStore`, over a `*pgxpool.Pool` the caller provides)
 - **Context-based slip resolution** - finds the correct slip using commit SHA, ancestry, or image tags
 - **Pre-job/Post-job execution model** - bookend operations around existing jobs
 - **Prerequisite-based holds** - intelligent waiting for dependent steps
@@ -278,8 +278,6 @@ type ComponentStepData struct {
 
 When all components in an aggregate complete, the parent step (e.g., `builds_completed`) is automatically updated.
 
-**Read-your-own-writes overlay:** ClickHouse `async_insert=1` means a row inserted into `slip_component_states` may not be visible to the subsequent `SELECT` inside `hydrateSlip` on the same connection (~200 ms async flush window). `overlayComponentState` (clickhouse_store.go) closes this gap: after `Load()` and before `Update()`, the just-written component state is merged into the in-memory `*Slip` so `computeAggregateStatus` always sees the freshly inserted row. Without this, the aggregate step could get permanently stuck at `running` even after all components complete.
-
 ### Steps
 
 Steps track individual pipeline stages. Each step has:
@@ -308,18 +306,12 @@ go get github.com/MyCarrier-DevOps/goLibMyCarrier/slippy
 
 ### Environment Variables
 
-Slippy can be configured via environment variables:
+Slippy reads no store connection settings: build a `*pgxpool.Pool` (the `goLibMyCarrier/postgres`
+module loads `POSTGRES_*` settings) and pass it to `NewPostgresStore`. `ConfigFromEnv` reads:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `CLICKHOUSE_HOSTNAME` | ClickHouse server hostname | required |
-| `CLICKHOUSE_PORT` | ClickHouse server port | `9000` |
-| `CLICKHOUSE_USERNAME` | ClickHouse username | required |
-| `CLICKHOUSE_PASSWORD` | ClickHouse password | required |
-| `CLICKHOUSE_DATABASE` | ClickHouse database | required |
-| `CLICKHOUSE_SKIP_VERIFY` | Skip TLS verification | `false` |
 | `SLIPPY_PIPELINE_CONFIG` | Pipeline configuration (file path or raw JSON) | required |
-| `SLIPPY_DATABASE` | ClickHouse database name for slippy tables | `ci` |
 | `SLIPPY_GITHUB_APP_ID` | GitHub App ID | required |
 | `SLIPPY_GITHUB_APP_PRIVATE_KEY` | GitHub App private key (PEM content or path) | required |
 | `SLIPPY_GITHUB_ENTERPRISE_URL` | GitHub Enterprise base URL | empty (uses github.com) |
@@ -332,15 +324,10 @@ Slippy can be configured via environment variables:
 
 ```go
 import (
-    "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
+    "github.com/jackc/pgx/v5/pgxpool"
+
     "github.com/MyCarrier-DevOps/goLibMyCarrier/slippy"
 )
-
-// Load ClickHouse config from environment
-chConfig, err := clickhouse.ClickhouseLoadConfig()
-if err != nil {
-    log.Fatal(err)
-}
 
 // Load pipeline configuration (from file or environment)
 pipelineConfig, err := slippy.LoadPipelineConfig()
@@ -348,9 +335,18 @@ if err != nil {
     log.Fatal(err)
 }
 
+// Build the store over a pool you own (the migrator Job owns the schema)
+pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+if err != nil {
+    log.Fatal(err)
+}
+store, err := slippy.NewPostgresStore(pool, pipelineConfig, nil)
+if err != nil {
+    log.Fatal(err)
+}
+
 // Create slippy config
 config := slippy.Config{
-    ClickHouseConfig:    chConfig,
     PipelineConfig:      pipelineConfig,
     GitHubAppID:         123456,
     GitHubPrivateKey:    "/path/to/private-key.pem",
@@ -359,14 +355,15 @@ config := slippy.Config{
     PollInterval:        30 * time.Second,
     AncestryDepth:       20,
     ShadowMode:          false,
-    Database:            "ci",
 }
 
-// Create client
-client, err := slippy.NewClient(config)
+github, err := slippy.NewGitHubClient(config.GitHubConfig(), nil)
 if err != nil {
     log.Fatal(err)
 }
+
+// Create client
+client := slippy.NewClientWithDependencies(store, github, config)
 defer client.Close()
 ```
 
@@ -473,21 +470,32 @@ import (
     "context"
     "log"
     "os"
-    
+
+    "github.com/jackc/pgx/v5/pgxpool"
+
     "github.com/MyCarrier-DevOps/goLibMyCarrier/slippy"
 )
 
 func main() {
     ctx := context.Background()
 
-    // Load config from environment
+    // Load config from environment, then build the store and GitHub client
     config := slippy.ConfigFromEnv()
-    
-    // Create client
-    client, err := slippy.NewClient(config)
+    pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
     if err != nil {
         log.Fatal(err)
     }
+    store, err := slippy.NewPostgresStore(pool, config.PipelineConfig, nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+    github, err := slippy.NewGitHubClient(config.GitHubConfig(), nil)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Create client
+    client := slippy.NewClientWithDependencies(store, github, config)
     defer client.Close()
 
     // Resolve slip from CI context (NOT by correlation ID)
@@ -777,7 +785,7 @@ For gradual rollout, enable shadow mode to log decisions without blocking:
 config := slippy.ConfigFromEnv()
 config.ShadowMode = true
 
-client, _ := slippy.NewClient(config)
+client := slippy.NewClientWithDependencies(store, github, config)
 // Prerequisites will be checked and logged, but never block
 ```
 
@@ -799,7 +807,7 @@ if err != nil {
     case errors.Is(err, slippy.ErrGitHubAPI):
         // GitHub API error during ancestry resolution
     case errors.Is(err, slippy.ErrStoreConnection):
-        // ClickHouse connection issue
+        // Store connection issue
     default:
         // Unexpected error
     }
@@ -917,43 +925,36 @@ if err == nil {
 
 ## Database Schema
 
-Slippy uses ClickHouse with the following schema design:
+Slippy stores slips in Postgres. The schema is generated from the pipeline configuration and
+owned by the slippy-migrator Job.
 
-### Table: `ci.routing_slips`
-
-Uses `ReplacingMergeTree` engine for efficient updates via INSERT.
+### Table: `routing_slips`
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `correlation_id` | String | Primary key - unique slip identifier |
-| `repository` | String | Full repository name (owner/repo) |
-| `branch` | String | Git branch name |
-| `commit_sha` | String | Full git commit SHA |
-| `status` | Enum8 | Overall slip status |
-| `components` | JSON | Array of component definitions |
-| `{step}_status` | Enum8 | Denormalized status per step |
-| `step_timestamps` | String (JSON) | Step timing information |
-| `state_history` | String (JSON) | Complete audit trail |
-| `created_at` | DateTime64(3) | Creation timestamp |
-| `updated_at` | DateTime64(3) | Last update timestamp |
+| `correlation_id` | text | Primary key - unique slip identifier |
+| `repository` | text | Full repository name (owner/repo) |
+| `branch` | text | Git branch name |
+| `commit_sha` | text | Full git commit SHA |
+| `status` | `slip_status` | Overall slip status (text DOMAIN) |
+| `step_details` | jsonb | Step timing, actor and error details |
+| `state_history` | jsonb | Complete audit trail |
+| `claimed_from` | text | Claim flag (DEVOPS-367); NULL when unclaimed |
+| `{step}_status` | `step_status` | Status per configured step (added by ensurers) |
+| `{aggregate step}` | jsonb | Per-component data for an aggregate step |
+| `created_at` / `updated_at` | timestamptz | Timestamps |
+
+`slip_component_states` holds one current-state row per `(correlation_id, step, component)`,
+and `slip_ancestry` the direct parent links.
 
 ### Migrations
 
-Migrations are managed automatically on client creation. To run migrations manually:
+Run them from the migrator process, not from the service that serves slips:
 
 ```go
-// Load pipeline configuration
-config, err := slippy.LoadPipelineConfig()
-if err != nil {
-    log.Fatal(err)
-}
-
-// Run migrations with the pipeline config
-result, err := slippy.RunMigrations(ctx, conn, slippy.MigrateOptions{
-    Database:       "ci",
-    DryRun:         false,
+result, err := slippy.RunPostgresMigrations(ctx, pool, slippy.PostgresMigrateOptions{
     TargetVersion:  0, // 0 = latest
-    PipelineConfig: config,
+    PipelineConfig: pipelineConfig,
 })
 ```
 

@@ -21,8 +21,8 @@
 - *Cascade abort* — step in `aborted` because prereq failed. Does NOT drive `slip.status=failed`.
 - *Aggregate step* — rollup of N components (e.g. `builds`). Status derived from component states.
 - *Pure pipeline step* — `componentName == ""` (e.g. `unit_tests`, `dev_deploy`).
-- *Event log* — `slip_component_states` table. Append-only. Authoritative source of step status history. argMax-derived view is the truth.
-- *Materialized step columns* — `routing_slips.<step>_status` columns. Cached projection from event log. Must always match argMax-derived status (per I5).
+- *Component-state rows* — `slip_component_states` table. One current-state row per (correlation_id, step, component); `component = ''` is the pipeline-level row. The authoritative step status.
+- *Materialized step columns* — `routing_slips.<step>_status` columns. Cached projection of the component-state rows. Must always match them (per I5).
 
 ## Rules
 
@@ -52,7 +52,7 @@
 ## Consistency Invariants
 
 A **discrepancy** is any condition where `slip.status` violates one of these invariants.
-Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - Slippy State Machine Discrepancies). bd issue `goLibMyCarrier-nl3` covers a concrete I5 violation example (write-path stale column clone). bd issue `goLibMyCarrier-yix` is a related but distinct bug (decision-time staleness in `hydrateSlip` — separate from the I5 write-path issue).
+Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - Slippy State Machine Discrepancies). bd issue `goLibMyCarrier-nl3` covers a concrete I5 violation example (write-path stale column clone). bd issue `goLibMyCarrier-yix` is a related but distinct bug (decision-time staleness in the removed ClickHouse store's read path — separate from the I5 write-path issue). Both predate DEVOPS-343.
 
 | # | Invariant |
 |---|-----------|
@@ -60,38 +60,18 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 | **I2** | `slip=failed` with zero primary failures → **violation** |
 | **I3** | `slip=completed` while any step is a primary failure OR `status = running` → **violation** |
 | **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335). **Formerly an exception path:** slippy-api's `POST /v1/slips/{id}/claim` wrote `in_progress` unconditionally under DEVOPS-285; since DEVOPS-367 the claim is a flag and writes no status at all, so it no longer touches `slip.status` — see "An ended row may have work in flight against it" under the repave sharp edges |
-| **I5** | `routing_slips.<step>_status` column does not match event-log-derived status (via `argMax(status, timestamp) FROM slip_component_states GROUP BY step`) → **materialization violation** |
+| **I5** | `routing_slips.<step>_status` column does not match the status the store derives for that step from its `slip_component_states` rows → **materialization violation** |
 
-**Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative event log in `slip_component_states`. Divergence indicates a write-path bug, not a state-machine logic bug.
+**Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative rows in `slip_component_states`. PostgresStore writes both in one transaction under the slip's row lock (`updateStepTx`), so I5 holds by construction there. Divergence indicates a write-path bug, not a state-machine logic bug.
 
-**I5 — async-insert visibility race (resolved):** With `async_insert=1`, the `INSERT` issued by `insertComponentState` may not be visible to the subsequent `SELECT` inside `hydrateSlip` on the same connection, causing `computeAggregateStatus` to return a stale (e.g. `running`) result that is written back to `routing_slips` — permanently stuck. **Fix:** `overlayComponentState` (clickhouse_store.go) merges the just-inserted row into the in-memory `*Slip` immediately after `Load()` and before `Update()` inside both `updateAggregateStatus*` functions. This is a read-your-own-writes safety net: I1 conformance is guaranteed even when the event log row is not yet flushed. External readers (HyperDX) may see a transient `~200ms` window of bounded staleness — this was the pre-existing async-flush latency and is an acceptable trade-off vs. the previous permanent staleness.
-
-**I5 — placeholder-component divergence (resolved, 2026-05-14):** On feature-branch repos (MC.*/ITM.*), `initializeSlipForPush` seeds the `builds` aggregate with PascalCase placeholder entries (e.g. `ExampleApi`, `ExampleWorker`) that have no timestamps. The Path B recompute blocks inside `updateAggregateStatusFromComponentStates` and `updateAggregateStatusFromComponentStatesWithHistory` previously passed the full `slip.Aggregates[aggregateStepName]` slice — including these placeholder entries — to `computeAggregateStatus`. At the final boundary (all real components completed, placeholder still pending), `computeAggregateStatus` returned `running` instead of `completed`, leaving `builds_status` permanently stuck. **Fix:** both Path B recompute blocks now call `filterActiveComponents` (a new helper in `clickhouse_store.go`) to strip zero-timestamp entries before recompute, aligning Path B with the active-only filter already used by Path A (`applyComponentStatesToAggregate`). If no active components exist yet, the recompute is skipped (existing step status preserved).
-
-**I5 — sibling-column stale-clone wedge (resolved, bd mycarrier-5dv5, prod repro `74cd6676`):** The original I5 write-path fix (Rule 9 / Violation 5 below) closes the stale-clone race only for the one step the caller is actively writing, via a caller-supplied `stepStatusOverride`. It does NOT close the race for SIBLING step columns: `insertAtomicStatusUpdate` / `insertAtomicHistoryUpdate` still cloned every other step-status column verbatim from the current top `routing_slips` row. Under ClickHouse async-insert visibility lag (`VersionedCollapsingMergeTree` without `FINAL`), that verbatim clone SELECT could miss a sibling handler's just-written step column and re-seal the stale value at a new highest version — permanently, once the slip reaches a terminal status (nothing subsequently re-derives a terminal row's cached columns). **Fix:** `buildCloneStepColumnDerive` (clickhouse_store.go) builds a 3-tier precedence expression, inline inside the same `INSERT ... SELECT` (no Load→compute→INSERT round-trip), for every PURE (non-aggregate) step-status column in `insertAtomicStatusUpdate` and `insertAtomicHistoryUpdate`:
-  1. caller-supplied `stepStatusOverride` (`?` literal) — highest precedence, unchanged from the original fix.
-  2. server-side `argMax(status, <sort key>) FROM slip_component_states` — filtered to `component = ''`, using the same `componentEventSortKeyNoImageTag` sort key used elsewhere for argMax-derived status — middle precedence. This is the new tier that closes the sibling-column wedge: it derives the sibling's current status from the authoritative event log instead of trusting the (possibly stale) cloned column.
-  3. verbatim cloned column value — lowest precedence (fallback when no matching event exists yet). Deliberately NOT `StepStatusPending` — a deliberate deviation from the BC-16 pending-coalesce convention used elsewhere, because these clone-derive code paths have no in-memory `*Slip` to consult; "no event yet" here must mean "trust whatever the row being cloned already had."
-  Aggregate step-status columns are explicitly OUT of scope for this derive — they remain the R2 path's responsibility (`resolveEffectiveStepStatuses` / `updateWithOverrides`) and are always cloned verbatim inside `buildCloneStepColumnDerive`, override or not. The `routing_slips` writer taxonomy is enforced by `TestRoutingSlipsWriterCanary` (`clickhouse_store_writer_canary_test.go`), which classifies every writer as one of: `FRESH_ROW` (a full new row — `Create`/`insertRow`), `R2_DERIVED` (aggregate rollup via `resolveEffectiveStepStatuses`), or `CLONE_DERIVED` (`insertAtomicStatusUpdate` / `insertAtomicHistoryUpdate`, now with the 3-tier precedence described here). **Accepted cost:** this issues one correlation-bounded scalar subquery per un-overridden pure step per write (P scalar subqueries, P = pure-step count), rather than a single shared scan across all pure steps; a single-scan `LEFT JOIN` refactor is tracked as a known follow-up, not yet required by benchmark evidence.
-
-**Accepted tradeoff — `handlePushRetry` best-effort history write-back (bd mycarrier-5dv5):** `handlePushRetry` (`push.go`) resets `push_parsed` on retry via `UpdateStepWithHistory` rather than separate `UpdateStep`/`AppendHistory` calls (see Rule 9's extension above), which also means it inherits `UpdateStepWithHistory`'s pure-step branch best-effort write-back semantics (#75): a failed history write-back is Warn-logged and non-fatal, superseding the previously hard-fail contract for standalone `AppendHistory` on this path (commit `a45e63c`). The `state_history` audit entry for the retry-reset transition is lost in that narrow window; `push_parsed_status` itself self-heals on next `Load`; event insert / gate-check failures still hard-fail the retry.
-
-**Known residual — tier-2 derive inversion window (accepted, documented, bd mycarrier-5dv5, PR #78 review thread):** For a non-overridden pure step, CLONE_DERIVED tier-2 (`argMax` over `slip_component_states`) beats the tier-3 cloned column whenever any event is visible to the derive SELECT. If a sibling's freshly-overridden `routing_slips` row becomes visible to the clone SELECT before that sibling's earlier-committed backing event does — cross-table visibility skew — tier-2 re-derives from the older visible event and can transiently revert the override at a new version.
-
-*Epistemic status:* PREDICTED, never observed — zero occurrences across two concurrent storms, failure-injection, and an A/B replay vs v1.3.95 (2026-07-15, bd mycarrier-5dv5); every version walk was checked for the clone-born-regression signature. Requires the storage layer to invert visibility against same-connection commit order (every writer commits the event before the row).
-
-*Severity:* low/cosmetic — snapshot column only; gates and pipeline flow read `slip_component_states` directly; `hydrateSlip` corrects every `Load`; heals on next write. Cannot recreate the "sealed forever" class (line 70 above) unless the event never becomes visible to any later write.
-
-*Lineage:* NOT introduced by CLONE_DERIVED — it is the inherent residual of the R2 "event log wins for pure steps" semantic ratified in PR #77 (`resolveEffectiveStepStatuses`: override > argMax > fallback); the same window has existed in the R2 aggregate write-back path since #77. CLONE_DERIVED extended the ratified semantic to the clone writers and documented the residual (PR #78 review thread, comment 3588778369-series/3588778389).
-
-*Fix ladder — REJECTED (MUST NOT be implemented; each breaks a ratified contract):*
-1. Monotonic "derive may never downgrade a terminal column" guard — violates the BC-17/BC-19 rerun idiom (a legit rerun IS a newer running event beating an older completed one; the guard cannot distinguish rerun from inversion).
-2. Row-columns-as-pseudo-events union (`argMax` over events ∪ row values @ version-time) — stale clones mint high versions, so stale values win the union, reintroducing the `74cd6676` bug wholesale.
-3. Event-timestamp vs row-version comparison — cannot disambiguate: in the original `74cd6676` wedge the FRESH event is also older than the stale clone row's version; row versions do not order content freshness.
-
-*Fix ladder — viable future fixes (tracked bd mycarrier-gzar):*
-1. Preferred: `SETTINGS select_sequential_consistency=1` on the derive read (CH Cloud SharedMergeTree) — removes the visibility skew at the root (event committed before row ⇒ visible whenever row is); needs a spike for INSERT...SELECT inner-read semantics + hot-path latency sign-off (same "conscious consequence" bar as R2's extra point-scan in #77).
-2. Fallback: per-step explicit-write provenance-map column joined into tier-2 evidence — closes the window without consistency costs but requires revising the D1 schema freeze.
+**I5 history — ClickHouse slip store (removed, DEVOPS-343).** Every I5 divergence recorded here
+before v1.5.0 came from the ClickHouse store: its async-insert visibility gap under
+VersionedCollapsingMergeTree without FINAL, the placeholder-component recompute, and the
+sibling-column stale-clone wedge (bd mycarrier-5dv5, prod repro `74cd6676`), with their fixes
+(`overlayComponentState`, `filterActiveComponents`, the CLONE_DERIVED 3-tier derive), the
+`handlePushRetry` best-effort history trade-off, and the accepted tier-2 inversion residual. None
+applies to PostgresStore. The full entries are in this file's history up to goLibMyCarrier v1.4.x
+(`git log -p -- .github/STATE_MACHINE_V3.md`).
 
 **Note on `aborted`:** cascade failures (`aborted`) are NOT primary failures — they do not independently drive `slip=failed` and are not counted in I1/I2/I3.
 **Note on `pending`/`held`:** non-terminal, do not block any transition including completion (I3).
@@ -151,7 +131,7 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
   A failed `Repave` is fatal to the push: nothing was written, so there is no successor to
   report, and failing lets Kafka redeliver against a store that still holds the superseded
-  row. A store that cannot repave at all (`ClickHouseStore`) returns `ErrRepaveUnsupported`
+  row. A store that cannot repave at all returns `ErrRepaveUnsupported`
   and the push path falls back to pre-DEVOPS-231 abandon-then-create semantics.
 - **Empty-run guard.** If the incoming push will dispatch nothing, the existing slip for
   that SHA is ended, and the push does **not** carry that row's own `correlation_id`,
@@ -473,9 +453,9 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
     decides which route to attempt — a dedup decided there skips ancestor resolution entirely —
     while the locked read decides what actually happens. On a refusal both in-place reset arms
     **deduplicate onto the live row** rather than failing the push: the claimant's run owns the
-    slip and the desired end state, one run for this commit, already holds. The ClickHouse
-    store returns `ErrResetUnsupported` and the push falls back to a plain `Create`, which
-    loses nothing there — it has no `claimed_from` column, so it has no claim to protect.
+    slip and the desired end state, one run for this commit, already holds. A store that
+    cannot take the lock returns `ErrResetUnsupported` and the push falls back to a plain
+    `Create`, which loses nothing there — with no `claimed_from` column there is no claim to protect.
   - **It ends when the run is over, and only then.** Two ways: a **terminal status write**
     through `UpdateSlipStatus` — the ONE write path that ends a claim, which `AbandonSlip`,
     `PromoteSlip` and `checkPipelineCompletion` all take — clears it, because terminal ends
@@ -998,13 +978,13 @@ Auto-deployer is **read-only** (polls `GetSlip`). It triggers Argo workflows via
 
 ### `checkPipelineCompletion` Pseudocode
 
-**Location:** `executor.go:249`
+**Location:** `executor.go` (`checkPipelineCompletion`)
 **Triggered by:** terminal event on a pure pipeline step (guard: `IsTerminal() && componentName == ""`)
 
 ```
 checkPipelineCompletion(ctx, correlationID):
 
-  slip = store.Load()  →  hydrateSlip()   // re-derives ALL statuses from slip_component_states
+  slip = store.Load()   // step columns match slip_component_states (I5)
 
   // GUARD: only completed is immutable (NOT IsTerminal())
   if slip.Status == completed:
@@ -1041,9 +1021,9 @@ checkPipelineCompletion(ctx, correlationID):
 
 | Category | `componentName` | Example | Update path in store |
 |----------|-----------------|---------|---------------------|
-| Pure pipeline | `""` | `unit_tests`, `dev_deploy`, `prod_gate` | `appendHistoryWithOverrides` - atomic INSERT SELECT, one column override |
-| Aggregate | `""` (rollup; before any component reports: writes the step column, DEVOPS-373) | `builds` | `updateAggregateStatusFromComponentStatesWithHistory` - full Load+hydrateSlip+Update |
-| Component | `"mc.x.y"` | individual build | `insertComponentState` + triggers aggregate recalc |
+| Pure pipeline | `""` | `unit_tests`, `dev_deploy`, `prod_gate` | `updateStepTx`: upsert the pipeline-level component-state row, then `writeStepStatusColumn`, in one transaction |
+| Aggregate | `""` (rollup; before any component reports: writes the step column, DEVOPS-373) | `builds` | `updateStepTx`: `recomputeAggregate` over the component rows |
+| Component | `"mc.x.y"` | individual build | `updateStepTx`: upsert the component row, then `recomputeAggregate` for its aggregate step |
 
 ### Step Status Reference
 
@@ -1071,7 +1051,7 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 2. **`checkPipelineCompletion` internal order** - the algorithm MUST follow: (a) completed short-circuit, (b) scan primaryFailures and cascadeFailures, (c) primaryFailures check FIRST → failed, (d) prod_steady_state check SECOND → completed, (e) recovery check THIRD. Flag any reordering of steps (c) and (d).
 
-3. **Event log written first** - `insertComponentState` MUST be called before any `routing_slips` write. Flag any change that writes to `routing_slips` before writing to `slip_component_states`.
+3. **Component-state row and step column in one transaction** - a step write MUST update `slip_component_states` and `routing_slips` in the same transaction (`updateStepTx`). Flag any change that writes one outside the other's transaction.
 
 4. **Slip status at creation** - `initializeSlipForPush` MUST set `Status: SlipStatusInProgress`, not `pending`.
 
@@ -1083,10 +1063,9 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 8. **Pipeline phase impact** - identify which pipeline phase(s) the change touches (STATE_MACHINE_V3.md phases) and verify phase transition behaviour is preserved. Flag any change where the high-level phase flow would need to be redrawn but hasn't been updated.
 
-9. **Atomic INSERT SELECT must override step columns being modified** — any new caller of `insertAtomicStatusUpdate`, `appendHistoryWithOverrides`, or `insertAtomicHistoryUpdate` MUST pass `stepStatusOverride` for every step whose status the caller intends to change. Verbatim cloning of step columns is unsafe under VersionedCollapsingMergeTree without FINAL — the just-written row may not be visible to the next SELECT.
-   **Extended (bd mycarrier-5dv5):** this is no longer the whole story for SIBLING step columns — the ones the caller is NOT overriding. `insertAtomicStatusUpdate` / `insertAtomicHistoryUpdate` now derive every un-overridden PURE step-status column server-side via the CLONE_DERIVED 3-tier precedence (caller override > `argMax` over `slip_component_states` > verbatim clone) built by `buildCloneStepColumnDerive` — see the "I5 — sibling-column stale-clone wedge" entry under Consistency Invariants above. Callers must still pass `stepStatusOverride` for the step they are actively writing (tier 1 is still required — it is the cheapest and most direct way to guarantee the writer and its own override agree); aggregate step-status columns are still the R2 path's responsibility and are always cloned verbatim by this derive, override or not.
+9. **(Removed with the ClickHouse store, DEVOPS-343.)** This rule governed the ClickHouse INSERT SELECT writers (`stepStatusOverride`, CLONE_DERIVED). PostgresStore writes step columns with plain UPDATEs inside the slip's row-locked transaction, so there is no clone to override.
 
-10. **Event log is source of truth** — never read raw `routing_slips.<step>_status` for correctness decisions. Always go through `Load` + `hydrateSlip`, OR query `slip_component_states` directly with `argMax(status, timestamp)`.
+10. **Component-state rows are the source of truth** — never read raw `routing_slips.<step>_status` for correctness decisions. Always go through `Load`, OR read the step's `slip_component_states` rows.
 
 ### 4 Most Common Violations
 
@@ -1094,13 +1073,11 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 **Violation 2 (I3):** `checkPipelineCompletion` order changed - `prod_steady_state` check placed before primary failures scan → pipeline can be marked `completed` despite having failed steps. Rule: `STATE_MACHINE.md §5` - algorithm order.
 
-**Violation 3 (persistence):** `routing_slips` written before `insertComponentState` → if the process crashes between the two writes, `hydrateSlip` will not override the cached status; step is permanently stuck. Rule: `STATE_MACHINE.md §8`.
+**Violation 3 (persistence):** a step write that updates `routing_slips` and `slip_component_states` in separate transactions → a crash between the two leaves the column and the row disagreeing (I5). Rule: checklist item 3.
 
 **Violation 4 (phase independence):** New prerequisite added to a step that breaks phase independence - e.g., adding `unit_tests` to `dev_deploy` prereqs couples DEV TRACK to CI_PARALLEL completion. Rule: `STATE_MACHINE_V3.md` - DEV + PREPROD PARALLEL phase.
 
-**Violation 5 (I5):** `insertAtomicStatusUpdate` (or any INSERT SELECT in the write path) clones step columns from a stale source row when the just-written row is not yet visible (ClickHouse async insert visibility under VersionedCollapsingMergeTree without FINAL). routing_slips column reverts to stale value while event log shows correct status. Fix: pass `stepStatusOverride` for the modified step into the atomic INSERT SELECT path. Rule: see bd issue `goLibMyCarrier-nl3`.
-
-**Violation 5, extended (I5, bd mycarrier-5dv5, prod repro `74cd6676`):** the override-only fix above closes the race only for the step the caller is actively writing. Sibling step-status columns — the ones cloned verbatim because the caller has no reason to override them — are exposed to the identical race: a sibling handler's just-written event can be invisible to the clone SELECT, re-sealing a stale sibling column at a new highest version, permanently once the slip is terminal. Fix: `insertAtomicStatusUpdate` / `insertAtomicHistoryUpdate` now derive every un-overridden pure step-status column server-side via the CLONE_DERIVED 3-tier precedence (override > `argMax` over `slip_component_states` > verbatim clone), enforced by `TestRoutingSlipsWriterCanary`'s `FRESH_ROW` / `R2_DERIVED` / `CLONE_DERIVED` writer taxonomy. See the "I5 — sibling-column stale-clone wedge" entry under Consistency Invariants above and Rule 9's extension.
+**Violation 5 (I5):** removed with the ClickHouse store (DEVOPS-343). It described the ClickHouse INSERT SELECT stale-clone race, which PostgresStore's transactional writes cannot produce.
 
 ---
 
@@ -1271,13 +1248,9 @@ The file `slippy/state_machine_invariants_test.go` is the machine-readable enfor
 | `TestStateMachine_I4_CompletedSlipIgnoresRecoveryAttempts` | I4 | `checkPipelineCompletion` on a completed slip changes nothing |
 | `TestClient_PromoteSlip_Immutable` | I4 | `FailStep`/`UpdateStepWithStatus` on a promoted slip does not change `slip.status` |
 | `TestClient_AbandonSlip_Immutable` | I4 | `FailStep`/`CompleteStep`/`UpdateStepWithStatus` on an abandoned slip does not change `slip.status` |
-
-| `TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride` | I5 | `FailStep` on a running step wires the step-override through `checkPipelineCompletion`; `slip.status=failed` and the failing step column retains its authoritative value. Mock-based: verifies API contract (override computed and applied), not the ClickHouse async-insert race. See goLibMyCarrier-nl3. |
-| `TestStateMachine_I5_StaleStepColumnNotPropagated` | I5 | Sequential terminal events (`FailStep` → `CompleteStep` → `FailStep`) do not revert earlier step columns to stale values; every `checkPipelineCompletion` call preserves all current primary-failure overrides. Mock-based: synchronous store cannot reproduce the visibility race; validates override-wiring contract. See goLibMyCarrier-nl3. |
-| `TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog` | I5 | Under sequential and concurrent terminal step events, `routing_slips.<step>_status` matches `argMax`-derived status from `slip_component_states`; recovery race leaves no stale columns. File: `slippy/e2e_integration_test.go` (build tag: `integration`). |
+| `TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride` | I5 | `FailStep` on a running step: `slip.status=failed` and the failing step column keeps its authoritative value. Mock-based. |
+| `TestStateMachine_I5_StaleStepColumnNotPropagated` | I5 | Sequential terminal events (`FailStep` → `CompleteStep` → `FailStep`) do not revert earlier step columns to stale values, and slip.status stays failed while any primary failure remains. Mock-based. |
 
 Run with: `go test -run TestStateMachine ./slippy/...`
-
-Run I5 e2e test with: `go test -tags integration -run TestE2E_ConcurrentTerminalStepEvents -v ./slippy/...`
 
 Failing tests indicate an invariant violation and MUST be resolved before merging.

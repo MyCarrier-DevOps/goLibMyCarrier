@@ -13,7 +13,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Multi-module architecture** - each package has its own `go.mod`
 - **Unified versioning** - all modules share same version (e.g., `v1.3.43`)
 - **75% test coverage threshold** enforced per module
-- **ClickHouse-backed persistence** for slippy routing slips
+- **Postgres-backed persistence** for slippy routing slips (the ClickHouse slip store was removed in DEVOPS-343; entries below that name `clickhouse_store.go` are history)
 
 ---
 
