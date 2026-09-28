@@ -1,7 +1,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/slippyapi.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/slippyapi) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/slippyapi)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/slippyapi)
 # Slippy API URL Resolver
 
-Lightweight, stdlib-only helpers for discovering the slippy-api HTTP base URL from the current environment. Kept separate from `goLibMyCarrier/slippy` (the state-machine library) so CLI tools, migrators, deploy-race checks, and push-event parsers can resolve the URL without pulling in ClickHouse, GitHub, or pipeline-config dependencies.
+Lightweight, stdlib-only helpers for discovering the slippy-api HTTP base URL from the current environment. Kept separate from `goLibMyCarrier/slippy` (the state-machine library) so CLI tools, migrators, deploy-race checks, and push-event parsers can resolve the URL without pulling in Postgres (pgx), GitHub, or pipeline-config dependencies.
 
 ## Usage
 
@@ -34,4 +34,4 @@ if err != nil {
 
 The returned URL never ends with a trailing slash.
 
-Note: this allow-list is intentionally narrower than `slippy/config.go`'s K8S_NAMESPACE classification. Sibling-package namespaces such as `feature-*` or `*-dev` will error here — operators on those namespaces must set `SLIPPY_API_URL` explicitly.
+Note: this allow-list is intentionally narrow. Namespaces such as `feature-*` or `*-dev` will error here — operators on those namespaces must set `SLIPPY_API_URL` explicitly.
