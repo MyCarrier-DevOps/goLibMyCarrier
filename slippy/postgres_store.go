@@ -454,7 +454,7 @@ func (s *PostgresStore) newSlipScan(extra ...any) (sc *pgSlipScan, dest []any) {
 // populate turns a scanned pgSlipScan into a fully hydrated Slip: the Steps map from the
 // status columns, timing/actor/error merged from step_details, the aggregate component
 // slices, and the state-history audit trail. Missing step timing is backfilled from the
-// history, matching the ClickHouse scanner.
+// history (reconstructStepTimingFromHistory).
 func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 	slip := sc.slip
 	slip.Status = SlipStatus(sc.statusStr)
@@ -469,9 +469,80 @@ func (s *PostgresStore) populate(sc *pgSlipScan) *Slip {
 
 	slip.StateHistory = decodeStateHistory(sc.stateHistory)
 
-	// Reuse the shared (backend-agnostic) timing reconstruction from the scanner.
-	NewSlipScanner(s.config).reconstructStepTimingFromHistory(slip)
+	reconstructStepTimingFromHistory(slip)
 	return slip
+}
+
+// reconstructStepTimingFromHistory fills in missing step timing from state_history entries.
+// It recovers timing that step_details does not carry, for example a step whose
+// step_details entry was written before its timing was known.
+//
+// The state_history is append-only and contains authoritative timestamps for when
+// steps transitioned to "running" (StartedAt) and terminal states (CompletedAt).
+// By scanning history, we can recover timing that would otherwise be lost.
+//
+// This function only fills in MISSING timing - it does not overwrite existing values
+// from step_details, preserving any timing that was successfully persisted.
+func reconstructStepTimingFromHistory(slip *Slip) {
+	if len(slip.StateHistory) == 0 {
+		return
+	}
+
+	// Build a map of step timing from history entries.
+	// For each step (non-component entries only), find:
+	// - First "running" transition -> StartedAt
+	// - First terminal transition -> CompletedAt
+	type stepTiming struct {
+		startedAt   *time.Time
+		completedAt *time.Time
+	}
+	historyTiming := make(map[string]*stepTiming)
+
+	for i := range slip.StateHistory {
+		entry := &slip.StateHistory[i]
+
+		// Skip component-level entries - they're tracked in Aggregates
+		if entry.Component != "" {
+			continue
+		}
+
+		// Initialize timing struct if needed
+		if historyTiming[entry.Step] == nil {
+			historyTiming[entry.Step] = &stepTiming{}
+		}
+		timing := historyTiming[entry.Step]
+
+		// Capture the timestamp (make a copy to avoid pointer issues)
+		ts := entry.Timestamp
+
+		// Record first "running" transition as StartedAt
+		if entry.Status == StepStatusRunning && timing.startedAt == nil {
+			timing.startedAt = &ts
+		}
+
+		// Record first terminal transition as CompletedAt
+		if entry.Status.IsTerminal() && timing.completedAt == nil {
+			timing.completedAt = &ts
+		}
+	}
+
+	// Fill in missing timing for steps
+	for stepName, timing := range historyTiming {
+		step, ok := slip.Steps[stepName]
+		if !ok {
+			continue
+		}
+
+		// Only fill in if the step is missing timing
+		if step.StartedAt == nil && timing.startedAt != nil {
+			step.StartedAt = timing.startedAt
+		}
+		if step.CompletedAt == nil && timing.completedAt != nil {
+			step.CompletedAt = timing.completedAt
+		}
+
+		slip.Steps[stepName] = step
+	}
 }
 
 // stepsFromStatuses turns the scanned per-step status strings — always in s.config.Steps

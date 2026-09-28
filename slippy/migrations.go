@@ -29,21 +29,6 @@ type MigrateOptions struct {
 	PipelineConfig *PipelineConfig
 }
 
-// MigrateResult contains information about the migration run.
-type MigrateResult struct {
-	// StartVersion is the schema version before migration.
-	StartVersion int
-
-	// EndVersion is the schema version after migration.
-	EndVersion int
-
-	// MigrationsApplied is the number of migrations that were applied.
-	MigrationsApplied int
-
-	// Direction indicates whether migrations went "up" or "down".
-	Direction string
-}
-
 // RunMigrations ensures the slippy schema is up to date.
 // It creates the schema_version table if needed and applies any pending migrations.
 // A PipelineConfig is required to generate the dynamic schema.

@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +22,76 @@ const (
 	terminalStepStatusesSQL    = "'completed','failed','error','aborted','timeout','skipped'"
 	nonTerminalStepStatusesSQL = "'pending','held','running'"
 )
+
+// defaultFreshnessWindowMS is the default window (in milliseconds) for the I5
+// terminal-freshness guard in upsertComponentState. A terminal component state younger than
+// this is "fresh", and a non-terminal write may not overwrite it. Configurable via
+// SLIPPY_I5_FRESHNESS_WINDOW_MS.
+//
+// 750 ms was derived from a 90-day production replay: the artifact ceiling
+// (spurious duplicate-write races) tops out at 465 ms, while the legitimate-restart
+// floor (genuine re-runs / re-cycles) starts at 1,700 ms. 750 ms bisects that gap.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
+const defaultFreshnessWindowMS = 750
+
+// maxFreshnessWindowMS is the maximum permitted freshness window, in milliseconds
+// (1 hour). Security M1: freshnessWindow clamps any larger value down to this at read time.
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
+const maxFreshnessWindowMS = 3600000
+
+// gateBypassSteps lists step names whose pipeline-level writes (component="") bypass
+// the terminal-freshness gate. push_parsed is bypassed because push-webhook retries
+// legitimately reset a terminal push_parsed event to running within the freshness
+// window — this is safe-by-design, not a race artifact.
+var gateBypassSteps = map[string]bool{ //nolint:gochecknoglobals // Go cannot declare const maps; bypass steps are a fixed, small set
+	"push_parsed": true,
+}
+
+// gateEnabled returns true when the I5 terminal-freshness gate should enforce
+// terminal-monotonicity. Reads SLIPPY_I5_GATE_ENABLED (strconv.ParseBool).
+// Defaults to true (fail-safe ON) when the variable is absent or unparseable.
+func gateEnabled() bool {
+	val, ok := os.LookupEnv("SLIPPY_I5_GATE_ENABLED")
+	if !ok {
+		return true // fail-safe ON when unset
+	}
+	enabled, err := strconv.ParseBool(val)
+	if err != nil {
+		return true // fail-safe ON on invalid value
+	}
+	return enabled
+}
+
+// freshnessWindow returns the configured freshness window for the I5 gate.
+// Reads SLIPPY_I5_FRESHNESS_WINDOW_MS (integer milliseconds). Defaults to
+// defaultFreshnessWindowMS (750 ms) when the variable is absent, non-integer,
+// or <= 0. Values above maxFreshnessWindowMS are clamped down to
+// maxFreshnessWindowMS rather than passed through raw.
+//
+// It re-reads the env var on every call and nothing validates the value at startup, so the
+// clamp is the guard: without it a huge value (e.g.
+// SLIPPY_I5_FRESHNESS_WINDOW_MS=10000000000000) would pass the Atoi/>0 checks here, and
+// `time.Duration(ms) * time.Millisecond` would overflow int64 into a negative duration,
+// silently killing the gate (the age <= window test is then always false).
+//
+// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
+func freshnessWindow() time.Duration {
+	val := os.Getenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+	if val == "" {
+		return defaultFreshnessWindowMS * time.Millisecond
+	}
+	ms, err := strconv.Atoi(val)
+	if err != nil || ms <= 0 {
+		return defaultFreshnessWindowMS * time.Millisecond
+	}
+	// Defensive cap: prevents int64 overflow -> negative window -> dead gate.
+	if ms > maxFreshnessWindowMS {
+		ms = maxFreshnessWindowMS
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // UpdateStep updates a step's status. Component-level updates (componentName != "") and
 // aggregate steps roll up into the aggregate columns once any component has reported; before
@@ -424,6 +497,20 @@ func (s *PostgresStore) updateStepTx(
 	})
 }
 
+// safeStepNameForDerivePattern matches step names that are safe to splice, through
+// stepStatusColumn, into a column identifier. writeStepStatusColumn consults it before it
+// builds its UPDATE, and a name that does not match writes nothing: the guard fails closed.
+//
+// LOOSER THAN THE CONFIG-TIME CHECK, DELIBERATELY. validateStepIdentifier (pipeline_config.go)
+// requires ^[A-Za-z_][A-Za-z0-9_]*$, and the difference is real: this pattern admits a leading
+// digit, and `1deploy` is not a legal non-quoted Postgres identifier. That is not a live hole,
+// because writeStepStatusColumn tests config.GetStep(stepName) != nil before it consults this
+// pattern, and a configured step name has been through validateStepIdentifier at parse time.
+// The config is where a bad name is rejected (PR #87, pkuzmenko finding 1 arm A); this is
+// defense in depth behind it. The name predates the ClickHouse store's removal (DEVOPS-343),
+// whose clone-derive expression was this pattern's other splice site.
+var safeStepNameForDerivePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
+
 // writeStepStatusColumn writes one step's <step>_status column. stepName arrives from
 // unvalidated HTTP/CI input through the SlipStore interface and is interpolated into the column
 // identifier, so it is spliced in ONLY after confirming it is a configured step AND a bare
@@ -586,6 +673,64 @@ func (s *PostgresStore) recomputeAggregate(
 		return false, fmt.Errorf("failed to write aggregate %s: %w", aggStep, err)
 	}
 	return true, nil
+}
+
+// buildComponentData constructs a ComponentStepData value from a raw componentStateRow.
+func buildComponentData(componentName string, state componentStateRow) ComponentStepData {
+	ts := state.Timestamp
+	compData := ComponentStepData{
+		Component: componentName,
+		Status:    StepStatus(state.Status),
+		ImageTag:  state.ImageTag,
+	}
+	// Only populate Error for failure statuses; non-failure messages (e.g. progress
+	// notes on a running step) should not appear as errors in downstream consumers.
+	if state.Message != "" && StepStatus(state.Status).IsFailure() {
+		compData.Error = state.Message
+	}
+	if StepStatus(state.Status).IsRunning() {
+		compData.StartedAt = &ts
+	}
+	if StepStatus(state.Status).IsTerminal() {
+		compData.CompletedAt = &ts
+	}
+	return compData
+}
+
+// updateExistingComponent merges updated fields from src into dest, preserving
+// existing non-zero values where the src field is zero.
+func updateExistingComponent(dest *ComponentStepData, src ComponentStepData) {
+	dest.Status = src.Status
+	// When the new status is a failure, propagate the error message.
+	// When transitioning away from failure (e.g. a retry succeeds), clear any
+	// stale error so observers do not see incorrect error information.
+	if src.Status.IsFailure() {
+		if src.Error != "" {
+			dest.Error = src.Error
+		}
+	} else {
+		dest.Error = ""
+	}
+	if src.ImageTag != "" {
+		dest.ImageTag = src.ImageTag
+	}
+	if src.StartedAt != nil && dest.StartedAt == nil {
+		dest.StartedAt = src.StartedAt
+	}
+	if src.CompletedAt != nil {
+		if dest.CompletedAt == nil || src.CompletedAt.After(*dest.CompletedAt) {
+			dest.CompletedAt = src.CompletedAt
+		}
+	}
+}
+
+type componentStateRow struct {
+	Step      string    `ch:"step"`
+	Component string    `ch:"component"`
+	Status    string    `ch:"status"`
+	Message   string    `ch:"message"`
+	ImageTag  string    `ch:"image_tag"`
+	Timestamp time.Time `ch:"timestamp"`
 }
 
 // resolveAggregateStep maps a step name to its aggregate step: the aggregate a component

@@ -12,6 +12,21 @@ import (
 // slippyExpectedTables are the core tables the Postgres schema must contain.
 var slippyExpectedTables = []string{"routing_slips", "slip_component_states", "slip_ancestry"}
 
+// MigrateResult reports what a RunPostgresMigrations call did.
+type MigrateResult struct {
+	// StartVersion is the schema version before migration.
+	StartVersion int
+
+	// EndVersion is the schema version after migration.
+	EndVersion int
+
+	// MigrationsApplied is the number of migrations that were applied.
+	MigrationsApplied int
+
+	// Direction indicates whether migrations went "up" or "down".
+	Direction string
+}
+
 // PostgresMigrateOptions configures a Postgres migration run.
 type PostgresMigrateOptions struct {
 	// TargetVersion is the version to migrate to. 0 means "latest".

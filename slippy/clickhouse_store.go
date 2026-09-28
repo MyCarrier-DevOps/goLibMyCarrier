@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -63,85 +62,6 @@ const componentEventSortKeyWithImageTag = "toUInt64(toUnixTimestamp64Micro(times
 //
 // Promoted from doLoadComponentStates function-local to package-level (I5 v2, ADO #83405).
 const componentEventSortKeyNoImageTag = "toUInt64(toUnixTimestamp64Micro(timestamp)) * 100 + toUInt64(toUInt8(status))"
-
-// defaultFreshnessWindowMS is the default window (in milliseconds) for the I5
-// freshness gate. Events younger than this threshold are considered "fresh" for
-// terminal-monotonicity enforcement. Configurable via SLIPPY_I5_FRESHNESS_WINDOW_MS.
-//
-// 750 ms was derived from a 90-day production replay: the artifact ceiling
-// (spurious duplicate-write races) tops out at 465 ms, while the legitimate-restart
-// floor (genuine re-runs / re-cycles) starts at 1,700 ms. 750 ms bisects that gap.
-//
-// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
-const defaultFreshnessWindowMS = 750
-
-// maxFreshnessWindowMS is the maximum permitted freshness window, in milliseconds
-// (1 hour). Security M1: values above this are rejected at startup by
-// validateFreshnessWindowEnv, and clamped defensively at read-time by
-// freshnessWindow if they somehow reach that path.
-//
-// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
-const maxFreshnessWindowMS = 3600000
-
-// gateBypassSteps lists step names whose pipeline-level writes (component="") bypass
-// the terminal-freshness gate. push_parsed is bypassed because push-webhook retries
-// legitimately reset a terminal push_parsed event to running within the freshness
-// window — this is safe-by-design, not a race artifact.
-var gateBypassSteps = map[string]bool{ //nolint:gochecknoglobals // Go cannot declare const maps; bypass steps are a fixed, small set
-	"push_parsed": true,
-}
-
-// gateEnabled returns true when the I5 terminal-freshness gate should enforce
-// terminal-monotonicity. Reads SLIPPY_I5_GATE_ENABLED (strconv.ParseBool).
-// Defaults to true (fail-safe ON) when the variable is absent or unparseable.
-func gateEnabled() bool {
-	val, ok := os.LookupEnv("SLIPPY_I5_GATE_ENABLED")
-	if !ok {
-		return true // fail-safe ON when unset
-	}
-	enabled, err := strconv.ParseBool(val)
-	if err != nil {
-		return true // fail-safe ON on invalid value
-	}
-	return enabled
-}
-
-// freshnessWindow returns the configured freshness window for the I5 gate.
-// Reads SLIPPY_I5_FRESHNESS_WINDOW_MS (integer milliseconds). Defaults to
-// defaultFreshnessWindowMS (750 ms) when the variable is absent, non-integer,
-// or <= 0. Values above maxFreshnessWindowMS are clamped down to
-// maxFreshnessWindowMS rather than passed through raw.
-//
-// This is a defensive read-time fallback: in production paths, construction of
-// the ClickHouseStore already rejects invalid values via validateFreshnessWindowEnv,
-// so a misconfigured pod fails at startup rather than silently falling back here.
-// The clamp exists for the paths that skip that startup check (e.g.
-// NewClickHouseStoreFromSession/FromConn) or a post-start env mutation, since
-// freshnessWindow re-reads the env var on every call: without it, a huge value
-// (e.g. SLIPPY_I5_FRESHNESS_WINDOW_MS=10000000000000) would still pass the
-// Atoi/>0 checks here, and `time.Duration(ms) * time.Millisecond` overflows
-// int64 into a negative duration, silently killing the gate (age < window is
-// then always false).
-//
-// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D4
-func freshnessWindow() time.Duration {
-	val := os.Getenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
-	if val == "" {
-		return defaultFreshnessWindowMS * time.Millisecond
-	}
-	ms, err := strconv.Atoi(val)
-	if err != nil || ms <= 0 {
-		return defaultFreshnessWindowMS * time.Millisecond
-	}
-	// Defensive cap: prevents int64 overflow -> negative window -> dead gate.
-	// The FromConfig startup path already rejects values above this cap via
-	// validateFreshnessWindowEnv; this is the read-time backstop for paths
-	// that bypass that validation.
-	if ms > maxFreshnessWindowMS {
-		ms = maxFreshnessWindowMS
-	}
-	return time.Duration(ms) * time.Millisecond
-}
 
 // validateFreshnessWindowEnv validates SLIPPY_I5_FRESHNESS_WINDOW_MS at startup.
 // It returns a descriptive error when the variable is set AND the value is
@@ -1659,29 +1579,6 @@ var sqlSingleQuoteEscapeReplacer = strings.NewReplacer(`\`, `\\`, `'`, `''`)
 func sqlSingleQuoteEscape(s string) string {
 	return sqlSingleQuoteEscapeReplacer.Replace(s)
 }
-
-// safeStepNameForDerivePattern matches step names that are safe to splice into a coalesce(...)
-// derive expression as both a quoted string literal and (via StepStatusColumn) a column-name
-// stem. Step names originate from the operator-managed pipeline config, not request-time input,
-// but a non-identifier step name is never legitimate anyway — the column-naming convention
-// (StepStatusColumn) requires it to form a valid ClickHouse identifier. Refusing to derive for
-// anything that doesn't match keeps this a local, defense-in-depth guard: it changes nothing for
-// any real pipeline config, and for a malformed one it falls back to the pre-fix verbatim clone
-// behavior instead of risking a broken query.
-//
-// LOOSER THAN THE CONFIG-TIME CHECK, DELIBERATELY. validateStepIdentifier (pipeline_config.go)
-// requires ^[A-Za-z_][A-Za-z0-9_]*$, and the difference is real: this pattern admits a leading
-// digit, and `1deploy` is not a legal non-quoted identifier in ClickHouse or in Postgres. That
-// is not a live hole at either of this pattern's two splice sites, because both are reached
-// only for a name that is already a configured step — buildCloneStepColumnDerive below reads
-// its step names from cfg.Steps, and PostgresStore's step-column write
-// (postgres_store_updates.go) tests config.GetStep(stepName) != nil before it consults this
-// pattern — and a configured step name has been through validateStepIdentifier at parse time.
-// Left as it is on purpose: it gates a DIFFERENT splice and fails CLOSED, falling back to a
-// verbatim clone rather than emitting anything, so tightening it here would change behaviour
-// for no reachable fault. The config is where a bad name is rejected (PR #87, pkuzmenko
-// finding 1 arm A).
-var safeStepNameForDerivePattern = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 
 // buildCloneStepColumnDerive builds the CLONE_DERIVED new-row SELECT expressions for
 // insertAtomicStatusUpdate / insertAtomicHistoryUpdate. stepColumns and cfg.Steps MUST be
@@ -3579,64 +3476,6 @@ func (s *ClickHouseStore) applyComponentStatesToAggregate(
 	// We use the timestamp of the latest component update as the transition time
 	step.ApplyStatusTransition(newStatus, maxTime)
 	slip.Steps[aggregateStepName] = step
-}
-
-// buildComponentData constructs a ComponentStepData value from a raw componentStateRow.
-func buildComponentData(componentName string, state componentStateRow) ComponentStepData {
-	ts := state.Timestamp
-	compData := ComponentStepData{
-		Component: componentName,
-		Status:    StepStatus(state.Status),
-		ImageTag:  state.ImageTag,
-	}
-	// Only populate Error for failure statuses; non-failure messages (e.g. progress
-	// notes on a running step) should not appear as errors in downstream consumers.
-	if state.Message != "" && StepStatus(state.Status).IsFailure() {
-		compData.Error = state.Message
-	}
-	if StepStatus(state.Status).IsRunning() {
-		compData.StartedAt = &ts
-	}
-	if StepStatus(state.Status).IsTerminal() {
-		compData.CompletedAt = &ts
-	}
-	return compData
-}
-
-// updateExistingComponent merges updated fields from src into dest, preserving
-// existing non-zero values where the src field is zero.
-func updateExistingComponent(dest *ComponentStepData, src ComponentStepData) {
-	dest.Status = src.Status
-	// When the new status is a failure, propagate the error message.
-	// When transitioning away from failure (e.g. a retry succeeds), clear any
-	// stale error so observers do not see incorrect error information.
-	if src.Status.IsFailure() {
-		if src.Error != "" {
-			dest.Error = src.Error
-		}
-	} else {
-		dest.Error = ""
-	}
-	if src.ImageTag != "" {
-		dest.ImageTag = src.ImageTag
-	}
-	if src.StartedAt != nil && dest.StartedAt == nil {
-		dest.StartedAt = src.StartedAt
-	}
-	if src.CompletedAt != nil {
-		if dest.CompletedAt == nil || src.CompletedAt.After(*dest.CompletedAt) {
-			dest.CompletedAt = src.CompletedAt
-		}
-	}
-}
-
-type componentStateRow struct {
-	Step      string    `ch:"step"`
-	Component string    `ch:"component"`
-	Status    string    `ch:"status"`
-	Message   string    `ch:"message"`
-	ImageTag  string    `ch:"image_tag"`
-	Timestamp time.Time `ch:"timestamp"`
 }
 
 // loadComponentStates fetches the latest state for all components of a slip.

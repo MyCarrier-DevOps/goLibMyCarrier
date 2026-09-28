@@ -4,11 +4,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"strconv"
 	"testing"
 )
 
@@ -253,79 +251,68 @@ func TestPrereqStatus_String(t *testing.T) {
 	}
 }
 
-// TestAllSlipStatusesInEnum verifies that all SlipStatus constants defined in code
-// are represented in the database enum definition in dynamic_migrations.go.
-// This test automatically discovers both the status constants AND the enum definitions,
-// ensuring no status value is forgotten when updating either file.
+// TestAllSlipStatusesInEnum verifies that the SlipStatus constants in status.go and the values
+// the slip_status DOMAIN admits (postgres_migrations.go, migration v1) are the same set, so
+// neither can gain or lose a status without the other. It discovers both sides rather than
+// listing them, so adding a status to only one of the two files fails here.
 func TestAllSlipStatusesInEnum(t *testing.T) {
+	assertStatusConstantsMatchDomain(t, "SlipStatus", "slip_status")
+}
+
+// TestAllStepStatusesInEnum is TestAllSlipStatusesInEnum for StepStatus and the step_status DOMAIN.
+func TestAllStepStatusesInEnum(t *testing.T) {
+	assertStatusConstantsMatchDomain(t, "StepStatus", "step_status")
+}
+
+// assertStatusConstantsMatchDomain compares the typeName constants declared in status.go with
+// the values in the named DOMAIN's CHECK (VALUE IN (...)) list in migration v1's UpSQL.
+func assertStatusConstantsMatchDomain(t *testing.T, typeName, domain string) {
+	t.Helper()
 	_, filename, _, _ := runtime.Caller(0)
-	dir := filepath.Dir(filename)
-
-	// Parse status.go to automatically discover all SlipStatus constants
-	statusFile := filepath.Join(dir, "status.go")
-	discoveredStatuses := parseStatusConstants(t, statusFile, "SlipStatus")
-
-	if len(discoveredStatuses) == 0 {
-		t.Fatal("No SlipStatus constants found in status.go - parsing may have failed")
+	discovered := parseStatusConstants(t, filepath.Join(filepath.Dir(filename), "status.go"), typeName)
+	if len(discovered) == 0 {
+		t.Fatalf("no %s constants found in status.go - parsing may have failed", typeName)
 	}
+	domainValues := parseDomainValues(t, domain)
 
-	// Parse dynamic_migrations.go to extract enum definitions from SQL
-	migrationsFile := filepath.Join(dir, "dynamic_migrations.go")
-	enumValues := parseSlipStatusEnumsFromMigrations(t, migrationsFile)
-
-	if len(enumValues) == 0 {
-		t.Fatal("No slip status enum values found in dynamic_migrations.go - parsing may have failed")
+	constByValue := make(map[string]string, len(discovered))
+	for name, value := range discovered {
+		constByValue[value] = name
 	}
-
-	// Verify all discovered statuses have enum values
-	for statusName, statusValue := range discoveredStatuses {
-		enumValue, exists := enumValues[statusValue]
-		if !exists {
-			t.Errorf(
-				"SlipStatus constant %s = %q is missing from enum definition in dynamic_migrations.go",
-				statusName,
-				statusValue,
-			)
-			continue
-		}
-		if enumValue < 1 {
-			t.Errorf("SlipStatus %q has invalid enum value %d - must be >= 1", statusValue, enumValue)
+	for value, name := range constByValue {
+		if _, ok := domainValues[value]; !ok {
+			t.Errorf("%s constant %s = %q is missing from the %s DOMAIN in postgres_migrations.go",
+				typeName, name, value, domain)
 		}
 	}
-
-	// Verify no enum values exist for non-existent statuses
-	for enumStatus := range enumValues {
-		found := false
-		for _, discoveredStatus := range discoveredStatuses {
-			if discoveredStatus == enumStatus {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("Enum definition includes %q but this status is not defined in status.go", enumStatus)
+	for value := range domainValues {
+		if _, ok := constByValue[value]; !ok {
+			t.Errorf("the %s DOMAIN admits %q but status.go defines no %s with that value", domain, value, typeName)
 		}
 	}
+}
 
-	// Verify no duplicate enum values
-	seenValues := make(map[int]string)
-	for status, value := range enumValues {
-		if existing, found := seenValues[value]; found {
-			t.Errorf("Duplicate enum value %d used for both %q and %q", value, existing, status)
+// parseDomainValues returns the quoted values of `CREATE DOMAIN <domain> AS text CHECK (VALUE IN
+// (...))` in migration v1's UpSQL. It fails the test when the DOMAIN is absent or lists a value twice.
+func parseDomainValues(t *testing.T, domain string) map[string]struct{} {
+	t.Helper()
+	up := NewPostgresDynamicMigrationManager(testPipelineConfig(), nil).enumsMigration().UpSQL
+	block := regexp.MustCompile(`(?s)CREATE DOMAIN ` + regexp.QuoteMeta(domain) +
+		`\s+AS\s+text\s+CHECK\s*\(\s*VALUE\s+IN\s*\(([^)]*)\)\s*\)`).FindStringSubmatch(up)
+	if block == nil {
+		t.Fatalf("could not find the %s DOMAIN in migration v1's UpSQL", domain)
+	}
+	values := make(map[string]struct{})
+	for _, m := range regexp.MustCompile(`'([^']+)'`).FindAllStringSubmatch(block[1], -1) {
+		if _, dup := values[m[1]]; dup {
+			t.Errorf("the %s DOMAIN lists %q twice", domain, m[1])
 		}
-		seenValues[value] = status
+		values[m[1]] = struct{}{}
 	}
-
-	// Verify counts match
-	if len(discoveredStatuses) != len(enumValues) {
-		t.Errorf(
-			"Mismatch: %d slip statuses in status.go but %d enum values in dynamic_migrations.go",
-			len(discoveredStatuses),
-			len(enumValues),
-		)
-		t.Logf("Discovered statuses: %v", discoveredStatuses)
-		t.Logf("Enum values: %v", enumValues)
+	if len(values) == 0 {
+		t.Fatalf("the %s DOMAIN lists no values - parsing may have failed", domain)
 	}
+	return values
 }
 
 // parseStatusConstants parses status.go and extracts all constants of the given type.
@@ -367,155 +354,6 @@ func parseStatusConstants(t *testing.T, filename, typeName string) map[string]st
 	})
 
 	return discovered
-}
-
-// parseSlipStatusEnumsFromMigrations parses dynamic_migrations.go and extracts
-// the slip status enum values from the SQL strings.
-func parseSlipStatusEnumsFromMigrations(t *testing.T, filename string) map[string]int {
-	t.Helper()
-
-	content, err := os.ReadFile(filename)
-	if err != nil {
-		t.Fatalf("Failed to read %s: %v", filename, err)
-	}
-
-	// Look for the slip status Enum8 definition in generateBaseTableMigration
-	// Pattern: 'status_name' = N
-	enumRegex := regexp.MustCompile(`'(\w+)'\s*=\s*(\d+)`)
-
-	// Find the slip status enum block - look for "status Enum8(" which is the slip status
-	// We want the one in generateBaseTableMigration, identified by context
-	statusEnumPattern := regexp.MustCompile(`(?s)status Enum8\(\s*((?:'[^']+'\s*=\s*\d+[,\s]*)+)\)`)
-	matches := statusEnumPattern.FindAllStringSubmatch(string(content), -1)
-
-	if len(matches) == 0 {
-		t.Fatal("Could not find slip status Enum8 definition in dynamic_migrations.go")
-	}
-
-	// Use the first match (from generateBaseTableMigration)
-	enumBlock := matches[0][1]
-
-	enumValues := make(map[string]int)
-	enumMatches := enumRegex.FindAllStringSubmatch(enumBlock, -1)
-	for _, match := range enumMatches {
-		name := match[1]
-		value, _ := strconv.Atoi(match[2])
-		enumValues[name] = value
-	}
-
-	return enumValues
-}
-
-// TestAllStepStatusesInEnum verifies that all StepStatus constants defined in code
-// are represented in the database enum definition in dynamic_migrations.go.
-// This test automatically discovers both the status constants AND the enum definitions,
-// ensuring no status value is forgotten when updating either file.
-func TestAllStepStatusesInEnum(t *testing.T) {
-	_, filename, _, _ := runtime.Caller(0)
-	dir := filepath.Dir(filename)
-
-	// Parse status.go to automatically discover all StepStatus constants
-	statusFile := filepath.Join(dir, "status.go")
-	discoveredStatuses := parseStatusConstants(t, statusFile, "StepStatus")
-
-	if len(discoveredStatuses) == 0 {
-		t.Fatal("No StepStatus constants found in status.go - parsing may have failed")
-	}
-
-	// Parse dynamic_migrations.go to extract enum definitions from SQL
-	migrationsFile := filepath.Join(dir, "dynamic_migrations.go")
-	enumValues := parseStepStatusEnumsFromMigrations(t, migrationsFile)
-
-	if len(enumValues) == 0 {
-		t.Fatal("No step status enum values found in dynamic_migrations.go - parsing may have failed")
-	}
-
-	// Verify all discovered statuses have enum values
-	for statusName, statusValue := range discoveredStatuses {
-		enumValue, exists := enumValues[statusValue]
-		if !exists {
-			t.Errorf(
-				"StepStatus constant %s = %q is missing from enum definition in generateStepColumnEnsurer() in dynamic_migrations.go",
-				statusName,
-				statusValue,
-			)
-			continue
-		}
-		if enumValue < 1 {
-			t.Errorf("StepStatus %q has invalid enum value %d - must be >= 1", statusValue, enumValue)
-		}
-	}
-
-	// Verify no enum values exist for non-existent statuses
-	for enumStatus := range enumValues {
-		found := false
-		for _, discoveredStatus := range discoveredStatuses {
-			if discoveredStatus == enumStatus {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("Enum definition includes %q but this status is not defined in status.go", enumStatus)
-		}
-	}
-
-	// Verify no duplicate enum values
-	seenValues := make(map[int]string)
-	for status, value := range enumValues {
-		if existing, found := seenValues[value]; found {
-			t.Errorf("Duplicate enum value %d used for both %q and %q", value, existing, status)
-		}
-		seenValues[value] = status
-	}
-
-	// Verify counts match
-	if len(discoveredStatuses) != len(enumValues) {
-		t.Errorf(
-			"Mismatch: %d step statuses in status.go but %d enum values in dynamic_migrations.go",
-			len(discoveredStatuses),
-			len(enumValues),
-		)
-		t.Logf("Discovered statuses: %v", discoveredStatuses)
-		t.Logf("Enum values: %v", enumValues)
-	}
-}
-
-// parseStepStatusEnumsFromMigrations parses dynamic_migrations.go and extracts
-// the step status enum values from the SQL strings in generateStepColumnEnsurer.
-func parseStepStatusEnumsFromMigrations(t *testing.T, filename string) map[string]int {
-	t.Helper()
-
-	content, err := os.ReadFile(filename)
-	if err != nil {
-		t.Fatalf("Failed to read %s: %v", filename, err)
-	}
-
-	// Look for the step status Enum8 definition in generateStepColumnEnsurer
-	// Format: 'pending'=1, 'held'=2, ... (no spaces around =)
-	enumRegex := regexp.MustCompile(`'(\w+)'\s*=\s*(\d+)`)
-
-	// Find the generateStepColumnEnsurer enum block
-	// This is identified by ADD COLUMN IF NOT EXISTS %s Enum8
-	stepEnumPattern := regexp.MustCompile(`(?s)ADD COLUMN IF NOT EXISTS %s Enum8\(\s*((?:'[^']+'\s*=\s*\d+[,\s]*)+)\)`)
-	matches := stepEnumPattern.FindAllStringSubmatch(string(content), -1)
-
-	if len(matches) == 0 {
-		t.Fatal("Could not find step status Enum8 definition in dynamic_migrations.go")
-	}
-
-	// Use the first match (from generateStepColumnEnsurer)
-	enumBlock := matches[0][1]
-
-	enumValues := make(map[string]int)
-	enumMatches := enumRegex.FindAllStringSubmatch(enumBlock, -1)
-	for _, match := range enumMatches {
-		name := match[1]
-		value, _ := strconv.Atoi(match[2])
-		enumValues[name] = value
-	}
-
-	return enumValues
 }
 
 func TestSlipStatus_IsTerminal_UnknownStatus(t *testing.T) {

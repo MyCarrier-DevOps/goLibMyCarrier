@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -19,12 +18,6 @@ import (
 
 	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
-
-func init() {
-	// Disable ryuk (reaper) for Podman compatibility
-	// Ryuk has issues connecting to Docker socket inside Podman containers
-	os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
-}
 
 // integrationTestPipelineConfig returns a pipeline config for integration tests.
 // It defines a simple pipeline matching the production config structure where:

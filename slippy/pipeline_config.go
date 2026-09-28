@@ -245,7 +245,7 @@ var reservedStepNames = func() map[string]struct{} {
 //     migration every consumer runs at startup — and nothing recovers, because the identifier
 //     is rebuilt from the same name on every read and write. See stepNameIdentifierPattern for
 //     the shape and for why it is stricter than either backend alone. It is also stricter than
-//     clickhouse_store.go's safeStepNameForDerivePattern, which admits a leading digit; the
+//     postgres_store_updates.go's safeStepNameForDerivePattern, which admits a leading digit; the
 //     note there says why that one is left as it is (PR #87, pkuzmenko finding 1 arm A).
 //   - A NAME THAT TRUNCATES. See MaxStepNameLen.
 //   - A NAME THAT IS ALREADY A FIXED routing_slips COLUMN. An AGGREGATE step's jsonb column is
