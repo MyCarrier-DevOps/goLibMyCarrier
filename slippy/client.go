@@ -147,7 +147,7 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 	}
 
 	// Promote changes only the top-level status, so it takes the same atomic status write
-	// AbandonSlip does. PromotedTo is persisted by NEITHER store (there is no promoted_to
+	// AbandonSlip does. PromotedTo is persisted by no store (there is no promoted_to
 	// column), so the full-row Update this replaced bought nothing for that field while
 	// costing a Load→Update snapshot race: it rewrote every column from a snapshot taken
 	// before the write, clobbering concurrent step and history writes. And the atomic status

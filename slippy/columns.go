@@ -62,7 +62,7 @@ func fixedSlipColumns() []string {
 
 // stepStatusColumn returns the column that carries one step's status: the step's name with a
 // `_status` suffix. Together with aggregateColumn below it is the WHOLE of what a configured
-// step puts into the schema (generatedColumnsFor), and both stores follow the same convention.
+// step puts into the schema (generatedColumnsFor), and PostgresStore follows it everywhere.
 //
 // It exists because that convention was open-coded at every site that needed it, each asking
 // the reader to keep it in step with the others (PR #87, jhicks review). Rather than enumerate
@@ -71,7 +71,7 @@ func fixedSlipColumns() []string {
 // stated as something checkable instead:
 //
 //	NO CALLER BUILDS A STEP'S COLUMN NAME BY HAND. Every `<name>_status` and every bare
-//	aggregate column comes from these two helpers, on BOTH backends.
+//	aggregate column comes from these two helpers.
 //
 // TestStepColumnConvention_NoNewHandBuiltIdentifiers is the check, and it runs in CI rather
 // than waiting for a reviewer to think of it. It was a pair of greps in the comment here; the

@@ -550,7 +550,7 @@ func TestClient_CreateSlipForPush_ResetSlipInPlaceArms(t *testing.T) {
 		})
 	}
 
-	// A store that cannot decide under a lock (ClickHouseStore) must not fail the push: it has
+	// A store that cannot decide under a lock must not fail the push: it has
 	// no claimed_from column either, so there is no claim for the refused decision to protect
 	// and the plain upsert is exactly what this arm did before the decision moved into the
 	// store. Same shape as repaveExistingSlip's ErrRepaveUnsupported fallback.

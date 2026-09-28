@@ -583,7 +583,7 @@ func TestStartOperationalSpan_WithAttributes(t *testing.T) {
 	ctx := context.Background()
 	correlationID := "550e8400-e29b-41d4-a716-446655440000"
 
-	_, span := StartOperationalSpan(ctx, "hydrateSlip", correlationID,
+	_, span := StartOperationalSpan(ctx, "UpdateStep", correlationID,
 		WithAttributes(
 			attribute.String("step.name", "build"),
 			attribute.Bool("include_history", true),

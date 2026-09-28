@@ -613,8 +613,8 @@ func emptyRunGuardApplies(existing *Slip, opts PushOptions) bool {
 //     time the went-live abort is detected, ancestor slips may already have been
 //     abandoned/promoted on behalf of a successor correlation ID that will never be
 //     created (DEVOPS-231 review D3.2).
-//     ErrRepaveUnsupported means the store cannot repave at all (the ClickHouse
-//     store, since Postgres is the operational store per DEVOPS-127); the fallback is
+//     ErrRepaveUnsupported means the store cannot repave at all (PostgresStore always
+//     can; a store with no delete path, or a test double, may not); the fallback is
 //     the pre-DEVOPS-231 semantics — AbandonSlip the superseded slip — followed by
 //     fresh-slip creation as usual.
 //
@@ -1223,8 +1223,8 @@ func (c *Client) resetSlipInPlace(
 		return true, nil
 
 	case errors.Is(resetErr, ErrResetUnsupported):
-		// The store cannot decide under a row lock (ClickHouseStore: no claimed_from column,
-		// no transaction). Falling back to the plain upsert is what this arm did before the
+		// The store cannot decide under a row lock (no claimed_from column, or no
+		// transaction). Falling back to the plain upsert is what this arm did before the
 		// decision moved into the store, and it loses nothing on such a store — with no claim
 		// column there is no claim for the refused decision to protect. Mirrors
 		// repaveExistingSlip's ErrRepaveUnsupported fallback.
@@ -1232,8 +1232,8 @@ func (c *Client) resetSlipInPlace(
 		// The Create here is deliberately NOT routed through createFreshSlip: that would send
 		// an ErrDuplicateSlip into the duplicate backstop, whose own self-referential arm
 		// comes back to this function — a loop with no bound for a store that returned both
-		// sentinels. No store in this repo can (ClickHouse raises neither ErrDuplicateSlip nor
-		// anything from a unique index), but the shape should not depend on that.
+		// sentinels. No store in this repo does (PostgresStore never returns
+		// ErrResetUnsupported), but the shape should not depend on that.
 		if createErr := c.store.Create(ctx, slip); createErr != nil {
 			return false, fmt.Errorf("failed to reset slip %s in place on a store without the locked reset: %w",
 				slip.CorrelationID, createErr)
@@ -1354,9 +1354,8 @@ func (c *Client) repaveExistingSlip(
 	//
 	// D3.3: log intent at Debug here, not as a claim of success — the "Repaved" log below
 	// only fires once Repave has confirmed it happened. Every same-commit push against a
-	// store that returns ErrRepaveUnsupported (i.e. every ClickHouse-backed client, since
-	// Postgres is the only store DEVOPS-231 wired for real repaves) used to log this as if
-	// delete + recreate had happened when it never did.
+	// store that returns ErrRepaveUnsupported used to log this as if delete + recreate had
+	// happened when it never did.
 	c.logger.Debug(ctx, "Attempting repave for same-commit push", map[string]interface{}{
 		"existing_id":     existingSlip.CorrelationID,
 		"existing_commit": shortSHA(existingSlip.CommitSHA),
@@ -1427,15 +1426,14 @@ func (c *Client) repaveExistingSlip(
 		return true, nil
 
 	case errors.Is(repaveErr, ErrRepaveUnsupported):
-		// The store cannot repave at all (the ClickHouse store: Postgres is the
-		// operational slip store per DEVOPS-127, and NewClient still builds a
-		// ClickHouseStore unconditionally, so this fires on every same-commit push for
-		// a CH-backed client). Fall back to the pre-DEVOPS-231 semantics — abandon the
+		// The store cannot repave at all (PostgresStore always can; this arm serves a store
+		// with no delete path, and the test doubles). Fall back to the pre-DEVOPS-231
+		// semantics — abandon the
 		// superseded slip rather than repaving it — then create the fresh slip the
 		// non-transactional way, since that is all such a store can offer.
 		// D3.3: abandonSupersededSlipForUnsupportedRepave only claims "abandoned" when
 		// AbandonSlip actually changed the slip's status, and does not add a Warning for
-		// this routine, expected-on-ClickHouse case (only a real AbandonSlip failure is
+		// this routine, expected case (only a real AbandonSlip failure is
 		// surfaced as a Warning) — see its doc for why.
 		c.abandonSupersededSlipForUnsupportedRepave(ctx, existingSlip, opts, result, "Repave")
 		return c.createFreshSlip(ctx, opts, slip, parent, result)
@@ -1507,7 +1505,7 @@ func (c *Client) repaveExistingSlip(
 
 // abandonSupersededSlipForUnsupportedRepave is the shared ErrRepaveUnsupported fallback
 // for both repaveExistingSlip and handleDuplicateSlipBackstop (DEVOPS-231 review D3.1/D3.3):
-// the store cannot repave (e.g. ClickHouseStore), so fall back to abandon semantics rather
+// the store cannot repave, so fall back to abandon semantics rather
 // than claiming a repave that never happened.
 //
 // AbandonSlip's checkTerminalStatus (client.go) silently no-ops when the slip is already
@@ -1521,8 +1519,8 @@ func (c *Client) repaveExistingSlip(
 //
 // Messaging (D3.3): this only ever logs at Info level and adds NOTHING to result.Warnings on
 // the expected/successful outcomes (already-terminal: nothing to abandon; non-terminal:
-// abandoned successfully) — this fallback fires on every same-commit push against a
-// ClickHouse-backed client, so treating it as a Warning misfires any consumer that alerts on
+// abandoned successfully) — on a store that cannot repave this fallback fires on every
+// same-commit push, so treating it as a Warning misfires any consumer that alerts on
 // len(result.Warnings) > 0 for what is a routine webhook redelivery. A Warning is added only
 // when AbandonSlip itself returns an error, since that means the superseded row's status was
 // NOT updated and dashboards/consumers may show it as still active.
@@ -2395,25 +2393,14 @@ func (c *Client) handlePushRetry(ctx context.Context, slip *Slip) (*Slip, error)
 	}
 
 	// Use UpdateStepWithHistory (not separate UpdateStep + AppendHistory calls) so the
-	// push_parsed status write and the history append happen atomically with the same
-	// caller-supplied stepStatusOverride that UpdateStepWithHistory's pure-step branch
-	// (see appendHistoryWithOverrides call in clickhouse_store.go) already uses to pin
-	// push_parsed_status = running. Two separate calls would let AppendHistory's derive
-	// CTE race the insertComponentState write UpdateStep just performed under ClickHouse
-	// async-insert visibility lag, falling back to a stale clone of push_parsed_status.
+	// push_parsed status write and its history entry land in one store call; PostgresStore
+	// writes both in one transaction, so the reset can never be recorded without its audit
+	// entry, or the entry without the reset.
 	//
-	// Routing through UpdateStepWithHistory also means this call adopts its best-effort
-	// history write-back semantics: a failed history write-back is Warn-logged and
-	// non-fatal, superseding a45e63c's hard-fail contract for standalone AppendHistory on
-	// this retry path — the audit entry for this transition is lost in that narrow window,
-	// status self-heals on next Load, and event insert / gate-check failures still fail
-	// the retry.
-	//
-	// Because history write-back failures are already swallowed inside UpdateStepWithHistory
-	// (Warn-logged, not returned), any error surfaced here is NOT a history-append failure —
-	// it is either the terminal-freshness gate rejecting the write (ErrTerminalAlreadyExists)
-	// or a genuine event-insert failure. Wrap with %w (not ErrHistoryAppendFailed) so the
-	// underlying error chain — including errors.Is(err, ErrTerminalAlreadyExists) — survives.
+	// Any error surfaced here fails the retry: the terminal-freshness gate refusing the write
+	// (ErrTerminalAlreadyExists), or a failed status or history write. Wrap with %w (not
+	// ErrHistoryAppendFailed) so the underlying error chain — including
+	// errors.Is(err, ErrTerminalAlreadyExists) — survives.
 	if err := c.store.UpdateStepWithHistory(
 		ctx,
 		slip.CorrelationID,
@@ -2463,8 +2450,7 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 				// aggregate step running over an aggregate that the gate below leaves EMPTY.
 				// What this gate does NOT do is make such a slip advance on its own, and an
 				// earlier version of this comment claimed otherwise: `pending` is no more
-				// self-advancing than `running`. applyComponentStatesToAggregate returns early
-				// when no component has reported, recomputeAggregate returns early on an empty
+				// self-advancing than `running`. recomputeAggregate returns early on an empty
 				// active set, getPrereqStatus hands the raw status to AllPrerequisitesMet
 				// which requires `completed`, and checkPipelineCompletion buckets pending and
 				// running identically. The slip is in_progress either way, so a later push
@@ -2508,10 +2494,10 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 				//
 				// It does NOT decide whether such a slip can make progress, and an earlier
 				// version of this comment claimed a causal chain that the code does not have.
-				// Neither store derives an aggregate step's status from these seeded rows —
-				// both aggregate only over components that have actually reported
-				// (filterActiveComponents in clickhouse_store.go, and the len(active) == 0
-				// early return in postgres_store_updates.go's recomputeAggregate) — and
+				// The store does not derive an aggregate step's status from these seeded rows —
+				// it aggregates only over components that have actually reported (the
+				// len(active) == 0 early return in postgres_store_updates.go's
+				// recomputeAggregate) — and
 				// checkPipelineCompletion never reads Aggregates at all, so an empty
 				// aggregate cannot end or extend a slip. Progress is decided by the
 				// hasComponents gate above.

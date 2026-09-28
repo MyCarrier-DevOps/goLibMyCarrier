@@ -115,8 +115,8 @@ func (s *PostgresStore) UpdateComponentStatus(
 }
 
 // UpdateStepWithHistory updates a step's status and appends a history entry in one
-// transaction. Unlike ClickHouse, the status write and the audit entry are atomic — there
-// is no best-effort write-back that can silently drop the history entry.
+// transaction: the status write and the audit entry are atomic, so there is no best-effort
+// write-back that can silently drop the history entry.
 func (s *PostgresStore) UpdateStepWithHistory(
 	ctx context.Context,
 	correlationID, stepName, componentName string,
@@ -537,7 +537,7 @@ func (s *PostgresStore) writeStepStatusColumn(
 // whether the write was applied. It reports false (applied=false, err=nil) only when the
 // I5 terminal-freshness guard rejected the write.
 //
-// The guard ports the ClickHouse enforceTerminalFreshnessGate semantics (same SLIPPY_I5_*
+// The guard carries the removed ClickHouse store's terminal-freshness gate (same SLIPPY_I5_*
 // knobs) into the upsert's WHERE clause: a non-terminal status may not overwrite a terminal
 // one for the same step/component, but ONLY while the terminal is younger than the freshness
 // window (default 750ms) — the window that discriminates a stale duplicate/redelivery
@@ -656,7 +656,7 @@ func (s *PostgresStore) recomputeAggregate(
 	}
 
 	// Status is computed over the active components only (excludes any config placeholders
-	// left in the items list), matching filterActiveComponents in the ClickHouse store.
+	// left in the items list).
 	status := computeAggregateStatus(active)
 
 	itemsJSON, err := json.Marshal(struct {
@@ -788,7 +788,7 @@ func (s *PostgresStore) inTx(ctx context.Context, fn func(pgx.Tx) error) (err er
 // exists, returning ErrSlipNotFound otherwise.
 //
 // Ordering contract: a step/component update requires the slip's routing_slips row to be
-// already committed by Create. This is a deliberate change from the ClickHouse store, which
+// already committed by Create. This is a deliberate change from the removed ClickHouse store, which
 // recorded the component event durably even before the slip existed and retried slip-creation
 // with backoff for ~30 minutes to absorb a producer/consumer race (a CI StartStep arriving
 // before pushhookparser's Create). Postgres Create is synchronous and committed, so that race

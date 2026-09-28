@@ -273,7 +273,7 @@ func StartSpan(
 // set via ContextWithServiceName.
 //
 // Use StartSpan for pipeline content spans (JobExecution, Held, TestExecution).
-// Use StartOperationalSpan for internal implementation spans (UpdateStep, AppendHistory, hydrateSlip).
+// Use StartOperationalSpan for internal implementation spans (UpdateStep, AppendHistory).
 //
 //nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
 func StartOperationalSpan(

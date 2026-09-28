@@ -216,7 +216,7 @@ func TestPostgresStore_UpdateStep_InjectionSafe_UnknownStepSkipsColumn(t *testin
 	store, mock := newMockStore(t)
 	// A crafted / unknown pipeline step name must never be spliced into a column identifier.
 	// The component-state event is still recorded, but no routing_slips column is written
-	// (matching ClickHouse, which materializes only config-known columns). If the guard
+	// (only config-known columns are materialized). If the guard
 	// regressed, the store would issue an UPDATE that pgxmock has no expectation for and the
 	// test would fail.
 	const evil = "unit_tests_status = 'skipped', builds_status"

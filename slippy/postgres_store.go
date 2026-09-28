@@ -26,10 +26,10 @@ type pgxPool interface {
 	Close()
 }
 
-// PostgresStore is a SlipStore backed by Postgres (pgx/pgxpool). It is the write and
-// read-modify-write path for slip persistence; unlike the ClickHouse store it relies on
-// atomic UPDATE + MVCC, so it carries none of the sign/version, argMax-dedup,
-// write-fingerprint, clone-derive, or verification-retry machinery.
+// PostgresStore is a SlipStore backed by Postgres (pgx/pgxpool), and the only one in this
+// package. It relies on atomic UPDATE + MVCC under a row lock, so it carries none of the
+// sign/version, argMax-dedup, write-fingerprint, clone-derive, or verification-retry
+// machinery the removed ClickHouse store needed.
 type PostgresStore struct {
 	pool   pgxPool
 	config *PipelineConfig
@@ -64,8 +64,8 @@ func (s *PostgresStore) Close() error { s.pool.Close(); return nil }
 // Ping verifies the connection is alive.
 func (s *PostgresStore) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
-// Create upserts a slip. Matches ClickHouse last-write-wins (and the in-memory
-// reference store): an existing correlation_id is overwritten rather than rejected.
+// Create upserts a slip, last-write-wins like the in-memory reference store: an existing
+// correlation_id is overwritten rather than rejected.
 //
 // It is the one full-row write in this store that takes NO row lock — a bare pool.Exec, where
 // Update and every step mutator go through lockSlip — and it never writes claimed_from, which
@@ -559,7 +559,7 @@ func (s *PostgresStore) stepsFromStatuses(statuses []string) map[string]Step {
 // decodeAggregates unwraps the {"items": [...]} envelope each aggregate jsonb column holds,
 // for cols and raw in the same order. A NULL or empty column leaves that aggregate as a NIL
 // slice — the key is present in the map with a nil value, not an empty one — and a malformed
-// one leaves it unset rather than failing the read, matching the ClickHouse scanner. Shared
+// one leaves it unset rather than failing the read. Shared
 // by populate and loadClaimStateTx.
 //
 // The nil matters past this function: encoding/json marshals a nil slice as `null` and an
@@ -750,9 +750,9 @@ type pgSlipScan struct {
 	claimedFrom    *string // NULL when unclaimed
 }
 
-// buildStepDetailsMap builds the step_details JSON object from a slip. Mirrors
-// ClickHouseStore.buildStepDetails so the serialized shape is identical across backends
-// (the reporting layer and the data-copy job depend on shape parity).
+// buildStepDetailsMap builds the step_details JSON object from a slip. The shape is the one
+// the removed ClickHouse store wrote, kept identical because the reporting layer and the
+// DEVOPS-127 data-copy job depend on shape parity.
 func buildStepDetailsMap(slip *Slip) map[string]any {
 	details := make(map[string]any)
 	for stepName, step := range slip.Steps {

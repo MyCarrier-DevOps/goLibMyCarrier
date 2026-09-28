@@ -11,7 +11,8 @@ import (
 type Logger = logger.Logger
 
 // SlipStore defines the interface for slip persistence operations.
-// Implementations provide storage backends (e.g., ClickHouse, in-memory for testing).
+// Implementations provide storage backends: PostgresStore is the one in this package, and
+// slippytest.MockStore is the in-memory double for tests.
 //
 // All methods that identify a slip use correlationID as the unique identifier.
 // The correlationID is the single, canonical identifier for a routing slip
@@ -100,9 +101,6 @@ type SlipStore interface {
 	// status filter screens it because `completed` is not terminal-superseded. State the rule
 	// here rather than leaving it to each store, so dropping the live-first term from a query
 	// reads as the contract break it is instead of a local optimisation.
-	//
-	// ClickHouseStore deliberately does not implement this ordering; the reason is specific to
-	// VersionedCollapsingMergeTree and is documented at that implementation.
 	LoadByCommit(ctx context.Context, repository, commitSHA string) (*Slip, error)
 
 	// LoadLiveByCommit returns the LIVE (non-terminal) slip for the exact (repository, commitSHA).
@@ -293,7 +291,7 @@ type SlipStore interface {
 	//     or the row was UNCLAIMED with work in flight and expected did not name its status.
 	//     Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
-	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all (ClickHouse).
+	//   - ErrClaimUnsupported (wrapped): the store cannot claim at all.
 	ClaimSlip(
 		ctx context.Context, correlationID string, expected []SlipStatus, claimedBy, reason string,
 	) (ClaimOutcome, error)
@@ -326,22 +324,15 @@ type SlipStore interface {
 	//   - ErrNotClaimed: claimed_from empty — the normal outcome after a terminal status
 	//     write already ended the claim. Nothing written.
 	//   - ErrSlipNotFound: no row for correlationID.
-	//   - ErrClaimUnsupported (wrapped): the store cannot release (ClickHouse).
+	//   - ErrClaimUnsupported (wrapped): the store cannot release.
 	ReleaseClaim(ctx context.Context, correlationID, releasedBy, reason string) (ReleaseOutcome, error)
 
 	// ProbeSchema is the readiness gate: it checks the columns this store's SELECTs name
 	// against the live schema and returns ErrSchemaBehind when any are missing, so a process
 	// running a library ahead of its database can refuse to serve instead of failing every
-	// read at request time (DEVOPS-367).
-	//
-	// ClickHouse returns nil, and the honest reason is NOT that it has no schema to check — it
-	// generates per-step columns from the same config Postgres does (generateStepColumnEnsurer
-	// in dynamic_migrations.go, rebuilt on every read by SlipQueryBuilder.BuildSelectColumns),
-	// so the config-ahead-of-migration drift this probe exists to catch exists there too. It
-	// returns nil because it is no longer an operational slip store: nothing outside this
-	// package's tests constructs one, the slip path is Postgres-only (DEVOPS-127), and its
-	// removal is tracked as DEVOPS-343. An implementer reviving it owes this method a real
-	// answer — a nil from a store with a live caller would make the gate unable to say no.
+	// read at request time (DEVOPS-367). A store that generates columns from the pipeline
+	// config owes this method a real answer: a nil from such a store would make the gate
+	// unable to say no.
 	ProbeSchema(ctx context.Context) error
 
 	// Repave atomically replaces one commit's ended run with a fresh one: it removes the
@@ -450,9 +441,8 @@ type SlipStore interface {
 	// cross-run collision documented above, which is accepted and documented rather than
 	// prevented.
 	//
-	// A store that cannot repave at all — e.g. ClickHouseStore, which is not the
-	// operational slip store (DEVOPS-127) — MUST return an error wrapping
-	// ErrRepaveUnsupported rather than a plain error or nil. The push path detects that
+	// A store that cannot repave at all MUST return an error wrapping
+	// ErrRepaveUnsupported rather than a plain error or nil (PostgresStore always can). The push path detects that
 	// sentinel with errors.Is and falls back to abandon semantics (marking the superseded
 	// slip abandoned, then creating the successor separately) instead of repaving.
 	Repave(ctx context.Context, oldCorrelationID string, newSlip *Slip, parent *AncestryEntry) error
@@ -487,9 +477,9 @@ type SlipStore interface {
 	//     row has gone (a concurrent repave) — a reset whose target is absent is simply the
 	//     insert a first push would have made, so redelivery converges.
 	//
-	// A store that cannot do any of that — ClickHouseStore, which has no claimed_from column
-	// and no transaction to hold the decision and the write together — MUST return an error
-	// wrapping ErrResetUnsupported. The push path detects that sentinel with errors.Is and
+	// A store that cannot do any of that — one with no claimed_from column, or no transaction
+	// to hold the decision and the write together — MUST return an error wrapping
+	// ErrResetUnsupported (PostgresStore always can). The push path detects that sentinel with errors.Is and
 	// falls back to a plain Create, which loses nothing on such a store: with no claim column
 	// there is no claim for the refused decision to protect.
 	//

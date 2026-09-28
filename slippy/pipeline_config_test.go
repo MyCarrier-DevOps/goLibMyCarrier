@@ -878,13 +878,14 @@ func TestGeneratedColumnsFor_TracksStepColumnEnsurerSQL(t *testing.T) {
 	}
 }
 
-// TestValidateStepIdentifier_ReservesClickHouseFixedColumns pins the three fixed columns that
-// exist only on the ClickHouse side of the schema (PR #87 review, pkuzmenko).
+// TestValidateStepIdentifier_ReservesClickHouseFixedColumns pins the three fixed columns of the
+// removed ClickHouse schema (PR #87 review, pkuzmenko; store removed in DEVOPS-343), which stay
+// reserved as step names.
 //
 // The sibling drift test walks a *PostgresStore column list, so by construction it can never
 // fail for a ClickHouse-only column — which is exactly how `sign`, `version` and `ancestry`
 // went unreserved. An aggregate step's column is its BARE name, so a step named after one of
-// them collides on ClickHouse the way a step named `status` collides on Postgres, and it
+// them collided on ClickHouse the way a step named `status` collides on Postgres, and it
 // passes every other arm because none of the three is a SQL keyword.
 //
 // Pinned by CONSTANT rather than by literal so renaming one of the constants keeps the

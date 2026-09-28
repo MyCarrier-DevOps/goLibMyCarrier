@@ -190,32 +190,25 @@ func (c *PipelineConfig) Validate() error {
 const MaxStepNameLen = 63 - len("_status")
 
 // stepNameIdentifierPattern matches the step names that survive being spliced UNQUOTED into
-// identifier position. It is the INTERSECTION of the two backends' unquoted-identifier rules:
-// Postgres requires a leading letter or underscore and then admits letters, digits,
-// underscores and dollar signs; ClickHouse's non-quoted identifiers must match
-// ^[a-zA-Z_][0-9a-zA-Z_]*$, which excludes the dollar sign. A config is written once and
-// generates schema for both, so the stricter of the two is what a step name has to satisfy.
+// identifier position. It is the INTERSECTION of Postgres's unquoted-identifier rule (a leading
+// letter or underscore, then letters, digits, underscores and dollar signs) and the rule of the
+// ClickHouse slip store removed in DEVOPS-343 (^[a-zA-Z_][0-9a-zA-Z_]*$, no dollar sign). It
+// stays at the stricter of the two: loosening it is a separate decision, not a side effect of
+// removing that store.
 var stepNameIdentifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// reservedStepNames is every fixed routing_slips column on EITHER backend, folded to lower
+// reservedStepNames is every fixed routing_slips column, folded to lower
 // case the way Postgres folds the DDL that would collide with it. DERIVED from
 // fixedSlipColumns() plus ColumnClaimedFrom — exactly the non-step part of
 // PostgresStore.slipSelectColumns() — rather than restated, so a column added to that list is
 // reserved against step names by the same edit and cannot silently stop being reserved.
 //
-// The three ClickHouse-only columns are appended explicitly because no Postgres-derived list
-// contains them (PR #87 review, pkuzmenko): ColumnSign and ColumnVersion are the unconditional
-// base-schema columns of the VersionedCollapsingMergeTree(sign, version) engine, and
-// ColumnAncestry is the v3 inline column. An aggregate step's jsonb/JSON column is its BARE
-// name, so an aggregate step named `version` collides with one of them on ClickHouse exactly
-// as one named `status` collides on Postgres — and it passes every other arm, since none of
-// the three is a SQL keyword.
-//
-// Reserving them on BOTH backends rather than only where they exist is the same choice
-// stepNameIdentifierPattern makes one paragraph below: a config is written once and generates
-// schema for both, so it must satisfy the stricter of the two. The cost is three step names
-// nobody wants; the alternative is a validator whose answer depends on which store the reader
-// happens to be looking at.
+// The three columns of the removed ClickHouse schema (DEVOPS-343) are appended explicitly
+// because no Postgres-derived list contains them (PR #87 review, pkuzmenko): ColumnSign and
+// ColumnVersion were the base-schema columns of its VersionedCollapsingMergeTree(sign, version)
+// engine, and ColumnAncestry its v3 inline column. They stay reserved for the same reason
+// stepNameIdentifierPattern stays strict: un-reserving them is a separate decision, not a side
+// effect of removing the store. The cost is three step names nobody wants.
 var reservedStepNames = func() map[string]struct{} {
 	cols := append(fixedSlipColumns(), ColumnClaimedFrom, ColumnSign, ColumnVersion, ColumnAncestry)
 	reserved := make(map[string]struct{}, len(cols))
@@ -244,7 +237,7 @@ var reservedStepNames = func() map[string]struct{} {
 //     and a step named `1deploy` emits `1deploy_status`, each a 42601 syntax error on the
 //     migration every consumer runs at startup — and nothing recovers, because the identifier
 //     is rebuilt from the same name on every read and write. See stepNameIdentifierPattern for
-//     the shape and for why it is stricter than either backend alone. It is also stricter than
+//     the shape and for why it is stricter than Postgres alone. It is also stricter than
 //     postgres_store_updates.go's safeStepNameForDerivePattern, which admits a leading digit; the
 //     note there says why that one is left as it is (PR #87, pkuzmenko finding 1 arm A).
 //   - A NAME THAT TRUNCATES. See MaxStepNameLen.
@@ -280,8 +273,8 @@ var reservedStepNames = func() map[string]struct{} {
 //
 // STILL ADMITTED, and deliberately: a name that is a bare identifier but a SQL RESERVED KEYWORD.
 // An aggregate step named `order`, `group`, `table` or `select` emits
-// `ADD COLUMN IF NOT EXISTS order jsonb` — 42601, the same class as the first arm above, and
-// ClickHouse's rules agree that a non-quoted identifier may not equal a keyword. It is left open
+// `ADD COLUMN IF NOT EXISTS order jsonb` — 42601, the same class as the first arm above. It is
+// left open
 // because the only check that fits here is a hand-typed keyword list, which is exactly the
 // drifting duplicate the reserved-column arm was written to avoid: Postgres's reserved set is
 // version-dependent and long. The fix that actually closes the class is to QUOTE the generated
@@ -518,7 +511,7 @@ func computeConfigHash(jsonData []byte) string {
 
 // GetAggregateColumnName returns the JSON column name for an aggregate step.
 // The column name is the step name itself (e.g., "builds_completed").
-// This must match the column created by dynamic_migrations.go.
+// This must match the column postgres_migrations.go creates (see aggregateColumn).
 func (c *PipelineConfig) GetAggregateColumnName(stepName string) string {
 	step := c.stepsByName[stepName]
 	if step == nil || step.Aggregates == "" {

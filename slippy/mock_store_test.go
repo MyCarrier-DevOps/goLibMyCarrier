@@ -206,10 +206,11 @@ type MockStore struct {
 	UpdateStepWithHistoryCallCount int
 
 	// SwallowedHistoryErrors records AppendHistoryError/AppendHistoryErrorFor errors that
-	// UpdateStepWithHistory swallowed (Warn + return nil) rather than propagated, mirroring
-	// the real store's best-effort history write-back semantics (clickhouse_store.go's
-	// pure-step branch, #75). Tests that need to observe a swallowed failure should assert
-	// against this field instead of expecting UpdateStepWithHistory to return the error.
+	// UpdateStepWithHistory swallowed (Warn + return nil) rather than propagated. That models
+	// the removed ClickHouse store's best-effort history write-back (#75); PostgresStore writes
+	// the status and the entry in one transaction and returns the error. Tests that need to
+	// observe a swallowed failure should assert against this field instead of expecting
+	// UpdateStepWithHistory to return the error.
 	SwallowedHistoryErrors []error
 
 	// Ping tracking and error injection
@@ -1007,8 +1008,8 @@ func (m *MockStore) UpdateStepWithHistory(
 	})
 
 	// UpdateStepError/UpdateStepErrorFor simulate the event-insert/gate write failing.
-	// The real store's UpdateStepWithHistory hard-fails in this case (insertComponentState
-	// or gate-check error), so the mock must too.
+	// PostgresStore's UpdateStepWithHistory hard-fails in this case (a failed component-state
+	// write or a gate refusal), so the mock must too.
 	if m.UpdateStepError != nil {
 		return m.UpdateStepError
 	}
@@ -1030,10 +1031,9 @@ func (m *MockStore) UpdateStepWithHistory(
 	slip.Steps[stepName] = step
 
 	// AppendHistoryError/AppendHistoryErrorFor simulate the history write-back failing.
-	// The real store's pure-step branch (clickhouse_store.go) treats this as best-effort:
-	// the event/step-status write is already durable, so the history append error is
-	// Warn-logged and swallowed (return nil), not propagated. Mirror that here — record
-	// the swallowed error for tests that want to assert it happened, but do not return it.
+	// This double keeps the removed ClickHouse store's best-effort semantics (see
+	// SwallowedHistoryErrors): the error is Warn-logged and swallowed (return nil), not
+	// propagated, and recorded for tests that want to assert it happened.
 	if m.AppendHistoryError != nil {
 		m.SwallowedHistoryErrors = append(m.SwallowedHistoryErrors, m.AppendHistoryError)
 		return nil

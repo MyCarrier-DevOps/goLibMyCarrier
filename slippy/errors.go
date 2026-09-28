@@ -51,11 +51,10 @@ var (
 	// The primary operation succeeded but audit trail is incomplete.
 	//
 	// Not returned by handlePushRetry (push.go): that call site routes through
-	// UpdateStepWithHistory, whose best-effort write-back semantics already Warn-log and
-	// swallow history-append failures internally — any error it does return there is a
-	// terminal-freshness gate rejection (ErrTerminalAlreadyExists) or an event-insert
-	// failure, not a history-append failure, so it is propagated via %w instead of this
-	// sentinel (bd mycarrier-5dv5 review fix).
+	// UpdateStepWithHistory, which writes the status and the history entry together, so there
+	// is no separate history-append failure to report there. Whatever it returns — a
+	// terminal-freshness gate rejection (ErrTerminalAlreadyExists) or a failed write — is
+	// propagated via %w instead of this sentinel (bd mycarrier-5dv5 review fix).
 	ErrHistoryAppendFailed = errors.New("failed to append state history")
 
 	// ErrSlipStatusUpdateFailed indicates updating slip status failed.
@@ -118,9 +117,9 @@ var (
 	ErrSlipWentLive = errors.New("slip went live between the repave decision and the repave")
 
 	// ErrRepaveUnsupported indicates the store cannot repave (replace one commit's slip
-	// with a fresh run) at all. The ClickHouse store returns this from Repave, wrapped
-	// with the correlation ID via %w, since it is not the operational slip store
-	// (DEVOPS-127) and implements no delete path. Callers should detect it with errors.Is
+	// with a fresh run) at all: it is the SlipStore contract's answer for a store with no
+	// delete path or no transaction. Such a store returns it from Repave, wrapped with the
+	// correlation ID via %w; PostgresStore never does. Callers should detect it with errors.Is
 	// and fall back to abandon semantics (mark the superseded slip abandoned, then create
 	// the successor separately) rather than treating it as a fatal, unrecoverable error.
 	ErrRepaveUnsupported = errors.New(
@@ -153,9 +152,9 @@ var (
 	ErrNotClaimed = errors.New("slip is not currently claimed")
 
 	// ErrClaimUnsupported indicates the store cannot perform ClaimSlip or ReleaseClaim at
-	// all: it has no claimed_from column and no transaction to make the claim atomic. The
-	// ClickHouse store returns it from both, wrapped with the correlation ID via %w, since it
-	// is not the operational slip store (DEVOPS-127, removal tracked in DEVOPS-343). Callers
+	// all: it has no claimed_from column and no transaction to make the claim atomic. Such a
+	// store returns it from both, wrapped with the correlation ID via %w; PostgresStore never
+	// does. Callers
 	// detect it with errors.Is and treat it as a failed claim — the same branch as
 	// ErrClaimPreconditionFailed: pushhookparser's rerunner dispatches nothing, the Slippy CLI
 	// pre-job proceeds unclaimed — and never as protection, since nothing was recorded and no
@@ -204,9 +203,9 @@ var (
 
 	// ErrResetUnsupported indicates the store cannot perform the locked in-place reset at
 	// all: it has no claimed_from column to read under a row lock and no transaction to hold
-	// the decision and the upsert together. The ClickHouse store returns it from
-	// ResetSlipInPlace, wrapped with the correlation ID via %w, since it is not the
-	// operational slip store (DEVOPS-127). Callers detect it with errors.Is and fall back to
+	// the decision and the upsert together. Such a store returns it from ResetSlipInPlace,
+	// wrapped with the correlation ID via %w; PostgresStore never does. Callers detect it with
+	// errors.Is and fall back to
 	// a plain Create, exactly as they fall back to abandon semantics on ErrRepaveUnsupported
 	// — and that fallback loses nothing, because a store with no claim column has no claim
 	// for the refused decision to protect.
