@@ -2472,10 +2472,13 @@ func (c *Client) initializeSlipForPush(opts PushOptions, ancestry []AncestryEntr
 				// push_parsed — a step no shipped config defines. So there is no PUSH-DRIVEN
 				// recovery for a zero-work aggregate-first slip, with or without this gate:
 				// clearing step 0 takes an explicit consumer call (SkipStep, CompleteStep or
-				// UpdateStepWithStatus in steps.go — skipped counts as success per
-				// StepStatus.IsSuccess, and the call must be component-scoped or the Postgres
-				// recompute is a no-op). That gap is pre-existing DEVOPS-231 behaviour, not
-				// something this gate closes. What this gate buys is reporting accuracy — no
+				// UpdateStepWithStatus in steps.go; skipped counts as success per
+				// StepStatus.IsSuccess). A componentless call is enough: while no component of
+				// the aggregate has reported, which on a zero-work slip is always, it lands on
+				// the step's own status column (DEVOPS-373), and pushhookparser's no-build
+				// SkipStep(builds, "") is exactly that call. The library's own push path still
+				// clears nothing; that gap is pre-existing DEVOPS-231 behaviour, not something
+				// this gate closes. What this gate buys is reporting accuracy — no
 				// falsified StartedAt, no step reported as started — the same class as the
 				// seeding change below.
 				//

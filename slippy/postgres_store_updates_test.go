@@ -231,12 +231,42 @@ func TestPostgresStore_UpdateStep_InjectionSafe_UnknownStepSkipsColumn(t *testin
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestPostgresStore_UpdateStep_AggregateNoComponents_NotWritten(t *testing.T) {
+// A componentless write to an aggregate step before any component has reported lands on the
+// step's own status column, like a pipeline step's (DEVOPS-373). Without it the write was
+// recorded in slip_component_states and read by nothing, so RunInFlight could not see the start.
+// The aggregate jsonb is still left alone: there is nothing to roll up.
+func TestPostgresStore_UpdateStep_AggregateNoComponents_WritesTheStepsOwnStatus(t *testing.T) {
+	for _, status := range []StepStatus{StepStatusRunning, StepStatusHeld, StepStatusCompleted, StepStatusSkipped} {
+		t.Run(string(status), func(t *testing.T) {
+			store, mock := newMockStore(t)
+			mock.ExpectBegin()
+			expectLock(mock, "c1")
+			mock.ExpectExec("INSERT INTO slip_component_states").
+				WithArgs("c1", "builds", "", string(status), "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+				WillReturnResult(pgxmock.NewResult("INSERT", 1))
+			mock.ExpectQuery("SELECT builds FROM routing_slips").
+				WithArgs("c1").
+				WillReturnRows(pgxmock.NewRows([]string{"builds"}).AddRow([]byte(`{"items":[]}`)))
+			mock.ExpectQuery("FROM slip_component_states").
+				WithArgs("c1", pgxmock.AnyArg()).
+				WillReturnRows(pgxmock.NewRows([]string{"component", "status", "message", "image_tag", "updated_at"}))
+			mock.ExpectExec(`UPDATE routing_slips SET builds_status = \$1, updated_at`).
+				WithArgs(string(status), "c1").
+				WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+			mock.ExpectCommit()
+
+			require.NoError(t, store.UpdateStep(context.Background(), "c1", "builds", "", status))
+			require.NoError(t, mock.ExpectationsWereMet())
+		})
+	}
+}
+
+// An error writing the aggregate step's own status column (the DEVOPS-373 branch) must surface
+// wrapped, and the transaction must roll back rather than leave the component-state insert
+// committed without the column it is meant to be visible through.
+func TestPostgresStore_UpdateStep_AggregateNoComponents_StepStatusWriteErrorRollsBack(t *testing.T) {
 	store, mock := newMockStore(t)
-	// A pipeline-level StartStep on an aggregate step before any component reports leaves the
-	// active component set empty; the aggregate must be left untouched rather than resolving
-	// to a vacuous "completed". If the guard regressed, an UPDATE ... SET builds_status would
-	// be issued and fail against the unexpected expectation below.
+	boom := errors.New("connection reset")
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
@@ -248,10 +278,41 @@ func TestPostgresStore_UpdateStep_AggregateNoComponents_NotWritten(t *testing.T)
 	mock.ExpectQuery("FROM slip_component_states").
 		WithArgs("c1", pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"component", "status", "message", "image_tag", "updated_at"}))
-	// Deliberately no "UPDATE routing_slips SET builds_status": empty active set.
+	mock.ExpectExec(`UPDATE routing_slips SET builds_status = \$1, updated_at`).
+		WithArgs("running", "c1").
+		WillReturnError(boom)
+	mock.ExpectRollback()
+
+	err := store.UpdateStep(context.Background(), "c1", "builds", "", StepStatusRunning)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, boom)
+	assert.Contains(t, err.Error(), "failed to update step builds")
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// Once a component has reported, the rollup is authoritative and a componentless write does not
+// touch the step column: recomputeAggregate's own UPDATE is the only one.
+func TestPostgresStore_UpdateStep_AggregateWithComponents_RollupStillWins(t *testing.T) {
+	store, mock := newMockStore(t)
+	mock.ExpectBegin()
+	expectLock(mock, "c1")
+	mock.ExpectExec("INSERT INTO slip_component_states").
+		WithArgs("c1", "builds", "", "failed", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	mock.ExpectQuery("SELECT builds FROM routing_slips").
+		WithArgs("c1").
+		WillReturnRows(pgxmock.NewRows([]string{"builds"}).AddRow([]byte(`{"items":[]}`)))
+	mock.ExpectQuery("FROM slip_component_states").
+		WithArgs("c1", pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"component", "status", "message", "image_tag", "updated_at"}).
+			AddRow("api", "completed", "", "", time.Now()))
+	// The rollup over [api completed], not the componentless "failed".
+	mock.ExpectExec(`UPDATE routing_slips SET builds_status = \$1, builds = \$2`).
+		WithArgs("completed", pgxmock.AnyArg(), "c1").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	mock.ExpectCommit()
 
-	require.NoError(t, store.UpdateStep(context.Background(), "c1", "builds", "", StepStatusRunning))
+	require.NoError(t, store.UpdateStep(context.Background(), "c1", "builds", "", StepStatusFailed))
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 

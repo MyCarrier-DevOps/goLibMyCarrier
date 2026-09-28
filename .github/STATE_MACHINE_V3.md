@@ -44,6 +44,7 @@
   - All primary failures resolved AND `slip=failed` → `slip=in_progress`; cascade-aborted steps reset to `pending`.
   - `prod_steady_state=completed` AND zero primary failures → `slip=completed` (terminal, immutable).
 - Aggregate `builds`: any single component primary failure → aggregate `failed` → `slip=failed`. Aggregate `completed` only when all components terminal-success.
+- Before any component reports, the aggregate step's status is its own last componentless write (DEVOPS-373).
 - Recovery path per step: `failed → running → completed`. Slip recovery fires on terminal post-event of last unresolved primary failure.
 
 ---
@@ -358,7 +359,11 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
   The claim, as of DEVOPS-367 (goLibMyCarrier ≥ v1.4.0), is a **flag**: `claimed_from`
   set means a run is in flight against the slip — running or held steps and components, which
-  is what `RunInFlight` counts. It protects *that*, and nothing wider: the gap between one
+  is what `RunInFlight` counts. This is what makes a componentless start of an aggregate step
+  count as in flight too (DEVOPS-373): before any component has reported, the write lands on
+  the step's own status column, the same as a pure pipeline step's, so `RunInFlight` sees it
+  through the same Steps loop. It protects running or held steps and components, and nothing
+  wider: the gap between one
   step's last post-job and the next step's pre-job is not covered, and closing it is tracked
   as **DEVOPS-371** (a dispatcher-held claim). Four properties:
 
@@ -1037,7 +1042,7 @@ checkPipelineCompletion(ctx, correlationID):
 | Category | `componentName` | Example | Update path in store |
 |----------|-----------------|---------|---------------------|
 | Pure pipeline | `""` | `unit_tests`, `dev_deploy`, `prod_gate` | `appendHistoryWithOverrides` - atomic INSERT SELECT, one column override |
-| Aggregate | `""` (rollup) | `builds` | `updateAggregateStatusFromComponentStatesWithHistory` - full Load+hydrateSlip+Update |
+| Aggregate | `""` (rollup; before any component reports: writes the step column, DEVOPS-373) | `builds` | `updateAggregateStatusFromComponentStatesWithHistory` - full Load+hydrateSlip+Update |
 | Component | `"mc.x.y"` | individual build | `insertComponentState` + triggers aggregate recalc |
 
 ### Step Status Reference
