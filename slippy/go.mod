@@ -5,7 +5,6 @@ go 1.26.0
 toolchain go1.26.5
 
 require (
-	github.com/ClickHouse/clickhouse-go/v2 v2.48.0
 	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.4.1
 	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.4.1
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.4.1
@@ -20,6 +19,7 @@ require (
 require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
+	github.com/ClickHouse/clickhouse-go/v2 v2.48.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.5.1 // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0 // indirect
@@ -103,7 +103,6 @@ require (
 
 require (
 	github.com/ClickHouse/ch-go v0.74.0 // indirect
-	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator v1.4.1
 	github.com/andybalholm/brotli v1.2.4 // indirect
 	github.com/go-faster/city v1.0.1 // indirect
 	github.com/go-faster/errors v0.8.0 // indirect
@@ -121,8 +120,6 @@ require (
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 )
-
-replace github.com/MyCarrier-DevOps/goLibMyCarrier/clickhousemigrator => ../clickhousemigrator
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator => ../postgresmigrator
 

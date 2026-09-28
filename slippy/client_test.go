@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
 func TestNewClientWithDependencies(t *testing.T) {
@@ -481,122 +479,6 @@ func TestClient_AbandonSlip(t *testing.T) {
 			t.Fatal("expected error")
 		}
 	})
-}
-
-// TestNewClient_ValidationErrors tests that NewClient properly validates configuration.
-// Note: We can't test successful NewClient without real ClickHouse/GitHub connections,
-// but we can test that invalid configurations are rejected before any connections are made.
-func TestNewClient_ValidationErrors(t *testing.T) {
-	// Helper to create a valid ClickHouseConfig for tests
-	validCHConfig := &ch.ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChPort:       "9000",
-		ChDatabase:   "testdb",
-		ChUsername:   "user",
-		ChPassword:   "pass",
-		ChSkipVerify: "true",
-	}
-
-	tests := []struct {
-		name    string
-		config  Config
-		wantErr bool
-	}{
-		{
-			name:    "empty config fails validation",
-			config:  Config{},
-			wantErr: true,
-		},
-		{
-			name: "missing ClickHouseConfig",
-			config: Config{
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "missing GitHubAppID",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "missing GitHubPrivateKey",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero HoldTimeout",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      0,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero PollInterval",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     0,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero AncestryDepth",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    0,
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewClient(tt.config)
-			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error, got nil")
-				}
-				// Verify the error mentions invalid configuration
-				if !errors.Is(err, ErrInvalidConfiguration) {
-					// The error should wrap the validation error
-					if err.Error() == "" {
-						t.Error("expected non-empty error message")
-					}
-				}
-			}
-			// Note: valid configs will still fail because we don't have real connections
-			// This is expected behavior - we're testing that validation runs first
-		})
-	}
 }
 
 func TestClient_Ping(t *testing.T) {

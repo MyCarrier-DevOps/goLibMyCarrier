@@ -3,7 +3,6 @@ package slippy
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -21,71 +20,6 @@ type Client struct {
 	config         Config
 	pipelineConfig *PipelineConfig
 	logger         Logger
-}
-
-// NewClient creates a new slippy client with all dependencies.
-// It validates the configuration and initializes the ClickHouse store and GitHub client.
-// The pipeline configuration must be set in the Config.
-func NewClient(config Config) (*Client, error) {
-	ctx := context.Background()
-	startTime := time.Now()
-
-	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
-
-	if config.Logger == nil {
-		config.Logger = NopLogger()
-	}
-
-	// Log database selection with reason
-	dbSource := "K8S_NAMESPACE"
-	if slippyDB := os.Getenv("SLIPPY_DATABASE"); slippyDB != "" {
-		dbSource = "SLIPPY_DATABASE override"
-	}
-	config.Logger.Info(ctx, "Database selected", map[string]interface{}{
-		"database":      config.Database,
-		"source":        dbSource,
-		"k8s_namespace": os.Getenv("K8S_NAMESPACE"),
-	})
-
-	// Initialize ClickHouse store from config
-	// Migrations are skipped if config.SkipMigrations is true (e.g., Slippy CLI trusts pushhookparser ran them)
-	storeStart := time.Now()
-	config.Logger.Info(ctx, "Creating ClickHouse store...", map[string]interface{}{
-		"skip_migrations": config.SkipMigrations,
-	})
-	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{
-		PipelineConfig: config.PipelineConfig,
-		Database:       config.Database,
-		Logger:         config.Logger,
-		SkipMigrations: config.SkipMigrations,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create store: %w", err)
-	}
-	config.Logger.Info(ctx, "ClickHouse store created", map[string]interface{}{
-		"store_create_ms": time.Since(storeStart).Milliseconds(),
-	})
-
-	// Initialize GitHub client for commit ancestry resolution
-	githubStart := time.Now()
-	githubClient, err := NewGitHubClient(config.GitHubConfig(), config.Logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GitHub client: %w", err)
-	}
-	config.Logger.Info(ctx, "GitHub client created", map[string]interface{}{
-		"github_create_ms": time.Since(githubStart).Milliseconds(),
-		"total_client_ms":  time.Since(startTime).Milliseconds(),
-	})
-
-	return &Client{
-		store:          store,
-		github:         githubClient,
-		config:         config,
-		pipelineConfig: config.PipelineConfig,
-		logger:         config.Logger,
-	}, nil
 }
 
 // NewClientWithDependencies creates a client with custom dependencies.
