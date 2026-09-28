@@ -724,13 +724,13 @@ func updateExistingComponent(dest *ComponentStepData, src ComponentStepData) {
 	}
 }
 
+// componentStateRow is one slip_component_states row, as recomputeAggregate scans it.
 type componentStateRow struct {
-	Step      string    `ch:"step"`
-	Component string    `ch:"component"`
-	Status    string    `ch:"status"`
-	Message   string    `ch:"message"`
-	ImageTag  string    `ch:"image_tag"`
-	Timestamp time.Time `ch:"timestamp"`
+	Component string
+	Status    string
+	Message   string
+	ImageTag  string
+	Timestamp time.Time
 }
 
 // resolveAggregateStep maps a step name to its aggregate step: the aggregate a component

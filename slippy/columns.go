@@ -19,7 +19,8 @@ const (
 	ColumnClaimedFrom = "claimed_from"
 	ColumnAncestry    = "ancestry"
 
-	// VersionedCollapsingMergeTree columns
+	// Columns of the removed ClickHouse routing_slips schema (DEVOPS-343). No store writes
+	// them; reservedStepNames (pipeline_config.go) still reserves them as step names.
 	ColumnSign    = "sign"
 	ColumnVersion = "version"
 )
