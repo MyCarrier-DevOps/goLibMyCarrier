@@ -1270,15 +1270,15 @@ func TestCheckPipelineCompletion_TerminalArmsWriteThroughUpdateSlipStatus(t *tes
 			store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusInProgress, Steps: arm.steps})
 			store.UpdateSlipStatusError = errors.New("write failed")
 
-			_, status, err := client.checkPipelineCompletion(ctx, "c")
+			done, status, err := client.checkPipelineCompletion(ctx, "c")
 			if !errors.Is(err, ErrSlipStatusUpdateFailed) {
 				t.Fatalf("expected ErrSlipStatusUpdateFailed, got %v", err)
 			}
 			if !strings.Contains(err.Error(), "write failed") {
 				t.Errorf("error %q does not carry the store's cause", err)
 			}
-			if status != arm.wantStatus {
-				t.Errorf("status = %q, want %q", status, arm.wantStatus)
+			if done != arm.wantDone || status != arm.wantStatus {
+				t.Errorf("got (%v, %q), want (%v, %q)", done, status, arm.wantDone, arm.wantStatus)
 			}
 		})
 	}

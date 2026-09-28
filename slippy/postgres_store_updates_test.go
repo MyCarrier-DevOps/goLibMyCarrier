@@ -1459,4 +1459,7 @@ func TestUpdateExistingComponent_CarriesImageTagAndKeepsFirstStartedAt(t *testin
 	updateExistingComponent(&dest, ComponentStepData{Component: "api", Status: StepStatusRunning, StartedAt: &later})
 	assert.True(t, dest.StartedAt.Equal(first), "a later report must not move StartedAt")
 	assert.Equal(t, "api:1", dest.ImageTag, "an empty ImageTag keeps the stored one")
+
+	updateExistingComponent(&dest, ComponentStepData{Component: "api", Status: StepStatusRunning, ImageTag: "api:2"})
+	assert.Equal(t, "api:2", dest.ImageTag, "a non-empty ImageTag replaces the stored one")
 }
