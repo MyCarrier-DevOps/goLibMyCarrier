@@ -32,9 +32,10 @@ package constructed the ClickHouse one. Removed from the exported API:
 `ch:` struct tags. `ErrRepaveUnsupported`, `ErrResetUnsupported` and `ErrClaimUnsupported`
 stay: they are the `SlipStore` contract for a store that cannot repave, reset or claim under a
 lock, and the push path still falls back on them. The module no longer requires
-`goLibMyCarrier/clickhouse`, `goLibMyCarrier/clickhousemigrator` or `clickhouse-go`. The only
-consumer, slippy-api, reads `DefaultConfig().Database` and `GetCurrentSchemaVersion`; its bump
-to v1.5.0 carries the change for both.
+`goLibMyCarrier/clickhouse`, `goLibMyCarrier/clickhousemigrator` or `clickhouse-go`. Two
+consumers import this module: slippy-api and slippy-migrator. slippy-migrator uses only surviving
+symbols and is unaffected. slippy-api, the only affected consumer, reads `DefaultConfig().Database`
+and `GetCurrentSchemaVersion`; its bump to v1.5.0 carries the change for both.
 
 **DEVOPS-367 added `ClaimSlip`, `ReleaseClaim`, `ProbeSchema` and `ResetSlipInPlace` to the
 exported `SlipStore` interface:**
@@ -435,7 +436,10 @@ result, err := slippy.RunPostgresMigrations(ctx, pool, slippy.PostgresMigrateOpt
 if err != nil {
     return handleError(logger, err)
 }
-logger.Info("schema migrated", result.StartVersion, "->", result.EndVersion)
+logger.Info(ctx, "schema migrated", map[string]interface{}{
+    "from": result.StartVersion,
+    "to":   result.EndVersion,
+})
 ```
 
 **Migration v6 (`claimed_from`, DEVOPS-367) rollout order.** Every Postgres read path
@@ -582,10 +586,24 @@ Slippy is enabled when `SLIPPY_PIPELINE_CONFIG` is set. If not set, slippy opera
 ```go
 // Production: build the store over your own pool, then inject it (see pattern 3 above)
 cfg := slippy.ConfigFromEnv()
-store, err := slippy.NewPostgresStore(pool, cfg.PipelineConfig, cfg.Logger)
-github, err := slippy.NewGitHubClient(cfg.GitHubConfig(), cfg.Logger)
-client := slippy.NewClientWithDependencies(store, github, cfg)
+pipelineConfig, err := slippy.LoadPipelineConfig() // ConfigFromEnv leaves it nil on error
+if err != nil {
+    return err
+}
+cfg.PipelineConfig = pipelineConfig
 
+store, err := slippy.NewPostgresStore(pool, cfg.PipelineConfig, cfg.Logger)
+if err != nil {
+    return err
+}
+github, err := slippy.NewGitHubClient(cfg.GitHubConfig(), cfg.Logger)
+if err != nil {
+    return err
+}
+client := slippy.NewClientWithDependencies(store, github, cfg)
+```
+
+```go
 // For testing with mocks
 client := slippy.NewClientWithDependencies(mockStore, mockGitHub, config)
 ```
@@ -761,7 +779,7 @@ func IsShadowMode() bool {
 1. **❌ Creating "WithGracefulFallback" wrappers** - Use shadow mode instead
 2. **❌ Hardcoding blocking/non-blocking behavior** - Let shadow mode control it
 3. **❌ Skipping nil client checks** - Client may be nil if slippy is disabled
-4. **❌ Running migrations without version check** - Always validate schema first
+4. **❌ Migrating from the serving process** - The migrator Job runs `RunPostgresMigrations`; services gate on `ProbeSchema`
 5. **❌ Importing types that create cycles** - Create local data structs
 6. **❌ Treating disabled slippy as an error** - Return nil, nil when disabled
 7. **❌ Forgetting to defer client.Close()** - Always clean up resources

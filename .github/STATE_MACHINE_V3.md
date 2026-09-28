@@ -13,7 +13,7 @@
 **Step statuses:** `pending`, `held`, `running`, `completed`, `skipped`, `failed`, `error`, `timeout`, `aborted`.
 - `completed` / `skipped`: terminal-success.
 - `failed` / `error` / `timeout`: terminal primary failure.
-- `aborted`: terminal-cascade (upstream prereq failed). **Reversible** — auto-reset to `pending` by recovery branch in `checkPipelineCompletion` when last primary failure resolves (`executor.go:365-405`).
+- `aborted`: terminal-cascade (upstream prereq failed). **Reversible** — auto-reset to `pending` by recovery branch in `checkPipelineCompletion` (`executor.go`) when last primary failure resolves.
 - Full table: see Step Status Reference below.
 
 **Glossary:**
@@ -62,7 +62,7 @@ Full definition and known violations: see `PROJECT_STATE.md` (Technical Debt - S
 | **I4** | `slip.status` change after `slip=completed` → **violation** (event log writes for further step events ARE allowed; only `slip.status` is immutable — see line 335). **Formerly an exception path:** slippy-api's `POST /v1/slips/{id}/claim` wrote `in_progress` unconditionally under DEVOPS-285; since DEVOPS-367 the claim is a flag and writes no status at all, so it no longer touches `slip.status` — see "An ended row may have work in flight against it" under the repave sharp edges |
 | **I5** | `routing_slips.<step>_status` column does not match the status the store derives for that step from its `slip_component_states` rows → **materialization violation** |
 
-**Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative rows in `slip_component_states`. PostgresStore writes both in one transaction under the slip's row lock (`updateStepTx`), so I5 holds by construction there. Divergence indicates a write-path bug, not a state-machine logic bug.
+**Note on invariant scope:** I1–I4 are semantic correctness invariants (slip.status given step states). I5 is a **materialization consistency** invariant — the cached `routing_slips.<step>_status` columns must match the authoritative rows in `slip_component_states`. PostgresStore keeps I5 for step writes: `updateStepTx` writes the component-state row and the step column in one transaction under the slip's row lock. It does not hold by construction on every path. A full-row `Create` or `Update` writes every `<step>_status` column from the caller's snapshot without touching `slip_component_states`, and `ResetSlipInPlace` rewrites the row but keeps the previous attempt's component rows (`push.go`, "Caveat 1"), so either can leave the two apart. Divergence points at one of those write paths or a write-path bug, not at state-machine logic.
 
 **I5 history — ClickHouse slip store (removed, DEVOPS-343).** Every I5 divergence recorded here
 before v1.5.0 came from the ClickHouse store: its async-insert visibility gap under
@@ -78,8 +78,8 @@ applies to PostgresStore. The full entries are in this file's history up to goLi
 **Note on `skipped`:** terminal-success, treated as `completed`. Does not block I3.
 
 **Pipeline termination without completing:**
-- `abandoned` - automatic when a newer push supersedes this branch (`AbandonSlip`, `client.go:170`)
-- `promoted` - automatic on PR squash-merge to another branch (`PromoteSlip`, `client.go:204`)
+- `abandoned` - automatic when a newer push supersedes this branch (`Client.AbandonSlip`)
+- `promoted` - automatic on PR squash-merge to another branch (`Client.PromoteSlip`)
 - No operator abort tool exists. Both bypass `checkPipelineCompletion`.
 
 **Same-commit slip identity — repave (DEVOPS-231):**
@@ -591,7 +591,7 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 - **`retrigger-ci`** (the operator workflow that resolves and re-dispatches an existing
   slip's steps, `action:"rerun"`): reuses the existing `correlation_id` and re-runs
   steps in place — a `failed` slip recovers via `checkPipelineCompletion`'s recovery
-  branch (`executor.go:365-405`), not via a new push. It never calls `CreateSlipForPush`
+  branch (`executor.go`), not via a new push. It never calls `CreateSlipForPush`
   and so never creates or repaves a slip; selective (e.g. unit-tests-only) retrigger must
   never be implemented as a filtered push replay, since repave would delete the build
   state such a retrigger wants to keep.
@@ -733,7 +733,7 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
 > **Note:** "downstream lazy-abort" means downstream step rows are NOT changed by FailStep. Each downstream step transitions to `aborted` only when its own `WaitForPrerequisites` call observes the failed prereq.
 
-> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch (`executor.go:365-405`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
+> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch of `checkPipelineCompletion` (`executor.go`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
 
 ---
 
@@ -917,7 +917,7 @@ slip recovers from failed → in_progress when:
   slip.Status == failed at the moment checkPipelineCompletion fires
 
 On recovery:
-  cascade-aborted (`aborted`) steps → reset to `pending` automatically by `checkPipelineCompletion` recovery branch (`executor.go:365-405`). `aborted` is the ONLY reversible terminal step status; `failed`, `error`, `timeout`, `completed`, `skipped` are not auto-reset. Peer steps in `running`/`held`/`pending` are NEVER modified by FailStep — only the failing step's own row and `slip.status` change synchronously.
+  cascade-aborted (`aborted`) steps → reset to `pending` automatically by `checkPipelineCompletion`'s recovery branch (`executor.go`). `aborted` is the ONLY reversible terminal step status; `failed`, `error`, `timeout`, `completed`, `skipped` are not auto-reset. Peer steps in `running`/`held`/`pending` are NEVER modified by FailStep — only the failing step's own row and `slip.status` change synchronously.
   slip.status → in_progress
   External orchestrators (auto-deployer, Argo) must re-trigger the pending steps
 ```
@@ -984,7 +984,7 @@ Auto-deployer is **read-only** (polls `GetSlip`). It triggers Argo workflows via
 ```
 checkPipelineCompletion(ctx, correlationID):
 
-  slip = store.Load()   // step columns match slip_component_states (I5)
+  slip = store.Load()   // step statuses are the materialized <step>_status columns (I5 scope: see above)
 
   // GUARD: only completed is immutable (NOT IsTerminal())
   if slip.Status == completed:
@@ -1037,7 +1037,7 @@ checkPipelineCompletion(ctx, correlationID):
 | `failed` | Yes | - | ✅ primary | Primary failure |
 | `error` | Yes | - | ✅ primary | Primary failure |
 | `timeout` | Yes | - | ✅ primary | Primary failure |
-| `aborted` | Yes* | - | ✅ cascade | Cascade - upstream prereq failed. *Reversible: auto-reset to `pending` on recovery (`executor.go:365-405`). |
+| `aborted` | Yes* | - | ✅ cascade | Cascade - upstream prereq failed. *Reversible: auto-reset to `pending` by `checkPipelineCompletion`'s recovery branch. |
 
 ---
 
@@ -1065,7 +1065,7 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 9. **(Removed with the ClickHouse store, DEVOPS-343.)** This rule governed the ClickHouse INSERT SELECT writers (`stepStatusOverride`, CLONE_DERIVED). PostgresStore writes step columns with plain UPDATEs inside the slip's row-locked transaction, so there is no clone to override.
 
-10. **Component-state rows are the source of truth** — never read raw `routing_slips.<step>_status` for correctness decisions. Always go through `Load`, OR read the step's `slip_component_states` rows.
+10. **Component-state rows are the source of truth** — `Load` returns the materialized `routing_slips.<step>_status` columns, which match the component-state rows only within I5's scope (see the note on invariant scope). A decision that needs the authoritative per-step state reads the step's `slip_component_states` rows. Never query `<step>_status` ad hoc.
 
 ### 4 Most Common Violations
 

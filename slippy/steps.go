@@ -95,8 +95,11 @@ func (c *Client) UpdateStepWithStatus(
 	// performed inside the store (PostgresStore.recomputeAggregate) do not re-enter this
 	// path, so they do not trigger pipeline completion from here.
 	//
-	// UpdateSlipStatus (store.UpdateSlipStatus) writes only the status column, with no
-	// Load+Update round-trip, so it cannot overwrite a concurrent state_history append.
+	// UpdateSlipStatus (store.UpdateSlipStatus) is a targeted status write with no Load+Update
+	// round-trip: it sets status and updated_at, and on a terminal status also clears
+	// claimed_from and appends a slip_released marker when a claim was held (see
+	// SlipStore.UpdateSlipStatus). It never rewrites state_history from a snapshot, so it
+	// cannot overwrite a concurrent state_history append.
 	if status.IsTerminal() && componentName == "" {
 		if _, _, checkErr := c.checkPipelineCompletion(ctx, correlationID); checkErr != nil {
 			c.logger.Warn(ctx, "pipeline completion check failed (non-fatal)", map[string]interface{}{
