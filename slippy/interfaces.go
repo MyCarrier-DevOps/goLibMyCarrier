@@ -153,11 +153,12 @@ type SlipStore interface {
 	AppendHistory(ctx context.Context, correlationID string, entry StateHistoryEntry) error
 
 	// UpdateSlipStatus atomically updates the slip's top-level status without a full Load+Update
-	// round-trip. Uses INSERT SELECT to copy the current DB row and override only the status
-	// column, preventing concurrent history appends from being lost under last-write-wins.
+	// round-trip: a targeted write of the status (and updated_at), so a concurrent step or
+	// history write is not clobbered by a stale snapshot.
 	//
 	// This is THE ONE WRITE PATH THAT ENDS A CLAIM: a terminal status also clears
-	// claimed_from, because terminal ends the run (DEVOPS-367). Non-terminal statuses —
+	// claimed_from, because terminal ends the run (DEVOPS-367), and when a claim was actually
+	// held it appends a slip_released marker atomically with that write. Non-terminal statuses —
 	// failed included — leave the claim in place. Neither Create nor the full-row Update
 	// touches the column, so every library path that must end a claim (AbandonSlip,
 	// PromoteSlip, checkPipelineCompletion) comes through here.

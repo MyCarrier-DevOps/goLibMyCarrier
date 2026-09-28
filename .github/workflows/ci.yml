@@ -93,9 +93,9 @@ jobs:
           threshold-total: 75
           source-dir: ./${{ matrix.module }}
 
-  # Merge-gated deterministic integration suite for the Postgres slip store. Only the suites
-  # the -run filter below names run here, each for a property pgxmock cannot exercise (see the
-  # notes on the step); DEVOPS-343 widened it to name every integration test in the package.
+  # Merge-gated deterministic integration suite for the Postgres slip store. Only the
+  # integration suites the -run filter below names run here (see the notes on the step for why
+  # each is included); DEVOPS-343 widened it to name every integration test in the package.
   # The flaky ClickHouse integration tests that once made an unfiltered run a coin flip were
   # deleted with the ClickHouse slip store (DEVOPS-343).
   #
@@ -152,8 +152,9 @@ jobs:
       # all properties of real Postgres locking and real DDL that pgxmock cannot exercise.
       # TestPostgresStore_ResetSlipInPlace.*_Integration is anchored on the _Integration suffix
       # rather than matched by bare prefix: five further ResetSlipInPlace tests are pgxmock and
-      # already run in the unit job, and dragging them in here would be the first entry in this
-      # regex to do so. The four it does select are the only real-Postgres proof that the reset
+      # already run in the unit job. (The bare Load, Repave and TestClaimedFromMigration_V6
+      # prefixes do pull 18 unit-job tests in here too, 17 of them pgxmock; they are cheap and
+      # harmless.) The four it does select are the only real-Postgres proof that the reset
       # serialises behind a concurrent claim, refuses one taken after the caller's read, carries
       # one that must be carried, and handles the unclaimed and absent rows — the FOR UPDATE race
       # ResetSlipInPlace exists to close, which is exactly what pgxmock cannot exercise.

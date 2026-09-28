@@ -1168,8 +1168,8 @@ func TestUpdateStepWithStatus_PipelineCompletion(t *testing.T) {
 	t.Run("checkPipelineCompletion uses UpdateSlipStatus not Load+Update for status change", func(t *testing.T) {
 		// Regression test: checkPipelineCompletion previously called client.UpdateSlipStatus
 		// which did store.Load() + store.Update(). Now client.UpdateSlipStatus delegates to
-		// store.UpdateSlipStatus (atomic INSERT SELECT), so store.Load must NOT be called by
-		// the status-update path, and store.Update must NOT be called at all.
+		// store.UpdateSlipStatus (a targeted status write, not Load+Update), so store.Load must
+		// NOT be called by the status-update path, and store.Update must NOT be called at all.
 		store := NewMockStore()
 		github := NewMockGitHubAPI()
 		client := NewClientWithDependencies(store, github, Config{})
