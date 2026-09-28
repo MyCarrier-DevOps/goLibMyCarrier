@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1222,4 +1223,63 @@ func TestUpdateStepWithStatus_PipelineCompletion(t *testing.T) {
 			t.Errorf("expected slip status %q, got %q", SlipStatusFailed, loaded.Status)
 		}
 	})
+}
+
+// TestCheckPipelineCompletion_TerminalArmsWriteThroughUpdateSlipStatus pins the slip-status
+// write that both terminal arms of checkPipelineCompletion make: exactly one
+// SlipStore.UpdateSlipStatus call carrying the arm's status, and a store error returned
+// wrapped in ErrSlipStatusUpdateFailed. The ClickHouse-only step-override path that could
+// bypass UpdateSlipStatus is gone (DEVOPS-343); this is the contract every store now gets.
+func TestCheckPipelineCompletion_TerminalArmsWriteThroughUpdateSlipStatus(t *testing.T) {
+	ctx := context.Background()
+	arms := []struct {
+		name       string
+		steps      map[string]Step
+		wantStatus SlipStatus
+		wantDone   bool
+	}{
+		{"primary failure", map[string]Step{"unit_tests": {Status: StepStatusFailed}}, SlipStatusFailed, false},
+		{
+			"steady state completed",
+			map[string]Step{"prod_steady_state": {Status: StepStatusCompleted}},
+			SlipStatusCompleted,
+			true,
+		},
+	}
+	for _, arm := range arms {
+		t.Run(arm.name+"/writes once", func(t *testing.T) {
+			store := NewMockStore()
+			client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{})
+			store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusInProgress, Steps: arm.steps})
+
+			done, status, err := client.checkPipelineCompletion(ctx, "c")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if done != arm.wantDone || status != arm.wantStatus {
+				t.Errorf("got (%v, %q), want (%v, %q)", done, status, arm.wantDone, arm.wantStatus)
+			}
+			want := []UpdateSlipStatusCall{{CorrelationID: "c", Status: arm.wantStatus}}
+			if len(store.UpdateSlipStatusCalls) != 1 || store.UpdateSlipStatusCalls[0] != want[0] {
+				t.Errorf("UpdateSlipStatus calls = %+v, want %+v", store.UpdateSlipStatusCalls, want)
+			}
+		})
+		t.Run(arm.name+"/wraps a store error", func(t *testing.T) {
+			store := NewMockStore()
+			client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{})
+			store.AddSlip(&Slip{CorrelationID: "c", Status: SlipStatusInProgress, Steps: arm.steps})
+			store.UpdateSlipStatusError = errors.New("write failed")
+
+			_, status, err := client.checkPipelineCompletion(ctx, "c")
+			if !errors.Is(err, ErrSlipStatusUpdateFailed) {
+				t.Fatalf("expected ErrSlipStatusUpdateFailed, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "write failed") {
+				t.Errorf("error %q does not carry the store's cause", err)
+			}
+			if status != arm.wantStatus {
+				t.Errorf("status = %q, want %q", status, arm.wantStatus)
+			}
+		})
+	}
 }
