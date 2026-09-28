@@ -22,8 +22,9 @@ type Client struct {
 	logger         Logger
 }
 
-// NewClientWithDependencies creates a client with custom dependencies.
-// This is primarily useful for testing with mock implementations.
+// NewClientWithDependencies creates a client over the given store and GitHub client. It is
+// the only constructor: callers build the store (NewPostgresStore over their own pgxpool.Pool,
+// or a test double) and the GitHub client (NewGitHubClient) and inject both.
 func NewClientWithDependencies(store SlipStore, github GitHubAPI, config Config) *Client {
 	if config.Logger == nil {
 		config.Logger = NopLogger()
@@ -37,9 +38,6 @@ func NewClientWithDependencies(store SlipStore, github GitHubAPI, config Config)
 	}
 	if config.AncestryDepth == 0 {
 		config.AncestryDepth = DefaultConfig().AncestryDepth
-	}
-	if config.Database == "" {
-		config.Database = DefaultConfig().Database
 	}
 
 	return &Client{
@@ -180,7 +178,7 @@ func (c *Client) Store() SlipStore {
 	return c.store
 }
 
-// Ping verifies the underlying ClickHouse connection is alive.
+// Ping verifies the underlying store connection is alive.
 // This allows callers to detect stale pool connections before performing operations.
 func (c *Client) Ping(ctx context.Context) error {
 	if c.store == nil {

@@ -5,7 +5,6 @@ go 1.26.0
 toolchain go1.26.5
 
 require (
-	github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse v1.4.1
 	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.4.1
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.4.1
 	github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator v1.4.1
@@ -19,7 +18,6 @@ require (
 require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
-	github.com/ClickHouse/clickhouse-go/v2 v2.48.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.5.1 // indirect
 	github.com/bradleyfalzon/ghinstallation/v2 v2.19.0 // indirect
@@ -102,17 +100,9 @@ require (
 )
 
 require (
-	github.com/ClickHouse/ch-go v0.74.0 // indirect
-	github.com/andybalholm/brotli v1.2.4 // indirect
-	github.com/go-faster/city v1.0.1 // indirect
-	github.com/go-faster/errors v0.8.0 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/google/go-querystring v1.2.0 // indirect
 	github.com/klauspost/compress v1.20.0 // indirect
-	github.com/paulmach/orb v0.13.0 // indirect
-	github.com/pierrec/lz4/v4 v4.1.30 // indirect
-	github.com/segmentio/asm v1.2.1 // indirect
-	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/shurcooL/graphql v0.0.0-20240915155400-7ee5256398cf // indirect
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
@@ -126,5 +116,3 @@ replace github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator => ../postgr
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/logger => ../logger
 
 replace github.com/MyCarrier-DevOps/goLibMyCarrier/github => ../github
-
-replace github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse => ../clickhouse
