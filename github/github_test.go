@@ -517,6 +517,33 @@ func TestGithubSession_Authenticate_ErrorWrapping(t *testing.T) {
 	})
 }
 
+// TestGithubSession_Authenticate_DropsThePEMLeader pins that a session accepts the PEM shapes
+// NewGraphQLClient does: the run of spaces, tabs, line breaks or byte order mark before
+// -----BEGIN is dropped before the key is parsed.
+func TestGithubSession_Authenticate_DropsThePEMLeader(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc(testTokenPath, tokenHandler)
+	server := newStallServer(t, mux)
+	validPEM := testPrivateKey(t)
+
+	tests := []struct {
+		name string
+		pem  string
+	}{
+		{name: "PEM as given", pem: validPEM},
+		{name: "PEM behind a UTF-8 BOM", pem: "\ufeff" + validPEM},
+		{name: "PEM with spaces before -----BEGIN on its line", pem: "\n  " + validPEM},
+		{name: "PEM after leading blank lines", pem: "\r\n\n" + validPEM},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session, err := NewGithubSessionWithOptions(tt.pem, "12345", "67890", withMintBaseURLForTest(server.URL))
+			require.NoError(t, err)
+			assert.Equal(t, testAccessToken, session.AuthToken().AccessToken)
+		})
+	}
+}
+
 // Benchmark tests
 func BenchmarkPullRequestOptions_Validate(b *testing.B) {
 	opts := &PullRequestOptions{
