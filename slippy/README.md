@@ -355,7 +355,9 @@ config := slippy.Config{
     HoldTimeout:         30 * time.Minute,
     PollInterval:        30 * time.Second,
     AncestryDepth:       20,
-    AncestryMaxDepth:    100, // not defaulted: left at 0, the search never widens past AncestryDepth
+    // Not defaulted: left at 0, the search never widens past AncestryDepth
+    // and Client.ResolveAncestry returns an empty chain.
+    AncestryMaxDepth:    100,
     ShadowMode:          false,
 }
 
@@ -483,8 +485,9 @@ func main() {
 
     // Load config from environment, then build the store and GitHub client.
     // ConfigFromEnv reports no errors: it leaves PipelineConfig nil when
-    // SLIPPY_PIPELINE_CONFIG fails to load, and GitHubAppID 0 when SLIPPY_GITHUB_APP_ID is
-    // unset or not a number. Check both here; before v1.5.0, NewClient's Config.Validate did.
+    // SLIPPY_PIPELINE_CONFIG fails to load, GitHubAppID 0 when SLIPPY_GITHUB_APP_ID is
+    // unset or not a number, and GitHubPrivateKey empty when SLIPPY_GITHUB_APP_PRIVATE_KEY
+    // is unset. Check all three here; before v1.5.0, NewClient's Config.Validate did.
     config := slippy.ConfigFromEnv()
     pipelineConfig, err := slippy.LoadPipelineConfig()
     if err != nil {
@@ -493,6 +496,9 @@ func main() {
     config.PipelineConfig = pipelineConfig
     if config.GitHubAppID == 0 {
         log.Fatal("SLIPPY_GITHUB_APP_ID must be set to the GitHub App's numeric ID")
+    }
+    if config.GitHubPrivateKey == "" {
+        log.Fatal("SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)")
     }
     pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
     if err != nil {
