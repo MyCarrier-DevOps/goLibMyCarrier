@@ -506,6 +506,12 @@ func InitializeSlippy(ctx context.Context, pool *pgxpool.Pool, logger Logger) (*
         return handleInitError(logger, fmt.Errorf(
             "SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative"))
     }
+    // ConfigFromEnv keeps a max depth below the initial one; the ancestry search then never widens
+    if cfg.AncestryMaxDepth < cfg.AncestryDepth {
+        return handleInitError(logger, fmt.Errorf(
+            "SLIPPY_ANCESTRY_MAX_DEPTH (%d) must be >= SLIPPY_ANCESTRY_DEPTH (%d)",
+            cfg.AncestryMaxDepth, cfg.AncestryDepth))
+    }
 
     store, err := slippy.NewPostgresStore(pool, pipelineConfig, cfg.Logger)
     if err != nil {
@@ -614,6 +620,11 @@ if cfg.GitHubPrivateKey == "" {
 // ConfigFromEnv keeps a negative duration; NewClientWithDependencies defaults only zero
 if cfg.HoldTimeout < 0 || cfg.PollInterval < 0 {
     return fmt.Errorf("SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative")
+}
+// ConfigFromEnv keeps a max depth below the initial one; the ancestry search then never widens
+if cfg.AncestryMaxDepth < cfg.AncestryDepth {
+    return fmt.Errorf("SLIPPY_ANCESTRY_MAX_DEPTH (%d) must be >= SLIPPY_ANCESTRY_DEPTH (%d)",
+        cfg.AncestryMaxDepth, cfg.AncestryDepth)
 }
 
 store, err := slippy.NewPostgresStore(pool, cfg.PipelineConfig, cfg.Logger)

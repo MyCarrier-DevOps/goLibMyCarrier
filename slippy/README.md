@@ -490,8 +490,9 @@ func main() {
     // is unset. It also keeps a negative SLIPPY_HOLD_TIMEOUT or SLIPPY_POLL_INTERVAL, and
     // NewClientWithDependencies defaults only zero ones: a negative poll interval re-polls
     // Postgres with no delay while a hold waits, and a negative hold timeout has expired
-    // before the first poll. Check all four here; before v1.5.0, NewClient's
-    // Config.Validate did.
+    // before the first poll. And it keeps a SLIPPY_ANCESTRY_MAX_DEPTH below
+    // SLIPPY_ANCESTRY_DEPTH, with which the ancestry search never widens. Check all five
+    // here; before v1.5.0, NewClient's Config.Validate did.
     config := slippy.ConfigFromEnv()
     pipelineConfig, err := slippy.LoadPipelineConfig()
     if err != nil {
@@ -506,6 +507,10 @@ func main() {
     }
     if config.HoldTimeout < 0 || config.PollInterval < 0 {
         log.Fatal("SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative")
+    }
+    if config.AncestryMaxDepth < config.AncestryDepth {
+        log.Fatalf("SLIPPY_ANCESTRY_MAX_DEPTH (%d) must be >= SLIPPY_ANCESTRY_DEPTH (%d)",
+            config.AncestryMaxDepth, config.AncestryDepth)
     }
     pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
     if err != nil {
