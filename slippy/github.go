@@ -20,8 +20,8 @@ type GitHubClient = gh.GraphQLClient
 type Installation = gh.Installation
 
 // NewGitHubClient creates a new GitHub client with App authentication.
-// The private key can be provided as PEM content (starts with "-----BEGIN")
-// or as a file path.
+// The private key can be provided as PEM content (starts with "-----BEGIN",
+// after any blank lines) or as a file path.
 //
 // This function wraps github.NewGraphQLClient for backward compatibility.
 func NewGitHubClient(cfg GitHubConfig, logger Logger) (*GitHubClient, error) {

@@ -5,13 +5,16 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -154,7 +157,7 @@ func TestNewGraphQLClient_InvalidFilePath(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Nil(t, client)
-	assert.Contains(t, err.Error(), "failed to read private key file")
+	assert.Contains(t, err.Error(), "nor a readable file path")
 }
 
 func TestNewGraphQLClient_InvalidKey(t *testing.T) {
@@ -166,6 +169,115 @@ func TestNewGraphQLClient_InvalidKey(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, client)
 	assert.Contains(t, err.Error(), "invalid private key")
+}
+
+// TestNewGraphQLClient_PrivateKeyNotEchoed pins that no NewGraphQLClient error
+// carries the configured PrivateKey: a value that fails PEM detection may still be
+// key material, and callers print these errors (slippy's Quick Start log.Fatals one).
+func TestNewGraphQLClient_PrivateKeyNotEchoed(t *testing.T) {
+	validPEM := testPrivateKey(t)
+	keyFile := filepath.Join(t.TempDir(), "private-key.pem")
+	require.NoError(t, os.WriteFile(keyFile, []byte(validPEM), 0o600))
+	block, _ := pem.Decode([]byte(validPEM))
+	require.NotNil(t, block)
+	truncatedPEM := string(pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: block.Bytes[:len(block.Bytes)/2]}))
+	const hint = "private key is neither PEM content (starting with -----BEGIN) nor a readable file path"
+
+	tests := []struct {
+		name       string
+		privateKey string
+		wantKey    string // on success, the key bytes the client holds
+		wantInMsg  string // on failure, text the message must contain
+		wantIs     error  // on failure, an errors.Is target
+	}{
+		{
+			name:       "base64 of a valid PEM",
+			privateKey: base64.StdEncoding.EncodeToString([]byte(validPEM)),
+			wantInMsg:  hint,
+		},
+		{
+			name:       "PEM after leading blank lines is content, kept as given",
+			privateKey: " \t\r\n\n" + validPEM,
+			wantKey:    " \t\r\n\n" + validPEM,
+		},
+		{
+			// pem.Decode wants -----BEGIN at the start of a line, so this is content that
+			// does not parse: it fails as an invalid key, not as a path.
+			name:       "PEM with spaces before -----BEGIN on its line",
+			privateKey: "\n  " + validPEM,
+			wantInMsg:  "invalid private key",
+		},
+		{
+			name:       "PEM behind a UTF-8 BOM",
+			privateKey: "\ufeff" + validPEM,
+			wantInMsg:  hint,
+		},
+		{
+			name:       "text naming PRIVATE KEY that is neither PEM nor a path",
+			privateKey: "my GitHub App PRIVATE KEY, pasted without its PEM armour",
+			wantInMsg:  hint,
+		},
+		{
+			name:       "PEM armour around a truncated key",
+			privateKey: truncatedPEM,
+			wantInMsg:  "invalid private key",
+		},
+		{
+			name:       "missing file path",
+			privateKey: filepath.Join(t.TempDir(), "missing-private-key.pem"),
+			wantInMsg:  hint,
+			wantIs:     fs.ErrNotExist,
+		},
+		{
+			name:       "file holding a valid PEM",
+			privateKey: keyFile,
+			wantKey:    validPEM,
+		},
+		{
+			name:       "empty",
+			privateKey: "",
+			wantInMsg:  "private key is empty",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := NewGraphQLClient(GraphQLConfig{AppID: 12345, PrivateKey: tt.privateKey}, nil)
+			if tt.wantKey != "" {
+				require.NoError(t, err)
+				require.NotNil(t, client)
+				assert.Equal(t, tt.wantKey, string(client.privateKey))
+				return
+			}
+			require.Error(t, err)
+			assert.Nil(t, client)
+			assertNoEcho(t, err.Error(), tt.privateKey)
+			assert.Contains(t, err.Error(), tt.wantInMsg)
+			if tt.wantIs != nil {
+				assert.ErrorIs(t, err, tt.wantIs)
+			}
+		})
+	}
+}
+
+// assertNoEcho fails when msg contains value or any 20-byte window of it, so a
+// partial echo (a prefix, a line of a PEM body) fails as well as a whole one.
+func assertNoEcho(t *testing.T, msg, value string) {
+	t.Helper()
+	const window = 20
+	if value == "" {
+		return
+	}
+	if len(value) < window {
+		assert.NotContains(t, msg, value, "error echoes the configured private key")
+		return
+	}
+	for i := 0; i+window <= len(value); i++ {
+		if strings.Contains(msg, value[i:i+window]) {
+			t.Errorf("error echoes the configured private key: bytes %d-%d of the value appear in a %d-byte message",
+				i, i+window, len(msg))
+			return
+		}
+	}
 }
 
 func TestNewGraphQLClient_WithEnterpriseURL(t *testing.T) {
