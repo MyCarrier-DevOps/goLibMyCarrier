@@ -487,7 +487,11 @@ func main() {
     // ConfigFromEnv reports no errors: it leaves PipelineConfig nil when
     // SLIPPY_PIPELINE_CONFIG fails to load, GitHubAppID 0 when SLIPPY_GITHUB_APP_ID is
     // unset or not a number, and GitHubPrivateKey empty when SLIPPY_GITHUB_APP_PRIVATE_KEY
-    // is unset. Check all three here; before v1.5.0, NewClient's Config.Validate did.
+    // is unset. It also keeps a negative SLIPPY_HOLD_TIMEOUT or SLIPPY_POLL_INTERVAL, and
+    // NewClientWithDependencies defaults only zero ones: a negative poll interval re-polls
+    // Postgres with no delay while a hold waits, and a negative hold timeout has expired
+    // before the first poll. Check all four here; before v1.5.0, NewClient's
+    // Config.Validate did.
     config := slippy.ConfigFromEnv()
     pipelineConfig, err := slippy.LoadPipelineConfig()
     if err != nil {
@@ -499,6 +503,9 @@ func main() {
     }
     if config.GitHubPrivateKey == "" {
         log.Fatal("SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)")
+    }
+    if config.HoldTimeout < 0 || config.PollInterval < 0 {
+        log.Fatal("SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative")
     }
     pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
     if err != nil {
@@ -526,8 +533,8 @@ func main() {
         log.Fatal(err)
     }
 
-    log.Printf("Resolved slip %s (status: %s) via %s", 
-        result.Slip.CorrelationID, 
+    log.Printf("Resolved slip %s (status: %s) via %s",
+        result.Slip.CorrelationID,
         result.Slip.Status,
         result.ResolvedBy)
 }

@@ -484,15 +484,28 @@ Initialize the slippy client early in the application lifecycle, with shadow mod
 func InitializeSlippy(ctx context.Context, pool *pgxpool.Pool, logger Logger) (*slippy.Client, error) {
     if !IsSlippyEnabled() {
         logger.Info("Slippy disabled (SLIPPY_PIPELINE_CONFIG not set)")
-        return nil, nil  // Disabled is not an error
+        return nil, nil // Disabled is not an error
     }
 
     cfg := slippy.ConfigFromEnv()
     pipelineConfig, err := slippy.LoadPipelineConfig() // ConfigFromEnv leaves it nil on error
     if err != nil {
-        return handleInitError(logger, err)  // Shadow mode determines blocking
+        return handleInitError(logger, err) // Shadow mode determines blocking
     }
     cfg.PipelineConfig = pipelineConfig
+    if cfg.GitHubAppID == 0 {
+        return handleInitError(logger, fmt.Errorf(
+            "SLIPPY_GITHUB_APP_ID must be set to the GitHub App's numeric ID"))
+    }
+    if cfg.GitHubPrivateKey == "" {
+        return handleInitError(logger, fmt.Errorf(
+            "SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)"))
+    }
+    // ConfigFromEnv keeps a negative duration; NewClientWithDependencies defaults only zero
+    if cfg.HoldTimeout < 0 || cfg.PollInterval < 0 {
+        return handleInitError(logger, fmt.Errorf(
+            "SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative"))
+    }
 
     store, err := slippy.NewPostgresStore(pool, pipelineConfig, cfg.Logger)
     if err != nil {
@@ -592,6 +605,16 @@ if err != nil {
     return err
 }
 cfg.PipelineConfig = pipelineConfig
+if cfg.GitHubAppID == 0 {
+    return fmt.Errorf("SLIPPY_GITHUB_APP_ID must be set to the GitHub App's numeric ID")
+}
+if cfg.GitHubPrivateKey == "" {
+    return fmt.Errorf("SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)")
+}
+// ConfigFromEnv keeps a negative duration; NewClientWithDependencies defaults only zero
+if cfg.HoldTimeout < 0 || cfg.PollInterval < 0 {
+    return fmt.Errorf("SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative")
+}
 
 store, err := slippy.NewPostgresStore(pool, cfg.PipelineConfig, cfg.Logger)
 if err != nil {
