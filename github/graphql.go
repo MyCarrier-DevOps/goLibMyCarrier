@@ -84,8 +84,8 @@ type Installation struct {
 
 // NewGraphQLClient creates a new GitHub GraphQL client with App authentication.
 // The private key can be provided as PEM content (starts with "-----BEGIN",
-// after any blank lines) or as a file path. No error it returns contains the
-// configured key value.
+// after any leading whitespace or byte order mark, which is dropped) or as a
+// file path. No error it returns contains the configured key value.
 func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, error) {
 	if log == nil {
 		log = &logger.NopLogger{}
@@ -116,22 +116,26 @@ func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, err
 // so it is safe to print.
 const privateKeyHint = "private key is neither PEM content (starting with -----BEGIN) nor a readable file path"
 
-// loadPrivateKey returns value as the key when it is PEM content, whose first
-// byte after any leading whitespace is '-', and otherwise the contents of the file
-// value names. Only the detection trims; PEM content is returned exactly as given.
-// It parses when that whitespace is blank lines: pem.Decode wants -----BEGIN at
-// the start of a line.
+// pemLeader is what may come before a PEM's -----BEGIN line: whitespace, and the
+// UTF-8 byte order mark an editor or a paste can leave in front.
+const pemLeader = "\ufeff \t\r\n"
+
+// loadPrivateKey returns the key when value is PEM content, whose first byte after
+// any pemLeader run is '-', and otherwise the contents of the file value names.
+// PEM content loses that leading run: it is never part of a PEM, and pem.Decode
+// wants -----BEGIN at the start of a line. The rest of the content, and a file
+// path, are used exactly as given.
 //
 // Its errors never contain value. A value that fails PEM detection may still be
-// key material (base64, or a key pasted behind a BOM), so a failed read reports
-// the value's length and the cause os.ReadFile gives, not the *fs.PathError,
-// whose Path is value.
+// key material (base64, or a PEM behind other text), so a failed read reports the
+// value's length and the cause os.ReadFile gives, not the *fs.PathError, whose
+// Path is value.
 func loadPrivateKey(value string) ([]byte, error) {
 	if value == "" {
 		return nil, errors.New("private key is empty: set PEM content or a key file path")
 	}
-	if strings.HasPrefix(strings.TrimLeft(value, " \t\r\n"), "-") {
-		return []byte(value), nil
+	if content := strings.TrimLeft(value, pemLeader); strings.HasPrefix(content, "-") {
+		return []byte(content), nil
 	}
 	key, err := os.ReadFile(value)
 	if err == nil {

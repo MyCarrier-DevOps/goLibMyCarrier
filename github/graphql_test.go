@@ -196,20 +196,25 @@ func TestNewGraphQLClient_PrivateKeyNotEchoed(t *testing.T) {
 			wantInMsg:  hint,
 		},
 		{
-			name:       "PEM after leading blank lines is content, kept as given",
+			name:       "PEM after leading blank lines parses; the whitespace is dropped",
 			privateKey: " \t\r\n\n" + validPEM,
-			wantKey:    " \t\r\n\n" + validPEM,
+			wantKey:    validPEM,
 		},
 		{
-			// pem.Decode wants -----BEGIN at the start of a line, so this is content that
-			// does not parse: it fails as an invalid key, not as a path.
-			name:       "PEM with spaces before -----BEGIN on its line",
+			// pem.Decode wants -----BEGIN at the start of a line, so this parses only
+			// because the leading whitespace is dropped.
+			name:       "PEM with spaces before -----BEGIN on its line parses",
 			privateKey: "\n  " + validPEM,
-			wantInMsg:  "invalid private key",
+			wantKey:    validPEM,
 		},
 		{
-			name:       "PEM behind a UTF-8 BOM",
+			name:       "PEM behind a UTF-8 BOM parses; the BOM is dropped",
 			privateKey: "\ufeff" + validPEM,
+			wantKey:    validPEM,
+		},
+		{
+			name:       "PEM behind other text",
+			privateKey: "GITHUB_APP_PRIVATE_KEY=" + validPEM,
 			wantInMsg:  hint,
 		},
 		{
