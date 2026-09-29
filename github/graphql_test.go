@@ -177,8 +177,12 @@ func TestNewGraphQLClient_InvalidKey(t *testing.T) {
 // key material, and callers print these errors (slippy's Quick Start log.Fatals one).
 func TestNewGraphQLClient_PrivateKeyNotEchoed(t *testing.T) {
 	validPEM := testPrivateKey(t)
-	keyFile := filepath.Join(t.TempDir(), "private-key.pem")
-	require.NoError(t, os.WriteFile(keyFile, []byte(validPEM), 0o600))
+	writeKeyFile := func(name, content string) string {
+		path := filepath.Join(t.TempDir(), name)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	keyFile := writeKeyFile("private-key.pem", validPEM)
 	block, _ := pem.Decode([]byte(validPEM))
 	require.NotNil(t, block)
 	truncatedPEM := string(pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: block.Bytes[:len(block.Bytes)/2]}))
@@ -237,6 +241,16 @@ func TestNewGraphQLClient_PrivateKeyNotEchoed(t *testing.T) {
 		{
 			name:       "file holding a valid PEM",
 			privateKey: keyFile,
+			wantKey:    validPEM,
+		},
+		{
+			name:       "key file with a BOM parses; the BOM is dropped",
+			privateKey: writeKeyFile("bom-private-key.pem", "\ufeff"+validPEM),
+			wantKey:    validPEM,
+		},
+		{
+			name:       "key file with leading blank lines parses; the blank lines are dropped",
+			privateKey: writeKeyFile("blank-lines-private-key.pem", "\r\n\n"+validPEM),
 			wantKey:    validPEM,
 		},
 		{

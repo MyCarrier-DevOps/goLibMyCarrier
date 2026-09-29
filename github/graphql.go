@@ -85,8 +85,8 @@ type Installation struct {
 // NewGraphQLClient creates a new GitHub GraphQL client with App authentication.
 // The private key can be provided as PEM content (starts with "-----BEGIN",
 // after any leading spaces, tabs, line breaks or byte order mark, which are
-// dropped) or as a file path. No error it returns contains the configured key
-// value.
+// dropped) or as the path of a file holding it (the file's leading run is
+// dropped the same way). No error it returns contains the configured key value.
 func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, error) {
 	if log == nil {
 		log = &logger.NopLogger{}
@@ -122,18 +122,23 @@ const privateKeyHint = "private key is neither PEM content (starting with -----B
 // A value made only of these is empty.
 const pemLeader = "\ufeff \t\r\n"
 
+// trimPEMLeader drops the pemLeader run from the front of a PEM: it is never part
+// of one, and pem.Decode wants -----BEGIN at the start of a line.
+func trimPEMLeader(pemText string) string {
+	return strings.TrimLeft(pemText, pemLeader)
+}
+
 // loadPrivateKey returns the key when value is PEM content, whose first byte after
 // any pemLeader run is '-', and otherwise the contents of the file value names.
-// PEM content loses that leading run: it is never part of a PEM, and pem.Decode
-// wants -----BEGIN at the start of a line. The rest of the content, and a file
-// path, are used exactly as given.
+// PEM content and the file's contents lose that leading run (trimPEMLeader). The
+// rest of the key, and a file path, are used exactly as given.
 //
 // Its errors never contain value. A value that fails PEM detection may still be
 // key material (base64, or a PEM behind other text), so a failed read reports the
 // value's length and the cause os.ReadFile gives, not the *fs.PathError, whose
 // Path is value.
 func loadPrivateKey(value string) ([]byte, error) {
-	content := strings.TrimLeft(value, pemLeader)
+	content := trimPEMLeader(value)
 	if content == "" {
 		return nil, errors.New("private key is empty: set PEM content or a key file path")
 	}
@@ -142,7 +147,7 @@ func loadPrivateKey(value string) ([]byte, error) {
 	}
 	key, err := os.ReadFile(value)
 	if err == nil {
-		return key, nil
+		return []byte(trimPEMLeader(string(key))), nil
 	}
 	msg := fmt.Sprintf("%s (value length %d)", privateKeyHint, len(value))
 	var pathErr *fs.PathError
