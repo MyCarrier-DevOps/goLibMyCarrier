@@ -357,8 +357,8 @@ config := slippy.Config{
     AncestryDepth:       20,
     // Not defaulted: left at 0, the search never widens past AncestryDepth
     // and Client.ResolveAncestry returns an empty chain.
-    AncestryMaxDepth:    100,
-    ShadowMode:          false,
+    AncestryMaxDepth: 100,
+    ShadowMode:       false,
 }
 
 github, err := slippy.NewGitHubClient(config.GitHubConfig(), nil)
