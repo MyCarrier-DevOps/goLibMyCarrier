@@ -817,7 +817,7 @@ func IsShadowMode() bool {
 4. **❌ Migrating from the serving process** - The migrator Job runs `RunPostgresMigrations`; services gate on `ProbeSchema`
 5. **❌ Importing types that create cycles** - Create local data structs
 6. **❌ Treating disabled slippy as an error** - Return nil, nil when disabled
-7. **❌ Forgetting to defer client.Close()** - Always clean up resources
+7. **❌ Calling or skipping client.Close() without asking who owns the pool** - `Client.Close` closes the store, and `PostgresStore.Close` closes the pool passed to `NewPostgresStore`. If the client owns that pool, `defer client.Close()`. If the pool is shared with other components, call neither; the pool's owner closes the pool once, after all of them are done with it. Pattern 3's `InitializeSlippy` takes its pool from its caller, so which rule applies there depends on who owns that pool
 
 ---
 
