@@ -570,7 +570,8 @@ and `slippy.LoadPipelineConfig()`.
 | `SLIPPY_SHADOW_MODE` | Enable shadow mode | `false` |
 | `SLIPPY_HOLD_TIMEOUT` | Max wait time | `60m` |
 | `SLIPPY_POLL_INTERVAL` | Prereq check interval | `60s` |
-| `SLIPPY_ANCESTRY_DEPTH` | Commits to check | `20` |
+| `SLIPPY_ANCESTRY_DEPTH` | Commits to check | `25` |
+| `SLIPPY_ANCESTRY_MAX_DEPTH` | Max depth for progressive ancestry search | `100` |
 | `SLIPPY_GITHUB_ENTERPRISE_URL` | GHE base URL | (github.com) |
 
 ### Enabling Slippy
