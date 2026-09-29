@@ -318,7 +318,8 @@ module loads `POSTGRES_*` settings) and pass it to `NewPostgresStore`. `ConfigFr
 | `SLIPPY_HOLD_TIMEOUT` | Max wait time for prerequisites | `60m` |
 | `SLIPPY_POLL_INTERVAL` | Interval between prerequisite checks | `60s` |
 | `SLIPPY_SHADOW_MODE` | Enable shadow mode (no blocking) | `false` |
-| `SLIPPY_ANCESTRY_DEPTH` | Commits to check for resolution | `20` |
+| `SLIPPY_ANCESTRY_DEPTH` | Commits to check for resolution | `25` |
+| `SLIPPY_ANCESTRY_MAX_DEPTH` | Max depth for progressive ancestry search | `100` |
 
 ### Programmatic Configuration
 
@@ -354,6 +355,7 @@ config := slippy.Config{
     HoldTimeout:         30 * time.Minute,
     PollInterval:        30 * time.Second,
     AncestryDepth:       20,
+    AncestryMaxDepth:    100, // not defaulted: left at 0, the search never widens past AncestryDepth
     ShadowMode:          false,
 }
 
@@ -479,13 +481,24 @@ import (
 func main() {
     ctx := context.Background()
 
-    // Load config from environment, then build the store and GitHub client
+    // Load config from environment, then build the store and GitHub client.
+    // ConfigFromEnv reports no errors: it leaves PipelineConfig nil when
+    // SLIPPY_PIPELINE_CONFIG fails to load, and GitHubAppID 0 when SLIPPY_GITHUB_APP_ID is
+    // unset or not a number. Check both here; before v1.5.0, NewClient's Config.Validate did.
     config := slippy.ConfigFromEnv()
+    pipelineConfig, err := slippy.LoadPipelineConfig()
+    if err != nil {
+        log.Fatal(err)
+    }
+    config.PipelineConfig = pipelineConfig
+    if config.GitHubAppID == 0 {
+        log.Fatal("SLIPPY_GITHUB_APP_ID must be set to the GitHub App's numeric ID")
+    }
     pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
     if err != nil {
         log.Fatal(err)
     }
-    store, err := slippy.NewPostgresStore(pool, config.PipelineConfig, nil)
+    store, err := slippy.NewPostgresStore(pool, pipelineConfig, nil)
     if err != nil {
         log.Fatal(err)
     }
