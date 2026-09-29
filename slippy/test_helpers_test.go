@@ -138,29 +138,3 @@ func (l *capturingLogger) WithFields(map[string]interface{}) logger.Logger {
 }
 
 var _ logger.Logger = (*capturingLogger)(nil)
-
-// callsWithField returns the subset of captured calls whose fields map has
-// the given key set to true.
-func (l *capturingLogger) callsWithField(key string) []capturedLogCall {
-	var out []capturedLogCall
-	for _, c := range l.calls {
-		if v, ok := c.fields[key]; ok {
-			if b, ok := v.(bool); ok && b {
-				out = append(out, c)
-			}
-		}
-	}
-	return out
-}
-
-// callsWithLevel returns the subset of captured calls at the given log level
-// (e.g. "warn", "info", "error").
-func (l *capturingLogger) callsWithLevel(level string) []capturedLogCall {
-	var out []capturedLogCall
-	for _, c := range l.calls {
-		if c.level == level {
-			out = append(out, c)
-		}
-	}
-	return out
-}

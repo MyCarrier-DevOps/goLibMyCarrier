@@ -5491,9 +5491,6 @@ func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 	// hypothetical — with the empty-run guard forced off, the push repaves instead, the repave
 	// line carries an identical trio, and all three guard-dedup subtests passed while site 1
 	// went unexercised.
-	//
-	// Also not capturingLogger.callsWithField: that matches only keys whose value is boolean
-	// true, which is wrong for dispatch_intent (a DispatchIntent) and silently matches nothing.
 	fieldsFor := func(t *testing.T, logger *capturingLogger, message string) map[string]interface{} {
 		t.Helper()
 		var found map[string]interface{}
