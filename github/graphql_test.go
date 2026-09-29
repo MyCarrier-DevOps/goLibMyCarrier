@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io/fs"
 	"net/http"
@@ -239,8 +240,20 @@ func TestNewGraphQLClient_PrivateKeyNotEchoed(t *testing.T) {
 			wantKey:    validPEM,
 		},
 		{
+			// Only PEM content is trimmed: a path is read as given, so this names no file.
+			name:       "real key file behind a leading space is not trimmed",
+			privateKey: " " + keyFile,
+			wantInMsg:  hint,
+			wantIs:     fs.ErrNotExist,
+		},
+		{
 			name:       "empty",
 			privateKey: "",
+			wantInMsg:  "private key is empty",
+		},
+		{
+			name:       "only leading spaces, tabs, line breaks and a BOM is empty",
+			privateKey: " \t\r\n\ufeff",
 			wantInMsg:  "private key is empty",
 		},
 	}
@@ -256,7 +269,14 @@ func TestNewGraphQLClient_PrivateKeyNotEchoed(t *testing.T) {
 			require.Error(t, err)
 			assert.Nil(t, client)
 			assertNoEcho(t, err.Error(), tt.privateKey)
-			assert.Contains(t, err.Error(), tt.wantInMsg)
+			assert.False(t, errors.As(err, new(*fs.PathError)),
+				"the error chain holds an *fs.PathError, whose Path is the value")
+			want := tt.wantInMsg
+			if want == hint {
+				// A failed read gives the value's length, never the value.
+				want = fmt.Sprintf("%s (value length %d)", hint, len(tt.privateKey))
+			}
+			assert.Contains(t, err.Error(), want)
 			if tt.wantIs != nil {
 				assert.ErrorIs(t, err, tt.wantIs)
 			}

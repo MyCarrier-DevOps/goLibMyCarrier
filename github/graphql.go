@@ -84,8 +84,9 @@ type Installation struct {
 
 // NewGraphQLClient creates a new GitHub GraphQL client with App authentication.
 // The private key can be provided as PEM content (starts with "-----BEGIN",
-// after any leading whitespace or byte order mark, which is dropped) or as a
-// file path. No error it returns contains the configured key value.
+// after any leading spaces, tabs, line breaks or byte order mark, which are
+// dropped) or as a file path. No error it returns contains the configured key
+// value.
 func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, error) {
 	if log == nil {
 		log = &logger.NopLogger{}
@@ -116,8 +117,9 @@ func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, err
 // so it is safe to print.
 const privateKeyHint = "private key is neither PEM content (starting with -----BEGIN) nor a readable file path"
 
-// pemLeader is what may come before a PEM's -----BEGIN line: whitespace, and the
-// UTF-8 byte order mark an editor or a paste can leave in front.
+// pemLeader is what may come before a PEM's -----BEGIN line: spaces, tabs, CR
+// and LF, and the UTF-8 byte order mark an editor or a paste can leave in front.
+// A value made only of these is empty.
 const pemLeader = "\ufeff \t\r\n"
 
 // loadPrivateKey returns the key when value is PEM content, whose first byte after
@@ -131,17 +133,18 @@ const pemLeader = "\ufeff \t\r\n"
 // value's length and the cause os.ReadFile gives, not the *fs.PathError, whose
 // Path is value.
 func loadPrivateKey(value string) ([]byte, error) {
-	if value == "" {
+	content := strings.TrimLeft(value, pemLeader)
+	if content == "" {
 		return nil, errors.New("private key is empty: set PEM content or a key file path")
 	}
-	if content := strings.TrimLeft(value, pemLeader); strings.HasPrefix(content, "-") {
+	if strings.HasPrefix(content, "-") {
 		return []byte(content), nil
 	}
 	key, err := os.ReadFile(value)
 	if err == nil {
 		return key, nil
 	}
-	msg := fmt.Sprintf("%s (value of %d bytes)", privateKeyHint, len(value))
+	msg := fmt.Sprintf("%s (value length %d)", privateKeyHint, len(value))
 	var pathErr *fs.PathError
 	if !errors.As(err, &pathErr) {
 		// os.ReadFile reports every failure as an *fs.PathError; anything else is
