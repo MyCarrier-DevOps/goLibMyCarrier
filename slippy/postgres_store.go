@@ -58,7 +58,10 @@ func newPostgresStoreWithPool(pool pgxPool, config *PipelineConfig, logger Logge
 	return &PostgresStore{pool: pool, config: config, logger: logger}, nil
 }
 
-// Close releases the pool.
+// Close closes the pool passed to NewPostgresStore, after which every query through that
+// pool fails, whichever component makes it. A caller that shares the pool with other
+// components must not call Close, or Client.Close, and closes the pool itself once all of
+// them are done with it.
 func (s *PostgresStore) Close() error { s.pool.Close(); return nil }
 
 // Ping verifies the connection is alive.

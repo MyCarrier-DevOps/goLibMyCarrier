@@ -165,7 +165,9 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 	return nil
 }
 
-// Close releases resources held by the client.
+// Close closes the client's store. For a PostgresStore that closes the pool passed to
+// NewPostgresStore (see PostgresStore.Close), so a caller that shares that pool with other
+// components must not call it.
 func (c *Client) Close() error {
 	if c.store != nil {
 		return c.store.Close()
