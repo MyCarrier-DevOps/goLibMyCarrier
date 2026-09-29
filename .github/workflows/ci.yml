@@ -288,6 +288,8 @@ jobs:
       - unit-tests-check
       - lint-check
       - vuln-check
+      # It has no if: or needs:, so every run that can release runs it too.
+      - integration-test-slippy
     if: |
       github.ref == 'refs/heads/main' ||
       startsWith(github.ref, 'refs/heads/feature/') ||
