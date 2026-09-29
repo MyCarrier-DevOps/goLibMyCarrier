@@ -21,7 +21,7 @@ type ResolveOptions struct {
 	// ImageTag for fallback resolution (e.g., "mycarrier/svc:abc123-1234567890")
 	ImageTag string
 
-	// AncestryDepth is how many commits to check (default: 20)
+	// AncestryDepth is how many commits to check (default: Config.AncestryDepth, 25 unless set)
 	AncestryDepth int
 }
 
