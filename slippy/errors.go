@@ -62,7 +62,10 @@ var (
 	ErrSlipStatusUpdateFailed = errors.New("failed to update slip status")
 
 	// ErrMaxRetriesExceeded indicates the maximum number of retry attempts was reached.
-	// This occurs when a slip is not found after multiple retries.
+	//
+	// Deprecated: no slippy code returns it since v1.5.0, which removed its only producer,
+	// the ClickHouse slip store (DEVOPS-343). It stays exported so code that names it still
+	// compiles.
 	ErrMaxRetriesExceeded = errors.New("maximum retry attempts exceeded")
 
 	// ErrTerminalAlreadyExists is returned by the terminal-freshness gate in
