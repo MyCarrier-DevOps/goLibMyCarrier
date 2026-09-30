@@ -122,15 +122,20 @@ func TestNewClientWithDependencies_NormalisesConfig(t *testing.T) {
 
 // TestNewClientWithDependencies_NormalisesConfigFromEnv pins the flow the README's Quick Start
 // relies on: ConfigFromEnv keeps a negative SLIPPY_HOLD_TIMEOUT or SLIPPY_POLL_INTERVAL and a
-// SLIPPY_ANCESTRY_MAX_DEPTH below SLIPPY_ANCESTRY_DEPTH, and the constructor corrects them.
+// SLIPPY_ANCESTRY_MAX_DEPTH below SLIPPY_ANCESTRY_DEPTH, and the constructor corrects them. It
+// blanks SLIPPY_GITHUB_APP_PRIVATE_KEY and prints only the fields it checks, so a failure cannot
+// log a private key ConfigFromEnv read from the process environment.
 func TestNewClientWithDependencies_NormalisesConfigFromEnv(t *testing.T) {
+	t.Setenv("SLIPPY_GITHUB_APP_PRIVATE_KEY", "")
 	t.Setenv("SLIPPY_HOLD_TIMEOUT", "-5m")
 	t.Setenv("SLIPPY_POLL_INTERVAL", "-30s")
 	t.Setenv("SLIPPY_ANCESTRY_DEPTH", "50")
 	t.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", "20")
 	cfg := ConfigFromEnv()
 	if cfg.HoldTimeout != -5*time.Minute || cfg.PollInterval != -30*time.Second || cfg.AncestryMaxDepth != 20 {
-		t.Fatalf("precondition: ConfigFromEnv should keep the values as given, got %+v", cfg)
+		t.Fatalf("precondition: ConfigFromEnv should keep the values as given, got hold timeout %v, "+
+			"poll interval %v, depth %d, max depth %d",
+			cfg.HoldTimeout, cfg.PollInterval, cfg.AncestryDepth, cfg.AncestryMaxDepth)
 	}
 
 	c := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), cfg).Config()
