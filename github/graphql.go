@@ -130,8 +130,8 @@ func trimPEMLeader(pemText string) string {
 }
 
 // maxKeyPathLen is the longest value loadPrivateKey reads as a file path. It is above
-// any realistic mount path, and below the shortest single-line encoding of a 2048-bit
-// RSA key (1,588 bytes: the base64 of its PKCS #1 body).
+// any realistic mount path, and well below any single-line encoding of a 2048-bit RSA
+// key (about 1,590 bytes: the base64 of its PKCS #1 body).
 const maxKeyPathLen = 1024
 
 // loadPrivateKey returns the key when value is PEM content, whose first byte after
@@ -144,10 +144,9 @@ const maxKeyPathLen = 1024
 // key material arrives in (a PEM behind other text, a key's base64 on one line), so such
 // a value never reaches the filesystem, where it would be the pathname openat(2) receives.
 //
-// Its errors never contain value. A value that fails PEM detection may still be
-// key material (base64, or a PEM behind other text), so a failed read reports the
-// value's length and the cause os.ReadFile gives, not the *fs.PathError, whose
-// Path is value.
+// Its errors never contain value. A value that fails PEM detection and reaches the
+// read may still be a fragment of key material, so a failed read reports the value's
+// length and the cause os.ReadFile gives, not the *fs.PathError, whose Path is value.
 func loadPrivateKey(value string) ([]byte, error) {
 	content := trimPEMLeader(value)
 	if content == "" {

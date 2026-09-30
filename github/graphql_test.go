@@ -344,6 +344,8 @@ func TestNewGraphQLClient_ValueThatCannotBeAPathIsNotRead(t *testing.T) {
 		{"a real key file whose name contains a line break", lineBreakName},
 		{"a real key file path with a trailing newline", keyFile + "\n"},
 		{"a real key file path with a trailing CRLF", keyFile + "\r\n"},
+		{"a real key file path with a trailing CR", keyFile + "\r"},
+		{"a line break before a real key file path", "\n" + keyFile},
 		{"the base64 of a key's DER body on one line", base64.StdEncoding.EncodeToString(block.Bytes)},
 		{"one line of 1025 bytes", "/" + strings.Repeat("k", limit)},
 	}
