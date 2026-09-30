@@ -264,8 +264,8 @@ func TestPrereqStatus_String(t *testing.T) {
 // release has shipped: v1-v6, all in slippy/v1.4.4. postgresmigrator applies only the versions
 // above the one a database has recorded, and records no checksum of what it applied
 // (postgresmigrator/migrator.go: migrateUp, createSchemaVersionTable), so an edit to a released
-// migration never reaches an existing database. When a release ships a new version, add its
-// digest here.
+// migration never reaches an existing database. The merge that adds a core migration tags a
+// release, so add its digest in the PR that adds it.
 var releasedCoreMigrationDigests = map[int]string{
 	1: "ea682143a72f8e0d50f913a2a41981ff3ced61a4ea9015c68fde68911397ceb8",
 	2: "3e75311460b0c5f48a1cd0759898da5a5aad679308d82cdcac32eda44131fccc",
@@ -468,6 +468,18 @@ func TestDomainCheckValues(t *testing.T) {
 			ALTER DOMAIN "slip_status"
 				ADD CONSTRAINT slip_status_check CHECK (VALUE IN ('pending','failed','queued'));`),
 			wantErr: "migration v2: a quoted DOMAIN name is not supported here; write it unquoted"},
+		{name: "a schema-qualified quoted DOMAIN name is refused", migrations: migs(create,
+			`ALTER DOMAIN public."slip_status" DROP CONSTRAINT slip_status_check;
+			ALTER DOMAIN public."slip_status" ADD CONSTRAINT slip_status_values CHECK (VALUE IN ('pending'));`),
+			wantErr: "migration v2: a quoted DOMAIN name is not supported here; write it unquoted"},
+		{name: "a nested block comment is refused", migrations: migs(create,
+			`/* a /* b */ ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check; */
+			ALTER DOMAIN slip_status ADD CONSTRAINT slip_status_v2 CHECK (VALUE IN ('pending','failed','queued'));`),
+			wantErr: "migration v2: a nested or unbalanced block comment is not supported here"},
+		{name: "a nested block comment whose last */ follows -- is refused", migrations: migs(create,
+			`/* a /* b */ ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check; -- */
+			ALTER DOMAIN slip_status ADD CONSTRAINT slip_status_v2 CHECK (VALUE IN ('pending','failed','queued'));`),
+			wantErr: "migration v2: a nested or unbalanced block comment is not supported here"},
 		{name: "a DROP of a constraint the DOMAIN lacks is refused", migrations: migs(create,
 			`ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_v2;`),
 			wantErr: "drops constraint slip_status_v2, which it does not have"},
@@ -508,8 +520,9 @@ var domainStatementRE = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\s+DOMAIN\s+(?:\
 var sqlCommentRE = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*`)
 
 // quotedDomainNameRE matches a CREATE DOMAIN or ALTER DOMAIN whose name begins with a quoted
-// identifier. domainStatementRE cannot read that, so domainCheckValues refuses it rather than skip it.
-var quotedDomainNameRE = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\s+DOMAIN\s+"`)
+// identifier, directly or after an unquoted schema qualifier (public."slip_status").
+// domainStatementRE cannot read that, so domainCheckValues refuses it rather than skip it.
+var quotedDomainNameRE = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\s+DOMAIN\s+(?:\w+\.)?"`)
 
 // The statement forms domainCheckValues reads, each anchored at the end of a domainStatementRE
 // match. A CHECK is always VALUE IN (a list of quoted values).
@@ -528,14 +541,25 @@ var (
 // Postgres has no ALTER DOMAIN that replaces a CHECK in place, and an ADD without a DROP keeps the
 // old CHECK, which still rejects every value it does not list. Any other statement on the DOMAIN
 // is an error, so a migration this cannot read fails the test instead of being skipped.
-// Comments are ignored, but text inside a string literal (for example a RAISE message) is still read.
+// Comments are ignored, but a nested block comment fails the test, and text inside a string
+// literal (for example a RAISE message) is still read.
 func domainCheckValues(migrations []postgresmigrator.Migration, domain string) (map[string]struct{}, error) {
 	ordered := slices.Clone(migrations)
 	slices.SortFunc(ordered, func(a, b postgresmigrator.Migration) int { return cmp.Compare(a.Version, b.Version) })
 
 	var checks map[string]map[string]struct{} // CHECK name -> the values it admits; nil until the CREATE
 	for _, mig := range ordered {
-		upSQL := sqlCommentRE.ReplaceAllString(mig.UpSQL, " ")
+		nested := false
+		upSQL := sqlCommentRE.ReplaceAllStringFunc(mig.UpSQL, func(comment string) string {
+			if strings.HasPrefix(comment, "/*") && strings.Contains(comment[2:], "/*") {
+				nested = true
+			}
+			return " "
+		})
+		if nested || strings.Contains(upSQL, "*/") {
+			return nil, fmt.Errorf("migration v%d: a nested or unbalanced block comment is not supported here",
+				mig.Version)
+		}
 		if quotedDomainNameRE.MatchString(upSQL) {
 			return nil, fmt.Errorf("migration v%d: a quoted DOMAIN name is not supported here; write it unquoted",
 				mig.Version)

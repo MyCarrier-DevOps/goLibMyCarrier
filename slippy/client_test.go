@@ -103,6 +103,7 @@ func TestNewClientWithDependencies_NormalisesConfig(t *testing.T) {
 			settings{d.HoldTimeout, d.PollInterval, 25, 25},
 		},
 		{
+			// 20 is below DefaultConfig's 25: above it, max() would hide a constructor that used the default depth.
 			"an unset max depth is raised to a non-default depth",
 			Config{AncestryDepth: 20},
 			settings{d.HoldTimeout, d.PollInterval, 20, 20},
@@ -157,6 +158,7 @@ func (s *ancestryDepthStore) ResolveAncestry(_ context.Context, _, _, _ string, 
 // returned an empty chain for a slip that has parents.
 func TestClient_ResolveAncestry_UnsetMaxDepthWalksAncestryDepth(t *testing.T) {
 	store := &ancestryDepthStore{MockStore: NewMockStore()}
+	// 20 is below DefaultConfig's 25: above it, max() would hide a constructor that used the default depth.
 	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{AncestryDepth: 20})
 
 	if _, err := client.ResolveAncestry(context.Background(), "owner/repo", "main", "corr-1"); err != nil {

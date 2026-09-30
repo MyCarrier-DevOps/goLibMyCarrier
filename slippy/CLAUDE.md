@@ -475,6 +475,13 @@ step (`POST /v1/slips/{id}/steps/{step}/complete`) and then release. A NON-termi
 also be ended with `POST /v1/slips/{id}/abandon`; an already-terminal one ignores that call
 (I4) and keeps its claim, so use the step-then-release route there. Then re-run the down.
 
+**Released core migrations are immutable.** postgresmigrator applies only the versions above
+the one a database has recorded, so an edit to a released migration never reaches an existing
+database; to change the schema, add a new version. `TestReleasedCoreMigrationsAreImmutable`
+(`status_test.go`) pins the SHA-256 of each released core migration's UpSQL in
+`releasedCoreMigrationDigests`. The merge that adds a core migration tags a release, so add
+its digest in the PR that adds it.
+
 ### 3. Client Initialization Pattern
 
 Initialize the slippy client early in the application lifecycle, with shadow mode controlling error handling:
