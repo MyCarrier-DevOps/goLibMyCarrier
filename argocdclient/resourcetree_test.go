@@ -232,3 +232,20 @@ func TestGetArgoApplicationResourceTreeWithContext_DeadlineExceeded(t *testing.T
 		t.Errorf("expected context.DeadlineExceeded in error chain, got %v", err)
 	}
 }
+
+func TestGetArgoApplicationResourceTreeWithContext_NotFoundIsErrNotFound(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		if _, err := w.Write([]byte(`{"code":5,"message":"not found"}`)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	_, err := client.GetArgoApplicationResourceTreeWithContext(context.Background(), "test-app")
+
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected errors.Is(err, ErrNotFound), got %v", err)
+	}
+}
