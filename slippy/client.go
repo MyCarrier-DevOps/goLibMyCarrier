@@ -211,17 +211,18 @@ func (c *Client) PipelineConfig() *PipelineConfig {
 	return c.pipelineConfig
 }
 
-// applyHoldDefaults applies default values for timeout and poll interval if not set.
+// applyHoldDefaults gives a timeout or poll interval of 0 or less the client's HoldTimeout or
+// PollInterval, as NewClientWithDependencies does for the Config's own values.
 // This centralizes the defaulting logic used across WaitForPrerequisites and RunPreExecution.
 func (c *Client) applyHoldDefaults(
 	timeout, pollInterval time.Duration,
 ) (appliedTimeout, appliedPollInterval time.Duration) {
 	appliedTimeout = timeout
-	if appliedTimeout == 0 {
+	if appliedTimeout <= 0 {
 		appliedTimeout = c.config.HoldTimeout
 	}
 	appliedPollInterval = pollInterval
-	if appliedPollInterval == 0 {
+	if appliedPollInterval <= 0 {
 		appliedPollInterval = c.config.PollInterval
 	}
 	return appliedTimeout, appliedPollInterval

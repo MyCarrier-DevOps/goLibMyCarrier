@@ -142,6 +142,37 @@ func TestNewClientWithDependencies_NormalisesConfigFromEnv(t *testing.T) {
 	}
 }
 
+// TestClient_ApplyHoldDefaults pins the per-call form of the constructor's rule, which
+// WaitForPrerequisites and RunPreExecution both apply: a Timeout or PollInterval of 0 or less is
+// unset and gets the client's HoldTimeout or PollInterval. Left alone, a negative PollInterval
+// re-polls the store with no delay while a hold waits, and a negative Timeout times the step out
+// at its first poll.
+func TestClient_ApplyHoldDefaults(t *testing.T) {
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{
+		HoldTimeout: 7 * time.Minute, PollInterval: 3 * time.Second,
+	})
+	type durations struct{ Timeout, PollInterval time.Duration }
+	configured := durations{7 * time.Minute, 3 * time.Second}
+	tests := []struct {
+		name     string
+		in, want durations
+	}{
+		{"unset", durations{}, configured},
+		{"negative values are unset", durations{-5 * time.Minute, -30 * time.Second}, configured},
+		{"positive values are kept", durations{5 * time.Minute, 10 * time.Second},
+			durations{5 * time.Minute, 10 * time.Second}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got durations
+			got.Timeout, got.PollInterval = client.applyHoldDefaults(tt.in.Timeout, tt.in.PollInterval)
+			if got != tt.want {
+				t.Errorf("timeout, poll interval = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
 // ancestryDepthStore records the maxDepth Client.ResolveAncestry hands the store.
 type ancestryDepthStore struct {
 	*MockStore
