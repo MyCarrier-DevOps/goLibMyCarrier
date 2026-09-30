@@ -304,8 +304,8 @@ func TestReleasedMigrationDrift(t *testing.T) {
 	}{
 		{"the released migrations as they are", released, nil},
 		{"an unreleased v7 is not pinned", withV7, nil},
-		{"a status appended to v1's CHECK", editedV1,
-			[]string{"migration v1 is released and immutable, so add a new version instead of editing it"}},
+		{"a status appended to v1's CHECK", editedV1, []string{
+			"migration v1 is released and immutable, so revert the edit; to change the schema, add a new version"}},
 		{"v3 removed", withoutV3,
 			[]string{"migration v3 is released and immutable, but GenerateMigrations no longer returns it"}},
 	}
@@ -344,8 +344,8 @@ func releasedMigrationDrift(migrations []postgresmigrator.Migration, golden map[
 		sum := sha256.Sum256([]byte(mig.UpSQL))
 		if got := hex.EncodeToString(sum[:]); got != golden[version] {
 			problems = append(problems, fmt.Sprintf(
-				"migration v%d is released and immutable, so add a new version instead of editing it "+
-					"(for a status change, one that ALTERs the DOMAIN): its UpSQL sha256 is %s, want %s",
+				"migration v%d is released and immutable, so revert the edit; to change the schema, add a new "+
+					"version (for a status change, one that ALTERs the DOMAIN): its UpSQL sha256 is %s, want %s",
 				version, got, golden[version]))
 		}
 	}
@@ -388,8 +388,9 @@ func assertStatusConstantsMatchDomain(t *testing.T, typeName, domain string) {
 		if _, ok := domainValues[value]; !ok {
 			t.Errorf("%[1]s constant %[2]s = %[3]q is not admitted by the %[4]s DOMAIN after the latest "+
 				"migration in postgres_migrations.go. Released migrations are immutable, so add a new migration "+
-				"that redefines the DOMAIN's CHECK: ALTER DOMAIN %[4]s DROP CONSTRAINT <name> (v1 named it "+
-				"%[4]s_check), then ALTER DOMAIN %[4]s ADD CONSTRAINT <name> CHECK (VALUE IN (...))",
+				"that redefines the DOMAIN's CHECK: ALTER DOMAIN %[4]s DROP CONSTRAINT <name> (Postgres named "+
+				"v1's unnamed CHECK %[4]s_check), then ALTER DOMAIN %[4]s ADD CONSTRAINT <name> CHECK "+
+				"(VALUE IN (...))",
 				typeName, name, value, domain)
 		}
 	}
@@ -447,9 +448,26 @@ func TestDomainCheckValues(t *testing.T) {
 			`ALTER DOMAIN step_status DROP CONSTRAINT step_status_check;`), want: []string{"failed", "pending"}},
 		{name: "DROP CONSTRAINT IF EXISTS of a name the DOMAIN lacks does nothing", migrations: migs(create,
 			`ALTER DOMAIN slip_status DROP CONSTRAINT IF EXISTS slip_status_v2;`), want: []string{"failed", "pending"}},
+		{name: "a line-commented DROP is not a DROP", migrations: migs(create,
+			`-- ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check;
+			ALTER DOMAIN slip_status ADD CONSTRAINT slip_status_v2 CHECK (VALUE IN ('pending','failed','queued'));`),
+			want: []string{"failed", "pending"}},
+		{name: "a block-commented DROP is not a DROP", migrations: migs(create,
+			`/* ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check; */
+			ALTER DOMAIN slip_status ADD CONSTRAINT slip_status_v2 CHECK (VALUE IN ('pending','failed','queued'));`),
+			want: []string{"failed", "pending"}},
+		{name: "a comment that names the DROP does not run it", migrations: migs(create,
+			"-- To redefine the CHECK, ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check, then ADD it.\n"+
+				redefine),
+			want: []string{"failed", "pending", "queued"}},
 		{name: "an unnamed ADD is refused", migrations: migs(create,
 			`ALTER DOMAIN slip_status ADD CHECK (VALUE IN ('pending'));`),
 			wantErr: "migration v2: ALTER DOMAIN slip_status: this test reads only ADD CONSTRAINT <name> CHECK"},
+		{name: "a quoted DOMAIN name is refused", migrations: migs(create,
+			`ALTER DOMAIN "slip_status" DROP CONSTRAINT slip_status_check;
+			ALTER DOMAIN "slip_status"
+				ADD CONSTRAINT slip_status_check CHECK (VALUE IN ('pending','failed','queued'));`),
+			wantErr: "migration v2: a quoted DOMAIN name is not supported here; write it unquoted"},
 		{name: "a DROP of a constraint the DOMAIN lacks is refused", migrations: migs(create,
 			`ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_v2;`),
 			wantErr: "drops constraint slip_status_v2, which it does not have"},
@@ -484,6 +502,15 @@ func TestDomainCheckValues(t *testing.T) {
 // group 2 the DOMAIN's name without its schema qualifier.
 var domainStatementRE = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\s+DOMAIN\s+(?:\w+\.)?(\w+)`)
 
+// sqlCommentRE matches a -- comment or a /* */ comment, without regard to string literals or to
+// nesting (Postgres nests /* */ comments). domainCheckValues replaces each match with a space
+// before it reads a migration, so SQL quoted in a comment is not taken for a statement.
+var sqlCommentRE = regexp.MustCompile(`(?s)/\*.*?\*/|--[^\n]*`)
+
+// quotedDomainNameRE matches a CREATE DOMAIN or ALTER DOMAIN whose name begins with a quoted
+// identifier. domainStatementRE cannot read that, so domainCheckValues refuses it rather than skip it.
+var quotedDomainNameRE = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\s+DOMAIN\s+"`)
+
 // The statement forms domainCheckValues reads, each anchored at the end of a domainStatementRE
 // match. A CHECK is always VALUE IN (a list of quoted values).
 var (
@@ -501,19 +528,25 @@ var (
 // Postgres has no ALTER DOMAIN that replaces a CHECK in place, and an ADD without a DROP keeps the
 // old CHECK, which still rejects every value it does not list. Any other statement on the DOMAIN
 // is an error, so a migration this cannot read fails the test instead of being skipped.
+// Comments are ignored, but text inside a string literal (for example a RAISE message) is still read.
 func domainCheckValues(migrations []postgresmigrator.Migration, domain string) (map[string]struct{}, error) {
 	ordered := slices.Clone(migrations)
 	slices.SortFunc(ordered, func(a, b postgresmigrator.Migration) int { return cmp.Compare(a.Version, b.Version) })
 
 	var checks map[string]map[string]struct{} // CHECK name -> the values it admits; nil until the CREATE
 	for _, mig := range ordered {
-		for _, loc := range domainStatementRE.FindAllStringSubmatchIndex(mig.UpSQL, -1) {
-			if !strings.EqualFold(mig.UpSQL[loc[4]:loc[5]], domain) {
+		upSQL := sqlCommentRE.ReplaceAllString(mig.UpSQL, " ")
+		if quotedDomainNameRE.MatchString(upSQL) {
+			return nil, fmt.Errorf("migration v%d: a quoted DOMAIN name is not supported here; write it unquoted",
+				mig.Version)
+		}
+		for _, loc := range domainStatementRE.FindAllStringSubmatchIndex(upSQL, -1) {
+			if !strings.EqualFold(upSQL[loc[4]:loc[5]], domain) {
 				continue
 			}
-			rest := mig.UpSQL[loc[1]:]
+			rest := upSQL[loc[1]:]
 			var err error
-			if strings.EqualFold(mig.UpSQL[loc[2]:loc[3]], "CREATE") {
+			if strings.EqualFold(upSQL[loc[2]:loc[3]], "CREATE") {
 				checks, err = createDomainChecks(checks, rest, domain)
 			} else {
 				err = alterDomainChecks(checks, rest, domain)
