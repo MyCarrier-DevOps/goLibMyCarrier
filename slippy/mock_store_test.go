@@ -205,14 +205,6 @@ type MockStore struct {
 	// counts" — see handlePushRetry's push_parsed reset (bd mycarrier-5dv5 F1).
 	UpdateStepWithHistoryCallCount int
 
-	// SwallowedHistoryErrors records AppendHistoryError/AppendHistoryErrorFor errors that
-	// UpdateStepWithHistory swallowed (Warn + return nil) rather than propagated. That models
-	// the removed ClickHouse store's best-effort history write-back (#75); PostgresStore writes
-	// the status and the entry in one transaction and returns the error. Tests that need to
-	// observe a swallowed failure should assert against this field instead of expecting
-	// UpdateStepWithHistory to return the error.
-	SwallowedHistoryErrors []error
-
 	// Ping tracking and error injection
 	PingCalls int
 	PingError error
@@ -1029,19 +1021,6 @@ func (m *MockStore) UpdateStepWithHistory(
 	step := slip.Steps[stepName]
 	step.Status = status
 	slip.Steps[stepName] = step
-
-	// AppendHistoryError/AppendHistoryErrorFor simulate the history write-back failing.
-	// This double keeps the removed ClickHouse store's best-effort semantics (see
-	// SwallowedHistoryErrors): the error is Warn-logged and swallowed (return nil), not
-	// propagated, and recorded for tests that want to assert it happened.
-	if m.AppendHistoryError != nil {
-		m.SwallowedHistoryErrors = append(m.SwallowedHistoryErrors, m.AppendHistoryError)
-		return nil
-	}
-	if err, ok := m.AppendHistoryErrorFor[correlationID]; ok {
-		m.SwallowedHistoryErrors = append(m.SwallowedHistoryErrors, err)
-		return nil
-	}
 
 	// Append history
 	slip.StateHistory = append(slip.StateHistory, entry)

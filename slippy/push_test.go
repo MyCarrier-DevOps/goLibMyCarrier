@@ -1254,54 +1254,6 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		}
 	})
 
-	t.Run("retry - history write-back error is non-fatal", func(t *testing.T) {
-		// handlePushRetry routes through UpdateStepWithHistory. The internal MockStore models
-		// the removed ClickHouse store's best-effort history write-back (#75): a history
-		// write-back failure is Warn-logged and swallowed, not propagated, so retry
-		// processing (and CreateSlipForPush) still succeeds. PostgresStore does not behave
-		// this way: it returns the error and the retry fails. Event
-		// insert / gate-check failures (simulated by UpdateStepError, see the
-		// "retry - UpdateStep error" case above) still hard-fail.
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
-
-		existingSlip := &Slip{
-			CorrelationID: "corr-push-hist-err",
-			Repository:    "owner/repo",
-			Branch:        "main",
-			CommitSHA:     "histerr123",
-			CreatedAt:     time.Now(),
-			UpdatedAt:     time.Now(),
-			Status:        SlipStatusInProgress,
-			Steps: map[string]Step{
-				"push_parsed": {Status: StepStatusFailed},
-			},
-		}
-		store.AddSlip(existingSlip)
-		store.AppendHistoryError = errors.New("history append failed")
-
-		opts := PushOptions{
-			CorrelationID: "new-corr",
-			Repository:    "owner/repo",
-			CommitSHA:     "histerr123",
-		}
-
-		result, err := client.CreateSlipForPush(ctx, opts)
-		if err != nil {
-			t.Fatalf("expected no error (history write-back failures are best-effort), got: %v", err)
-		}
-		if result == nil {
-			t.Fatal("expected a slip to be returned")
-		}
-		if len(store.SwallowedHistoryErrors) != 1 {
-			t.Errorf(
-				"expected the history write-back failure to be recorded as swallowed, got %d",
-				len(store.SwallowedHistoryErrors),
-			)
-		}
-	})
-
 	t.Run("cross-branch ended slip - repaves onto the new branch", func(t *testing.T) {
 		// FF-merge shape: SHA built on feature branch, same SHA pushed to integration
 		// after the slip ended. One row per commit: the slip repaves onto the new
