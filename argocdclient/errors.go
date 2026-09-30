@@ -21,8 +21,9 @@ var (
 	// gives when a resource is "not found as part of application".
 	ErrNotFound = errors.New("argocd: not found")
 
-	// ErrConflict matches an HTTP 409 answer: the resource's current state does
-	// not allow the request.
+	// ErrConflict means the resource's current state does not allow the request:
+	// an HTTP 409 answer, or an action the resource does not currently offer
+	// (disabled or absent in ArgoCD's action discovery).
 	ErrConflict = errors.New("argocd: conflict")
 )
 
