@@ -1,0 +1,32 @@
+{
+  "actions": [
+    {
+      "name": "abort",
+      "disabled": true
+    },
+    {
+      "name": "pause",
+      "disabled": true
+    },
+    {
+      "name": "promote-full",
+      "disabled": true
+    },
+    {
+      "name": "restart",
+      "displayName": "Restart Pods"
+    },
+    {
+      "name": "resume",
+      "disabled": true
+    },
+    {
+      "name": "retry",
+      "disabled": true
+    },
+    {
+      "name": "skip-current-step",
+      "disabled": true
+    }
+  ]
+}
