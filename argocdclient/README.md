@@ -27,8 +27,6 @@ The client uses environment variables for configuration:
 |---------------------|-------------|----------|
 | `ARGOCD_SERVER` | ArgoCD server URL (e.g., `https://argocd.example.com`) | Yes |
 | `ARGOCD_AUTHTOKEN` | Bearer token for authentication | Yes |
-| `ARGOCD_APP_NAME` | ArgoCD application name | No |
-| `ARGOCD_REVISION` | Git revision/commit hash | No |
 
 ## Usage
 
@@ -97,55 +95,45 @@ for i, manifest := range manifests {
 
 ## Usage with Interfaces
 
-### ApplicationService Example
+`NewClient` returns the concrete `*Client`. Consumers that want to substitute a test
+double define a small interface with only the methods they call and accept it in their
+constructors:
 
 ```go
 package main
 
 import (
+    "context"
     "fmt"
     "log"
+
     "github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient"
 )
 
-func main() {
-    config := &argocdclient.Config{
-        ServerUrl: "https://argocd.example.com",
-        AuthToken: "your-bearer-token",
-        AppName:   "my-application",
-    }
-    var appSvc argocdclient.ApplicationService = argocdclient.NewClient()
-    appData, err := appSvc.GetApplication(config)
+// applicationReader is the part of *argocdclient.Client this consumer uses.
+type applicationReader interface {
+    GetApplicationWithContext(ctx context.Context, argoAppName string) (map[string]interface{}, error)
+    GetManifestsWithContext(ctx context.Context, revision, argoAppName string) ([]string, error)
+}
+
+func printSyncStatus(ctx context.Context, reader applicationReader, appName string) error {
+    appData, err := reader.GetApplicationWithContext(ctx, appName)
     if err != nil {
-        log.Fatal("Failed to get application:", err)
+        return err
     }
     fmt.Printf("Application sync status: %v\n", appData["status"])
+    return nil
 }
-```
-
-### ManifestService Example
-
-```go
-package main
-
-import (
-    "fmt"
-    "log"
-    "github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient"
-)
 
 func main() {
     config := &argocdclient.Config{
         ServerUrl: "https://argocd.example.com",
         AuthToken: "your-bearer-token",
-        AppName:   "my-application",
     }
-    var manifestSvc argocdclient.ManifestService = argocdclient.NewClient()
-    manifests, err := manifestSvc.GetManifests("", config)
-    if err != nil {
-        log.Fatal("Failed to get manifests:", err)
+    client := argocdclient.NewClient(config)
+    if err := printSyncStatus(context.Background(), client, "my-application"); err != nil {
+        log.Fatal("Failed to get application:", err)
     }
-    fmt.Printf("Manifests: %v\n", manifests)
 }
 ```
 
@@ -159,8 +147,6 @@ func main() {
 type Config struct {
     ServerUrl string // ArgoCD server URL (required)
     AuthToken string // Bearer token for authentication (required)
-    AppName   string // ArgoCD application name (optional)
-    Revision  string // Git revision/commit hash (optional)
 }
 ```
 
@@ -440,9 +426,10 @@ caller runs.
 
 ## Context Support
 
-All public HTTP methods on `Client` have context-aware variants suffixed with
-`WithContext`. The ctx-aware variants honor `ctx` cancellation and deadline so
-callers can bound HTTP latency (including connect, TLS handshake, and read)
+The read methods `GetApplication`, `GetManifests` and `GetArgoApplicationResourceTree`
+have context-aware variants suffixed with `WithContext`. `ListRolloutGroup` and
+`RunResourceAction` take `ctx` as their first parameter and have no no-ctx variant.
+The ctx-aware variants honor `ctx` cancellation and deadline so callers can bound HTTP latency (including connect, TLS handshake, and read)
 by their own timeouts — important when an upstream operation like
 `WaitForSyncStart` advertises ctx-cancellation honoring and must not be
 outlived by a hung TCP connection.
@@ -583,24 +570,22 @@ func main() {
 
 ## Testing
 
-Run the tests with:
+Run the tests from the repository root:
 
 ```bash
-cd argocdclient
-go test -v
+make test PKG=argocdclient
 ```
 
-Run tests with coverage:
+Run the linter:
 
 ```bash
-go test -v -cover
+make lint PKG=argocdclient
 ```
 
-Generate coverage report:
+Check the coverage threshold:
 
 ```bash
-go test -coverprofile=coverage.out
-go tool cover -html=coverage.out -o coverage.html
+make check-coverage PKG=argocdclient
 ```
 
 ## License
