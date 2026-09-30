@@ -124,10 +124,11 @@ stay in this repo). Full list in `slippy/CLAUDE.md`'s Breaking changes section.
 `slippy` v1.5.0 requires `github` v1.5.0, so a consumer that bumps only `slippy` also gets the
 `github` release whose `NewGraphQLClient` never puts the configured private key in an error.
 
-Before v1.5.0 (`github` v1.3.41 through v1.4.4), `NewGraphQLClient`, which `slippy`'s `NewGitHubClient`
-calls, read a key value not starting with `-` as a file path, and its error echoed the whole value:
-`failed to read private key file: open <value>: …`. That covers a PEM behind a leading line break,
-space, BOM or quote, and a base64 value. If any log captured such an error, rotate that GitHub App's private key.
+In every `github` tag from v1.3.41 below v1.5.0, prereleases included, `NewGraphQLClient`, which `slippy`'s
+`NewGitHubClient` calls, reads a key value not starting with `-` as a file path, and its error echoes the whole value:
+`failed to read private key file: open <value>: …`. That covers a PEM behind a leading line break, space, BOM or quote,
+and a base64 value. If any log captured such an error, deploy a new key for that GitHub App wherever the logged key is
+configured, then delete it under the App's Private keys, matched by SHA-256 fingerprint, since App keys never expire.
 
 | What changed | Migration |
 |---|---|
