@@ -501,8 +501,9 @@ func InitializeSlippy(ctx context.Context, pool *pgxpool.Pool, logger Logger) (*
         return handleInitError(logger, fmt.Errorf(
             "SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)"))
     }
-    // No check of the durations or depths: NewClientWithDependencies gives a value of 0 or
-    // less its default and raises AncestryMaxDepth to at least AncestryDepth.
+    // No check of the durations or depths: NewClientWithDependencies gives a HoldTimeout,
+    // PollInterval or AncestryDepth of 0 or less its default and raises AncestryMaxDepth to
+    // at least AncestryDepth.
 
     store, err := slippy.NewPostgresStore(pool, pipelineConfig, cfg.Logger)
     if err != nil {
@@ -608,8 +609,9 @@ if cfg.GitHubAppID == 0 {
 if cfg.GitHubPrivateKey == "" {
     return fmt.Errorf("SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)")
 }
-// No check of the durations or depths: NewClientWithDependencies gives a value of 0 or less
-// its default and raises AncestryMaxDepth to at least AncestryDepth.
+// No check of the durations or depths: NewClientWithDependencies gives a HoldTimeout,
+// PollInterval or AncestryDepth of 0 or less its default and raises AncestryMaxDepth to at
+// least AncestryDepth.
 
 store, err := slippy.NewPostgresStore(pool, cfg.PipelineConfig, cfg.Logger)
 if err != nil {

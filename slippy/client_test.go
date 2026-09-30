@@ -102,6 +102,11 @@ func TestNewClientWithDependencies_NormalisesConfig(t *testing.T) {
 			Config{AncestryDepth: 25},
 			settings{d.HoldTimeout, d.PollInterval, 25, 25},
 		},
+		{
+			"an unset max depth is raised to a non-default depth",
+			Config{AncestryDepth: 20},
+			settings{d.HoldTimeout, d.PollInterval, 20, 20},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -152,13 +157,13 @@ func (s *ancestryDepthStore) ResolveAncestry(_ context.Context, _, _, _ string, 
 // returned an empty chain for a slip that has parents.
 func TestClient_ResolveAncestry_UnsetMaxDepthWalksAncestryDepth(t *testing.T) {
 	store := &ancestryDepthStore{MockStore: NewMockStore()}
-	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{AncestryDepth: 25})
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{AncestryDepth: 20})
 
 	if _, err := client.ResolveAncestry(context.Background(), "owner/repo", "main", "corr-1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if store.maxDepth != 25 {
-		t.Errorf("ResolveAncestry passed maxDepth %d to the store, want 25 (AncestryDepth)", store.maxDepth)
+	if store.maxDepth != 20 {
+		t.Errorf("ResolveAncestry passed maxDepth %d to the store, want 20 (AncestryDepth)", store.maxDepth)
 	}
 }
 
