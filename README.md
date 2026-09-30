@@ -108,9 +108,11 @@ breaking release carries a one-release floor in `.github/Gitversion.yml`: `next-
 the `ConfiguredNextVersion` strategy that makes it effective. Every module in this repo
 releases at one shared version, so the floor tags the sibling modules too. **The floor is for
 one release only: delete `next-version` (and `ConfiguredNextVersion`) once that version is
-tagged on main.** Left in place it would let the NEXT breaking change ship as a patch to
-consumers pinned to the minor — the defect it exists to prevent. The current floor is `1.5.0`,
-for DEVOPS-343; v1.4.0's floor was added in #87 and removed in #90.
+tagged on main.** After that tag it does nothing: GitVersion takes the highest candidate, so
+main's Patch increment gives the next patch with or without it. It does not protect the next
+breaking change; for that, set `next-version` again, or put `+semver: minor` in that commit's
+message. The current floor is `1.5.0`, for DEVOPS-343; v1.4.0's floor was added in #87 and
+removed in #90.
 
 ### `slippy`: the ClickHouse slip store is removed — since `v1.5.0` (DEVOPS-343)
 
