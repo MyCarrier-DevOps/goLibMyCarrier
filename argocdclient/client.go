@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -41,7 +42,7 @@ func NewClient(config *Config) *Client {
 
 // doGET performs an authenticated GET request against the ArgoCD API.
 // It sets Authorization and Content-Type headers, handles retries via the
-// retryable HTTP client, and classifies 4xx vs 5xx errors.
+// retryable HTTP client, and returns *APIError for statuses of 400 and above.
 // Returns the raw response body on success.
 //
 // The request honors ctx cancellation/deadline. ctx must be non-nil; callers
@@ -69,27 +70,23 @@ func (c *Client) doGET(ctx context.Context, url string) ([]byte, error) {
 		}
 	}()
 
-	// Handle 4xx client errors (these weren't retried)
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("error reading body: %w", err)
-		}
-		return nil, fmt.Errorf("client error %d: %s", resp.StatusCode, string(body))
-	}
+	return readResponse(resp)
+}
 
-	// Handle any remaining 5xx errors that exhausted retries
-	if resp.StatusCode >= 500 {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("error reading body: %w", err)
-		}
-		return nil, fmt.Errorf("server error %d: %s", resp.StatusCode, string(body))
-	}
-
+// readResponse reads the body of resp and returns it for 2xx/3xx statuses.
+// Any status of 400 or above yields an *APIError carrying the raw body, so
+// callers can match it with errors.Is/errors.As.
+func readResponse(resp *http.Response) ([]byte, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		if resp.StatusCode >= http.StatusBadRequest {
+			return nil, fmt.Errorf("error reading body: %w", err)
+		}
 		return nil, fmt.Errorf("error reading response body: %w", err)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 
 	return body, nil
