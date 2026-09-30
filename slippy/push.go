@@ -1892,7 +1892,7 @@ func (c *Client) handleDuplicateSlipBackstop(
 // and returns the ancestry chain along with any warnings encountered.
 //
 // This uses progressive depth searching: starts with AncestryDepth (default 25),
-// and if no ancestor slip is found, expands to AncestryMaxDepth (default 100).
+// and if no ancestor slip is found, expands to AncestryMaxDepth when that is above AncestryDepth (DefaultConfig: 100).
 // This handles cases where pushes contain many commits or there are gaps between slips.
 //
 // For squash merges (when CommitMessage contains a PR reference like "#42"),

@@ -355,8 +355,9 @@ config := slippy.Config{
     HoldTimeout:         30 * time.Minute,
     PollInterval:        30 * time.Second,
     AncestryDepth:       20,
-    // Never given DefaultConfig's 100: left at 0, it is raised to AncestryDepth
-    // and the search never widens past AncestryDepth.
+    // Set it to widen the search past AncestryDepth. Left at 0,
+    // NewClientWithDependencies raises it to AncestryDepth (never to
+    // DefaultConfig's 100), so the search never widens.
     AncestryMaxDepth: 100,
     ShadowMode:       false,
 }

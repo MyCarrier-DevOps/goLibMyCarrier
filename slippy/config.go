@@ -42,7 +42,9 @@ type Config struct {
 	// If no ancestor is found, slippy will progressively increase up to AncestryMaxDepth.
 	AncestryDepth int
 
-	// AncestryMaxDepth is the maximum number of commits to check when no ancestor is found (default: 100)
+	// AncestryMaxDepth is the maximum number of commits to check when no ancestor is found
+	// (DefaultConfig and ConfigFromEnv: 100). NewClientWithDependencies raises an unset or smaller
+	// value to AncestryDepth, and the search then does not widen.
 	// This handles cases where many commits occur between slip creations.
 	AncestryMaxDepth int
 }

@@ -93,11 +93,12 @@ jobs:
           threshold-total: 75
           source-dir: ./${{ matrix.module }}
 
-  # Merge-gated deterministic integration suite for the Postgres slip store.
+  # Merge-gated run of the whole slippy module with -tags integration: the Postgres store's
+  # testcontainers suites plus every unit test.
   #
-  # Runs directly on the ubuntu-latest VM (NOT inside a `container:` block, unlike some other CI
-  # jobs) because testcontainers-go needs direct access to the runner's Docker socket; ubuntu-latest
-  # ships Docker out of the box, so no additional setup is required.
+  # Runs directly on the ubuntu-latest VM (NOT inside a `container:` block) because
+  # testcontainers-go needs direct access to the runner's Docker socket; ubuntu-latest ships
+  # Docker out of the box, so no additional setup is required.
   #
   # No `if:` restriction is applied — this job runs on the same push/pull_request trigger
   # conditions (branches/paths) as the rest of the workflow, same as unit-tests, so it is
