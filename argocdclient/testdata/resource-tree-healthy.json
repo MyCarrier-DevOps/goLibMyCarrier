@@ -1,0 +1,1042 @@
+{
+  "nodes": [
+    {
+      "version": "v1",
+      "kind": "Endpoints",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api",
+      "uid": "48305d67-d165-42eb-9af0-2abc9cdc13cb",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api",
+          "uid": "2e424781-cab8-4a6a-84ac-63b05337d761"
+        }
+      ],
+      "resourceVersion": "1858800515",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Endpoints",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api-canary",
+      "uid": "33f3b355-776e-4d2b-9930-c74f18b5280d",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-canary",
+          "uid": "8c0a89d9-490f-4e86-b008-7280be8333c5"
+        }
+      ],
+      "resourceVersion": "1858800514",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Endpoints",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other",
+      "uid": "bfb64927-d86b-4c77-86a4-45cf53dc890b",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other",
+          "uid": "da2499e9-1988-438f-9bce-c76eb144906a"
+        }
+      ],
+      "resourceVersion": "1858800513",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Endpoints",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other-canary",
+      "uid": "eb2141f7-fc58-46d3-9efa-87a51d12e126",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-canary",
+          "uid": "0239f6d5-3607-4ef0-ad6f-3b5dabb94a28"
+        }
+      ],
+      "resourceVersion": "1858800512",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Endpoints",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker",
+      "uid": "b88e2aaf-dc4c-42d5-a46e-7766f4c9d82c",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker",
+          "uid": "a4d82ad7-59e8-4916-b711-f4c276a1f0f2"
+        }
+      ],
+      "resourceVersion": "1858800507",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Endpoints",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker-canary",
+      "uid": "04f21b03-8efa-4957-bf60-a2fb0e22d5b0",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-canary",
+          "uid": "8931b751-925b-4c51-aa99-b78d36e33bad"
+        }
+      ],
+      "resourceVersion": "1858800510",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Pod",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api-679bc4c8fc-97zbh",
+      "uid": "da59e45b-c1f6-44e9-825c-60c07308989f",
+      "parentRefs": [
+        {
+          "group": "apps",
+          "version": "v1",
+          "kind": "ReplicaSet",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-679bc4c8fc",
+          "uid": "f449c85d-8b66-4b3e-86a7-d4a52f6b41da"
+        }
+      ],
+      "info": [
+        {
+          "name": "Status Reason",
+          "value": "Running"
+        },
+        {
+          "name": "Containers",
+          "value": "2/2"
+        }
+      ],
+      "networkingInfo": {
+        "labels": {
+          "app": "rt-api",
+          "mycarrier.tech/correlationId": "devops-315-group-a",
+          "rollouts-pod-template-hash": "679bc4c8fc",
+          "security.istio.io/tlsMode": "istio",
+          "service.istio.io/canonical-name": "rt-api",
+          "service.istio.io/canonical-revision": "latest",
+          "topology.kubernetes.io/region": "eastus",
+          "topology.kubernetes.io/zone": "0"
+        }
+      },
+      "resourceVersion": "1858801554",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:26Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Pod",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api-679bc4c8fc-wdgg2",
+      "uid": "2a655f5c-fb6c-4e0e-b141-8b2ce3d8236e",
+      "parentRefs": [
+        {
+          "group": "apps",
+          "version": "v1",
+          "kind": "ReplicaSet",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-679bc4c8fc",
+          "uid": "f449c85d-8b66-4b3e-86a7-d4a52f6b41da"
+        }
+      ],
+      "info": [
+        {
+          "name": "Status Reason",
+          "value": "PodInitializing"
+        },
+        {
+          "name": "Containers",
+          "value": "1/2"
+        }
+      ],
+      "networkingInfo": {
+        "labels": {
+          "app": "rt-api",
+          "mycarrier.tech/correlationId": "devops-315-group-a",
+          "rollouts-pod-template-hash": "679bc4c8fc",
+          "security.istio.io/tlsMode": "istio",
+          "service.istio.io/canonical-name": "rt-api",
+          "service.istio.io/canonical-revision": "latest",
+          "topology.kubernetes.io/region": "eastus",
+          "topology.kubernetes.io/zone": "0"
+        }
+      },
+      "resourceVersion": "1858802235",
+      "health": {
+        "status": "Progressing"
+      },
+      "createdAt": "2026-09-30T21:31:28Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Pod",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other-796b5bb5b6-89bd7",
+      "uid": "ec461d4b-d4f8-440b-9d0b-1eb0c3eca5c8",
+      "parentRefs": [
+        {
+          "group": "apps",
+          "version": "v1",
+          "kind": "ReplicaSet",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-796b5bb5b6",
+          "uid": "2a75139c-4319-416d-9fcc-dc504ebbb11a"
+        }
+      ],
+      "info": [
+        {
+          "name": "Status Reason",
+          "value": "PodInitializing"
+        },
+        {
+          "name": "Containers",
+          "value": "1/2"
+        }
+      ],
+      "networkingInfo": {
+        "labels": {
+          "app": "rt-other",
+          "mycarrier.tech/correlationId": "devops-315-group-b",
+          "rollouts-pod-template-hash": "796b5bb5b6",
+          "security.istio.io/tlsMode": "istio",
+          "service.istio.io/canonical-name": "rt-other",
+          "service.istio.io/canonical-revision": "latest",
+          "topology.kubernetes.io/region": "eastus",
+          "topology.kubernetes.io/zone": "0"
+        }
+      },
+      "resourceVersion": "1858802224",
+      "health": {
+        "status": "Progressing"
+      },
+      "createdAt": "2026-09-30T21:31:27Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Pod",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other-796b5bb5b6-qj58n",
+      "uid": "dda957e8-1963-46bd-b500-6d6a184a464f",
+      "parentRefs": [
+        {
+          "group": "apps",
+          "version": "v1",
+          "kind": "ReplicaSet",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-796b5bb5b6",
+          "uid": "2a75139c-4319-416d-9fcc-dc504ebbb11a"
+        }
+      ],
+      "info": [
+        {
+          "name": "Status Reason",
+          "value": "PodInitializing"
+        },
+        {
+          "name": "Containers",
+          "value": "1/2"
+        }
+      ],
+      "networkingInfo": {
+        "labels": {
+          "app": "rt-other",
+          "mycarrier.tech/correlationId": "devops-315-group-b",
+          "rollouts-pod-template-hash": "796b5bb5b6",
+          "security.istio.io/tlsMode": "istio",
+          "service.istio.io/canonical-name": "rt-other",
+          "service.istio.io/canonical-revision": "latest",
+          "topology.kubernetes.io/region": "eastus",
+          "topology.kubernetes.io/zone": "0"
+        }
+      },
+      "resourceVersion": "1858802245",
+      "health": {
+        "status": "Progressing"
+      },
+      "createdAt": "2026-09-30T21:31:29Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Pod",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker-7b89495949-vk8d5",
+      "uid": "c3d470df-935a-4c1a-b838-1e215d74f656",
+      "parentRefs": [
+        {
+          "group": "apps",
+          "version": "v1",
+          "kind": "ReplicaSet",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-7b89495949",
+          "uid": "7cd20c33-babc-4af6-83b5-ab2e38287b46"
+        }
+      ],
+      "info": [
+        {
+          "name": "Status Reason",
+          "value": "Running"
+        },
+        {
+          "name": "Containers",
+          "value": "2/2"
+        }
+      ],
+      "networkingInfo": {
+        "labels": {
+          "app": "rt-worker",
+          "mycarrier.tech/correlationId": "devops-315-group-a",
+          "rollouts-pod-template-hash": "7b89495949",
+          "security.istio.io/tlsMode": "istio",
+          "service.istio.io/canonical-name": "rt-worker",
+          "service.istio.io/canonical-revision": "latest",
+          "topology.kubernetes.io/region": "eastus",
+          "topology.kubernetes.io/zone": "0"
+        }
+      },
+      "resourceVersion": "1858801682",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:27Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Pod",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker-7b89495949-zz94t",
+      "uid": "afd5a421-75bc-4e00-ac86-2564b3736466",
+      "parentRefs": [
+        {
+          "group": "apps",
+          "version": "v1",
+          "kind": "ReplicaSet",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-7b89495949",
+          "uid": "7cd20c33-babc-4af6-83b5-ab2e38287b46"
+        }
+      ],
+      "info": [
+        {
+          "name": "Status Reason",
+          "value": "Running"
+        },
+        {
+          "name": "Containers",
+          "value": "2/2"
+        }
+      ],
+      "networkingInfo": {
+        "labels": {
+          "app": "rt-worker",
+          "mycarrier.tech/correlationId": "devops-315-group-a",
+          "rollouts-pod-template-hash": "7b89495949",
+          "security.istio.io/tlsMode": "istio",
+          "service.istio.io/canonical-name": "rt-worker",
+          "service.istio.io/canonical-revision": "latest",
+          "topology.kubernetes.io/region": "eastus",
+          "topology.kubernetes.io/zone": "0"
+        }
+      },
+      "resourceVersion": "1858802356",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:29Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Service",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api",
+      "uid": "2e424781-cab8-4a6a-84ac-63b05337d761",
+      "networkingInfo": {
+        "targetLabels": {
+          "app": "rt-api",
+          "rollouts-pod-template-hash": "679bc4c8fc"
+        }
+      },
+      "resourceVersion": "1858802985",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Service",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api-canary",
+      "uid": "8c0a89d9-490f-4e86-b008-7280be8333c5",
+      "networkingInfo": {
+        "targetLabels": {
+          "app": "rt-api",
+          "rollouts-pod-template-hash": "679bc4c8fc"
+        }
+      },
+      "resourceVersion": "1858802987",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Service",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other",
+      "uid": "da2499e9-1988-438f-9bce-c76eb144906a",
+      "networkingInfo": {
+        "targetLabels": {
+          "app": "rt-other",
+          "rollouts-pod-template-hash": "796b5bb5b6"
+        }
+      },
+      "resourceVersion": "1858802996",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Service",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other-canary",
+      "uid": "0239f6d5-3607-4ef0-ad6f-3b5dabb94a28",
+      "networkingInfo": {
+        "targetLabels": {
+          "app": "rt-other",
+          "rollouts-pod-template-hash": "796b5bb5b6"
+        }
+      },
+      "resourceVersion": "1858802997",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Service",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker",
+      "uid": "a4d82ad7-59e8-4916-b711-f4c276a1f0f2",
+      "networkingInfo": {
+        "targetLabels": {
+          "app": "rt-worker",
+          "rollouts-pod-template-hash": "7b89495949"
+        }
+      },
+      "resourceVersion": "1858802365",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "version": "v1",
+      "kind": "Service",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker-canary",
+      "uid": "8931b751-925b-4c51-aa99-b78d36e33bad",
+      "networkingInfo": {
+        "targetLabels": {
+          "app": "rt-worker",
+          "rollouts-pod-template-hash": "7b89495949"
+        }
+      },
+      "resourceVersion": "1858802369",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "apps",
+      "version": "v1",
+      "kind": "ReplicaSet",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api-679bc4c8fc",
+      "uid": "f449c85d-8b66-4b3e-86a7-d4a52f6b41da",
+      "parentRefs": [
+        {
+          "group": "argoproj.io",
+          "version": "v1alpha1",
+          "kind": "Rollout",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api",
+          "uid": "afc0e4fd-69c8-48ff-8455-aff9e3909d68"
+        }
+      ],
+      "info": [
+        {
+          "name": "Revision",
+          "value": "Rev:1"
+        }
+      ],
+      "resourceVersion": "1858802979",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "apps",
+      "version": "v1",
+      "kind": "ReplicaSet",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other-796b5bb5b6",
+      "uid": "2a75139c-4319-416d-9fcc-dc504ebbb11a",
+      "parentRefs": [
+        {
+          "group": "argoproj.io",
+          "version": "v1alpha1",
+          "kind": "Rollout",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other",
+          "uid": "358be5b9-f474-4f3c-a9c5-3b4258e0d3d3"
+        }
+      ],
+      "info": [
+        {
+          "name": "Revision",
+          "value": "Rev:1"
+        }
+      ],
+      "resourceVersion": "1858802989",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "apps",
+      "version": "v1",
+      "kind": "ReplicaSet",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker-7b89495949",
+      "uid": "7cd20c33-babc-4af6-83b5-ab2e38287b46",
+      "parentRefs": [
+        {
+          "group": "argoproj.io",
+          "version": "v1alpha1",
+          "kind": "Rollout",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker",
+          "uid": "759734b8-af00-4e55-97f3-27fafb89bd0d"
+        }
+      ],
+      "info": [
+        {
+          "name": "Revision",
+          "value": "Rev:1"
+        }
+      ],
+      "resourceVersion": "1858802358",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "argoproj.io",
+      "version": "v1alpha1",
+      "kind": "Rollout",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api",
+      "uid": "afc0e4fd-69c8-48ff-8455-aff9e3909d68",
+      "info": [
+        {
+          "name": "Revision",
+          "value": "Rev:1"
+        }
+      ],
+      "resourceVersion": "1858802995",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "argoproj.io",
+      "version": "v1alpha1",
+      "kind": "Rollout",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other",
+      "uid": "358be5b9-f474-4f3c-a9c5-3b4258e0d3d3",
+      "info": [
+        {
+          "name": "Revision",
+          "value": "Rev:1"
+        }
+      ],
+      "resourceVersion": "1858803002",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "argoproj.io",
+      "version": "v1alpha1",
+      "kind": "Rollout",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker",
+      "uid": "759734b8-af00-4e55-97f3-27fafb89bd0d",
+      "info": [
+        {
+          "name": "Revision",
+          "value": "Rev:1"
+        }
+      ],
+      "resourceVersion": "1858802373",
+      "health": {
+        "status": "Healthy"
+      },
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "discovery.k8s.io",
+      "version": "v1",
+      "kind": "EndpointSlice",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api-canary-psw9w",
+      "uid": "7b8913b4-3092-4280-acc5-bc692eef06d5",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-canary",
+          "uid": "8c0a89d9-490f-4e86-b008-7280be8333c5"
+        }
+      ],
+      "resourceVersion": "1858802980",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "discovery.k8s.io",
+      "version": "v1",
+      "kind": "EndpointSlice",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api-czwlz",
+      "uid": "323719f2-3f7b-468d-9165-596fdef21a1d",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api",
+          "uid": "2e424781-cab8-4a6a-84ac-63b05337d761"
+        }
+      ],
+      "resourceVersion": "1858802983",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "discovery.k8s.io",
+      "version": "v1",
+      "kind": "EndpointSlice",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other-canary-m9b4j",
+      "uid": "a1e407c6-1b4a-42b4-8678-ae7c7948d350",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-canary",
+          "uid": "0239f6d5-3607-4ef0-ad6f-3b5dabb94a28"
+        }
+      ],
+      "resourceVersion": "1858802971",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "discovery.k8s.io",
+      "version": "v1",
+      "kind": "EndpointSlice",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other-fkz4r",
+      "uid": "28418b4d-8b4f-472e-9324-029389bf9243",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other",
+          "uid": "da2499e9-1988-438f-9bce-c76eb144906a"
+        }
+      ],
+      "resourceVersion": "1858802974",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "discovery.k8s.io",
+      "version": "v1",
+      "kind": "EndpointSlice",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker-canary-9wxs2",
+      "uid": "16124729-ad58-4b3a-a3c5-c38fb61dd61d",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-canary",
+          "uid": "8931b751-925b-4c51-aa99-b78d36e33bad"
+        }
+      ],
+      "resourceVersion": "1858802362",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "discovery.k8s.io",
+      "version": "v1",
+      "kind": "EndpointSlice",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker-xzfsl",
+      "uid": "27c88874-248b-46e6-998b-f72256f02fce",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Service",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker",
+          "uid": "a4d82ad7-59e8-4916-b711-f4c276a1f0f2"
+        }
+      ],
+      "resourceVersion": "1858802359",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "networking.istio.io",
+      "version": "v1",
+      "kind": "VirtualService",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-api",
+      "uid": "756dd8cd-f114-4ecd-a4a9-50a5611840c1",
+      "networkingInfo": {
+        "targetRefs": [
+          {
+            "kind": "Service",
+            "namespace": "devops-315-rollout-test",
+            "name": "rt-api"
+          },
+          {
+            "kind": "Service",
+            "namespace": "devops-315-rollout-test",
+            "name": "rt-api-canary"
+          }
+        ]
+      },
+      "resourceVersion": "1858800539",
+      "createdAt": "2026-09-30T21:31:24Z"
+    },
+    {
+      "group": "networking.istio.io",
+      "version": "v1",
+      "kind": "VirtualService",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-other",
+      "uid": "362cb0d9-4e7e-4ab1-a5fe-4a97ede786f2",
+      "networkingInfo": {
+        "targetRefs": [
+          {
+            "kind": "Service",
+            "namespace": "devops-315-rollout-test",
+            "name": "rt-other-canary"
+          },
+          {
+            "kind": "Service",
+            "namespace": "devops-315-rollout-test",
+            "name": "rt-other"
+          }
+        ]
+      },
+      "resourceVersion": "1858800566",
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "networking.istio.io",
+      "version": "v1",
+      "kind": "VirtualService",
+      "namespace": "devops-315-rollout-test",
+      "name": "rt-worker",
+      "uid": "b739f0de-5595-47d5-a0ae-828fc8a38b39",
+      "networkingInfo": {
+        "targetRefs": [
+          {
+            "kind": "Service",
+            "namespace": "devops-315-rollout-test",
+            "name": "rt-worker"
+          },
+          {
+            "kind": "Service",
+            "namespace": "devops-315-rollout-test",
+            "name": "rt-worker-canary"
+          }
+        ]
+      },
+      "resourceVersion": "1858800588",
+      "createdAt": "2026-09-30T21:31:25Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "103453bb-2c69-4b91-816a-cbd8fa3d9b72-4z754",
+      "uid": "f02c3e61-6d14-4287-b2f4-7c7bb3df22c9",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-7b89495949-zz94t",
+          "uid": "afd5a421-75bc-4e00-ac86-2564b3736466"
+        }
+      ],
+      "resourceVersion": "1858802430",
+      "createdAt": "2026-09-30T21:31:29Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "103453bb-2c69-4b91-816a-cbd8fa3d9b72-l7gnj",
+      "uid": "d82eeb98-4381-479f-8a00-be3426f61507",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-7b89495949-zz94t",
+          "uid": "afd5a421-75bc-4e00-ac86-2564b3736466"
+        }
+      ],
+      "resourceVersion": "1858802431",
+      "createdAt": "2026-09-30T21:31:29Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "137fdd1e-7f18-4aa5-984c-f44be3af21cd-mkrwb",
+      "uid": "1a7302c3-3ed1-4fa6-8e40-ce73bc8a5197",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-796b5bb5b6-89bd7",
+          "uid": "ec461d4b-d4f8-440b-9d0b-1eb0c3eca5c8"
+        }
+      ],
+      "resourceVersion": "1858802097",
+      "createdAt": "2026-09-30T21:31:27Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "137fdd1e-7f18-4aa5-984c-f44be3af21cd-wrrm8",
+      "uid": "4764a867-bfc5-4e75-87a6-25099eb59924",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-796b5bb5b6-89bd7",
+          "uid": "ec461d4b-d4f8-440b-9d0b-1eb0c3eca5c8"
+        }
+      ],
+      "resourceVersion": "1858802100",
+      "createdAt": "2026-09-30T21:31:27Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "76c495cb-7291-4f31-bede-1d0c095b3e19-dzxt8",
+      "uid": "ee21c0b8-f584-4003-a1a5-bf1c6f503412",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-7b89495949-vk8d5",
+          "uid": "c3d470df-935a-4c1a-b838-1e215d74f656"
+        }
+      ],
+      "resourceVersion": "1858802161",
+      "createdAt": "2026-09-30T21:31:27Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "76c495cb-7291-4f31-bede-1d0c095b3e19-zvqd7",
+      "uid": "2d6e956b-9db5-4da7-8d60-b9142dd6bc0a",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-worker-7b89495949-vk8d5",
+          "uid": "c3d470df-935a-4c1a-b838-1e215d74f656"
+        }
+      ],
+      "resourceVersion": "1858802167",
+      "createdAt": "2026-09-30T21:31:27Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "7a532c5b-3af5-420d-9c48-526dac40e778-8lcx5",
+      "uid": "2ff05dd6-f4b0-4405-818c-c12f5d76cf53",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-796b5bb5b6-qj58n",
+          "uid": "dda957e8-1963-46bd-b500-6d6a184a464f"
+        }
+      ],
+      "resourceVersion": "1858802375",
+      "createdAt": "2026-09-30T21:31:29Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "7a532c5b-3af5-420d-9c48-526dac40e778-gbq96",
+      "uid": "a0cbb937-0508-45c3-8ce9-7932316230fb",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-other-796b5bb5b6-qj58n",
+          "uid": "dda957e8-1963-46bd-b500-6d6a184a464f"
+        }
+      ],
+      "resourceVersion": "1858802370",
+      "createdAt": "2026-09-30T21:31:29Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "806ff812-ad24-43a9-868b-dfc07b14dd96-95hkz",
+      "uid": "560af5f5-7f93-485a-9d58-16c47e82f02c",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-679bc4c8fc-wdgg2",
+          "uid": "2a655f5c-fb6c-4e0e-b141-8b2ce3d8236e"
+        }
+      ],
+      "resourceVersion": "1858802324",
+      "createdAt": "2026-09-30T21:31:28Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "806ff812-ad24-43a9-868b-dfc07b14dd96-mz8h8",
+      "uid": "01f33a2a-bc21-45a3-a7a2-935939b70c55",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-679bc4c8fc-wdgg2",
+          "uid": "2a655f5c-fb6c-4e0e-b141-8b2ce3d8236e"
+        }
+      ],
+      "resourceVersion": "1858802329",
+      "createdAt": "2026-09-30T21:31:28Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "f864562e-48c3-475d-97f7-3269cd1b3a59-8sxqj",
+      "uid": "9f97038a-d9f5-4904-acdc-d5b99dbf6249",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-679bc4c8fc-97zbh",
+          "uid": "da59e45b-c1f6-44e9-825c-60c07308989f"
+        }
+      ],
+      "resourceVersion": "1858802080",
+      "createdAt": "2026-09-30T21:31:26Z"
+    },
+    {
+      "group": "reports.kyverno.io",
+      "version": "v1",
+      "kind": "EphemeralReport",
+      "namespace": "devops-315-rollout-test",
+      "name": "f864562e-48c3-475d-97f7-3269cd1b3a59-n5xsk",
+      "uid": "1ba37222-b808-4827-adad-8aeae4593a8f",
+      "parentRefs": [
+        {
+          "version": "v1",
+          "kind": "Pod",
+          "namespace": "devops-315-rollout-test",
+          "name": "rt-api-679bc4c8fc-97zbh",
+          "uid": "da59e45b-c1f6-44e9-825c-60c07308989f"
+        }
+      ],
+      "resourceVersion": "1858802075",
+      "createdAt": "2026-09-30T21:31:26Z"
+    }
+  ]
+}
