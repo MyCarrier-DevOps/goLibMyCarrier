@@ -194,7 +194,11 @@ func TestNewInstallationClient_MintIsOneBoundedRequest(t *testing.T) {
 			mux.HandleFunc(testTokenPath, tt.handler)
 			server := newStallServer(t, mux)
 
-			tokenSource, _ := newInstallationClient(testAppTokenSource(t), testInstallationID, testSessionConfig(server.URL))
+			tokenSource, _ := newInstallationClient(
+				testAppTokenSource(t),
+				testInstallationID,
+				testSessionConfig(server.URL),
+			)
 
 			var token *oauth2.Token
 			err, elapsed := runBounded(t, func() error {
@@ -211,7 +215,12 @@ func TestNewInstallationClient_MintIsOneBoundedRequest(t *testing.T) {
 			}
 			require.Error(t, err)
 			if tt.wantRateLimit {
-				assert.ErrorIs(t, err, githubauth.ErrRateLimited, "a throttled mint must be recognisable to the caller that retries it")
+				assert.ErrorIs(
+					t,
+					err,
+					githubauth.ErrRateLimited,
+					"a throttled mint must be recognisable to the caller that retries it",
+				)
 			}
 		})
 	}
@@ -296,10 +305,30 @@ func TestGraphQLClient_CallsAreBounded(t *testing.T) {
 		tokens        http.HandlerFunc
 		graphql       http.HandlerFunc
 	}{
-		{name: "installation discovery stalls", installations: stallHandler(false), tokens: tokens, graphql: stallHandler(false)},
-		{name: "graphql query stalls before headers", installations: installations, tokens: tokens, graphql: stallHandler(false)},
-		{name: "graphql query stalls the body", installations: installations, tokens: tokens, graphql: stallHandler(true)},
-		{name: "token refresh inside the query stalls", installations: installations, tokens: stallHandler(false), graphql: stallHandler(false)},
+		{
+			name:          "installation discovery stalls",
+			installations: stallHandler(false),
+			tokens:        tokens,
+			graphql:       stallHandler(false),
+		},
+		{
+			name:          "graphql query stalls before headers",
+			installations: installations,
+			tokens:        tokens,
+			graphql:       stallHandler(false),
+		},
+		{
+			name:          "graphql query stalls the body",
+			installations: installations,
+			tokens:        tokens,
+			graphql:       stallHandler(true),
+		},
+		{
+			name:          "token refresh inside the query stalls",
+			installations: installations,
+			tokens:        stallHandler(false),
+			graphql:       stallHandler(false),
+		},
 	}
 
 	for _, tt := range tests {
@@ -359,7 +388,12 @@ func TestNewSessionConfig(t *testing.T) {
 		wantErrContain string
 	}{
 		{name: "defaults", wantCtx: context.Background(), wantTimeout: DefaultRequestTimeout},
-		{name: "WithContext", opts: []SessionOption{WithContext(ctx)}, wantCtx: ctx, wantTimeout: DefaultRequestTimeout},
+		{
+			name:        "WithContext",
+			opts:        []SessionOption{WithContext(ctx)},
+			wantCtx:     ctx,
+			wantTimeout: DefaultRequestTimeout,
+		},
 		{
 			name:        "WithRequestTimeout raises the bound",
 			opts:        []SessionOption{WithRequestTimeout(2 * time.Minute)},
@@ -373,8 +407,10 @@ func TestNewSessionConfig(t *testing.T) {
 			wantTimeout: 0,
 		},
 		{
-			name:           "nil context is rejected",
-			opts:           []SessionOption{WithContext(nil)}, //nolint:staticcheck // SA1012: the nil is the input under test
+			name: "nil context is rejected",
+			opts: []SessionOption{
+				WithContext(nil),
+			}, //nolint:staticcheck // SA1012: the nil is the input under test
 			wantErrContain: "WithContext",
 		},
 		{
@@ -467,7 +503,11 @@ func TestNewInstallationClient_ThrottledRefreshIsThisPackagesErrRateLimited(t *t
 	mux.HandleFunc("/ok", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
 	server := newStallServer(t, mux)
 
-	tokenSource, client := newInstallationClient(testAppTokenSource(t), testInstallationID, testSessionConfig(server.URL))
+	tokenSource, client := newInstallationClient(
+		testAppTokenSource(t),
+		testInstallationID,
+		testSessionConfig(server.URL),
+	)
 	_, err := tokenSource.Token()
 	require.NoError(t, err, "the first mint succeeds")
 
@@ -511,7 +551,12 @@ func TestNewBoundedTransport_KeepsTheDefaultTransportBounds(t *testing.T) {
 	require.True(t, ok, "the bounded transport must be an *http.Transport of its own")
 
 	assert.Equal(t, ResponseHeaderTimeout, transport.ResponseHeaderTimeout)
-	assert.Equal(t, defaultTransport.TLSHandshakeTimeout, transport.TLSHandshakeTimeout, "the TLS handshake bound must be kept")
+	assert.Equal(
+		t,
+		defaultTransport.TLSHandshakeTimeout,
+		transport.TLSHandshakeTimeout,
+		"the TLS handshake bound must be kept",
+	)
 	assert.Equal(t, defaultTransport.ExpectContinueTimeout, transport.ExpectContinueTimeout)
 	assert.Equal(t, defaultTransport.IdleConnTimeout, transport.IdleConnTimeout)
 	assert.NotNil(t, transport.DialContext, "the dial bound and keep-alive must be kept")
