@@ -1,15 +1,17 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient)
 # ArgoCD Client
 
-A Go client library for interacting with the ArgoCD API. This package provides functionality to retrieve ArgoCD application data and manifests with built-in retry logic and error handling.
+A Go client library for interacting with the ArgoCD API. This package retrieves ArgoCD application data and manifests, reports the status of Argo Rollouts grouped by correlation ID, and runs Rollout actions on the ArgoCD instance an application routes to. Reads retry on transient failures and every HTTP failure surfaces as a typed error.
 
 ## Features
 
 - **Retry Logic**: Built-in exponential backoff retry strategy for network failures and server errors (5xx)
-- **Error Handling**: Smart error handling that avoids retries for client errors (4xx) 
+- **Typed Errors**: HTTP failures return `*APIError` and match the sentinels `ErrPermissionDenied`, `ErrNotFound` and `ErrConflict` with `errors.Is`; client errors (4xx) are never retried
 - **Configuration Management**: Environment variable-based configuration with validation
 - **Application Data**: Retrieve ArgoCD application information with soft refresh
 - **Manifest Retrieval**: Get application manifests for specific revisions
+- **Rollout Status**: List the Argo Rollouts of an Application that carry a correlation ID, with health, phase, step index, canary weight and step plugin statuses
+- **Routed Resource Actions**: Run `abort`, `promote-full`, `retry` and `resume` on a Rollout through a `Router` that always uses the token of the instance the application routes to, and refuses when that instance is not configured
 
 ## Installation
 
@@ -223,6 +225,25 @@ section above for details and the recommended usage pattern.
 - `(c *Client) GetManifestsWithContext(ctx context.Context, revision, argoAppName string) ([]string, error)`
 - `(c *Client) GetArgoApplicationResourceTreeWithContext(ctx context.Context, argoAppName string) (map[string]interface{}, error)`
 
+#### Rollout and action API
+
+- `const CorrelationIDLabel = "mycarrier.tech/correlationId"`: the Rollout label that carries the correlation ID
+- `type ResourceRef struct{ Group, Version, Kind, Namespace, Name string }`: identifies a live resource in an Application
+- `type HealthStatus string`: ArgoCD health code (`HealthStatusHealthy`, `HealthStatusProgressing`, `HealthStatusSuspended`, `HealthStatusDegraded`, `HealthStatusMissing`, `HealthStatusUnknown`)
+- `type RolloutPhase string`: Argo Rollouts `status.phase` (`RolloutPhaseHealthy`, `RolloutPhaseProgressing`, `RolloutPhasePaused`, `RolloutPhaseDegraded`)
+- `type StepPluginPhase string`: step plugin phase (`StepPluginPhaseRunning`, `StepPluginPhaseSuccessful`, `StepPluginPhaseFailed`, `StepPluginPhaseError`)
+- `type StepPluginStatus struct{ Index int32; Name string; Phase StepPluginPhase; Message string }`: one entry of `status.canary.stepPluginStatuses`
+- `type RolloutStatus struct{ ... }`: combined resource-tree and live state of one Rollout (see [Argo Rollouts](#argo-rollouts))
+- `(c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: Rollouts of an Application labeled with the correlation ID
+- `type ResourceAction string`: `ActionAbort`, `ActionPromoteFull`, `ActionRetry`, `ActionResume`
+- `type Router struct{ ... }`: one `Client` per configured `Instance`
+- `NewRouter(configs map[Instance]*Config) *Router`: builds a `Router`; nil or incomplete configs leave an instance unconfigured
+- `(r *Router) ClientFor(appName string) (*Client, error)`: the client of the instance `appName` routes to, or `ErrInstanceNotConfigured`
+- `(r *Router) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: `ClientFor` followed by `Client.ListRolloutGroup`
+- `(r *Router) RunResourceAction(ctx context.Context, appName string, ref ResourceRef, action ResourceAction) error`: runs an action on the routed instance
+- `type APIError struct{ StatusCode int; Body string }`: returned for any HTTP status of 400 and above
+- `ErrPermissionDenied`, `ErrNotFound`, `ErrConflict`, `ErrInstanceNotConfigured`: sentinel errors (see [Error Handling](#error-handling))
+
 ## Instance Routing
 
 MyCarrier runs three ArgoCD control planes (DEV / MGMT / PROD). The
@@ -282,6 +303,141 @@ fmt.Println(instance.String()) // "PROD"
 // Caller then reads ARGOCD_SERVER_PROD / ARGOCD_AUTHTOKEN_PROD.
 ```
 
+## Argo Rollouts
+
+`ListRolloutGroup(ctx, appName, correlationID)` returns the status of every Argo
+Rollout in an Application whose `mycarrier.tech/correlationId` label
+(`CorrelationIDLabel`) equals `correlationID`. It is available on `Client` and on
+`Router`; `Router.ListRolloutGroup` routes `appName` to its instance and delegates.
+
+The call works in these steps:
+
+1. An empty `correlationID` returns an error; unlabeled Rollouts are never matched.
+2. It reads the Application's resource tree
+   (`GET /api/v1/applications/{app}/resource-tree`) and keeps the nodes with group
+   `argoproj.io` and kind `Rollout`. Tree nodes carry no labels.
+3. For each Rollout node it reads the live manifest
+   (`GET /api/v1/applications/{app}/resource`). A failure to read any live Rollout
+   fails the whole call.
+4. It keeps the Rollouts whose label matches and returns them sorted by namespace,
+   then name.
+
+### RolloutStatus
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `Ref` | resource tree | Group, version, kind, namespace and name of the Rollout |
+| `Health` | resource tree | ArgoCD health code (`health.status`) |
+| `Message` | resource tree | ArgoCD health message (`health.message`) |
+| `Phase` | live Rollout | `status.phase` |
+| `CurrentStepIndex` | live Rollout | `status.currentStepIndex`; `nil` when unset |
+| `Aborted` | live Rollout | `status.abort` |
+| `CanaryWeight` | live Rollout | Percentage of traffic on the canary, see below |
+| `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, phase, message) |
+
+### CanaryWeight
+
+`CanaryWeight` follows the same precedence as `kubectl argo rollouts`:
+
+1. The Rollout is aborted (`status.abort`): `0`.
+2. There is no current canary step, which means the Rollout has no canary steps or
+   `currentStepIndex` is past the last step (fully promoted): the max traffic weight,
+   `spec.strategy.canary.trafficRouting.maxTrafficWeight`, default `100`. A traffic
+   router such as Istio reports a canary weight of `0` after full promotion, so
+   `status.canary.weights` is not used here.
+3. A traffic router is configured and `status.canary.weights` reports a canary weight:
+   that weight.
+4. Otherwise: the last `setWeight` step at or before the current step (an unset
+   `currentStepIndex` counts as step `0`), or `0` when there is none.
+
+```go
+statuses, err := router.ListRolloutGroup(ctx, "mycarrier-frontend-prod", correlationID)
+if err != nil {
+    log.Fatal(err)
+}
+for _, s := range statuses {
+    fmt.Printf("%s/%s health=%s phase=%s weight=%d%%\n",
+        s.Ref.Namespace, s.Ref.Name, s.Health, s.Phase, s.CanaryWeight)
+}
+```
+
+## Resource Actions
+
+Rollout actions are reachable only through a `Router`; `Client` has no exported
+action method. Because the `Router` picks the client by `RouteInstance(appName)`,
+an action is always sent with the token of the instance the application routes to.
+
+The module does not read the per-instance environment variables itself. The caller
+loads them into a `map[Instance]*Config`:
+
+```go
+configs := map[argocdclient.Instance]*argocdclient.Config{
+    argocdclient.InstanceDev: {
+        ServerUrl: os.Getenv("ARGOCD_SERVER_DEV"),
+        AuthToken: os.Getenv("ARGOCD_AUTHTOKEN_DEV"),
+    },
+    argocdclient.InstanceMgmt: {
+        ServerUrl: os.Getenv("ARGOCD_SERVER_MGMT"),
+        AuthToken: os.Getenv("ARGOCD_AUTHTOKEN_MGMT"),
+    },
+    argocdclient.InstanceProd: {
+        ServerUrl: os.Getenv("ARGOCD_SERVER_PROD"),
+        AuthToken: os.Getenv("ARGOCD_AUTHTOKEN_PROD"),
+    },
+}
+router := argocdclient.NewRouter(configs)
+
+ref := argocdclient.ResourceRef{
+    Group: "argoproj.io", Version: "v1alpha1", Kind: "Rollout",
+    Namespace: "default", Name: "my-rollout",
+}
+err := router.RunResourceAction(ctx, "mycarrier-frontend-prod", ref, argocdclient.ActionAbort)
+```
+
+### Fail-closed routing
+
+`NewRouter` leaves an instance unconfigured when its config is `nil` or has an empty
+`ServerUrl` or `AuthToken`. `ClientFor`, `ListRolloutGroup` and `RunResourceAction`
+return an error wrapping `ErrInstanceNotConfigured` (naming the application and the
+instance) for an application that routes to an unconfigured instance. No HTTP call is
+made and no other instance is used as a fallback. For example, a `Router` configured
+with only `InstanceDev` refuses actions for `mycarrier-frontend-prod`.
+
+### Actions
+
+| Constant | Action | Effect | Repeat-safe |
+|----------|--------|--------|-------------|
+| `ActionAbort` | `abort` | Sets `status.abort` on the Rollout | Yes |
+| `ActionPromoteFull` | `promote-full` | Skips the remaining canary steps | Yes |
+| `ActionRetry` | `retry` | Clears an abort so the Rollout tries again | Yes |
+| `ActionResume` | `resume` | Clears the pause conditions | No |
+
+`resume` is not idempotent: a repeated resume can release the next `pause: {}` step.
+
+### Request flow
+
+1. `ref.Name`, `ref.Kind`, `ref.Version` and the action must be non-empty, otherwise an
+   error is returned without any HTTP call.
+2. The action is checked against ArgoCD's action discovery
+   (`GET /api/v1/applications/{name}/resource/actions`). ArgoCD does not enforce an
+   action's `disabled` flag when running it, so an action that is absent or disabled
+   returns an error wrapping `ErrConflict` and nothing is posted.
+3. The action is sent with `POST /api/v1/applications/{name}/resource/actions/v2`. The
+   POST is a single attempt and is never retried. A non-2xx answer is returned as
+   `*APIError`.
+
+### Required ArgoCD RBAC
+
+The token of each instance needs these policies on the Application:
+
+```
+p, <role>, applications, get, <project>/<app>, allow
+p, <role>, applications, action/argoproj.io/Rollout/<action>, <project>/<app>, allow
+```
+
+where `<action>` is each of `abort`, `promote-full`, `retry` and `resume` that the
+caller runs.
+
 ## Context Support
 
 All public HTTP methods on `Client` have context-aware variants suffixed with
@@ -316,23 +472,64 @@ if err != nil {
 Note on retry interaction: the underlying `retryablehttp.Client` uses
 `DefaultRetryPolicy`, which does **not** retry requests that fail with
 `context.Canceled` or `context.DeadlineExceeded`. A cancelled or expired ctx
-short-circuits retries and returns promptly.
+short-circuits retries and returns promptly. Action calls take a `ctx` directly and
+honor it the same way.
 
 ## Retry Strategy
 
-Both `GetArgoApplication` and `GetManifests` implement the same retry strategy:
+All GET requests (application data, manifests, resource tree, rollout group reads and
+action discovery) share one retry strategy:
 
 - **Maximum Retries**: 3 attempts
 - **Backoff Strategy**: Exponential backoff with delays of 1s, 2s, 4s
 - **Retry Conditions**: Network errors and HTTP 5xx server errors
 - **No Retry Conditions**: HTTP 4xx client errors (authentication, authorization, etc.)
 
+Action POSTs are never retried: they are sent exactly once, because a repeated `resume`
+can release the next `pause: {}` step.
+
 ## Error Handling
 
-The client distinguishes between different types of errors:
+Every HTTP answer with a status of 400 or above is returned as `*APIError`:
 
-- **Network Errors**: Retried with exponential backoff
-- **Server Errors (5xx)**: Retried with exponential backoff  
+```go
+type APIError struct {
+    StatusCode int    // HTTP status code
+    Body       string // raw response body, typically grpc-gateway JSON
+}
+```
+
+`Error()` renders `client error <code>: <body>` for 4xx statuses and
+`server error <code>: <body>` for 5xx statuses.
+
+Sentinel errors match through `errors.Is`:
+
+| Sentinel | Matches |
+|----------|---------|
+| `ErrPermissionDenied` | HTTP 403. A scoped token also gets 403, not 404, for an Application that does not exist |
+| `ErrNotFound` | HTTP 404, and HTTP 400 whose body contains `not found as part of application` (a resource that is not in the Application) |
+| `ErrConflict` | HTTP 409, or an action the resource does not currently offer (disabled or absent in ArgoCD's action discovery) |
+| `ErrInstanceNotConfigured` | An application that routes to an instance without a configured server URL and token |
+
+```go
+_, err := client.GetApplicationWithContext(ctx, "my-application")
+switch {
+case errors.Is(err, argocdclient.ErrNotFound):
+    // the Application or resource does not exist
+case errors.Is(err, argocdclient.ErrPermissionDenied):
+    // the token may not read it, or the Application does not exist
+}
+
+var apiErr *argocdclient.APIError
+if errors.As(err, &apiErr) {
+    fmt.Println(apiErr.StatusCode, apiErr.Body)
+}
+```
+
+Other failures:
+
+- **Network Errors**: Retried with exponential backoff for GET requests
+- **Server Errors (5xx)**: Retried with exponential backoff for GET requests; returned immediately for action POSTs
 - **Client Errors (4xx)**: Returned immediately without retry
 - **Parsing Errors**: Returned immediately without retry
 
