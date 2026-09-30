@@ -25,20 +25,27 @@ type Client struct {
 // NewClientWithDependencies creates a client over the given store and GitHub client. It is
 // the only constructor: callers build the store (NewPostgresStore over their own pgxpool.Pool,
 // or a test double) and the GitHub client (NewGitHubClient) and inject both.
+//
+// A HoldTimeout, PollInterval or AncestryDepth of 0 or less is unset and gets DefaultConfig's
+// value, and AncestryMaxDepth is raised to at least AncestryDepth. AncestryMaxDepth never gets
+// DefaultConfig's 100: the push path widens its ancestor search only when AncestryMaxDepth is
+// above AncestryDepth, so a Config that leaves it unset keeps searching at AncestryDepth, and
+// ResolveAncestry walks up to AncestryDepth links.
 func NewClientWithDependencies(store SlipStore, github GitHubAPI, config Config) *Client {
 	if config.Logger == nil {
 		config.Logger = NopLogger()
 	}
-	// Set defaults for unset config values
-	if config.HoldTimeout == 0 {
-		config.HoldTimeout = DefaultConfig().HoldTimeout
+	defaults := DefaultConfig()
+	if config.HoldTimeout <= 0 {
+		config.HoldTimeout = defaults.HoldTimeout
 	}
-	if config.PollInterval == 0 {
-		config.PollInterval = DefaultConfig().PollInterval
+	if config.PollInterval <= 0 {
+		config.PollInterval = defaults.PollInterval
 	}
-	if config.AncestryDepth == 0 {
-		config.AncestryDepth = DefaultConfig().AncestryDepth
+	if config.AncestryDepth <= 0 {
+		config.AncestryDepth = defaults.AncestryDepth
 	}
+	config.AncestryMaxDepth = max(config.AncestryMaxDepth, config.AncestryDepth)
 
 	return &Client{
 		store:          store,

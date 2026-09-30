@@ -26,7 +26,7 @@ package constructed the ClickHouse one. Removed from the exported API:
 | `ClickHouseStore`, `ClickHouseStoreOptions`, `NewClickHouseStoreFromConfig`, `NewClickHouseStoreFromSession`, `NewClickHouseStoreFromConn` | `PostgresStore` |
 | `RunMigrations`, `ValidateSchema`, `GetCurrentSchemaVersion`, `GetPendingMigrations`, `MigrateOptions`, `DynamicMigrationManager`, `DynamicMigration`, `NewDynamicMigrationManager`, `GetDynamicMigrations`, `GetDynamicEnsurers`, `GetDynamicMigrationVersion` | `RunPostgresMigrations`, `ValidatePostgresSchema`, `GetPostgresDynamicEnsurers`, `GetPostgresDynamicMigrationVersion`; `MigrateResult` is unchanged |
 | `SlipScanner`, `NewSlipScanner`, `SlipQueryBuilder`, `NewSlipQueryBuilder`, `RetrySpan` | nothing; they were ClickHouse row plumbing |
-| `Config.ClickHouseConfig`, `Config.Database`, `Config.SkipMigrations`, `Config.WithDatabase`, `Config.Validate`, `Config.ValidateMinimal`; `ConfigFromEnv` no longer reads `CLICKHOUSE_*` or `SLIPPY_DATABASE` | build the store yourself and inject it. `ConfigFromEnv` leaves `PipelineConfig` nil when `SLIPPY_PIPELINE_CONFIG` fails to load; call `LoadPipelineConfig` to see why. `Validate`'s non-ClickHouse checks are now the caller's job: `PipelineConfig` is non-nil; the GitHub app ID and private key are set; `HoldTimeout`, `PollInterval` and `AncestryDepth` are positive; and `AncestryMaxDepth >= AncestryDepth`. `NewClientWithDependencies` defaults `HoldTimeout`, `PollInterval` and `AncestryDepth` when they are zero, but never `AncestryMaxDepth`: left at 0, the ancestry search never widens past `AncestryDepth` and `Client.ResolveAncestry` returns an empty chain (`DefaultConfig` sets 100) |
+| `Config.ClickHouseConfig`, `Config.Database`, `Config.SkipMigrations`, `Config.WithDatabase`, `Config.Validate`, `Config.ValidateMinimal`; `ConfigFromEnv` no longer reads `CLICKHOUSE_*` or `SLIPPY_DATABASE` | build the store yourself and inject it. `ConfigFromEnv` leaves `PipelineConfig` nil when `SLIPPY_PIPELINE_CONFIG` fails to load; call `LoadPipelineConfig` to see why. `Validate`'s non-ClickHouse checks split two ways. The caller's job: `PipelineConfig` is non-nil, and the GitHub app ID and private key are set. `NewClientWithDependencies` corrects the rest instead of rejecting them: a `HoldTimeout`, `PollInterval` or `AncestryDepth` of 0 or less gets `DefaultConfig`'s value, and `AncestryMaxDepth` is raised to at least `AncestryDepth` (never to `DefaultConfig`'s 100, so a Config that leaves it unset never widens the ancestry search past `AncestryDepth`) |
 
 `Slip.Sign` and `Slip.Version` stay, deprecated and always zero, and `Slip` no longer carries
 `ch:` struct tags. `ErrRepaveUnsupported`, `ErrResetUnsupported` and `ErrClaimUnsupported`
@@ -501,17 +501,8 @@ func InitializeSlippy(ctx context.Context, pool *pgxpool.Pool, logger Logger) (*
         return handleInitError(logger, fmt.Errorf(
             "SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)"))
     }
-    // ConfigFromEnv keeps a negative duration; NewClientWithDependencies defaults only zero
-    if cfg.HoldTimeout < 0 || cfg.PollInterval < 0 {
-        return handleInitError(logger, fmt.Errorf(
-            "SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative"))
-    }
-    // ConfigFromEnv keeps a max depth below the initial one; the ancestry search then never widens
-    if cfg.AncestryMaxDepth < cfg.AncestryDepth {
-        return handleInitError(logger, fmt.Errorf(
-            "SLIPPY_ANCESTRY_MAX_DEPTH (%d) must be >= SLIPPY_ANCESTRY_DEPTH (%d)",
-            cfg.AncestryMaxDepth, cfg.AncestryDepth))
-    }
+    // No check of the durations or depths: NewClientWithDependencies gives a value of 0 or
+    // less its default and raises AncestryMaxDepth to at least AncestryDepth.
 
     store, err := slippy.NewPostgresStore(pool, pipelineConfig, cfg.Logger)
     if err != nil {
@@ -617,15 +608,8 @@ if cfg.GitHubAppID == 0 {
 if cfg.GitHubPrivateKey == "" {
     return fmt.Errorf("SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)")
 }
-// ConfigFromEnv keeps a negative duration; NewClientWithDependencies defaults only zero
-if cfg.HoldTimeout < 0 || cfg.PollInterval < 0 {
-    return fmt.Errorf("SLIPPY_HOLD_TIMEOUT and SLIPPY_POLL_INTERVAL must not be negative")
-}
-// ConfigFromEnv keeps a max depth below the initial one; the ancestry search then never widens
-if cfg.AncestryMaxDepth < cfg.AncestryDepth {
-    return fmt.Errorf("SLIPPY_ANCESTRY_MAX_DEPTH (%d) must be >= SLIPPY_ANCESTRY_DEPTH (%d)",
-        cfg.AncestryMaxDepth, cfg.AncestryDepth)
-}
+// No check of the durations or depths: NewClientWithDependencies gives a value of 0 or less
+// its default and raises AncestryMaxDepth to at least AncestryDepth.
 
 store, err := slippy.NewPostgresStore(pool, cfg.PipelineConfig, cfg.Logger)
 if err != nil {

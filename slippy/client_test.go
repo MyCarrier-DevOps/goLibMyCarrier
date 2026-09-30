@@ -57,6 +57,143 @@ func TestNewClientWithDependencies_DefaultConfig(t *testing.T) {
 	}
 }
 
+// TestNewClientWithDependencies_NormalisesConfig pins what the constructor does with a Config's
+// hold and ancestry settings: a HoldTimeout, PollInterval or AncestryDepth of 0 or less is unset
+// and gets DefaultConfig's value, and AncestryMaxDepth is raised to at least AncestryDepth, never
+// to DefaultConfig's 100. Left alone, a negative PollInterval re-polls the store with no delay
+// while a hold waits, a negative HoldTimeout times the step out at its first poll, and an
+// AncestryMaxDepth of 0 makes ResolveAncestry return an empty chain.
+func TestNewClientWithDependencies_NormalisesConfig(t *testing.T) {
+	d := DefaultConfig()
+	type settings struct {
+		HoldTimeout, PollInterval       time.Duration
+		AncestryDepth, AncestryMaxDepth int
+	}
+	tests := []struct {
+		name string
+		in   Config
+		want settings
+	}{
+		{"all unset", Config{}, settings{d.HoldTimeout, d.PollInterval, d.AncestryDepth, d.AncestryDepth}},
+		{
+			"negative durations and depths are unset",
+			Config{
+				HoldTimeout: -5 * time.Minute, PollInterval: -30 * time.Second,
+				AncestryDepth: -1, AncestryMaxDepth: -1,
+			},
+			settings{d.HoldTimeout, d.PollInterval, d.AncestryDepth, d.AncestryDepth},
+		},
+		{
+			"positive values are kept",
+			Config{
+				HoldTimeout: 5 * time.Minute, PollInterval: 10 * time.Second,
+				AncestryDepth: 15, AncestryMaxDepth: 40,
+			},
+			settings{5 * time.Minute, 10 * time.Second, 15, 40},
+		},
+		{
+			"a max depth below the depth is raised to it",
+			Config{AncestryDepth: 50, AncestryMaxDepth: 20},
+			settings{d.HoldTimeout, d.PollInterval, 50, 50},
+		},
+		{
+			// slippy-api builds exactly this: AncestryDepth set, AncestryMaxDepth left at 0.
+			"an unset max depth is raised to the depth, not to 100",
+			Config{AncestryDepth: 25},
+			settings{d.HoldTimeout, d.PollInterval, 25, 25},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), tt.in).Config()
+			got := settings{c.HoldTimeout, c.PollInterval, c.AncestryDepth, c.AncestryMaxDepth}
+			if got != tt.want {
+				t.Errorf("hold timeout, poll interval, depth, max depth = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewClientWithDependencies_NormalisesConfigFromEnv pins the flow the README's Quick Start
+// relies on: ConfigFromEnv keeps a negative SLIPPY_HOLD_TIMEOUT or SLIPPY_POLL_INTERVAL and a
+// SLIPPY_ANCESTRY_MAX_DEPTH below SLIPPY_ANCESTRY_DEPTH, and the constructor corrects them.
+func TestNewClientWithDependencies_NormalisesConfigFromEnv(t *testing.T) {
+	t.Setenv("SLIPPY_HOLD_TIMEOUT", "-5m")
+	t.Setenv("SLIPPY_POLL_INTERVAL", "-30s")
+	t.Setenv("SLIPPY_ANCESTRY_DEPTH", "50")
+	t.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", "20")
+	cfg := ConfigFromEnv()
+	if cfg.HoldTimeout != -5*time.Minute || cfg.PollInterval != -30*time.Second || cfg.AncestryMaxDepth != 20 {
+		t.Fatalf("precondition: ConfigFromEnv should keep the values as given, got %+v", cfg)
+	}
+
+	c := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), cfg).Config()
+	if c.HoldTimeout != 60*time.Minute || c.PollInterval != 60*time.Second {
+		t.Errorf("hold timeout, poll interval = %v, %v; want the defaults 1h0m0s, 1m0s", c.HoldTimeout, c.PollInterval)
+	}
+	if c.AncestryDepth != 50 || c.AncestryMaxDepth != 50 {
+		t.Errorf("depth, max depth = %d, %d; want 50, 50", c.AncestryDepth, c.AncestryMaxDepth)
+	}
+}
+
+// ancestryDepthStore records the maxDepth Client.ResolveAncestry hands the store.
+type ancestryDepthStore struct {
+	*MockStore
+	maxDepth int
+}
+
+func (s *ancestryDepthStore) ResolveAncestry(_ context.Context, _, _, _ string, maxDepth int) ([]AncestryEntry, error) {
+	s.maxDepth = maxDepth
+	return nil, nil
+}
+
+// TestClient_ResolveAncestry_UnsetMaxDepthWalksAncestryDepth pins the consequence of raising an
+// unset AncestryMaxDepth: ResolveAncestry walks up to AncestryDepth links, where a maxDepth of 0
+// returned an empty chain for a slip that has parents.
+func TestClient_ResolveAncestry_UnsetMaxDepthWalksAncestryDepth(t *testing.T) {
+	store := &ancestryDepthStore{MockStore: NewMockStore()}
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{AncestryDepth: 25})
+
+	if _, err := client.ResolveAncestry(context.Background(), "owner/repo", "main", "corr-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.maxDepth != 25 {
+		t.Errorf("ResolveAncestry passed maxDepth %d to the store, want 25 (AncestryDepth)", store.maxDepth)
+	}
+}
+
+// TestNewClientWithDependencies_UnsetMaxDepthKeepsThePushSearchAtDepth pins that raising an unset
+// AncestryMaxDepth to AncestryDepth leaves both push-path searches where they were: one GitHub
+// ancestry query, at AncestryDepth. That is slippy-api's Config; giving AncestryMaxDepth
+// DefaultConfig's 100 instead would add a second query at 100 to every push that finds no slip.
+func TestNewClientWithDependencies_UnsetMaxDepthKeepsThePushSearchAtDepth(t *testing.T) {
+	ctx := context.Background()
+	searches := map[string]func(c *Client) ([]SlipWithCommit, error){
+		"ancestor search": func(c *Client) ([]SlipWithCommit, error) {
+			return c.findAncestorSlipsWithProgressiveDepth(ctx, "owner", "repo",
+				PushOptions{CorrelationID: "corr-new", Repository: "owner/repo", CommitSHA: "abc123"})
+		},
+		"PR branch search": func(c *Client) ([]SlipWithCommit, error) {
+			return c.findSlipsInPRBranchHistory(ctx, "owner", "repo", "owner/repo", "abc123")
+		},
+	}
+	for name, search := range searches {
+		t.Run(name, func(t *testing.T) {
+			github := NewMockGitHubAPI()
+			github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123", "grandparent456"})
+			client := NewClientWithDependencies(NewMockStore(), github, Config{AncestryDepth: 25})
+
+			if _, err := search(client); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			calls := github.GetCommitAncestryCalls
+			if len(calls) != 1 || calls[0].Depth != 25 {
+				t.Errorf("GetCommitAncestry calls = %+v, want exactly one, at depth 25", calls)
+			}
+		})
+	}
+}
+
 func TestClient_Load(t *testing.T) {
 	ctx := context.Background()
 
