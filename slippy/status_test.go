@@ -276,9 +276,10 @@ var releasedCoreMigrationDigests = map[int]string{
 }
 
 // TestReleasedCoreMigrationsAreImmutable fails when a released core migration's UpSQL changes or
-// the migration disappears. Appending a status to v1's CHECK list is the edit it exists to stop:
-// the DOMAIN tests below would pass it, yet no existing database runs v1 again, so every one of
-// them would reject the new status with SQLSTATE 23514.
+// the migration disappears, and when a core migration has no pinned digest. Appending a status to
+// v1's CHECK list is the edit it exists to stop: the DOMAIN tests below would pass it, yet no
+// existing database runs v1 again, so every one of them would reject the new status with SQLSTATE
+// 23514.
 func TestReleasedCoreMigrationsAreImmutable(t *testing.T) {
 	migrations := NewPostgresDynamicMigrationManager(testPipelineConfig(), nil).GenerateMigrations()
 	for _, problem := range releasedMigrationDrift(migrations, releasedCoreMigrationDigests) {
@@ -286,15 +287,23 @@ func TestReleasedCoreMigrationsAreImmutable(t *testing.T) {
 	}
 }
 
-// TestReleasedMigrationDrift pins releasedMigrationDrift itself: the real migrations only ever
-// take its passing path.
+// TestReleasedMigrationDrift pins releasedMigrationDrift itself. It computes its digests from the
+// real migrations instead of reading releasedCoreMigrationDigests, and derives next and dropped from
+// them, so a real migration that is unpinned, edited or removed fails only
+// TestReleasedCoreMigrationsAreImmutable here (the v1-edit case still needs v1 itself).
 func TestReleasedMigrationDrift(t *testing.T) {
 	released := NewPostgresDynamicMigrationManager(testPipelineConfig(), nil).GenerateMigrations()
+	golden := make(map[int]string, len(released))
+	for _, mig := range released {
+		golden[mig.Version] = upSQLDigest(mig)
+	}
+	next := slices.Max(slices.Collect(maps.Keys(golden))) + 1
 	editedV1 := slices.Clone(released)
 	editedV1[0].UpSQL = strings.Replace(editedV1[0].UpSQL, "'promoted'", "'promoted','queued'", 1)
-	withV7 := append(slices.Clone(released), postgresmigrator.Migration{Version: 7, UpSQL: "SELECT 1"})
-	withoutV3 := slices.DeleteFunc(slices.Clone(released), func(m postgresmigrator.Migration) bool {
-		return m.Version == 3
+	withNext := append(slices.Clone(released), postgresmigrator.Migration{Version: next, UpSQL: "SELECT 1"})
+	dropped := released[len(released)/2].Version
+	withoutOne := slices.DeleteFunc(slices.Clone(released), func(m postgresmigrator.Migration) bool {
+		return m.Version == dropped
 	})
 
 	cases := []struct {
@@ -303,15 +312,16 @@ func TestReleasedMigrationDrift(t *testing.T) {
 		want       []string // one substring per expected problem, in version order
 	}{
 		{"the released migrations as they are", released, nil},
-		{"an unreleased v7 is not pinned", withV7, nil},
+		{"an unpinned migration is reported", withNext,
+			[]string{fmt.Sprintf("migration v%d has no pinned digest", next)}},
 		{"a status appended to v1's CHECK", editedV1, []string{
 			"migration v1 is released and immutable, so revert the edit; to change the schema, add a new version"}},
-		{"v3 removed", withoutV3,
-			[]string{"migration v3 is released and immutable, but GenerateMigrations no longer returns it"}},
+		{"a pinned migration removed", withoutOne, []string{fmt.Sprintf(
+			"migration v%d is released and immutable, but GenerateMigrations no longer returns it", dropped)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			problems := releasedMigrationDrift(tc.migrations, releasedCoreMigrationDigests)
+			problems := releasedMigrationDrift(tc.migrations, golden)
 			if len(problems) != len(tc.want) {
 				t.Fatalf("got %d problems %q, want %d", len(problems), problems, len(tc.want))
 			}
@@ -324,9 +334,10 @@ func TestReleasedMigrationDrift(t *testing.T) {
 	}
 }
 
-// releasedMigrationDrift returns one message, in version order, for each released version (a
-// key of golden) whose migration is missing from migrations or whose UpSQL no longer has the
-// golden SHA-256.
+// releasedMigrationDrift returns one message for each pinned version (a key of golden) whose
+// migration is missing from migrations or whose UpSQL no longer has the golden SHA-256, then one
+// for each migration golden does not pin, each group in version order. The merge that adds a core
+// migration releases it, so the PR that adds it must pin it.
 func releasedMigrationDrift(migrations []postgresmigrator.Migration, golden map[int]string) []string {
 	byVersion := make(map[int]postgresmigrator.Migration, len(migrations))
 	for _, mig := range migrations {
@@ -341,15 +352,27 @@ func releasedMigrationDrift(migrations []postgresmigrator.Migration, golden map[
 				version))
 			continue
 		}
-		sum := sha256.Sum256([]byte(mig.UpSQL))
-		if got := hex.EncodeToString(sum[:]); got != golden[version] {
+		if got := upSQLDigest(mig); got != golden[version] {
 			problems = append(problems, fmt.Sprintf(
 				"migration v%d is released and immutable, so revert the edit; to change the schema, add a new "+
 					"version (for a status change, one that ALTERs the DOMAIN): its UpSQL sha256 is %s, want %s",
 				version, got, golden[version]))
 		}
 	}
+	for _, version := range slices.Sorted(maps.Keys(byVersion)) {
+		if _, pinned := golden[version]; !pinned {
+			problems = append(problems, fmt.Sprintf(
+				"migration v%d has no pinned digest; the merge that adds it releases it, so add this line to "+
+					"releasedCoreMigrationDigests: %d: %q,", version, version, upSQLDigest(byVersion[version])))
+		}
+	}
 	return problems
+}
+
+// upSQLDigest is the hex SHA-256 of a migration's UpSQL: the value releasedCoreMigrationDigests pins.
+func upSQLDigest(mig postgresmigrator.Migration) string {
+	sum := sha256.Sum256([]byte(mig.UpSQL))
+	return hex.EncodeToString(sum[:])
 }
 
 // TestAllSlipStatusesInEnum verifies that the SlipStatus constants in status.go and the values
@@ -480,6 +503,11 @@ func TestDomainCheckValues(t *testing.T) {
 			`/* a /* b */ ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check; -- */
 			ALTER DOMAIN slip_status ADD CONSTRAINT slip_status_v2 CHECK (VALUE IN ('pending','failed','queued'));`),
 			wantErr: "migration v2: a nested or unbalanced block comment is not supported here"},
+		{name: "a comment opener after a string literal's -- is refused", migrations: migs(create,
+			`SELECT '--'; /* retired:
+			ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check; */
+			ALTER DOMAIN slip_status ADD CONSTRAINT slip_status_v2 CHECK (VALUE IN ('pending','failed','queued'));`),
+			wantErr: "migration v2: a nested or unbalanced block comment is not supported here"},
 		{name: "a DROP of a constraint the DOMAIN lacks is refused", migrations: migs(create,
 			`ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_v2;`),
 			wantErr: "drops constraint slip_status_v2, which it does not have"},
@@ -541,8 +569,8 @@ var (
 // Postgres has no ALTER DOMAIN that replaces a CHECK in place, and an ADD without a DROP keeps the
 // old CHECK, which still rejects every value it does not list. Any other statement on the DOMAIN
 // is an error, so a migration this cannot read fails the test instead of being skipped.
-// Comments are ignored, but a nested block comment fails the test, and text inside a string
-// literal (for example a RAISE message) is still read.
+// Comments are ignored, but a nested block comment, or a */ the strip leaves behind, fails the
+// test, and text inside a string literal (for example a RAISE message) is still read.
 func domainCheckValues(migrations []postgresmigrator.Migration, domain string) (map[string]struct{}, error) {
 	ordered := slices.Clone(migrations)
 	slices.SortFunc(ordered, func(a, b postgresmigrator.Migration) int { return cmp.Compare(a.Version, b.Version) })

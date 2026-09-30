@@ -480,7 +480,11 @@ the one a database has recorded, so an edit to a released migration never reache
 database; to change the schema, add a new version. `TestReleasedCoreMigrationsAreImmutable`
 (`status_test.go`) pins the SHA-256 of each released core migration's UpSQL in
 `releasedCoreMigrationDigests`. The merge that adds a core migration tags a release, so add
-its digest in the PR that adds it.
+its digest in the PR that adds it. That PR also updates the count pins, which check the
+migration count or the latest version: `TestUniquenessMigration_V5` and
+`TestClaimedFromMigration_V6` in `postgres_migrations_test.go`, and
+`TestUniquenessMigration_V5_Integration` and `TestClaimedFromMigration_V6_Integration` in the
+integration suites.
 
 ### 3. Client Initialization Pattern
 
