@@ -1,6 +1,7 @@
 package argocdclient
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -66,6 +67,34 @@ func (c *Client) doGET(ctx context.Context, url string) ([]byte, error) {
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			// Intentionally ignore close error; response body already processed
+			_ = closeErr
+		}
+	}()
+
+	return readResponse(resp)
+}
+
+// doPOST performs an authenticated JSON POST against the ArgoCD API.
+// The request is sent exactly once through the underlying http.Client and is
+// never retried: ArgoCD resource actions are not idempotent (a retried resume
+// can clear the next pause step), so a transport failure or 5xx must surface to
+// the caller instead of being replayed.
+// Returns the raw response body on success and *APIError for statuses of 400 and above.
+func (c *Client) doPOST(ctx context.Context, url string, body []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.authToken))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.retryableClient.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %w", err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
 			_ = closeErr
 		}
 	}()
