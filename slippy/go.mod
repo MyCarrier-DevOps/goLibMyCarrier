@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.5
 
 require (
-	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.4.1
+	github.com/MyCarrier-DevOps/goLibMyCarrier/github v1.5.0
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.4.1
 	github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator v1.4.1
 	github.com/jackc/pgx/v5 v5.11.0

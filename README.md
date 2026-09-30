@@ -119,6 +119,9 @@ schema API and the constructor that built it are gone, and the `slippy` module n
 requires `goLibMyCarrier/clickhouse`, `clickhousemigrator` or `clickhouse-go` (both modules
 stay in this repo). Full list in `slippy/CLAUDE.md`'s Breaking changes section.
 
+`slippy` v1.5.0 requires `github` v1.5.0, so a consumer that bumps only `slippy` also gets the
+`github` release whose `NewGraphQLClient` never puts the configured private key in an error.
+
 | What changed | Migration |
 |---|---|
 | `NewClient(Config)` — **removed** | Build the store and inject it: `store, err := slippy.NewPostgresStore(pool, pipelineConfig, logger)` (check `err`), then `slippy.NewClientWithDependencies(store, githubClient, config)`. |
