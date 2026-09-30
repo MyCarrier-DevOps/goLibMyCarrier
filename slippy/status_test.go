@@ -1,13 +1,22 @@
 package slippy
 
 import (
+	"cmp"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strings"
 	"testing"
+
+	"github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator"
 )
 
 func TestSlipStatus_String(t *testing.T) {
@@ -251,10 +260,102 @@ func TestPrereqStatus_String(t *testing.T) {
 	}
 }
 
+// releasedCoreMigrationDigests pins the SHA-256 of the UpSQL of every core migration a slippy
+// release has shipped: v1-v6, all in slippy/v1.4.4. postgresmigrator applies only the versions
+// above the one a database has recorded, and records no checksum of what it applied
+// (postgresmigrator/migrator.go: migrateUp, createSchemaVersionTable), so an edit to a released
+// migration never reaches an existing database. When a release ships a new version, add its
+// digest here.
+var releasedCoreMigrationDigests = map[int]string{
+	1: "ea682143a72f8e0d50f913a2a41981ff3ced61a4ea9015c68fde68911397ceb8",
+	2: "3e75311460b0c5f48a1cd0759898da5a5aad679308d82cdcac32eda44131fccc",
+	3: "2d289713ceaf60ff2e24d42b7406ffcc99b6c1ad84031e8cf7b5b74503711282",
+	4: "31b244dee1d9db9ae85717733802c39adbd082695d8fdf80323592489409809a",
+	5: "2dd7c4b1377dad00a0036efe93e4bc483450a87fcfabcf73fcbe76a353ea18c5",
+	6: "e7e57697d520e5b397d1bd235c01e4a0532279cb14fb8fd4c15ff9304c179008",
+}
+
+// TestReleasedCoreMigrationsAreImmutable fails when a released core migration's UpSQL changes or
+// the migration disappears. Appending a status to v1's CHECK list is the edit it exists to stop:
+// the DOMAIN tests below would pass it, yet no existing database runs v1 again, so every one of
+// them would reject the new status with SQLSTATE 23514.
+func TestReleasedCoreMigrationsAreImmutable(t *testing.T) {
+	migrations := NewPostgresDynamicMigrationManager(testPipelineConfig(), nil).GenerateMigrations()
+	for _, problem := range releasedMigrationDrift(migrations, releasedCoreMigrationDigests) {
+		t.Error(problem)
+	}
+}
+
+// TestReleasedMigrationDrift pins releasedMigrationDrift itself: the real migrations only ever
+// take its passing path.
+func TestReleasedMigrationDrift(t *testing.T) {
+	released := NewPostgresDynamicMigrationManager(testPipelineConfig(), nil).GenerateMigrations()
+	editedV1 := slices.Clone(released)
+	editedV1[0].UpSQL = strings.Replace(editedV1[0].UpSQL, "'promoted'", "'promoted','queued'", 1)
+	withV7 := append(slices.Clone(released), postgresmigrator.Migration{Version: 7, UpSQL: "SELECT 1"})
+	withoutV3 := slices.DeleteFunc(slices.Clone(released), func(m postgresmigrator.Migration) bool {
+		return m.Version == 3
+	})
+
+	cases := []struct {
+		name       string
+		migrations []postgresmigrator.Migration
+		want       []string // one substring per expected problem, in version order
+	}{
+		{"the released migrations as they are", released, nil},
+		{"an unreleased v7 is not pinned", withV7, nil},
+		{"a status appended to v1's CHECK", editedV1,
+			[]string{"migration v1 is released and immutable, so add a new version instead of editing it"}},
+		{"v3 removed", withoutV3,
+			[]string{"migration v3 is released and immutable, but GenerateMigrations no longer returns it"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			problems := releasedMigrationDrift(tc.migrations, releasedCoreMigrationDigests)
+			if len(problems) != len(tc.want) {
+				t.Fatalf("got %d problems %q, want %d", len(problems), problems, len(tc.want))
+			}
+			for i, want := range tc.want {
+				if !strings.Contains(problems[i], want) {
+					t.Errorf("problem %d = %q, want it to contain %q", i, problems[i], want)
+				}
+			}
+		})
+	}
+}
+
+// releasedMigrationDrift returns one message, in version order, for each released version (a
+// key of golden) whose migration is missing from migrations or whose UpSQL no longer has the
+// golden SHA-256.
+func releasedMigrationDrift(migrations []postgresmigrator.Migration, golden map[int]string) []string {
+	byVersion := make(map[int]postgresmigrator.Migration, len(migrations))
+	for _, mig := range migrations {
+		byVersion[mig.Version] = mig
+	}
+	var problems []string
+	for _, version := range slices.Sorted(maps.Keys(golden)) {
+		mig, ok := byVersion[version]
+		if !ok {
+			problems = append(problems, fmt.Sprintf(
+				"migration v%d is released and immutable, but GenerateMigrations no longer returns it: restore it",
+				version))
+			continue
+		}
+		sum := sha256.Sum256([]byte(mig.UpSQL))
+		if got := hex.EncodeToString(sum[:]); got != golden[version] {
+			problems = append(problems, fmt.Sprintf(
+				"migration v%d is released and immutable, so add a new version instead of editing it "+
+					"(for a status change, one that ALTERs the DOMAIN): its UpSQL sha256 is %s, want %s",
+				version, got, golden[version]))
+		}
+	}
+	return problems
+}
+
 // TestAllSlipStatusesInEnum verifies that the SlipStatus constants in status.go and the values
-// the slip_status DOMAIN admits (postgres_migrations.go, migration v1) are the same set, so
-// neither can gain or lose a status without the other. It discovers both sides rather than
-// listing them, so adding a status to only one of the two files fails here.
+// the slip_status DOMAIN admits once every core migration has run are the same set, so neither
+// can gain or lose a status without the other. It discovers both sides rather than listing them,
+// so adding a status to only one side fails here.
 func TestAllSlipStatusesInEnum(t *testing.T) {
 	assertStatusConstantsMatchDomain(t, "SlipStatus", "slip_status")
 }
@@ -265,7 +366,7 @@ func TestAllStepStatusesInEnum(t *testing.T) {
 }
 
 // assertStatusConstantsMatchDomain compares the typeName constants declared in status.go with
-// the values in the named DOMAIN's CHECK (VALUE IN (...)) list in migration v1's UpSQL.
+// the values the named DOMAIN admits after the latest core migration (domainCheckValues).
 func assertStatusConstantsMatchDomain(t *testing.T, typeName, domain string) {
 	t.Helper()
 	_, filename, _, _ := runtime.Caller(0)
@@ -273,7 +374,11 @@ func assertStatusConstantsMatchDomain(t *testing.T, typeName, domain string) {
 	if len(discovered) == 0 {
 		t.Fatalf("no %s constants found in status.go - parsing may have failed", typeName)
 	}
-	domainValues := parseDomainValues(t, domain)
+	migrations := NewPostgresDynamicMigrationManager(testPipelineConfig(), nil).GenerateMigrations()
+	domainValues, err := domainCheckValues(migrations, domain)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	constByValue := make(map[string]string, len(discovered))
 	for name, value := range discovered {
@@ -281,7 +386,10 @@ func assertStatusConstantsMatchDomain(t *testing.T, typeName, domain string) {
 	}
 	for value, name := range constByValue {
 		if _, ok := domainValues[value]; !ok {
-			t.Errorf("%s constant %s = %q is missing from the %s DOMAIN in postgres_migrations.go",
+			t.Errorf("%[1]s constant %[2]s = %[3]q is not admitted by the %[4]s DOMAIN after the latest "+
+				"migration in postgres_migrations.go. Released migrations are immutable, so add a new migration "+
+				"that redefines the DOMAIN's CHECK: ALTER DOMAIN %[4]s DROP CONSTRAINT <name> (v1 named it "+
+				"%[4]s_check), then ALTER DOMAIN %[4]s ADD CONSTRAINT <name> CHECK (VALUE IN (...))",
 				typeName, name, value, domain)
 		}
 	}
@@ -292,27 +400,219 @@ func assertStatusConstantsMatchDomain(t *testing.T, typeName, domain string) {
 	}
 }
 
-// parseDomainValues returns the quoted values of `CREATE DOMAIN <domain> AS text CHECK (VALUE IN
-// (...))` in migration v1's UpSQL. It fails the test when the DOMAIN is absent or lists a value twice.
-func parseDomainValues(t *testing.T, domain string) map[string]struct{} {
-	t.Helper()
-	up := NewPostgresDynamicMigrationManager(testPipelineConfig(), nil).enumsMigration().UpSQL
-	block := regexp.MustCompile(`(?s)CREATE DOMAIN ` + regexp.QuoteMeta(domain) +
-		`\s+AS\s+text\s+CHECK\s*\(\s*VALUE\s+IN\s*\(([^)]*)\)\s*\)`).FindStringSubmatch(up)
-	if block == nil {
-		t.Fatalf("could not find the %s DOMAIN in migration v1's UpSQL", domain)
+// TestDomainCheckValues pins how domainCheckValues follows a DOMAIN's CHECK across migrations,
+// including the redefinitions a later migration makes: the released migrations only ever take
+// its CREATE DOMAIN path.
+func TestDomainCheckValues(t *testing.T) {
+	const create = `DO $$ BEGIN
+		BEGIN CREATE DOMAIN slip_status AS text CHECK (VALUE IN ('pending','failed'));
+		EXCEPTION WHEN duplicate_object THEN NULL; END;
+		BEGIN CREATE DOMAIN step_status AS text CHECK (VALUE IN ('pending','running'));
+		EXCEPTION WHEN duplicate_object THEN NULL; END;
+	END $$;`
+	const redefine = `ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check;
+		ALTER DOMAIN slip_status ADD CONSTRAINT slip_status_check CHECK (VALUE IN ('pending','failed','queued'));`
+	migs := func(upSQL ...string) []postgresmigrator.Migration {
+		out := make([]postgresmigrator.Migration, 0, len(upSQL))
+		for i, sql := range upSQL {
+			out = append(out, postgresmigrator.Migration{Version: i + 1, UpSQL: sql})
+		}
+		return out
 	}
+
+	cases := []struct {
+		name       string
+		migrations []postgresmigrator.Migration
+		want       []string // the admitted values, sorted
+		wantErr    string
+	}{
+		{name: "the CREATE alone", migrations: migs(create), want: []string{"failed", "pending"}},
+		{name: "a later DROP then ADD redefines the CHECK", migrations: migs(create, redefine),
+			want: []string{"failed", "pending", "queued"}},
+		{
+			// Postgres keeps slip_status_check, which rejects 'queued', so the new value is not admitted.
+			name: "an ADD without a DROP keeps the old CHECK too",
+			migrations: migs(create, `ALTER DOMAIN slip_status
+				ADD CONSTRAINT slip_status_v2 CHECK (VALUE IN ('pending','failed','queued'));`),
+			want: []string{"failed", "pending"},
+		},
+		{name: "lower case and a schema qualifier are read", migrations: migs(create,
+			`alter domain public.slip_status drop constraint slip_status_check;
+			alter domain public.slip_status add constraint slip_status_v2 check (value in ('pending','queued'));`),
+			want: []string{"pending", "queued"}},
+		{name: "migrations are read in version order", migrations: []postgresmigrator.Migration{
+			{Version: 7, UpSQL: redefine}, {Version: 1, UpSQL: create},
+		}, want: []string{"failed", "pending", "queued"}},
+		{name: "another DOMAIN's statements are ignored", migrations: migs(create,
+			`ALTER DOMAIN step_status DROP CONSTRAINT step_status_check;`), want: []string{"failed", "pending"}},
+		{name: "DROP CONSTRAINT IF EXISTS of a name the DOMAIN lacks does nothing", migrations: migs(create,
+			`ALTER DOMAIN slip_status DROP CONSTRAINT IF EXISTS slip_status_v2;`), want: []string{"failed", "pending"}},
+		{name: "an unnamed ADD is refused", migrations: migs(create,
+			`ALTER DOMAIN slip_status ADD CHECK (VALUE IN ('pending'));`),
+			wantErr: "migration v2: ALTER DOMAIN slip_status: this test reads only ADD CONSTRAINT <name> CHECK"},
+		{name: "a DROP of a constraint the DOMAIN lacks is refused", migrations: migs(create,
+			`ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_v2;`),
+			wantErr: "drops constraint slip_status_v2, which it does not have"},
+		{name: "a second CREATE DOMAIN is refused", migrations: migs(create, create),
+			wantErr: "migration v2: CREATE DOMAIN slip_status runs again"},
+		{name: "dropping every CHECK is refused", migrations: migs(create,
+			`ALTER DOMAIN slip_status DROP CONSTRAINT slip_status_check;`),
+			wantErr: "the slip_status DOMAIN has no CHECK (VALUE IN (...)) left"},
+		{name: "no CREATE is refused", migrations: migs(`SELECT 1`),
+			wantErr: "no migration creates the slip_status DOMAIN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := domainCheckValues(tc.migrations, "slip_status")
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if values := slices.Sorted(maps.Keys(got)); !slices.Equal(values, tc.want) {
+				t.Errorf("admitted values = %q, want %q", values, tc.want)
+			}
+		})
+	}
+}
+
+// domainStatementRE finds each CREATE DOMAIN and ALTER DOMAIN statement: group 1 is the verb,
+// group 2 the DOMAIN's name without its schema qualifier.
+var domainStatementRE = regexp.MustCompile(`(?i)\b(CREATE|ALTER)\s+DOMAIN\s+(?:\w+\.)?(\w+)`)
+
+// The statement forms domainCheckValues reads, each anchored at the end of a domainStatementRE
+// match. A CHECK is always VALUE IN (a list of quoted values).
+var (
+	domainCreateCheckRE = regexp.MustCompile(
+		`(?is)^\s+AS\s+text\s+(?:CONSTRAINT\s+(\w+)\s+)?CHECK\s*\(\s*VALUE\s+IN\s*\(([^)]*)\)\s*\)`)
+	domainAddCheckRE = regexp.MustCompile(
+		`(?is)^\s+ADD\s+CONSTRAINT\s+(\w+)\s+CHECK\s*\(\s*VALUE\s+IN\s*\(([^)]*)\)\s*\)`)
+	domainDropConstraintRE = regexp.MustCompile(`(?is)^\s+DROP\s+CONSTRAINT\s+(IF\s+EXISTS\s+)?(\w+)`)
+)
+
+// domainCheckValues returns the values the named text DOMAIN admits once migrations have run in
+// version order. A value must pass every CHECK the DOMAIN still has: the one its CREATE DOMAIN
+// defines (Postgres names an unnamed one <domain>_check), plus each later ALTER DOMAIN ... ADD
+// CONSTRAINT <name> CHECK (VALUE IN (...)), less each ALTER DOMAIN ... DROP CONSTRAINT <name>.
+// Postgres has no ALTER DOMAIN that replaces a CHECK in place, and an ADD without a DROP keeps the
+// old CHECK, which still rejects every value it does not list. Any other statement on the DOMAIN
+// is an error, so a migration this cannot read fails the test instead of being skipped.
+func domainCheckValues(migrations []postgresmigrator.Migration, domain string) (map[string]struct{}, error) {
+	ordered := slices.Clone(migrations)
+	slices.SortFunc(ordered, func(a, b postgresmigrator.Migration) int { return cmp.Compare(a.Version, b.Version) })
+
+	var checks map[string]map[string]struct{} // CHECK name -> the values it admits; nil until the CREATE
+	for _, mig := range ordered {
+		for _, loc := range domainStatementRE.FindAllStringSubmatchIndex(mig.UpSQL, -1) {
+			if !strings.EqualFold(mig.UpSQL[loc[4]:loc[5]], domain) {
+				continue
+			}
+			rest := mig.UpSQL[loc[1]:]
+			var err error
+			if strings.EqualFold(mig.UpSQL[loc[2]:loc[3]], "CREATE") {
+				checks, err = createDomainChecks(checks, rest, domain)
+			} else {
+				err = alterDomainChecks(checks, rest, domain)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("migration v%d: %w", mig.Version, err)
+			}
+		}
+	}
+	if checks == nil {
+		return nil, fmt.Errorf("no migration creates the %s DOMAIN", domain)
+	}
+	if len(checks) == 0 {
+		return nil, fmt.Errorf("after the latest migration the %s DOMAIN has no CHECK (VALUE IN (...)) left", domain)
+	}
+	var admitted map[string]struct{}
+	for _, values := range checks {
+		if admitted == nil {
+			admitted = maps.Clone(values)
+			continue
+		}
+		maps.DeleteFunc(admitted, func(value string, _ struct{}) bool {
+			_, ok := values[value]
+			return !ok
+		})
+	}
+	return admitted, nil
+}
+
+// createDomainChecks returns the CHECK set a CREATE DOMAIN statement defines; rest is the text
+// after the DOMAIN's name.
+func createDomainChecks(checks map[string]map[string]struct{}, rest, domain string) (
+	map[string]map[string]struct{}, error,
+) {
+	if checks != nil {
+		// v1 swallows duplicate_object: on a database that has the DOMAIN, a CREATE changes nothing.
+		return nil, fmt.Errorf("CREATE DOMAIN %s runs again, which changes nothing on a database that has it; "+
+			"redefine its CHECK with ALTER DOMAIN", domain)
+	}
+	m := domainCreateCheckRE.FindStringSubmatch(rest)
+	if m == nil {
+		return nil, fmt.Errorf("CREATE DOMAIN %s is not AS text CHECK (VALUE IN (...))", domain)
+	}
+	name := m[1]
+	if name == "" {
+		name = domain + "_check" // the name Postgres gives a DOMAIN's unnamed CHECK
+	}
+	values, err := quotedValues(m[2], domain)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]map[string]struct{}{strings.ToLower(name): values}, nil
+}
+
+// alterDomainChecks applies an ALTER DOMAIN statement to checks; rest is the text after the
+// DOMAIN's name.
+func alterDomainChecks(checks map[string]map[string]struct{}, rest, domain string) error {
+	if checks == nil {
+		return fmt.Errorf("ALTER DOMAIN %s runs before any migration creates it", domain)
+	}
+	if m := domainAddCheckRE.FindStringSubmatch(rest); m != nil {
+		name := strings.ToLower(m[1])
+		if _, dup := checks[name]; dup {
+			return fmt.Errorf("ALTER DOMAIN %s adds constraint %s, which it already has", domain, name)
+		}
+		values, err := quotedValues(m[2], domain)
+		if err != nil {
+			return err
+		}
+		checks[name] = values
+		return nil
+	}
+	if m := domainDropConstraintRE.FindStringSubmatch(rest); m != nil {
+		name := strings.ToLower(m[2])
+		if _, ok := checks[name]; !ok && m[1] == "" {
+			return fmt.Errorf("ALTER DOMAIN %s drops constraint %s, which it does not have", domain, name)
+		}
+		delete(checks, name)
+		return nil
+	}
+	statement := strings.TrimSpace(strings.SplitN(rest, ";", 2)[0])
+	return fmt.Errorf("ALTER DOMAIN %s: this test reads only ADD CONSTRAINT <name> CHECK (VALUE IN (...)) "+
+		"and DROP CONSTRAINT <name>, not %q", domain, statement)
+}
+
+// quotedValues returns the quoted values of a CHECK (VALUE IN (...)) list. A value listed twice,
+// or no value at all, is an error.
+func quotedValues(list, domain string) (map[string]struct{}, error) {
 	values := make(map[string]struct{})
-	for _, m := range regexp.MustCompile(`'([^']+)'`).FindAllStringSubmatch(block[1], -1) {
+	for _, m := range regexp.MustCompile(`'([^']+)'`).FindAllStringSubmatch(list, -1) {
 		if _, dup := values[m[1]]; dup {
-			t.Errorf("the %s DOMAIN lists %q twice", domain, m[1])
+			return nil, fmt.Errorf("a CHECK on the %s DOMAIN lists %q twice", domain, m[1])
 		}
 		values[m[1]] = struct{}{}
 	}
 	if len(values) == 0 {
-		t.Fatalf("the %s DOMAIN lists no values - parsing may have failed", domain)
+		return nil, fmt.Errorf("a CHECK on the %s DOMAIN lists no values - parsing may have failed", domain)
 	}
-	return values
+	return values, nil
 }
 
 // parseStatusConstants parses status.go and extracts all constants of the given type.
