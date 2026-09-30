@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -317,6 +318,55 @@ func assertNoEcho(t *testing.T, msg, value string) {
 			return
 		}
 	}
+}
+
+// TestNewGraphQLClient_ValueThatCannotBeAPathIsNotRead pins that a value that is not PEM content
+// is not read as a key file path when it has a line break or is longer than 1024 bytes
+// (loadPrivateKey's maxKeyPathLen). os.ReadFile would hand it to openat(2) as the pathname, and
+// both are shapes key material arrives in. A real, readable file behind such a name is not read
+// either, and the error still carries only the hint and the value's length.
+func TestNewGraphQLClient_ValueThatCannotBeAPathIsNotRead(t *testing.T) {
+	const limit = 1024 // loadPrivateKey's maxKeyPathLen
+	const notAPath = ": not a file path (contains a line break or is too long)"
+	validPEM := testPrivateKey(t)
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "private-key.pem")
+	require.NoError(t, os.WriteFile(keyFile, []byte(validPEM), 0o600))
+	lineBreakName := filepath.Join(dir, "private\nkey.pem")
+	require.NoError(t, os.WriteFile(lineBreakName, []byte(validPEM), 0o600))
+	block, _ := pem.Decode([]byte(validPEM))
+	require.NotNil(t, block)
+
+	tests := []struct {
+		name       string
+		privateKey string
+	}{
+		{"a real key file whose name contains a line break", lineBreakName},
+		{"a real key file path with a trailing newline", keyFile + "\n"},
+		{"a real key file path with a trailing CRLF", keyFile + "\r\n"},
+		{"the base64 of a key's DER body on one line", base64.StdEncoding.EncodeToString(block.Bytes)},
+		{"one line of 1025 bytes", "/" + strings.Repeat("k", limit)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := NewGraphQLClient(GraphQLConfig{AppID: 12345, PrivateKey: tt.privateKey}, nil)
+			require.Error(t, err)
+			assert.Nil(t, client)
+			assert.Equal(t, fmt.Sprintf("%s (value length %d)%s", privateKeyHint, len(tt.privateKey), notAPath),
+				err.Error())
+			assertNoEcho(t, err.Error(), tt.privateKey)
+		})
+	}
+
+	t.Run("one line of exactly 1024 bytes is still read as a path", func(t *testing.T) {
+		value := "/" + strings.Repeat("k", limit-1)
+		_, err := NewGraphQLClient(GraphQLConfig{AppID: 12345, PrivateKey: value}, nil)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), notAPath)
+		var errno syscall.Errno
+		assert.True(t, errors.As(err, &errno), "the read's errno is kept, so the value reached os.ReadFile: %v", err)
+		assertNoEcho(t, err.Error(), value)
+	})
 }
 
 func TestNewGraphQLClient_WithEnterpriseURL(t *testing.T) {

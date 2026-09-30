@@ -22,7 +22,8 @@ type Installation = gh.Installation
 // NewGitHubClient creates a new GitHub client with App authentication.
 // The private key can be provided as PEM content (starts with "-----BEGIN",
 // after any leading spaces, tabs, line breaks or byte order mark) or as the
-// path of a file holding such content.
+// path of a file holding such content. A value with a line break, or longer
+// than 1024 bytes, is never read as a path.
 //
 // This function wraps github.NewGraphQLClient for backward compatibility.
 func NewGitHubClient(cfg GitHubConfig, logger Logger) (*GitHubClient, error) {

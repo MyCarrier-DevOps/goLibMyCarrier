@@ -86,7 +86,8 @@ type Installation struct {
 // The private key can be provided as PEM content (starts with "-----BEGIN",
 // after any leading spaces, tabs, line breaks or byte order mark, which are
 // dropped) or as the path of a file holding it (the file's leading run is
-// dropped the same way). No error it returns contains the configured key value.
+// dropped the same way). A value with a line break, or longer than 1024 bytes,
+// is never read as a path. No error it returns contains the configured key value.
 func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, error) {
 	if log == nil {
 		log = &logger.NopLogger{}
@@ -128,10 +129,20 @@ func trimPEMLeader(pemText string) string {
 	return strings.TrimLeft(pemText, pemLeader)
 }
 
+// maxKeyPathLen is the longest value loadPrivateKey reads as a file path. It is above
+// any realistic mount path, and below the shortest single-line encoding of a 2048-bit
+// RSA key (1,588 bytes: the base64 of its PKCS #1 body).
+const maxKeyPathLen = 1024
+
 // loadPrivateKey returns the key when value is PEM content, whose first byte after
 // any pemLeader run is '-', and otherwise the contents of the file value names.
 // PEM content and the file's contents lose that leading run (trimPEMLeader). The
 // rest of the key, and a file path, are used exactly as given.
+//
+// A value that is not PEM content is read only when it has no line break and is at
+// most maxKeyPathLen bytes. A realistic key file path has neither, and both are shapes
+// key material arrives in (a PEM behind other text, a key's base64 on one line), so such
+// a value never reaches the filesystem, where it would be the pathname openat(2) receives.
 //
 // Its errors never contain value. A value that fails PEM detection may still be
 // key material (base64, or a PEM behind other text), so a failed read reports the
@@ -145,11 +156,14 @@ func loadPrivateKey(value string) ([]byte, error) {
 	if strings.HasPrefix(content, "-") {
 		return []byte(content), nil
 	}
+	msg := fmt.Sprintf("%s (value length %d)", privateKeyHint, len(value))
+	if strings.ContainsAny(value, "\r\n") || len(value) > maxKeyPathLen {
+		return nil, errors.New(msg + ": not a file path (contains a line break or is too long)")
+	}
 	key, err := os.ReadFile(value)
 	if err == nil {
 		return []byte(trimPEMLeader(string(key))), nil
 	}
-	msg := fmt.Sprintf("%s (value length %d)", privateKeyHint, len(value))
 	var pathErr *fs.PathError
 	if !errors.As(err, &pathErr) {
 		// os.ReadFile reports every failure as an *fs.PathError; anything else is
