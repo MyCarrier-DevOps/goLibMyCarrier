@@ -2,6 +2,7 @@ package argocdclient
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -269,6 +270,8 @@ type rolloutServer struct {
 	treeBody       string
 	resourceStatus int
 	resourceBody   string // when empty the recorded resource-<name>-<state> fixture is served
+	// missing lists Rollouts whose live read answers 404, as for a stale resource tree.
+	missing map[string]bool
 }
 
 func newRolloutServer(t *testing.T, state string) *rolloutServer {
@@ -290,6 +293,11 @@ func newRolloutServer(t *testing.T, state string) *rolloutServer {
 			w.WriteHeader(s.treeStatus)
 			_, _ = w.Write([]byte(s.treeBody))
 		case strings.HasSuffix(r.URL.Path, "/resource"):
+			if s.missing[r.URL.Query().Get("resourceName")] {
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"code":5,"message":"not found"}`))
+				return
+			}
 			body := s.resourceBody
 			if body == "" {
 				body = readFixture(t, "resource-"+r.URL.Query().Get("resourceName")+"-"+state+".json")
@@ -478,5 +486,80 @@ func TestListRolloutGroup_EmptyCorrelationID(t *testing.T) {
 	}
 	if n := len(srv.recorded()); n != 0 {
 		t.Errorf("expected no HTTP calls, got %d", n)
+	}
+}
+
+// withUnmanagedRollout appends to the recorded tree a Rollout node without a uid, as ArgoCD
+// adds for a managed Rollout that has no live object.
+func withUnmanagedRollout(t *testing.T, tree, name string) string {
+	t.Helper()
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(tree), &parsed); err != nil {
+		t.Fatalf("decode tree: %v", err)
+	}
+	nodes, _ := parsed["nodes"].([]any)
+	parsed["nodes"] = append(nodes, map[string]any{
+		"group": "argoproj.io", "version": "v1alpha1", "kind": "Rollout", "namespace": fixtureNamespace, "name": name,
+	})
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		t.Fatalf("encode tree: %v", err)
+	}
+	return string(out)
+}
+
+func TestListRolloutGroup_SkipsRolloutWithoutLiveObject(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, s *rolloutServer)
+		wantGet map[string]bool // live reads expected, by Rollout name
+	}{
+		{"node without uid", func(t *testing.T, s *rolloutServer) {
+			s.treeBody = withUnmanagedRollout(t, s.treeBody, "rt-ghost")
+		}, map[string]bool{"rt-api": true, "rt-worker": true, "rt-other": true}},
+		{"live read answers 404", func(_ *testing.T, s *rolloutServer) {
+			s.missing = map[string]bool{"rt-worker": true}
+		}, map[string]bool{"rt-api": true, "rt-worker": true, "rt-other": true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newRolloutServer(t, "suspended")
+			tt.prepare(t, srv)
+
+			got, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, fixtureGroupA)
+			if err != nil {
+				t.Fatalf("ListRolloutGroup: %v", err)
+			}
+
+			var names []string
+			for _, s := range got {
+				names = append(names, s.Ref.Name)
+			}
+			want := []string{"rt-api", "rt-worker"}
+			if tt.name == "live read answers 404" {
+				want = []string{"rt-api"}
+			}
+			if !reflect.DeepEqual(names, want) {
+				t.Errorf("rollouts = %v, want %v", names, want)
+			}
+			read := map[string]bool{}
+			for _, r := range srv.recorded()[1:] {
+				read[r.Query.Get("resourceName")] = true
+			}
+			if !reflect.DeepEqual(read, tt.wantGet) {
+				t.Errorf("live reads = %v, want %v", read, tt.wantGet)
+			}
+		})
+	}
+}
+
+func TestListRolloutGroup_LivePermissionDeniedFailsTheCall(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	srv.resourceStatus, srv.resourceBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
+
+	_, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, fixtureGroupA)
+
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("expected ErrPermissionDenied, got %v", err)
 	}
 }
