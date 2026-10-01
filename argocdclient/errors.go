@@ -14,9 +14,9 @@ const notFoundInApplication = "not found as part of application"
 var (
 	// ErrPermissionDenied matches an HTTP 403 answer. ArgoCD answers 403, not 404,
 	// for an Application that does not exist (this client never sends a project),
-	// so a 403 can mean a missing permission or a missing Application. For
-	// GetApplication and GetApplicationWithContext it can also mean ArgoCD failed
-	// to read the Application, and that 403 is not retried.
+	// so a 403 can mean a missing permission, a missing Application, or ArgoCD
+	// failing to read the Application; that last one is an ArgoCD-side failure,
+	// usually transient, and is not retried.
 	ErrPermissionDenied = errors.New("argocd: permission denied")
 
 	// ErrNotFound matches an HTTP 404 answer, and the HTTP 400 answer ArgoCD
