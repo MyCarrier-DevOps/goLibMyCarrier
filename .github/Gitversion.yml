@@ -1,15 +1,3 @@
-# DEVOPS-343 removes exported slippy API (NewClient, the ClickHouse slip store and its
-# schema API, and Config's ClickHouse fields), and main's increment is Patch, so without a
-# floor it would land on consumers pinned to v1.4.x as a patch bump with no signal. Every
-# module in this repo releases at one shared version, so 1.5.0 is the right floor.
-#
-# REMOVE THIS FLOOR (delete next-version, and ConfiguredNextVersion with it) ONCE v1.5.0 IS
-# TAGGED ON MAIN. After that tag it does nothing: GitVersion takes the highest candidate, and
-# main's Patch increment gives 1.5.1 with or without it. It does not protect the next breaking
-# change; for that, restore the floor (next-version and the ConfiguredNextVersion strategy), or
-# put "+semver: minor" in that commit's message.
-next-version: 1.5.0
-
 assembly-versioning-scheme: MajorMinorPatch
 assembly-file-versioning-scheme: MajorMinorPatchTag
 commit-date-format: yyyy-MM-dd
