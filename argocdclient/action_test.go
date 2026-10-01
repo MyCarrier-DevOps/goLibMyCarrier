@@ -253,6 +253,13 @@ func TestRunResourceAction_PostIsNeverRetried(t *testing.T) {
 	}
 }
 
+// withRef returns a copy of testRolloutRef modified by change.
+func withRef(change func(*ResourceRef)) ResourceRef {
+	ref := testRolloutRef
+	change(&ref)
+	return ref
+}
+
 func TestRunResourceAction_Validation(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -263,6 +270,15 @@ func TestRunResourceAction_Validation(t *testing.T) {
 		{"empty kind", ResourceRef{Version: "v1alpha1", Name: "x"}, ActionAbort},
 		{"empty version", ResourceRef{Kind: "Rollout", Name: "x"}, ActionAbort},
 		{"empty action", testRolloutRef, ""},
+		{
+			"kind other than Rollout",
+			withRef(func(r *ResourceRef) { r.Group, r.Kind = "apps", "Deployment" }),
+			ActionAbort,
+		},
+		{"group other than argoproj.io", withRef(func(r *ResourceRef) { r.Group = "apps" }), ActionAbort},
+		{"empty group", withRef(func(r *ResourceRef) { r.Group = "" }), ActionAbort},
+		{"restart is not a rollout action", testRolloutRef, ResourceAction("restart")},
+		{"skip-current-step is not offered", testRolloutRef, ResourceAction("skip-current-step")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -275,6 +291,17 @@ func TestRunResourceAction_Validation(t *testing.T) {
 				t.Errorf("expected no HTTP calls, got %d", n)
 			}
 		})
+	}
+}
+
+func TestRunResourceAction_EmptyApplicationName(t *testing.T) {
+	f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
+
+	if err := f.client().runResourceAction(context.Background(), "", testRolloutRef, ActionAbort); err == nil {
+		t.Fatal("expected error for empty application name")
+	}
+	if n := len(f.recorded()); n != 0 {
+		t.Errorf("expected no HTTP calls, got %d", n)
 	}
 }
 
