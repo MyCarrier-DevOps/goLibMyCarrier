@@ -437,8 +437,9 @@ Repeat-safe means a repeat never changes the Rollout, not that it always succeed
 
 ### Request flow
 
-1. `ref.Name`, `ref.Kind`, `ref.Version` and the action must be non-empty, otherwise an
-   error is returned without any HTTP call.
+1. An empty `appName`, `ref.Name` or `ref.Version`, a `ref` that is not an `argoproj.io`
+   `Rollout`, or an action other than the four above returns an error (not wrapping
+   `ErrConflict`) without any HTTP call.
 2. The action is checked against ArgoCD's action discovery
    (`GET /api/v1/applications/{name}/resource/actions`). ArgoCD does not enforce an
    action's `disabled` flag when running it, so an action that is absent or disabled
