@@ -439,9 +439,9 @@ func TestListRolloutGroup_Errors(t *testing.T) {
 		{"tree permission denied", func(t *testing.T, s *rolloutServer) {
 			s.treeStatus, s.treeBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
 		}, ErrPermissionDenied},
-		{"live resource not found in application", func(t *testing.T, s *rolloutServer) {
-			s.resourceStatus, s.resourceBody = http.StatusBadRequest, readFixture(t, "error-resource-not-found.json")
-		}, ErrNotFound},
+		{"live resource permission denied", func(t *testing.T, s *rolloutServer) {
+			s.resourceStatus, s.resourceBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
+		}, ErrPermissionDenied},
 		{"malformed tree", func(_ *testing.T, s *rolloutServer) { s.treeBody = "not json" }, nil},
 		{"malformed envelope", func(_ *testing.T, s *rolloutServer) { s.resourceBody = "not json" }, nil},
 		{
@@ -469,7 +469,7 @@ func TestListRolloutGroup_Errors(t *testing.T) {
 
 func TestListRolloutGroup_LiveFailureNamesTheRollout(t *testing.T) {
 	srv := newRolloutServer(t, "suspended")
-	srv.resourceStatus, srv.resourceBody = http.StatusBadRequest, readFixture(t, "error-resource-not-found.json")
+	srv.resourceStatus, srv.resourceBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
 
 	_, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, fixtureGroupA)
 
@@ -517,6 +517,9 @@ func TestListRolloutGroup_SkipsRolloutWithoutLiveObject(t *testing.T) {
 		{"node without uid", func(t *testing.T, s *rolloutServer) {
 			s.treeBody = withUnmanagedRollout(t, s.treeBody, "rt-ghost")
 		}, map[string]bool{"rt-api": true, "rt-worker": true, "rt-other": true}},
+		{"live read answers 400 not found as part of application", func(t *testing.T, s *rolloutServer) {
+			s.resourceStatus, s.resourceBody = http.StatusBadRequest, readFixture(t, "error-resource-not-found.json")
+		}, map[string]bool{"rt-api": true, "rt-worker": true, "rt-other": true}},
 		{"live read answers 404", func(_ *testing.T, s *rolloutServer) {
 			s.missing = map[string]bool{"rt-worker": true}
 		}, map[string]bool{"rt-api": true, "rt-worker": true, "rt-other": true}},
@@ -536,8 +539,11 @@ func TestListRolloutGroup_SkipsRolloutWithoutLiveObject(t *testing.T) {
 				names = append(names, s.Ref.Name)
 			}
 			want := []string{"rt-api", "rt-worker"}
-			if tt.name == "live read answers 404" {
+			switch tt.name {
+			case "live read answers 404":
 				want = []string{"rt-api"}
+			case "live read answers 400 not found as part of application":
+				want = nil
 			}
 			if !reflect.DeepEqual(names, want) {
 				t.Errorf("rollouts = %v, want %v", names, want)
