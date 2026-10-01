@@ -313,12 +313,14 @@ The call works in these steps:
    then name. When none match, the result is an empty, non-nil slice and the error is
    `nil`.
 
-Failures of the resource tree and live reads that are not retried wrap `*APIError`, so
-`errors.As` gives the status and body and `errors.Is` reaches `ErrPermissionDenied`. A
-missing Application surfaces as `ErrPermissionDenied` (HTTP 403), because ArgoCD answers 403
-for an Application that does not exist when no project is sent. A live-read error names the
-Rollout (`<namespace>/<name>`). Retried statuses return the untyped give-up error described in
-[Error Handling](#error-handling).
+HTTP answers of 400 or above from the resource tree and live reads that are not retried wrap
+`*APIError`, so `errors.As` gives the status and body and `errors.Is` reaches
+`ErrPermissionDenied`. A missing Application surfaces as `ErrPermissionDenied` (HTTP 403),
+because ArgoCD answers 403 for an Application that does not exist when no project is sent. A
+live-read error names the Rollout (`<namespace>/<name>`). Retried statuses return the untyped
+give-up error described in [Error Handling](#error-handling). Decode errors, transport errors
+the retry client does not retry (such as TLS verification failures) and context cancellation
+are returned wrapped as-is.
 
 ### RolloutStatus
 
