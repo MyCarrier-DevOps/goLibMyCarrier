@@ -499,7 +499,7 @@ An HTTP answer with a status of 400 or above that is not retried is returned as
 `*APIError`: any status on an action POST, and on GETs every 4xx except 429, plus 501.
 A GET still answered with 429, or with a status of 500 or above other than 501, after its
 retries returns the retry client's `giving up after N attempt(s)` error instead: an untyped
-error with no body, whose text names the status only for statuses of 500 and above.
+error with no body whose text does not name the status.
 
 ```go
 type APIError struct {
