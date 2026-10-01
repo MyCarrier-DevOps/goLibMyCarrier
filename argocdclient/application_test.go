@@ -393,3 +393,31 @@ func containsHelper(s, substr string) bool {
 	}
 	return false
 }
+
+func TestGetApplicationWithContext_ForbiddenIsTypedAPIError(t *testing.T) {
+	const body = `{"code":7,"message":"permission denied"}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		if _, err := w.Write([]byte(body)); err != nil {
+			t.Fatalf("failed to write response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(&Config{ServerUrl: server.URL, AuthToken: "token"})
+	_, err := client.GetApplicationWithContext(context.Background(), "test-app")
+
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *APIError, got %T: %v", err, err)
+	}
+	if apiErr.StatusCode != http.StatusForbidden {
+		t.Errorf("expected status 403, got %d", apiErr.StatusCode)
+	}
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Error("expected errors.Is(err, ErrPermissionDenied)")
+	}
+	if want := "client error 403: " + body; err.Error() != want {
+		t.Errorf("expected error %q, got %q", want, err.Error())
+	}
+}
