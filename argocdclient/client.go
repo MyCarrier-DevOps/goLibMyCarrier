@@ -49,7 +49,10 @@ func (c *Client) applicationURL(appName string) string {
 
 // doGET performs an authenticated GET request against the ArgoCD API.
 // It sets Authorization and Content-Type headers, handles retries via the
-// retryable HTTP client, and returns *APIError for statuses of 400 and above.
+// retryable HTTP client, and returns *APIError for the statuses it does not retry:
+// every 4xx except 429, plus 501. A 429, or a status of 500 or above other than
+// 501, that is still returned after the retries are exhausted surfaces as the retry
+// client's untyped "giving up after N attempt(s)" error instead.
 // Returns the raw response body on success.
 //
 // The request honors ctx cancellation/deadline. ctx must be non-nil; callers
