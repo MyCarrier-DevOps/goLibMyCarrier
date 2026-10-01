@@ -488,8 +488,8 @@ honor it the same way.
 All GET requests (application data, manifests, resource tree, rollout group reads and
 action discovery) share one retry strategy:
 
-- **Maximum Retries**: 3 attempts
-- **Backoff Strategy**: Exponential backoff with delays of 1s, 2s, 4s
+- **Maximum Retries**: 3 retries, so 4 attempts in total
+- **Backoff Strategy**: Exponential backoff with delays of 1s, 2s, 4s between attempts. When ArgoCD answers 429 or 503 with a `Retry-After` header, the retry client waits for that long instead, without capping it at the 4s maximum
 - **Retry Conditions**: Network errors, HTTP 429, and HTTP 5xx server errors other than 501
 - **No Retry Conditions**: Other HTTP 4xx client errors (authentication, authorization, etc.) and HTTP 501
 
