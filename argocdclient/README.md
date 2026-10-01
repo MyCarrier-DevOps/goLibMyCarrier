@@ -347,14 +347,15 @@ the current step's `setWeight` (the desired weight), whereas `kubectl argo rollo
 ratio of available canary replicas. The precedence:
 
 1. The Rollout is aborted (`status.abort`): `0`.
-2. There is no current canary step, which means the Rollout has no canary steps or
+2. The Rollout has no canary strategy (for example blue-green): `0`.
+3. There is no current canary step, which means the canary strategy has no steps or
    `currentStepIndex` is past the last step (fully promoted): the max traffic weight,
    `spec.strategy.canary.trafficRouting.maxTrafficWeight`, default `100`. A traffic
    router such as Istio reports a canary weight of `0` after full promotion, so
    `status.canary.weights` is not used here.
-3. A traffic router is configured and `status.canary.weights` reports a canary weight:
+4. A traffic router is configured and `status.canary.weights` reports a canary weight:
    that weight.
-4. Otherwise: the last `setWeight` step at or before the current step (an unset
+5. Otherwise: the last `setWeight` step at or before the current step (an unset
    `currentStepIndex` counts as step `0`), or `0` when there is none.
 
 ```go
