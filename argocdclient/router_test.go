@@ -168,3 +168,30 @@ func TestRouter_ListRolloutGroup_FailsClosed(t *testing.T) {
 		t.Errorf("expected no HTTP calls, got %d", n)
 	}
 }
+
+func TestRouter_RunResourceAction_RefusesOutsideTheContract(t *testing.T) {
+	deployment := withRef(func(r *ResourceRef) { r.Group, r.Kind = "apps", "Deployment" })
+	tests := []struct {
+		name   string
+		app    string
+		ref    ResourceRef
+		action ResourceAction
+	}{
+		{"deployment restart", "mycarrier-frontend-dev", deployment, ResourceAction("restart")},
+		{"deployment abort", "mycarrier-frontend-dev", deployment, ActionAbort},
+		{"empty application name", "", testRolloutRef, ActionAbort},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dev := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
+			router := NewRouter(map[Instance]*Config{InstanceDev: {ServerUrl: dev.URL, AuthToken: "dev-token"}})
+
+			if err := router.RunResourceAction(context.Background(), tt.app, tt.ref, tt.action); err == nil {
+				t.Fatal("expected error")
+			}
+			if n := len(dev.recorded()); n != 0 {
+				t.Errorf("expected no HTTP calls, got %d", n)
+			}
+		})
+	}
+}
