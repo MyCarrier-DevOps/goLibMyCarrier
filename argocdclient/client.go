@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
@@ -39,6 +40,11 @@ func NewClient(config *Config) *Client {
 		baseUrl:         config.ServerUrl,
 		authToken:       config.AuthToken,
 	}
+}
+
+// applicationURL returns the API URL of the Application appName, path-escaped.
+func (c *Client) applicationURL(appName string) string {
+	return fmt.Sprintf("%s/api/v1/applications/%s", c.baseUrl, url.PathEscape(appName))
 }
 
 // doGET performs an authenticated GET request against the ArgoCD API.
