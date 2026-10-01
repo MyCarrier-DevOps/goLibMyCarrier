@@ -1,8 +1,12 @@
 package argocdclient
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
+	"sort"
 )
 
 // CorrelationIDLabel is the Rollout label that carries the pipeline correlation ID.
@@ -26,6 +30,17 @@ type ResourceRef struct {
 	Kind      string
 	Namespace string
 	Name      string
+}
+
+// query returns the query parameters ArgoCD's resource and action endpoints use to address ref.
+func (r ResourceRef) query() url.Values {
+	return url.Values{
+		"namespace":    {r.Namespace},
+		"resourceName": {r.Name},
+		"version":      {r.Version},
+		"group":        {r.Group},
+		"kind":         {r.Kind},
+	}
 }
 
 // HealthStatus is an ArgoCD health code, as reported on a resource-tree node.
@@ -206,4 +221,82 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 		CanaryWeight:       canaryWeight(live),
 		StepPluginStatuses: live.Status.Canary.StepPluginStatuses,
 	}
+}
+
+// decodeRolloutNodes returns the Argo Rollouts nodes of an ArgoCD resource-tree response.
+func decodeRolloutNodes(tree []byte) ([]resourceNode, error) {
+	var parsed struct {
+		Nodes []resourceNode `json:"nodes"`
+	}
+	if err := json.Unmarshal(tree, &parsed); err != nil {
+		return nil, fmt.Errorf("error decoding resource tree: %w", err)
+	}
+
+	var rollouts []resourceNode
+	for _, node := range parsed.Nodes {
+		if node.Group == rolloutGroup && node.Kind == rolloutKind {
+			rollouts = append(rollouts, node)
+		}
+	}
+	return rollouts, nil
+}
+
+// getLiveRollout reads the live manifest of the Rollout behind node.
+func (c *Client) getLiveRollout(ctx context.Context, appName string, node resourceNode) (liveRollout, error) {
+	ref := ResourceRef{
+		Group: node.Group, Version: node.Version, Kind: node.Kind, Namespace: node.Namespace, Name: node.Name,
+	}
+	body, err := c.doGET(ctx, c.applicationURL(appName)+"/resource?"+ref.query().Encode())
+	if err != nil {
+		return liveRollout{}, err
+	}
+
+	var envelope struct {
+		Manifest string `json:"manifest"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return liveRollout{}, fmt.Errorf("error decoding resource response: %w", err)
+	}
+	return decodeRollout(envelope.Manifest)
+}
+
+// ListRolloutGroup returns the status of every Argo Rollout in the Application appName whose
+// CorrelationIDLabel label equals correlationID, sorted by namespace and then name.
+//
+// The Rollouts come from the Application's resource tree; the label, phase, step index and
+// canary weight come from each Rollout's live manifest. An empty correlationID is an error, so
+// unlabeled Rollouts are never matched. A failure to read any live Rollout fails the call.
+// When no Rollout matches, the result is an empty, non-nil slice and the error is nil.
+func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error) {
+	if correlationID == "" {
+		return nil, errors.New("correlation id is required")
+	}
+
+	tree, err := c.doGET(ctx, c.applicationURL(appName)+"/resource-tree")
+	if err != nil {
+		return nil, fmt.Errorf("error reading resource tree of %s: %w", appName, err)
+	}
+	nodes, err := decodeRolloutNodes(tree)
+	if err != nil {
+		return nil, err
+	}
+
+	statuses := make([]RolloutStatus, 0, len(nodes))
+	for _, node := range nodes {
+		live, err := c.getLiveRollout(ctx, appName, node)
+		if err != nil {
+			return nil, fmt.Errorf("error reading rollout %s/%s: %w", node.Namespace, node.Name, err)
+		}
+		if live.Metadata.Labels[CorrelationIDLabel] == correlationID {
+			statuses = append(statuses, newRolloutStatus(node, live))
+		}
+	}
+
+	sort.Slice(statuses, func(i, j int) bool {
+		if statuses[i].Ref.Namespace != statuses[j].Ref.Namespace {
+			return statuses[i].Ref.Namespace < statuses[j].Ref.Namespace
+		}
+		return statuses[i].Ref.Name < statuses[j].Ref.Name
+	})
+	return statuses, nil
 }
