@@ -63,6 +63,10 @@ func (r *Router) ListRolloutGroup(ctx context.Context, appName, correlationID st
 // The action is checked against ArgoCD's action discovery first: an action the
 // resource does not offer returns an error wrapping ErrConflict. The action
 // itself is sent once and never retried.
+//
+// Only ActionAbort, ActionPromoteFull, ActionRetry and ActionResume are accepted, and only on
+// argoproj.io Rollouts. An empty appName, any other action and any other resource kind is refused
+// with an error before any HTTP call.
 func (r *Router) RunResourceAction(
 	ctx context.Context,
 	appName string,
