@@ -218,7 +218,8 @@ section above for details and the recommended usage pattern.
 - `type HealthStatus string`: ArgoCD health code (`HealthStatusHealthy`, `HealthStatusProgressing`, `HealthStatusSuspended`, `HealthStatusDegraded`, `HealthStatusMissing`, `HealthStatusUnknown`)
 - `type RolloutPhase string`: Argo Rollouts `status.phase` (`RolloutPhaseHealthy`, `RolloutPhaseProgressing`, `RolloutPhasePaused`, `RolloutPhaseDegraded`)
 - `type StepPluginPhase string`: step plugin phase (`StepPluginPhaseRunning`, `StepPluginPhaseSuccessful`, `StepPluginPhaseFailed`, `StepPluginPhaseError`)
-- `type StepPluginStatus struct{ Index int32; Name string; Phase StepPluginPhase; Message string }`: one entry of `status.canary.stepPluginStatuses`
+- `type StepPluginOperation string`: step plugin operation (`StepPluginOperationRun`, `StepPluginOperationTerminate`, `StepPluginOperationAbort`)
+- `type StepPluginStatus struct{ Index int32; Name string; Operation StepPluginOperation; Phase StepPluginPhase; Message string }`: one entry of `status.canary.stepPluginStatuses`
 - `type RolloutStatus struct{ ... }`: combined resource-tree and live state of one Rollout (see [Argo Rollouts](#argo-rollouts))
 - `(c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: Rollouts of an Application labeled with the correlation ID
 - `type ResourceAction string`: `ActionAbort`, `ActionPromoteFull`, `ActionRetry`, `ActionResume`
@@ -327,7 +328,11 @@ error names the Rollout (`<namespace>/<name>`).
 | `CurrentStepIndex` | live Rollout | `status.currentStepIndex`; `nil` when unset |
 | `Aborted` | live Rollout | `status.abort` |
 | `CanaryWeight` | live Rollout | Percentage of traffic on the canary, see below |
-| `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, phase, message) |
+| `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, operation, phase, message) |
+
+Argo Rollouts keeps one step plugin entry per step and operation: an abort or a full
+promotion adds an `Abort` or `Terminate` entry (same index and name) next to the step's
+`Run` entry. An empty `Phase` on a `Run` entry means the plugin is globally disabled.
 
 ### CanaryWeight
 
