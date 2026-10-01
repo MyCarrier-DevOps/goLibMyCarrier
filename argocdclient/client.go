@@ -118,7 +118,7 @@ func readResponse(resp *http.Response) ([]byte, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		if resp.StatusCode >= http.StatusBadRequest {
-			return nil, fmt.Errorf("error reading body: %w", err)
+			return nil, fmt.Errorf("error reading body of %d response: %w", resp.StatusCode, err)
 		}
 		return nil, fmt.Errorf("error reading response body: %w", err)
 	}
