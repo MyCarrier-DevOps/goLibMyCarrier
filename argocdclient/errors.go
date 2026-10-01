@@ -12,9 +12,9 @@ import (
 const notFoundInApplication = "not found as part of application"
 
 var (
-	// ErrPermissionDenied matches an HTTP 403 answer. With a scoped token ArgoCD
-	// answers 403, not 404, for an Application that does not exist, so a 403
-	// can mean either a missing permission or a missing Application.
+	// ErrPermissionDenied matches an HTTP 403 answer. ArgoCD answers 403, not 404,
+	// for an Application that does not exist (this client never sends a project),
+	// so a 403 can mean either a missing permission or a missing Application.
 	ErrPermissionDenied = errors.New("argocd: permission denied")
 
 	// ErrNotFound matches an HTTP 404 answer, and the HTTP 400 answer ArgoCD
