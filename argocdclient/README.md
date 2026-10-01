@@ -1,12 +1,12 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient)
 # ArgoCD Client
 
-A Go client library for interacting with the ArgoCD API. This package retrieves ArgoCD application data and manifests, reports the status of Argo Rollouts grouped by correlation ID, and runs Rollout actions on the ArgoCD instance an application routes to. Reads retry on transient failures and every HTTP failure surfaces as a typed error.
+A Go client library for interacting with the ArgoCD API. This package retrieves ArgoCD application data and manifests, reports the status of Argo Rollouts grouped by correlation ID, and runs Rollout actions on the ArgoCD instance an application routes to. Reads retry on transient failures and HTTP failures that are not retried surface as a typed error.
 
 ## Features
 
 - **Retry Logic**: Built-in exponential backoff retry strategy for network failures and server errors (5xx)
-- **Typed Errors**: HTTP failures return `*APIError` and match the sentinels `ErrPermissionDenied`, `ErrNotFound` and `ErrConflict` with `errors.Is`; client errors (4xx) are never retried
+- **Typed Errors**: HTTP failures that are not retried return `*APIError` and match the sentinels `ErrPermissionDenied`, `ErrNotFound` and `ErrConflict` with `errors.Is`; GETs retry transient failures (network errors, 429 and 5xx other than 501)
 - **Configuration Management**: Environment variable-based configuration with validation
 - **Application Data**: Retrieve ArgoCD application information with soft refresh
 - **Manifest Retrieval**: Get application manifests for specific revisions
@@ -227,7 +227,7 @@ section above for details and the recommended usage pattern.
 - `(r *Router) ClientFor(appName string) (*Client, error)`: the client of the instance `appName` routes to, or `ErrInstanceNotConfigured`
 - `(r *Router) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: `ClientFor` followed by `Client.ListRolloutGroup`
 - `(r *Router) RunResourceAction(ctx context.Context, appName string, ref ResourceRef, action ResourceAction) error`: runs an action on the routed instance
-- `type APIError struct{ StatusCode int; Body string }`: returned for any HTTP status of 400 and above
+- `type APIError struct{ StatusCode int; Body string }`: returned for an HTTP status of 400 and above that is not retried (see [Error Handling](#error-handling))
 - `ErrPermissionDenied`, `ErrNotFound`, `ErrConflict`, `ErrInstanceNotConfigured`: sentinel errors (see [Error Handling](#error-handling))
 
 ## Instance Routing
@@ -312,8 +312,8 @@ The call works in these steps:
    then name. When none match, the result is an empty, non-nil slice and the error is
    `nil`.
 
-Errors from the resource tree and from the live reads wrap the underlying `*APIError`,
-so `errors.Is` reaches `ErrPermissionDenied`, `ErrNotFound` and `ErrConflict`; a live-read
+Errors from the resource tree and from the live reads wrap the underlying `*APIError`
+when the status is not retried, so `errors.Is` reaches `ErrPermissionDenied`, `ErrNotFound` and `ErrConflict`; a live-read
 error names the Rollout (`<namespace>/<name>`).
 
 ### RolloutStatus
@@ -477,15 +477,19 @@ action discovery) share one retry strategy:
 
 - **Maximum Retries**: 3 attempts
 - **Backoff Strategy**: Exponential backoff with delays of 1s, 2s, 4s
-- **Retry Conditions**: Network errors and HTTP 5xx server errors
-- **No Retry Conditions**: HTTP 4xx client errors (authentication, authorization, etc.)
+- **Retry Conditions**: Network errors, HTTP 429, and HTTP 5xx server errors other than 501
+- **No Retry Conditions**: Other HTTP 4xx client errors (authentication, authorization, etc.) and HTTP 501
 
 Action POSTs are never retried: they are sent exactly once, because a repeated `resume`
 can release the next `pause: {}` step.
 
 ## Error Handling
 
-Every HTTP answer with a status of 400 or above is returned as `*APIError`:
+An HTTP answer with a status of 400 or above that is not retried is returned as
+`*APIError`: any status on an action POST, and on GETs every 4xx except 429, plus 501.
+A GET still answered with 429, or with a status of 500 or above other than 501, after its
+retries returns the retry client's `giving up after N attempt(s)` error instead: an untyped
+error with no body, whose text names the status only for statuses of 500 and above.
 
 ```go
 type APIError struct {
@@ -524,8 +528,9 @@ if errors.As(err, &apiErr) {
 Other failures:
 
 - **Network Errors**: Retried with exponential backoff for GET requests
-- **Server Errors (5xx)**: Retried with exponential backoff for GET requests; returned immediately for action POSTs
-- **Client Errors (4xx)**: Returned immediately without retry
+- **Server Errors (5xx other than 501)**: Retried with exponential backoff for GET requests; returned immediately as `*APIError` for action POSTs
+- **Too Many Requests (429)**: Retried with exponential backoff for GET requests
+- **Client Errors (4xx other than 429)**: Returned immediately without retry
 - **Parsing Errors**: Returned immediately without retry
 
 ## Examples
