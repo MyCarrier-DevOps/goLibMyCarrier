@@ -299,7 +299,7 @@ Rollout in an Application whose `mycarrier.tech/correlationId` label
 
 The call works in these steps:
 
-1. An empty `correlationID` returns an error; unlabeled Rollouts are never matched.
+1. An empty `appName` or `correlationID` returns an error; unlabeled Rollouts are never matched.
 2. It reads the Application's resource tree
    (`GET /api/v1/applications/{app}/resource-tree`) and keeps the nodes with group
    `argoproj.io` and kind `Rollout` that have a `uid`. Tree nodes carry no labels.
