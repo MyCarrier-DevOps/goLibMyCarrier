@@ -8,24 +8,23 @@ import (
 )
 
 // PostgresDynamicMigrationManager generates Postgres schema migrations and ensurers
-// from a pipeline configuration. It is the Postgres counterpart of
-// DynamicMigrationManager (ClickHouse).
+// from a pipeline configuration.
 //
-// Unlike the ClickHouse schema, the Postgres schema is greenfield (a hard cutover,
-// with no pre-existing Postgres version history to preserve). Core migrations therefore
-// start at version 1 with the final table shapes directly — there is no need to replay
-// ClickHouse's version evolution (materialized-view create-then-drop, inline-ancestry
-// add-then-drop). The Postgres port also collapses ClickHouse's async-merge machinery:
+// The Postgres schema was greenfield: a hard cutover from the ClickHouse slip store
+// (DEVOPS-127, store removed in DEVOPS-343), with no Postgres version history to preserve.
+// Core migrations therefore start at version 1 with the final table shapes directly, rather
+// than replaying the ClickHouse schema's evolution (materialized-view create-then-drop,
+// inline-ancestry add-then-drop). The port also dropped ClickHouse's async-merge machinery:
 //   - no sign / version columns and no VersionedCollapsingMergeTree — Postgres updates
 //     rows in place under MVCC;
-//   - Enum8 becomes a text DOMAIN + CHECK (slip_status, step_status);
-//   - JSON becomes jsonb, DateTime64 becomes timestamptz;
+//   - Enum8 became a text DOMAIN + CHECK (slip_status, step_status);
+//   - JSON became jsonb, DateTime64 became timestamptz;
 //   - slip_component_states is a current-state table keyed by
 //     (correlation_id, step, component), not an append-only ReplacingMergeTree log.
 //
 // Per-step status columns and aggregate jsonb columns are emitted as idempotent
-// ensurers (ADD COLUMN IF NOT EXISTS), exactly as in the ClickHouse manager, so the
-// schema tracks the pipeline config without new versioned migrations.
+// ensurers (ADD COLUMN IF NOT EXISTS), so the schema tracks the pipeline config without
+// new versioned migrations.
 type PostgresDynamicMigrationManager struct {
 	config *PipelineConfig
 	logger postgresmigrator.Logger

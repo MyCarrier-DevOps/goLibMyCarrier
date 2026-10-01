@@ -48,3 +48,93 @@ func (l *testLogger) WithFields(fields map[string]interface{}) logger.Logger {
 
 // Ensure testLogger implements logger.Logger.
 var _ logger.Logger = (*testLogger)(nil)
+
+// testPipelineConfig returns a minimal pipeline config for testing.
+// The config is properly initialized with internal lookup maps.
+func testPipelineConfig() *PipelineConfig {
+	config := &PipelineConfig{
+		Version:     "1",
+		Name:        "test-pipeline",
+		Description: "Test pipeline config",
+		Steps: []StepConfig{
+			{Name: "push_parsed", Description: "Push parsed"},
+			{
+				Name:          "builds",
+				Description:   "Builds completed",
+				Aggregates:    "build",
+				Prerequisites: []string{"push_parsed"},
+			},
+			{
+				Name:          "unit_tests",
+				Description:   "Unit tests completed",
+				Aggregates:    "unit_test",
+				Prerequisites: []string{"builds"},
+			},
+			{Name: "dev_deploy", Description: "Dev deploy", Prerequisites: []string{"unit_tests"}},
+		},
+	}
+	// Initialize internal lookup maps (same as what LoadPipelineConfig does)
+	config.stepsByName = make(map[string]*StepConfig)
+	config.aggregateMap = make(map[string]string)
+	config.gateSteps = make([]string, 0)
+	for i := range config.Steps {
+		step := &config.Steps[i]
+		step.order = i
+		config.stepsByName[step.Name] = step
+		if step.Aggregates != "" {
+			config.aggregateMap[step.Aggregates] = step.Name
+		}
+		if step.IsGate {
+			config.gateSteps = append(config.gateSteps, step.Name)
+		}
+	}
+	return config
+}
+
+// capturedLogCall records a single logger invocation, for tests that assert on what was logged.
+type capturedLogCall struct {
+	level   string
+	message string
+	fields  map[string]interface{}
+}
+
+// capturingLogger is a minimal Logger implementation that records every call
+// instead of discarding it, so tests can assert on the exact message/fields
+// pair a code path emitted.
+type capturingLogger struct {
+	calls []capturedLogCall
+}
+
+func (l *capturingLogger) Info(_ context.Context, message string, fields map[string]interface{}) {
+	l.calls = append(l.calls, capturedLogCall{level: "info", message: message, fields: fields})
+}
+
+func (l *capturingLogger) Debug(_ context.Context, message string, fields map[string]interface{}) {
+	l.calls = append(l.calls, capturedLogCall{level: "debug", message: message, fields: fields})
+}
+
+func (l *capturingLogger) Warn(_ context.Context, message string, fields map[string]interface{}) {
+	l.calls = append(l.calls, capturedLogCall{level: "warn", message: message, fields: fields})
+}
+
+func (l *capturingLogger) Warning(ctx context.Context, message string, fields map[string]interface{}) {
+	l.Warn(ctx, message, fields)
+}
+
+func (l *capturingLogger) Error(
+	_ context.Context, message string, err error, fields map[string]interface{},
+) {
+	if fields == nil {
+		fields = map[string]interface{}{}
+	}
+	if err != nil {
+		fields["error"] = err.Error()
+	}
+	l.calls = append(l.calls, capturedLogCall{level: "error", message: message, fields: fields})
+}
+
+func (l *capturingLogger) WithFields(map[string]interface{}) logger.Logger {
+	return l
+}
+
+var _ logger.Logger = (*capturingLogger)(nil)

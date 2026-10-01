@@ -25,25 +25,25 @@ type Slip struct {
 	// CorrelationID is the unique identifier for this routing slip.
 	// This ID persists through the entire slip lifecycle and links
 	// the slip to Kafka events, workflows, and all related systems.
-	CorrelationID string `json:"correlation_id" ch:"correlation_id"`
+	CorrelationID string `json:"correlation_id"`
 
 	// Repository is the full repository name (owner/repo)
-	Repository string `json:"repository" ch:"repository"`
+	Repository string `json:"repository"`
 
 	// Branch is the git branch name
-	Branch string `json:"branch" ch:"branch"`
+	Branch string `json:"branch"`
 
 	// CommitSHA is the full git commit SHA
-	CommitSHA string `json:"commit_sha" ch:"commit_sha"`
+	CommitSHA string `json:"commit_sha"`
 
 	// CreatedAt is when the slip was created
-	CreatedAt time.Time `json:"created_at" ch:"created_at"`
+	CreatedAt time.Time `json:"created_at"`
 
 	// UpdatedAt is when the slip was last modified
-	UpdatedAt time.Time `json:"updated_at" ch:"updated_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	// Status is the overall slip status
-	Status SlipStatus `json:"status" ch:"status"`
+	Status SlipStatus `json:"status"`
 
 	// ClaimedFrom is the claim flag (DEVOPS-367): non-empty means a run is in flight against
 	// this slip. Its value is the status the slip had when ClaimSlip recorded the claim, kept
@@ -52,24 +52,24 @@ type Slip struct {
 	// UpdateSlipStatus on a terminal status — that atomic status write is the ONE write path
 	// that ends a claim. SELECT-only in Postgres: neither Create nor the full-row Update
 	// writes the column, whatever status they carry, so a caller's snapshot can never end a
-	// claim it did not see. Not a ClickHouse column.
-	ClaimedFrom SlipStatus `json:"claimed_from,omitempty" ch:"-"`
+	// claim it did not see.
+	ClaimedFrom SlipStatus `json:"claimed_from,omitempty"`
 
 	// Steps maps step names to their current state
 	// This is dynamically populated based on the pipeline configuration
-	Steps map[string]Step `json:"steps" ch:"-"`
+	Steps map[string]Step `json:"steps"`
 
 	// Aggregates maps aggregate step names to their component data
 	// For steps with "aggregates" in config, this holds per-component details
-	Aggregates map[string][]ComponentStepData `json:"aggregates" ch:"-"`
+	Aggregates map[string][]ComponentStepData `json:"aggregates"`
 
 	// StateHistory is the complete audit trail of state transitions
-	StateHistory []StateHistoryEntry `json:"state_history" ch:"-"`
+	StateHistory []StateHistoryEntry `json:"state_history"`
 
 	// Ancestry tracks the chain of prior slips that this slip supersedes.
 	// Ordered most-recent-first, so Ancestry[0] is the immediate parent.
 	// Nil or empty if this is the first slip for this commit lineage.
-	Ancestry []AncestryEntry `json:"ancestry" ch:"-"`
+	Ancestry []AncestryEntry `json:"ancestry"`
 
 	// PromotedTo held the correlation ID of the slip this was promoted to.
 	//
@@ -77,48 +77,23 @@ type Slip struct {
 	// always empty on a loaded slip. Nothing records the promotion target at all — PromoteSlip
 	// writes the status column and appends no history — so `Status == SlipStatusPromoted` is the
 	// only signal a reader of the slip has, and WHICH slip it was promoted to is not persisted
-	// anywhere (PR #87 finding p4). The field and its tags are kept because removing them is a
+	// anywhere (PR #87 finding p4). The field and its json tag are kept because removing them is a
 	// second breaking change for no gain: nothing reads a value that is never written, and the
 	// test doubles drop it on copy so no consumer test can pass on one.
-	PromotedTo string `json:"promoted_to,omitempty" ch:"promoted_to"`
+	PromotedTo string `json:"promoted_to,omitempty"`
 
-	// Sign is used by VersionedCollapsingMergeTree for row management.
-	// 1 = active row, -1 = cancelled/deleted row
-	// This field is managed internally by the store and should not be set manually.
-	Sign int8 `json:"-" ch:"sign"`
-
-	// Version is used by VersionedCollapsingMergeTree to track row versions.
-	// Higher versions take precedence during collapsing.
-	// Uses nanosecond timestamps (time.Now().UnixNano()) to ensure uniqueness across concurrent writers.
-	// This field is managed internally by the store and should not be set manually.
-	Version uint64 `json:"-" ch:"version"`
-
-	// loadedWriteFingerprint is the write-fingerprint (see ClickHouseStore.writeFingerprint)
-	// computed at Load/LoadByCommit/LoadLiveByCommit time. It captures the exact set of
-	// row values that updateWithOverrides would otherwise re-write, letting the dirty-check
-	// write-suppression (D3) detect a no-change write and skip the INSERT.
+	// Sign was the ClickHouse store's VersionedCollapsingMergeTree row sign.
 	//
-	// Unexported and excluded from JSON/CH marshaling by construction (lowercase field,
-	// no struct tags) — it is a purely in-process cache-validation token, never persisted.
-	// Empty string means "no fingerprint captured" (e.g. a hand-built Slip that was never
-	// Loaded), which disables suppression for that slip — fail-open to writing.
-	//
-	// Spec: standup-notes/2026/07/slip-state-ch-fix-spec-and-plan.md §2 D3, BC-13.
-	loadedWriteFingerprint string
+	// Deprecated: no store reads or writes it since the ClickHouse store was removed
+	// (DEVOPS-343), so it is always zero. Kept for the same reason as PromotedTo: removing an
+	// exported field breaks any consumer that names it, for no gain.
+	Sign int8 `json:"-"`
 
-	// loadedStateHistoryLen is len(slip.StateHistory) captured at the same
-	// pre-hydration point as loadedWriteFingerprint (Load/LoadByCommit/
-	// LoadLiveByCommit, immediately after scanSlip). writeFingerprint
-	// deliberately excludes state_history, so D3 suppression cannot detect a
-	// StateHistory-only change on its own. Comparing len(slip.StateHistory)
-	// against this baseline in the suppression branch lets updateWithOverrides
-	// tell "history entry appended since Load, and the D3 write suppressing it
-	// would silently drop that journal entry" apart from "nothing changed" —
-	// escalating the former to a Warn instead of the routine Debug line.
+	// Version was the ClickHouse store's VersionedCollapsingMergeTree row version.
 	//
-	// Unexported and excluded from JSON/CH marshaling by construction (lowercase
-	// field, no struct tags) — purely in-process, never persisted.
-	loadedStateHistoryLen int
+	// Deprecated: no store reads or writes it since the ClickHouse store was removed
+	// (DEVOPS-343), so it is always zero. Kept for the same reason as Sign.
+	Version uint64 `json:"-"`
 }
 
 // AncestryEntry records metadata about a prior slip in the ancestry chain.

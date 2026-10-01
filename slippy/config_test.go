@@ -1,12 +1,9 @@
 package slippy
 
 import (
-	"errors"
 	"os"
 	"testing"
 	"time"
-
-	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
 func TestDefaultConfig(t *testing.T) {
@@ -30,14 +27,6 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestConfigFromEnv(t *testing.T) {
-	// Save original env vars for ClickHouse (loaded via clickhouse package)
-	origCHHost := os.Getenv("CLICKHOUSE_HOSTNAME")
-	origCHPort := os.Getenv("CLICKHOUSE_PORT")
-	origCHUser := os.Getenv("CLICKHOUSE_USERNAME")
-	origCHPass := os.Getenv("CLICKHOUSE_PASSWORD")
-	origCHDB := os.Getenv("CLICKHOUSE_DATABASE")
-	origCHSkip := os.Getenv("CLICKHOUSE_SKIP_VERIFY")
-
 	// Save original env vars for Slippy
 	origAppID := os.Getenv("SLIPPY_GITHUB_APP_ID")
 	origKey := os.Getenv("SLIPPY_GITHUB_APP_PRIVATE_KEY")
@@ -49,12 +38,6 @@ func TestConfigFromEnv(t *testing.T) {
 
 	// Restore env vars after test
 	defer func() {
-		_ = os.Setenv("CLICKHOUSE_HOSTNAME", origCHHost)
-		_ = os.Setenv("CLICKHOUSE_PORT", origCHPort)
-		_ = os.Setenv("CLICKHOUSE_USERNAME", origCHUser)
-		_ = os.Setenv("CLICKHOUSE_PASSWORD", origCHPass)
-		_ = os.Setenv("CLICKHOUSE_DATABASE", origCHDB)
-		_ = os.Setenv("CLICKHOUSE_SKIP_VERIFY", origCHSkip)
 		_ = os.Setenv("SLIPPY_GITHUB_APP_ID", origAppID)
 		_ = os.Setenv("SLIPPY_GITHUB_APP_PRIVATE_KEY", origKey)
 		_ = os.Setenv("SLIPPY_GITHUB_ENTERPRISE_URL", origEnterprise)
@@ -63,14 +46,6 @@ func TestConfigFromEnv(t *testing.T) {
 		_ = os.Setenv("SLIPPY_SHADOW_MODE", origShadow)
 		_ = os.Setenv("SLIPPY_ANCESTRY_DEPTH", origDepth)
 	}()
-
-	// Set test values for ClickHouse (via clickhouse package env vars)
-	_ = os.Setenv("CLICKHOUSE_HOSTNAME", "localhost")
-	_ = os.Setenv("CLICKHOUSE_PORT", "9000")
-	_ = os.Setenv("CLICKHOUSE_USERNAME", "testuser")
-	_ = os.Setenv("CLICKHOUSE_PASSWORD", "testpass")
-	_ = os.Setenv("CLICKHOUSE_DATABASE", "testdb")
-	_ = os.Setenv("CLICKHOUSE_SKIP_VERIFY", "true")
 
 	// Set test values for Slippy
 	_ = os.Setenv("SLIPPY_GITHUB_APP_ID", "12345")
@@ -82,27 +57,6 @@ func TestConfigFromEnv(t *testing.T) {
 	_ = os.Setenv("SLIPPY_ANCESTRY_DEPTH", "50")
 
 	cfg := ConfigFromEnv()
-
-	// Verify ClickHouse config was loaded
-	if cfg.ClickHouseConfig == nil {
-		t.Error("ClickHouseConfig should not be nil")
-	} else {
-		if cfg.ClickHouseConfig.ChHostname != "localhost" {
-			t.Errorf("ChHostname = %q, want 'localhost'", cfg.ClickHouseConfig.ChHostname)
-		}
-		if cfg.ClickHouseConfig.ChPort != "9000" {
-			t.Errorf("ChPort = %q, want '9000'", cfg.ClickHouseConfig.ChPort)
-		}
-		if cfg.ClickHouseConfig.ChUsername != "testuser" {
-			t.Errorf("ChUsername = %q, want 'testuser'", cfg.ClickHouseConfig.ChUsername)
-		}
-		if cfg.ClickHouseConfig.ChPassword != "testpass" {
-			t.Errorf("ChPassword = %q, want 'testpass'", cfg.ClickHouseConfig.ChPassword)
-		}
-		if cfg.ClickHouseConfig.ChDatabase != "testdb" {
-			t.Errorf("ChDatabase = %q, want 'testdb'", cfg.ClickHouseConfig.ChDatabase)
-		}
-	}
 
 	if cfg.GitHubAppID != 12345 {
 		t.Errorf("GitHubAppID = %d, want 12345", cfg.GitHubAppID)
@@ -158,26 +112,20 @@ func TestConfigFromEnv_InvalidValues(t *testing.T) {
 	}
 }
 
-func TestConfigFromEnv_MaxDepthAndDatabase(t *testing.T) {
+func TestConfigFromEnv_MaxDepth(t *testing.T) {
 	// Save and restore env vars
 	origMaxDepth := os.Getenv("SLIPPY_ANCESTRY_MAX_DEPTH")
-	origDatabase := os.Getenv("SLIPPY_DATABASE")
 	defer func() {
 		_ = os.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", origMaxDepth)
-		_ = os.Setenv("SLIPPY_DATABASE", origDatabase)
 	}()
 
 	// Test valid max depth
 	_ = os.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", "200")
-	_ = os.Setenv("SLIPPY_DATABASE", "custom_db")
 
 	cfg := ConfigFromEnv()
 
 	if cfg.AncestryMaxDepth != 200 {
 		t.Errorf("AncestryMaxDepth = %d, want 200", cfg.AncestryMaxDepth)
-	}
-	if cfg.Database != "custom_db" {
-		t.Errorf("Database = %q, want 'custom_db'", cfg.Database)
 	}
 
 	// Test invalid max depth (negative)
@@ -194,231 +142,6 @@ func TestConfigFromEnv_MaxDepthAndDatabase(t *testing.T) {
 
 	if cfg.AncestryMaxDepth != 100 { // default
 		t.Errorf("AncestryMaxDepth should be default (100) for invalid value, got %d", cfg.AncestryMaxDepth)
-	}
-}
-
-func TestConfig_Validate(t *testing.T) {
-	// Helper to create a valid ClickHouseConfig for tests
-	validCHConfig := &ch.ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChPort:       "9000",
-		ChDatabase:   "testdb",
-		ChUsername:   "user",
-		ChPassword:   "pass",
-		ChSkipVerify: "true",
-	}
-
-	// Helper to create a valid PipelineConfig for tests
-	validPipelineConfig := &PipelineConfig{
-		Version:     "1",
-		Name:        "test-pipeline",
-		Description: "Test pipeline",
-		Steps: []StepConfig{
-			{Name: "push_parsed", Description: "Push parsed"},
-			{Name: "builds_completed", Description: "Builds completed", Prerequisites: []string{"push_parsed"}},
-		},
-	}
-
-	tests := []struct {
-		name      string
-		config    Config
-		wantError bool
-		errorIs   error
-	}{
-		{
-			name: "valid config",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key-content",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: false,
-		},
-		{
-			name: "missing ClickHouseConfig",
-			config: Config{
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "missing PipelineConfig",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "missing GitHubAppID",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "missing GitHubPrivateKey",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "zero HoldTimeout",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      0,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "negative HoldTimeout",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      -time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "zero PollInterval",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     0,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "zero AncestryDepth",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    0,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "AncestryMaxDepth less than AncestryDepth",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    50,
-				AncestryMaxDepth: 25, // less than AncestryDepth
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "ClickHouse load error stored",
-			config: Config{
-				ClickHouseConfig:  nil,
-				clickhouseLoadErr: errors.New("connection failed"),
-				PipelineConfig:    validPipelineConfig,
-				GitHubAppID:       12345,
-				GitHubPrivateKey:  "key",
-				HoldTimeout:       time.Minute,
-				PollInterval:      time.Second,
-				AncestryDepth:     10,
-				AncestryMaxDepth:  100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-		{
-			name: "Pipeline load error stored",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   nil,
-				pipelineLoadErr:  errors.New("invalid config file"),
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-				AncestryMaxDepth: 100,
-			},
-			wantError: true,
-			errorIs:   ErrInvalidConfiguration,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.config.Validate()
-			if tt.wantError {
-				if err == nil {
-					t.Error("expected error, got nil")
-				} else if tt.errorIs != nil && !errors.Is(err, tt.errorIs) {
-					t.Errorf("error should wrap %v", tt.errorIs)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
 	}
 }
 
@@ -478,75 +201,6 @@ func TestConfig_GitHubConfig(t *testing.T) {
 	}
 }
 
-func TestConfig_ValidateMinimal(t *testing.T) {
-	validCHConfig := &ch.ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChPort:       "9000",
-		ChDatabase:   "testdb",
-		ChUsername:   "user",
-		ChPassword:   "pass",
-		ChSkipVerify: "true",
-	}
-
-	validPipelineConfig := &PipelineConfig{
-		Version:     "1",
-		Name:        "test-pipeline",
-		Description: "Test pipeline",
-		Steps: []StepConfig{
-			{Name: "push_parsed", Description: "Push parsed"},
-		},
-	}
-
-	tests := []struct {
-		name      string
-		config    Config
-		wantError bool
-	}{
-		{
-			name: "valid minimal config",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				PipelineConfig:   validPipelineConfig,
-			},
-			wantError: false,
-		},
-		{
-			name: "missing ClickHouseConfig",
-			config: Config{
-				PipelineConfig: validPipelineConfig,
-			},
-			wantError: true,
-		},
-		{
-			name: "missing PipelineConfig",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-			},
-			wantError: true,
-		},
-		{
-			name:      "missing both",
-			config:    Config{},
-			wantError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.config.ValidateMinimal()
-			if tt.wantError {
-				if err == nil {
-					t.Error("expected error, got nil")
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-			}
-		})
-	}
-}
-
 func TestConfig_WithPipelineConfig(t *testing.T) {
 	cfg := DefaultConfig()
 
@@ -564,55 +218,5 @@ func TestConfig_WithPipelineConfig(t *testing.T) {
 	// Original should be unchanged
 	if cfg.PipelineConfig != nil {
 		t.Error("original config should not be modified")
-	}
-}
-
-func TestConfig_WithDatabase(t *testing.T) {
-	cfg := DefaultConfig()
-	original := cfg.Database
-
-	newCfg := cfg.WithDatabase("custom_db")
-
-	if newCfg.Database != "custom_db" {
-		t.Errorf("WithDatabase should set database to 'custom_db', got '%s'", newCfg.Database)
-	}
-	// Original should be unchanged
-	if cfg.Database != original {
-		t.Errorf("original config should not be modified, got '%s'", cfg.Database)
-	}
-}
-
-func TestDefaultDatabase_K8SNamespace(t *testing.T) {
-	orig := os.Getenv("K8S_NAMESPACE")
-	defer func() { _ = os.Setenv("K8S_NAMESPACE", orig) }()
-
-	tests := []struct {
-		namespace string
-		want      string
-	}{
-		{"", "ci"},
-		{"production", "ci"},
-		{"argo-events", "ci"},
-		{"test", "ci"},
-		{"testing", "ci"},
-		{"testengine", "ci"},
-		{"dev", "ci_test"},
-		{"feature-abc", "ci_test"},
-		{"feature-shipment-webhook", "ci_test"},
-		{"feature", "ci_test"},
-		{"slippy-test", "ci_test"},
-		{"argo-events-test", "ci_test"},
-		{"slippy-dev", "ci_test"},
-		{"argo-events-dev", "ci_test"},
-	}
-
-	for _, tt := range tests {
-		t.Run("namespace_"+tt.namespace, func(t *testing.T) {
-			_ = os.Setenv("K8S_NAMESPACE", tt.namespace)
-			got := defaultDatabase()
-			if got != tt.want {
-				t.Errorf("defaultDatabase() with K8S_NAMESPACE=%q = %q, want %q", tt.namespace, got, tt.want)
-			}
-		})
 	}
 }

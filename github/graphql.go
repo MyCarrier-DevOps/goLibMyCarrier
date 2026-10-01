@@ -3,8 +3,10 @@ package github_handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -81,26 +83,19 @@ type Installation struct {
 }
 
 // NewGraphQLClient creates a new GitHub GraphQL client with App authentication.
-// The private key can be provided as PEM content (starts with "-----BEGIN")
-// or as a file path.
+// The private key can be provided as PEM content (starts with "-----BEGIN",
+// after any leading spaces, tabs, line breaks or byte order mark, which are
+// dropped) or as the path of a file holding it (the file's leading run is
+// dropped the same way). A value with a line break, or longer than 1024 bytes,
+// is never read as a path. No error it returns contains the configured key value.
 func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, error) {
 	if log == nil {
 		log = &logger.NopLogger{}
 	}
 
-	var privateKey []byte
-
-	// Support both inline key and file path
-	if cfg.PrivateKey != "" && cfg.PrivateKey[0] == '-' {
-		// Looks like PEM content (starts with "-----BEGIN")
-		privateKey = []byte(cfg.PrivateKey)
-	} else {
-		// Treat as file path
-		var err error
-		privateKey, err = os.ReadFile(cfg.PrivateKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read private key file: %w", err)
-		}
+	privateKey, err := loadPrivateKey(cfg.PrivateKey)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate the private key
@@ -117,6 +112,64 @@ func NewGraphQLClient(cfg GraphQLConfig, log logger.Logger) (*GraphQLClient, err
 		installationCache: make(map[string]int64),
 		clientCache:       make(map[string]*githubv4.Client),
 	}, nil
+}
+
+// privateKeyHint names what a private key must be without repeating the value,
+// so it is safe to print.
+const privateKeyHint = "private key is neither PEM content (starting with -----BEGIN) nor a readable file path"
+
+// pemLeader is what may come before a PEM's -----BEGIN line: spaces, tabs, CR
+// and LF, and the UTF-8 byte order mark an editor or a paste can leave in front.
+// A value made only of these is empty.
+const pemLeader = "\ufeff \t\r\n"
+
+// trimPEMLeader drops the pemLeader run from the front of a PEM: it is never part
+// of one, and pem.Decode wants -----BEGIN at the start of a line.
+func trimPEMLeader(pemText string) string {
+	return strings.TrimLeft(pemText, pemLeader)
+}
+
+// maxKeyPathLen is the longest value loadPrivateKey reads as a file path. It is above
+// any realistic mount path, and well below any single-line encoding of a 2048-bit RSA
+// key (about 1,590 bytes: the base64 of its PKCS #1 body).
+const maxKeyPathLen = 1024
+
+// loadPrivateKey returns the key when value is PEM content, whose first byte after
+// any pemLeader run is '-', and otherwise the contents of the file value names.
+// PEM content and the file's contents lose that leading run (trimPEMLeader). The
+// rest of the key, and a file path, are used exactly as given.
+//
+// A value that is not PEM content is read only when it has no line break and is at
+// most maxKeyPathLen bytes. A realistic key file path has neither, and both are shapes
+// key material arrives in (a PEM behind other text, a key's base64 on one line), so such
+// a value never reaches the filesystem, where it would be the pathname openat(2) receives.
+//
+// Its errors never contain value. A value that fails PEM detection and reaches the
+// read may still be a fragment of key material, so a failed read reports the value's
+// length and the cause os.ReadFile gives, not the *fs.PathError, whose Path is value.
+func loadPrivateKey(value string) ([]byte, error) {
+	content := trimPEMLeader(value)
+	if content == "" {
+		return nil, errors.New("private key is empty: set PEM content or a key file path")
+	}
+	if strings.HasPrefix(content, "-") {
+		return []byte(content), nil
+	}
+	msg := fmt.Sprintf("%s (value length %d)", privateKeyHint, len(value))
+	if strings.ContainsAny(value, "\r\n") || len(value) > maxKeyPathLen {
+		return nil, errors.New(msg + ": not a file path (contains a line break or is too long)")
+	}
+	key, err := os.ReadFile(value)
+	if err == nil {
+		return []byte(trimPEMLeader(string(key))), nil
+	}
+	var pathErr *fs.PathError
+	if !errors.As(err, &pathErr) {
+		// os.ReadFile reports every failure as an *fs.PathError; anything else is
+		// dropped rather than risk printing value.
+		return nil, errors.New(msg)
+	}
+	return nil, fmt.Errorf("%s: %w", msg, pathErr.Err)
 }
 
 // GetAPIBaseURL returns the appropriate REST API base URL.

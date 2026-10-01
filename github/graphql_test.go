@@ -5,15 +5,20 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -154,7 +159,7 @@ func TestNewGraphQLClient_InvalidFilePath(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Nil(t, client)
-	assert.Contains(t, err.Error(), "failed to read private key file")
+	assert.Contains(t, err.Error(), "nor a readable file path")
 }
 
 func TestNewGraphQLClient_InvalidKey(t *testing.T) {
@@ -166,6 +171,204 @@ func TestNewGraphQLClient_InvalidKey(t *testing.T) {
 	require.Error(t, err)
 	assert.Nil(t, client)
 	assert.Contains(t, err.Error(), "invalid private key")
+}
+
+// TestNewGraphQLClient_PrivateKeyNotEchoed pins that no NewGraphQLClient error
+// carries the configured PrivateKey: a value that fails PEM detection may still be
+// key material, and callers print these errors (slippy's Quick Start log.Fatals one).
+func TestNewGraphQLClient_PrivateKeyNotEchoed(t *testing.T) {
+	validPEM := testPrivateKey(t)
+	writeKeyFile := func(name, content string) string {
+		path := filepath.Join(t.TempDir(), name)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+		return path
+	}
+	keyFile := writeKeyFile("private-key.pem", validPEM)
+	block, _ := pem.Decode([]byte(validPEM))
+	require.NotNil(t, block)
+	truncatedPEM := string(pem.EncodeToMemory(&pem.Block{Type: block.Type, Bytes: block.Bytes[:len(block.Bytes)/2]}))
+	const hint = "private key is neither PEM content (starting with -----BEGIN) nor a readable file path"
+
+	tests := []struct {
+		name       string
+		privateKey string
+		wantKey    string // on success, the key bytes the client holds
+		wantInMsg  string // on failure, text the message must contain
+		wantIs     error  // on failure, an errors.Is target
+	}{
+		{
+			name:       "base64 of a valid PEM",
+			privateKey: base64.StdEncoding.EncodeToString([]byte(validPEM)),
+			wantInMsg:  hint,
+		},
+		{
+			name:       "PEM after leading blank lines parses; the whitespace is dropped",
+			privateKey: " \t\r\n\n" + validPEM,
+			wantKey:    validPEM,
+		},
+		{
+			// pem.Decode wants -----BEGIN at the start of a line, so this parses only
+			// because the leading whitespace is dropped.
+			name:       "PEM with spaces before -----BEGIN on its line parses",
+			privateKey: "\n  " + validPEM,
+			wantKey:    validPEM,
+		},
+		{
+			name:       "PEM behind a UTF-8 BOM parses; the BOM is dropped",
+			privateKey: "\ufeff" + validPEM,
+			wantKey:    validPEM,
+		},
+		{
+			name:       "PEM behind other text",
+			privateKey: "GITHUB_APP_PRIVATE_KEY=" + validPEM,
+			wantInMsg:  hint,
+		},
+		{
+			name:       "text naming PRIVATE KEY that is neither PEM nor a path",
+			privateKey: "my GitHub App PRIVATE KEY, pasted without its PEM armour",
+			wantInMsg:  hint,
+		},
+		{
+			name:       "PEM armour around a truncated key",
+			privateKey: truncatedPEM,
+			wantInMsg:  "invalid private key",
+		},
+		{
+			name:       "missing file path",
+			privateKey: filepath.Join(t.TempDir(), "missing-private-key.pem"),
+			wantInMsg:  hint,
+			wantIs:     fs.ErrNotExist,
+		},
+		{
+			name:       "file holding a valid PEM",
+			privateKey: keyFile,
+			wantKey:    validPEM,
+		},
+		{
+			name:       "key file with a BOM parses; the BOM is dropped",
+			privateKey: writeKeyFile("bom-private-key.pem", "\ufeff"+validPEM),
+			wantKey:    validPEM,
+		},
+		{
+			name:       "key file with leading blank lines parses; the blank lines are dropped",
+			privateKey: writeKeyFile("blank-lines-private-key.pem", "\r\n\n"+validPEM),
+			wantKey:    validPEM,
+		},
+		{
+			// Only PEM content is trimmed: a path is read as given, so this names no file.
+			name:       "real key file behind a leading space is not trimmed",
+			privateKey: " " + keyFile,
+			wantInMsg:  hint,
+			wantIs:     fs.ErrNotExist,
+		},
+		{
+			name:       "empty",
+			privateKey: "",
+			wantInMsg:  "private key is empty",
+		},
+		{
+			name:       "only leading spaces, tabs, line breaks and a BOM is empty",
+			privateKey: " \t\r\n\ufeff",
+			wantInMsg:  "private key is empty",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := NewGraphQLClient(GraphQLConfig{AppID: 12345, PrivateKey: tt.privateKey}, nil)
+			if tt.wantKey != "" {
+				require.NoError(t, err)
+				require.NotNil(t, client)
+				assert.Equal(t, tt.wantKey, string(client.privateKey))
+				return
+			}
+			require.Error(t, err)
+			assert.Nil(t, client)
+			assertNoEcho(t, err.Error(), tt.privateKey)
+			assert.False(t, errors.As(err, new(*fs.PathError)),
+				"the error chain holds an *fs.PathError, whose Path is the value")
+			want := tt.wantInMsg
+			if want == hint {
+				// A failed read gives the value's length, never the value.
+				want = fmt.Sprintf("%s (value length %d)", hint, len(tt.privateKey))
+			}
+			assert.Contains(t, err.Error(), want)
+			if tt.wantIs != nil {
+				assert.ErrorIs(t, err, tt.wantIs)
+			}
+		})
+	}
+}
+
+// assertNoEcho fails when msg contains value or any 20-byte window of it, so a
+// partial echo (a prefix, a line of a PEM body) fails as well as a whole one.
+func assertNoEcho(t *testing.T, msg, value string) {
+	t.Helper()
+	const window = 20
+	if value == "" {
+		return
+	}
+	if len(value) < window {
+		assert.NotContains(t, msg, value, "error echoes the configured private key")
+		return
+	}
+	for i := 0; i+window <= len(value); i++ {
+		if strings.Contains(msg, value[i:i+window]) {
+			t.Errorf("error echoes the configured private key: bytes %d-%d of the value appear in a %d-byte message",
+				i, i+window, len(msg))
+			return
+		}
+	}
+}
+
+// TestNewGraphQLClient_ValueThatCannotBeAPathIsNotRead pins that a value that is not PEM content
+// is not read as a key file path when it has a line break or is longer than 1024 bytes
+// (loadPrivateKey's maxKeyPathLen). os.ReadFile would hand it to openat(2) as the pathname, and
+// both are shapes key material arrives in. A real, readable file behind such a name is not read
+// either, and the error still carries only the hint and the value's length.
+func TestNewGraphQLClient_ValueThatCannotBeAPathIsNotRead(t *testing.T) {
+	const limit = 1024 // loadPrivateKey's maxKeyPathLen
+	const notAPath = ": not a file path (contains a line break or is too long)"
+	validPEM := testPrivateKey(t)
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "private-key.pem")
+	require.NoError(t, os.WriteFile(keyFile, []byte(validPEM), 0o600))
+	lineBreakName := filepath.Join(dir, "private\nkey.pem")
+	require.NoError(t, os.WriteFile(lineBreakName, []byte(validPEM), 0o600))
+	block, _ := pem.Decode([]byte(validPEM))
+	require.NotNil(t, block)
+
+	tests := []struct {
+		name       string
+		privateKey string
+	}{
+		{"a real key file whose name contains a line break", lineBreakName},
+		{"a real key file path with a trailing newline", keyFile + "\n"},
+		{"a real key file path with a trailing CRLF", keyFile + "\r\n"},
+		{"a real key file path with a trailing CR", keyFile + "\r"},
+		{"a line break before a real key file path", "\n" + keyFile},
+		{"the base64 of a key's DER body on one line", base64.StdEncoding.EncodeToString(block.Bytes)},
+		{"one line of 1025 bytes", "/" + strings.Repeat("k", limit)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := NewGraphQLClient(GraphQLConfig{AppID: 12345, PrivateKey: tt.privateKey}, nil)
+			require.Error(t, err)
+			assert.Nil(t, client)
+			assert.Equal(t, fmt.Sprintf("%s (value length %d)%s", privateKeyHint, len(tt.privateKey), notAPath),
+				err.Error())
+			assertNoEcho(t, err.Error(), tt.privateKey)
+		})
+	}
+
+	t.Run("one line of exactly 1024 bytes is still read as a path", func(t *testing.T) {
+		value := "/" + strings.Repeat("k", limit-1)
+		_, err := NewGraphQLClient(GraphQLConfig{AppID: 12345, PrivateKey: value}, nil)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), notAPath)
+		var errno syscall.Errno
+		assert.True(t, errors.As(err, &errno), "the read's errno is kept, so the value reached os.ReadFile: %v", err)
+		assertNoEcho(t, err.Error(), value)
+	})
 }
 
 func TestNewGraphQLClient_WithEnterpriseURL(t *testing.T) {

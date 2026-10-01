@@ -19,10 +19,10 @@ type HoldOptions struct {
 	// ComponentName is the component context (if applicable)
 	ComponentName string
 
-	// Timeout is the maximum time to wait (defaults to config.HoldTimeout)
+	// Timeout is the maximum time to wait (0 or less takes config.HoldTimeout)
 	Timeout time.Duration
 
-	// PollInterval is the interval between checks (defaults to config.PollInterval)
+	// PollInterval is the interval between checks (0 or less takes config.PollInterval)
 	PollInterval time.Duration
 
 	// StepName is the step that is being held (for status updates)

@@ -25,9 +25,8 @@ func TestClaimSentinelsAreDistinct(t *testing.T) {
 	assert.Contains(t, ErrNotClaimed.Error(), "claimed")
 }
 
-// ClaimedFrom must serialise under the snake_case key the API contract exposes, be omitted
-// when the slip is unclaimed, and be excluded from the ClickHouse column mapping (ch:"-")
-// because no ClickHouse table has it.
+// ClaimedFrom must serialise under the snake_case key the API contract exposes and be omitted
+// when the slip is unclaimed.
 func TestSlip_ClaimedFrom_JSONShape(t *testing.T) {
 	claimed, err := json.Marshal(&Slip{CorrelationID: "c1", Status: SlipStatusFailed, ClaimedFrom: SlipStatusFailed})
 	require.NoError(t, err)
@@ -43,7 +42,6 @@ func TestSlip_ClaimedFrom_JSONShape(t *testing.T) {
 	field, ok := reflect.TypeOf(Slip{}).FieldByName("ClaimedFrom")
 	require.True(t, ok)
 	assert.Equal(t, "claimed_from,omitempty", field.Tag.Get("json"))
-	assert.Equal(t, "-", field.Tag.Get("ch"), "no ClickHouse column: the ch mapper must skip it")
 }
 
 // The marker builders are the single definition of the markers' shape; the status in the

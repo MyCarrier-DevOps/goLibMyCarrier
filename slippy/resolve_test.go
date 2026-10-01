@@ -242,13 +242,59 @@ func TestClient_ResolveSlip(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
-		// Options depth should be used (config depth is used only if options depth is 0)
+		// Options depth should be used (config depth is used only if options depth is 0 or less)
 		if len(github.GetCommitAncestryCalls) != 1 {
 			t.Fatal("expected 1 GetCommitAncestry call")
 		}
-		// Note: The implementation uses config.AncestryDepth if opts.AncestryDepth is 0
+		// Note: The implementation uses config.AncestryDepth if opts.AncestryDepth is 0 or less
 		// So with AncestryDepth: 10, it should use 10
 	})
+}
+
+// TestClient_ResolveSlip_AncestryDepth pins the depth ResolveSlip asks GitHub for: an
+// AncestryDepth of 0 or less is unset and takes the client's AncestryDepth, and a positive one
+// is used as given. The client's 20 is not DefaultConfig's 25, so the default it takes is visibly
+// the client's.
+func TestClient_ResolveSlip_AncestryDepth(t *testing.T) {
+	tests := []struct {
+		name        string
+		depth, want int
+	}{
+		{"unset takes the client's depth", 0, 20},
+		{"a negative depth takes the client's depth", -1, 20},
+		{"a positive depth is used as given", 10, 10},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := NewMockStore()
+			github := NewMockGitHubAPI()
+			client := NewClientWithDependencies(store, github, Config{AncestryDepth: 20})
+			store.AddSlip(&Slip{
+				CorrelationID: "corr-resolve-depth",
+				Repository:    "owner/repo",
+				Branch:        "main",
+				CommitSHA:     "abc123",
+				CreatedAt:     time.Now(),
+				UpdatedAt:     time.Now(),
+				Status:        SlipStatusInProgress,
+				Steps:         make(map[string]Step),
+			})
+			github.SetAncestry("owner", "repo", "HEAD", []string{"abc123"})
+
+			_, err := client.ResolveSlip(context.Background(), ResolveOptions{
+				Repository:    "owner/repo",
+				Branch:        "main",
+				Ref:           "HEAD",
+				AncestryDepth: tt.depth,
+			})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if calls := github.GetCommitAncestryCalls; len(calls) != 1 || calls[0].Depth != tt.want {
+				t.Errorf("GetCommitAncestry calls = %+v, want exactly one, at depth %d", calls, tt.want)
+			}
+		})
+	}
 }
 
 // TestResolveSlip_ImageTagFallback_ReturnsPromotedSlip asserts that the

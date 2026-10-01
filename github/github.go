@@ -188,7 +188,8 @@ func validateConfig(config *GithubConfig) error {
 }
 
 // NewGithubSession creates a new Github session using the provided PEM file, App ID, and Install ID.
-// It is NewGithubSessionWithOptions with no options.
+// pem is the key's PEM content, not a path; any leading spaces, tabs, line breaks or byte order
+// mark before -----BEGIN are dropped. It is NewGithubSessionWithOptions with no options.
 func NewGithubSession(pem, appID, installID string) (*GithubSession, error) {
 	return NewGithubSessionWithOptions(pem, appID, installID)
 }
@@ -293,9 +294,11 @@ func (s *GithubSession) Client() *github.Client {
 	return s.client
 }
 
-// authenticate with Github using the provided PEM file, App ID, and Install ID
+// authenticate with Github using the provided PEM file, App ID, and Install ID. The PEM
+// loses its leading run of spaces, tabs, line breaks or byte order mark first, as in
+// NewGraphQLClient (trimPEMLeader).
 func (s *GithubSession) authenticate() error {
-	privateKey := []byte(s.pem)
+	privateKey := []byte(trimPEMLeader(s.pem))
 	if _, err := jwt.ParseRSAPrivateKeyFromPEM(privateKey); err != nil {
 		return fmt.Errorf("error creating application token source: invalid private key: %w", err)
 	}

@@ -13,7 +13,7 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Multi-module architecture** - each package has its own `go.mod`
 - **Unified versioning** - all modules share same version (e.g., `v1.3.43`)
 - **75% test coverage threshold** enforced per module
-- **ClickHouse-backed persistence** for slippy routing slips
+- **Postgres-backed persistence** for slippy routing slips (the ClickHouse slip store was removed in DEVOPS-343; dated entries, entries marked historical or superseded, and entries that name `clickhouse_store.go` describe history)
 
 ---
 
@@ -38,13 +38,13 @@ goLibMyCarrier is a **multi-module Go monorepo** providing reusable infrastructu
 - **Shadow mode** (`SLIPPY_SHADOW_MODE`) - controls blocking vs non-blocking errors
 - **Dynamic schema** - generated from JSON pipeline configuration
 - **Two migration types** - versioned migrations for core schema + idempotent ensurers for dynamic columns
-- **Config error capture** - stores load errors for proper surfacing in validation
-- **ClickHouse store** - slip persistence with query builders and scanners
-- **Native JSON handling** - uses `chcol.JSON` for ClickHouse JSON columns
-- **Ancestry tracking** - maintains full commit lineage chain in `Ancestry` JSON field
+- **Config loading** - `ConfigFromEnv` leaves `PipelineConfig` nil when `SLIPPY_PIPELINE_CONFIG` fails to load; `LoadPipelineConfig` returns the error (`Config.Validate` was removed in DEVOPS-343)
+- **Postgres store** (`PostgresStore`) - the only slip store; the caller builds the `*pgxpool.Pool`, passes it to `NewPostgresStore`, and injects the store with `NewClientWithDependencies`
+- **jsonb columns** - `step_details`, `state_history` and each aggregate step's column are `jsonb`, with arrays wrapped in objects (`{"entries": [...]}`, `{"items": [...]}`)
+- **Ancestry tracking** - each slip's direct parent link is a `slip_ancestry` row; `ResolveAncestry` walks the links to rebuild the lineage chain
 - **Progressive depth ancestry search** - starts at 25 commits, expands to 100 if no ancestor found
-- **Ancestry inheritance** - child slips inherit parent's ancestry chain for complete lineage
-- **Event Sourcing for Component Updates** - uses high-throughput `ReplacingMergeTree` for component states
+- **Ancestry inheritance** - a child's lineage continues through its parent's link, so the walk reaches every ancestor
+- **Component states** - `slip_component_states` is a current-state table, one row per (correlation_id, step, component), upserted in the same transaction that recomputes the aggregate or writes the step column (`updateStepTx`)
 - **Event Sourcing extended to pipeline-level steps** (March 4, 2026) - eliminates concurrent lost-update bug; see "Recent Changes"
 - See `slippy/CLAUDE.md` for detailed patterns
 - See `.github/STATE_MACHINE_V3.md` for state machine specification, algorithm reference, and validation guide
@@ -67,9 +67,11 @@ Source values from `slippy/status.go`.
 
 I1/I2 are eventually consistent — transient inconsistency between step event write and next `checkPipelineCompletion` call is acceptable. Permanent inconsistency is a violation.
 
-**Pipeline termination without completing:** `abandoned` (`AbandonSlip`, client.go:170 — new push supersedes branch), `promoted` (`PromoteSlip`, client.go:204 — PR squash-merge). Both bypass `checkPipelineCompletion`. No operator abort tool exists.
+**Pipeline termination without completing:** `abandoned` (`Client.AbandonSlip` — new push supersedes branch), `promoted` (`Client.PromoteSlip` — PR squash-merge). Both bypass `checkPipelineCompletion`. No operator abort tool exists.
 
-### Component State Event Sourcing (January 20, 2026)
+### Component State Event Sourcing (January 20, 2026) (ClickHouse store, removed in DEVOPS-343; historical)
+> **Historical.** This section describes the ClickHouse slip store, which DEVOPS-343 removed. PostgresStore keeps `slip_component_states` as a current-state table (one row per key, `ON CONFLICT` upserts) and writes it in the same transaction as the step column or aggregate recompute; see the Slippy Package bullets above.
+
 - **Status:** Complete & Validated
 - **Architecture:** Moved component status updates (highly concurrent) to `slip_component_states` table (`ReplacingMergeTree`)
 - **Reasoning:** Eliminates lock contention/version conflicts on main `routing_slips` table during parallel build/test execution
@@ -1110,7 +1112,8 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - Never call `viper.SetEnvPrefix()` on the global instance in library code
 **Anti-pattern:** Using global `viper.SetEnvPrefix()` in library packages that may be imported by applications using viper for other purposes.
 
-### ClickHouse JSON Column Pattern
+### ClickHouse JSON Column Pattern (ClickHouse store — historical; superseded by DEVOPS-343)
+**Superseded by DEVOPS-343:** the ClickHouse slip store was removed. PostgresStore keeps the same wrapped shapes (`{"entries": [...]}`, `{"items": [...]}`) in `jsonb` columns; the `chcol`, `ARRAY JOIN` and `Dynamic` guidance below applies to no slippy code.
 **Decision:** Use native JSON type with arrays wrapped in objects. Never use String type to store complex data.
 **Rationale:** ClickHouse JSON type only supports objects at root; arrays need wrapper. String storage loses type safety, query optimization, and ClickHouse's native JSON functions.
 **Implementation:**
@@ -1121,7 +1124,8 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 - Extract Array from Dynamic: Use `dynamicElement(column, 'Array(JSON)')` when ARRAY JOIN needs an array from JSON column
 - **Anti-pattern:** Never use `toString(column)` or `String DEFAULT '[]'` for JSON data
 
-### Error Handling Pattern
+### Error Handling Pattern (superseded by DEVOPS-343)
+**Superseded by DEVOPS-343:** `Config.Validate` and the captured load error were removed. `ConfigFromEnv` leaves `PipelineConfig` nil when the load fails, and `LoadPipelineConfig` returns the error.
 **Decision:** Capture config load errors on first attempt, don't retry in validation.
 **Rationale:** Retrying is wasteful; errors should be surfaced with full context immediately.
 **Implementation:** Private error fields in Config struct, checked in Validate().
@@ -1146,10 +1150,10 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 **Decision:** Use versioned migrations for core schema, idempotent ensurers for dynamic columns.
 **Rationale:** Adding a step to pipeline config shouldn't require version bump; step columns are order-independent.
 **Implementation:**
-- Core schema (v1: base table, v2: materialized view) - versioned, tracked in migrations table
+- Core schema (Postgres v1-v6: enums, `routing_slips`, `slip_component_states`, `slip_ancestry`, one slip per commit, `claimed_from`) - versioned, tracked in `slippy_schema_version`
 - Step columns and indexes - ensurers, run every `CreateTables()` call
 - Ensurers use `IF NOT EXISTS` to be idempotent
-- Consumers must always call `RunMigrations()` (not just when version mismatches)
+- The migrator Job must always call `RunPostgresMigrations()` (not just when version mismatches); the ClickHouse `RunMigrations()` was removed in DEVOPS-343
 
 ### Update Existing Functions, Never Create New Versions
 **Decision:** When changing a function's signature or behavior, update the existing function rather than creating a new function with a modified name (e.g., `FooWithWarnings`, `FooV2`).
@@ -1169,13 +1173,14 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 **Decision:** Combine step status updates and history appends into a single atomic operation.
 **Rationale:** Separate `UpdateStep` and `AppendHistory` calls create race conditions where `AppendHistory`'s `Load()` can read stale data and overwrite the step status change.
 **Implementation:**
-- `UpdateStepWithHistory` method performs Load→modify step→modify history→Update in one cycle
-- `AppendHistory` uses `insertAtomicHistoryUpdate` (atomic DB-passthrough UNION ALL; no Load→Update cycle — step columns are copied verbatim from the latest DB row)
-- Single version increment ensures both changes are applied atomically
+- `UpdateStepWithHistory` runs `updateStepTx`: one transaction under the slip's row lock writes the step and appends the history entry
+- `AppendHistory` appends to the `state_history` `jsonb` under the same row lock, with no Load→Update cycle
+- The single transaction applies both changes atomically (the ClickHouse `insertAtomicHistoryUpdate` and its version increment were removed in DEVOPS-343)
 - Used by `UpdateStepWithStatus` in `steps.go`
 **Anti-pattern:** Calling `UpdateStep` followed by `AppendHistory` separately.
 
-### VCMT Query Pattern with sign=1 Filter
+### VCMT Query Pattern with sign=1 Filter (ClickHouse store — historical; superseded by DEVOPS-343)
+**Superseded by DEVOPS-343:** the ClickHouse slip store was removed. PostgresStore's `routing_slips` has one row per slip keyed on `correlation_id`, with no `sign` or `version` column, so no read needs this filter.
 **Decision:** Always filter `sign = 1` and `ORDER BY version DESC` when querying VersionedCollapsingMergeTree tables.
 **Rationale:** VCMT's `FINAL` modifier can return multiple rows (including orphaned sign=-1 cancel rows) until background merges complete. The `sign = 1` filter reliably selects only active rows.
 **Implementation:**
@@ -1225,9 +1230,9 @@ Parse PR number from commit message, query GitHub for PR head commit, find assoc
 ## Technical Debt / Known Issues
 
 - [ ] `slippytest` package shows 0% coverage (test fixture, expected)
-- [ ] `NewClickHouseStoreFromConfig` at 0% coverage - requires real ClickHouse connection
-- [ ] `NewClient` in slippy at 18.2% coverage - requires real ClickHouse/GitHub connections
-- [ ] `chcol.JSON` mocking limitations - step_details timestamp parsing cannot be unit tested (requires integration tests)
+- [x] ~~`NewClickHouseStoreFromConfig` at 0% coverage - requires real ClickHouse connection~~ - moot: removed in DEVOPS-343
+- [x] ~~`NewClient` in slippy at 18.2% coverage - requires real ClickHouse/GitHub connections~~ - moot: removed in DEVOPS-343
+- [x] ~~`chcol.JSON` mocking limitations - step_details timestamp parsing cannot be unit tested (requires integration tests)~~ - moot: the ClickHouse store was removed in DEVOPS-343
 
 ### Slippy State Machine Discrepancies
 

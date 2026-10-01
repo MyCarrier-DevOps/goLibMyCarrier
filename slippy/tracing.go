@@ -85,8 +85,8 @@ func applySpanOptions(opts ...SpanOption) *spanConfig {
 // ContextWithServiceName returns a context with the service name set for spans
 // started via the slippy tracing helpers.
 //
-// When spans are created (for example via StartSpan, StartOperationalSpan, or
-// internal helpers such as startRetrySpan), they will include this service name
+// When spans are created (for example via StartSpan or StartOperationalSpan), they
+// will include this service name
 // as an attribute, making it easier to identify which service generated the span
 // in APM tools.
 //
@@ -273,7 +273,7 @@ func StartSpan(
 // set via ContextWithServiceName.
 //
 // Use StartSpan for pipeline content spans (JobExecution, Held, TestExecution).
-// Use StartOperationalSpan for internal implementation spans (UpdateStep, AppendHistory, hydrateSlip).
+// Use StartOperationalSpan for internal implementation spans (UpdateStep, AppendHistory).
 //
 //nolint:spancheck // Caller is responsible for calling span.End() - this is the API contract
 func StartOperationalSpan(
@@ -317,128 +317,6 @@ func StartOperationalSpan(
 	newCtx, span := tracer().Start(freshCtx, operationName, traceOpts...)
 
 	return newCtx, span
-}
-
-// RetrySpan represents a traced retry operation with metrics collection.
-type RetrySpan struct {
-	ctx           context.Context
-	span          trace.Span
-	operationName string
-	attempts      int
-	totalBackoff  int64 // milliseconds
-}
-
-// startRetrySpan begins a new traced retry operation in an OPERATIONAL trace.
-// This creates spans in a separate trace from the pipeline content, keeping
-// operational details (retries, version conflicts, etc.) out of the main pipeline trace.
-//
-// The correlation ID is stored as a searchable attribute (not as the trace ID),
-// allowing operational traces to be correlated with pipeline traces when debugging.
-//
-// The returned RetrySpan wraps the span and caller must call EndSuccess() or EndError().
-//
-// Span is wrapped in RetrySpan; caller calls EndSuccess/EndError which calls span.End()
-func startRetrySpan(ctx context.Context, operationName, correlationID string) *RetrySpan {
-	// Create an operational span that is NOT a child of the pipeline trace.
-	// This keeps operational spans (UpdateStep, AppendHistory, etc.) separate
-	// from pipeline content spans (JobExecution, Held, TestExecution).
-	ctx, span := StartOperationalSpan(ctx, operationName, correlationID)
-
-	span.SetAttributes(
-		attribute.String("slippy.operation", operationName),
-	)
-
-	return &RetrySpan{
-		ctx:           ctx,
-		span:          span,
-		operationName: operationName,
-		attempts:      0,
-		totalBackoff:  0,
-	}
-}
-
-// Context returns the context with the span attached.
-func (r *RetrySpan) Context() context.Context {
-	return r.ctx
-}
-
-// RecordAttempt records a retry attempt and the backoff duration that will follow.
-func (r *RetrySpan) RecordAttempt(backoffMs int64) {
-	r.attempts++
-	r.totalBackoff += backoffMs
-
-	// Add an event for each retry attempt
-	r.span.AddEvent("retry_attempt",
-		trace.WithAttributes(
-			attribute.Int("attempt_number", r.attempts),
-			attribute.Int64("backoff_ms", backoffMs),
-			attribute.Int64("total_backoff_ms", r.totalBackoff),
-		),
-	)
-}
-
-// RecordVersionConflict records a version conflict error.
-func (r *RetrySpan) RecordVersionConflict(expectedVersion, actualVersion int) {
-	r.span.AddEvent("version_conflict",
-		trace.WithAttributes(
-			attribute.Int("expected_version", expectedVersion),
-			attribute.Int("actual_version", actualVersion),
-		),
-	)
-}
-
-// EndSuccess marks the operation as successful and ends the span.
-func (r *RetrySpan) EndSuccess() {
-	r.span.SetAttributes(
-		attribute.Int("slippy.retry.total_attempts", r.attempts),
-		attribute.Int64("slippy.retry.total_backoff_ms", r.totalBackoff),
-		attribute.Bool("slippy.retry.succeeded", true),
-	)
-	r.span.SetStatus(codes.Ok, "operation succeeded")
-	r.span.End()
-}
-
-// EndError marks the operation as failed and ends the span.
-func (r *RetrySpan) EndError(err error) {
-	r.span.SetAttributes(
-		attribute.Int("slippy.retry.total_attempts", r.attempts),
-		attribute.Int64("slippy.retry.total_backoff_ms", r.totalBackoff),
-		attribute.Bool("slippy.retry.succeeded", false),
-	)
-	r.span.RecordError(err)
-	r.span.SetStatus(codes.Error, err.Error())
-	r.span.End()
-}
-
-// EndWithStatus ends the span with a custom status.
-func (r *RetrySpan) EndWithStatus(succeeded bool, message string) {
-	r.span.SetAttributes(
-		attribute.Int("slippy.retry.total_attempts", r.attempts),
-		attribute.Int64("slippy.retry.total_backoff_ms", r.totalBackoff),
-		attribute.Bool("slippy.retry.succeeded", succeeded),
-	)
-	if succeeded {
-		r.span.SetStatus(codes.Ok, message)
-	} else {
-		r.span.SetStatus(codes.Error, message)
-	}
-	r.span.End()
-}
-
-// AddAttribute adds a custom attribute to the span.
-func (r *RetrySpan) AddAttribute(key string, value interface{}) {
-	switch v := value.(type) {
-	case string:
-		r.span.SetAttributes(attribute.String(key, v))
-	case int:
-		r.span.SetAttributes(attribute.Int(key, v))
-	case int64:
-		r.span.SetAttributes(attribute.Int64(key, v))
-	case bool:
-		r.span.SetAttributes(attribute.Bool(key, v))
-	case float64:
-		r.span.SetAttributes(attribute.Float64(key, v))
-	}
 }
 
 // RecordJobExecutionSpan creates a synthetic span representing the job execution duration.

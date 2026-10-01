@@ -1,7 +1,7 @@
 // Package slippyapi provides lightweight helpers for talking to the
 // slippy-api HTTP service. It is intentionally separate from the
 // goLibMyCarrier/slippy package — that one is the slippy state-machine
-// library and pulls in ClickHouse, GitHub, and pipeline-config deps.
+// library and pulls in Postgres (pgx), GitHub, and pipeline-config deps.
 // Consumers that only need to discover the slippy-api URL (CLI tools,
 // migrators, deploy-race checks, push-event parsers) import this
 // stdlib-only package instead.
@@ -55,8 +55,7 @@ var ErrNotConfigured = errors.New("slippyapi: not configured (K8S_NAMESPACE unse
 //
 // The returned URL never ends with a trailing slash.
 //
-// Note: this allow-list is intentionally narrower than slippy/config.go's
-// K8S_NAMESPACE classification; sibling-package namespaces like `feature-*`
+// Note: this allow-list is intentionally narrow; namespaces like `feature-*`
 // or `*-dev` will error here. Operators on those namespaces must set
 // SLIPPY_API_URL explicitly.
 //

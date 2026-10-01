@@ -16,6 +16,27 @@ This document provides guidance for AI-assisted development of the slippy routin
 
 ## Breaking changes
 
+**DEVOPS-343 (v1.5.0) removed the ClickHouse slip store and everything only it used.**
+Postgres has been the only operational slip store since DEVOPS-127, and nothing outside this
+package constructed the ClickHouse one. Removed from the exported API:
+
+| Removed | Use instead |
+|---|---|
+| `NewClient(Config)` | `NewClientWithDependencies(store, github, config)`, with `NewPostgresStore(pool, pipelineConfig, logger)` and `NewGitHubClient(config.GitHubConfig(), logger)` |
+| `ClickHouseStore`, `ClickHouseStoreOptions`, `NewClickHouseStoreFromConfig`, `NewClickHouseStoreFromSession`, `NewClickHouseStoreFromConn` | `PostgresStore` |
+| `RunMigrations`, `ValidateSchema`, `GetCurrentSchemaVersion`, `GetPendingMigrations`, `MigrateOptions`, `DynamicMigrationManager`, `DynamicMigration`, `NewDynamicMigrationManager`, `GetDynamicMigrations`, `GetDynamicEnsurers`, `GetDynamicMigrationVersion` | `RunPostgresMigrations`, `ValidatePostgresSchema`, `GetPostgresDynamicEnsurers`, `GetPostgresDynamicMigrationVersion`; `MigrateResult` is unchanged |
+| `SlipScanner`, `NewSlipScanner`, `SlipQueryBuilder`, `NewSlipQueryBuilder`, `RetrySpan` | nothing; they were ClickHouse row plumbing |
+| `Config.ClickHouseConfig`, `Config.Database`, `Config.SkipMigrations`, `Config.WithDatabase`, `Config.Validate`, `Config.ValidateMinimal`; `ConfigFromEnv` no longer reads `CLICKHOUSE_*` or `SLIPPY_DATABASE` | build the store yourself and inject it. `ConfigFromEnv` leaves `PipelineConfig` nil when `SLIPPY_PIPELINE_CONFIG` fails to load; call `LoadPipelineConfig` to see why. `Validate`'s non-ClickHouse checks split two ways. The caller's job: `PipelineConfig` is non-nil, and the GitHub app ID and private key are set. `NewClientWithDependencies` corrects the rest instead of rejecting them: a `HoldTimeout`, `PollInterval` or `AncestryDepth` of 0 or less gets `DefaultConfig`'s value, and `AncestryMaxDepth` is raised to at least `AncestryDepth` (never to `DefaultConfig`'s 100, so a Config that leaves it unset never widens the ancestry search past `AncestryDepth`) |
+
+`Slip.Sign` and `Slip.Version` stay, deprecated and always zero, and `Slip` no longer carries
+`ch:` struct tags. `ErrRepaveUnsupported`, `ErrResetUnsupported` and `ErrClaimUnsupported`
+stay: they are the `SlipStore` contract for a store that cannot repave, reset or claim under a
+lock, and the push path still falls back on them. The module no longer requires
+`goLibMyCarrier/clickhouse`, `goLibMyCarrier/clickhousemigrator` or `clickhouse-go`. Two
+consumers import this module: slippy-api and slippy-migrator. slippy-migrator uses only surviving
+symbols and is unaffected. slippy-api, the only affected consumer, reads `DefaultConfig().Database`
+and `GetCurrentSchemaVersion`; its bump to v1.5.0 carries the change for both.
+
 **DEVOPS-367 added `ClaimSlip`, `ReleaseClaim`, `ProbeSchema` and `ResetSlipInPlace` to the
 exported `SlipStore` interface:**
 
@@ -27,10 +48,9 @@ ResetSlipInPlace(ctx context.Context, slip *Slip) error
 ```
 
 Same posture as `Repave` below: a downstream `SlipStore` implementation fails to compile
-until all four methods exist (the ClickHouse store returns `ErrClaimUnsupported` from the
-first two, `nil` from `ProbeSchema`, having no schema of its own, and `ErrResetUnsupported`
-from `ResetSlipInPlace`; the `slippytest.MockStore` and slippy-api's `mockSlipStore`
-implement them). `ResetSlipInPlace` is the in-place reset the push path used to perform with
+until all four methods exist (the `slippytest.MockStore` and slippy-api's `mockSlipStore`
+implement them; a store that cannot claim or reset under a lock returns `ErrClaimUnsupported`
+from the first two and `ErrResetUnsupported` from `ResetSlipInPlace`). `ResetSlipInPlace` is the in-place reset the push path used to perform with
 a bare `Create` — see "A push never resets a claimed row whose run is in flight" below for
 what it decides and why it has to be the store that decides it. The claim is a
 **flag**: `ClaimSlip` never writes `status`, and `ReleaseClaim` clears the claim only when
@@ -130,9 +150,9 @@ row `FOR UPDATE`, and either performs the upsert onto an unclaimed row or refuse
 authorises. `DecideReset(claimedFrom, inFlight) error` is the shared decision, beside
 `DecideClaim` and `DecideRelease`, so the store and both test doubles cannot drift. `inFlight`
 no longer changes the answer — any claim refuses — and is kept only so the refusal can tell an
-operator which shape it refused. The ClickHouse store returns
-`ErrResetUnsupported`, which the push path falls back from to a plain `Create` — it has no
-claim column, so there is no claim for the refused decision to protect.
+operator which shape it refused. A store that cannot take the lock returns
+`ErrResetUnsupported`, which the push path falls back from to a plain `Create` — with no
+claim column there is no claim for the refused decision to protect. PostgresStore never does.
 
 It replaced an unlocked `Create` gated on an unlocked `LoadByCommit`, with
 `resolveAndAbandonAncestors`' GitHub round trips in between — seconds during which a row read
@@ -253,7 +273,7 @@ redelivers, and the redelivery converges because the superseded row is still the
 Callers may also now observe two sentinel errors from this path: `ErrSlipWentLive` (the
 repave was rejected because the slip went live between the repave decision and the call —
 nothing was written, and the successor was NOT created) and `ErrRepaveUnsupported` (the
-store, e.g. `ClickHouseStore`, does not support repave and the caller should fall back to
+store does not support repave — PostgresStore always does — and the caller should fall back to
 abandon semantics, then create the successor separately). `Repave` can also return
 `ErrDuplicateSlip` once migration v5's unique index is applied. See `errors.go` for full contracts.
 
@@ -368,12 +388,9 @@ path instead.
 
 ### Key Characteristics
 
-- **Postgres (`PostgresStore`) is the operational slip store** (since DEVOPS-127). `ClickHouseStore`
-  remains in the codebase and implements the same `SlipStore` interface, but is not the write path
-  for production slips — e.g. `ClickHouseStore.Repave` (`clickhouse_store.go`) unconditionally
-  returns an error wrapping the `ErrRepaveUnsupported` sentinel (see `errors.go`), signaling
-  callers to fall back to abandon semantics instead of repave. ClickHouse has neither a
-  delete path nor transactions, so it cannot offer `Repave`'s atomicity contract at all.
+- **Postgres (`PostgresStore`) is the only slip store** (operational since DEVOPS-127; the
+  ClickHouse store was removed in DEVOPS-343, v1.5.0). The caller builds the `*pgxpool.Pool`,
+  passes it to `NewPostgresStore`, and injects the store with `NewClientWithDependencies`.
 - **Dynamic schema** generated from JSON pipeline configuration
 - **Pre-job/Post-job execution model** - bookend operations around existing jobs (does NOT wrap job execution)
 - **Correlation ID** is the single canonical identifier for a slip throughout its lifecycle
@@ -404,29 +421,25 @@ func handleError(logger Logger, err error) error {
 
 **DO NOT** create separate "WithGracefulFallback" wrapper functions. Shadow mode replaces this pattern entirely.
 
-### 2. Validate Schema Before Migrations
+### 2. Schema Migrations Run in the Migrator Job
 
-Always check the current schema version before running migrations:
+The Postgres schema is owned by the slippy-migrator Job, which calls `RunPostgresMigrations`.
+slippy-api does not migrate at startup; it probes the schema with `ProbeSchema` (below). A
+process that runs the migrations itself uses the same entry point:
 
 ```go
-// PATTERN: Validate-first migration logic
-currentVersion, err := slippy.GetCurrentSchemaVersion(ctx, conn, database)
+// PATTERN: run the Postgres migrations from a migrator process
+result, err := slippy.RunPostgresMigrations(ctx, pool, slippy.PostgresMigrateOptions{
+    PipelineConfig: pipelineConfig, // required: it generates the per-step columns
+    Logger:         migratorLogger, // a postgresmigrator.Logger; nil means no-op
+})
 if err != nil {
-    // Schema version table may not exist yet - expected on first run
-    currentVersion = 0
+    return handleError(logger, err)
 }
-
-targetVersion := slippy.GetDynamicMigrationVersion(pipelineConfig)
-
-if currentVersion < targetVersion {
-    // Only run migrations if schema is outdated
-    result, err := slippy.RunMigrations(ctx, conn, opts)
-    if err != nil {
-        return handleError(logger, err)
-    }
-} else {
-    logger.Info("Schema validation passed, no migrations needed")
-}
+logger.Info(ctx, "schema migrated", map[string]interface{}{
+    "from": result.StartVersion,
+    "to":   result.EndVersion,
+})
 ```
 
 **Migration v6 (`claimed_from`, DEVOPS-367) rollout order.** Every Postgres read path
@@ -462,32 +475,61 @@ step (`POST /v1/slips/{id}/steps/{step}/complete`) and then release. A NON-termi
 also be ended with `POST /v1/slips/{id}/abandon`; an already-terminal one ignores that call
 (I4) and keeps its claim, so use the step-then-release route there. Then re-run the down.
 
+**Released core migrations are immutable.** postgresmigrator applies only the versions above
+the one a database has recorded, so an edit to a released migration never reaches an existing
+database; to change the schema, add a new version. `TestReleasedCoreMigrationsAreImmutable`
+(`status_test.go`) pins the SHA-256 of each released core migration's UpSQL in
+`releasedCoreMigrationDigests`. The merge that adds a core migration tags a release, so add
+its digest in the PR that adds it. That PR also updates the count pins, which check the
+migration count or the latest version: `TestUniquenessMigration_V5` and
+`TestClaimedFromMigration_V6` in `postgres_migrations_test.go`, and
+`TestUniquenessMigration_V5_Integration` and `TestClaimedFromMigration_V6_Integration` in the
+integration suites.
+
 ### 3. Client Initialization Pattern
 
 Initialize the slippy client early in the application lifecycle, with shadow mode controlling error handling:
 
 ```go
 // PATTERN: Client initialization with shadow mode
-func InitializeSlippy(ctx context.Context, logger Logger) (*slippy.Client, error) {
+func InitializeSlippy(ctx context.Context, pool *pgxpool.Pool, logger Logger) (*slippy.Client, error) {
     if !IsSlippyEnabled() {
         logger.Info("Slippy disabled (SLIPPY_PIPELINE_CONFIG not set)")
-        return nil, nil  // Disabled is not an error
+        return nil, nil // Disabled is not an error
     }
 
     cfg := slippy.ConfigFromEnv()
+    pipelineConfig, err := slippy.LoadPipelineConfig() // ConfigFromEnv leaves it nil on error
+    if err != nil {
+        return handleInitError(logger, err) // Shadow mode determines blocking
+    }
+    cfg.PipelineConfig = pipelineConfig
+    if cfg.GitHubAppID == 0 {
+        return handleInitError(logger, fmt.Errorf(
+            "SLIPPY_GITHUB_APP_ID must be set to the GitHub App's numeric ID"))
+    }
+    if cfg.GitHubPrivateKey == "" {
+        return handleInitError(logger, fmt.Errorf(
+            "SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)"))
+    }
+    // No check of the durations or depths: NewClientWithDependencies gives a HoldTimeout,
+    // PollInterval or AncestryDepth of 0 or less its default and raises AncestryMaxDepth to
+    // at least AncestryDepth.
 
-    if err := cfg.Validate(); err != nil {
-        return handleInitError(logger, err)  // Shadow mode determines blocking
+    store, err := slippy.NewPostgresStore(pool, pipelineConfig, cfg.Logger)
+    if err != nil {
+        return handleInitError(logger, err)
+    }
+    if err := store.ProbeSchema(ctx); err != nil { // ErrSchemaBehind: the migrator has not run
+        return handleInitError(logger, err)
     }
 
-    // ... validation and migration logic ...
-
-    client, err := slippy.NewClient(cfg)
+    github, err := slippy.NewGitHubClient(cfg.GitHubConfig(), cfg.Logger)
     if err != nil {
         return handleInitError(logger, err)
     }
 
-    return client, nil
+    return slippy.NewClientWithDependencies(store, github, cfg), nil
 }
 ```
 
@@ -527,27 +569,18 @@ type SlipPushData struct {
 
 ## Environment Variables
 
-**Postgres is the operational slip store (see Key Characteristics above), but slippy does
-NOT read Postgres connection settings itself.** `NewPostgresStore(pool, config, logger)`
-takes an already-built `*pgxpool.Pool` — the caller constructs and injects it. The tables
-below (`CLICKHOUSE_*`, `SLIPPY_*`) are consumed by `slippy.ConfigFromEnv()`/`NewClient`,
-the ClickHouse-backed path; they say nothing about how a deployment provisions Postgres.
-For that, see the sibling `goLibMyCarrier/postgres` module: it provides a
-`POSTGRES_*`-prefixed env config (`PostgresLoadConfig`: `POSTGRES_HOSTNAME`,
-`POSTGRES_USERNAME`, `POSTGRES_PASSWORD`, `POSTGRES_DATABASE`, `POSTGRES_PORT`,
-`POSTGRES_SSLMODE`, plus pool/timeout tunables) and a pooled session helper
-(`session.go`), mirroring this package's `clickhouse` config shape — the designed
-counterpart for building the pool a caller then passes to `NewPostgresStore`.
+**slippy does not read store connection settings.** `NewPostgresStore(pool, config, logger)`
+takes an already-built `*pgxpool.Pool`; the caller constructs and injects it. For that, see the
+sibling `goLibMyCarrier/postgres` module: it provides a `POSTGRES_*`-prefixed env config
+(`PostgresLoadConfig`: `POSTGRES_HOSTNAME`, `POSTGRES_USERNAME`, `POSTGRES_PASSWORD`,
+`POSTGRES_DATABASE`, `POSTGRES_PORT`, `POSTGRES_SSLMODE`, plus pool/timeout tunables) and a
+pooled session helper (`session.go`). The variables below are read by `slippy.ConfigFromEnv()`
+and `slippy.LoadPipelineConfig()`.
 
-### Required for Slippy Operation (ClickHouse-backed `NewClient` path only)
+### Required for Slippy Operation
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `CLICKHOUSE_HOSTNAME` | ClickHouse host | `clickhouse.example.com` |
-| `CLICKHOUSE_PORT` | ClickHouse port | `9440` |
-| `CLICKHOUSE_USERNAME` | ClickHouse user | `slippy` |
-| `CLICKHOUSE_PASSWORD` | ClickHouse password | `***` |
-| `CLICKHOUSE_DATABASE` | ClickHouse database | `ci` |
 | `SLIPPY_PIPELINE_CONFIG` | Pipeline JSON (path or raw) | `/config/pipeline.json` |
 | `SLIPPY_GITHUB_APP_ID` | GitHub App ID | `12345` |
 | `SLIPPY_GITHUB_APP_PRIVATE_KEY` | Private key (PEM or path) | `/secrets/key.pem` |
@@ -557,11 +590,10 @@ counterpart for building the pool a caller then passes to `NewPostgresStore`.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `SLIPPY_SHADOW_MODE` | Enable shadow mode | `false` |
-| `SLIPPY_DATABASE` | Database name | `ci` |
 | `SLIPPY_HOLD_TIMEOUT` | Max wait time | `60m` |
 | `SLIPPY_POLL_INTERVAL` | Prereq check interval | `60s` |
-| `SLIPPY_ANCESTRY_DEPTH` | Commits to check | `20` |
-| `CLICKHOUSE_SKIP_VERIFY` | Skip TLS verification | `false` |
+| `SLIPPY_ANCESTRY_DEPTH` | Commits to check | `25` |
+| `SLIPPY_ANCESTRY_MAX_DEPTH` | Max depth for progressive ancestry search | `100` |
 | `SLIPPY_GITHUB_ENTERPRISE_URL` | GHE base URL | (github.com) |
 
 ### Enabling Slippy
@@ -575,10 +607,35 @@ Slippy is enabled when `SLIPPY_PIPELINE_CONFIG` is set. If not set, slippy opera
 ### Client Creation
 
 ```go
-// From environment
+// Production: build the store over your own pool, then inject it (see pattern 3 above)
 cfg := slippy.ConfigFromEnv()
-client, err := slippy.NewClient(cfg)
+pipelineConfig, err := slippy.LoadPipelineConfig() // ConfigFromEnv leaves it nil on error
+if err != nil {
+    return err
+}
+cfg.PipelineConfig = pipelineConfig
+if cfg.GitHubAppID == 0 {
+    return fmt.Errorf("SLIPPY_GITHUB_APP_ID must be set to the GitHub App's numeric ID")
+}
+if cfg.GitHubPrivateKey == "" {
+    return fmt.Errorf("SLIPPY_GITHUB_APP_PRIVATE_KEY must be set (PEM content or a key file path)")
+}
+// No check of the durations or depths: NewClientWithDependencies gives a HoldTimeout,
+// PollInterval or AncestryDepth of 0 or less its default and raises AncestryMaxDepth to at
+// least AncestryDepth.
 
+store, err := slippy.NewPostgresStore(pool, cfg.PipelineConfig, cfg.Logger)
+if err != nil {
+    return err
+}
+github, err := slippy.NewGitHubClient(cfg.GitHubConfig(), cfg.Logger)
+if err != nil {
+    return err
+}
+client := slippy.NewClientWithDependencies(store, github, cfg)
+```
+
+```go
 // For testing with mocks
 client := slippy.NewClientWithDependencies(mockStore, mockGitHub, config)
 ```
@@ -694,27 +751,21 @@ slippy/
 ├── push.go             # CreateSlipForPush
 ├── resolve.go          # ResolveSlip (ancestry resolution)
 ├── status.go           # SlipStatus/StepStatus/PrereqStatus enums + predicates (IsTerminal, IsSuccess, IsFailure) only
-├── aggregate_status.go # computeAggregateStatus (component -> aggregate rollup shared by both stores)
+├── aggregate_status.go # computeAggregateStatus (component -> aggregate rollup)
 ├── steps.go            # UpdateStepWithStatus + wrappers (CompleteStep, FailStep, StartStep, ...)
 ├── history.go          # AppendHistoryEntry (state history convenience wrapper)
 ├── executor.go         # RunPreExecution/RunPostExecution; checkPipelineCompletion (pipeline-status derivation, recovery)
 ├── prereqs.go          # CheckPrerequisites, holds
 ├── hold.go             # WaitForPrerequisites
-├── migrations.go       # ClickHouse migration options/orchestration
-├── dynamic_migrations.go # Pipeline-config-based ClickHouse migrations
-├── schema_migrations.go # Versioned core schema migrations (table, materialized views)
 ├── pipeline_config.go  # Pipeline JSON parsing
-├── clickhouse_store.go # ClickHouse SlipStore implementation (not the operational store; see Key Characteristics)
-├── postgres_store.go   # PostgresStore type + pgxPool interface (the operational SlipStore, DEVOPS-127)
+├── postgres_store.go   # PostgresStore type + pgxPool interface (the SlipStore implementation)
 ├── postgres_store_reads.go   # PostgresStore read methods (FindByCommits, LoadByCommit, ResolveAncestry, ...)
 ├── postgres_store_updates.go # PostgresStore write methods (Update, Repave, ...) + SlipStore conformance assertion
 ├── postgres_migrate.go   # Postgres schema-migration options and expected-table checks
-├── postgres_migrations.go # PostgresDynamicMigrationManager (Postgres counterpart of DynamicMigrationManager)
+├── postgres_migrations.go # PostgresDynamicMigrationManager (config-driven Postgres schema)
 ├── github.go           # GitHub API implementation
 ├── errors.go           # Custom error types
 ├── columns.go          # Dynamic column generation
-├── query_builder.go    # SQL query building
-├── scanner.go          # Row scanning utilities
 ├── tracing.go          # OpenTelemetry span helpers
 ├── logger.go           # Logger interface adapter
 ├── slippytest/         # Test utilities package
@@ -760,10 +811,10 @@ func IsShadowMode() bool {
 1. **❌ Creating "WithGracefulFallback" wrappers** - Use shadow mode instead
 2. **❌ Hardcoding blocking/non-blocking behavior** - Let shadow mode control it
 3. **❌ Skipping nil client checks** - Client may be nil if slippy is disabled
-4. **❌ Running migrations without version check** - Always validate schema first
+4. **❌ Migrating from the serving process** - The migrator Job runs `RunPostgresMigrations`; services gate on `ProbeSchema`
 5. **❌ Importing types that create cycles** - Create local data structs
 6. **❌ Treating disabled slippy as an error** - Return nil, nil when disabled
-7. **❌ Forgetting to defer client.Close()** - Always clean up resources
+7. **❌ Calling or skipping client.Close() without asking who owns the pool** - `Client.Close` closes the store, and `PostgresStore.Close` closes the pool passed to `NewPostgresStore`. If the client owns that pool, `defer client.Close()`. If the pool is shared with other components, call neither; the pool's owner closes the pool once, after all of them are done with it. Pattern 3's `InitializeSlippy` takes its pool from its caller, so which rule applies there depends on who owns that pool
 
 ---
 

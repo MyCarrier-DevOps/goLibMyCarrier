@@ -497,29 +497,20 @@ func TestStateMachine_I4_CompletedSlipIgnoresRecoveryAttempts(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// I5: Materialization consistency — step columns must match event-log-derived status
+// I5: Materialization consistency — step columns must match the component-state rows
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // I5 states: routing_slips.<step>_status columns must always reflect the authoritative
-// status derived from the event log (argMax(status, timestamp) FROM slip_component_states).
-// A write-path bug can cause a stale clone of the prior row to overwrite the just-written
-// step status when the new row is not yet visible (ClickHouse async insert visibility gap
-// under VersionedCollapsingMergeTree without FINAL). The fix (bd issue goLibMyCarrier-nl3)
-// is to pass stepStatusOverride literals into insertAtomicStatusUpdate via
-// updateSlipStatusWithStepOverrides, so the INSERT SELECT uses the authoritative value
-// rather than cloning from a potentially-stale row.
+// status in slip_component_states. PostgresStore writes both under the slip's row lock in
+// one transaction, so neither can be seen without the other. These tests pin the part the
+// client owns: after a sequence of terminal step events, checkPipelineCompletion leaves
+// every step column at its authoritative value and derives slip.status from them.
 //
-// MOCK CAVEAT: MockStore does not implement slipStatusOverrideWriter, so
-// updateSlipStatusWithStepOverrides falls back to the standard UpdateSlipStatus path
-// (which is correct for the in-memory case — there is no async insert visibility gap
-// in a synchronous map). These tests therefore validate the WIRING CONTRACT: that
-// checkPipelineCompletion computes the correct final state and that override parameters
-// are constructed and threaded correctly. The actual stale-visibility race cannot be
-// reproduced with mocks. For the end-to-end race test, see:
-//   slippy/e2e_integration_test.go: TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog
-//   (build tag: integration)
+// They were written for the removed ClickHouse store (DEVOPS-343), whose async-insert
+// visibility gap needed the client to pass step-column overrides (bd issue
+// goLibMyCarrier-nl3); on MockStore they still pin the observable result.
 //
-// References: .github/STATE_MACHINE_V3.md §Invariants, bd issue goLibMyCarrier-nl3.
+// References: .github/STATE_MACHINE_V3.md §Invariants.
 
 // TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride verifies that when
 // checkPipelineCompletion is called after a primary step failure, the failing step's
@@ -555,13 +546,10 @@ func TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride(t *testing.T) {
 	}
 	store.AddSlip(slip)
 
-	// FailStep writes prod_alert_gate=failed then calls checkPipelineCompletion.
-	// checkPipelineCompletion detects the primary failure and calls
-	// updateSlipStatusWithStepOverrides(ctx, corrID, SlipStatusFailed,
-	//   stepStatusOverride{columnName: "prod_alert_gate_status", status: failed}).
-	// MockStore does not implement slipStatusOverrideWriter, so the fallback
-	// UpdateSlipStatus path fires — the contract under test is that slip.status
-	// ends up as failed and the step column value is preserved correctly.
+	// FailStep writes prod_alert_gate=failed then calls checkPipelineCompletion, which
+	// detects the primary failure and writes slip.status=failed through UpdateSlipStatus.
+	// The contract under test is that slip.status ends up as failed and the step column
+	// value is preserved correctly.
 	if err := client.FailStep(ctx, corrID, "prod_alert_gate", "", "alert threshold breached"); err != nil {
 		t.Fatalf("FailStep returned unexpected error: %v%s", err, stateMachineRef)
 	}
@@ -571,9 +559,8 @@ func TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride(t *testing.T) {
 		t.Fatalf("failed to load slip: %v%s", err, stateMachineRef)
 	}
 
-	// I5 contract (wiring): checkPipelineCompletion must pass the failing step's
-	// override into updateSlipStatusWithStepOverrides. Behavioral proof: the slip
-	// status must be failed, and the failing step column must retain its failed value.
+	// I5 contract: the slip status must be failed, and the failing step column must
+	// retain its failed value.
 	if loaded.Status != SlipStatusFailed {
 		t.Errorf("expected slip.status=%q after primary step failure, got %q%s",
 			SlipStatusFailed, loaded.Status, stateMachineRef)
@@ -600,18 +587,10 @@ func TestStateMachine_I5_AtomicStatusUpdateRespectsStepOverride(t *testing.T) {
 }
 
 // TestStateMachine_I5_StaleStepColumnNotPropagated verifies that sequential terminal
-// step events do not propagate a stale value for an earlier step's column. Each call
-// to checkPipelineCompletion must pass the correct set of step-column overrides so that
-// the authoritative status of every primary-failure step is preserved regardless of the
-// order in which terminal events arrive.
-//
-// MOCK CAVEAT: MockStore is synchronous; the stale-visibility race (ClickHouse async
-// insert gap) cannot manifest here. This test validates the contract: every
-// checkPipelineCompletion invocation must compute overrides for ALL current primary
-// failures, not just the step that triggered the call. Failure to include earlier steps
-// in the override set would, in a real ClickHouse backend, allow those columns to be
-// overwritten with a stale (pre-failure) value. See goLibMyCarrier-nl3 and
-// TestE2E_ConcurrentTerminalStepEvents_RoutingSlipsMatchesEventLog (integration tag).
+// step events do not propagate a stale value for an earlier step's column: the
+// authoritative status of every primary-failure step is preserved regardless of the
+// order in which terminal events arrive, and every checkPipelineCompletion call keeps
+// slip.status failed while any of them remains.
 //
 // Precondition: slip=in_progress, prod_alert_gate=running, prod_rollback=running,
 //
@@ -672,9 +651,7 @@ func TestStateMachine_I5_StaleStepColumnNotPropagated(t *testing.T) {
 
 	t.Run("step2_CompleteProdRollback", func(t *testing.T) {
 		// CompleteStep triggers checkPipelineCompletion again. prod_alert_gate is still a
-		// primary failure. The override set passed into updateSlipStatusWithStepOverrides
-		// must include prod_alert_gate_status=failed. In the real ClickHouse backend,
-		// omitting it would allow the INSERT SELECT to clone a stale (running) value.
+		// primary failure, so its column must keep its failed value.
 		if err := client.CompleteStep(ctx, corrID, "prod_rollback", ""); err != nil {
 			t.Fatalf("CompleteStep(prod_rollback) unexpected error: %v%s", err, stateMachineRef)
 		}

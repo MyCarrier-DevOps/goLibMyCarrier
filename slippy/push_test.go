@@ -230,14 +230,11 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 
 		// bd mycarrier-5dv5 (F1): handlePushRetry must reset push_parsed and append the
 		// state_history entry via a single atomic UpdateStepWithHistory call, not two
-		// separate UpdateStep + AppendHistory calls. Two separate calls would let
-		// AppendHistory's CLONE_DERIVED derive CTE race the just-written push_parsed
-		// event under ClickHouse async-insert visibility lag, falling back to a stale
-		// clone of push_parsed_status instead of the explicit stepStatusOverride that
-		// UpdateStepWithHistory's pure-step branch passes to appendHistoryWithOverrides.
+		// separate UpdateStep + AppendHistory calls, so the reset and its audit entry land
+		// together (one transaction on PostgresStore).
 		if store.UpdateStepWithHistoryCallCount != 1 {
 			t.Errorf("expected exactly 1 atomic UpdateStepWithHistory call for the push_parsed "+
-				"retry reset (override must be passed atomically, not via separate "+
+				"retry reset (the reset and its entry must land together, not via separate "+
 				"UpdateStep+AppendHistory calls), got %d", store.UpdateStepWithHistoryCallCount)
 		}
 		if len(store.UpdateStepCalls) != 1 {
@@ -1038,7 +1035,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		//
 		// This is a data-accuracy property, not a liveness one. An earlier version of this
 		// comment claimed the seeded rows kept the slip IsLive() and so forced later pushes
-		// down handlePushRetry; that chain does not exist. Neither store feeds these rows to
+		// down handlePushRetry; that chain does not exist. No store feeds these rows to
 		// computeAggregateStatus, and checkPipelineCompletion never reads Aggregates at all.
 		// The reporting-accuracy question lives in initializeSlipForPush's hasComponents
 		// gate, which is covered separately. Note that gate does not confer recoverability
@@ -1073,8 +1070,8 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		// detection.
 		//
 		// It would also pin a mechanism the code does not have, which is worse than adding
-		// nothing: neither store feeds these seeded rows to computeAggregateStatus (both
-		// aggregate only over components that have actually reported), and
+		// nothing: no store feeds these seeded rows to computeAggregateStatus (PostgresStore
+		// aggregates only over components that have actually reported), and
 		// checkPipelineCompletion never reads Aggregates at all — it terminates on
 		// Steps["prod_steady_state"] or a primary step failure. So an empty aggregate cannot
 		// end a slip or stop it being live. What this fix actually buys is data accuracy;
@@ -1254,54 +1251,6 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 		_, err := client.CreateSlipForPush(ctx, opts)
 		if err == nil {
 			t.Fatal("expected error from UpdateStep failure")
-		}
-	})
-
-	t.Run("retry - history write-back error is non-fatal", func(t *testing.T) {
-		// handlePushRetry routes through UpdateStepWithHistory, which adopts the real
-		// store's best-effort history write-back semantics (#75): the event/step-status
-		// write is already durable, so a history write-back failure is Warn-logged and
-		// swallowed, not propagated. The state_history audit entry for this transition is
-		// lost, but retry processing (and CreateSlipForPush) must still succeed. Event
-		// insert / gate-check failures (simulated by UpdateStepError, see the
-		// "retry - UpdateStep error" case above) still hard-fail.
-		store := NewMockStore()
-		github := NewMockGitHubAPI()
-		client := NewClientWithDependencies(store, github, Config{})
-
-		existingSlip := &Slip{
-			CorrelationID: "corr-push-hist-err",
-			Repository:    "owner/repo",
-			Branch:        "main",
-			CommitSHA:     "histerr123",
-			CreatedAt:     time.Now(),
-			UpdatedAt:     time.Now(),
-			Status:        SlipStatusInProgress,
-			Steps: map[string]Step{
-				"push_parsed": {Status: StepStatusFailed},
-			},
-		}
-		store.AddSlip(existingSlip)
-		store.AppendHistoryError = errors.New("history append failed")
-
-		opts := PushOptions{
-			CorrelationID: "new-corr",
-			Repository:    "owner/repo",
-			CommitSHA:     "histerr123",
-		}
-
-		result, err := client.CreateSlipForPush(ctx, opts)
-		if err != nil {
-			t.Fatalf("expected no error (history write-back failures are best-effort), got: %v", err)
-		}
-		if result == nil {
-			t.Fatal("expected a slip to be returned")
-		}
-		if len(store.SwallowedHistoryErrors) != 1 {
-			t.Errorf(
-				"expected the history write-back failure to be recorded as swallowed, got %d",
-				len(store.SwallowedHistoryErrors),
-			)
 		}
 	})
 
@@ -1816,10 +1765,9 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 	t.Run(
 		"B2: repave delete returns ErrRepaveUnsupported - falls back to AbandonSlip, fresh slip still created",
 		func(t *testing.T) {
-			// ClickHouse-backed stores implement no delete path (DEVOPS-127: Postgres is
-			// the operational slip store). NewClient still builds a ClickHouseStore
-			// unconditionally, so a CH-backed client's repave attempts hit this on every
-			// same-commit push. The fallback restores the pre-DEVOPS-231 behavior:
+			// A store with no delete path returns ErrRepaveUnsupported from Repave, so every
+			// same-commit push against it hits this (PostgresStore never does; the MockStore
+			// here is set to). The fallback restores the pre-DEVOPS-231 behavior:
 			// abandon the superseded slip instead of repaving it, then still create the
 			// fresh slip so the caller sees a new correlation_id and re-dispatches.
 			store := NewMockStore()
@@ -1865,7 +1813,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 			}
 			// D3.3 (DEVOPS-231 review): zero warnings are expected on this successful-create
 			// path. AbandonSlip succeeds here (the old slip is Failed, not terminal), and this
-			// fallback fires on EVERY same-commit push against a ClickHouse-backed client -
+			// fallback fires on EVERY same-commit push against a store that cannot repave -
 			// treating that as a Warning would misfire any consumer that alerts on
 			// len(result.Warnings) > 0 for what is a routine webhook redelivery. A Warning is
 			// only added when AbandonSlip itself fails (see the sibling "already terminal"
@@ -1919,7 +1867,7 @@ func TestClient_CreateSlipForPush(t *testing.T) {
 				}
 			}
 			if len(result.Warnings) != 0 {
-				t.Errorf("expected no warnings for the routine ClickHouse unsupported-repave case, got %d: %v",
+				t.Errorf("expected no warnings for the routine unsupported-repave case, got %d: %v",
 					len(result.Warnings), result.Warnings)
 			}
 		})
@@ -2609,7 +2557,7 @@ func TestClient_InitializeSlipForPush_MobileApp(t *testing.T) {
 
 	// CRITICAL: First step should be PENDING (not RUNNING) when it's an aggregate with zero components
 	// The step stays pending rather than reporting a start nothing will advance. It does NOT
-	// auto-complete — neither store feeds these seeded rows to computeAggregateStatus.
+	// auto-complete — no store feeds these seeded rows to computeAggregateStatus.
 	firstStepName := config.Steps[0].Name
 	if slip.Steps[firstStepName].Status != StepStatusPending {
 		t.Errorf(
@@ -2670,7 +2618,6 @@ func aggregateFirstTestConfig() *PipelineConfig {
 // With intent honoured for contents but not for the gate, a Nothing push carrying components
 // marks `builds` running, with a StartedAt, over an aggregate that is now EMPTY — reporting
 // work as in flight that will never report. Nothing advances such a step:
-// applyComponentStatesToAggregate returns early when no component reported, and
 // recomputeAggregate returns early on an empty active set.
 //
 // What this does NOT claim, because it is not true: that the gate makes the slip recoverable.
@@ -4142,7 +4089,7 @@ func TestClient_CreateSlipForPush_LinkWriteRouting(t *testing.T) {
 	})
 
 	t.Run("unsupported repave falls back to create plus a separate link write", func(t *testing.T) {
-		// A ClickHouse-backed client cannot repave, so it abandons the superseded slip and
+		// A client over a store that cannot repave abandons the superseded slip and
 		// then takes the fresh-create path — including that path's separate link write,
 		// since there is no transaction to put it in.
 		store := NewMockStore()
@@ -5496,9 +5443,6 @@ func TestDispatchIntentTelemetryIsEmitted(t *testing.T) {
 	// hypothetical — with the empty-run guard forced off, the push repaves instead, the repave
 	// line carries an identical trio, and all three guard-dedup subtests passed while site 1
 	// went unexercised.
-	//
-	// Also not capturingLogger.callsWithField: that matches only keys whose value is boolean
-	// true, which is wrong for dispatch_intent (a DispatchIntent) and silently matches nothing.
 	fieldsFor := func(t *testing.T, logger *capturingLogger, message string) map[string]interface{} {
 		t.Helper()
 		var found map[string]interface{}
