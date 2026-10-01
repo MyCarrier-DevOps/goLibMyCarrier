@@ -27,7 +27,12 @@ var (
 	ErrConflict = errors.New("argocd: conflict")
 )
 
-// APIError is returned for any ArgoCD HTTP answer with a status of 400 or above.
+// APIError is returned for an ArgoCD HTTP answer with a status of 400 or above
+// that is not retried: any status on an action POST, and on GETs every 4xx
+// except 429, plus 501. A GET still answered with 429, or with a status of 500
+// or above other than 501, after its retries returns the retry client's
+// "giving up after N attempt(s)" error instead: an untyped error with no Body,
+// whose text names the status only for statuses of 500 and above.
 // Body is the raw response body, typically grpc-gateway JSON such as
 // {"code":7,"message":"permission denied"}. Match it with errors.Is against
 // ErrPermissionDenied, ErrNotFound and ErrConflict, or with errors.As for
