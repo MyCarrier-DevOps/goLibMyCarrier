@@ -529,7 +529,8 @@ Sentinel errors match through `errors.Is`:
 _, err := client.GetApplicationWithContext(ctx, "my-application")
 switch {
 case errors.Is(err, argocdclient.ErrNotFound):
-    // the Application or resource does not exist
+    // the Application was deleted while the request was in flight; one already
+    // missing is reported as ErrPermissionDenied
 case errors.Is(err, argocdclient.ErrPermissionDenied):
     // the token may not read it, or the Application does not exist
 }
