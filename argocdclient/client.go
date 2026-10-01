@@ -56,8 +56,8 @@ func (c *Client) applicationURL(appName string) string {
 // should pass context.Background() explicitly if no deadline/cancellation is
 // desired. Internal helper; signature change is intentional and not part of the
 // public API.
-func (c *Client) doGET(ctx context.Context, url string) ([]byte, error) {
-	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", url, nil)
+func (c *Client) doGET(ctx context.Context, apiURL string) ([]byte, error) {
+	req, err := retryablehttp.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
@@ -86,8 +86,8 @@ func (c *Client) doGET(ctx context.Context, url string) ([]byte, error) {
 // can clear the next pause step), so a transport failure or 5xx must surface to
 // the caller instead of being replayed.
 // Returns the raw response body on success and *APIError for statuses of 400 and above.
-func (c *Client) doPOST(ctx context.Context, url string, body []byte) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+func (c *Client) doPOST(ctx context.Context, apiURL string, body []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("error creating request: %w", err)
 	}
