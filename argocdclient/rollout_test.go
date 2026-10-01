@@ -57,9 +57,9 @@ func TestCanaryWeight(t *testing.T) {
 			want:     100,
 		},
 		{
-			name:     "non canary strategy is fully promoted",
+			name:     "non canary strategy has no canary weight",
 			manifest: `{"spec":{"strategy":{"blueGreen":{}}},"status":{}}`,
-			want:     100,
+			want:     0,
 		},
 		{
 			name: "routing weights win at a current step",
