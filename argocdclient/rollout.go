@@ -117,9 +117,10 @@ type RolloutStatus struct {
 	CurrentStepIndex *int32
 	// Aborted is status.abort of the live Rollout.
 	Aborted bool
-	// CanaryWeight is the percentage of traffic on the canary: 0 when aborted; the max traffic
-	// weight when no canary step is current; otherwise the traffic-router weight when one is
-	// configured and reported, else the last setWeight at or before the current step.
+	// CanaryWeight is the percentage of traffic on the canary: 0 when aborted or when the Rollout
+	// has no canary strategy (blue-green); the max traffic weight when a canary strategy has no
+	// current step; otherwise the traffic-router weight when one is configured and reported, else
+	// the last setWeight at or before the current step.
 	CanaryWeight int32
 	// StepPluginStatuses is status.canary.stepPluginStatuses of the live Rollout.
 	StepPluginStatuses []StepPluginStatus
@@ -191,11 +192,15 @@ func canaryWeight(live liveRollout) int32 {
 	}
 
 	canary := live.Spec.Strategy.Canary
+	if canary == nil {
+		return 0
+	}
+
 	index := int32(0)
 	if live.Status.CurrentStepIndex != nil {
 		index = *live.Status.CurrentStepIndex
 	}
-	if canary == nil || len(canary.Steps) == 0 || int(index) >= len(canary.Steps) {
+	if len(canary.Steps) == 0 || int(index) >= len(canary.Steps) {
 		return maxTrafficWeight(canary)
 	}
 
