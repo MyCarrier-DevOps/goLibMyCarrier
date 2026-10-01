@@ -510,6 +510,17 @@ func TestListRolloutGroup_EmptyCorrelationID(t *testing.T) {
 	}
 }
 
+func TestListRolloutGroup_EmptyApplicationName(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+
+	if _, err := srv.client().ListRolloutGroup(context.Background(), "", fixtureGroupA); err == nil {
+		t.Fatal("expected error for empty application name")
+	}
+	if n := len(srv.recorded()); n != 0 {
+		t.Errorf("expected no HTTP calls, got %d", n)
+	}
+}
+
 // withUnmanagedRollout appends to the recorded tree a Rollout node without a uid, as ArgoCD
 // adds for a managed Rollout that has no live object.
 func withUnmanagedRollout(t *testing.T, tree, name string) string {
