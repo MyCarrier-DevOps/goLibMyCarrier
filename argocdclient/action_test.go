@@ -267,11 +267,16 @@ func TestRunResourceAction_Validation(t *testing.T) {
 		action ResourceAction
 	}{
 		{"empty name", ResourceRef{Group: "argoproj.io", Version: "v1alpha1", Kind: "Rollout"}, ActionAbort},
-		{"empty kind", ResourceRef{Version: "v1alpha1", Name: "x"}, ActionAbort},
-		{"empty version", ResourceRef{Kind: "Rollout", Name: "x"}, ActionAbort},
+		{"empty kind on an argoproj.io ref", withRef(func(r *ResourceRef) { r.Kind = "" }), ActionAbort},
+		{"empty version on a Rollout ref", withRef(func(r *ResourceRef) { r.Version = "" }), ActionAbort},
 		{"empty action", testRolloutRef, ""},
 		{
-			"kind other than Rollout",
+			"kind other than Rollout on an argoproj.io ref",
+			withRef(func(r *ResourceRef) { r.Kind = "AnalysisRun" }),
+			ActionAbort,
+		},
+		{
+			"apps Deployment",
 			withRef(func(r *ResourceRef) { r.Group, r.Kind = "apps", "Deployment" }),
 			ActionAbort,
 		},
