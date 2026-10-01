@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 )
 
 // ResourceAction names an Argo Rollouts action that ArgoCD can run on a live resource.
@@ -62,16 +61,9 @@ func (c *Client) runResourceAction(ctx context.Context, appName string, ref Reso
 		return errors.New("resource name, kind, version and action are required")
 	}
 
-	appPath := fmt.Sprintf("%s/api/v1/applications/%s", c.baseUrl, url.PathEscape(appName))
+	appPath := c.applicationURL(appName)
 
-	query := url.Values{
-		"namespace":    {ref.Namespace},
-		"resourceName": {ref.Name},
-		"version":      {ref.Version},
-		"group":        {ref.Group},
-		"kind":         {ref.Kind},
-	}
-	body, err := c.doGET(ctx, appPath+"/resource/actions?"+query.Encode())
+	body, err := c.doGET(ctx, appPath+"/resource/actions?"+ref.query().Encode())
 	if err != nil {
 		return fmt.Errorf("error listing actions for %s %s/%s: %w", ref.Kind, ref.Namespace, ref.Name, err)
 	}
