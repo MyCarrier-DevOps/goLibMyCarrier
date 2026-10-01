@@ -301,10 +301,13 @@ The call works in these steps:
 1. An empty `correlationID` returns an error; unlabeled Rollouts are never matched.
 2. It reads the Application's resource tree
    (`GET /api/v1/applications/{app}/resource-tree`) and keeps the nodes with group
-   `argoproj.io` and kind `Rollout`. Tree nodes carry no labels.
+   `argoproj.io` and kind `Rollout` that have a `uid`. Tree nodes carry no labels.
+   ArgoCD adds a node without a `uid` for a managed Rollout that does not exist in the
+   cluster (not yet created, rejected by admission, or deleted out of band).
 3. For each Rollout node it reads the live manifest
-   (`GET /api/v1/applications/{app}/resource`). A failure to read any live Rollout
-   fails the whole call.
+   (`GET /api/v1/applications/{app}/resource`). A Rollout with no live object (not yet
+   created, or deleted since ArgoCD last refreshed the tree) is skipped; any other
+   failure to read a live Rollout fails the whole call.
 4. It keeps the Rollouts whose label matches and returns them sorted by namespace,
    then name. When none match, the result is an empty, non-nil slice and the error is
    `nil`.
