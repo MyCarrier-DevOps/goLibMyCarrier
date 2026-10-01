@@ -331,7 +331,10 @@ error names the Rollout (`<namespace>/<name>`).
 
 ### CanaryWeight
 
-`CanaryWeight` follows the same precedence as `kubectl argo rollouts`:
+`CanaryWeight` is the traffic share of the canary. For a canary with traffic routing it is the
+weight the router reports, as `kubectl argo rollouts` shows it. Without traffic routing it is
+the current step's `setWeight` (the desired weight), whereas `kubectl argo rollouts` reports the
+ratio of available canary replicas. The precedence:
 
 1. The Rollout is aborted (`status.abort`): `0`.
 2. There is no current canary step, which means the Rollout has no canary steps or
