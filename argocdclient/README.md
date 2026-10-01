@@ -412,6 +412,10 @@ with only `InstanceDev` refuses actions for `mycarrier-frontend-prod`.
 
 ### Actions
 
+Only these four actions are accepted, and only on `argoproj.io` Rollouts (`Group` `argoproj.io`,
+`Kind` `Rollout`). Any other action or resource kind, such as `restart` on a Deployment, and an
+empty application name, are refused with an error before any HTTP call.
+
 | Constant | Action | Effect | Repeat-safe |
 |----------|--------|--------|-------------|
 | `ActionAbort` | `abort` | Sets `status.abort` on the Rollout | Yes |
