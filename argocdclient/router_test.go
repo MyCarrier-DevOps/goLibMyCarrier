@@ -124,3 +124,47 @@ func TestRouter_RunResourceAction_RoutesToOwningInstance(t *testing.T) {
 		})
 	}
 }
+
+func TestRouter_ListRolloutGroup(t *testing.T) {
+	dev := newRolloutServer(t, "suspended")
+	prod := newRolloutServer(t, "suspended")
+	router := NewRouter(map[Instance]*Config{
+		InstanceDev:  {ServerUrl: dev.URL, AuthToken: "dev-token"},
+		InstanceProd: {ServerUrl: prod.URL, AuthToken: "prod-token"},
+	})
+
+	got, err := router.ListRolloutGroup(context.Background(), "mycarrier-frontend-prod", fixtureGroupB)
+	if err != nil {
+		t.Fatalf("ListRolloutGroup: %v", err)
+	}
+	if len(got) != 1 || got[0].Ref.Name != "rt-other" {
+		t.Errorf("unexpected statuses %+v", got)
+	}
+	if n := len(dev.recorded()); n != 0 {
+		t.Errorf("expected no requests on the dev instance, got %d", n)
+	}
+	for _, r := range prod.recorded() {
+		if r.Auth != "Bearer prod-token" {
+			t.Errorf("Authorization = %q, want the prod token", r.Auth)
+		}
+	}
+	if n := len(prod.recorded()); n == 0 {
+		t.Error("expected requests on the prod instance")
+	}
+}
+
+func TestRouter_ListRolloutGroup_FailsClosed(t *testing.T) {
+	dev := newRolloutServer(t, "suspended")
+	router := NewRouter(map[Instance]*Config{
+		InstanceDev: {ServerUrl: dev.URL, AuthToken: "dev-token"},
+	})
+
+	_, err := router.ListRolloutGroup(context.Background(), "mycarrier-frontend-prod", fixtureGroupA)
+
+	if !errors.Is(err, ErrInstanceNotConfigured) {
+		t.Fatalf("expected ErrInstanceNotConfigured, got %v", err)
+	}
+	if n := len(dev.recorded()); n != 0 {
+		t.Errorf("expected no HTTP calls, got %d", n)
+	}
+}
