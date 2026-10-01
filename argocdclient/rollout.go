@@ -78,12 +78,26 @@ const (
 	StepPluginPhaseError      StepPluginPhase = "Error"
 )
 
+// StepPluginOperation is the operation a step plugin entry records.
+type StepPluginOperation string
+
+// Step plugin operations.
+const (
+	StepPluginOperationRun       StepPluginOperation = "Run"
+	StepPluginOperationTerminate StepPluginOperation = "Terminate"
+	StepPluginOperationAbort     StepPluginOperation = "Abort"
+)
+
 // StepPluginStatus is one entry of a Rollout's status.canary.stepPluginStatuses.
+// Argo Rollouts keeps one entry per step and operation: an abort or a full promotion adds an
+// Abort or Terminate entry next to the step's Run entry. An empty Phase on a Run entry means
+// the plugin is globally disabled.
 type StepPluginStatus struct {
-	Index   int32           `json:"index"`
-	Name    string          `json:"name"`
-	Phase   StepPluginPhase `json:"phase"`
-	Message string          `json:"message"`
+	Index     int32               `json:"index"`
+	Name      string              `json:"name"`
+	Operation StepPluginOperation `json:"operation"`
+	Phase     StepPluginPhase     `json:"phase"`
+	Message   string              `json:"message"`
 }
 
 // RolloutStatus is the combined state of one Rollout in an Application.
