@@ -1,6 +1,7 @@
 package slippy
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -416,5 +417,20 @@ func TestStep_ApplyStatusTransition(t *testing.T) {
 				t.Error("CompletedAt should not be set")
 			}
 		})
+	}
+}
+
+// TestSlipTypes_CarryNoClickHouseColumnTags pins that no field of Slip or componentStateRow
+// carries a ch: struct tag. The ClickHouse store that read those tags is gone (DEVOPS-343),
+// and a tag left behind reads as a live column mapping.
+func TestSlipTypes_CarryNoClickHouseColumnTags(t *testing.T) {
+	for _, v := range []any{Slip{}, componentStateRow{}} {
+		typ := reflect.TypeOf(v)
+		for i := range typ.NumField() {
+			f := typ.Field(i)
+			if tag, ok := f.Tag.Lookup("ch"); ok {
+				t.Errorf("%s.%s carries a ch:%q tag", typ.Name(), f.Name, tag)
+			}
+		}
 	}
 }

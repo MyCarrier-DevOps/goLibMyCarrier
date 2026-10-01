@@ -1,23 +1,15 @@
 package slippy
 
 import (
-	"fmt"
 	"os"
 	"strconv"
-	"strings"
 	"time"
-
-	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
-// Config holds configuration for the slippy client.
-// It includes connection settings, authentication, and behavior options.
+// Config holds configuration for the slippy client: pipeline definition, GitHub App
+// authentication, and behaviour options. It carries no store connection settings; the
+// caller builds the store and passes it to NewClientWithDependencies.
 type Config struct {
-	// ClickHouseConfig holds the ClickHouse connection parameters.
-	// Use clickhouse.ClickhouseLoadConfig() to load from environment variables,
-	// or construct manually with hostname, port, username, password, database, and skipVerify.
-	ClickHouseConfig *ch.ClickhouseConfig
-
 	// PipelineConfig holds the pipeline step configuration.
 	// This defines all steps, their prerequisites, and aggregation relationships.
 	// Load via LoadPipelineConfig() from SLIPPY_PIPELINE_CONFIG env var,
@@ -50,33 +42,11 @@ type Config struct {
 	// If no ancestor is found, slippy will progressively increase up to AncestryMaxDepth.
 	AncestryDepth int
 
-	// AncestryMaxDepth is the maximum number of commits to check when no ancestor is found (default: 100)
+	// AncestryMaxDepth is the maximum number of commits to check when no ancestor is found
+	// (DefaultConfig and ConfigFromEnv: 100). NewClientWithDependencies raises an unset or smaller
+	// value to AncestryDepth, and the search then does not widen.
 	// This handles cases where many commits occur between slip creations.
 	AncestryMaxDepth int
-
-	// Database is the ClickHouse database name (default: "ci")
-	Database string
-
-	// SkipMigrations if true, skips running migrations during store initialization.
-	// Set to true when the calling application trusts that another service
-	// (e.g., pushhookparser) has already run the necessary migrations.
-	SkipMigrations bool
-
-	// Internal fields for error tracking
-	clickhouseLoadErr error // Error from ClickHouse config loading
-	pipelineLoadErr   error // Error from pipeline config loading
-}
-
-// defaultDatabase returns the database name based on the K8S_NAMESPACE environment variable.
-// If K8S_NAMESPACE ends with "-test" or "-dev", starts with "feature", or is exactly "dev",
-// it returns "ci_test"; otherwise "ci".
-func defaultDatabase() string {
-	ns := os.Getenv("K8S_NAMESPACE")
-	if strings.HasSuffix(ns, "-test") || strings.HasSuffix(ns, "-dev") || strings.HasPrefix(ns, "feature") ||
-		ns == "dev" {
-		return "ci_test"
-	}
-	return "ci"
 }
 
 // DefaultConfig returns a Config with sensible default values.
@@ -86,15 +56,13 @@ func DefaultConfig() Config {
 		PollInterval:     60 * time.Second,
 		AncestryDepth:    25,
 		AncestryMaxDepth: 100,
-		Database:         defaultDatabase(),
 	}
 }
 
 // ConfigFromEnv loads configuration from environment variables.
 // Environment variables:
-//   - CLICKHOUSE_HOSTNAME, CLICKHOUSE_PORT, CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD,
-//     CLICKHOUSE_DATABASE, CLICKHOUSE_SKIP_VERIFY: ClickHouse connection settings
-//   - SLIPPY_PIPELINE_CONFIG: Pipeline configuration (file path or raw JSON)
+//   - SLIPPY_PIPELINE_CONFIG: Pipeline configuration (file path or raw JSON). PipelineConfig
+//     is left nil when it is unset or fails to load; call LoadPipelineConfig for the error.
 //   - SLIPPY_GITHUB_APP_ID: GitHub App ID
 //   - SLIPPY_GITHUB_APP_PRIVATE_KEY: Private key (PEM content or file path)
 //   - SLIPPY_GITHUB_ENTERPRISE_URL: GitHub Enterprise base URL (optional)
@@ -103,24 +71,12 @@ func DefaultConfig() Config {
 //   - SLIPPY_SHADOW_MODE: Set to "true" for shadow mode
 //   - SLIPPY_ANCESTRY_DEPTH: Initial ancestry search depth (default: 25)
 //   - SLIPPY_ANCESTRY_MAX_DEPTH: Max depth for progressive search (default: 100)
-//   - SLIPPY_DATABASE: ClickHouse database name (default: "ci")
 func ConfigFromEnv() Config {
 	cfg := DefaultConfig()
 
-	// ClickHouse - use the standard clickhouse config loader
-	chConfig, err := ch.ClickhouseLoadConfig()
-	if err == nil {
-		cfg.ClickHouseConfig = chConfig
-	} else {
-		cfg.clickhouseLoadErr = err
-	}
-
 	// Pipeline configuration
-	pipelineConfig, err := LoadPipelineConfig()
-	if err == nil {
+	if pipelineConfig, err := LoadPipelineConfig(); err == nil {
 		cfg.PipelineConfig = pipelineConfig
-	} else {
-		cfg.pipelineLoadErr = err
 	}
 
 	// GitHub App authentication
@@ -153,83 +109,7 @@ func ConfigFromEnv() Config {
 		}
 	}
 
-	if database := os.Getenv("SLIPPY_DATABASE"); database != "" {
-		cfg.Database = database
-	}
-
 	return cfg
-}
-
-// Validate checks that all required configuration is present and valid.
-// Returns an error describing any missing or invalid settings.
-func (c Config) Validate() error {
-	if c.ClickHouseConfig == nil {
-		if c.clickhouseLoadErr != nil {
-			return fmt.Errorf(
-				"%w: ClickHouse configuration failed to load: %w (check CLICKHOUSE_HOSTNAME, CLICKHOUSE_PORT, CLICKHOUSE_USERNAME, CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE env vars)",
-				ErrInvalidConfiguration,
-				c.clickhouseLoadErr,
-			)
-		}
-		return fmt.Errorf(
-			"%w: ClickHouseConfig is required (check CLICKHOUSE_* environment variables)",
-			ErrInvalidConfiguration,
-		)
-	}
-	if err := ch.ClickhouseValidateConfig(c.ClickHouseConfig); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidConfiguration, err)
-	}
-	if c.PipelineConfig == nil {
-		if c.pipelineLoadErr != nil {
-			return fmt.Errorf(
-				"%w: Pipeline configuration failed to load: %w (check SLIPPY_PIPELINE_CONFIG env var)",
-				ErrInvalidConfiguration,
-				c.pipelineLoadErr,
-			)
-		}
-		return fmt.Errorf(
-			"%w: PipelineConfig is required (set SLIPPY_PIPELINE_CONFIG)",
-			ErrInvalidConfiguration,
-		)
-	}
-	if c.GitHubAppID == 0 {
-		return fmt.Errorf(
-			"%w: GitHubAppID is required (set SLIPPY_GITHUB_APP_ID)",
-			ErrInvalidConfiguration,
-		)
-	}
-	if c.GitHubPrivateKey == "" {
-		return fmt.Errorf(
-			"%w: GitHubPrivateKey is required (set SLIPPY_GITHUB_APP_PRIVATE_KEY)",
-			ErrInvalidConfiguration,
-		)
-	}
-	if c.HoldTimeout <= 0 {
-		return fmt.Errorf("%w: HoldTimeout must be positive", ErrInvalidConfiguration)
-	}
-	if c.PollInterval <= 0 {
-		return fmt.Errorf("%w: PollInterval must be positive", ErrInvalidConfiguration)
-	}
-	if c.AncestryDepth <= 0 {
-		return fmt.Errorf("%w: AncestryDepth must be positive", ErrInvalidConfiguration)
-	}
-	if c.AncestryMaxDepth < c.AncestryDepth {
-		return fmt.Errorf("%w: AncestryMaxDepth (%d) must be >= AncestryDepth (%d)",
-			ErrInvalidConfiguration, c.AncestryMaxDepth, c.AncestryDepth)
-	}
-	return nil
-}
-
-// ValidateMinimal checks only the minimum required configuration.
-// This is useful when not all features are needed (e.g., GitHub auth for tests).
-func (c Config) ValidateMinimal() error {
-	if c.ClickHouseConfig == nil {
-		return fmt.Errorf("%w: ClickHouseConfig is required", ErrInvalidConfiguration)
-	}
-	if c.PipelineConfig == nil {
-		return fmt.Errorf("%w: PipelineConfig is required", ErrInvalidConfiguration)
-	}
-	return nil
 }
 
 // WithLogger returns a copy of the config with the specified logger.
@@ -247,12 +127,6 @@ func (c Config) WithShadowMode(enabled bool) Config {
 // WithPipelineConfig returns a copy of the config with the specified pipeline config.
 func (c Config) WithPipelineConfig(pipelineConfig *PipelineConfig) Config {
 	c.PipelineConfig = pipelineConfig
-	return c
-}
-
-// WithDatabase returns a copy of the config with the specified database name.
-func (c Config) WithDatabase(database string) Config {
-	c.Database = database
 	return c
 }
 

@@ -1,8 +1,8 @@
 package slippy
 
 // computeAggregateStatus determines an aggregate step's status from its component statuses,
-// and is the single source of truth shared by both the ClickHouse and Postgres stores (so the
-// two backends cannot drift). The aggregate is:
+// and is the single source of truth for that rule (PostgresStore.recomputeAggregate calls it),
+// so no caller can drift from it. The aggregate is:
 //   - "failed"    if any component has failed
 //   - "completed" if all components are completed (or skipped/other success)
 //   - "running"   if any component is running OR already completed (work is in progress)

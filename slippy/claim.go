@@ -643,8 +643,7 @@ func (c *Client) ReleaseClaim(
 
 // ProbeSchema is the readiness gate consumers reach through the abstraction they hold: it
 // checks the store's SELECT column list against the live schema and reports ErrSchemaBehind
-// when the database is behind this library. A store with no schema of its own (ClickHouse)
-// returns nil. See SlipStore.ProbeSchema.
+// when the database is behind this library. See SlipStore.ProbeSchema.
 func (c *Client) ProbeSchema(ctx context.Context) error {
 	return c.store.ProbeSchema(ctx)
 }

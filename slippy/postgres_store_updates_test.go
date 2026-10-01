@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -215,7 +216,7 @@ func TestPostgresStore_UpdateStep_InjectionSafe_UnknownStepSkipsColumn(t *testin
 	store, mock := newMockStore(t)
 	// A crafted / unknown pipeline step name must never be spliced into a column identifier.
 	// The component-state event is still recorded, but no routing_slips column is written
-	// (matching ClickHouse, which materializes only config-known columns). If the guard
+	// (only config-known columns are materialized). If the guard
 	// regressed, the store would issue an UPDATE that pgxmock has no expectation for and the
 	// test would fail.
 	const evil = "unit_tests_status = 'skipped', builds_status"
@@ -1233,4 +1234,232 @@ func TestPostgresStore_UpdateSlipStatus_NonTerminalNotFound(t *testing.T) {
 	require.ErrorIs(t,
 		store.UpdateSlipStatus(context.Background(), "nope", SlipStatusInProgress), ErrSlipNotFound)
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- I5 gate knobs: gateEnabled / freshnessWindow (moved from terminal_monotonicity_gate_test.go) ---
+
+func TestGateEnabled_Default(t *testing.T) {
+	// sentinel+unset ensures auto-restore even if the env var was set before this test.
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_GATE_ENABLED")
+	if !gateEnabled() {
+		t.Error("expected gate to be ON by default (fail-safe)")
+	}
+}
+
+func TestGateEnabled_ExplicitTrue(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "true")
+	if !gateEnabled() {
+		t.Error("expected gate enabled when SLIPPY_I5_GATE_ENABLED=true")
+	}
+}
+
+func TestGateEnabled_ExplicitFalse(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "false")
+	if gateEnabled() {
+		t.Error("expected gate disabled when SLIPPY_I5_GATE_ENABLED=false")
+	}
+}
+
+func TestGateEnabled_InvalidValue_FailSafeOn(t *testing.T) {
+	t.Setenv("SLIPPY_I5_GATE_ENABLED", "notabool")
+	if !gateEnabled() {
+		t.Error("expected gate to be ON (fail-safe) when env value is unparseable")
+	}
+}
+
+func TestFreshnessWindow_Default(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "__sentinel__")
+	os.Unsetenv("SLIPPY_I5_FRESHNESS_WINDOW_MS")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default %v, got %v", defaultFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+func TestFreshnessWindow_Custom(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "1500")
+	if got := freshnessWindow(); got != 1500*time.Millisecond {
+		t.Errorf("expected 1500ms, got %v", got)
+	}
+}
+
+func TestFreshnessWindow_Invalid_FallsBackToDefault(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "abc")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default on invalid value, got %v", got)
+	}
+}
+
+func TestFreshnessWindow_Zero_FallsBackToDefault(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "0")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default on zero value, got %v", got)
+	}
+}
+
+// TestFreshnessWindow_Overflow_ClampedNotNegative covers SF-4: a value large
+// enough that ms*time.Millisecond overflows int64 (producing a negative
+// duration and silently killing the gate) must be clamped to
+// maxFreshnessWindowMS instead of passed through raw.
+func TestFreshnessWindow_Overflow_ClampedNotNegative(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "10000000000000")
+	got := freshnessWindow()
+	if got < 0 {
+		t.Fatalf("freshnessWindow must never be negative, got %v", got)
+	}
+	if got != maxFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected clamp to %v (1h cap), got %v", maxFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+// TestFreshnessWindow_HugeButSubInt64_Clamped covers SF-4 for a value that is
+// large but does not itself overflow int64 as a raw integer — the overflow
+// only happens once multiplied by time.Millisecond. This must also clamp.
+func TestFreshnessWindow_HugeButSubInt64_Clamped(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "9999999999")
+	got := freshnessWindow()
+	if got != maxFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected clamp to %v (1h cap), got %v", maxFreshnessWindowMS*time.Millisecond, got)
+	}
+}
+
+// TestFreshnessWindow_AtoiOverflow_FallsBackToDefault covers a value whose
+// Atoi parse itself overflows int64 (strconv.Atoi returns an error in that
+// case), which must fall back to the read-time default rather than clamp,
+// since the value never successfully parses.
+func TestFreshnessWindow_AtoiOverflow_FallsBackToDefault(t *testing.T) {
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "99999999999999999999")
+	if got := freshnessWindow(); got != defaultFreshnessWindowMS*time.Millisecond {
+		t.Errorf("expected default on Atoi-overflow value, got %v", got)
+	}
+}
+
+// TestBuildComponentData_MessageOnlyForFailure verifies that state.Message is only
+// mapped to Error when the component's status is a failure. Non-failure statuses
+// (e.g. "running" with a progress note) must not produce an Error field.
+func TestBuildComponentData_MessageOnlyForFailure(t *testing.T) {
+	t.Run("failure with message sets Error", func(t *testing.T) {
+		state := componentStateRow{
+			Status:  string(StepStatusFailed),
+			Message: "build timeout",
+		}
+		got := buildComponentData("api", state)
+		if got.Error != "build timeout" {
+			t.Errorf("expected Error='build timeout', got %q", got.Error)
+		}
+	})
+
+	t.Run("running with message does not set Error", func(t *testing.T) {
+		state := componentStateRow{
+			Status:  string(StepStatusRunning),
+			Message: "building layer 3/5",
+		}
+		got := buildComponentData("api", state)
+		if got.Error != "" {
+			t.Errorf("expected empty Error for running status, got %q", got.Error)
+		}
+	})
+
+	t.Run("completed with message does not set Error", func(t *testing.T) {
+		state := componentStateRow{
+			Status:  string(StepStatusCompleted),
+			Message: "image pushed",
+		}
+		got := buildComponentData("api", state)
+		if got.Error != "" {
+			t.Errorf("expected empty Error for completed status, got %q", got.Error)
+		}
+	})
+}
+
+// TestUpdateExistingComponent_ClearsErrorOnNonFailure verifies that transitioning a
+// component away from a failure status clears any stale Error value.
+func TestUpdateExistingComponent_ClearsErrorOnNonFailure(t *testing.T) {
+	dest := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusFailed,
+		Error:     "previous error",
+	}
+	src := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusCompleted,
+		Error:     "", // retry succeeded — no new error
+	}
+	updateExistingComponent(&dest, src)
+	if dest.Error != "" {
+		t.Errorf("expected Error to be cleared on non-failure transition, got %q", dest.Error)
+	}
+	if dest.Status != StepStatusCompleted {
+		t.Errorf("expected status=completed, got %s", dest.Status)
+	}
+}
+
+// TestUpdateExistingComponent_PreservesErrorOnFailure verifies that a failure status
+// propagates the error message.
+func TestUpdateExistingComponent_PreservesErrorOnFailure(t *testing.T) {
+	dest := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusRunning,
+	}
+	src := ComponentStepData{
+		Component: "api",
+		Status:    StepStatusFailed,
+		Error:     "out of memory",
+	}
+	updateExistingComponent(&dest, src)
+	if dest.Error != "out of memory" {
+		t.Errorf("expected Error='out of memory', got %q", dest.Error)
+	}
+}
+
+// TestUpdateExistingComponent_CompletedAt_UpdatedOnRetry verifies that when a component
+// transitions from a terminal failure to a terminal success (retry scenario), CompletedAt
+// is updated to the later timestamp rather than keeping the stale failure timestamp.
+func TestUpdateExistingComponent_CompletedAt_UpdatedOnRetry(t *testing.T) {
+	failedTime := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
+	retryTime := time.Date(2026, 4, 2, 10, 5, 0, 0, time.UTC)
+
+	dest := ComponentStepData{
+		Component:   "api",
+		Status:      StepStatusFailed,
+		CompletedAt: &failedTime,
+	}
+	src := ComponentStepData{
+		Component:   "api",
+		Status:      StepStatusCompleted,
+		CompletedAt: &retryTime,
+	}
+	updateExistingComponent(&dest, src)
+	if dest.CompletedAt == nil {
+		t.Fatal("CompletedAt should not be nil after retry")
+	}
+	if !dest.CompletedAt.Equal(retryTime) {
+		t.Errorf("CompletedAt should be updated to retry time %v, got %v", retryTime, *dest.CompletedAt)
+	}
+	if dest.Status != StepStatusCompleted {
+		t.Errorf("expected status=completed, got %s", dest.Status)
+	}
+}
+
+// TestUpdateExistingComponent_CarriesImageTagAndKeepsFirstStartedAt pins the two merge rules
+// recomputeAggregate relies on when a component reports again: a non-empty ImageTag replaces
+// the stored one while an empty one keeps it, and StartedAt is filled once and never moved.
+func TestUpdateExistingComponent_CarriesImageTagAndKeepsFirstStartedAt(t *testing.T) {
+	first := time.Date(2026, 4, 2, 10, 0, 0, 0, time.UTC)
+	later := first.Add(5 * time.Minute)
+
+	dest := ComponentStepData{Component: "api", Status: StepStatusPending}
+	updateExistingComponent(&dest, ComponentStepData{
+		Component: "api", Status: StepStatusRunning, StartedAt: &first, ImageTag: "api:1",
+	})
+	require.NotNil(t, dest.StartedAt)
+	assert.True(t, dest.StartedAt.Equal(first), "StartedAt is filled from the first running report")
+	assert.Equal(t, "api:1", dest.ImageTag)
+
+	updateExistingComponent(&dest, ComponentStepData{Component: "api", Status: StepStatusRunning, StartedAt: &later})
+	assert.True(t, dest.StartedAt.Equal(first), "a later report must not move StartedAt")
+	assert.Equal(t, "api:1", dest.ImageTag, "an empty ImageTag keeps the stored one")
+
+	updateExistingComponent(&dest, ComponentStepData{Component: "api", Status: StepStatusRunning, ImageTag: "api:2"})
+	assert.Equal(t, "api:2", dest.ImageTag, "a non-empty ImageTag replaces the stored one")
 }

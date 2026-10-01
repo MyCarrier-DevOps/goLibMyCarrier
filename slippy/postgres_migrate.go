@@ -12,6 +12,21 @@ import (
 // slippyExpectedTables are the core tables the Postgres schema must contain.
 var slippyExpectedTables = []string{"routing_slips", "slip_component_states", "slip_ancestry"}
 
+// MigrateResult reports what a RunPostgresMigrations call did.
+type MigrateResult struct {
+	// StartVersion is the schema version before migration.
+	StartVersion int
+
+	// EndVersion is the schema version after migration.
+	EndVersion int
+
+	// MigrationsApplied is the number of migrations that were applied.
+	MigrationsApplied int
+
+	// Direction indicates whether migrations went "up" or "down".
+	Direction string
+}
+
 // PostgresMigrateOptions configures a Postgres migration run.
 type PostgresMigrateOptions struct {
 	// TargetVersion is the version to migrate to. 0 means "latest".
@@ -31,8 +46,7 @@ type PostgresMigrateOptions struct {
 // slippy_schema_version table if needed, applies pending core migrations, and runs the
 // config-driven ensurers. A PipelineConfig is required to generate the dynamic schema.
 //
-// This is the Postgres counterpart of RunMigrations (ClickHouse). It is intended to be
-// driven by the dedicated migrator Job, not by slippy-api at startup.
+// It is intended to be driven by the dedicated migrator Job, not by slippy-api at startup.
 func RunPostgresMigrations(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -120,7 +134,7 @@ func absInt(n int) int {
 }
 
 // ValidatePostgresSchema checks that the core tables exist. A PipelineConfig is required
-// to build the migrator, mirroring the ClickHouse ValidateSchema.
+// to build the migrator.
 func ValidatePostgresSchema(ctx context.Context, pool *pgxpool.Pool, config *PipelineConfig) error {
 	if config == nil {
 		return fmt.Errorf("PipelineConfig is required for schema validation")

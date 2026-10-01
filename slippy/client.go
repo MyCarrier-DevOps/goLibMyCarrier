@@ -3,7 +3,6 @@ package slippy
 import (
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -23,90 +22,30 @@ type Client struct {
 	logger         Logger
 }
 
-// NewClient creates a new slippy client with all dependencies.
-// It validates the configuration and initializes the ClickHouse store and GitHub client.
-// The pipeline configuration must be set in the Config.
-func NewClient(config Config) (*Client, error) {
-	ctx := context.Background()
-	startTime := time.Now()
-
-	if err := config.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
-
-	if config.Logger == nil {
-		config.Logger = NopLogger()
-	}
-
-	// Log database selection with reason
-	dbSource := "K8S_NAMESPACE"
-	if slippyDB := os.Getenv("SLIPPY_DATABASE"); slippyDB != "" {
-		dbSource = "SLIPPY_DATABASE override"
-	}
-	config.Logger.Info(ctx, "Database selected", map[string]interface{}{
-		"database":      config.Database,
-		"source":        dbSource,
-		"k8s_namespace": os.Getenv("K8S_NAMESPACE"),
-	})
-
-	// Initialize ClickHouse store from config
-	// Migrations are skipped if config.SkipMigrations is true (e.g., Slippy CLI trusts pushhookparser ran them)
-	storeStart := time.Now()
-	config.Logger.Info(ctx, "Creating ClickHouse store...", map[string]interface{}{
-		"skip_migrations": config.SkipMigrations,
-	})
-	store, err := NewClickHouseStoreFromConfig(config.ClickHouseConfig, ClickHouseStoreOptions{
-		PipelineConfig: config.PipelineConfig,
-		Database:       config.Database,
-		Logger:         config.Logger,
-		SkipMigrations: config.SkipMigrations,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create store: %w", err)
-	}
-	config.Logger.Info(ctx, "ClickHouse store created", map[string]interface{}{
-		"store_create_ms": time.Since(storeStart).Milliseconds(),
-	})
-
-	// Initialize GitHub client for commit ancestry resolution
-	githubStart := time.Now()
-	githubClient, err := NewGitHubClient(config.GitHubConfig(), config.Logger)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create GitHub client: %w", err)
-	}
-	config.Logger.Info(ctx, "GitHub client created", map[string]interface{}{
-		"github_create_ms": time.Since(githubStart).Milliseconds(),
-		"total_client_ms":  time.Since(startTime).Milliseconds(),
-	})
-
-	return &Client{
-		store:          store,
-		github:         githubClient,
-		config:         config,
-		pipelineConfig: config.PipelineConfig,
-		logger:         config.Logger,
-	}, nil
-}
-
-// NewClientWithDependencies creates a client with custom dependencies.
-// This is primarily useful for testing with mock implementations.
+// NewClientWithDependencies creates a client over the given store and GitHub client. It is
+// the only constructor: callers build the store (NewPostgresStore over their own pgxpool.Pool,
+// or a test double) and the GitHub client (NewGitHubClient) and inject both.
+//
+// A HoldTimeout, PollInterval or AncestryDepth of 0 or less is unset and gets DefaultConfig's
+// value, and AncestryMaxDepth is raised to at least AncestryDepth. AncestryMaxDepth never gets
+// DefaultConfig's 100: the push path widens its ancestor search only when AncestryMaxDepth is
+// above AncestryDepth, so a Config that leaves it unset keeps searching at AncestryDepth, and
+// ResolveAncestry walks up to AncestryDepth links.
 func NewClientWithDependencies(store SlipStore, github GitHubAPI, config Config) *Client {
 	if config.Logger == nil {
 		config.Logger = NopLogger()
 	}
-	// Set defaults for unset config values
-	if config.HoldTimeout == 0 {
-		config.HoldTimeout = DefaultConfig().HoldTimeout
+	defaults := DefaultConfig()
+	if config.HoldTimeout <= 0 {
+		config.HoldTimeout = defaults.HoldTimeout
 	}
-	if config.PollInterval == 0 {
-		config.PollInterval = DefaultConfig().PollInterval
+	if config.PollInterval <= 0 {
+		config.PollInterval = defaults.PollInterval
 	}
-	if config.AncestryDepth == 0 {
-		config.AncestryDepth = DefaultConfig().AncestryDepth
+	if config.AncestryDepth <= 0 {
+		config.AncestryDepth = defaults.AncestryDepth
 	}
-	if config.Database == "" {
-		config.Database = DefaultConfig().Database
-	}
+	config.AncestryMaxDepth = max(config.AncestryMaxDepth, config.AncestryDepth)
 
 	return &Client{
 		store:          store,
@@ -215,7 +154,7 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 	}
 
 	// Promote changes only the top-level status, so it takes the same atomic status write
-	// AbandonSlip does. PromotedTo is persisted by NEITHER store (there is no promoted_to
+	// AbandonSlip does. PromotedTo is persisted by no store (there is no promoted_to
 	// column), so the full-row Update this replaced bought nothing for that field while
 	// costing a Load→Update snapshot race: it rewrote every column from a snapshot taken
 	// before the write, clobbering concurrent step and history writes. And the atomic status
@@ -233,7 +172,9 @@ func (c *Client) PromoteSlip(ctx context.Context, correlationID, promotedTo stri
 	return nil
 }
 
-// Close releases resources held by the client.
+// Close closes the client's store. For a PostgresStore that closes the pool passed to
+// NewPostgresStore (see PostgresStore.Close), so a caller that shares that pool with other
+// components must not call it.
 func (c *Client) Close() error {
 	if c.store != nil {
 		return c.store.Close()
@@ -246,7 +187,7 @@ func (c *Client) Store() SlipStore {
 	return c.store
 }
 
-// Ping verifies the underlying ClickHouse connection is alive.
+// Ping verifies the underlying store connection is alive.
 // This allows callers to detect stale pool connections before performing operations.
 func (c *Client) Ping(ctx context.Context) error {
 	if c.store == nil {
@@ -270,17 +211,18 @@ func (c *Client) PipelineConfig() *PipelineConfig {
 	return c.pipelineConfig
 }
 
-// applyHoldDefaults applies default values for timeout and poll interval if not set.
+// applyHoldDefaults gives a timeout or poll interval of 0 or less the client's HoldTimeout or
+// PollInterval, as NewClientWithDependencies does for the Config's own values.
 // This centralizes the defaulting logic used across WaitForPrerequisites and RunPreExecution.
 func (c *Client) applyHoldDefaults(
 	timeout, pollInterval time.Duration,
 ) (appliedTimeout, appliedPollInterval time.Duration) {
 	appliedTimeout = timeout
-	if appliedTimeout == 0 {
+	if appliedTimeout <= 0 {
 		appliedTimeout = c.config.HoldTimeout
 	}
 	appliedPollInterval = pollInterval
-	if appliedPollInterval == 0 {
+	if appliedPollInterval <= 0 {
 		appliedPollInterval = c.config.PollInterval
 	}
 	return appliedTimeout, appliedPollInterval

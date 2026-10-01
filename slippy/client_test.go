@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	ch "github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse"
 )
 
 func TestNewClientWithDependencies(t *testing.T) {
@@ -56,6 +54,186 @@ func TestNewClientWithDependencies_DefaultConfig(t *testing.T) {
 	}
 	if client.config.AncestryDepth != defaultCfg.AncestryDepth {
 		t.Errorf("expected default AncestryDepth %v, got %v", defaultCfg.AncestryDepth, client.config.AncestryDepth)
+	}
+}
+
+// TestNewClientWithDependencies_NormalisesConfig pins what the constructor does with a Config's
+// hold and ancestry settings: a HoldTimeout, PollInterval or AncestryDepth of 0 or less is unset
+// and gets DefaultConfig's value, and AncestryMaxDepth is raised to at least AncestryDepth, never
+// to DefaultConfig's 100. Left alone, a negative PollInterval re-polls the store with no delay
+// while a hold waits, a negative HoldTimeout times the step out at its first poll, and an
+// AncestryMaxDepth of 0 makes ResolveAncestry return an empty chain.
+func TestNewClientWithDependencies_NormalisesConfig(t *testing.T) {
+	d := DefaultConfig()
+	type settings struct {
+		HoldTimeout, PollInterval       time.Duration
+		AncestryDepth, AncestryMaxDepth int
+	}
+	tests := []struct {
+		name string
+		in   Config
+		want settings
+	}{
+		{"all unset", Config{}, settings{d.HoldTimeout, d.PollInterval, d.AncestryDepth, d.AncestryDepth}},
+		{
+			"negative durations and depths are unset",
+			Config{
+				HoldTimeout: -5 * time.Minute, PollInterval: -30 * time.Second,
+				AncestryDepth: -1, AncestryMaxDepth: -1,
+			},
+			settings{d.HoldTimeout, d.PollInterval, d.AncestryDepth, d.AncestryDepth},
+		},
+		{
+			"positive values are kept",
+			Config{
+				HoldTimeout: 5 * time.Minute, PollInterval: 10 * time.Second,
+				AncestryDepth: 15, AncestryMaxDepth: 40,
+			},
+			settings{5 * time.Minute, 10 * time.Second, 15, 40},
+		},
+		{
+			"a max depth below the depth is raised to it",
+			Config{AncestryDepth: 50, AncestryMaxDepth: 20},
+			settings{d.HoldTimeout, d.PollInterval, 50, 50},
+		},
+		{
+			// slippy-api builds exactly this: AncestryDepth set, AncestryMaxDepth left at 0.
+			"an unset max depth is raised to the depth, not to 100",
+			Config{AncestryDepth: 25},
+			settings{d.HoldTimeout, d.PollInterval, 25, 25},
+		},
+		{
+			// 20 is below DefaultConfig's 25: above it, max() would hide a constructor that used the default depth.
+			"an unset max depth is raised to a non-default depth",
+			Config{AncestryDepth: 20},
+			settings{d.HoldTimeout, d.PollInterval, 20, 20},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), tt.in).Config()
+			got := settings{c.HoldTimeout, c.PollInterval, c.AncestryDepth, c.AncestryMaxDepth}
+			if got != tt.want {
+				t.Errorf("hold timeout, poll interval, depth, max depth = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewClientWithDependencies_NormalisesConfigFromEnv pins the flow the README's Quick Start
+// relies on: ConfigFromEnv keeps a negative SLIPPY_HOLD_TIMEOUT or SLIPPY_POLL_INTERVAL and a
+// SLIPPY_ANCESTRY_MAX_DEPTH below SLIPPY_ANCESTRY_DEPTH, and the constructor corrects them. It
+// blanks SLIPPY_GITHUB_APP_PRIVATE_KEY and prints only the fields it checks, so a failure cannot
+// log a private key ConfigFromEnv read from the process environment.
+func TestNewClientWithDependencies_NormalisesConfigFromEnv(t *testing.T) {
+	t.Setenv("SLIPPY_GITHUB_APP_PRIVATE_KEY", "")
+	t.Setenv("SLIPPY_HOLD_TIMEOUT", "-5m")
+	t.Setenv("SLIPPY_POLL_INTERVAL", "-30s")
+	t.Setenv("SLIPPY_ANCESTRY_DEPTH", "50")
+	t.Setenv("SLIPPY_ANCESTRY_MAX_DEPTH", "20")
+	cfg := ConfigFromEnv()
+	if cfg.HoldTimeout != -5*time.Minute || cfg.PollInterval != -30*time.Second || cfg.AncestryMaxDepth != 20 {
+		t.Fatalf("precondition: ConfigFromEnv should keep the values as given, got hold timeout %v, "+
+			"poll interval %v, depth %d, max depth %d",
+			cfg.HoldTimeout, cfg.PollInterval, cfg.AncestryDepth, cfg.AncestryMaxDepth)
+	}
+
+	c := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), cfg).Config()
+	if c.HoldTimeout != 60*time.Minute || c.PollInterval != 60*time.Second {
+		t.Errorf("hold timeout, poll interval = %v, %v; want the defaults 1h0m0s, 1m0s", c.HoldTimeout, c.PollInterval)
+	}
+	if c.AncestryDepth != 50 || c.AncestryMaxDepth != 50 {
+		t.Errorf("depth, max depth = %d, %d; want 50, 50", c.AncestryDepth, c.AncestryMaxDepth)
+	}
+}
+
+// TestClient_ApplyHoldDefaults pins the per-call form of the constructor's rule, which
+// WaitForPrerequisites and RunPreExecution both apply: a Timeout or PollInterval of 0 or less is
+// unset and gets the client's HoldTimeout or PollInterval. Left alone, a negative PollInterval
+// re-polls the store with no delay while a hold waits, and a negative Timeout times the step out
+// at its first poll.
+func TestClient_ApplyHoldDefaults(t *testing.T) {
+	client := NewClientWithDependencies(NewMockStore(), NewMockGitHubAPI(), Config{
+		HoldTimeout: 7 * time.Minute, PollInterval: 3 * time.Second,
+	})
+	type durations struct{ Timeout, PollInterval time.Duration }
+	configured := durations{7 * time.Minute, 3 * time.Second}
+	tests := []struct {
+		name     string
+		in, want durations
+	}{
+		{"unset", durations{}, configured},
+		{"negative values are unset", durations{-5 * time.Minute, -30 * time.Second}, configured},
+		{"positive values are kept", durations{5 * time.Minute, 10 * time.Second},
+			durations{5 * time.Minute, 10 * time.Second}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got durations
+			got.Timeout, got.PollInterval = client.applyHoldDefaults(tt.in.Timeout, tt.in.PollInterval)
+			if got != tt.want {
+				t.Errorf("timeout, poll interval = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// ancestryDepthStore records the maxDepth Client.ResolveAncestry hands the store.
+type ancestryDepthStore struct {
+	*MockStore
+	maxDepth int
+}
+
+func (s *ancestryDepthStore) ResolveAncestry(_ context.Context, _, _, _ string, maxDepth int) ([]AncestryEntry, error) {
+	s.maxDepth = maxDepth
+	return nil, nil
+}
+
+// TestClient_ResolveAncestry_UnsetMaxDepthWalksAncestryDepth pins the consequence of raising an
+// unset AncestryMaxDepth: ResolveAncestry walks up to AncestryDepth links, where a maxDepth of 0
+// returned an empty chain for a slip that has parents.
+func TestClient_ResolveAncestry_UnsetMaxDepthWalksAncestryDepth(t *testing.T) {
+	store := &ancestryDepthStore{MockStore: NewMockStore()}
+	// 20 is below DefaultConfig's 25: above it, max() would hide a constructor that used the default depth.
+	client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{AncestryDepth: 20})
+
+	if _, err := client.ResolveAncestry(context.Background(), "owner/repo", "main", "corr-1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if store.maxDepth != 20 {
+		t.Errorf("ResolveAncestry passed maxDepth %d to the store, want 20 (AncestryDepth)", store.maxDepth)
+	}
+}
+
+// TestNewClientWithDependencies_UnsetMaxDepthKeepsThePushSearchAtDepth pins that raising an unset
+// AncestryMaxDepth to AncestryDepth leaves both push-path searches where they were: one GitHub
+// ancestry query, at AncestryDepth. That is slippy-api's Config; giving AncestryMaxDepth
+// DefaultConfig's 100 instead would add a second query at 100 to every push that finds no slip.
+func TestNewClientWithDependencies_UnsetMaxDepthKeepsThePushSearchAtDepth(t *testing.T) {
+	ctx := context.Background()
+	searches := map[string]func(c *Client) ([]SlipWithCommit, error){
+		"ancestor search": func(c *Client) ([]SlipWithCommit, error) {
+			return c.findAncestorSlipsWithProgressiveDepth(ctx, "owner", "repo",
+				PushOptions{CorrelationID: "corr-new", Repository: "owner/repo", CommitSHA: "abc123"})
+		},
+		"PR branch search": func(c *Client) ([]SlipWithCommit, error) {
+			return c.findSlipsInPRBranchHistory(ctx, "owner", "repo", "owner/repo", "abc123")
+		},
+	}
+	for name, search := range searches {
+		t.Run(name, func(t *testing.T) {
+			github := NewMockGitHubAPI()
+			github.SetAncestry("owner", "repo", "abc123", []string{"abc123", "parent123", "grandparent456"})
+			client := NewClientWithDependencies(NewMockStore(), github, Config{AncestryDepth: 25})
+
+			if _, err := search(client); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			calls := github.GetCommitAncestryCalls
+			if len(calls) != 1 || calls[0].Depth != 25 {
+				t.Errorf("GetCommitAncestry calls = %+v, want exactly one, at depth 25", calls)
+			}
+		})
 	}
 }
 
@@ -481,122 +659,6 @@ func TestClient_AbandonSlip(t *testing.T) {
 			t.Fatal("expected error")
 		}
 	})
-}
-
-// TestNewClient_ValidationErrors tests that NewClient properly validates configuration.
-// Note: We can't test successful NewClient without real ClickHouse/GitHub connections,
-// but we can test that invalid configurations are rejected before any connections are made.
-func TestNewClient_ValidationErrors(t *testing.T) {
-	// Helper to create a valid ClickHouseConfig for tests
-	validCHConfig := &ch.ClickhouseConfig{
-		ChHostname:   "localhost",
-		ChPort:       "9000",
-		ChDatabase:   "testdb",
-		ChUsername:   "user",
-		ChPassword:   "pass",
-		ChSkipVerify: "true",
-	}
-
-	tests := []struct {
-		name    string
-		config  Config
-		wantErr bool
-	}{
-		{
-			name:    "empty config fails validation",
-			config:  Config{},
-			wantErr: true,
-		},
-		{
-			name: "missing ClickHouseConfig",
-			config: Config{
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "missing GitHubAppID",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "missing GitHubPrivateKey",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero HoldTimeout",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      0,
-				PollInterval:     time.Second,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero PollInterval",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     0,
-				AncestryDepth:    10,
-			},
-			wantErr: true,
-		},
-		{
-			name: "zero AncestryDepth",
-			config: Config{
-				ClickHouseConfig: validCHConfig,
-				GitHubAppID:      12345,
-				GitHubPrivateKey: "key",
-				HoldTimeout:      time.Minute,
-				PollInterval:     time.Second,
-				AncestryDepth:    0,
-			},
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := NewClient(tt.config)
-			if tt.wantErr {
-				if err == nil {
-					t.Error("expected error, got nil")
-				}
-				// Verify the error mentions invalid configuration
-				if !errors.Is(err, ErrInvalidConfiguration) {
-					// The error should wrap the validation error
-					if err.Error() == "" {
-						t.Error("expected non-empty error message")
-					}
-				}
-			}
-			// Note: valid configs will still fail because we don't have real connections
-			// This is expected behavior - we're testing that validation runs first
-		})
-	}
 }
 
 func TestClient_Ping(t *testing.T) {

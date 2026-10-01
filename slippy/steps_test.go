@@ -262,8 +262,8 @@ func TestClient_UpdateStepWithStatus(t *testing.T) {
 // TestClient_UpdateStepWithStatus_SingleStoreCallPerUpdate is a regression test verifying that
 // the client no longer performs a second store load+update via checkAndUpdateAggregate after
 // each component step update. The aggregate status is now computed entirely within the store
-// (via updateAggregateStatusFromComponentStatesWithHistory), so the client should issue exactly
-// one UpdateStepWithHistory call per UpdateStepWithStatus invocation.
+// (PostgresStore.recomputeAggregate), so the client should issue exactly one
+// UpdateStepWithHistory call per UpdateStepWithStatus invocation.
 func TestClient_UpdateStepWithStatus_SingleStoreCallPerUpdate(t *testing.T) {
 	ctx := context.Background()
 
@@ -537,8 +537,8 @@ func createTestSlip(correlationID string) *Slip {
 //	"Aggregate builds: any single component primary failure → aggregate failed →
 //	 slip=failed. Aggregate completed only when all components terminal-success."
 //
-// The mock store does not perform ClickHouse-side aggregate rollup
-// (updateAggregateStatusFromComponentStatesWithHistory), so this test exercises the
+// The mock store does not perform the store-side aggregate rollup
+// (PostgresStore.recomputeAggregate), so this test exercises the
 // pipeline-step path directly: once the store rolls up a component failure into the
 // aggregate step status, executor calls FailStep("builds", "", reason) at the
 // pipeline-step level (componentName == ""), which triggers checkPipelineCompletion
@@ -577,7 +577,7 @@ func TestClient_AggregateBuildFailurePropagatesSlipFailed(t *testing.T) {
 
 		// Simulate two components completing successfully and one failing.
 		// At the component level the mock store records the call but does NOT
-		// recompute the aggregate status (that is ClickHouse-store behaviour).
+		// recompute the aggregate status (that is store-side behaviour).
 		// We therefore update the in-memory aggregate state manually to match
 		// what the production path would produce, then call FailStep on the
 		// pipeline-level aggregate step ("builds", componentName="") to trigger

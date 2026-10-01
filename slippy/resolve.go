@@ -21,7 +21,7 @@ type ResolveOptions struct {
 	// ImageTag for fallback resolution (e.g., "mycarrier/svc:abc123-1234567890")
 	ImageTag string
 
-	// AncestryDepth is how many commits to check (default: 20)
+	// AncestryDepth is how many commits to check (0 or less takes Config.AncestryDepth, 25 unless set)
 	AncestryDepth int
 }
 
@@ -53,7 +53,7 @@ type ResolveResult struct {
 // encountered during resolution. For example, if ancestry lookup fails but
 // image tag resolution succeeds, the ancestry error is included as a warning.
 func (c *Client) ResolveSlip(ctx context.Context, opts ResolveOptions) (*ResolveResult, error) {
-	if opts.AncestryDepth == 0 {
+	if opts.AncestryDepth <= 0 {
 		opts.AncestryDepth = c.config.AncestryDepth
 	}
 

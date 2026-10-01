@@ -103,18 +103,45 @@ This library follows [Semantic Versioning](https://semver.org/).
 
 ## Breaking changes
 
-These are breaking, so the release is a **minor** bump, not a patch: the merge commit must be
-tagged `slippy/v1.4.0` (and the sibling modules likewise, since every module in this repo
-releases at one shared version). `.github/Gitversion.yml` carries `next-version: 1.4.0` plus
-the `ConfiguredNextVersion` strategy that makes that floor effective, so main's `Patch`
-increment cannot land these on consumers pinned to `v1.3.x` with no signal. **The floor is
-for this release only: delete `next-version` (and `ConfiguredNextVersion`) once `v1.4.0` is
-tagged on main.** Left in place it would let the NEXT breaking `SlipStore` change ship as a
-`1.4.x` patch to consumers pinned to `1.4` — the same defect it was added to fix.
+Each break below is a **minor** bump, not a patch. main's GitVersion increment is `Patch`, so a
+breaking release carries a one-release floor in `.github/Gitversion.yml`: `next-version` plus
+the `ConfiguredNextVersion` strategy that makes it effective. Every module in this repo
+releases at one shared version, so the floor tags the sibling modules too. **The floor is for
+one release only: delete `next-version` (and `ConfiguredNextVersion`) once that version is
+tagged on main.** After that tag it does nothing: GitVersion takes the highest candidate, so
+main's Patch increment gives the next patch with or without it. It does not protect the next
+breaking change; for that, restore the floor (`next-version` and the `ConfiguredNextVersion`
+strategy), or put `+semver: minor` in that commit's message. The current floor is `1.5.0`, for
+DEVOPS-343; v1.4.0's floor was added in #87 and removed in #90.
+
+### `slippy`: the ClickHouse slip store is removed — since `v1.5.0` (DEVOPS-343)
+
+Postgres has been the only operational slip store since DEVOPS-127. The ClickHouse store, its
+schema API and the constructor that built it are gone, and the `slippy` module no longer
+requires `goLibMyCarrier/clickhouse`, `clickhousemigrator` or `clickhouse-go` (both modules
+stay in this repo). Full list in `slippy/CLAUDE.md`'s Breaking changes section.
+
+`slippy` v1.5.0 requires `github` v1.5.0, so a consumer that bumps only `slippy` also gets the
+`github` release whose `NewGraphQLClient` never puts the configured private key in an error.
+
+In every `github` tag from v1.3.41 below v1.5.0, prereleases included, `NewGraphQLClient`, which `slippy`'s
+`NewGitHubClient` calls, reads a key value not starting with `-` as a file path, and its error echoes the whole value:
+`failed to read private key file: open <value>: …`. That covers a PEM behind a leading line break, space, BOM or quote,
+and a base64 value. If any log captured such an error, deploy a new key for that GitHub App wherever the logged key is
+configured, then delete it under the App's Private keys, matched by SHA-256 fingerprint, since App keys never expire.
+
+| What changed | Migration |
+|---|---|
+| `NewClient(Config)` — **removed** | Build the store and inject it: `store, err := slippy.NewPostgresStore(pool, pipelineConfig, logger)` (check `err`), then `slippy.NewClientWithDependencies(store, githubClient, config)`. |
+| `ClickHouseStore`, `RunMigrations`, `GetCurrentSchemaVersion` and the rest of the ClickHouse schema API — **removed** | Use `PostgresStore` and `RunPostgresMigrations`. A consumer that still reads the frozen ClickHouse slip schema version calls `m, err := clickhousemigrator.NewMigrator(conn, nil, clickhousemigrator.WithDatabase(db), clickhousemigrator.WithTablePrefix("slippy"))` (check `err`), then `m.GetSchemaVersion(ctx)` itself. |
+| `Config.ClickHouseConfig`, `Config.Database`, `Config.SkipMigrations`, `Config.WithDatabase`, `Config.Validate`, `Config.ValidateMinimal` — **removed** | Delete the references. `Validate`'s non-ClickHouse checks split two ways. The caller's: `PipelineConfig` is non-nil (`ConfigFromEnv` leaves it nil when `SLIPPY_PIPELINE_CONFIG` fails to load; `LoadPipelineConfig` returns why), and the GitHub app ID and private key are set. `NewClientWithDependencies` corrects the rest instead of rejecting them: a `HoldTimeout`, `PollInterval` or `AncestryDepth` of 0 or less gets `DefaultConfig`'s value, and `AncestryMaxDepth` is raised to at least `AncestryDepth`. It never gets `DefaultConfig`'s 100, so a Config that leaves it unset never widens the ancestry search past `AncestryDepth`. `DefaultConfig().Database` was `"ci_test"` in `-test`/`-dev`/`feature*`/`dev` namespaces and `"ci"` otherwise; a consumer that needs that name computes it. |
+| `Slip.Sign`, `Slip.Version` — **deprecated**, always zero | Stop reading them. |
+
+`ErrRepaveUnsupported`, `ErrResetUnsupported` and `ErrClaimUnsupported` are unchanged.
 
 ### `slippy`: the claim joins `SlipStore` — since `v1.4.0` (DEVOPS-367)
 
-This is the break the `v1.4.0` floor above exists for, and it is the one a consumer meets
+This is the break the `v1.4.0` floor existed for, and it is the one a consumer meets
 first: `slippy.SlipStore` gained three methods, so any out-of-repo implementation (a
 `var _ slippy.SlipStore = (*fakeStore)(nil)` assertion, a hand-rolled test double) fails to
 compile until all three exist. Full contracts are on the interface in `slippy/interfaces.go`
@@ -123,7 +150,7 @@ and the model is in `.github/STATE_MACHINE_V3.md`; the migrations are covered by
 
 | What changed | Migration |
 |---|---|
-| `ClaimSlip(ctx, correlationID string, expected []SlipStatus, claimedBy, reason string) (ClaimOutcome, error)` — **new on `SlipStore`**, and it returns an outcome rather than a bare error | Implement it. Route the decision through `slippy.DecideClaim` so it cannot drift from the store; a store that cannot claim returns `ErrClaimUnsupported` (wrapped), as `ClickHouseStore` does. `ClaimOutcome{Claimed, Prior, InFlight}`: `Claimed=false` is the idempotent repeat with nothing written, not a failure, and a caller that must not dispatch onto running work branches on `InFlight`. |
+| `ClaimSlip(ctx, correlationID string, expected []SlipStatus, claimedBy, reason string) (ClaimOutcome, error)` — **new on `SlipStore`**, and it returns an outcome rather than a bare error | Implement it. Route the decision through `slippy.DecideClaim` so it cannot drift from the store; a store that cannot claim returns `ErrClaimUnsupported` (wrapped). `ClaimOutcome{Claimed, Prior, InFlight}`: `Claimed=false` is the idempotent repeat with nothing written, not a failure, and a caller that must not dispatch onto running work branches on `InFlight`. |
 | `ReleaseClaim(ctx, correlationID, releasedBy, reason string) (ReleaseOutcome, error)` — **new on `SlipStore`**, also an outcome | Implement it via `slippy.DecideRelease`. `ReleaseOutcome{Released, Status}`: `Released=false` means work is in flight and the claim was KEPT with nothing written — the arm all but the last of a run's N post-job releases take. |
 | `ProbeSchema(ctx) error` — **new on `SlipStore`** | Implement it. A store with no schema of its own returns `nil`. Consumers reach it through `Client.ProbeSchema` and treat `ErrSchemaBehind` as "not ready". |
 | `ErrRunInFlight` — **removed** | Delete the `errors.Is(err, slippy.ErrRunInFlight)` branch and read `ReleaseOutcome.Released` instead. Work in flight stopped being an error because it is the normal outcome, not a failure. |
