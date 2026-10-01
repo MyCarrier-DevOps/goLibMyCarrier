@@ -306,7 +306,12 @@ The call works in these steps:
    (`GET /api/v1/applications/{app}/resource`). A failure to read any live Rollout
    fails the whole call.
 4. It keeps the Rollouts whose label matches and returns them sorted by namespace,
-   then name.
+   then name. When none match, the result is an empty, non-nil slice and the error is
+   `nil`.
+
+Errors from the resource tree and from the live reads wrap the underlying `*APIError`,
+so `errors.Is` reaches `ErrPermissionDenied`, `ErrNotFound` and `ErrConflict`; a live-read
+error names the Rollout (`<namespace>/<name>`).
 
 ### RolloutStatus
 
