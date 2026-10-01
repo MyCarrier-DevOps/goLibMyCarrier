@@ -281,12 +281,15 @@ func (c *Client) getLiveRollout(ctx context.Context, appName string, node resour
 // CorrelationIDLabel label equals correlationID, sorted by namespace and then name.
 //
 // The Rollouts come from the Application's resource tree; the label, phase, step index and
-// canary weight come from each Rollout's live manifest. An empty correlationID is an error, so
-// unlabeled Rollouts are never matched. A Rollout with no live object (not yet created, or deleted
+// canary weight come from each Rollout's live manifest. An empty appName or correlationID is an
+// error, so unlabeled Rollouts are never matched. A Rollout with no live object (not yet created, or deleted
 // since ArgoCD last refreshed the tree) is skipped; any other failure to read a live Rollout fails
 // the whole call.
 // When no Rollout matches, the result is an empty, non-nil slice and the error is nil.
 func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error) {
+	if appName == "" {
+		return nil, errors.New("application name is required")
+	}
 	if correlationID == "" {
 		return nil, errors.New("correlation id is required")
 	}
