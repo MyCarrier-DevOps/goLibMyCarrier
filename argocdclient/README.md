@@ -398,8 +398,15 @@ ref := argocdclient.ResourceRef{
     Group: "argoproj.io", Version: "v1alpha1", Kind: "Rollout",
     Namespace: "default", Name: "my-rollout",
 }
+ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+defer cancel()
 err := router.RunResourceAction(ctx, "mycarrier-frontend-prod", ref, argocdclient.ActionAbort)
 ```
+
+`ctx` is the only deadline for an action: the client sets no timeout of its own and never
+retries the POST, so pass a `ctx` with a deadline. A deadline that fires after ArgoCD accepted
+the action leaves the outcome unknown, so re-read the Rollout with `ListRolloutGroup` before
+acting again.
 
 ### Fail-closed routing
 
