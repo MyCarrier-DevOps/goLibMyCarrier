@@ -1,7 +1,16 @@
 package argocdclient
 
 import (
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -170,5 +179,289 @@ func TestNewRolloutStatus(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("newRolloutStatus() =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+// readFixture returns a response recorded from the dev ArgoCD (v3.1.5).
+func readFixture(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("reading fixture %s: %v", name, err)
+	}
+	return string(data)
+}
+
+const (
+	fixtureApp       = "devops-315-rollout-test"
+	fixtureNamespace = "devops-315-rollout-test"
+	fixtureGroupA    = "devops-315-group-a"
+	fixtureGroupB    = "devops-315-group-b"
+)
+
+type nodeWant struct {
+	health  HealthStatus
+	message string
+}
+
+func TestDecodeRolloutNodes(t *testing.T) {
+	tests := []struct {
+		state string
+		want  map[string]nodeWant
+	}{
+		{"healthy", map[string]nodeWant{
+			"rt-api":    {HealthStatusHealthy, ""},
+			"rt-worker": {HealthStatusHealthy, ""},
+			"rt-other":  {HealthStatusHealthy, ""},
+		}},
+		{"progressing", map[string]nodeWant{
+			"rt-api":    {HealthStatusProgressing, "more replicas need to be updated"},
+			"rt-worker": {HealthStatusProgressing, "more replicas need to be updated"},
+			"rt-other":  {HealthStatusProgressing, "more replicas need to be updated"},
+		}},
+		{"suspended", map[string]nodeWant{
+			"rt-api":    {HealthStatusSuspended, "CanaryPauseStep"},
+			"rt-worker": {HealthStatusSuspended, "CanaryPauseStep"},
+			"rt-other":  {HealthStatusSuspended, "CanaryPauseStep"},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.state, func(t *testing.T) {
+			nodes, err := decodeRolloutNodes([]byte(readFixture(t, "resource-tree-"+tt.state+".json")))
+			if err != nil {
+				t.Fatalf("decodeRolloutNodes: %v", err)
+			}
+
+			got := map[string]nodeWant{}
+			for _, n := range nodes {
+				if n.Group != "argoproj.io" || n.Kind != "Rollout" || n.Version != "v1alpha1" ||
+					n.Namespace != fixtureNamespace {
+					t.Errorf("unexpected node %+v", n)
+				}
+				got[n.Name] = nodeWant{n.Health.Status, n.Health.Message}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("rollout nodes = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDecodeRolloutNodes_InvalidJSON(t *testing.T) {
+	if _, err := decodeRolloutNodes([]byte("not json")); err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+// rolloutServer answers the resource-tree and live-resource calls from recorded fixtures.
+type rolloutServer struct {
+	*httptest.Server
+
+	mu       sync.Mutex
+	requests []recordedRequest
+
+	treeStatus     int
+	treeBody       string
+	resourceStatus int
+	resourceBody   string // when empty the recorded resource-<name>-<state> fixture is served
+}
+
+func newRolloutServer(t *testing.T, state string) *rolloutServer {
+	t.Helper()
+	s := &rolloutServer{
+		treeStatus:     http.StatusOK,
+		treeBody:       readFixture(t, "resource-tree-"+state+".json"),
+		resourceStatus: http.StatusOK,
+	}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.requests = append(s.requests, recordedRequest{
+			Method: r.Method, Path: r.URL.EscapedPath(), Query: r.URL.Query(), Auth: r.Header.Get("Authorization"),
+		})
+		s.mu.Unlock()
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/resource-tree"):
+			w.WriteHeader(s.treeStatus)
+			_, _ = w.Write([]byte(s.treeBody))
+		case strings.HasSuffix(r.URL.Path, "/resource"):
+			body := s.resourceBody
+			if body == "" {
+				body = readFixture(t, "resource-"+r.URL.Query().Get("resourceName")+"-"+state+".json")
+			}
+			w.WriteHeader(s.resourceStatus)
+			_, _ = w.Write([]byte(body))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func (s *rolloutServer) recorded() []recordedRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]recordedRequest(nil), s.requests...)
+}
+
+func (s *rolloutServer) client() *Client {
+	return NewClient(&Config{ServerUrl: s.URL, AuthToken: testToken})
+}
+
+func rolloutRef(name string) ResourceRef {
+	return ResourceRef{
+		Group: "argoproj.io", Version: "v1alpha1", Kind: "Rollout", Namespace: fixtureNamespace, Name: name,
+	}
+}
+
+func TestListRolloutGroup(t *testing.T) {
+	tests := []struct {
+		name        string
+		state       string
+		correlation string
+		wantNames   []string
+		wantHealth  HealthStatus
+		wantMessage string
+		wantPhase   RolloutPhase
+		wantIndex   int32
+		wantWeight  int32
+	}{
+		{"suspended group a", "suspended", fixtureGroupA, []string{"rt-api", "rt-worker"},
+			HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, 50},
+		{"suspended group b", "suspended", fixtureGroupB, []string{"rt-other"},
+			HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, 50},
+		{"progressing group a", "progressing", fixtureGroupA, []string{"rt-api", "rt-worker"},
+			HealthStatusProgressing, "more replicas need to be updated", RolloutPhaseProgressing, 0, 0},
+		{"unknown correlation id", "suspended", "devops-315-unknown", nil,
+			HealthStatusSuspended, "", RolloutPhasePaused, 1, 50},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newRolloutServer(t, tt.state)
+
+			got, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, tt.correlation)
+			if err != nil {
+				t.Fatalf("ListRolloutGroup: %v", err)
+			}
+			if got == nil || len(got) != len(tt.wantNames) {
+				t.Fatalf("got %d statuses (nil=%v), want %d", len(got), got == nil, len(tt.wantNames))
+			}
+			for i, name := range tt.wantNames {
+				want := RolloutStatus{
+					Ref:                rolloutRef(name),
+					Health:             tt.wantHealth,
+					Message:            tt.wantMessage,
+					Phase:              tt.wantPhase,
+					CurrentStepIndex:   int32Ptr(tt.wantIndex),
+					Aborted:            false,
+					CanaryWeight:       tt.wantWeight,
+					StepPluginStatuses: nil,
+				}
+				if !reflect.DeepEqual(got[i], want) {
+					t.Errorf("status[%d] =\n%+v\nwant\n%+v", i, got[i], want)
+				}
+			}
+		})
+	}
+}
+
+func TestListRolloutGroup_Requests(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	app := "app/with space"
+
+	if _, err := srv.client().ListRolloutGroup(context.Background(), app, fixtureGroupB); err != nil {
+		t.Fatalf("ListRolloutGroup: %v", err)
+	}
+
+	reqs := srv.recorded()
+	if len(reqs) != 4 {
+		t.Fatalf("expected 1 tree call and 3 live calls, got %d requests", len(reqs))
+	}
+	if reqs[0].Path != "/api/v1/applications/app%2Fwith%20space/resource-tree" {
+		t.Errorf("tree path = %s", reqs[0].Path)
+	}
+	seen := map[string]bool{}
+	for _, r := range reqs[1:] {
+		if r.Method != http.MethodGet || r.Path != "/api/v1/applications/app%2Fwith%20space/resource" {
+			t.Errorf("unexpected live call %s %s", r.Method, r.Path)
+		}
+		if r.Auth != "Bearer "+testToken {
+			t.Errorf("Authorization = %q", r.Auth)
+		}
+		name := r.Query.Get("resourceName")
+		seen[name] = true
+		want := url.Values{
+			"namespace":    {fixtureNamespace},
+			"resourceName": {name},
+			"version":      {"v1alpha1"},
+			"group":        {"argoproj.io"},
+			"kind":         {"Rollout"},
+		}
+		if !reflect.DeepEqual(r.Query, want) {
+			t.Errorf("live query = %v, want %v", r.Query, want)
+		}
+	}
+	if !reflect.DeepEqual(seen, map[string]bool{"rt-api": true, "rt-worker": true, "rt-other": true}) {
+		t.Errorf("live calls for %v", seen)
+	}
+}
+
+func TestListRolloutGroup_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, s *rolloutServer)
+		wantIs  error
+	}{
+		{"tree permission denied", func(t *testing.T, s *rolloutServer) {
+			s.treeStatus, s.treeBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
+		}, ErrPermissionDenied},
+		{"live resource not found in application", func(t *testing.T, s *rolloutServer) {
+			s.resourceStatus, s.resourceBody = http.StatusBadRequest, readFixture(t, "error-resource-not-found.json")
+		}, ErrNotFound},
+		{"malformed tree", func(_ *testing.T, s *rolloutServer) { s.treeBody = "not json" }, nil},
+		{"malformed envelope", func(_ *testing.T, s *rolloutServer) { s.resourceBody = "not json" }, nil},
+		{
+			"malformed manifest",
+			func(_ *testing.T, s *rolloutServer) { s.resourceBody = `{"manifest":"not json"}` },
+			nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newRolloutServer(t, "suspended")
+			tt.prepare(t, srv)
+
+			got, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, fixtureGroupA)
+
+			if err == nil {
+				t.Fatalf("expected error, got %v", got)
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Errorf("expected errors.Is(%v), got %v", tt.wantIs, err)
+			}
+		})
+	}
+}
+
+func TestListRolloutGroup_LiveFailureNamesTheRollout(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	srv.resourceStatus, srv.resourceBody = http.StatusBadRequest, readFixture(t, "error-resource-not-found.json")
+
+	_, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, fixtureGroupA)
+
+	if err == nil || !strings.Contains(err.Error(), fixtureNamespace+"/rt-") {
+		t.Errorf("expected error naming the rollout, got %v", err)
+	}
+}
+
+func TestListRolloutGroup_EmptyCorrelationID(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+
+	if _, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, ""); err == nil {
+		t.Fatal("expected error for empty correlation id")
+	}
+	if n := len(srv.recorded()); n != 0 {
+		t.Errorf("expected no HTTP calls, got %d", n)
 	}
 }
