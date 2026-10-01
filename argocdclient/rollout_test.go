@@ -219,6 +219,11 @@ func TestDecodeRolloutNodes(t *testing.T) {
 			"rt-worker": {HealthStatusProgressing, "more replicas need to be updated"},
 			"rt-other":  {HealthStatusProgressing, "more replicas need to be updated"},
 		}},
+		{"degraded", map[string]nodeWant{
+			"rt-api":    {HealthStatusDegraded, "RolloutAborted: Rollout aborted update to revision 2"},
+			"rt-worker": {HealthStatusSuspended, "CanaryPauseStep"},
+			"rt-other":  {HealthStatusSuspended, "CanaryPauseStep"},
+		}},
 		{"suspended", map[string]nodeWant{
 			"rt-api":    {HealthStatusSuspended, "CanaryPauseStep"},
 			"rt-worker": {HealthStatusSuspended, "CanaryPauseStep"},
@@ -315,26 +320,51 @@ func rolloutRef(name string) ResourceRef {
 	}
 }
 
+func fixtureStatus(
+	name string, health HealthStatus, message string, phase RolloutPhase, index int32, aborted bool, weight int32,
+) RolloutStatus {
+	return RolloutStatus{
+		Ref:                rolloutRef(name),
+		Health:             health,
+		Message:            message,
+		Phase:              phase,
+		CurrentStepIndex:   int32Ptr(index),
+		Aborted:            aborted,
+		CanaryWeight:       weight,
+		StepPluginStatuses: nil,
+	}
+}
+
 func TestListRolloutGroup(t *testing.T) {
+	const abortedMessage = "RolloutAborted: Rollout aborted update to revision 2"
 	tests := []struct {
 		name        string
 		state       string
 		correlation string
-		wantNames   []string
-		wantHealth  HealthStatus
-		wantMessage string
-		wantPhase   RolloutPhase
-		wantIndex   int32
-		wantWeight  int32
+		want        []RolloutStatus
 	}{
-		{"suspended group a", "suspended", fixtureGroupA, []string{"rt-api", "rt-worker"},
-			HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, 50},
-		{"suspended group b", "suspended", fixtureGroupB, []string{"rt-other"},
-			HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, 50},
-		{"progressing group a", "progressing", fixtureGroupA, []string{"rt-api", "rt-worker"},
-			HealthStatusProgressing, "more replicas need to be updated", RolloutPhaseProgressing, 0, 0},
-		{"unknown correlation id", "suspended", "devops-315-unknown", nil,
-			HealthStatusSuspended, "", RolloutPhasePaused, 1, 50},
+		{"healthy group a after promotion", "healthy", fixtureGroupA, []RolloutStatus{
+			fixtureStatus("rt-api", HealthStatusHealthy, "", RolloutPhaseHealthy, 5, false, 100),
+			fixtureStatus("rt-worker", HealthStatusHealthy, "", RolloutPhaseHealthy, 5, false, 100),
+		}},
+		{"degraded group a with an aborted rollout", "degraded", fixtureGroupA, []RolloutStatus{
+			fixtureStatus("rt-api", HealthStatusDegraded, abortedMessage, RolloutPhaseDegraded, 0, true, 0),
+			fixtureStatus("rt-worker", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
+		}},
+		{"suspended group a", "suspended", fixtureGroupA, []RolloutStatus{
+			fixtureStatus("rt-api", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
+			fixtureStatus("rt-worker", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
+		}},
+		{"suspended group b", "suspended", fixtureGroupB, []RolloutStatus{
+			fixtureStatus("rt-other", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
+		}},
+		{"progressing group a", "progressing", fixtureGroupA, []RolloutStatus{
+			fixtureStatus("rt-api", HealthStatusProgressing, "more replicas need to be updated",
+				RolloutPhaseProgressing, 0, false, 0),
+			fixtureStatus("rt-worker", HealthStatusProgressing, "more replicas need to be updated",
+				RolloutPhaseProgressing, 0, false, 0),
+		}},
+		{"unknown correlation id", "suspended", "devops-315-unknown", []RolloutStatus{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -344,23 +374,8 @@ func TestListRolloutGroup(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ListRolloutGroup: %v", err)
 			}
-			if got == nil || len(got) != len(tt.wantNames) {
-				t.Fatalf("got %d statuses (nil=%v), want %d", len(got), got == nil, len(tt.wantNames))
-			}
-			for i, name := range tt.wantNames {
-				want := RolloutStatus{
-					Ref:                rolloutRef(name),
-					Health:             tt.wantHealth,
-					Message:            tt.wantMessage,
-					Phase:              tt.wantPhase,
-					CurrentStepIndex:   int32Ptr(tt.wantIndex),
-					Aborted:            false,
-					CanaryWeight:       tt.wantWeight,
-					StepPluginStatuses: nil,
-				}
-				if !reflect.DeepEqual(got[i], want) {
-					t.Errorf("status[%d] =\n%+v\nwant\n%+v", i, got[i], want)
-				}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("statuses =\n%+v\nwant\n%+v", got, tt.want)
 			}
 		})
 	}
