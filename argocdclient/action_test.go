@@ -91,12 +91,10 @@ func (f *fakeArgoCD) client() *Client {
 	return NewClient(&Config{ServerUrl: f.URL, AuthToken: testToken})
 }
 
-const allActions = `{"actions":[{"name":"abort"},{"name":"promote-full"},{"name":"retry","disabled":true},{"name":"resume"}]}`
-
 func TestRunResourceAction_HappyPath(t *testing.T) {
 	for _, action := range []ResourceAction{ActionResume, ActionAbort} {
 		t.Run(string(action), func(t *testing.T) {
-			f := newFakeArgoCD(t, allActions)
+			f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 
 			if err := f.client().
 				runResourceAction(context.Background(), testAppName, testRolloutRef, action); err != nil {
@@ -153,7 +151,7 @@ func TestRunResourceAction_HappyPath(t *testing.T) {
 }
 
 func TestRunResourceAction_EscapesApplicationName(t *testing.T) {
-	f := newFakeArgoCD(t, allActions)
+	f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 
 	if err := f.client().
 		runResourceAction(context.Background(), "app/with space", testRolloutRef, ActionAbort); err != nil {
@@ -174,7 +172,8 @@ func TestRunResourceAction_NotOffered(t *testing.T) {
 		actions string
 		action  ResourceAction
 	}{
-		{"disabled action", allActions, ActionRetry},
+		{"disabled action", readFixture(t, "actions-rt-api-suspended.json"), ActionRetry},
+		{"disabled in healthy state", readFixture(t, "actions-rt-api-healthy.json"), ActionAbort},
 		{"absent action", `{"actions":[{"name":"abort"}]}`, ActionResume},
 		{"no actions", `{"actions":[]}`, ActionAbort},
 	}
@@ -195,8 +194,7 @@ func TestRunResourceAction_NotOffered(t *testing.T) {
 }
 
 func TestRunResourceAction_PostErrorMapping(t *testing.T) {
-	const denied = `{"code":7,"message":"permission denied: applications, action/argoproj.io/Rollout/abort, ` +
-		`default/devops-315-rollout-test, sub: cisvc, iat: 2026-09-30T00:00:00Z"}`
+	denied := readFixture(t, "error-app-not-found.json")
 	tests := []struct {
 		name   string
 		status int
@@ -209,7 +207,7 @@ func TestRunResourceAction_PostErrorMapping(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeArgoCD(t, allActions)
+			f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 			f.postStatus, f.postBody = tt.status, tt.body
 
 			err := f.client().runResourceAction(context.Background(), testAppName, testRolloutRef, ActionAbort)
@@ -228,8 +226,7 @@ func TestRunResourceAction_PostErrorMapping(t *testing.T) {
 func TestRunResourceAction_PreCheckNotFoundInApplication(t *testing.T) {
 	f := newFakeArgoCD(t, "")
 	f.actionsStatus = http.StatusBadRequest
-	f.actionsBody = `{"code":3,"message":"Rollout argoproj.io does-not-exist not found as part of application ` +
-		`devops-315-rollout-test"}`
+	f.actionsBody = readFixture(t, "error-resource-not-found.json")
 
 	err := f.client().runResourceAction(context.Background(), testAppName, testRolloutRef, ActionAbort)
 
@@ -242,7 +239,7 @@ func TestRunResourceAction_PreCheckNotFoundInApplication(t *testing.T) {
 }
 
 func TestRunResourceAction_PostIsNeverRetried(t *testing.T) {
-	f := newFakeArgoCD(t, allActions)
+	f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 	f.postStatus, f.postBody = http.StatusServiceUnavailable, "unavailable"
 
 	err := f.client().runResourceAction(context.Background(), testAppName, testRolloutRef, ActionResume)
@@ -269,7 +266,7 @@ func TestRunResourceAction_Validation(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newFakeArgoCD(t, allActions)
+			f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 
 			if err := f.client().runResourceAction(context.Background(), testAppName, tt.ref, tt.action); err == nil {
 				t.Fatal("expected validation error")
@@ -282,7 +279,7 @@ func TestRunResourceAction_Validation(t *testing.T) {
 }
 
 func TestRunResourceAction_CanceledContext(t *testing.T) {
-	f := newFakeArgoCD(t, allActions)
+	f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
