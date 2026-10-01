@@ -43,6 +43,17 @@ func (r *Router) ClientFor(appName string) (*Client, error) {
 	return client, nil
 }
 
+// ListRolloutGroup lists the Rollouts labeled with correlationID in the Application appName,
+// on the instance appName routes to. See Client.ListRolloutGroup. An unconfigured instance
+// returns ErrInstanceNotConfigured before any HTTP call.
+func (r *Router) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error) {
+	client, err := r.ClientFor(appName)
+	if err != nil {
+		return nil, err
+	}
+	return client.ListRolloutGroup(ctx, appName, correlationID)
+}
+
 // RunResourceAction runs action on the live resource ref inside the Application
 // appName, on the instance appName routes to, using that instance's token.
 //
