@@ -118,6 +118,7 @@ type resourceNode struct {
 	Kind      string     `json:"kind"`
 	Namespace string     `json:"namespace"`
 	Name      string     `json:"name"`
+	UID       string     `json:"uid"`
 	Health    nodeHealth `json:"health"`
 }
 
@@ -223,7 +224,9 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 	}
 }
 
-// decodeRolloutNodes returns the Argo Rollouts nodes of an ArgoCD resource-tree response.
+// decodeRolloutNodes returns the Argo Rollouts nodes of an ArgoCD resource-tree response that
+// have a live object. ArgoCD adds a node without a uid for a managed Rollout that does not exist
+// in the cluster (not yet created, rejected by admission, or deleted out of band).
 func decodeRolloutNodes(tree []byte) ([]resourceNode, error) {
 	var parsed struct {
 		Nodes []resourceNode `json:"nodes"`
@@ -234,7 +237,7 @@ func decodeRolloutNodes(tree []byte) ([]resourceNode, error) {
 
 	var rollouts []resourceNode
 	for _, node := range parsed.Nodes {
-		if node.Group == rolloutGroup && node.Kind == rolloutKind {
+		if node.Group == rolloutGroup && node.Kind == rolloutKind && node.UID != "" {
 			rollouts = append(rollouts, node)
 		}
 	}
@@ -265,7 +268,9 @@ func (c *Client) getLiveRollout(ctx context.Context, appName string, node resour
 //
 // The Rollouts come from the Application's resource tree; the label, phase, step index and
 // canary weight come from each Rollout's live manifest. An empty correlationID is an error, so
-// unlabeled Rollouts are never matched. A failure to read any live Rollout fails the call.
+// unlabeled Rollouts are never matched. A Rollout with no live object (not yet created, or deleted
+// since ArgoCD last refreshed the tree) is skipped; any other failure to read a live Rollout fails
+// the whole call.
 // When no Rollout matches, the result is an empty, non-nil slice and the error is nil.
 func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error) {
 	if correlationID == "" {
@@ -284,6 +289,9 @@ func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID st
 	statuses := make([]RolloutStatus, 0, len(nodes))
 	for _, node := range nodes {
 		live, err := c.getLiveRollout(ctx, appName, node)
+		if errors.Is(err, ErrNotFound) {
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("error reading rollout %s/%s: %w", node.Namespace, node.Name, err)
 		}
