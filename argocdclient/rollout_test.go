@@ -111,8 +111,9 @@ const realisticRollout = `{
     "canary": {
       "weights": {"canary": {"weight": 50}, "stable": {"weight": 50}},
       "stepPluginStatuses": [
-        {"index": 0, "name": "mc/gate", "phase": "Successful", "message": "ok"},
-        {"index": 1, "name": "mc/verify", "phase": "Running", "message": "waiting"}
+        {"index": 0, "name": "mc/gate", "operation": "Run", "phase": "Successful", "message": "ok"},
+        {"index": 1, "name": "mc/verify", "operation": "Run", "phase": "Running", "message": "waiting"},
+        {"index": 1, "name": "mc/verify", "operation": "Abort", "phase": "Successful"}
       ]
     }
   }
@@ -134,8 +135,15 @@ func TestDecodeRollout(t *testing.T) {
 		t.Error("abort = true, want false")
 	}
 	wantPlugins := []StepPluginStatus{
-		{Index: 0, Name: "mc/gate", Phase: StepPluginPhaseSuccessful, Message: "ok"},
-		{Index: 1, Name: "mc/verify", Phase: StepPluginPhaseRunning, Message: "waiting"},
+		{Index: 0, Name: "mc/gate", Operation: StepPluginOperationRun, Phase: StepPluginPhaseSuccessful, Message: "ok"},
+		{
+			Index:     1,
+			Name:      "mc/verify",
+			Operation: StepPluginOperationRun,
+			Phase:     StepPluginPhaseRunning,
+			Message:   "waiting",
+		},
+		{Index: 1, Name: "mc/verify", Operation: StepPluginOperationAbort, Phase: StepPluginPhaseSuccessful},
 	}
 	if !reflect.DeepEqual(live.Status.Canary.StepPluginStatuses, wantPlugins) {
 		t.Errorf("stepPluginStatuses = %+v, want %+v", live.Status.Canary.StepPluginStatuses, wantPlugins)
@@ -174,8 +182,21 @@ func TestNewRolloutStatus(t *testing.T) {
 		Aborted:          false,
 		CanaryWeight:     50,
 		StepPluginStatuses: []StepPluginStatus{
-			{Index: 0, Name: "mc/gate", Phase: StepPluginPhaseSuccessful, Message: "ok"},
-			{Index: 1, Name: "mc/verify", Phase: StepPluginPhaseRunning, Message: "waiting"},
+			{
+				Index:     0,
+				Name:      "mc/gate",
+				Operation: StepPluginOperationRun,
+				Phase:     StepPluginPhaseSuccessful,
+				Message:   "ok",
+			},
+			{
+				Index:     1,
+				Name:      "mc/verify",
+				Operation: StepPluginOperationRun,
+				Phase:     StepPluginPhaseRunning,
+				Message:   "waiting",
+			},
+			{Index: 1, Name: "mc/verify", Operation: StepPluginOperationAbort, Phase: StepPluginPhaseSuccessful},
 		},
 	}
 	if !reflect.DeepEqual(got, want) {
