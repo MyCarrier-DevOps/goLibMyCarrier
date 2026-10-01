@@ -11,11 +11,16 @@ import (
 type ResourceAction string
 
 const (
-	// ActionAbort sets status.abort on the Rollout. It is safe to repeat.
+	// ActionAbort sets status.abort on the Rollout. A repeat never changes the
+	// Rollout, but ArgoCD stops offering abort once the Rollout is aborted or fully
+	// promoted, so a repeat then returns ErrConflict; RolloutStatus.Aborted tells
+	// the two cases apart.
 	ActionAbort ResourceAction = "abort"
-	// ActionPromoteFull skips the Rollout's remaining canary steps.
+	// ActionPromoteFull skips the Rollout's remaining canary steps. Once the
+	// Rollout is fully promoted, a repeat returns ErrConflict.
 	ActionPromoteFull ResourceAction = "promote-full"
-	// ActionRetry clears an abort so the Rollout tries again.
+	// ActionRetry clears an abort so the Rollout tries again. Once the abort is
+	// cleared, a repeat returns ErrConflict.
 	ActionRetry ResourceAction = "retry"
 	// ActionResume clears the Rollout's pause conditions. It is NOT idempotent:
 	// a repeated resume can release the next `pause: {}` step.
