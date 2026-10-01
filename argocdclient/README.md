@@ -406,6 +406,8 @@ with only `InstanceDev` refuses actions for `mycarrier-frontend-prod`.
 | `ActionRetry` | `retry` | Clears an abort so the Rollout tries again | Yes |
 | `ActionResume` | `resume` | Clears the pause conditions | No |
 
+Repeat-safe means a repeat never changes the Rollout, not that it always succeeds. `abort` is not offered once the Rollout is aborted or fully promoted; both cases return `ErrConflict`, so re-read `RolloutStatus.Aborted` to tell them apart. `retry` is not offered once the abort is cleared. `promote-full` is not offered once the Rollout is fully promoted; while a promotion is still in progress a repeat is posted again, harmlessly.
+
 `resume` is not idempotent: a repeated resume can release the next `pause: {}` step.
 
 ### Request flow
