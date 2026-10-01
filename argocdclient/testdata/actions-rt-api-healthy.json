@@ -1,14 +1,6 @@
 {
   "actions": [
     {
-      "name": "abort",
-      "disabled": true
-    },
-    {
-      "name": "pause",
-      "disabled": true
-    },
-    {
       "name": "promote-full",
       "disabled": true
     },
@@ -26,6 +18,14 @@
     },
     {
       "name": "skip-current-step",
+      "disabled": true
+    },
+    {
+      "name": "abort",
+      "disabled": true
+    },
+    {
+      "name": "pause",
       "disabled": true
     }
   ]
