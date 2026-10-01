@@ -8,6 +8,8 @@ import (
 )
 
 // ResourceAction names an Argo Rollouts action that ArgoCD can run on a live resource.
+// Only the four actions below are accepted, and only on argoproj.io Rollouts; any
+// other action or resource is refused before any HTTP call.
 type ResourceAction string
 
 const (
@@ -26,6 +28,15 @@ const (
 	// a repeated resume can release the next `pause: {}` step.
 	ActionResume ResourceAction = "resume"
 )
+
+// supported reports whether a is one of the actions this package runs.
+func (a ResourceAction) supported() bool {
+	switch a {
+	case ActionAbort, ActionPromoteFull, ActionRetry, ActionResume:
+		return true
+	}
+	return false
+}
 
 // availableActions is the ArgoCD action discovery response.
 type availableActions struct {
@@ -62,8 +73,24 @@ type runActionRequest struct {
 // checked against action discovery; an action that is absent or disabled
 // returns an error wrapping ErrConflict and nothing is posted.
 func (c *Client) runResourceAction(ctx context.Context, appName string, ref ResourceRef, action ResourceAction) error {
-	if ref.Name == "" || ref.Kind == "" || ref.Version == "" || action == "" {
-		return errors.New("resource name, kind, version and action are required")
+	if appName == "" {
+		return errors.New("application name is required")
+	}
+	if ref.Name == "" || ref.Version == "" {
+		return errors.New("resource name and version are required")
+	}
+	if ref.Group != rolloutGroup || ref.Kind != rolloutKind {
+		return fmt.Errorf(
+			"actions are limited to %s %s resources, got %s %q",
+			rolloutGroup,
+			rolloutKind,
+			ref.Group,
+			ref.Kind,
+		)
+	}
+	if !action.supported() {
+		return fmt.Errorf("unsupported action %q: must be one of %s, %s, %s, %s",
+			action, ActionAbort, ActionPromoteFull, ActionRetry, ActionResume)
 	}
 
 	appPath := c.applicationURL(appName)
