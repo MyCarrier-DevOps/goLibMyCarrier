@@ -67,6 +67,11 @@ func (r *Router) ListRolloutGroup(ctx context.Context, appName, correlationID st
 // Only ActionAbort, ActionPromoteFull, ActionRetry and ActionResume are accepted, and only on
 // argoproj.io Rollouts. An empty appName, any other action and any other resource kind is refused
 // with an error before any HTTP call.
+//
+// ctx is the only deadline for the call: the client sets no timeout of its own and the action is not
+// retried, so callers should pass a ctx with a deadline. A deadline that fires after ArgoCD accepted
+// the action leaves the outcome unknown (a repeated resume is not safe), so re-read the Rollout with
+// ListRolloutGroup before acting again.
 func (r *Router) RunResourceAction(
 	ctx context.Context,
 	appName string,
