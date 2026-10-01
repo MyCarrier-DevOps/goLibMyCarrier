@@ -518,7 +518,7 @@ Sentinel errors match through `errors.Is`:
 
 | Sentinel | Matches |
 |----------|---------|
-| `ErrPermissionDenied` | HTTP 403. A scoped token also gets 403, not 404, for an Application that does not exist |
+| `ErrPermissionDenied` | HTTP 403. ArgoCD answers 403, not 404, for an Application that does not exist (this client never sends a project), so a 403 can mean a missing permission or a missing Application |
 | `ErrNotFound` | HTTP 404, and HTTP 400 whose body contains `not found as part of application` (a resource that is not in the Application) |
 | `ErrConflict` | HTTP 409, or an action the resource does not currently offer (disabled or absent in ArgoCD's action discovery) |
 | `ErrInstanceNotConfigured` | An application that routes to an instance without a configured server URL and token |
