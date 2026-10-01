@@ -194,7 +194,7 @@ func TestRunResourceAction_NotOffered(t *testing.T) {
 }
 
 func TestRunResourceAction_PostErrorMapping(t *testing.T) {
-	denied := readFixture(t, "error-app-not-found.json")
+	denied := readFixture(t, "error-action-permission-denied.json")
 	tests := []struct {
 		name   string
 		status int
@@ -288,5 +288,40 @@ func TestRunResourceAction_CanceledContext(t *testing.T) {
 	}
 	if len(f.posts()) != 0 {
 		t.Error("expected no POST for canceled context")
+	}
+}
+
+func TestRunResourceAction_DegradedRollout(t *testing.T) {
+	tests := []struct {
+		action   ResourceAction
+		wantPost bool
+	}{
+		{ActionAbort, false},
+		{ActionResume, false},
+		{ActionRetry, true},
+		{ActionPromoteFull, true},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.action), func(t *testing.T) {
+			f := newFakeArgoCD(t, readFixture(t, "actions-rt-api-degraded.json"))
+
+			err := f.client().runResourceAction(context.Background(), testAppName, testRolloutRef, tt.action)
+
+			if tt.wantPost {
+				if err != nil {
+					t.Fatalf("runResourceAction: %v", err)
+				}
+				if n := len(f.posts()); n != 1 {
+					t.Errorf("expected 1 POST, got %d", n)
+				}
+				return
+			}
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("expected ErrConflict, got %v", err)
+			}
+			if n := len(f.posts()); n != 0 {
+				t.Errorf("expected no POST, got %d", n)
+			}
+		})
 	}
 }
