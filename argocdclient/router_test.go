@@ -7,7 +7,7 @@ import (
 )
 
 func TestRouter_ClientFor(t *testing.T) {
-	dev := newFakeArgoCD(t, allActions)
+	dev := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 	router := NewRouter(map[Instance]*Config{
 		InstanceDev: {ServerUrl: dev.URL, AuthToken: "dev-token"},
 	})
@@ -69,8 +69,8 @@ func TestRouter_RunResourceAction_FailsClosed(t *testing.T) {
 	for _, tt := range tests {
 		for _, app := range apps {
 			t.Run(tt.name+"/"+app, func(t *testing.T) {
-				dev := newFakeArgoCD(t, allActions)
-				prod := newFakeArgoCD(t, allActions)
+				dev := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
+				prod := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 				router := NewRouter(tt.configs(dev.URL, prod.URL))
 
 				err := router.RunResourceAction(context.Background(), app, testRolloutRef, ActionAbort)
@@ -97,8 +97,8 @@ func TestRouter_RunResourceAction_RoutesToOwningInstance(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.app, func(t *testing.T) {
-			dev := newFakeArgoCD(t, allActions)
-			prod := newFakeArgoCD(t, allActions)
+			dev := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
+			prod := newFakeArgoCD(t, readFixture(t, "actions-rt-api-suspended.json"))
 			router := NewRouter(map[Instance]*Config{
 				InstanceDev:  {ServerUrl: dev.URL, AuthToken: "dev-token"},
 				InstanceProd: {ServerUrl: prod.URL, AuthToken: "prod-token"},
