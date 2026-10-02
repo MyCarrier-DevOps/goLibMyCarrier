@@ -45,10 +45,15 @@
       "prerequisites": ["preprod_deploy"]
     },
     {
+      "name": "preprod_rollback_test",
+      "description": "Rollback rehearsal in pre-production (canary repos only; skipped otherwise)",
+      "prerequisites": ["preprod_tests"]
+    },
+    {
       "name": "prod_gate",
       "description": "Checks that the code is ready to be promoted to production",
       "is_gate": true,
-      "prerequisites": ["preprod_deploy", "preprod_tests"]
+      "prerequisites": ["preprod_deploy", "preprod_tests", "preprod_rollback_test"]
     },
     {
       "name": "prod_release_created",
@@ -56,9 +61,14 @@
       "prerequisites": ["prod_gate"]
     },
     {
+      "name": "prod_canary",
+      "description": "Canary rollout observation in production (canary repos only; skipped otherwise)",
+      "prerequisites": ["prod_release_created"]
+    },
+    {
       "name": "prod_deploy",
       "description": "Deployment to production environment",
-      "prerequisites": ["prod_gate", "prod_release_created"]
+      "prerequisites": ["prod_gate", "prod_release_created", "prod_canary"]
     },
     {
       "name": "prod_tests",

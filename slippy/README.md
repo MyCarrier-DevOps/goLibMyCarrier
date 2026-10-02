@@ -553,7 +553,9 @@ The default MyCarrier pipeline configuration (`default.json`) tracks the followi
 | Dev Tests | `dev_tests` | Dev environment tests passed |
 | Pre-Prod Deploy | `preprod_deploy` | Deployed to pre-production |
 | Pre-Prod Tests | `preprod_tests` | Pre-production tests passed |
+| Pre-Prod Rollback Test | `preprod_rollback_test` | Rollback test passed; `skipped` unless repo `deployment-strategy` is `canary` |
 | Prod Release | `prod_release_created` | Production release created |
+| Prod Canary | `prod_canary` | Canary soak passed; `skipped` unless repo `deployment-strategy` is `canary` |
 | Prod Deploy | `prod_deploy` | Deployed to production |
 | Prod Tests | `prod_tests` | Production tests passed |
 | Alert Gate | `alert_gate` | Alert monitoring passed (gate step) |
