@@ -833,7 +833,7 @@ prod_gate=completed
     └─► prod_release_created=running ─► completed
             └─► prod_canary=running ─► completed | skipped (prereq: prod_release_created)
                     └─► prod_deploy=running (prereqs: prod_gate + prod_release_created + prod_canary)
-                    └─► prod_tests=running (prereqs: prod_gate + prod_deploy)
+                            └─► prod_tests=running (prereqs: prod_gate + prod_deploy)
 ```
 
 | | |
@@ -960,8 +960,8 @@ builds + unit_tests + secret_scan all complete
                                     └─► prod_release_created
                                             └─► prod_canary (skipped unless canary repo)
                                                     └─► prod_deploy + prod_tests (parallel)
-                                              └─► prod_alert_gate
-                                                        └─► completed OR rollback
+                                                            └─► prod_alert_gate
+                                                                    └─► completed OR rollback
 ```
 
 **dev track and preprod track are fully independent after CI_PARALLEL.**
@@ -980,7 +980,7 @@ Auto-deployer is **read-only** (polls `GetSlip`). It triggers Argo workflows via
 | `DEV_TESTS_RUNNING` | If `dev_tests=failed`: F2/F3 retry - POSTs `/autotriggertests` |
 | `PREPROD_RUNNING` | Triggers `preprod_deploy`; watches for completion |
 | `PREPROD_TESTS_RUNNING` | If `preprod_tests=failed`: F2/F3 retry |
-| `PROD_RELEASE` | Monitors prod_gate → prod_release_created → prod_deploy → prod_tests sequentially (tracks only these four: `release_stage.go:79-83,120,174`; `prod_canary` and `preprod_rollback_test` are NOT tracked, so their time counts against its 10m prod_gate / prod_deploy waits, `main.go:227`; follow-up DEVOPS-318/319, bd mycarrier-we5c); does NOT auto-retry |
+| `PROD_RELEASE` | Monitors prod_gate → prod_release_created → prod_deploy → prod_tests sequentially (tracks only these four: `release_stage.go:79-83,120,174`; `prod_canary` and `preprod_rollback_test` are NOT tracked, so their time counts against its 10m prod_gate / prod_release_created / prod_deploy waits, set at `main.go:240-242` from `DefaultDeployTimeout` (`internal/config/config.go:30`); time spent in the step-0 skip jobs also counts against the prod activation wait (`release_stage.go:160-165`, `WaitForActivation`), raised to 8m in auto-deployer#17 (open); follow-up DEVOPS-318/319, bd mycarrier-we5c); does NOT auto-retry |
 | Failures | Does NOT auto-retry prod_deploy or prod_gate |
 
 ---
@@ -1066,16 +1066,16 @@ Two config-driven steps (Postgres columns `preprod_rollback_test_status`, `prod_
 - **Status:** introduced by DEVOPS-314 in workflow-dev/workflow-core `create-github-release` step 0 (planned; lands before the config change), not the Slippy library.
 - **Ordering invariant:** the skip writer must be live in the workflows before any Slippy config (Vault `#config-dev` / `#config`) gains these steps; otherwise non-canary releases hold `prod_gate`/`prod_deploy` for 60m and fail. The example JSON files carry no skip semantics.
 - **Fail-open:** missing/empty custom properties are treated as non-canary, so both steps are skipped (by design, decisions #2/#9: default = rolling). A canary repo whose properties fail to arrive therefore deploys without a canary. A consistency guard between `deployment-strategy` and helm `deploymentType: rollout` is DEVOPS-310's.
-- **When / rule:** it marks both steps `skipped` unless the repo custom property `deployment-strategy` equals `canary`. Absent or any other value means skip. Canary repos leave them `pending` for their own workflows to run.
+- **When / rule:** it marks both steps `skipped` unless the repo custom property `deployment-strategy` equals `canary`. Absent or any other value means skip. Canary repos leave them `pending` for their own workflows to run. No such workflow exists yet (the canary runner is DEVOPS-319, which records `prod_canary`; the rollback-rehearsal driver is DEVOPS-318, which drives `preprod_rollback_test`), so until they land, setting `deployment-strategy=canary` on a repo leaves both steps `pending`, its `prod_gate` holds for 60m, and every release of that repo fails.
 - **Why it matters:** `skipped` satisfies prerequisites (`status.go` IsSuccess, `prereqs.go`). A `pending` canary step blocks promotion, so the skip must be written before `prod_gate` on non-canary repos.
-- The skip API accepts any state and overwrites terminal statuses, including a `failed` `prod_canary`.
+- The skip API accepts any state and overwrites terminal statuses, including a `failed` `prod_canary`. `SkipStep` has no status guard, `skipped` counts as success (`IsSuccess`), and retry recovery resets only `aborted` steps. So a re-run release whose custom properties fail to arrive (fail-open) would turn a `failed` `prod_canary` into `skipped` and unblock `prod_deploy`/`prod_gate`, and nothing would revisit the failure. Follow-up: the skip writer or `SkipStep` must refuse to overwrite `failed` on canary steps (ticket: DEVOPS-319, the runner that records `prod_canary`). Flipping the property to non-canary and re-running is the one intended recovery.
 
 ### Checklist item 7 trace
 
 - **Cascade scope, `prod_canary` failed:** primary failure, so `slip=failed`. Library path: `prod_deploy`'s hold aborts it; `prod_tests` and `prod_steady_state` stay `pending` until their own holds (blocked until `prod_canary` is `completed` or `skipped`). A retry that completes `prod_canary` resets the aborted steps to `pending` and the slip to `in_progress`.
 - **`preprod_rollback_test` failed:** same library/CLI split (see below): `prod_gate` -> `aborted` (library) or stays `pending` (CLI). Blocks `prod_gate` and, through it, everything downstream including `prod_steady_state`.
 - **`prod_steady_state` reachability:** `prod_release_created -> prod_canary (skipped|completed) -> prod_deploy -> prod_tests -> prod_steady_state`. The example files list only `[prod_deploy, prod_tests]` as `prod_steady_state` prereqs; the live Vault config also requires `prod_alert_gate` (example files drift), so live reachability additionally depends on the alert-gate branch.
-- **Phases:** nothing upstream of the new steps changed (`dev_deploy` stays `[builds]`), so DEV and CI_PARALLEL are unaffected (rule 8).
+- **Phases:** nothing upstream of the new steps changed (`dev_deploy` is unchanged; its prereqs are `[builds]` in `production.json` and the live config, but `[builds, unit_tests, secret_scan]` in `slippy/default.json`, a pre-existing drift), so DEV and CI_PARALLEL are unaffected (rule 8).
 
 ### Library vs CLI cascade
 

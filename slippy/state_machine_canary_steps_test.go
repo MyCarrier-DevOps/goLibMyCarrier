@@ -370,7 +370,7 @@ func TestPipelineConfig_ExampleFiles_ProdSteadyStateReachable(t *testing.T) {
 				}
 			}
 			stuckRollback := reach(cfg, nil, map[string]bool{"preprod_rollback_test": true})
-			for _, s := range []string{"prod_gate", "prod_release_created", "prod_canary", "prod_deploy", "prod_steady_state"} {
+			for _, s := range []string{"prod_gate", "prod_release_created", "prod_canary", "prod_deploy", "prod_tests", "prod_steady_state"} {
 				if stuckRollback[s] {
 					t.Errorf("%s: %s must be blocked while preprod_rollback_test is neither completed nor skipped", file, s)
 				}
