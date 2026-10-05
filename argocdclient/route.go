@@ -51,6 +51,7 @@ func (i Instance) String() string {
 //
 //   - "-offload-" substring                        → InstanceDev   (feature offloads)
 //   - "development-dev-" or "development-preprod-" → InstanceMgmt  (legacy dev/preprod)
+//   - "development-lab-dev-" or "development-lab-preprod-" → InstanceMgmt  (MyCarrier-Product lab tier)
 //   - "production-csp-" prefix                     → InstanceMgmt  (legacy prod cluster selector)
 //   - "-prod" suffix (NOT "-preprod")              → InstanceProd  (new mc-environment scheme)
 //   - otherwise                                     → InstanceDev   (default — new-scheme dev/preprod)
@@ -77,9 +78,14 @@ func RouteInstance(appName string) Instance {
 		return InstanceDev
 	}
 
-	// Legacy non-prod scheme: "development-dev-{svc}" / "development-preprod-{svc}".
+	// Legacy non-prod scheme: "development-dev-{svc}" / "development-preprod-{svc}",
+	// plus the MyCarrier-Product lab tier "development-lab-dev-{svc}" /
+	// "development-lab-preprod-{svc}" (same management ArgoCD). Only the two
+	// lab envs match; a broad "development-lab-" prefix is deliberately avoided.
 	if strings.HasPrefix(n, "development-dev-") ||
-		strings.HasPrefix(n, "development-preprod-") {
+		strings.HasPrefix(n, "development-preprod-") ||
+		strings.HasPrefix(n, "development-lab-dev-") ||
+		strings.HasPrefix(n, "development-lab-preprod-") {
 		return InstanceMgmt
 	}
 

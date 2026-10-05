@@ -243,7 +243,7 @@ the correct control plane so the caller can pick the matching
 | # | Pattern in `appName` | Instance | Use case |
 |---|---|---|---|
 | 1 | contains `-offload-` | `InstanceDev` | Legacy feature offload (any env shape) |
-| 2 | prefix `development-dev-` or `development-preprod-` | `InstanceMgmt` | Legacy dev / preprod |
+| 2 | prefix `development-dev-`, `development-preprod-`, `development-lab-dev-` or `development-lab-preprod-` | `InstanceMgmt` | Legacy dev / preprod and MyCarrier-Product lab tier |
 | 3 | prefix `production-csp-` | `InstanceMgmt` | Legacy prod cluster selector |
 | 4 | suffix `-prod` (NOT `-preprod`) | `InstanceProd` | New `mc-environment` scheme prod |
 | 5 | _otherwise_ (default) | `InstanceDev` | New `mc-environment` scheme dev / preprod / feature |

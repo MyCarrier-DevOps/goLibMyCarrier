@@ -36,6 +36,13 @@ func TestRouteInstance(t *testing.T) {
 			want:    InstanceMgmt,
 		},
 
+		// MyCarrier-Product lab tier → mgmt (only the two lab envs).
+		{name: "lab-dev prefix → mgmt", appName: "development-lab-dev-pythonexample", want: InstanceMgmt},
+		{name: "lab-preprod prefix → mgmt", appName: "development-lab-preprod-pythonexample", want: InstanceMgmt},
+		{name: "lab-dev mixed case → mgmt", appName: "Development-Lab-Dev-X", want: InstanceMgmt},
+		{name: "lab offload still dev", appName: "development-lab-dev-pythonexample-offload-feature1", want: InstanceDev},
+		{name: "unknown lab env → dev", appName: "development-lab-x", want: InstanceDev},
+
 		// Legacy production-csp prefix → mgmt.
 		{
 			name:    "legacy production-csp-prod prefix → mgmt",
