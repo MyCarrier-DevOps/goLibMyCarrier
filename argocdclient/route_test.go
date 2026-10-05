@@ -41,6 +41,7 @@ func TestRouteInstance(t *testing.T) {
 		{name: "lab-preprod prefix → mgmt", appName: "development-lab-preprod-pythonexample", want: InstanceMgmt},
 		{name: "lab-dev mixed case → mgmt", appName: "Development-Lab-Dev-X", want: InstanceMgmt},
 		{name: "lab offload still dev", appName: "development-lab-dev-pythonexample-offload-feature1", want: InstanceDev},
+		{name: "lab-preprod offload still dev", appName: "development-lab-preprod-pythonexample-offload-feature1", want: InstanceDev},
 		{name: "unknown lab env → dev", appName: "development-lab-x", want: InstanceDev},
 
 		// Legacy production-csp prefix → mgmt.

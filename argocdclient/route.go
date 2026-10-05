@@ -78,10 +78,10 @@ func RouteInstance(appName string) Instance {
 		return InstanceDev
 	}
 
-	// Legacy non-prod scheme: "development-dev-{svc}" / "development-preprod-{svc}",
-	// plus the MyCarrier-Product lab tier "development-lab-dev-{svc}" /
-	// "development-lab-preprod-{svc}" (same management ArgoCD). Only the two
-	// lab envs match; a broad "development-lab-" prefix is deliberately avoided.
+	// Management-instance non-prod apps: legacy "development-dev-{svc}" /
+	// "development-preprod-{svc}", plus the MyCarrier-Product lab tier
+	// "development-lab-dev-{svc}" / "development-lab-preprod-{svc}" (same
+	// management ArgoCD). Only the two lab envs match; a broad "development-lab-" prefix is deliberately avoided.
 	if strings.HasPrefix(n, "development-dev-") ||
 		strings.HasPrefix(n, "development-preprod-") ||
 		strings.HasPrefix(n, "development-lab-dev-") ||
