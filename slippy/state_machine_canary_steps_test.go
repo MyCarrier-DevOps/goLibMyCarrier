@@ -253,18 +253,17 @@ var canaryExampleGraph = map[string][]string{
 }
 
 // TestPipelineConfig_ExampleFiles_CanaryGraph pins the DEVOPS-314 graph in both example configs.
-// These files are examples (the live config is in Vault), so only the steps this change
-// touches are pinned; other drift between the files and Vault is deliberately not asserted.
+// These files are examples (the live config is in Vault), so the graph is pinned for the steps
+// this change touches; it also asserts that mutation_tests is standalone and that
+// prod_steady_state waits on prod_alert_gate. Other drift from Vault is not asserted.
 func TestPipelineConfig_ExampleFiles_CanaryGraph(t *testing.T) {
-	// devDeployPrereqs records each file's CURRENT dev_deploy prerequisites so an accidental
-	// edit is caught. default.json differs from production.json and the live config (which
-	// follow STATE_MACHINE_V3 rule 7, [builds]); that drift predates DEVOPS-314 and is out of
-	// scope here.
+	// devDeployPreqs records dev_deploy's prerequisites ([builds], STATE_MACHINE_V3 rule 7) so an
+	// accidental edit is caught. Both example files mirror the live config here.
 	cases := []struct {
 		file           string
 		devDeployPreqs []string
 	}{
-		{"default.json", []string{"builds", "unit_tests", "secret_scan"}},
+		{"default.json", []string{"builds"}},
 		{"production.json", []string{"builds"}},
 	}
 	for _, tc := range cases {
@@ -289,6 +288,14 @@ func TestPipelineConfig_ExampleFiles_CanaryGraph(t *testing.T) {
 			}
 			if dd := cfg.GetStep("dev_deploy"); dd == nil || !slices.Equal(dd.Prerequisites, tc.devDeployPreqs) {
 				t.Errorf("%s: dev_deploy prerequisites changed, want %v", tc.file, tc.devDeployPreqs)
+			}
+			// Live-shape edges outside the canary change: mutation_tests is a standalone step and
+			// prod_steady_state also waits on prod_alert_gate.
+			if mt := cfg.GetStep("mutation_tests"); mt == nil || len(mt.Prerequisites) != 0 || mt.IsGate || mt.Aggregates != "" {
+				t.Errorf("%s: mutation_tests must exist as a plain step with no prerequisites", tc.file)
+			}
+			if ss := cfg.GetStep("prod_steady_state"); ss == nil || !slices.Equal(ss.Prerequisites, []string{"prod_deploy", "prod_tests", "prod_alert_gate"}) {
+				t.Errorf("%s: prod_steady_state prerequisites changed, want [prod_deploy prod_tests prod_alert_gate]", tc.file)
 			}
 			// Full dependent sets (reverse edges): extra edges onto unpinned steps must fail.
 			dependents := func(prereq string) []string {
@@ -376,5 +383,55 @@ func TestPipelineConfig_ExampleFiles_ProdSteadyStateReachable(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// liveShapeStepOrder is the live Vault pipeline config's step order (config-dev v16, which equals
+// the prod `config` key) plus the two DEVOPS-314 steps.
+var liveShapeStepOrder = []string{
+	"builds", "unit_tests", "mutation_tests", "secret_scan", "package_artifact",
+	"dev_deploy", "dev_tests", "preprod_deploy", "preprod_tests", "preprod_rollback_test",
+	"prod_gate", "prod_release_created", "prod_canary", "prod_deploy", "prod_tests",
+	"prod_alert_gate", "prod_rollback", "prod_steady_state",
+}
+
+// TestPipelineConfig_ExampleFiles_MirrorEachOtherAndLiveShape pins that default.json and
+// production.json are identical field by field (name, description, is_gate, aggregates,
+// prerequisites) and that their step names and order match the live 18-step target. It also
+// pins that prod_gate is the only gate step.
+func TestPipelineConfig_ExampleFiles_MirrorEachOtherAndLiveShape(t *testing.T) {
+	def, err := LoadPipelineConfigFromFile("default.json")
+	if err != nil {
+		t.Fatalf("load default.json: %v", err)
+	}
+	prod, err := LoadPipelineConfigFromFile("production.json")
+	if err != nil {
+		t.Fatalf("load production.json: %v", err)
+	}
+	if def.Version != prod.Version || def.Name != prod.Name || def.Description != prod.Description {
+		t.Errorf("top-level fields differ: default=(%q,%q,%q) production=(%q,%q,%q)",
+			def.Version, def.Name, def.Description, prod.Version, prod.Name, prod.Description)
+	}
+	if len(def.Steps) != len(prod.Steps) {
+		t.Fatalf("step counts differ: default.json=%d production.json=%d", len(def.Steps), len(prod.Steps))
+	}
+	for i := range def.Steps {
+		d, p := def.Steps[i], prod.Steps[i]
+		if d.Name != p.Name || d.Description != p.Description || d.IsGate != p.IsGate ||
+			d.Aggregates != p.Aggregates || !slices.Equal(d.Prerequisites, p.Prerequisites) {
+			t.Errorf("step %d differs between files: default=%+v production=%+v", i, d, p)
+		}
+	}
+	for name, cfg := range map[string]*PipelineConfig{"default.json": def, "production.json": prod} {
+		var names []string
+		for _, st := range cfg.Steps {
+			names = append(names, st.Name)
+			if st.IsGate != (st.Name == "prod_gate") {
+				t.Errorf("%s: step %s IsGate = %v, want %v (prod_gate is the only gate)", name, st.Name, st.IsGate, st.Name == "prod_gate")
+			}
+		}
+		if !slices.Equal(names, liveShapeStepOrder) {
+			t.Errorf("%s: step order = %v, want %v", name, names, liveShapeStepOrder)
+		}
 	}
 }

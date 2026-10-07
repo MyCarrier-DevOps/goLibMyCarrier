@@ -1074,8 +1074,8 @@ Two config-driven steps (Postgres columns `preprod_rollback_test_status`, `prod_
 
 - **Cascade scope, `prod_canary` failed:** primary failure, so `slip=failed`. Library path: `prod_deploy`'s hold aborts it; `prod_tests` and `prod_steady_state` stay `pending` until their own holds (blocked until `prod_canary` is `completed` or `skipped`). A retry that completes `prod_canary` resets the aborted steps to `pending` and the slip to `in_progress`.
 - **`preprod_rollback_test` failed:** same library/CLI split (see below): `prod_gate` -> `aborted` (library) or stays `pending` (CLI). Blocks `prod_gate` and, through it, everything downstream including `prod_steady_state`.
-- **`prod_steady_state` reachability:** `prod_release_created -> prod_canary (skipped|completed) -> prod_deploy -> prod_tests -> prod_steady_state`. The example files list only `[prod_deploy, prod_tests]` as `prod_steady_state` prereqs; the live Vault config also requires `prod_alert_gate` (example files drift), so live reachability additionally depends on the alert-gate branch.
-- **Phases:** nothing upstream of the new steps changed (`dev_deploy` is unchanged; its prereqs are `[builds]` in `production.json` and the live config, but `[builds, unit_tests, secret_scan]` in `slippy/default.json`, a pre-existing drift), so DEV and CI_PARALLEL are unaffected (rule 8).
+- **`prod_steady_state` reachability:** `prod_release_created -> prod_canary (skipped|completed) -> prod_deploy -> prod_tests -> prod_steady_state`. The example files and the live Vault config both list `[prod_deploy, prod_tests, prod_alert_gate]` as `prod_steady_state` prereqs, so reachability also depends on the alert-gate branch.
+- **Phases:** nothing upstream of the new steps changed (`dev_deploy` is unchanged; its prereqs are `[builds]` in both example files and the live config), so DEV and CI_PARALLEL are unaffected (rule 8).
 
 ### Library vs CLI cascade
 
