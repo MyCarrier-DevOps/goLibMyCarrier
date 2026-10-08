@@ -33,6 +33,7 @@
 - Step dependencies defined by pipeline config (`production.json`).
 - Initial steps (no prereqs): `builds`, `unit_tests`, `secret_scan`, `package_artifact`.
 - Final step: `prod_steady_state`.
+- Canary steps (DEVOPS-314): `preprod_rollback_test` (prereq `preprod_tests`; added to `prod_gate` prereqs) and `prod_canary` (prereq `prod_release_created`; added to `prod_deploy` prereqs). Both are marked `skipped` by the release workflow unless the repo's `deployment-strategy` custom property is `canary` (see Canary Steps section).
 - All initial steps run in parallel for same correlation id. Build components run in parallel within `builds` aggregate.
 - Downstream steps run per config-defined prereqs (see Pipeline Flow diagram).
 
@@ -40,7 +41,7 @@
 - Slippy CLI `-pre` (`StartStep` / `WaitForPrerequisites`) and `-post` (`RunPostExecution`) drive every step transition. No direct `routing_slips` writes outside this path.
 - Step terminal status propagates to `slip.status` via `checkPipelineCompletion`:
   - Any primary failure → `slip=failed`.
-  - **FailStep(X) scope:** only `X.status → failed` and `slip.status → failed`. No other step rows modified synchronously. Downstream steps self-abort lazily when each one calls `WaitForPrerequisites` and observes the failed prereq (`hold.go:83-110`).
+  - **FailStep(X) scope:** only `X.status → failed` and `slip.status → failed`. No other step rows modified synchronously. Downstream steps self-abort lazily when each one calls `WaitForPrerequisites` and observes the failed prereq (`hold.go:83-111`).
   - All primary failures resolved AND `slip=failed` → `slip=in_progress`; cascade-aborted steps reset to `pending`.
   - `prod_steady_state=completed` AND zero primary failures → `slip=completed` (terminal, immutable).
 - Aggregate `builds`: any single component primary failure → aggregate `failed` → `slip=failed`. Aggregate `completed` only when all components terminal-success.
@@ -733,7 +734,9 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
 > **Note:** "downstream lazy-abort" means downstream step rows are NOT changed by FailStep. Each downstream step transitions to `aborted` only when its own `WaitForPrerequisites` call observes the failed prereq.
 
-> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-110`). Steps that never enter pre-job stay `pending`. The recovery branch of `checkPipelineCompletion` (`executor.go`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
+> **Note (DEVOPS-314):** the diagram predates the canary steps. `preprod_rollback_test` sits between `preprod_tests` and `PROD_GATE` (a prereq of `prod_gate`); `prod_canary` sits between `prod_release_created` and `prod_deploy` (a prereq of `prod_deploy`). Both are usually `skipped`, which satisfies prerequisites. See "Canary Steps (DEVOPS-314)".
+
+> **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-111`). Steps that never enter pre-job stay `pending`. The recovery branch of `checkPipelineCompletion` (`executor.go`) only resets steps actually in `aborted` — vacuous if none ever transitioned.
 
 ---
 
@@ -798,8 +801,10 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 |-------|------------|---------|----------------|
 | `preprod_deploy=running` | `in_progress` | `builds+unit_tests+secret_scan=completed` | `failed` - blocks `prod_gate` |
 | `preprod_tests=running` | `in_progress` | ArgoCD PostSync → TestEngine ⚠️ | `failed` - blocks `prod_gate` |
+| `preprod_rollback_test=running` | `in_progress` | after `preprod_tests=completed` (or `skipped` by the release workflow) | `failed` - blocks `prod_gate` |
 | `preprod_deploy=failed` | `failed` | post-job | `preprod_tests` aborts if waiting; `prod_gate` blocked |
 | `preprod_tests=failed` | `failed` | TestEngine RunPostExecution | `prod_gate` blocked until resolved |
+| `preprod_rollback_test=failed` | `failed` | post-job | `prod_gate` blocked until resolved |
 
 > ⚠️ `preprod_tests` can run against a failed or restarted deployment (PROJECT_STATE.md - discrepancy #9).
 > `prod_gate` has no awareness of which deployment the test results belong to.
@@ -811,10 +816,10 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 | | |
 |---|---|
 | **slip.status** | `in_progress` |
-| **Prereqs** | `preprod_deploy=completed` AND `preprod_tests=completed` |
+| **Prereqs** | `preprod_deploy=completed` AND `preprod_tests=completed` AND `preprod_rollback_test` terminal-success (`completed` or `skipped`) |
 | **Running** | `prod_gate` (is_gate=true) |
 | **On success** | All downstream prod steps unblocked; pipeline continues to `PROD_RELEASE` |
-| **On failure** | `slip=failed` (FailStep only flips `prod_gate` + `slip.status`). Downstream steps NOT immediately aborted — each self-aborts lazily when its own `WaitForPrerequisites` observes `prod_gate=failed` (`hold.go:83-110`). Steps whose pre-job never runs stay `pending`. |
+| **On failure** | `slip=failed` (FailStep only flips `prod_gate` + `slip.status`). Downstream steps NOT immediately aborted — each self-aborts lazily when its own `WaitForPrerequisites` observes `prod_gate=failed` (`hold.go:83-111`). Steps whose pre-job never runs stay `pending`. |
 | **Recovery** | Re-run `prod_gate` → success → cascade steps reset to `pending` → `prod_gate=completed` must then unblock each downstream step individually as they restart |
 
 ---
@@ -826,14 +831,16 @@ Steps run sequentially within this phase (each unblocks the next):
 ```
 prod_gate=completed
     └─► prod_release_created=running ─► completed
-            └─► prod_deploy=running (prereqs: prod_gate + prod_release_created)
-                    └─► prod_tests=running (prereqs: prod_gate + prod_deploy)
+            └─► prod_canary=running ─► completed | skipped (prereq: prod_release_created)
+                    └─► prod_deploy=running (prereqs: prod_gate + prod_release_created + prod_canary)
+                            └─► prod_tests=running (prereqs: prod_gate + prod_deploy)
 ```
 
 | | |
 |---|---|
 | **slip.status** | `in_progress` |
-| **Failure at prod_release_created** | `slip=failed`; `prod_deploy`, `prod_tests`, `prod_alert_gate`, etc. blocked (prereqs not met) |
+| **Failure at prod_release_created** | `slip=failed`; `prod_canary`, `prod_deploy`, `prod_tests`, `prod_alert_gate`, etc. blocked (prereqs not met) |
+| **Failure at prod_canary** | `slip=failed`; `prod_deploy`, `prod_tests`, `prod_steady_state` blocked until a retry makes `prod_canary` `completed` or `skipped` (see Canary Steps for library vs CLI cascade) |
 | **Failure at prod_deploy** | `slip=failed`; `prod_tests` cascade-aborts (detected by WaitForPrerequisites) |
 | **Failure at prod_tests** | `slip=failed`; `prod_steady_state` blocked |
 
@@ -899,9 +906,11 @@ prod_gate=completed
 | `dev_deploy` failed | `failed` | `dev_tests` | `dev_tests` (if waiting) | Re-run `dev_deploy` - does NOT block preprod |
 | `dev_tests` failed | `failed` | Nothing downstream | None | Re-run `dev_tests` - does NOT block preprod |
 | `preprod_deploy` failed | `failed` | `preprod_tests`, `prod_gate` | `preprod_tests` (if waiting) | Re-run `preprod_deploy` |
-| `preprod_tests` failed | `failed` | `prod_gate` | None | Re-run `preprod_tests` |
-| `prod_gate` failed | `failed` | All production steps | `prod_release_created`, `prod_deploy`, `prod_tests`, `prod_alert_gate`, `prod_rollback`, `prod_steady_state` | Re-run `prod_gate` |
-| `prod_release_created` failed | `failed` | `prod_deploy`, `prod_tests` | None (prereqs not met - they stay pending) | Re-run `prod_release_created` |
+| `preprod_tests` failed | `failed` | `preprod_rollback_test`, `prod_gate` | `preprod_rollback_test` (if waiting) | Re-run `preprod_tests` |
+| `preprod_rollback_test` failed | `failed` | `prod_gate` and, through it, all production steps | `prod_gate` (library path: hold returns `ErrPrerequisiteFailed`, `prod_gate` -> `aborted`); CLI/Argo path: prod-gate pre-job exits non-zero, `prod_gate` stays `pending` | Re-run `preprod_rollback_test` |
+| `prod_gate` failed | `failed` | All production steps | `prod_release_created`, `prod_canary`, `prod_deploy`, `prod_tests`, `prod_alert_gate`, `prod_rollback`, `prod_steady_state` | Re-run `prod_gate` |
+| `prod_release_created` failed | `failed` | `prod_canary`, `prod_deploy`, `prod_tests` | None (prereqs not met - they stay pending) | Re-run `prod_release_created` |
+| `prod_canary` failed | `failed` | `prod_deploy`, `prod_tests`, `prod_steady_state` | `prod_deploy` (library path, if in WaitForPrerequisites); on the Slippy CLI path nothing is written and `prod_deploy` stays `pending` | Re-run `prod_canary` |
 | `prod_deploy` failed | `failed` | `prod_tests`, `prod_steady_state` | `prod_tests` (if in WaitForPrerequisites) | Re-run `prod_deploy` |
 | `prod_tests` failed | `failed` | `prod_steady_state` | None | Re-run `prod_tests` |
 | `prod_alert_gate` failed | `failed` | `prod_steady_state` | None | Triggers rollback instead |
@@ -946,11 +955,13 @@ builds completes
 builds + unit_tests + secret_scan all complete
     └─► preprod_deploy
             └─► preprod_tests (TestEngine PostSync)
-                    └─► prod_gate (after both preprod steps done)
-                            └─► prod_release_created
-                                    └─► prod_deploy + prod_tests (parallel)
-                                              └─► prod_alert_gate
-                                                        └─► completed OR rollback
+                    └─► preprod_rollback_test (skipped unless canary repo)
+                            └─► prod_gate (after all preprod steps done)
+                                    └─► prod_release_created
+                                            └─► prod_canary (skipped unless canary repo)
+                                                    └─► prod_deploy + prod_tests (parallel)
+                                                            └─► prod_alert_gate
+                                                                    └─► completed OR rollback
 ```
 
 **dev track and preprod track are fully independent after CI_PARALLEL.**
@@ -969,7 +980,7 @@ Auto-deployer is **read-only** (polls `GetSlip`). It triggers Argo workflows via
 | `DEV_TESTS_RUNNING` | If `dev_tests=failed`: F2/F3 retry - POSTs `/autotriggertests` |
 | `PREPROD_RUNNING` | Triggers `preprod_deploy`; watches for completion |
 | `PREPROD_TESTS_RUNNING` | If `preprod_tests=failed`: F2/F3 retry |
-| `PROD_RELEASE` | Monitors prod_gate → prod_release_created → prod_deploy → prod_tests sequentially; does NOT auto-retry |
+| `PROD_RELEASE` | Monitors prod_gate → prod_release_created → prod_deploy → prod_tests sequentially (tracks only these four: `release_stage.go:79-83,120,174`; `prod_canary` and `preprod_rollback_test` are NOT tracked, so their time counts against its 10m prod_gate / prod_release_created / prod_deploy waits, set at `main.go:240-242` from `DefaultDeployTimeout` (`internal/config/config.go:30`); time spent in the step-0 skip jobs also counts against the prod activation wait (`release_stage.go:160-165`, `WaitForActivation`), raised to 8m in auto-deployer#17 (open); follow-up DEVOPS-318/319, bd mycarrier-we5c); does NOT auto-retry |
 | Failures | Does NOT auto-retry prod_deploy or prod_gate |
 
 ---
@@ -1041,6 +1052,37 @@ checkPipelineCompletion(ctx, correlationID):
 
 ---
 
+## Canary Steps (DEVOPS-314)
+
+Two config-driven steps (Postgres columns `preprod_rollback_test_status`, `prod_canary_status`, added by slippy-migrator before slippy-api restarts; ProbeSchema fails otherwise). The slippy-migrator Job does not re-run on a Vault edit: trigger it explicitly before restarting slippy-api:
+
+| Step | Prereqs | Added to |
+|------|---------|----------|
+| `preprod_rollback_test` | `preprod_tests` | `prod_gate` prereqs |
+| `prod_canary` | `prod_release_created` | `prod_deploy` prereqs |
+
+### Skip-writer contract
+
+- **Status:** introduced by DEVOPS-314 in workflow-dev/workflow-core `create-github-release` step 0 (planned; lands before the config change), not the Slippy library.
+- **Ordering invariant:** the skip writer must be live in the workflows before any Slippy config (Vault `#config-dev` / `#config`) gains these steps; otherwise non-canary releases hold `prod_gate`/`prod_deploy` for 60m and fail. The example JSON files carry no skip semantics.
+- **Fail-open:** missing/empty custom properties are treated as non-canary, so both steps are skipped (by design, decisions #2/#9: default = rolling). A canary repo whose properties fail to arrive therefore deploys without a canary. A consistency guard between `deployment-strategy` and helm `deploymentType: rollout` is DEVOPS-310's.
+- **When / rule:** it marks both steps `skipped` unless the repo custom property `deployment-strategy` equals `canary`. Absent or any other value means skip. Canary repos leave them `pending` for their own workflows to run. No such workflow exists yet (the canary runner is DEVOPS-319, which records `prod_canary`; the rollback-rehearsal driver is DEVOPS-318, which drives `preprod_rollback_test`), so until they land, setting `deployment-strategy=canary` on a repo leaves both steps `pending`, its `prod_gate` holds for 60m, and every release of that repo fails.
+- **Why it matters:** `skipped` satisfies prerequisites (`status.go` IsSuccess, `prereqs.go`). A `pending` canary step blocks promotion, so the skip must be written before `prod_gate` on non-canary repos.
+- The skip API accepts any state and overwrites terminal statuses, including a `failed` `prod_canary`. `SkipStep` has no status guard, `skipped` counts as success (`IsSuccess`), and retry recovery resets only `aborted` steps. So a re-run release whose custom properties fail to arrive (fail-open) would turn a `failed` `prod_canary` into `skipped` and unblock `prod_deploy`/`prod_gate`, and nothing would revisit the failure. Follow-up: the skip writer or `SkipStep` must refuse to overwrite `failed` on canary steps (ticket: DEVOPS-319, the runner that records `prod_canary`). Flipping the property to non-canary and re-running is the one intended recovery.
+
+### Checklist item 7 trace
+
+- **Cascade scope, `prod_canary` failed:** primary failure, so `slip=failed`. Library path: `prod_deploy`'s hold aborts it; `prod_tests` and `prod_steady_state` stay `pending` until their own holds (blocked until `prod_canary` is `completed` or `skipped`). A retry that completes `prod_canary` resets the aborted steps to `pending` and the slip to `in_progress`.
+- **`preprod_rollback_test` failed:** same library/CLI split (see below): `prod_gate` -> `aborted` (library) or stays `pending` (CLI). Blocks `prod_gate` and, through it, everything downstream including `prod_steady_state`.
+- **`prod_steady_state` reachability:** `prod_release_created -> prod_canary (skipped|completed) -> prod_deploy -> prod_tests -> prod_steady_state`. The example files and the live Vault config both list `[prod_deploy, prod_tests, prod_alert_gate]` as `prod_steady_state` prereqs, so reachability also depends on the alert-gate branch.
+- **Phases:** nothing upstream of the new steps changed (`dev_deploy` is unchanged; its prereqs are `[builds]` in both example files and the live config), so DEV and CI_PARALLEL are unaffected (rule 8).
+
+### Library vs CLI cascade
+
+The "aborted automatically" cascade holds only in the library: `WaitForPrerequisites` calls `AbortStep` on a failed prereq (`hold.go:83-111`). The Argo path uses the Slippy CLI, which polls read-only `GET step-prerequisites` and never writes `aborted`. There the downstream step stays `pending` and the pre-job exits non-zero. Retry still works because the recovery reset only touches `aborted` steps. Invariant tests prove the library semantics only (`slippy/state_machine_canary_steps_test.go`).
+
+---
+
 ## Code Validation Guide
 
 When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/`, `MC.TestEngine/`, `auto-deployer/`, workflow templates), use this checklist. The machine-readable version of these rules is `slippy/state_machine_invariants_test.go` (I1–I4 invariant tests).
@@ -1059,7 +1101,7 @@ When reviewing any change to `goLibMyCarrier/slippy/` or any caller (`Slippy/ci/
 
 6. **`WaitForPrerequisites` in new callers** - any new integration that calls `StartStep` (pre-job) MUST either call `WaitForPrerequisites` first, or document the explicit assumption about why prereqs are guaranteed at call time.
 
-7. **Pipeline config changes** - for any new step or prerequisite change, trace the cascade abort scope and verify `prod_steady_state` terminal path is still reachable. Verify `dev_deploy` prereqs remain `[builds]` only (adding `unit_tests`/`secret_scan` breaks CI_PARALLEL → DEV independence).
+7. **Pipeline config changes** - for any new step or prerequisite change, trace the cascade abort scope and verify `prod_steady_state` terminal path is still reachable. Verify `dev_deploy` prereqs remain `[builds]` only (adding `unit_tests`/`secret_scan` breaks CI_PARALLEL → DEV independence). Worked example: see "Canary Steps (DEVOPS-314)" below.
 
 8. **Pipeline phase impact** - identify which pipeline phase(s) the change touches (STATE_MACHINE_V3.md phases) and verify phase transition behaviour is preserved. Flag any change where the high-level phase flow would need to be redrawn but hasn't been updated.
 

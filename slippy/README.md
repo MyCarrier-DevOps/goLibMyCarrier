@@ -541,23 +541,28 @@ func main() {
 
 ## Pipeline Stages
 
-The default MyCarrier pipeline configuration (`default.json`) tracks the following stages. Your pipeline configuration may differ based on your specific workflow needs.
+The example pipeline configurations (`default.json` and `production.json`, which carry the same steps) are the live pipeline config plus the two DEVOPS-314 steps (`prod_canary`, `preprod_rollback_test`), the 18-step target the live Vault config moves to at cutover. Your pipeline configuration may differ based on your specific workflow needs.
 
-| Stage | Step Name | Description |
-|-------|-----------|-------------|
-| Push Parsing | `push_parsed` | Initial commit processing |
-| Build | `builds_completed` | All component builds done (aggregates `build`) |
-| Unit Tests | `unit_tests_completed` | All unit tests passed (aggregates `unit_test`) |
-| Secret Scan | `secret_scan_completed` | Security scanning passed |
-| Dev Deploy | `dev_deploy` | Deployed to dev environment |
-| Dev Tests | `dev_tests` | Dev environment tests passed |
-| Pre-Prod Deploy | `preprod_deploy` | Deployed to pre-production |
-| Pre-Prod Tests | `preprod_tests` | Pre-production tests passed |
-| Prod Release | `prod_release_created` | Production release created |
-| Prod Deploy | `prod_deploy` | Deployed to production |
-| Prod Tests | `prod_tests` | Production tests passed |
-| Alert Gate | `alert_gate` | Alert monitoring passed (gate step) |
-| Steady State | `prod_steady_state` | Production is stable |
+| Stage | Step Name | Prerequisites | Description |
+|-------|-----------|---------------|-------------|
+| Build | `builds` | none | All component builds done (aggregates `build`) |
+| Unit Tests | `unit_tests` | none | All unit tests passed |
+| Mutation Tests | `mutation_tests` | none | Mutation tests finished |
+| Secret Scan | `secret_scan` | none | Security scanning passed |
+| Package Artifact | `package_artifact` | none | Internal nuget/npm packages published |
+| Dev Deploy | `dev_deploy` | `builds` | Deployed to dev environment |
+| Dev Tests | `dev_tests` | `dev_deploy` | Dev environment tests passed |
+| Pre-Prod Deploy | `preprod_deploy` | `builds`, `unit_tests`, `secret_scan` | Deployed to pre-production |
+| Pre-Prod Tests | `preprod_tests` | `preprod_deploy` | Pre-production tests passed |
+| Pre-Prod Rollback Test | `preprod_rollback_test` | `preprod_tests` | Rollback test passed; `skipped` unless repo `deployment-strategy` is `canary` |
+| Prod Gate | `prod_gate` | `preprod_deploy`, `preprod_tests`, `preprod_rollback_test` | Ready to promote to production (gate step) |
+| Prod Release | `prod_release_created` | `prod_gate` | Production release created |
+| Prod Canary | `prod_canary` | `prod_release_created` | Canary soak passed; `skipped` unless repo `deployment-strategy` is `canary` |
+| Prod Deploy | `prod_deploy` | `prod_gate`, `prod_release_created`, `prod_canary` | Deployed to production |
+| Prod Tests | `prod_tests` | `prod_gate`, `prod_deploy` | Production tests passed |
+| Alert Gate | `prod_alert_gate` | none | Post-deploy alert monitoring |
+| Prod Rollback | `prod_rollback` | none | Automated rollback triggered when `prod_alert_gate` fails |
+| Steady State | `prod_steady_state` | `prod_deploy`, `prod_tests`, `prod_alert_gate` | Production is stable |
 
 ---
 
