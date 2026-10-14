@@ -39,6 +39,12 @@ func TestCanaryWeight(t *testing.T) {
 			want: 10,
 		},
 		{
+			name: "aborted past the last step still reports the router weight",
+			manifest: `{"spec":{"strategy":{"canary":{"trafficRouting":{},"steps":[{"setWeight":50}]}}},
+				"status":{"abort":true,"currentStepIndex":1,"canary":{"weights":{"canary":{"weight":10}}}}}`,
+			want: 10,
+		},
+		{
 			name: "aborted with routing reports a settled router weight of zero",
 			manifest: `{"spec":{"strategy":{"canary":{"trafficRouting":{},"steps":[{"setWeight":50},{"pause":{}}]}}},
 				"status":{"abort":true,"currentStepIndex":1,"canary":{"weights":{"canary":{"weight":0},"stable":{"weight":100}}}}}`,

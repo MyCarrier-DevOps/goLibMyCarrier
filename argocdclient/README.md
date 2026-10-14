@@ -351,6 +351,8 @@ The precedence:
    traffic router is configured and reports one, otherwise `0`. The controller steps the
    reported weight down to `0` after an abort (gradually with `dynamicStableScale`), so wait
    for `0` before treating traffic as moved back to stable.
+   A `0` can also mean the controller has not reported weights yet, so a consumer waiting
+   for stable traffic should read it together with `Aborted` and `Phase`.
 3. There is no current canary step, which means the canary strategy has no steps or
    `currentStepIndex` is past the last step (fully promoted): the max traffic weight,
    `spec.strategy.canary.trafficRouting.maxTrafficWeight`, default `100`. A traffic
