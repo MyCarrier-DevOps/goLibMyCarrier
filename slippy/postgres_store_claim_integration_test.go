@@ -767,6 +767,23 @@ func TestPostgresStore_ProbeSchema_Integration(t *testing.T) {
 		assert.NotErrorIs(t, loadErr, ErrSlipNotFound,
 			"and it fails with 42703, not a sentinel the caller could mistake for an empty database")
 	})
+
+	// The store now writes slip_rollbacks too (DEVOPS-320), so a database at v6 — every
+	// routing_slips column present — must still refuse to serve: otherwise every rollback
+	// record would fail at request time with 42P01, which is the class this probe exists for.
+	t.Run("reports a missing slip_rollbacks at v6", func(t *testing.T) {
+		pool := newPGMigrationTestPool(t)
+		cfg := pgTestPipelineConfig(t)
+		_, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 6})
+		require.NoError(t, err)
+		store, err := NewPostgresStore(pool, cfg, nil)
+		require.NoError(t, err)
+
+		err = store.ProbeSchema(ctx)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrSchemaBehind)
+		assert.Contains(t, err.Error(), TableSlipRollbacks, "the probe names the missing table")
+	})
 }
 
 // resetSuccessor builds what initializeSlipForPush hands the store for an in-delivery retry:
