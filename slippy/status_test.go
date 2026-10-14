@@ -261,7 +261,8 @@ func TestPrereqStatus_String(t *testing.T) {
 }
 
 // releasedCoreMigrationDigests pins the SHA-256 of the UpSQL of every core migration a slippy
-// release has shipped: v1-v6, all in slippy/v1.4.4. postgresmigrator applies only the versions
+// release has shipped: v1-v6 in slippy/v1.4.4; v7 (DEVOPS-320) is pinned too and ships with the
+// next slippy tag. postgresmigrator applies only the versions
 // above the one a database has recorded, and records no checksum of what it applied
 // (postgresmigrator/migrator.go: migrateUp, createSchemaVersionTable), so an edit to a released
 // migration never reaches an existing database. The merge that adds a core migration tags a

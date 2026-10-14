@@ -313,9 +313,10 @@ func (s *PostgresStore) probeRoutingSlipColumns(ctx context.Context) error {
 // (PR #87 review, jhicks).
 //
 // Checking one table was too narrow for what the gate promises: a database current on
-// routing_slips but missing slip_component_states, slip_ancestry or (since migration v7, DEVOPS-320) slip_rollbacks passed the probe and then
-// failed every component write, every ancestry insert and every repave at request time — which
-// is precisely the class the probe was added to turn into a refusal to start.
+// routing_slips but missing slip_component_states, slip_ancestry or (since migration v7,
+// DEVOPS-320) slip_rollbacks passed the probe and then failed every component write, every
+// ancestry insert and every repave at request time — which is precisely the class the probe
+// was added to turn into a refusal to start.
 //
 // Scoped to table PRESENCE deliberately. Indexes and constraints are not checked here because
 // the migrations that create them assert their own shape and RAISE on a mismatch (v5's

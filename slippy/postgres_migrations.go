@@ -475,8 +475,8 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 //     the same attempt twice. RecordRollback inserts with ON CONFLICT (workflow) DO NOTHING.
 //   - status is CHECKed against the five RollbackStatus values. Validate refuses anything
 //     else first; the CHECK is the backstop for a writer that skips the library.
-//   - Every other column is NOT NULL with an empty-string default, so the ClickHouse PostgreSQL-engine mirror
-//     needs no Nullable types.
+//   - Every other column is NOT NULL with an empty-string default, so the ClickHouse
+//     PostgreSQL-engine mirror needs no Nullable types.
 //
 // The FK takes SHARE ROW EXCLUSIVE on routing_slips. postgresmigrator runs each migration with
 // SET LOCAL lock_timeout = 0, and an unbounded lock request queues ahead of every later slip
