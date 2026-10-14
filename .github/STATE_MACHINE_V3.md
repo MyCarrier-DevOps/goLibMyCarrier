@@ -219,7 +219,8 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
 - **Repave is a hard delete, and that is a recorded decision.** A repaved run's
   `routing_slips` row — and with it its `state_history` jsonb — plus its
-  `slip_component_states` and `slip_ancestry` rows are destroyed. No tombstone, archive
+  `slip_component_states` and `slip_ancestry` rows are destroyed, and since migration v7
+  (DEVOPS-320) so are its `slip_rollbacks` rows, by `ON DELETE CASCADE`. No tombstone, archive
   or retention copy exists anywhere. That was decided in DEVOPS-231 §4, and re-examined
   and confirmed on 2026-09-09 under **DEVOPS-277**, which declined both soft-delete
   (DEVOPS-230's partial-index model) and a tombstone row: nothing consumes a superseded

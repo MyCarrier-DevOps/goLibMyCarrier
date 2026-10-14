@@ -975,6 +975,26 @@ owned by the slippy-migrator Job.
 `slip_component_states` holds one current-state row per `(correlation_id, step, component)`,
 and `slip_ancestry` the direct parent links.
 
+### Table: `slip_rollbacks` (migration v7, DEVOPS-320)
+
+One row per gitops-rollback attempt for a slip, written through slippy-api with
+`PostgresStore.RecordRollback` and read with `ListRollbacks`. ClickHouse mirrors it as
+`ci.slip_rollbacks_pg` and `ci_test.slip_rollbacks_pg` for reporting (DDL in
+`clickhouse/slip_rollbacks_pg.sql`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | bigserial | Primary key |
+| `correlation_id` | text | The slip; `ON DELETE CASCADE` from `routing_slips` |
+| `workflow` | text | Argo Workflow of the attempt; unique, so a retried emit writes once |
+| `recorded_at` | timestamptz | Set by the database |
+| `environment` | text | `dev`, `preprod` or `prod` |
+| `reason`, `source`, `rollout_phase`, `pod_hash` | text | Event metadata; empty when unknown |
+| `gitops_repo`, `gitops_commit`, `revert_commit` | text | What was reverted, and the revert commit |
+| `status` | text | `success`, `noop`, `skipped`, `failed` or `dry_run` (CHECKed) |
+| `forced` | boolean | Whether `--force` conflict resolution was used |
+| `message` | text | Outcome detail, up to 1,000 characters |
+
 ### Migrations
 
 Run them from the migrator process, not from the service that serves slips:
