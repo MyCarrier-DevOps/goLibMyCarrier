@@ -42,7 +42,7 @@ func TestClaimedFromMigration_V6_Integration(t *testing.T) {
 		cfg := pgTestPipelineConfig(t)
 		res, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
 		require.NoError(t, err)
-		assert.Equal(t, 6, res.EndVersion, "v6 is the new latest")
+		assert.Equal(t, 7, res.EndVersion, "v7 (DEVOPS-320) is the latest; v6's shape is asserted below")
 
 		exists, dt, nullable := v6ColumnShape(t, pool)
 		require.True(t, exists, "claimed_from must exist after v6")
