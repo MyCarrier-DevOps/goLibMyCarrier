@@ -241,12 +241,12 @@ func TestUniquenessMigration_V5(t *testing.T) {
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
 
 	migs := mgr.GenerateMigrations()
-	require.Len(t, migs, 6, "v1-v4, v5 (DEVOPS-231 Phase B), v6 (DEVOPS-367)")
+	require.Len(t, migs, 7, "v1-v4, v5 (DEVOPS-231 Phase B), v6 (DEVOPS-367), v7 (DEVOPS-320)")
 	v5 := migs[4]
 	assert.Equal(t, 5, v5.Version)
 	assert.Equal(t, "one_slip_per_commit", v5.Name)
-	assert.Equal(t, 6, mgr.LatestVersion(), "v6 (DEVOPS-367) is now latest; v5's own version is asserted above")
-	assert.Equal(t, 6, GetPostgresDynamicMigrationVersion(cfg))
+	assert.Equal(t, 7, mgr.LatestVersion(), "v7 (DEVOPS-320) is now latest; v5's own version is asserted above")
+	assert.Equal(t, 7, GetPostgresDynamicMigrationVersion(cfg))
 
 	// Every assertion below runs against the SQL with -- comments stripped, because they are all
 	// about what the migration EXECUTES, not how it is documented. No comment supplies any of
@@ -316,7 +316,7 @@ func TestUniquenessMigration_V5(t *testing.T) {
 func TestClaimedFromMigration_V6(t *testing.T) {
 	cfg := pgTestPipelineConfig(t)
 	migs := NewPostgresDynamicMigrationManager(cfg, nil).GenerateMigrations()
-	require.Len(t, migs, 6, "DEVOPS-367 adds migration v6 on top of v1-v5")
+	require.Len(t, migs, 7, "v6 (DEVOPS-367) sits under v7 (DEVOPS-320)")
 	v6 := migs[5]
 
 	assert.Equal(t, 6, v6.Version)
@@ -387,4 +387,50 @@ func TestClaimedFromMigration_V6(t *testing.T) {
 	// guard's own to_regclass already makes it and not what this test asserted above.
 	assert.Contains(t, down, "ALTER TABLE IF EXISTS routing_slips",
 		"a missing table makes the drop a no-op, not a 42P01")
+}
+
+// TestSlipRollbacksMigration_V7 pins the shape of the slip_rollbacks migration (DEVOPS-320):
+// a bounded lock wait before the CREATE (its foreign key takes SHARE ROW EXCLUSIVE on
+// routing_slips, which queues ahead of every later writer), the three named constraints, a
+// CHECK naming exactly the Go statuses, and a post-condition for each constraint the store
+// depends on.
+func TestSlipRollbacksMigration_V7(t *testing.T) {
+	cfg := pgTestPipelineConfig(t)
+	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
+	migs := mgr.GenerateMigrations()
+	require.Len(t, migs, 7, "DEVOPS-320 adds migration v7 on top of v1-v6")
+	v7 := migs[6]
+
+	assert.Equal(t, 7, v7.Version)
+	assert.Equal(t, "create_slip_rollbacks", v7.Name)
+	assert.Equal(t, 7, mgr.LatestVersion())
+	assert.Equal(t, 7, GetPostgresDynamicMigrationVersion(cfg))
+
+	up := stripSQLLineComments(v7.UpSQL)
+	for _, want := range []string{
+		"CREATE TABLE IF NOT EXISTS slip_rollbacks",
+		"CONSTRAINT fk_slip_rollbacks_slip FOREIGN KEY (correlation_id)",
+		"REFERENCES routing_slips(correlation_id) ON DELETE CASCADE",
+		"CONSTRAINT uq_slip_rollbacks_workflow UNIQUE (workflow)",
+		"CONSTRAINT ck_slip_rollbacks_status",
+		"CREATE INDEX IF NOT EXISTS idx_slip_rollbacks_correlation_id ON slip_rollbacks (correlation_id)",
+	} {
+		assert.Contains(t, up, want)
+	}
+	for _, s := range []RollbackStatus{
+		RollbackStatusSuccess, RollbackStatusNoop, RollbackStatusSkipped,
+		RollbackStatusFailed, RollbackStatusDryRun,
+	} {
+		assert.Contains(t, up, "'"+string(s)+"'", "the CHECK must accept every Go status")
+	}
+	assert.Regexp(t, `SET LOCAL lock_timeout = '[^']+'`, up, "the FK's lock request must be bounded")
+	assert.NotRegexp(t, `SET LOCAL lock_timeout = '?0'?\s*;`, up, "and the bound must not be zero")
+	assert.Less(t, strings.Index(up, "lock_timeout"), strings.Index(up, "CREATE TABLE"),
+		"the timeout is set before the CREATE that requests the lock")
+	assert.Equal(t, 2, strings.Count(up, "RAISE EXCEPTION"), "one post-condition per constraint the store keys on")
+
+	down := stripSQLLineComments(v7.DownSQL)
+	assert.Contains(t, down, "DROP TABLE IF EXISTS slip_rollbacks")
+	assert.Less(t, strings.Index(down, "lock_timeout"), strings.Index(down, "DROP TABLE"),
+		"the drop also releases routing_slips' FK trigger, so its lock wait is bounded too")
 }
