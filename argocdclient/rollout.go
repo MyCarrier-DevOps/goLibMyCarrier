@@ -117,10 +117,12 @@ type RolloutStatus struct {
 	CurrentStepIndex *int32
 	// Aborted is status.abort of the live Rollout.
 	Aborted bool
-	// CanaryWeight is the percentage of traffic on the canary: 0 when aborted or when the Rollout
-	// has no canary strategy (blue-green); the max traffic weight when a canary strategy has no
-	// current step; otherwise the traffic-router weight when one is configured and reported, else
-	// the last setWeight at or before the current step.
+	// CanaryWeight is the percentage of traffic on the canary. When the Rollout is aborted it is
+	// the traffic-router weight when one is configured and reported (it steps down to 0 as the
+	// controller reconciles), else 0. Otherwise it is 0 when the Rollout has no canary strategy
+	// (blue-green); the max traffic weight when a canary strategy has no current step; else the
+	// traffic-router weight when one is configured and reported, else the last setWeight at or
+	// before the current step.
 	CanaryWeight int32
 	// StepPluginStatuses is status.canary.stepPluginStatuses of the live Rollout.
 	StepPluginStatuses []StepPluginStatus
@@ -185,14 +187,19 @@ func decodeRollout(manifest string) (liveRollout, error) {
 	return live, nil
 }
 
-// canaryWeight mirrors the actual weight reported by `kubectl argo rollouts`.
+// canaryWeight returns the percentage of traffic on the canary. For an aborted Rollout it is the
+// router-confirmed weight when a traffic router reports one, because the weight steps down to 0
+// as the controller reconciles, and 0 otherwise. For any other Rollout see RolloutStatus.CanaryWeight.
 func canaryWeight(live liveRollout) int32 {
-	if live.Status.Abort {
+	canary := live.Spec.Strategy.Canary
+	if canary == nil {
 		return 0
 	}
 
-	canary := live.Spec.Strategy.Canary
-	if canary == nil {
+	if live.Status.Abort {
+		if canary.TrafficRouting != nil && live.Status.Canary.Weights != nil {
+			return live.Status.Canary.Weights.Canary.Weight
+		}
 		return 0
 	}
 
