@@ -162,7 +162,7 @@ func TestPostgresStore_Rollbacks_Integration(t *testing.T) {
 		assert.Equal(t, retried.Outcome, got[0].Outcome)
 		assert.Equal(t, retried.RevertCommit, got[0].RevertCommit)
 		assert.Equal(t, failed.Message, got[0].Message, "why the rollback started does not change")
-		assert.False(t, got[0].RecordedAt.Before(first[0].RecordedAt), "recorded_at moves to the retry")
+		assert.True(t, got[0].RecordedAt.After(first[0].RecordedAt), "recorded_at moves to the retry")
 
 		_, err = store.RecordRollback(ctx, failed)
 		require.NoError(t, err)

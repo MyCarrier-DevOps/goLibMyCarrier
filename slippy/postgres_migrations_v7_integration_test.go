@@ -103,6 +103,27 @@ func TestSlipRollbacksMigration_V7_Integration(t *testing.T) {
 		assert.Contains(t, err.Error(), "fk_slip_rollbacks_slip")
 	})
 
+	// The .14 prerelease shape: the cascade FK is right, the key is the old UNIQUE (workflow).
+	t.Run("refuses a same-named table keyed on the workflow alone", func(t *testing.T) {
+		pool := newPGMigrationTestPool(t)
+		cfg := pgTestPipelineConfig(t)
+		_, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 6})
+		require.NoError(t, err)
+		_, err = pool.Exec(ctx, `CREATE TABLE slip_rollbacks (
+			id bigserial PRIMARY KEY,
+			correlation_id text NOT NULL,
+			workflow text NOT NULL,
+			CONSTRAINT fk_slip_rollbacks_slip FOREIGN KEY (correlation_id)
+				REFERENCES routing_slips(correlation_id) ON DELETE CASCADE,
+			CONSTRAINT uq_slip_rollbacks_workflow UNIQUE (workflow))`)
+		require.NoError(t, err)
+
+		v7 := NewPostgresDynamicMigrationManager(cfg, nil).GenerateMigrations()[6]
+		_, err = pool.Exec(ctx, v7.UpSQL)
+		require.Error(t, err, "the post-condition must refuse the old key")
+		assert.Contains(t, err.Error(), "uq_slip_rollbacks_slip_workflow")
+	})
+
 	t.Run("the CHECK refuses a status the library does not define", func(t *testing.T) {
 		store, pool, _ := newMigratedStore(t)
 		claimTestSlip(t, store, "v7-check", "sha-v7-check", SlipStatusFailed)
