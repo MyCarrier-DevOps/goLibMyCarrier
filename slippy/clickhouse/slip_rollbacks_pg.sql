@@ -8,10 +8,11 @@
 --   ci      -> the prod pipeline instance's slippy Postgres (slippy-api)
 --
 -- This repository is public. Copy this file OUTSIDE the repository, and in that copy replace
--- {database} with ci_test or ci and the four connection placeholders with the values the
--- existing *_pg tables in THAT database use (same host, database, user and password). Apply the
--- copy, then delete it. Never fill the placeholders in here. Use a Postgres role with SELECT
--- only: this engine also accepts INSERT.
+-- {database} with ci_test or ci and the four connection placeholders: the host and database
+-- that the existing *_pg tables in THAT database use, and a Postgres user that has SELECT only
+-- on slip_rollbacks (this engine also accepts INSERT). If the existing tables connect as a user
+-- that can write, create a SELECT-only user for this table. Apply the copy, then delete it.
+-- Never fill the placeholders in here.
 --
 -- Every Postgres column is NOT NULL, so no Nullable types are needed here.
 CREATE TABLE IF NOT EXISTS {database}.slip_rollbacks_pg
