@@ -77,7 +77,8 @@ func (s RollbackStatus) Valid() bool {
 // Validate reports every field that would make r unwritable, as one error wrapping
 // ErrInvalidRollback, or nil when r can be recorded. The descriptive fields (reason, source,
 // rollout_phase, pod_hash, message, outcome) are free text with a length bound only: gitops-rollback
-// normalises unknown values, and a rollback record must never be refused for its metadata.
+// normalises unknown values, and a rollback record must never be refused for its metadata. Every
+// text field must also be storable: Postgres text holds no NUL byte and no invalid UTF-8.
 func (r *RollbackRecord) Validate() error {
 	var problems []string
 	addf := func(format string, args ...any) {
@@ -100,11 +101,7 @@ func (r *RollbackRecord) Validate() error {
 	if !r.Status.Valid() {
 		addf("status %q is not one of success, noop, skipped, failed, dry_run", r.Status)
 	}
-	for _, f := range []struct {
-		name  string
-		value string
-		limit int
-	}{
+	fields := []rollbackTextField{
 		{"reason", r.Reason, maxRollbackLabelLen},
 		{"source", r.Source, maxRollbackLabelLen},
 		{"rollout_phase", r.RolloutPhase, maxRollbackLabelLen},
@@ -114,9 +111,19 @@ func (r *RollbackRecord) Validate() error {
 		{"revert_commit", r.RevertCommit, maxRollbackCommitLen},
 		{"message", r.Message, maxRollbackMessageLen},
 		{"outcome", r.Outcome, maxRollbackOutcomeLen},
-	} {
+	}
+	for _, f := range fields {
 		if exceedsRunes(f.value, f.limit) {
 			addf("%s exceeds %d characters", f.name, f.limit)
+		}
+	}
+	identity := []rollbackTextField{
+		{"correlation_id", r.CorrelationID, maxRollbackCorrelationIDLen},
+		{"workflow", r.Workflow, maxRollbackWorkflowLen},
+	}
+	for _, f := range append(identity, fields...) {
+		if !storableText(f.value) {
+			addf("%s contains a NUL byte or invalid UTF-8", f.name)
 		}
 	}
 
@@ -124,6 +131,19 @@ func (r *RollbackRecord) Validate() error {
 		return fmt.Errorf("%w: %s", ErrInvalidRollback, strings.Join(problems, "; "))
 	}
 	return nil
+}
+
+// rollbackTextField is one text field of a RollbackRecord and its character limit.
+type rollbackTextField struct {
+	name  string
+	value string
+	limit int
+}
+
+// storableText reports whether Postgres text can hold v: no NUL byte and valid UTF-8 (otherwise
+// SQLSTATE 22021).
+func storableText(v string) bool {
+	return utf8.ValidString(v) && !strings.ContainsRune(v, 0)
 }
 
 // exceedsRunes reports whether v is longer than limit characters (runes, not bytes).

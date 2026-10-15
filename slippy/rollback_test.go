@@ -101,6 +101,16 @@ func TestRollbackRecord_Validate(t *testing.T) {
 		{name: "outcome one rune over the limit", mutate: func(r *RollbackRecord) {
 			r.Outcome = strings.Repeat("é", 1001)
 		}, wantErr: "outcome exceeds 1000 characters"},
+		// Postgres text cannot store a NUL byte or invalid UTF-8 (SQLSTATE 22021), so they are
+		// refused here, before the database, for every text field.
+		{name: "NUL byte in the message", mutate: func(r *RollbackRecord) { r.Message = "before\x00after" },
+			wantErr: "message contains a NUL byte or invalid UTF-8"},
+		{name: "invalid UTF-8 in the outcome", mutate: func(r *RollbackRecord) { r.Outcome = "bad \xff byte" },
+			wantErr: "outcome contains a NUL byte or invalid UTF-8"},
+		{name: "NUL byte in the correlation id", mutate: func(r *RollbackRecord) { r.CorrelationID = "c\x00" },
+			wantErr: "correlation_id contains a NUL byte or invalid UTF-8"},
+		{name: "invalid UTF-8 in the workflow", mutate: func(r *RollbackRecord) { r.Workflow = "wf-\xfe" },
+			wantErr: "workflow contains a NUL byte or invalid UTF-8"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
