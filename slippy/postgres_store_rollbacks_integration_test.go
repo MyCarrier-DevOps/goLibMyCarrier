@@ -90,8 +90,8 @@ func TestPostgresStore_Rollbacks_Integration(t *testing.T) {
 		assert.Zero(t, n)
 	})
 
-	// Review Focus 2: a retried pod and an exit-handler re-run can emit the same workflow at
-	// the same moment; exactly one of them may write.
+	// Review Focus 2: an argo retry re-runs the exit handler under the same Workflow name, and
+	// two emits for one workflow may race; exactly one of them may write a new row.
 	t.Run("concurrent emits for one workflow write exactly one row", func(t *testing.T) {
 		store, _, _ := newMigratedStore(t)
 		claimTestSlip(t, store, "rb-race", "sha-rb-race", SlipStatusFailed)
@@ -120,6 +120,56 @@ func TestPostgresStore_Rollbacks_Integration(t *testing.T) {
 		got, err := store.ListRollbacks(ctx, "rb-race")
 		require.NoError(t, err)
 		assert.Len(t, got, 1)
+	})
+
+	// generateName workflow names come back after their Workflow is gone, so the key is the
+	// pair: the same name on another slip is a new row, never a lost one.
+	t.Run("a recycled workflow name on another slip is recorded", func(t *testing.T) {
+		store, _, _ := newMigratedStore(t)
+		claimTestSlip(t, store, "rb-a", "sha-rb-a", SlipStatusFailed)
+		claimTestSlip(t, store, "rb-b", "sha-rb-b", SlipStatusFailed)
+
+		for _, corr := range []string{"rb-a", "rb-b"} {
+			inserted, err := store.RecordRollback(ctx, testRollback(corr, "gitops-rollback-x7k2p"))
+			require.NoError(t, err)
+			assert.True(t, inserted, "slip %s", corr)
+		}
+	})
+
+	// An argo retry of a failed rollback carries the newer outcome: it replaces the failed row.
+	// A repeat over any other row changes nothing, so a recorded success is never overwritten.
+	t.Run("a retry replaces a failed row and never a successful one", func(t *testing.T) {
+		store, _, _ := newMigratedStore(t)
+		claimTestSlip(t, store, "rb-retry", "sha-rb-retry", SlipStatusFailed)
+
+		failed := testRollback("rb-retry", "wf-retry")
+		failed.Status, failed.Outcome, failed.RevertCommit = RollbackStatusFailed, "push rejected after 5 attempts", ""
+		inserted, err := store.RecordRollback(ctx, failed)
+		require.NoError(t, err)
+		require.True(t, inserted)
+		first, err := store.ListRollbacks(ctx, "rb-retry")
+		require.NoError(t, err)
+		require.Len(t, first, 1)
+
+		retried := testRollback("rb-retry", "wf-retry")
+		inserted, err = store.RecordRollback(ctx, retried)
+		require.NoError(t, err)
+		assert.False(t, inserted, "an update is not a new row")
+		got, err := store.ListRollbacks(ctx, "rb-retry")
+		require.NoError(t, err)
+		require.Len(t, got, 1)
+		assert.Equal(t, RollbackStatusSuccess, got[0].Status)
+		assert.Equal(t, retried.Outcome, got[0].Outcome)
+		assert.Equal(t, retried.RevertCommit, got[0].RevertCommit)
+		assert.Equal(t, failed.Message, got[0].Message, "why the rollback started does not change")
+		assert.False(t, got[0].RecordedAt.Before(first[0].RecordedAt), "recorded_at moves to the retry")
+
+		_, err = store.RecordRollback(ctx, failed)
+		require.NoError(t, err)
+		got, err = store.ListRollbacks(ctx, "rb-retry")
+		require.NoError(t, err)
+		assert.Equal(t, RollbackStatusSuccess, got[0].Status, "a later failed emit never overwrites a success")
+		assert.Equal(t, retried.Outcome, got[0].Outcome)
 	})
 
 	// Review Focus 3: the limit is characters, not bytes.

@@ -986,8 +986,8 @@ One row per gitops-rollback attempt for a slip, written through slippy-api with
 |--------|------|-------------|
 | `id` | bigserial | Primary key |
 | `correlation_id` | text | The slip; `ON DELETE CASCADE` from `routing_slips` |
-| `workflow` | text | Argo Workflow of the attempt; unique, so a retried emit writes once |
-| `recorded_at` | timestamptz | Set by the database |
+| `workflow` | text | Argo Workflow of the attempt; unique per slip, so a repeated emit writes once. An `argo retry` of a failed rollback replaces that failed row's outcome; any other row is left as it is |
+| `recorded_at` | timestamptz | Set by the database when the row's outcome is recorded (a retry that replaces a failed outcome moves it) |
 | `environment` | text | `dev`, `preprod` or `prod` |
 | `reason`, `source`, `rollout_phase`, `pod_hash` | text | Event metadata; empty when unknown |
 | `gitops_repo`, `gitops_commit`, `revert_commit` | text | What was reverted, and the revert commit |

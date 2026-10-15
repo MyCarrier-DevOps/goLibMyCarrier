@@ -471,8 +471,12 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 //   - ON DELETE CASCADE from routing_slips, like the other child tables since v5, so a
 //     repave (which hard-deletes the superseded run's row) takes the run's rollback rows with
 //     it. STATE_MACHINE_V3's repave bullet records that consequence.
-//   - UNIQUE (workflow): one Argo Workflow is one attempt, so a retried emit cannot record
-//     the same attempt twice. RecordRollback inserts with ON CONFLICT (workflow) DO NOTHING.
+//   - UNIQUE (correlation_id, workflow): one Argo Workflow is one attempt for one slip, so a
+//     repeated emit cannot record the same attempt twice. The workflow name alone is not a key:
+//     generateName names come back once the Workflow object is gone. The index leads with
+//     correlation_id, so it also serves ListRollbacks and the FK cascade; no separate index.
+//     RecordRollback inserts with ON CONFLICT on that pair and lets an argo retry's outcome
+//     replace a failed row only.
 //   - status is CHECKed against the five RollbackStatus values. Validate refuses anything
 //     else first; the CHECK is the backstop for a writer that skips the library.
 //   - Every other column is NOT NULL with an empty-string default, so the ClickHouse
@@ -484,13 +488,13 @@ func (m *PostgresDynamicMigrationManager) claimedFromMigration() postgresmigrato
 // migration instead; re-run it.
 //
 // Idempotent by NAME (IF NOT EXISTS), asserted by SHAPE: a pre-existing same-named table
-// without the cascade FK or the workflow uniqueness fails v7 loudly instead of being recorded
+// without the cascade FK or the (correlation_id, workflow) uniqueness fails v7 loudly instead of being recorded
 // as applied, the same posture as v5 and v6.
 func (m *PostgresDynamicMigrationManager) slipRollbacksMigration() postgresmigrator.Migration {
 	return postgresmigrator.Migration{
 		Version:     7,
 		Name:        "create_slip_rollbacks",
-		Description: "slip_rollbacks: one row per gitops-rollback attempt, cascading from routing_slips, unique per workflow (DEVOPS-320)",
+		Description: "slip_rollbacks: one row per gitops-rollback attempt, cascading from routing_slips, unique per slip and workflow (DEVOPS-320)",
 		UpSQL: `
 			-- Bound the FK's SHARE ROW EXCLUSIVE request on routing_slips (see the Go comment).
 			SET LOCAL lock_timeout = '5s';
@@ -514,18 +518,17 @@ func (m *PostgresDynamicMigrationManager) slipRollbacksMigration() postgresmigra
 				outcome        text        NOT NULL DEFAULT '',
 				CONSTRAINT fk_slip_rollbacks_slip FOREIGN KEY (correlation_id)
 					REFERENCES routing_slips(correlation_id) ON DELETE CASCADE,
-				CONSTRAINT uq_slip_rollbacks_workflow UNIQUE (workflow),
+				CONSTRAINT uq_slip_rollbacks_slip_workflow UNIQUE (correlation_id, workflow),
 				CONSTRAINT ck_slip_rollbacks_status
 					CHECK (status IN ('success', 'noop', 'skipped', 'failed', 'dry_run'))
 			);
-
-			CREATE INDEX IF NOT EXISTS idx_slip_rollbacks_correlation_id ON slip_rollbacks (correlation_id);
 
 			-- Post-condition: IF NOT EXISTS matched a NAME; assert the constraints the store keys
 			-- on. Resolved through to_regclass, as v5 and v6 resolve routing_slips.
 			DO $$
 			DECLARE
 				fk_def text;
+				uq_def text;
 			BEGIN
 				SELECT pg_get_constraintdef(c.oid) INTO fk_def
 				FROM pg_constraint c
@@ -537,13 +540,13 @@ func (m *PostgresDynamicMigrationManager) slipRollbacksMigration() postgresmigra
 					'FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id) ON DELETE CASCADE' THEN
 					RAISE EXCEPTION 'migration v7: slip_rollbacks has no validated fk_slip_rollbacks_slip ON DELETE CASCADE foreign key to routing_slips (found %); drop slip_rollbacks and re-run v7', coalesce(fk_def, 'none');
 				END IF;
-				IF NOT EXISTS (
-					SELECT 1 FROM pg_constraint c
-					WHERE c.conrelid = to_regclass('slip_rollbacks')
-					  AND c.conname = 'uq_slip_rollbacks_workflow'
-					  AND c.contype = 'u'
-				) THEN
-					RAISE EXCEPTION 'migration v7: slip_rollbacks has no uq_slip_rollbacks_workflow unique constraint; drop slip_rollbacks and re-run v7';
+				SELECT pg_get_constraintdef(c.oid) INTO uq_def
+				FROM pg_constraint c
+				WHERE c.conrelid = to_regclass('slip_rollbacks')
+				  AND c.conname = 'uq_slip_rollbacks_slip_workflow'
+				  AND c.contype = 'u';
+				IF uq_def IS DISTINCT FROM 'UNIQUE (correlation_id, workflow)' THEN
+					RAISE EXCEPTION 'migration v7: slip_rollbacks has no uq_slip_rollbacks_slip_workflow UNIQUE (correlation_id, workflow) constraint (found %); drop slip_rollbacks and re-run v7', coalesce(uq_def, 'none');
 				END IF;
 			END $$;
 		`,

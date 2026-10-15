@@ -21,12 +21,17 @@ func rollbackInsertArgs(r RollbackRecord) []any {
 	}
 }
 
+// insertedRow is the single-column result RecordRollback scans: RETURNING (xmax = 0).
+func insertedRow(inserted bool) *pgxmock.Rows {
+	return pgxmock.NewRows([]string{"inserted"}).AddRow(inserted)
+}
+
 func TestPostgresStore_RecordRollback_Inserted(t *testing.T) {
 	store, mock := newMockStore(t)
 	rec := validRollbackRecord()
-	mock.ExpectExec("INSERT INTO slip_rollbacks").
+	mock.ExpectQuery("INSERT INTO slip_rollbacks").
 		WithArgs(rollbackInsertArgs(rec)...).
-		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+		WillReturnRows(insertedRow(true))
 
 	inserted, err := store.RecordRollback(context.Background(), rec)
 	require.NoError(t, err)
@@ -34,12 +39,43 @@ func TestPostgresStore_RecordRollback_Inserted(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestPostgresStore_RecordRollback_RepeatWorkflowWritesNothing(t *testing.T) {
+// The key is (correlation_id, workflow): a recycled generateName workflow name on another
+// slip is a new row, not a conflict.
+func TestPostgresStore_RecordRollback_ConflictsOnTheSlipAndWorkflow(t *testing.T) {
 	store, mock := newMockStore(t)
 	rec := validRollbackRecord()
-	mock.ExpectExec("ON CONFLICT \\(workflow\\) DO NOTHING").
+	mock.ExpectQuery("ON CONFLICT \\(correlation_id, workflow\\) DO UPDATE").
 		WithArgs(rollbackInsertArgs(rec)...).
-		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+		WillReturnRows(insertedRow(true))
+
+	_, err := store.RecordRollback(context.Background(), rec)
+	require.NoError(t, err)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// An argo retry re-runs the exit handler under the same Workflow name. The retry's outcome
+// replaces a failed record only; the update reports inserted=false.
+func TestPostgresStore_RecordRollback_ARetryReplacesAFailedRecord(t *testing.T) {
+	store, mock := newMockStore(t)
+	rec := validRollbackRecord()
+	mock.ExpectQuery("WHERE slip_rollbacks.status = 'failed'\\s+RETURNING \\(xmax = 0\\)").
+		WithArgs(rollbackInsertArgs(rec)...).
+		WillReturnRows(insertedRow(false))
+
+	inserted, err := store.RecordRollback(context.Background(), rec)
+	require.NoError(t, err)
+	assert.False(t, inserted)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+// Over a record that did not fail, the guarded update matches nothing and RETURNING yields no
+// row: that is a repeat, not an error.
+func TestPostgresStore_RecordRollback_ARepeatOverAnyOtherRecordWritesNothing(t *testing.T) {
+	store, mock := newMockStore(t)
+	rec := validRollbackRecord()
+	mock.ExpectQuery("INSERT INTO slip_rollbacks").
+		WithArgs(rollbackInsertArgs(rec)...).
+		WillReturnRows(pgxmock.NewRows([]string{"inserted"}))
 
 	inserted, err := store.RecordRollback(context.Background(), rec)
 	require.NoError(t, err, "a repeat of the same workflow is a success, not an error")
@@ -50,7 +86,7 @@ func TestPostgresStore_RecordRollback_RepeatWorkflowWritesNothing(t *testing.T) 
 func TestPostgresStore_RecordRollback_UnknownSlip(t *testing.T) {
 	store, mock := newMockStore(t)
 	rec := validRollbackRecord()
-	mock.ExpectExec("INSERT INTO slip_rollbacks").
+	mock.ExpectQuery("INSERT INTO slip_rollbacks").
 		WithArgs(rollbackInsertArgs(rec)...).
 		WillReturnError(&pgconn.PgError{Code: "23503", ConstraintName: "fk_slip_rollbacks_slip"})
 
@@ -62,7 +98,7 @@ func TestPostgresStore_RecordRollback_UnknownSlip(t *testing.T) {
 func TestPostgresStore_RecordRollback_CheckViolationIsInvalid(t *testing.T) {
 	store, mock := newMockStore(t)
 	rec := validRollbackRecord()
-	mock.ExpectExec("INSERT INTO slip_rollbacks").
+	mock.ExpectQuery("INSERT INTO slip_rollbacks").
 		WithArgs(rollbackInsertArgs(rec)...).
 		WillReturnError(&pgconn.PgError{Code: "23514", ConstraintName: "ck_slip_rollbacks_status",
 			Message: "new row violates check constraint"})
@@ -74,7 +110,7 @@ func TestPostgresStore_RecordRollback_CheckViolationIsInvalid(t *testing.T) {
 func TestPostgresStore_RecordRollback_OtherForeignKeyIsNotNotFound(t *testing.T) {
 	store, mock := newMockStore(t)
 	rec := validRollbackRecord()
-	mock.ExpectExec("INSERT INTO slip_rollbacks").
+	mock.ExpectQuery("INSERT INTO slip_rollbacks").
 		WithArgs(rollbackInsertArgs(rec)...).
 		WillReturnError(&pgconn.PgError{Code: "23503", ConstraintName: "some_other_fk"})
 
@@ -87,7 +123,7 @@ func TestPostgresStore_RecordRollback_DriverErrorIsWrapped(t *testing.T) {
 	store, mock := newMockStore(t)
 	rec := validRollbackRecord()
 	boom := errors.New("connection reset")
-	mock.ExpectExec("INSERT INTO slip_rollbacks").
+	mock.ExpectQuery("INSERT INTO slip_rollbacks").
 		WithArgs(rollbackInsertArgs(rec)...).
 		WillReturnError(boom)
 

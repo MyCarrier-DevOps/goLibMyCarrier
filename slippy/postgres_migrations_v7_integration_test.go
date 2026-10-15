@@ -45,7 +45,11 @@ func TestSlipRollbacksMigration_V7_Integration(t *testing.T) {
 		assert.Equal(t,
 			"FOREIGN KEY (correlation_id) REFERENCES routing_slips(correlation_id) ON DELETE CASCADE",
 			v7ConstraintDef(t, pool, "fk_slip_rollbacks_slip"))
-		assert.Equal(t, "UNIQUE (workflow)", v7ConstraintDef(t, pool, "uq_slip_rollbacks_workflow"))
+		assert.Equal(
+			t,
+			"UNIQUE (correlation_id, workflow)",
+			v7ConstraintDef(t, pool, "uq_slip_rollbacks_slip_workflow"),
+		)
 		assert.Contains(t, v7ConstraintDef(t, pool, "ck_slip_rollbacks_status"), "dry_run")
 	})
 

@@ -411,12 +411,13 @@ func TestSlipRollbacksMigration_V7(t *testing.T) {
 		"CREATE TABLE IF NOT EXISTS slip_rollbacks",
 		"CONSTRAINT fk_slip_rollbacks_slip FOREIGN KEY (correlation_id)",
 		"REFERENCES routing_slips(correlation_id) ON DELETE CASCADE",
-		"CONSTRAINT uq_slip_rollbacks_workflow UNIQUE (workflow)",
+		"CONSTRAINT uq_slip_rollbacks_slip_workflow UNIQUE (correlation_id, workflow)",
 		"CONSTRAINT ck_slip_rollbacks_status",
-		"CREATE INDEX IF NOT EXISTS idx_slip_rollbacks_correlation_id ON slip_rollbacks (correlation_id)",
 	} {
 		assert.Contains(t, up, want)
 	}
+	assert.NotContains(t, up, "CREATE INDEX",
+		"the unique index leads with correlation_id, so it serves ListRollbacks and the FK cascade")
 	for _, column := range []string{"message", "outcome"} {
 		assert.Regexp(t, column+`\s+text\s+NOT NULL DEFAULT ''`, up, "RecordRollback writes %s", column)
 	}

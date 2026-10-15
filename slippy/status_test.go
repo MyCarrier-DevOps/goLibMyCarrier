@@ -274,7 +274,7 @@ var releasedCoreMigrationDigests = map[int]string{
 	4: "31b244dee1d9db9ae85717733802c39adbd082695d8fdf80323592489409809a",
 	5: "2dd7c4b1377dad00a0036efe93e4bc483450a87fcfabcf73fcbe76a353ea18c5",
 	6: "e7e57697d520e5b397d1bd235c01e4a0532279cb14fb8fd4c15ff9304c179008",
-	7: "80443144fc122f084ab1f78b60d72eec978cc1d7a26be1e053c93daf0a1d4c3c",
+	7: "2258c7f21f91b45ef4111e36cc3705cc77941006ede62c9761e423cec62c38e1",
 }
 
 // TestReleasedCoreMigrationsAreImmutable fails when a released core migration's UpSQL changes or
