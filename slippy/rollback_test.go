@@ -23,7 +23,8 @@ func validRollbackRecord() RollbackRecord {
 		GitOpsCommit:  "a1b2c3d",
 		RevertCommit:  "e4f5a6b",
 		Status:        RollbackStatusSuccess,
-		Message:       "reverted",
+		Message:       "canary analysis failed: error rate above 5%",
+		Outcome:       "reverted",
 	}
 }
 
@@ -48,13 +49,16 @@ func TestRollbackRecord_Validate(t *testing.T) {
 		{name: "valid record", mutate: func(*RollbackRecord) {}},
 		{name: "metadata may be empty", mutate: func(r *RollbackRecord) {
 			r.Reason, r.Source, r.RolloutPhase, r.PodHash = "", "", "", ""
-			r.GitOpsRepo, r.GitOpsCommit, r.RevertCommit, r.Message = "", "", "", ""
+			r.GitOpsRepo, r.GitOpsCommit, r.RevertCommit, r.Message, r.Outcome = "", "", "", "", ""
 		}},
 		{name: "every status is accepted", mutate: func(r *RollbackRecord) { r.Status = RollbackStatusDryRun }},
 		{name: "dev environment", mutate: func(r *RollbackRecord) { r.Environment = "dev" }},
 		{name: "preprod environment", mutate: func(r *RollbackRecord) { r.Environment = "preprod" }},
 		{name: "message at the limit in multibyte runes", mutate: func(r *RollbackRecord) {
 			r.Message = strings.Repeat("é", 1000)
+		}},
+		{name: "outcome at the limit in multibyte runes", mutate: func(r *RollbackRecord) {
+			r.Outcome = strings.Repeat("é", 1000)
 		}},
 		{name: "empty correlation id", mutate: func(r *RollbackRecord) { r.CorrelationID = "" },
 			wantErr: "correlation_id is empty"},
@@ -94,6 +98,9 @@ func TestRollbackRecord_Validate(t *testing.T) {
 		{name: "message one rune over the limit", mutate: func(r *RollbackRecord) {
 			r.Message = strings.Repeat("é", 1001)
 		}, wantErr: "message exceeds 1000 characters"},
+		{name: "outcome one rune over the limit", mutate: func(r *RollbackRecord) {
+			r.Outcome = strings.Repeat("é", 1001)
+		}, wantErr: "outcome exceeds 1000 characters"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

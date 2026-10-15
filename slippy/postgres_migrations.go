@@ -511,6 +511,7 @@ func (m *PostgresDynamicMigrationManager) slipRollbacksMigration() postgresmigra
 				status         text        NOT NULL,
 				forced         boolean     NOT NULL DEFAULT false,
 				message        text        NOT NULL DEFAULT '',
+				outcome        text        NOT NULL DEFAULT '',
 				CONSTRAINT fk_slip_rollbacks_slip FOREIGN KEY (correlation_id)
 					REFERENCES routing_slips(correlation_id) ON DELETE CASCADE,
 				CONSTRAINT uq_slip_rollbacks_workflow UNIQUE (workflow),

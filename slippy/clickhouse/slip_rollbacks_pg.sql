@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS {database}.slip_rollbacks_pg
     revert_commit  String,
     status         String,
     forced         Bool,
-    message        String
+    message        String,
+    outcome        String
 )
 ENGINE = PostgreSQL('{postgres_host_port}', '{postgres_database}', 'slip_rollbacks', '{postgres_user}', '{postgres_password}');

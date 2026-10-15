@@ -19,14 +19,14 @@ const (
 // for the same Argo Workflow a no-op rather than a second row (uq_slip_rollbacks_workflow).
 const insertRollbackSQL = `INSERT INTO slip_rollbacks (
 	correlation_id, workflow, environment, reason, source, rollout_phase, pod_hash,
-	gitops_repo, gitops_commit, revert_commit, status, forced, message
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+	gitops_repo, gitops_commit, revert_commit, status, forced, message, outcome
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 ON CONFLICT (workflow) DO NOTHING`
 
 // listRollbacksSQL reads a slip's attempts in the order they were recorded; id breaks ties
 // between rows recorded in the same microsecond.
 const listRollbacksSQL = `SELECT id, correlation_id, workflow, recorded_at, environment, reason, source,
-	rollout_phase, pod_hash, gitops_repo, gitops_commit, revert_commit, status, forced, message
+	rollout_phase, pod_hash, gitops_repo, gitops_commit, revert_commit, status, forced, message, outcome
 FROM slip_rollbacks WHERE correlation_id = $1 ORDER BY recorded_at, id`
 
 // RecordRollback writes one rollback attempt for a slip (DEVOPS-320). It returns true when this
@@ -43,7 +43,7 @@ func (s *PostgresStore) RecordRollback(ctx context.Context, rec RollbackRecord) 
 	tag, err := s.pool.Exec(ctx, insertRollbackSQL,
 		rec.CorrelationID, rec.Workflow, rec.Environment, rec.Reason, rec.Source, rec.RolloutPhase,
 		rec.PodHash, rec.GitOpsRepo, rec.GitOpsCommit, rec.RevertCommit, string(rec.Status), rec.Forced,
-		rec.Message)
+		rec.Message, rec.Outcome)
 	if err != nil {
 		return false, mapRollbackError(rec.CorrelationID, err)
 	}
@@ -66,7 +66,7 @@ func (s *PostgresStore) ListRollbacks(ctx context.Context, correlationID string)
 		if scanErr := rows.Scan(&rec.ID, &rec.CorrelationID, &rec.Workflow, &rec.RecordedAt,
 			&rec.Environment, &rec.Reason, &rec.Source, &rec.RolloutPhase, &rec.PodHash,
 			&rec.GitOpsRepo, &rec.GitOpsCommit, &rec.RevertCommit, &status, &rec.Forced,
-			&rec.Message); scanErr != nil {
+			&rec.Message, &rec.Outcome); scanErr != nil {
 			return nil, fmt.Errorf("list rollbacks for slip %s: %w", correlationID, scanErr)
 		}
 		rec.Status = RollbackStatus(status)

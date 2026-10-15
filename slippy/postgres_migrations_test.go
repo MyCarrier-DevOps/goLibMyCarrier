@@ -417,6 +417,9 @@ func TestSlipRollbacksMigration_V7(t *testing.T) {
 	} {
 		assert.Contains(t, up, want)
 	}
+	for _, column := range []string{"message", "outcome"} {
+		assert.Regexp(t, column+`\s+text\s+NOT NULL DEFAULT ''`, up, "RecordRollback writes %s", column)
+	}
 	for _, s := range []RollbackStatus{
 		RollbackStatusSuccess, RollbackStatusNoop, RollbackStatusSkipped,
 		RollbackStatusFailed, RollbackStatusDryRun,

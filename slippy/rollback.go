@@ -36,11 +36,14 @@ const (
 	maxRollbackRepoLen          = 128
 	maxRollbackCommitLen        = 64
 	maxRollbackMessageLen       = 1000
+	maxRollbackOutcomeLen       = 1000
 )
 
 // RollbackRecord is one row of slip_rollbacks: a single rollback attempt for a slip, written
 // by gitops-rollback through slippy-api (DEVOPS-320). ID and RecordedAt are assigned by the
-// database; RecordRollback ignores whatever the caller puts in them.
+// database; RecordRollback ignores whatever the caller puts in them. Message says why the
+// rollback started (the publisher's text); Outcome says what the attempt did, or why it did not
+// land.
 type RollbackRecord struct {
 	ID            int64          `json:"id"`
 	CorrelationID string         `json:"correlation_id"`
@@ -57,6 +60,7 @@ type RollbackRecord struct {
 	Status        RollbackStatus `json:"status"`
 	Forced        bool           `json:"forced"`
 	Message       string         `json:"message"`
+	Outcome       string         `json:"outcome"`
 }
 
 // Valid reports whether s is one of the five recorded rollback statuses.
@@ -72,7 +76,7 @@ func (s RollbackStatus) Valid() bool {
 
 // Validate reports every field that would make r unwritable, as one error wrapping
 // ErrInvalidRollback, or nil when r can be recorded. The descriptive fields (reason, source,
-// rollout_phase, pod_hash, message) are free text with a length bound only: gitops-rollback
+// rollout_phase, pod_hash, message, outcome) are free text with a length bound only: gitops-rollback
 // normalises unknown values, and a rollback record must never be refused for its metadata.
 func (r *RollbackRecord) Validate() error {
 	var problems []string
@@ -109,6 +113,7 @@ func (r *RollbackRecord) Validate() error {
 		{"gitops_commit", r.GitOpsCommit, maxRollbackCommitLen},
 		{"revert_commit", r.RevertCommit, maxRollbackCommitLen},
 		{"message", r.Message, maxRollbackMessageLen},
+		{"outcome", r.Outcome, maxRollbackOutcomeLen},
 	} {
 		if exceedsRunes(f.value, f.limit) {
 			addf("%s exceeds %d characters", f.name, f.limit)

@@ -993,7 +993,8 @@ One row per gitops-rollback attempt for a slip, written through slippy-api with
 | `gitops_repo`, `gitops_commit`, `revert_commit` | text | What was reverted, and the revert commit |
 | `status` | text | `success`, `noop`, `skipped`, `failed` or `dry_run` (CHECKed) |
 | `forced` | boolean | Whether `--force` conflict resolution was used |
-| `message` | text | Outcome detail, up to 1,000 characters |
+| `message` | text | Why the rollback started (the publisher's text), up to 1,000 characters |
+| `outcome` | text | What the attempt did, or why it did not land, up to 1,000 characters |
 
 ### Migrations
 

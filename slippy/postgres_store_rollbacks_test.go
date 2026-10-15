@@ -17,7 +17,7 @@ import (
 func rollbackInsertArgs(r RollbackRecord) []any {
 	return []any{
 		r.CorrelationID, r.Workflow, r.Environment, r.Reason, r.Source, r.RolloutPhase, r.PodHash,
-		r.GitOpsRepo, r.GitOpsCommit, r.RevertCommit, string(r.Status), r.Forced, r.Message,
+		r.GitOpsRepo, r.GitOpsCommit, r.RevertCommit, string(r.Status), r.Forced, r.Message, r.Outcome,
 	}
 }
 
@@ -111,7 +111,7 @@ func rollbackColumns() []string {
 	return []string{
 		"id", "correlation_id", "workflow", "recorded_at", "environment", "reason", "source",
 		"rollout_phase", "pod_hash", "gitops_repo", "gitops_commit", "revert_commit", "status",
-		"forced", "message",
+		"forced", "message", "outcome",
 	}
 }
 
@@ -121,9 +121,9 @@ func TestPostgresStore_ListRollbacks_OK(t *testing.T) {
 	t2 := t1.Add(time.Minute)
 	rows := pgxmock.NewRows(rollbackColumns()).
 		AddRow(int64(1), "c1", "wf-1", t1, "prod", "canary_abort", "canary-coordinator", "dark",
-			"5d8b9c7f6", "GitOps-prod", "a1b2c3d", "e4f5a6b", "success", false, "reverted").
+			"5d8b9c7f6", "GitOps-prod", "a1b2c3d", "e4f5a6b", "success", false, "canary analysis failed", "reverted").
 		AddRow(int64(2), "c1", "wf-2", t2, "prod", "canary_abort", "rollout-watch", "dark",
-			"5d8b9c7f6", "GitOps-prod", "a1b2c3d", "", "noop", true, "")
+			"5d8b9c7f6", "GitOps-prod", "a1b2c3d", "", "noop", true, "", "")
 	mock.ExpectQuery("FROM slip_rollbacks WHERE correlation_id = \\$1 ORDER BY recorded_at, id").
 		WithArgs("c1").
 		WillReturnRows(rows)
@@ -135,7 +135,7 @@ func TestPostgresStore_ListRollbacks_OK(t *testing.T) {
 		ID: 1, CorrelationID: "c1", Workflow: "wf-1", RecordedAt: t1, Environment: "prod",
 		Reason: "canary_abort", Source: "canary-coordinator", RolloutPhase: "dark", PodHash: "5d8b9c7f6",
 		GitOpsRepo: "GitOps-prod", GitOpsCommit: "a1b2c3d", RevertCommit: "e4f5a6b",
-		Status: RollbackStatusSuccess, Message: "reverted",
+		Status: RollbackStatusSuccess, Message: "canary analysis failed", Outcome: "reverted",
 	}, got[0])
 	assert.Equal(t, RollbackStatusNoop, got[1].Status)
 	assert.True(t, got[1].Forced)
@@ -165,7 +165,7 @@ func TestPostgresStore_ListRollbacks_QueryError(t *testing.T) {
 func TestPostgresStore_ListRollbacks_ScanError(t *testing.T) {
 	store, mock := newMockStore(t)
 	rows := pgxmock.NewRows(rollbackColumns()).
-		AddRow("not-a-number", "c1", "wf-1", time.Now(), "prod", "", "", "", "", "", "", "", "success", false, "")
+		AddRow("not-a-number", "c1", "wf-1", time.Now(), "prod", "", "", "", "", "", "", "", "success", false, "", "")
 	mock.ExpectQuery("FROM slip_rollbacks").WithArgs("c1").WillReturnRows(rows)
 
 	_, err := store.ListRollbacks(context.Background(), "c1")
@@ -177,7 +177,7 @@ func TestPostgresStore_ListRollbacks_RowsError(t *testing.T) {
 	store, mock := newMockStore(t)
 	boom := errors.New("stream broke")
 	rows := pgxmock.NewRows(rollbackColumns()).
-		AddRow(int64(1), "c1", "wf-1", time.Now(), "prod", "", "", "", "", "", "", "", "success", false, "").
+		AddRow(int64(1), "c1", "wf-1", time.Now(), "prod", "", "", "", "", "", "", "", "success", false, "", "").
 		RowError(0, boom)
 	mock.ExpectQuery("FROM slip_rollbacks").WithArgs("c1").WillReturnRows(rows)
 
