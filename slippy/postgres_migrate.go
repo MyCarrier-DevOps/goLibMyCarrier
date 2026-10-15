@@ -9,8 +9,13 @@ import (
 	"github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator"
 )
 
+// slippyChildTables are the tables that hang off routing_slips. ProbeSchema and
+// ValidatePostgresSchema both read this one list, so they cannot disagree on what a current
+// schema contains.
+var slippyChildTables = []string{TableSlipComponentStates, TableSlipAncestry, TableSlipRollbacks}
+
 // slippyExpectedTables are the core tables the Postgres schema must contain.
-var slippyExpectedTables = []string{"routing_slips", "slip_component_states", "slip_ancestry"}
+var slippyExpectedTables = append([]string{TableRoutingSlips}, slippyChildTables...)
 
 // MigrateResult reports what a RunPostgresMigrations call did.
 type MigrateResult struct {

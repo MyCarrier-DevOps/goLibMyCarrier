@@ -222,6 +222,11 @@ var (
 	// 42703. Callers probe at startup and refuse to serve until the migrator has applied the
 	// schema (DEVOPS-367).
 	ErrSchemaBehind = errors.New("routing_slips schema is behind this library; apply migrations before serving")
+
+	// ErrInvalidRollback is returned by RollbackRecord.Validate, and by
+	// PostgresStore.RecordRollback when the database refuses a record's values, when a rollback
+	// record cannot be written as given (DEVOPS-320).
+	ErrInvalidRollback = errors.New("invalid rollback record")
 )
 
 // SlipError wraps an error with additional context about the slip operation.

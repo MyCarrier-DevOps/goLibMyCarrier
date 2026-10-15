@@ -342,12 +342,17 @@ promotion adds an `Abort` or `Terminate` entry (same index and name) next to the
 ### CanaryWeight
 
 `CanaryWeight` is the traffic share of the canary. For a canary with traffic routing it is the
-weight the router reports, as `kubectl argo rollouts` shows it. Without traffic routing it is
-the current step's `setWeight` (the desired weight), whereas `kubectl argo rollouts` reports the
-ratio of available canary replicas. The precedence:
+weight the router reports. Without traffic routing it is the current step's `setWeight` (the
+desired weight), whereas `kubectl argo rollouts` reports the ratio of available canary replicas.
+The precedence:
 
-1. The Rollout is aborted (`status.abort`): `0`.
-2. The Rollout has no canary strategy (for example blue-green): `0`.
+1. The Rollout has no canary strategy (for example blue-green): `0`.
+2. The Rollout is aborted (`status.abort`): the canary weight in `status.canary.weights` when a
+   traffic router is configured and reports one, otherwise `0`. The controller steps the
+   reported weight down to `0` after an abort (gradually with `dynamicStableScale`), so wait
+   for `0` before treating traffic as moved back to stable.
+   A `0` can also mean the controller has not reported weights yet, so a consumer waiting
+   for stable traffic should read it together with `Aborted` and `Phase`.
 3. There is no current canary step, which means the canary strategy has no steps or
    `currentStepIndex` is past the last step (fully promoted): the max traffic weight,
    `spec.strategy.canary.trafficRouting.maxTrafficWeight`, default `100`. A traffic

@@ -30,6 +30,7 @@ const (
 	TableRoutingSlips        = "routing_slips"
 	TableSlipComponentStates = "slip_component_states"
 	TableSlipAncestry        = "slip_ancestry"
+	TableSlipRollbacks       = "slip_rollbacks"
 )
 
 // Column name constants for the slip_ancestry table.

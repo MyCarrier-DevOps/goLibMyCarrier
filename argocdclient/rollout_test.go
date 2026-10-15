@@ -33,10 +33,39 @@ func TestCanaryWeight(t *testing.T) {
 		want     int32
 	}{
 		{
-			name: "aborted with weights present is zero",
+			name: "aborted with routing reports the router weight while it steps down",
 			manifest: `{"spec":{"strategy":{"canary":{"trafficRouting":{},"steps":[{"setWeight":50},{"pause":{}}]}}},
-				"status":{"abort":true,"currentStepIndex":1,"canary":{"weights":{"canary":{"weight":50}}}}}`,
+				"status":{"abort":true,"currentStepIndex":1,"canary":{"weights":{"canary":{"weight":10}}}}}`,
+			want: 10,
+		},
+		{
+			name: "aborted past the last step still reports the router weight",
+			manifest: `{"spec":{"strategy":{"canary":{"trafficRouting":{},"steps":[{"setWeight":50}]}}},
+				"status":{"abort":true,"currentStepIndex":1,"canary":{"weights":{"canary":{"weight":10}}}}}`,
+			want: 10,
+		},
+		{
+			name: "aborted with routing reports a settled router weight of zero",
+			manifest: `{"spec":{"strategy":{"canary":{"trafficRouting":{},"steps":[{"setWeight":50},{"pause":{}}]}}},
+				"status":{"abort":true,"currentStepIndex":1,"canary":{"weights":{"canary":{"weight":0},"stable":{"weight":100}}}}}`,
 			want: 0,
+		},
+		{
+			name: "aborted with routing but no reported weights is zero",
+			manifest: `{"spec":{"strategy":{"canary":{"trafficRouting":{},"steps":[{"setWeight":50},{"pause":{}}]}}},
+				"status":{"abort":true,"currentStepIndex":1}}`,
+			want: 0,
+		},
+		{
+			name: "aborted without routing ignores setWeight",
+			manifest: `{"spec":{"strategy":{"canary":{"steps":[{"setWeight":20},{"pause":{}}]}}},
+				"status":{"abort":true,"currentStepIndex":0}}`,
+			want: 0,
+		},
+		{
+			name:     "aborted without a canary strategy is zero",
+			manifest: `{"spec":{"strategy":{"blueGreen":{}}},"status":{"abort":true}}`,
+			want:     0,
 		},
 		{
 			name: "fully promoted with routing ignores reset weights",
@@ -600,4 +629,51 @@ func TestListRolloutGroup_LivePermissionDeniedFailsTheCall(t *testing.T) {
 	if !errors.Is(err, ErrPermissionDenied) {
 		t.Fatalf("expected ErrPermissionDenied, got %v", err)
 	}
+}
+
+func TestListRolloutGroup_AbortedRolloutReportsRouterWeight(t *testing.T) {
+	var resource struct {
+		Manifest string `json:"manifest"`
+	}
+	if err := json.Unmarshal([]byte(readFixture(t, "resource-rt-api-degraded.json")), &resource); err != nil {
+		t.Fatalf("decoding fixture: %v", err)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal([]byte(resource.Manifest), &manifest); err != nil {
+		t.Fatalf("decoding fixture manifest: %v", err)
+	}
+	status, _ := manifest["status"].(map[string]any)
+	canary, _ := status["canary"].(map[string]any)
+	weights, _ := canary["weights"].(map[string]any)
+	canaryWeights, _ := weights["canary"].(map[string]any)
+	if canaryWeights == nil {
+		t.Fatal("fixture has no status.canary.weights.canary")
+	}
+	canaryWeights["weight"] = 10
+	edited, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("encoding manifest: %v", err)
+	}
+	body, err := json.Marshal(map[string]string{"manifest": string(edited)})
+	if err != nil {
+		t.Fatalf("encoding resource: %v", err)
+	}
+
+	srv := newRolloutServer(t, "degraded")
+	srv.resourceBody = string(body)
+
+	got, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, fixtureGroupA)
+	if err != nil {
+		t.Fatalf("ListRolloutGroup: %v", err)
+	}
+	for _, status := range got {
+		if status.Ref.Name != "rt-api" {
+			continue
+		}
+		if !status.Aborted || status.CanaryWeight != 10 {
+			t.Errorf("rt-api Aborted = %t, CanaryWeight = %d, want true and 10", status.Aborted, status.CanaryWeight)
+		}
+		return
+	}
+	t.Fatal("rt-api missing from the statuses")
 }

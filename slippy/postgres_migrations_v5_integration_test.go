@@ -82,8 +82,8 @@ func TestUniquenessMigration_V5_Integration(t *testing.T) {
 		cfg := pgTestPipelineConfig(t)
 		res, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
 		require.NoError(t, err)
-		// Latest is v6 since DEVOPS-367; v5's own version is asserted by the unit test on migs[4].
-		assert.Equal(t, 6, res.EndVersion)
+		// Latest is v7 since DEVOPS-320; v5's own version is asserted by the unit test on migs[4].
+		assert.Equal(t, 7, res.EndVersion)
 
 		assert.Equal(t, 1, pgCountV5(
 			t,

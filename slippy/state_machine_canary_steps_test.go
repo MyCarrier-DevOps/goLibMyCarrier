@@ -121,7 +121,12 @@ func TestStateMachine_CanarySteps_FailProdCanary_SlipFailed_DownstreamAbortsLazi
 		}
 	}
 	if got := canaryStepStatus(t, store, corrID, "prod_canary"); got != StepStatusFailed {
-		t.Errorf("prod_canary must stay %q after the downstream abort, got %q%s", StepStatusFailed, got, stateMachineRef)
+		t.Errorf(
+			"prod_canary must stay %q after the downstream abort, got %q%s",
+			StepStatusFailed,
+			got,
+			stateMachineRef,
+		)
 	}
 }
 
@@ -274,7 +279,12 @@ func TestPipelineConfig_ExampleFiles_CanaryGraph(t *testing.T) {
 			}
 			// Membership, not an exact count: unrelated steps may be added without breaking this.
 			if len(cfg.Steps) < len(canaryExampleGraph) {
-				t.Errorf("%s: only %d steps, fewer than the %d pinned", tc.file, len(cfg.Steps), len(canaryExampleGraph))
+				t.Errorf(
+					"%s: only %d steps, fewer than the %d pinned",
+					tc.file,
+					len(cfg.Steps),
+					len(canaryExampleGraph),
+				)
 			}
 			for name, want := range canaryExampleGraph {
 				step := cfg.GetStep(name)
@@ -291,11 +301,20 @@ func TestPipelineConfig_ExampleFiles_CanaryGraph(t *testing.T) {
 			}
 			// Live-shape edges outside the canary change: mutation_tests is a standalone step and
 			// prod_steady_state also waits on prod_alert_gate.
-			if mt := cfg.GetStep("mutation_tests"); mt == nil || len(mt.Prerequisites) != 0 || mt.IsGate || mt.Aggregates != "" {
+			if mt := cfg.GetStep(
+				"mutation_tests",
+			); mt == nil || len(mt.Prerequisites) != 0 || mt.IsGate ||
+				mt.Aggregates != "" {
 				t.Errorf("%s: mutation_tests must exist as a plain step with no prerequisites", tc.file)
 			}
-			if ss := cfg.GetStep("prod_steady_state"); ss == nil || !slices.Equal(ss.Prerequisites, []string{"prod_deploy", "prod_tests", "prod_alert_gate"}) {
-				t.Errorf("%s: prod_steady_state prerequisites changed, want [prod_deploy prod_tests prod_alert_gate]", tc.file)
+			if ss := cfg.GetStep(
+				"prod_steady_state",
+			); ss == nil ||
+				!slices.Equal(ss.Prerequisites, []string{"prod_deploy", "prod_tests", "prod_alert_gate"}) {
+				t.Errorf(
+					"%s: prod_steady_state prerequisites changed, want [prod_deploy prod_tests prod_alert_gate]",
+					tc.file,
+				)
 			}
 			// Full dependent sets (reverse edges): extra edges onto unpinned steps must fail.
 			dependents := func(prereq string) []string {
@@ -317,7 +336,13 @@ func TestPipelineConfig_ExampleFiles_CanaryGraph(t *testing.T) {
 			// The new steps must not be gates and must not aggregate component work.
 			for _, name := range []string{"preprod_rollback_test", "prod_canary"} {
 				if s := cfg.GetStep(name); s != nil && (s.IsGate || s.Aggregates != "") {
-					t.Errorf("%s: %s must be a plain step (is_gate=%v aggregates=%q)", tc.file, name, s.IsGate, s.Aggregates)
+					t.Errorf(
+						"%s: %s must be a plain step (is_gate=%v aggregates=%q)",
+						tc.file,
+						name,
+						s.IsGate,
+						s.Aggregates,
+					)
 				}
 			}
 		})
@@ -379,7 +404,11 @@ func TestPipelineConfig_ExampleFiles_ProdSteadyStateReachable(t *testing.T) {
 			stuckRollback := reach(cfg, nil, map[string]bool{"preprod_rollback_test": true})
 			for _, s := range []string{"prod_gate", "prod_release_created", "prod_canary", "prod_deploy", "prod_tests", "prod_steady_state"} {
 				if stuckRollback[s] {
-					t.Errorf("%s: %s must be blocked while preprod_rollback_test is neither completed nor skipped", file, s)
+					t.Errorf(
+						"%s: %s must be blocked while preprod_rollback_test is neither completed nor skipped",
+						file,
+						s,
+					)
 				}
 			}
 		})
@@ -427,7 +456,13 @@ func TestPipelineConfig_ExampleFiles_MirrorEachOtherAndLiveShape(t *testing.T) {
 		for _, st := range cfg.Steps {
 			names = append(names, st.Name)
 			if st.IsGate != (st.Name == "prod_gate") {
-				t.Errorf("%s: step %s IsGate = %v, want %v (prod_gate is the only gate)", name, st.Name, st.IsGate, st.Name == "prod_gate")
+				t.Errorf(
+					"%s: step %s IsGate = %v, want %v (prod_gate is the only gate)",
+					name,
+					st.Name,
+					st.IsGate,
+					st.Name == "prod_gate",
+				)
 			}
 		}
 		if !slices.Equal(names, liveShapeStepOrder) {
