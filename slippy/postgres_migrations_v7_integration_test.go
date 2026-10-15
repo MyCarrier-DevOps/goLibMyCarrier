@@ -53,6 +53,18 @@ func TestSlipRollbacksMigration_V7_Integration(t *testing.T) {
 		assert.Contains(t, v7ConstraintDef(t, pool, "ck_slip_rollbacks_status"), "dry_run")
 	})
 
+	// ValidatePostgresSchema and ProbeSchema read one list of child tables, so they agree on v7.
+	t.Run("ValidatePostgresSchema refuses a database without slip_rollbacks", func(t *testing.T) {
+		pool := newPGMigrationTestPool(t)
+		cfg := pgTestPipelineConfig(t)
+		_, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg, TargetVersion: 6})
+		require.NoError(t, err)
+
+		err = ValidatePostgresSchema(ctx, pool, cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "slip_rollbacks")
+	})
+
 	t.Run("down drops the table and up re-applies idempotently", func(t *testing.T) {
 		pool := newPGMigrationTestPool(t)
 		cfg := pgTestPipelineConfig(t)

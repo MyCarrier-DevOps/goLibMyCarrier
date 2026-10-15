@@ -326,7 +326,7 @@ func (s *PostgresStore) probeRoutingSlipColumns(ctx context.Context) error {
 // until the first write fails.
 func (s *PostgresStore) probeChildTables(ctx context.Context) error {
 	var missing []string
-	for _, table := range []string{TableSlipComponentStates, TableSlipAncestry, TableSlipRollbacks} {
+	for _, table := range slippyChildTables {
 		var present bool
 		if err := s.pool.QueryRow(ctx,
 			"SELECT to_regclass($1) IS NOT NULL", table).Scan(&present); err != nil {
