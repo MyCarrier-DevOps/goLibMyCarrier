@@ -220,7 +220,12 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 - **Repave is a hard delete, and that is a recorded decision.** A repaved run's
   `routing_slips` row — and with it its `state_history` jsonb — plus its
   `slip_component_states` and `slip_ancestry` rows are destroyed, and since migration v7
-  (DEVOPS-320) so are its `slip_rollbacks` rows, by `ON DELETE CASCADE`. No tombstone, archive
+  (DEVOPS-320) so are its `slip_rollbacks` rows, by `ON DELETE CASCADE`. A rolled-back
+  release's commit can repave this way without a new commit: a branch created at that SHA
+  is a push with no new commits, for which pushhookparser reads the head commit's own
+  changes (`config/parse.go`), so it builds and repaves the ended slip whenever that commit
+  changed build paths. `ci.slip_rollbacks_pg` reads Postgres at query time, so it loses the
+  rows too; reporting that must outlive a repave needs its own retained copy. No tombstone, archive
   or retention copy exists anywhere. That was decided in DEVOPS-231 §4, and re-examined
   and confirmed on 2026-09-09 under **DEVOPS-277**, which declined both soft-delete
   (DEVOPS-230's partial-index model) and a tombstone row: nothing consumes a superseded
