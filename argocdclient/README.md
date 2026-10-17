@@ -222,6 +222,7 @@ section above for details and the recommended usage pattern.
 - `type StepPluginStatus struct{ Index int32; Name string; Operation StepPluginOperation; Phase StepPluginPhase; Message string }`: one entry of `status.canary.stepPluginStatuses`
 - `type RolloutStatus struct{ ... }`: combined resource-tree and live state of one Rollout (see [Argo Rollouts](#argo-rollouts))
 - `(c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: Rollouts of an Application labeled with the correlation ID
+- `(c *Client) GetLiveResource(ctx context.Context, appName string, ref ResourceRef) ([]byte, error)`: the live manifest (JSON) of any resource `ref` can name, including core-group kinds such as a ConfigMap (leave `ref.Group` empty). An empty `appName` or `ref.Name` is an error and sends no request. `appName` and every `ref` field are escaped, so names with `/`, `?`, `&`, `#` or spaces are sent intact. HTTP 404 and HTTP 400 "not found as part of application" match `ErrNotFound`; HTTP 403 matches `ErrPermissionDenied`; a cancelled or expired `ctx` returns the context error (`errors.Is(err, context.Canceled)`), never an ArgoCD error
 - `type ResourceAction string`: `ActionAbort`, `ActionPromoteFull`, `ActionRetry`, `ActionResume`
 - `type Router struct{ ... }`: one `Client` per configured `Instance`
 - `NewRouter(configs map[Instance]*Config) *Router`: builds a `Router`; nil or incomplete configs leave an instance unconfigured
@@ -334,6 +335,13 @@ are returned wrapped as-is.
 | `Aborted` | live Rollout | `status.abort` |
 | `CanaryWeight` | live Rollout | Percentage of traffic on the canary, see below |
 | `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, operation, phase, message) |
+| `UID` | live Rollout | `metadata.uid` |
+| `StableRS` | live Rollout | `status.stableRS` |
+| `CurrentPodHash` | live Rollout | `status.currentPodHash` |
+| `Labels` | live Rollout | `metadata.labels` |
+| `Annotations` | live Rollout | `metadata.annotations` |
+| `IstioVirtualServices` | live Rollout | VirtualService names from `trafficRouting.istio.virtualService.name`, then `trafficRouting.istio.virtualServices[].name`, de-duplicated; empty when neither is set |
+| `ManagedRoutes` | live Rollout | `trafficRouting.managedRoutes[].name`; empty when none |
 
 Argo Rollouts keeps one step plugin entry per step and operation: an abort or a full
 promotion adds an `Abort` or `Terminate` entry (same index and name) next to the step's
