@@ -210,6 +210,9 @@ func TestNewRolloutStatus(t *testing.T) {
 		CurrentStepIndex: int32Ptr(1),
 		Aborted:          false,
 		CanaryWeight:     50,
+		// Labels come from realisticRollout metadata.labels. The fixture has no uid, stableRS,
+		// currentPodHash, annotations, Istio virtual services or managedRoutes, so those stay empty.
+		Labels: map[string]string{CorrelationIDLabel: "corr-1", "app": "api"},
 		StepPluginStatuses: []StepPluginStatus{
 			{
 				Index:     0,
@@ -378,9 +381,23 @@ func rolloutRef(name string) ResourceRef {
 	}
 }
 
+// fixtureLive holds the identity-bound live fields of each recorded Rollout manifest in
+// testdata/resource-<name>-<state>.json: metadata.uid, the correlation label value and the
+// single trafficRouting.istio.virtualService name (equal to the rollout name in every fixture).
+// The fixtures set no trafficRouting.managedRoutes, so ManagedRoutes is nil.
+var fixtureLive = map[string]struct{ uid, group string }{
+	"rt-api":    {"afc0e4fd-69c8-48ff-8455-aff9e3909d68", fixtureGroupA},
+	"rt-worker": {"759734b8-af00-4e55-97f3-27fafb89bd0d", fixtureGroupA},
+	"rt-other":  {"358be5b9-f474-4f3c-a9c5-3b4258e0d3d3", fixtureGroupB},
+}
+
+// fixtureStatus builds the expected status of a recorded Rollout. stableRS and podHash are the
+// manifest's status.stableRS and status.currentPodHash, which differ per state.
 func fixtureStatus(
 	name string, health HealthStatus, message string, phase RolloutPhase, index int32, aborted bool, weight int32,
+	stableRS, podHash string,
 ) RolloutStatus {
+	live := fixtureLive[name]
 	return RolloutStatus{
 		Ref:                rolloutRef(name),
 		Health:             health,
@@ -390,6 +407,15 @@ func fixtureStatus(
 		Aborted:            aborted,
 		CanaryWeight:       weight,
 		StepPluginStatuses: nil,
+		UID:                live.uid,
+		StableRS:           stableRS,
+		CurrentPodHash:     podHash,
+		Labels:             map[string]string{CorrelationIDLabel: live.group},
+		Annotations: map[string]string{
+			"argocd.argoproj.io/tracking-id": fixtureApp + ":argoproj.io/Rollout:" + fixtureNamespace + "/" + name,
+			"rollout.argoproj.io/revision":   "2",
+		},
+		IstioVirtualServices: []string{name},
 	}
 }
 
@@ -402,25 +428,25 @@ func TestListRolloutGroup(t *testing.T) {
 		want        []RolloutStatus
 	}{
 		{"healthy group a after promotion", "healthy", fixtureGroupA, []RolloutStatus{
-			fixtureStatus("rt-api", HealthStatusHealthy, "", RolloutPhaseHealthy, 5, false, 100),
-			fixtureStatus("rt-worker", HealthStatusHealthy, "", RolloutPhaseHealthy, 5, false, 100),
+			fixtureStatus("rt-api", HealthStatusHealthy, "", RolloutPhaseHealthy, 5, false, 100, "775f8d9cb4", "775f8d9cb4"),
+			fixtureStatus("rt-worker", HealthStatusHealthy, "", RolloutPhaseHealthy, 5, false, 100, "6d866788c6", "6d866788c6"),
 		}},
 		{"degraded group a with an aborted rollout", "degraded", fixtureGroupA, []RolloutStatus{
-			fixtureStatus("rt-api", HealthStatusDegraded, abortedMessage, RolloutPhaseDegraded, 0, true, 0),
-			fixtureStatus("rt-worker", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
+			fixtureStatus("rt-api", HealthStatusDegraded, abortedMessage, RolloutPhaseDegraded, 0, true, 0, "679bc4c8fc", "775f8d9cb4"),
+			fixtureStatus("rt-worker", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50, "7b89495949", "6d866788c6"),
 		}},
 		{"suspended group a", "suspended", fixtureGroupA, []RolloutStatus{
-			fixtureStatus("rt-api", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
-			fixtureStatus("rt-worker", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
+			fixtureStatus("rt-api", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50, "679bc4c8fc", "775f8d9cb4"),
+			fixtureStatus("rt-worker", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50, "7b89495949", "6d866788c6"),
 		}},
 		{"suspended group b", "suspended", fixtureGroupB, []RolloutStatus{
-			fixtureStatus("rt-other", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50),
+			fixtureStatus("rt-other", HealthStatusSuspended, "CanaryPauseStep", RolloutPhasePaused, 1, false, 50, "796b5bb5b6", "f99554ff5"),
 		}},
 		{"progressing group a", "progressing", fixtureGroupA, []RolloutStatus{
 			fixtureStatus("rt-api", HealthStatusProgressing, "more replicas need to be updated",
-				RolloutPhaseProgressing, 0, false, 0),
+				RolloutPhaseProgressing, 0, false, 0, "679bc4c8fc", "775f8d9cb4"),
 			fixtureStatus("rt-worker", HealthStatusProgressing, "more replicas need to be updated",
-				RolloutPhaseProgressing, 0, false, 0),
+				RolloutPhaseProgressing, 0, false, 0, "7b89495949", "6d866788c6"),
 		}},
 		{"unknown correlation id", "suspended", "devops-315-unknown", []RolloutStatus{}},
 	}

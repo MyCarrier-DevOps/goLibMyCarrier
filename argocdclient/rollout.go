@@ -126,6 +126,20 @@ type RolloutStatus struct {
 	CanaryWeight int32
 	// StepPluginStatuses is status.canary.stepPluginStatuses of the live Rollout.
 	StepPluginStatuses []StepPluginStatus
+	// UID is metadata.uid of the live Rollout.
+	UID string
+	// StableRS is status.stableRS of the live Rollout.
+	StableRS string
+	// CurrentPodHash is status.currentPodHash of the live Rollout.
+	CurrentPodHash string
+	// Labels is metadata.labels of the live Rollout.
+	Labels map[string]string
+	// Annotations is metadata.annotations of the live Rollout.
+	Annotations map[string]string
+	// IstioVirtualServices lists the Istio VirtualService names the canary traffic routing references.
+	IstioVirtualServices []string
+	// ManagedRoutes lists the names in spec.strategy.canary.trafficRouting.managedRoutes.
+	ManagedRoutes []string
 }
 
 // resourceNode is a node of the ArgoCD resource-tree response.
@@ -147,7 +161,9 @@ type nodeHealth struct {
 // liveRollout holds the parts of a live Rollout manifest this package reads.
 type liveRollout struct {
 	Metadata struct {
-		Labels map[string]string `json:"labels"`
+		UID         string            `json:"uid"`
+		Labels      map[string]string `json:"labels"`
+		Annotations map[string]string `json:"annotations"`
 	} `json:"metadata"`
 	Spec struct {
 		Strategy struct {
@@ -158,6 +174,8 @@ type liveRollout struct {
 		Phase            RolloutPhase `json:"phase"`
 		CurrentStepIndex *int32       `json:"currentStepIndex"`
 		Abort            bool         `json:"abort"`
+		StableRS         string       `json:"stableRS"`
+		CurrentPodHash   string       `json:"currentPodHash"`
 		Canary           struct {
 			Weights *struct {
 				Canary struct {
@@ -175,6 +193,17 @@ type canaryStrategy struct {
 	} `json:"steps"`
 	TrafficRouting *struct {
 		MaxTrafficWeight *int32 `json:"maxTrafficWeight"`
+		Istio            *struct {
+			VirtualService *struct {
+				Name string `json:"name"`
+			} `json:"virtualService"`
+			VirtualServices []struct {
+				Name string `json:"name"`
+			} `json:"virtualServices"`
+		} `json:"istio"`
+		ManagedRoutes []struct {
+			Name string `json:"name"`
+		} `json:"managedRoutes"`
 	} `json:"trafficRouting"`
 }
 
@@ -240,14 +269,59 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 			Namespace: node.Namespace,
 			Name:      node.Name,
 		},
-		Health:             node.Health.Status,
-		Message:            node.Health.Message,
-		Phase:              live.Status.Phase,
-		CurrentStepIndex:   live.Status.CurrentStepIndex,
-		Aborted:            live.Status.Abort,
-		CanaryWeight:       canaryWeight(live),
-		StepPluginStatuses: live.Status.Canary.StepPluginStatuses,
+		Health:               node.Health.Status,
+		Message:              node.Health.Message,
+		Phase:                live.Status.Phase,
+		CurrentStepIndex:     live.Status.CurrentStepIndex,
+		Aborted:              live.Status.Abort,
+		CanaryWeight:         canaryWeight(live),
+		StepPluginStatuses:   live.Status.Canary.StepPluginStatuses,
+		UID:                  live.Metadata.UID,
+		StableRS:             live.Status.StableRS,
+		CurrentPodHash:       live.Status.CurrentPodHash,
+		Labels:               live.Metadata.Labels,
+		Annotations:          live.Metadata.Annotations,
+		IstioVirtualServices: istioVirtualServices(live.Spec.Strategy.Canary),
+		ManagedRoutes:        managedRoutes(live.Spec.Strategy.Canary),
 	}
+}
+
+// istioVirtualServices returns the de-duplicated VirtualService names of the canary traffic
+// routing: trafficRouting.istio.virtualService first, then trafficRouting.istio.virtualServices
+// in list order. It is nil when neither is set.
+func istioVirtualServices(canary *canaryStrategy) []string {
+	if canary == nil || canary.TrafficRouting == nil || canary.TrafficRouting.Istio == nil {
+		return nil
+	}
+	istio := canary.TrafficRouting.Istio
+
+	var names []string
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name != "" && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	if istio.VirtualService != nil {
+		add(istio.VirtualService.Name)
+	}
+	for _, vs := range istio.VirtualServices {
+		add(vs.Name)
+	}
+	return names
+}
+
+// managedRoutes returns the names in trafficRouting.managedRoutes, nil when there are none.
+func managedRoutes(canary *canaryStrategy) []string {
+	if canary == nil || canary.TrafficRouting == nil {
+		return nil
+	}
+	var names []string
+	for _, route := range canary.TrafficRouting.ManagedRoutes {
+		names = append(names, route.Name)
+	}
+	return names
 }
 
 // decodeRolloutNodes returns the Argo Rollouts nodes of an ArgoCD resource-tree response that
@@ -270,23 +344,46 @@ func decodeRolloutNodes(tree []byte) ([]resourceNode, error) {
 	return rollouts, nil
 }
 
-// getLiveRollout reads the live manifest of the Rollout behind node.
-func (c *Client) getLiveRollout(ctx context.Context, appName string, node resourceNode) (liveRollout, error) {
-	ref := ResourceRef{
-		Group: node.Group, Version: node.Version, Kind: node.Kind, Namespace: node.Namespace, Name: node.Name,
+// GetLiveResource returns the live manifest of the resource ref in the Application appName, as
+// the JSON document ArgoCD holds for it. It works for any kind ResourceRef can name; for a
+// core-group resource such as a ConfigMap, leave ref.Group empty.
+//
+// An empty appName or ref.Name is an error and sends no request. appName and every ref field are
+// escaped, so names with "/", "?", "&", "#" or spaces are sent intact. A resource ArgoCD does not
+// have (HTTP 404, or HTTP 400 "not found as part of application") matches ErrNotFound; HTTP 403
+// matches ErrPermissionDenied. A cancelled or expired ctx surfaces as the context error.
+func (c *Client) GetLiveResource(ctx context.Context, appName string, ref ResourceRef) ([]byte, error) {
+	if appName == "" {
+		return nil, errors.New("application name is required")
 	}
+	if ref.Name == "" {
+		return nil, errors.New("resource name is required")
+	}
+
 	body, err := c.doGET(ctx, c.applicationURL(appName)+"/resource?"+ref.query().Encode())
 	if err != nil {
-		return liveRollout{}, err
+		return nil, err
 	}
 
 	var envelope struct {
 		Manifest string `json:"manifest"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return liveRollout{}, fmt.Errorf("error decoding resource response: %w", err)
+		return nil, fmt.Errorf("error decoding resource response: %w", err)
 	}
-	return decodeRollout(envelope.Manifest)
+	return []byte(envelope.Manifest), nil
+}
+
+// getLiveRollout reads the live manifest of the Rollout behind node.
+func (c *Client) getLiveRollout(ctx context.Context, appName string, node resourceNode) (liveRollout, error) {
+	ref := ResourceRef{
+		Group: node.Group, Version: node.Version, Kind: node.Kind, Namespace: node.Namespace, Name: node.Name,
+	}
+	manifest, err := c.GetLiveResource(ctx, appName, ref)
+	if err != nil {
+		return liveRollout{}, err
+	}
+	return decodeRollout(string(manifest))
 }
 
 // ListRolloutGroup returns the status of every Argo Rollout in the Application appName whose
