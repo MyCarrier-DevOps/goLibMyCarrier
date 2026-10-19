@@ -198,9 +198,10 @@ sorted by name, then namespace. It sends one
 response carries only names and namespaces. An empty result is an empty, non-nil slice
 and a `nil` error.
 
-ArgoCD answers HTTP 200 with an empty list, not HTTP 403, for a token that is not
-allowed to get any Application, so an empty result can mean "nothing to see" or
-"no permission". Errors wrap `*APIError` (see [Error Handling](#error-handling)).
+ArgoCD answers HTTP 200, not HTTP 403, and leaves out each Application the token may
+not get. So a token with no such policy gets an empty list, and a token scoped to some
+projects gets a short list. Neither is an error, and the result does not show which
+case applies. Errors wrap `*APIError` (see [Error Handling](#error-handling)).
 
 When ArgoCD has `application.namespaces` set, the list also holds Applications outside
 the control-plane namespace, and a name can repeat. `ListRollouts`, `GetLiveResource`
@@ -319,8 +320,12 @@ only those whose `mycarrier.tech/correlationId` label (`CorrelationIDLabel`) equ
 `ListRolloutGroup` is also on `Router`, which routes `appName` to its instance and
 delegates. `ListRollouts` and `ListApplications` are `Client` methods only: a caller
 that scans a whole instance (it has no application name to route on yet) builds one
-`Client` per instance with `NewClient`, and can check each listed name with
-`RouteInstance`.
+`Client` per instance with `NewClient`. `Router` sends an action to the instance that
+`RouteInstance(appName)` picks, and that is not always the instance that listed the
+name. So before it acts on a Rollout it found in a scan, the caller checks that
+`RouteInstance(appName)` is the scanned instance. When it is not, the caller does not
+act, and reports that Rollout as one it cannot act on. Names that route elsewhere but
+need no action are not an error.
 
 The call works in these steps:
 
