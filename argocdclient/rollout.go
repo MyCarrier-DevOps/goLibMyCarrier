@@ -456,8 +456,8 @@ func (c *Client) getLiveRollout(ctx context.Context, appName string, node resour
 // no Rollout the result is an empty, non-nil slice and the error is nil.
 //
 // An HTTP answer of 400 or above that is not retried wraps *APIError, so errors.Is reaches
-// ErrPermissionDenied. A missing Application surfaces as ErrPermissionDenied (HTTP 403), as for
-// GetLiveResource. A cancelled or expired ctx surfaces as the context error.
+// ErrPermissionDenied. A missing Application, or an Application outside the control-plane
+// namespace, surfaces as ErrPermissionDenied (HTTP 403), as for GetLiveResource. A cancelled or expired ctx surfaces as the context error.
 func (c *Client) ListRollouts(ctx context.Context, appName string) ([]RolloutStatus, error) {
 	if appName == "" {
 		return nil, errors.New("application name is required")

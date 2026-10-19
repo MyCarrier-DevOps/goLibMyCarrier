@@ -460,20 +460,24 @@ func (s *applicationListServer) recorded() []recordedRequest {
 	return append([]recordedRequest(nil), s.requests...)
 }
 
-func TestListApplications_ReturnsSortedNames(t *testing.T) {
+func TestListApplications_ReturnsSortedRefs(t *testing.T) {
 	srv := newApplicationListServer(t, http.StatusOK, `{"metadata":{"resourceVersion":"7"},"items":[
-		{"metadata":{"name":"zeta-prod"}},
-		{"metadata":{"name":"production-csp-prod-api"}},
-		{"metadata":{"name":"alpha-prod"}}]}`)
+		{"metadata":{"name":"zeta-prod","namespace":"argocd"}},
+		{"metadata":{"name":"production-csp-prod-api","namespace":"argocd"}},
+		{"metadata":{"name":"alpha-prod","namespace":"argocd"}}]}`)
 
 	got, err := srv.client().ListApplications(context.Background())
 	if err != nil {
 		t.Fatalf("ListApplications: %v", err)
 	}
 
-	want := []string{"alpha-prod", "production-csp-prod-api", "zeta-prod"}
+	want := []ApplicationRef{
+		{Namespace: "argocd", Name: "alpha-prod"},
+		{Namespace: "argocd", Name: "production-csp-prod-api"},
+		{Namespace: "argocd", Name: "zeta-prod"},
+	}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("names = %v, want %v", got, want)
+		t.Errorf("refs = %v, want %v", got, want)
 	}
 	reqs := srv.recorded()
 	if len(reqs) != 1 {
@@ -485,8 +489,30 @@ func TestListApplications_ReturnsSortedNames(t *testing.T) {
 	if reqs[0].Auth != "Bearer "+testToken {
 		t.Errorf("Authorization = %q", reqs[0].Auth)
 	}
-	if fields := reqs[0].Query.Get("fields"); fields != "items.metadata.name" {
-		t.Errorf("fields = %q, want items.metadata.name", fields)
+	wantFields := "items.metadata.name,items.metadata.namespace"
+	if fields := reqs[0].Query.Get("fields"); fields != wantFields {
+		t.Errorf("fields = %q, want %s", fields, wantFields)
+	}
+}
+
+func TestListApplications_SameNameInTwoNamespaces(t *testing.T) {
+	srv := newApplicationListServer(t, http.StatusOK, `{"items":[
+		{"metadata":{"name":"x","namespace":"c1-cluster-apps"}},
+		{"metadata":{"name":"only-inner","namespace":"c1-cluster-apps"}},
+		{"metadata":{"name":"x","namespace":"argocd"}}]}`)
+
+	got, err := srv.client().ListApplications(context.Background())
+	if err != nil {
+		t.Fatalf("ListApplications: %v", err)
+	}
+
+	want := []ApplicationRef{
+		{Namespace: "c1-cluster-apps", Name: "only-inner"},
+		{Namespace: "argocd", Name: "x"},
+		{Namespace: "c1-cluster-apps", Name: "x"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("refs = %v, want %v", got, want)
 	}
 }
 
@@ -500,7 +526,7 @@ func TestListApplications_EmptyList(t *testing.T) {
 				t.Fatalf("ListApplications: %v", err)
 			}
 			if got == nil || len(got) != 0 {
-				t.Errorf("names = %#v, want an empty non-nil slice", got)
+				t.Errorf("refs = %#v, want an empty non-nil slice", got)
 			}
 		})
 	}

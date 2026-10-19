@@ -190,15 +190,22 @@ Retrieves ArgoCD application data for the specified application name using the c
 - `map[string]interface{}`: Application data as parsed JSON
 - `error`: Request or parsing error
 
-#### (c *Client) ListApplications(ctx context.Context) ([]string, error)
+#### (c *Client) ListApplications(ctx context.Context) ([]ApplicationRef, error)
 
-Returns the names of every Application the token can see, sorted. It sends one
-`GET /api/v1/applications?fields=items.metadata.name`, so the response carries only
-names. An empty result is an empty, non-nil slice and a `nil` error.
+Returns every Application the token can see as an `ApplicationRef{Namespace, Name}`,
+sorted by name, then namespace. It sends one
+`GET /api/v1/applications?fields=items.metadata.name,items.metadata.namespace`, so the
+response carries only names and namespaces. An empty result is an empty, non-nil slice
+and a `nil` error.
 
 ArgoCD answers HTTP 200 with an empty list, not HTTP 403, for a token that is not
 allowed to get any Application, so an empty result can mean "nothing to see" or
 "no permission". Errors wrap `*APIError` (see [Error Handling](#error-handling)).
+
+When ArgoCD has `application.namespaces` set, the list also holds Applications outside
+the control-plane namespace, and a name can repeat. `ListRollouts`, `GetLiveResource`
+and `Router` read only Applications in the control-plane namespace, so a caller skips
+any other Application on purpose. The caller knows its install namespace.
 
 #### (c *Client) GetManifests(revision, argoAppName string) ([]string, error)
 
@@ -494,6 +501,10 @@ caller runs.
 `ListApplications` lists only the Applications the token may `get`, so a scan of a whole
 instance needs `p, <role>, applications, get, */*, allow`; it is the same policy that
 `ListRollouts` needs on each Application it reads.
+`*/*` also matches `<project>/<namespace>/<app>`, so the policy covers Applications
+outside the control-plane namespace too; `ListRollouts`, `GetLiveResource` and `Router`
+still read only Applications in the control-plane namespace, and a caller skips any
+other one.
 
 ## Context Support
 
