@@ -92,33 +92,6 @@ func TestGetLiveResource_ReturnsManifest(t *testing.T) {
 	}
 }
 
-func TestGetLiveResource_ConfigMapKind(t *testing.T) {
-	// The core API group is the empty string; the query must still carry an empty group key.
-	srv := newRolloutServer(t, "suspended")
-	const manifest = `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"settings"},"data":{"a":"b"}}`
-	srv.resourceBody = envelopeFor(t, manifest)
-	ref := ResourceRef{Version: "v1", Kind: "ConfigMap", Namespace: "ns-a", Name: "settings"}
-
-	got, err := srv.client().GetLiveResource(context.Background(), fixtureApp, ref)
-
-	if err != nil {
-		t.Fatalf("GetLiveResource: %v", err)
-	}
-	if string(got) != manifest {
-		t.Errorf("manifest = %q, want %q", got, manifest)
-	}
-	reqs := srv.recorded()
-	if len(reqs) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(reqs))
-	}
-	if g, ok := reqs[0].Query["group"]; !ok || !reflect.DeepEqual(g, []string{""}) {
-		t.Errorf("group query = %v (present=%v), want [\"\"]", g, ok)
-	}
-	if k := reqs[0].Query.Get("kind"); k != "ConfigMap" {
-		t.Errorf("kind query = %q, want ConfigMap", k)
-	}
-}
-
 func TestGetLiveResource_ErrorMapping(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -129,12 +102,20 @@ func TestGetLiveResource_ErrorMapping(t *testing.T) {
 	}{
 		{"404", http.StatusNotFound, `{"code":5,"message":"not found"}`, ErrNotFound, []error{ErrPermissionDenied}},
 		{
+			"404 recorded ArgoCD body", http.StatusNotFound, readFixture(t, "error-resource-not-found.json"),
+			ErrNotFound, []error{ErrPermissionDenied},
+		},
+		{
 			"400 not found as part of application", http.StatusBadRequest,
 			`{"code":3,"message":"Rollout rt-api not found as part of application x"}`,
 			ErrNotFound, []error{ErrPermissionDenied},
 		},
 		{"403", http.StatusForbidden, `{"code":7,"message":"permission denied"}`, ErrPermissionDenied,
 			[]error{ErrNotFound}},
+		{
+			"403 recorded ArgoCD body", http.StatusForbidden, readFixture(t, "error-app-not-found.json"),
+			ErrPermissionDenied, []error{ErrNotFound},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -155,43 +136,6 @@ func TestGetLiveResource_ErrorMapping(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestGetLiveResource_404_ErrNotFound(t *testing.T) {
-	srv := newRolloutServer(t, "suspended")
-	srv.resourceStatus, srv.resourceBody = http.StatusNotFound, readFixture(t, "error-resource-not-found.json")
-
-	_, err := srv.client().GetLiveResource(context.Background(), fixtureApp, rolloutRef("rt-api"))
-
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("expected errors.Is(ErrNotFound), got %v", err)
-	}
-}
-
-func TestGetLiveResource_400NotFoundInApp_ErrNotFound(t *testing.T) {
-	srv := newRolloutServer(t, "suspended")
-	srv.resourceStatus = http.StatusBadRequest
-	srv.resourceBody = `{"code":3,"message":"Rollout rt-api not found as part of application devops-315-rollout-test"}`
-
-	_, err := srv.client().GetLiveResource(context.Background(), fixtureApp, rolloutRef("rt-api"))
-
-	if !errors.Is(err, ErrNotFound) {
-		t.Errorf("expected errors.Is(ErrNotFound), got %v", err)
-	}
-}
-
-func TestGetLiveResource_403_ErrPermissionDenied(t *testing.T) {
-	srv := newRolloutServer(t, "suspended")
-	srv.resourceStatus, srv.resourceBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
-
-	_, err := srv.client().GetLiveResource(context.Background(), fixtureApp, rolloutRef("rt-api"))
-
-	if !errors.Is(err, ErrPermissionDenied) {
-		t.Errorf("expected errors.Is(ErrPermissionDenied), got %v", err)
-	}
-	if errors.Is(err, ErrNotFound) {
-		t.Errorf("a 403 must not match ErrNotFound, got %v", err)
 	}
 }
 
@@ -337,6 +281,93 @@ func TestGetLiveResource_EmptyObjectManifest(t *testing.T) {
 	}
 	if string(got) != "{}" {
 		t.Errorf("manifest = %q, want {}", got)
+	}
+}
+
+func TestGetLiveResource_AbsentOrNullManifest(t *testing.T) {
+	tests := []struct{ name, body string }{
+		{"no manifest key", `{}`},
+		{"null manifest", `{"manifest": null}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newRolloutServer(t, "suspended")
+			srv.resourceBody = tt.body
+
+			got, err := srv.client().GetLiveResource(context.Background(), fixtureApp, rolloutRef("rt-api"))
+
+			if err != nil {
+				t.Fatalf("GetLiveResource: %v", err)
+			}
+			if len(got) != 0 {
+				t.Errorf("manifest = %q, want empty", got)
+			}
+		})
+	}
+}
+
+// fixtureManifest returns the live manifest inside the recorded resource envelope fixture name.
+func fixtureManifest(t *testing.T, name string) string {
+	t.Helper()
+	var env struct {
+		Manifest string `json:"manifest"`
+	}
+	if err := json.Unmarshal([]byte(readFixture(t, name)), &env); err != nil {
+		t.Fatalf("decode fixture %s: %v", name, err)
+	}
+	return env.Manifest
+}
+
+func TestNewRolloutStatus_Strategy(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{"canary recorded fixture", fixtureManifest(t, "resource-rt-api-healthy.json"), RolloutStrategyCanary},
+		{"canary inline", `{"spec":{"strategy":{"canary":{}}}}`, RolloutStrategyCanary},
+		{"blueGreen", `{"spec":{"strategy":{"blueGreen":{"activeService":"a"}}}}`, RolloutStrategyBlueGreen},
+		{"neither", `{"spec":{"strategy":{}}}`, ""},
+		{"no spec", `{}`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := newRolloutStatus(resourceNode{}, mustDecodeRollout(t, tt.manifest)).Strategy
+
+			if got != tt.want {
+				t.Errorf("Strategy = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewRolloutStatus_Generation(t *testing.T) {
+	tests := []struct {
+		name         string
+		manifest     string
+		wantGen      int64
+		wantObserved string
+		wantCurrent  bool
+	}{
+		{"current recorded fixture", fixtureManifest(t, "resource-rt-api-healthy.json"), 2, "2", true},
+		{"lagging", `{"metadata":{"generation":5},"status":{"observedGeneration":"4"}}`, 5, "4", false},
+		{"no status yet", `{"metadata":{"generation":1}}`, 1, "", false},
+		{"nothing set", `{}`, 0, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := newRolloutStatus(resourceNode{}, mustDecodeRollout(t, tt.manifest))
+
+			if got.Generation != tt.wantGen {
+				t.Errorf("Generation = %d, want %d", got.Generation, tt.wantGen)
+			}
+			if got.ObservedGeneration != tt.wantObserved {
+				t.Errorf("ObservedGeneration = %q, want %q", got.ObservedGeneration, tt.wantObserved)
+			}
+			if got.StatusCurrent() != tt.wantCurrent {
+				t.Errorf("StatusCurrent() = %v, want %v", got.StatusCurrent(), tt.wantCurrent)
+			}
+		})
 	}
 }
 

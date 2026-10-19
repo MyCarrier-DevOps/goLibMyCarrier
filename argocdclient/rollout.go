@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"strconv"
 )
 
 // CorrelationIDLabel is the Rollout label that carries the pipeline correlation ID.
@@ -134,12 +135,45 @@ type RolloutStatus struct {
 	CurrentPodHash string
 	// Labels is metadata.labels of the live Rollout.
 	Labels map[string]string
-	// Annotations is metadata.annotations of the live Rollout.
+	// Annotations is metadata.annotations of the live Rollout. Under client-side apply it
+	// may include kubectl.kubernetes.io/last-applied-configuration (the full applied spec);
+	// do not log or forward the map wholesale.
 	Annotations map[string]string
-	// IstioVirtualServices lists the Istio VirtualService names the canary traffic routing references.
+	// IstioVirtualServices lists the raw virtualService(s)[].name values of the canary traffic
+	// routing as written in the Rollout, de-duplicated by raw string: a bare name (the Rollout's
+	// namespace) or "name.namespace", optionally ending in ".cluster.local", interpreted as in
+	// Argo Rollouts' GetVirtualServiceNamespaceName. Split it before using it as ResourceRef.Name.
 	IstioVirtualServices []string
 	// ManagedRoutes lists the names in spec.strategy.canary.trafficRouting.managedRoutes.
 	ManagedRoutes []string
+	// Strategy is the deployment strategy of the live Rollout: RolloutStrategyCanary when
+	// spec.strategy.canary is present, else RolloutStrategyBlueGreen when spec.strategy.blueGreen
+	// is present, else empty. When a Rollout carries both blocks (Argo admission normally rejects
+	// this), Strategy reports "canary".
+	Strategy string
+	// Generation is metadata.generation of the live Rollout.
+	Generation int64
+	// ObservedGeneration is status.observedGeneration of the live Rollout, exactly as Argo
+	// Rollouts writes it (a string, empty when unset). The status reflects the current spec only
+	// when ObservedGeneration equals strconv.FormatInt(Generation, 10); see StatusCurrent.
+	// Current Argo Rollouts controllers write the plain generation number as a string. A missing
+	// or empty value reports not reconciled, so callers must bound any retry on StatusCurrent.
+	ObservedGeneration string
+}
+
+// Values of RolloutStatus.Strategy.
+const (
+	// RolloutStrategyCanary marks a Rollout whose spec.strategy has a canary block.
+	RolloutStrategyCanary = "canary"
+	// RolloutStrategyBlueGreen marks a Rollout whose spec.strategy has a blueGreen block.
+	RolloutStrategyBlueGreen = "blueGreen"
+)
+
+// StatusCurrent reports whether the status reflects the current spec, that is whether
+// ObservedGeneration equals strconv.FormatInt(Generation, 10). A missing or empty
+// ObservedGeneration reports false (not reconciled), so callers must bound any retry on it.
+func (r RolloutStatus) StatusCurrent() bool {
+	return r.ObservedGeneration == strconv.FormatInt(r.Generation, 10)
 }
 
 // resourceNode is a node of the ArgoCD resource-tree response.
@@ -162,12 +196,14 @@ type nodeHealth struct {
 type liveRollout struct {
 	Metadata struct {
 		UID         string            `json:"uid"`
+		Generation  int64             `json:"generation"`
 		Labels      map[string]string `json:"labels"`
 		Annotations map[string]string `json:"annotations"`
 	} `json:"metadata"`
 	Spec struct {
 		Strategy struct {
-			Canary *canaryStrategy `json:"canary"`
+			Canary    *canaryStrategy `json:"canary"`
+			BlueGreen *struct{}       `json:"blueGreen"`
 		} `json:"strategy"`
 	} `json:"spec"`
 	Status struct {
@@ -175,6 +211,7 @@ type liveRollout struct {
 		CurrentStepIndex *int32       `json:"currentStepIndex"`
 		Abort            bool         `json:"abort"`
 		StableRS         string       `json:"stableRS"`
+		ObservedGen      string       `json:"observedGeneration"`
 		CurrentPodHash   string       `json:"currentPodHash"`
 		Canary           struct {
 			Weights *struct {
@@ -283,7 +320,21 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 		Annotations:          live.Metadata.Annotations,
 		IstioVirtualServices: istioVirtualServices(live.Spec.Strategy.Canary),
 		ManagedRoutes:        managedRoutes(live.Spec.Strategy.Canary),
+		Strategy:             strategyOf(live),
+		Generation:           live.Metadata.Generation,
+		ObservedGeneration:   live.Status.ObservedGen,
 	}
+}
+
+// strategyOf returns the RolloutStrategy* value for the strategy block live declares, or "".
+func strategyOf(live liveRollout) string {
+	switch {
+	case live.Spec.Strategy.Canary != nil:
+		return RolloutStrategyCanary
+	case live.Spec.Strategy.BlueGreen != nil:
+		return RolloutStrategyBlueGreen
+	}
+	return ""
 }
 
 // istioVirtualServices returns the de-duplicated VirtualService names of the canary traffic
@@ -346,7 +397,8 @@ func decodeRolloutNodes(tree []byte) ([]resourceNode, error) {
 
 // GetLiveResource returns the live manifest of the resource ref in the Application appName, as
 // the JSON document ArgoCD holds for it. It works for any kind ResourceRef can name; for a
-// core-group resource such as a ConfigMap, leave ref.Group empty.
+// core-group resource such as a ConfigMap, leave ref.Group empty. A 2xx answer whose manifest
+// is absent or null yields an empty slice and a nil error; callers decoding it must handle that.
 //
 // An empty appName or ref.Name is an error and sends no request. appName and every ref field are
 // escaped, so names with "/", "?", "&", "#" or spaces are sent intact. A resource ArgoCD does not

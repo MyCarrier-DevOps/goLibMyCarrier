@@ -210,6 +210,7 @@ func TestNewRolloutStatus(t *testing.T) {
 		CurrentStepIndex: int32Ptr(1),
 		Aborted:          false,
 		CanaryWeight:     50,
+		Strategy:         RolloutStrategyCanary,
 		// Labels come from realisticRollout metadata.labels. The fixture has no uid, stableRS,
 		// currentPodHash, annotations, Istio virtual services or managedRoutes, so those stay empty.
 		Labels: map[string]string{CorrelationIDLabel: "corr-1", "app": "api"},
@@ -416,6 +417,9 @@ func fixtureStatus(
 			"rollout.argoproj.io/revision":   "2",
 		},
 		IstioVirtualServices: []string{name},
+		Strategy:             RolloutStrategyCanary,
+		Generation:           2,
+		ObservedGeneration:   "2",
 	}
 }
 
