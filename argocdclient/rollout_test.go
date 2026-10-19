@@ -1023,8 +1023,8 @@ func TestListRollouts_Requests(t *testing.T) {
 	if len(reqs) != 4 {
 		t.Fatalf("expected 1 tree call and 3 live calls, got %d requests", len(reqs))
 	}
-	if reqs[0].Path != "/api/v1/applications/app%2Fwith%20space/resource-tree" {
-		t.Errorf("tree path = %s", reqs[0].Path)
+	if reqs[0].Method != http.MethodGet || reqs[0].Path != "/api/v1/applications/app%2Fwith%20space/resource-tree" {
+		t.Errorf("unexpected tree call %s %s", reqs[0].Method, reqs[0].Path)
 	}
 	for _, r := range reqs[1:] {
 		if r.Method != http.MethodGet || r.Path != "/api/v1/applications/app%2Fwith%20space/resource" {
