@@ -222,6 +222,7 @@ section above for details and the recommended usage pattern.
 - `type StepPluginStatus struct{ Index int32; Name string; Operation StepPluginOperation; Phase StepPluginPhase; Message string }`: one entry of `status.canary.stepPluginStatuses`
 - `type RolloutStatus struct{ ... }`: combined resource-tree and live state of one Rollout (see [Argo Rollouts](#argo-rollouts))
 - `(c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: Rollouts of an Application labeled with the correlation ID
+- `(c *Client) GetLiveResource(ctx context.Context, appName string, ref ResourceRef) ([]byte, error)`: the live manifest (JSON) of any resource `ref` can name, including core-group kinds such as a ConfigMap (leave `ref.Group` empty). A 2xx answer whose manifest is absent or null yields an empty slice and a nil error; callers decoding it must handle that. An empty `appName` or `ref.Name` is an error and sends no request. `appName` and every `ref` field are escaped, so names with `/`, `?`, `&`, `#` or spaces are sent intact. HTTP 404 and HTTP 400 "not found as part of application" match `ErrNotFound`; HTTP 403 matches `ErrPermissionDenied`; a cancelled or expired `ctx` returns the context error (`errors.Is(err, context.Canceled)`), never an ArgoCD error
 - `type ResourceAction string`: `ActionAbort`, `ActionPromoteFull`, `ActionRetry`, `ActionResume`
 - `type Router struct{ ... }`: one `Client` per configured `Instance`
 - `NewRouter(configs map[Instance]*Config) *Router`: builds a `Router`; nil or incomplete configs leave an instance unconfigured
@@ -334,6 +335,16 @@ are returned wrapped as-is.
 | `Aborted` | live Rollout | `status.abort` |
 | `CanaryWeight` | live Rollout | Percentage of traffic on the canary, see below |
 | `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, operation, phase, message) |
+| `UID` | live Rollout | `metadata.uid` |
+| `StableRS` | live Rollout | `status.stableRS` |
+| `CurrentPodHash` | live Rollout | `status.currentPodHash` |
+| `Labels` | live Rollout | `metadata.labels` |
+| `Annotations` | live Rollout | `metadata.annotations`; may include `kubectl.kubernetes.io/last-applied-configuration`, so do not log or forward the map wholesale |
+| `IstioVirtualServices` | live Rollout | raw VirtualService names (bare, or `name.namespace`, optionally `.cluster.local`; split before use as `ResourceRef.Name`) from `trafficRouting.istio.virtualService.name`, then `trafficRouting.istio.virtualServices[].name`, de-duplicated; empty when neither is set |
+| `ManagedRoutes` | live Rollout | `trafficRouting.managedRoutes[].name`; empty when none |
+| `Strategy` | live Rollout | `RolloutStrategyCanary` ("canary") or `RolloutStrategyBlueGreen` ("blueGreen") by which `spec.strategy` block is present; empty when neither. When both blocks are present (the API server accepts it; the Argo Rollouts controller marks it InvalidSpec and its Phase is Degraded), it is "canary" |
+| `Generation` | live Rollout | `metadata.generation` |
+| `ObservedGeneration` | live Rollout | `status.observedGeneration` as Argo Rollouts writes it (a string). For a Rollout with an inline pod template, the status reflects the current spec only when it equals `strconv.FormatInt(Generation, 10)`; `StatusCurrent()` checks this. It does not cover `spec.workloadRef` Rollouts: a change to the referenced Deployment only patches the `rollout.argoproj.io/workload-generation` annotation and does not move `metadata.generation`; Argo tracks that in `status.workloadObservedGeneration`, which this type does not expose. A missing or empty value reports false (not reconciled), so bound any retry on it |
 
 Argo Rollouts keeps one step plugin entry per step and operation: an abort or a full
 promotion adds an `Abort` or `Terminate` entry (same index and name) next to the step's
