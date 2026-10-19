@@ -1035,3 +1035,16 @@ func TestListRollouts_Requests(t *testing.T) {
 		}
 	}
 }
+
+func TestListRollouts_NoRolloutsReturnsEmptySlice(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	srv.treeBody = `{"nodes":[]}`
+
+	got, err := srv.client().ListRollouts(context.Background(), fixtureApp)
+	if err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Errorf("statuses = %#v, want empty non-nil slice", got)
+	}
+}
