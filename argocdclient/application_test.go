@@ -6,6 +6,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -419,5 +422,154 @@ func TestGetApplicationWithContext_ForbiddenIsTypedAPIError(t *testing.T) {
 	}
 	if want := "client error 403: " + body; err.Error() != want {
 		t.Errorf("expected error %q, got %q", want, err.Error())
+	}
+}
+
+// applicationListServer answers GET /api/v1/applications with the given status and body and records
+// every request it receives.
+type applicationListServer struct {
+	*httptest.Server
+
+	mu       sync.Mutex
+	requests []recordedRequest
+}
+
+func newApplicationListServer(t *testing.T, status int, body string) *applicationListServer {
+	t.Helper()
+	s := &applicationListServer{}
+	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.requests = append(s.requests, recordedRequest{
+			Method: r.Method, Path: r.URL.EscapedPath(), Query: r.URL.Query(), Auth: r.Header.Get("Authorization"),
+		})
+		s.mu.Unlock()
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func (s *applicationListServer) client() *Client {
+	return NewClient(&Config{ServerUrl: s.URL, AuthToken: testToken})
+}
+
+func (s *applicationListServer) recorded() []recordedRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]recordedRequest(nil), s.requests...)
+}
+
+func TestListApplications_ReturnsSortedRefs(t *testing.T) {
+	srv := newApplicationListServer(t, http.StatusOK, `{"metadata":{"resourceVersion":"7"},"items":[
+		{"metadata":{"name":"zeta-prod","namespace":"argocd"}},
+		{"metadata":{"name":"production-csp-prod-api","namespace":"argocd"}},
+		{"metadata":{"name":"alpha-prod","namespace":"argocd"}}]}`)
+
+	got, err := srv.client().ListApplications(context.Background())
+	if err != nil {
+		t.Fatalf("ListApplications: %v", err)
+	}
+
+	want := []ApplicationRef{
+		{Namespace: "argocd", Name: "alpha-prod"},
+		{Namespace: "argocd", Name: "production-csp-prod-api"},
+		{Namespace: "argocd", Name: "zeta-prod"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("refs = %v, want %v", got, want)
+	}
+	reqs := srv.recorded()
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 request, got %d", len(reqs))
+	}
+	if reqs[0].Method != http.MethodGet || reqs[0].Path != "/api/v1/applications" {
+		t.Errorf("request = %s %s", reqs[0].Method, reqs[0].Path)
+	}
+	if reqs[0].Auth != "Bearer "+testToken {
+		t.Errorf("Authorization = %q", reqs[0].Auth)
+	}
+	wantFields := "items.metadata.name,items.metadata.namespace"
+	if fields := reqs[0].Query.Get("fields"); fields != wantFields {
+		t.Errorf("fields = %q, want %s", fields, wantFields)
+	}
+}
+
+func TestListApplications_SameNameInTwoNamespaces(t *testing.T) {
+	srv := newApplicationListServer(t, http.StatusOK, `{"items":[
+		{"metadata":{"name":"x","namespace":"c1-cluster-apps"}},
+		{"metadata":{"name":"only-inner","namespace":"c1-cluster-apps"}},
+		{"metadata":{"name":"x","namespace":"argocd"}}]}`)
+
+	got, err := srv.client().ListApplications(context.Background())
+	if err != nil {
+		t.Fatalf("ListApplications: %v", err)
+	}
+
+	want := []ApplicationRef{
+		{Namespace: "c1-cluster-apps", Name: "only-inner"},
+		{Namespace: "argocd", Name: "x"},
+		{Namespace: "c1-cluster-apps", Name: "x"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("refs = %v, want %v", got, want)
+	}
+}
+
+func TestListApplications_EmptyList(t *testing.T) {
+	for _, body := range []string{`{"items":null}`, `{"items":[]}`, `{}`} {
+		t.Run(body, func(t *testing.T) {
+			srv := newApplicationListServer(t, http.StatusOK, body)
+
+			got, err := srv.client().ListApplications(context.Background())
+			if err != nil {
+				t.Fatalf("ListApplications: %v", err)
+			}
+			if got == nil || len(got) != 0 {
+				t.Errorf("refs = %#v, want an empty non-nil slice", got)
+			}
+		})
+	}
+}
+
+func TestListApplications_Errors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		wantIs error
+	}{
+		{"permission denied", http.StatusForbidden, `{"code":7,"message":"permission denied"}`, ErrPermissionDenied},
+		{"unauthorized", http.StatusUnauthorized, `{"code":16,"message":"invalid session"}`, nil},
+		{"malformed body", http.StatusOK, "not json", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newApplicationListServer(t, tt.status, tt.body)
+
+			got, err := srv.client().ListApplications(context.Background())
+
+			if err == nil {
+				t.Fatalf("expected error, got %v", got)
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Errorf("expected errors.Is(%v), got %v", tt.wantIs, err)
+			}
+			if !strings.Contains(err.Error(), "applications") {
+				t.Errorf("error does not say what failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestListApplications_CancelledContext(t *testing.T) {
+	srv := newApplicationListServer(t, http.StatusOK, `{"items":[]}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := srv.client().ListApplications(ctx)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }

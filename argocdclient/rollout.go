@@ -445,23 +445,26 @@ func (c *Client) getLiveRollout(ctx context.Context, appName string, node resour
 	return decodeRollout(string(manifest))
 }
 
-// ListRolloutGroup returns the status of every Argo Rollout in the Application appName whose
-// CorrelationIDLabel label equals correlationID, sorted by namespace and then name.
+// ListRollouts returns the status of every Argo Rollout in the Application appName, labelled or
+// not, sorted by namespace and then name.
 //
-// The Rollouts come from the Application's resource tree; the label, phase, step index and
-// canary weight come from each Rollout's live manifest. An empty appName or correlationID is an
-// error, so unlabeled Rollouts are never matched. A Rollout with no live object (not yet created, or deleted
+// The Rollouts come from the Application's resource tree; the labels, phase, step index and canary
+// weight come from each Rollout's live manifest. An empty appName is an error and sends no
+// request. A Rollout with no live object (a tree node without a uid, not yet created, or deleted
 // since ArgoCD last refreshed the tree) is skipped; any other failure to read a live Rollout fails
-// the whole call.
-// When no Rollout matches, the result is an empty, non-nil slice and the error is nil.
-func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error) {
+// the whole call, and the error names the Rollout (<namespace>/<name>). When the Application has
+// no Rollout the result is an empty, non-nil slice and the error is nil.
+//
+// An HTTP answer of 400 or above that is not retried wraps *APIError, so errors.Is reaches
+// ErrPermissionDenied. A missing Application surfaces as ErrPermissionDenied (HTTP 403), as for
+// GetLiveResource. ListRollouts sends no namespace, so ArgoCD reads appName in the control-plane
+// namespace: an Application only in another namespace surfaces as ErrPermissionDenied, and when
+// the control-plane namespace also holds an Application of that name, ListRollouts reads that
+// one with a nil error. A cancelled or expired ctx surfaces as the context error.
+func (c *Client) ListRollouts(ctx context.Context, appName string) ([]RolloutStatus, error) {
 	if appName == "" {
 		return nil, errors.New("application name is required")
 	}
-	if correlationID == "" {
-		return nil, errors.New("correlation id is required")
-	}
-
 	tree, err := c.doGET(ctx, c.applicationURL(appName)+"/resource-tree")
 	if err != nil {
 		return nil, fmt.Errorf("error reading resource tree of %s: %w", appName, err)
@@ -480,11 +483,8 @@ func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID st
 		if err != nil {
 			return nil, fmt.Errorf("error reading rollout %s/%s: %w", node.Namespace, node.Name, err)
 		}
-		if live.Metadata.Labels[CorrelationIDLabel] == correlationID {
-			statuses = append(statuses, newRolloutStatus(node, live))
-		}
+		statuses = append(statuses, newRolloutStatus(node, live))
 	}
-
 	sort.Slice(statuses, func(i, j int) bool {
 		if statuses[i].Ref.Namespace != statuses[j].Ref.Namespace {
 			return statuses[i].Ref.Namespace < statuses[j].Ref.Namespace
@@ -492,4 +492,34 @@ func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID st
 		return statuses[i].Ref.Name < statuses[j].Ref.Name
 	})
 	return statuses, nil
+}
+
+// ListRolloutGroup returns the status of every Argo Rollout in the Application appName whose
+// CorrelationIDLabel label equals correlationID, sorted by namespace and then name. It is
+// ListRollouts filtered on the label.
+//
+// An empty appName or correlationID is an error and sends no request, so unlabeled Rollouts are
+// never matched. A Rollout with no live object (not yet created, or deleted since ArgoCD last
+// refreshed the tree) is skipped; any other failure to read a live Rollout fails the whole call.
+// When no Rollout matches, the result is an empty, non-nil slice and the error is nil.
+func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error) {
+	if appName == "" {
+		return nil, errors.New("application name is required")
+	}
+	if correlationID == "" {
+		return nil, errors.New("correlation id is required")
+	}
+
+	rollouts, err := c.ListRollouts(ctx, appName)
+	if err != nil {
+		return nil, err
+	}
+
+	group := make([]RolloutStatus, 0, len(rollouts))
+	for _, rollout := range rollouts {
+		if rollout.Labels[CorrelationIDLabel] == correlationID {
+			group = append(group, rollout)
+		}
+	}
+	return group, nil
 }
