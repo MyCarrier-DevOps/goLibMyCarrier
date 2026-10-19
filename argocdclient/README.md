@@ -10,7 +10,7 @@ A Go client library for interacting with the ArgoCD API. This package retrieves 
 - **Configuration Management**: Environment variable-based configuration with validation
 - **Application Data**: Retrieve ArgoCD application information with soft refresh
 - **Manifest Retrieval**: Get application manifests for specific revisions
-- **Application Listing**: List the names of every Application a token can see, for a scan of a whole ArgoCD instance
+- **Application Listing**: List the namespace and name of every Application a token can see, for a scan of a whole ArgoCD instance
 - **Rollout Status**: List every Argo Rollout of an Application, or only those that carry a correlation ID, with health, phase, step index, canary weight and step plugin statuses
 - **Routed Resource Actions**: Run `abort`, `promote-full`, `retry` and `resume` on a Rollout through a `Router` that always uses the token of the instance the application routes to, and refuses when that instance is not configured
 
@@ -344,7 +344,10 @@ The call works in these steps:
 HTTP answers of 400 or above from the resource tree and live reads that are not retried wrap
 `*APIError`, so `errors.As` gives the status and body and `errors.Is` reaches
 `ErrPermissionDenied`. A missing Application surfaces as `ErrPermissionDenied` (HTTP 403),
-because ArgoCD answers 403 for an Application that does not exist when no project is sent. A
+because ArgoCD answers 403 for an Application that does not exist when no project is sent. An
+Application that exists only outside the control-plane namespace also surfaces as
+`ErrPermissionDenied`, because the call names no namespace. When the control-plane namespace
+holds an Application of the same name, the call reads that one and returns no error. A
 live-read error names the Rollout (`<namespace>/<name>`). Retried statuses return the untyped
 give-up error described in [Error Handling](#error-handling). Decode errors, transport errors
 the retry client does not retry (such as TLS verification failures) and context cancellation
