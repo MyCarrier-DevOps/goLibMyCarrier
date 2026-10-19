@@ -328,6 +328,8 @@ func TestNewRolloutStatus_Strategy(t *testing.T) {
 		{"canary inline", `{"spec":{"strategy":{"canary":{}}}}`, RolloutStrategyCanary},
 		{"blueGreen", `{"spec":{"strategy":{"blueGreen":{"activeService":"a"}}}}`, RolloutStrategyBlueGreen},
 		{"neither", `{"spec":{"strategy":{}}}`, ""},
+		{"null blocks", `{"spec":{"strategy":{"canary":null,"blueGreen":null}}}`, ""},
+		{"both blocks", `{"spec":{"strategy":{"canary":{},"blueGreen":{}}}}`, RolloutStrategyCanary},
 		{"no spec", `{}`, ""},
 	}
 	for _, tt := range tests {

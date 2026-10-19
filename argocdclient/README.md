@@ -342,9 +342,9 @@ are returned wrapped as-is.
 | `Annotations` | live Rollout | `metadata.annotations`; may include `kubectl.kubernetes.io/last-applied-configuration`, so do not log or forward the map wholesale |
 | `IstioVirtualServices` | live Rollout | raw VirtualService names (bare, or `name.namespace`, optionally `.cluster.local`; split before use as `ResourceRef.Name`) from `trafficRouting.istio.virtualService.name`, then `trafficRouting.istio.virtualServices[].name`, de-duplicated; empty when neither is set |
 | `ManagedRoutes` | live Rollout | `trafficRouting.managedRoutes[].name`; empty when none |
-| `Strategy` | live Rollout | `RolloutStrategyCanary` ("canary") or `RolloutStrategyBlueGreen` ("blueGreen") by which `spec.strategy` block is present; empty when neither. When both blocks are present (Argo admission normally rejects this), it is "canary" |
+| `Strategy` | live Rollout | `RolloutStrategyCanary` ("canary") or `RolloutStrategyBlueGreen` ("blueGreen") by which `spec.strategy` block is present; empty when neither. When both blocks are present (the API server accepts it; the Argo Rollouts controller marks it InvalidSpec and its Phase is Degraded), it is "canary" |
 | `Generation` | live Rollout | `metadata.generation` |
-| `ObservedGeneration` | live Rollout | `status.observedGeneration` as Argo Rollouts writes it (a string). The status reflects the current spec only when it equals `strconv.FormatInt(Generation, 10)`; `StatusCurrent()` checks this. A missing or empty value reports false (not reconciled), so bound any retry on it |
+| `ObservedGeneration` | live Rollout | `status.observedGeneration` as Argo Rollouts writes it (a string). For a Rollout with an inline pod template, the status reflects the current spec only when it equals `strconv.FormatInt(Generation, 10)`; `StatusCurrent()` checks this. It does not cover `spec.workloadRef` Rollouts: a change to the referenced Deployment only patches the `rollout.argoproj.io/workload-generation` annotation and does not move `metadata.generation`; Argo tracks that in `status.workloadObservedGeneration`, which this type does not expose. A missing or empty value reports false (not reconciled), so bound any retry on it |
 
 Argo Rollouts keeps one step plugin entry per step and operation: an abort or a full
 promotion adds an `Abort` or `Terminate` entry (same index and name) next to the step's

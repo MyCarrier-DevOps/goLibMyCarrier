@@ -148,14 +148,18 @@ type RolloutStatus struct {
 	ManagedRoutes []string
 	// Strategy is the deployment strategy of the live Rollout: RolloutStrategyCanary when
 	// spec.strategy.canary is present, else RolloutStrategyBlueGreen when spec.strategy.blueGreen
-	// is present, else empty. When a Rollout carries both blocks (Argo admission normally rejects
-	// this), Strategy reports "canary".
+	// is present, else empty. When a Rollout carries both blocks (the API server accepts it; the
+	// Argo Rollouts controller marks it InvalidSpec and its Phase is Degraded), Strategy reports "canary".
 	Strategy string
 	// Generation is metadata.generation of the live Rollout.
 	Generation int64
 	// ObservedGeneration is status.observedGeneration of the live Rollout, exactly as Argo
-	// Rollouts writes it (a string, empty when unset). The status reflects the current spec only
-	// when ObservedGeneration equals strconv.FormatInt(Generation, 10); see StatusCurrent.
+	// Rollouts writes it (a string, empty when unset). For a Rollout with an inline pod template,
+	// the status reflects the current spec only when ObservedGeneration equals
+	// strconv.FormatInt(Generation, 10); see StatusCurrent. This does not cover spec.workloadRef
+	// Rollouts: a change to the referenced Deployment only patches the
+	// rollout.argoproj.io/workload-generation annotation and does not move metadata.generation;
+	// Argo tracks that in status.workloadObservedGeneration, which this type does not expose.
 	// Current Argo Rollouts controllers write the plain generation number as a string. A missing
 	// or empty value reports not reconciled, so callers must bound any retry on StatusCurrent.
 	ObservedGeneration string
@@ -169,9 +173,12 @@ const (
 	RolloutStrategyBlueGreen = "blueGreen"
 )
 
-// StatusCurrent reports whether the status reflects the current spec, that is whether
-// ObservedGeneration equals strconv.FormatInt(Generation, 10). A missing or empty
-// ObservedGeneration reports false (not reconciled), so callers must bound any retry on it.
+// StatusCurrent reports whether ObservedGeneration equals strconv.FormatInt(Generation, 10).
+// A missing or empty ObservedGeneration reports false (not reconciled), so callers must bound
+// any retry on it. It does not cover spec.workloadRef Rollouts: a change to the referenced
+// Deployment only patches the rollout.argoproj.io/workload-generation annotation and does not
+// move metadata.generation; Argo tracks that in status.workloadObservedGeneration, which this
+// type does not expose.
 func (r RolloutStatus) StatusCurrent() bool {
 	return r.ObservedGeneration == strconv.FormatInt(r.Generation, 10)
 }
