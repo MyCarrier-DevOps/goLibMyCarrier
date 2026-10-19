@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -674,19 +675,7 @@ func TestListRolloutGroup_EmptyApplicationName(t *testing.T) {
 // adds for a managed Rollout that has no live object.
 func withUnmanagedRollout(t *testing.T, tree, name string) string {
 	t.Helper()
-	var parsed map[string]any
-	if err := json.Unmarshal([]byte(tree), &parsed); err != nil {
-		t.Fatalf("decode tree: %v", err)
-	}
-	nodes, _ := parsed["nodes"].([]any)
-	parsed["nodes"] = append(nodes, map[string]any{
-		"group": "argoproj.io", "version": "v1alpha1", "kind": "Rollout", "namespace": fixtureNamespace, "name": name,
-	})
-	out, err := json.Marshal(parsed)
-	if err != nil {
-		t.Fatalf("encode tree: %v", err)
-	}
-	return string(out)
+	return withRolloutNode(t, tree, fixtureNamespace, name, "")
 }
 
 func TestListRolloutGroup_SkipsRolloutWithoutLiveObject(t *testing.T) {
@@ -796,4 +785,253 @@ func TestListRolloutGroup_AbortedRolloutReportsRouterWeight(t *testing.T) {
 		return
 	}
 	t.Fatal("rt-api missing from the statuses")
+}
+
+func TestListRollouts_ReturnsEveryRollout(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+
+	got, err := srv.client().ListRollouts(context.Background(), fixtureApp)
+	if err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+
+	want := []RolloutStatus{
+		fixtureStatus(
+			"rt-api",
+			HealthStatusSuspended,
+			"CanaryPauseStep",
+			RolloutPhasePaused,
+			1,
+			false,
+			50,
+			"679bc4c8fc",
+			"775f8d9cb4",
+		),
+		fixtureStatus(
+			"rt-other",
+			HealthStatusSuspended,
+			"CanaryPauseStep",
+			RolloutPhasePaused,
+			1,
+			false,
+			50,
+			"796b5bb5b6",
+			"f99554ff5",
+		),
+		fixtureStatus(
+			"rt-worker",
+			HealthStatusSuspended,
+			"CanaryPauseStep",
+			RolloutPhasePaused,
+			1,
+			false,
+			50,
+			"7b89495949",
+			"6d866788c6",
+		),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("statuses =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+// resourceEnvelope wraps a manifest in the {"manifest": "<json string>"} document ArgoCD returns for a
+// live resource.
+func resourceEnvelope(t *testing.T, manifest string) string {
+	t.Helper()
+	out, err := json.Marshal(map[string]string{"manifest": manifest})
+	if err != nil {
+		t.Fatalf("encode resource: %v", err)
+	}
+	return string(out)
+}
+
+func TestListRollouts_IncludesUnlabelledRollouts(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	srv.resourceBody = resourceEnvelope(t,
+		`{"metadata":{"uid":"uid-1"},"spec":{"strategy":{"canary":{}}},"status":{"phase":"Healthy"}}`)
+
+	got, err := srv.client().ListRollouts(context.Background(), fixtureApp)
+	if err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+
+	var names []string
+	for _, s := range got {
+		names = append(names, s.Ref.Name)
+		if len(s.Labels) != 0 {
+			t.Errorf("%s Labels = %v, want none", s.Ref.Name, s.Labels)
+		}
+	}
+	if want := []string{"rt-api", "rt-other", "rt-worker"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("rollouts = %v, want %v", names, want)
+	}
+}
+
+// withRolloutNode appends a Rollout node to the recorded tree. An empty uid models the node ArgoCD adds
+// for a managed Rollout that has no live object.
+func withRolloutNode(t *testing.T, tree, namespace, name, uid string) string {
+	t.Helper()
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(tree), &parsed); err != nil {
+		t.Fatalf("decode tree: %v", err)
+	}
+	node := map[string]any{
+		"group": "argoproj.io", "version": "v1alpha1", "kind": "Rollout", "namespace": namespace, "name": name,
+	}
+	if uid != "" {
+		node["uid"] = uid
+	}
+	nodes, _ := parsed["nodes"].([]any)
+	parsed["nodes"] = append(nodes, node)
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		t.Fatalf("encode tree: %v", err)
+	}
+	return string(out)
+}
+
+func TestListRollouts_SortsByNamespaceThenName(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	// Appended last in the tree, so only the sort puts it first; its live read is served from the
+	// rt-api fixture (the test server keys on the resource name).
+	srv.treeBody = withRolloutNode(t, srv.treeBody, "aaa-namespace", "rt-api", "uid-aaa")
+
+	got, err := srv.client().ListRollouts(context.Background(), fixtureApp)
+	if err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+
+	var order []string
+	for _, s := range got {
+		order = append(order, s.Ref.Namespace+"/"+s.Ref.Name)
+	}
+	want := []string{
+		"aaa-namespace/rt-api",
+		fixtureNamespace + "/rt-api",
+		fixtureNamespace + "/rt-other",
+		fixtureNamespace + "/rt-worker",
+	}
+	if !reflect.DeepEqual(order, want) {
+		t.Errorf("order = %v, want %v", order, want)
+	}
+}
+
+func TestListRollouts_SkipsRolloutWithoutLiveObject(t *testing.T) {
+	tests := []struct {
+		name      string
+		prepare   func(t *testing.T, s *rolloutServer)
+		wantNames []string
+		wantReads []string // live reads expected, by Rollout name, sorted
+	}{
+		{"node without uid", func(t *testing.T, s *rolloutServer) {
+			s.treeBody = withRolloutNode(t, s.treeBody, fixtureNamespace, "rt-ghost", "")
+		}, []string{"rt-api", "rt-other", "rt-worker"}, []string{"rt-api", "rt-other", "rt-worker"}},
+		{"live read answers 404", func(_ *testing.T, s *rolloutServer) {
+			s.missing = map[string]bool{"rt-worker": true}
+		}, []string{"rt-api", "rt-other"}, []string{"rt-api", "rt-other", "rt-worker"}},
+		{"live read answers 400 not found as part of application", func(t *testing.T, s *rolloutServer) {
+			s.resourceStatus, s.resourceBody = http.StatusBadRequest, readFixture(t, "error-resource-not-found.json")
+		}, nil, []string{"rt-api", "rt-other", "rt-worker"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newRolloutServer(t, "suspended")
+			tt.prepare(t, srv)
+
+			got, err := srv.client().ListRollouts(context.Background(), fixtureApp)
+			if err != nil {
+				t.Fatalf("ListRollouts: %v", err)
+			}
+
+			var names []string
+			for _, s := range got {
+				names = append(names, s.Ref.Name)
+			}
+			if !reflect.DeepEqual(names, tt.wantNames) {
+				t.Errorf("rollouts = %v, want %v", names, tt.wantNames)
+			}
+			var reads []string
+			for _, r := range srv.recorded()[1:] {
+				reads = append(reads, r.Query.Get("resourceName"))
+			}
+			sort.Strings(reads)
+			if !reflect.DeepEqual(reads, tt.wantReads) {
+				t.Errorf("live reads = %v, want %v", reads, tt.wantReads)
+			}
+		})
+	}
+}
+
+func TestListRollouts_EmptyApplicationName(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+
+	if _, err := srv.client().ListRollouts(context.Background(), ""); err == nil {
+		t.Fatal("expected error for empty application name")
+	}
+	if n := len(srv.recorded()); n != 0 {
+		t.Errorf("expected no HTTP calls, got %d", n)
+	}
+}
+
+func TestListRollouts_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(t *testing.T, s *rolloutServer)
+		wantIs  error
+		wantMsg string
+	}{
+		{"tree permission denied", func(t *testing.T, s *rolloutServer) {
+			s.treeStatus, s.treeBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
+		}, ErrPermissionDenied, "resource tree of " + fixtureApp},
+		{"live resource permission denied", func(t *testing.T, s *rolloutServer) {
+			s.resourceStatus, s.resourceBody = http.StatusForbidden, readFixture(t, "error-app-not-found.json")
+		}, ErrPermissionDenied, fixtureNamespace + "/rt-"},
+		{"malformed tree", func(_ *testing.T, s *rolloutServer) { s.treeBody = "not json" }, nil, "resource tree"},
+		{"malformed manifest", func(_ *testing.T, s *rolloutServer) {
+			s.resourceBody = `{"manifest":"not json"}`
+		}, nil, fixtureNamespace + "/rt-"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newRolloutServer(t, "suspended")
+			tt.prepare(t, srv)
+
+			got, err := srv.client().ListRollouts(context.Background(), fixtureApp)
+
+			if err == nil {
+				t.Fatalf("expected error, got %v", got)
+			}
+			if tt.wantIs != nil && !errors.Is(err, tt.wantIs) {
+				t.Errorf("expected errors.Is(%v), got %v", tt.wantIs, err)
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error %q does not contain %q", err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+func TestListRollouts_Requests(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+
+	if _, err := srv.client().ListRollouts(context.Background(), "app/with space"); err != nil {
+		t.Fatalf("ListRollouts: %v", err)
+	}
+
+	reqs := srv.recorded()
+	if len(reqs) != 4 {
+		t.Fatalf("expected 1 tree call and 3 live calls, got %d requests", len(reqs))
+	}
+	if reqs[0].Path != "/api/v1/applications/app%2Fwith%20space/resource-tree" {
+		t.Errorf("tree path = %s", reqs[0].Path)
+	}
+	for _, r := range reqs[1:] {
+		if r.Method != http.MethodGet || r.Path != "/api/v1/applications/app%2Fwith%20space/resource" {
+			t.Errorf("unexpected live call %s %s", r.Method, r.Path)
+		}
+		if r.Auth != "Bearer "+testToken {
+			t.Errorf("Authorization = %q", r.Auth)
+		}
+	}
 }
