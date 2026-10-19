@@ -10,7 +10,8 @@ A Go client library for interacting with the ArgoCD API. This package retrieves 
 - **Configuration Management**: Environment variable-based configuration with validation
 - **Application Data**: Retrieve ArgoCD application information with soft refresh
 - **Manifest Retrieval**: Get application manifests for specific revisions
-- **Rollout Status**: List the Argo Rollouts of an Application that carry a correlation ID, with health, phase, step index, canary weight and step plugin statuses
+- **Application Listing**: List the names of every Application a token can see, for a scan of a whole ArgoCD instance
+- **Rollout Status**: List every Argo Rollout of an Application, or only those that carry a correlation ID, with health, phase, step index, canary weight and step plugin statuses
 - **Routed Resource Actions**: Run `abort`, `promote-full`, `retry` and `resume` on a Rollout through a `Router` that always uses the token of the instance the application routes to, and refuses when that instance is not configured
 
 ## Installation
@@ -189,6 +190,16 @@ Retrieves ArgoCD application data for the specified application name using the c
 - `map[string]interface{}`: Application data as parsed JSON
 - `error`: Request or parsing error
 
+#### (c *Client) ListApplications(ctx context.Context) ([]string, error)
+
+Returns the names of every Application the token can see, sorted. It sends one
+`GET /api/v1/applications?fields=items.metadata.name`, so the response carries only
+names. An empty result is an empty, non-nil slice and a `nil` error.
+
+ArgoCD answers HTTP 200 with an empty list, not HTTP 403, for a token that is not
+allowed to get any Application, so an empty result can mean "nothing to see" or
+"no permission". Errors wrap `*APIError` (see [Error Handling](#error-handling)).
+
 #### (c *Client) GetManifests(revision, argoAppName string) ([]string, error)
 
 Retrieves application manifests from ArgoCD for the specified application and revision using the configured client.
@@ -221,7 +232,8 @@ section above for details and the recommended usage pattern.
 - `type StepPluginOperation string`: step plugin operation (`StepPluginOperationRun`, `StepPluginOperationTerminate`, `StepPluginOperationAbort`)
 - `type StepPluginStatus struct{ Index int32; Name string; Operation StepPluginOperation; Phase StepPluginPhase; Message string }`: one entry of `status.canary.stepPluginStatuses`
 - `type RolloutStatus struct{ ... }`: combined resource-tree and live state of one Rollout (see [Argo Rollouts](#argo-rollouts))
-- `(c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: Rollouts of an Application labeled with the correlation ID
+- `(c *Client) ListRollouts(ctx context.Context, appName string) ([]RolloutStatus, error)`: every Rollout of an Application, labeled or not, sorted by namespace then name
+- `(c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error)`: `ListRollouts` filtered on the correlation ID label
 - `(c *Client) GetLiveResource(ctx context.Context, appName string, ref ResourceRef) ([]byte, error)`: the live manifest (JSON) of any resource `ref` can name, including core-group kinds such as a ConfigMap (leave `ref.Group` empty). A 2xx answer whose manifest is absent or null yields an empty slice and a nil error; callers decoding it must handle that. An empty `appName` or `ref.Name` is an error and sends no request. `appName` and every `ref` field are escaped, so names with `/`, `?`, `&`, `#` or spaces are sent intact. HTTP 404 and HTTP 400 "not found as part of application" match `ErrNotFound`; HTTP 403 matches `ErrPermissionDenied`; a cancelled or expired `ctx` returns the context error (`errors.Is(err, context.Canceled)`), never an ArgoCD error
 - `type ResourceAction string`: `ActionAbort`, `ActionPromoteFull`, `ActionRetry`, `ActionResume`
 - `type Router struct{ ... }`: one `Client` per configured `Instance`
@@ -293,14 +305,19 @@ fmt.Println(instance.String()) // "PROD"
 
 ## Argo Rollouts
 
-`ListRolloutGroup(ctx, appName, correlationID)` returns the status of every Argo
-Rollout in an Application whose `mycarrier.tech/correlationId` label
-(`CorrelationIDLabel`) equals `correlationID`. It is available on `Client` and on
-`Router`; `Router.ListRolloutGroup` routes `appName` to its instance and delegates.
+`ListRollouts(ctx, appName)` returns the status of every Argo Rollout in an
+Application, labeled or not. `ListRolloutGroup(ctx, appName, correlationID)` returns
+only those whose `mycarrier.tech/correlationId` label (`CorrelationIDLabel`) equals
+`correlationID`; it is `ListRollouts` plus that filter. Both are available on `Client`;
+`ListRolloutGroup` is also on `Router`, which routes `appName` to its instance and
+delegates. `ListRollouts` and `ListApplications` are `Client` methods only: a caller
+that scans a whole instance (it has no application name to route on yet) builds one
+`Client` per instance with `NewClient`, and can check each listed name with
+`RouteInstance`.
 
 The call works in these steps:
 
-1. An empty `appName` or `correlationID` returns an error; unlabeled Rollouts are never matched.
+1. An empty `appName` returns an error; `ListRolloutGroup` also rejects an empty `correlationID`, so unlabeled Rollouts are never matched by it.
 2. It reads the Application's resource tree
    (`GET /api/v1/applications/{app}/resource-tree`) and keeps the nodes with group
    `argoproj.io` and kind `Rollout` that have a `uid`. Tree nodes carry no labels.
@@ -310,9 +327,7 @@ The call works in these steps:
    (`GET /api/v1/applications/{app}/resource`). A Rollout with no live object (not yet
    created, or deleted since ArgoCD last refreshed the tree) is skipped; any other
    failure to read a live Rollout fails the whole call.
-4. It keeps the Rollouts whose label matches and returns them sorted by namespace,
-   then name. When none match, the result is an empty, non-nil slice and the error is
-   `nil`.
+4. `ListRolloutGroup` keeps the Rollouts whose label matches; `ListRollouts` keeps all. Both return them sorted by namespace, then name. When none are left, the result is an empty, non-nil slice and the error is `nil`.
 
 HTTP answers of 400 or above from the resource tree and live reads that are not retried wrap
 `*APIError`, so `errors.As` gives the status and body and `errors.Is` reaches
@@ -476,10 +491,14 @@ p, <role>, applications, action/argoproj.io/Rollout/<action>, <project>/<app>, a
 where `<action>` is each of `abort`, `promote-full`, `retry` and `resume` that the
 caller runs.
 
+`ListApplications` lists only the Applications the token may `get`, so a scan of a whole
+instance needs `p, <role>, applications, get, */*, allow`; it is the same policy that
+`ListRollouts` needs on each Application it reads.
+
 ## Context Support
 
 The read methods `GetApplication`, `GetManifests` and `GetArgoApplicationResourceTree`
-have context-aware variants suffixed with `WithContext`. `ListRolloutGroup` and
+have context-aware variants suffixed with `WithContext`. `ListApplications`, `ListRollouts`, `ListRolloutGroup` and
 `RunResourceAction` take `ctx` as their first parameter and have no no-ctx variant.
 The ctx-aware variants honor `ctx` cancellation and deadline so callers can bound HTTP latency (including connect, TLS handshake, and read)
 by their own timeouts — important when an upstream operation like
