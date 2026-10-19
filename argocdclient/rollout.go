@@ -492,13 +492,12 @@ func (c *Client) ListRollouts(ctx context.Context, appName string) ([]RolloutSta
 }
 
 // ListRolloutGroup returns the status of every Argo Rollout in the Application appName whose
-// CorrelationIDLabel label equals correlationID, sorted by namespace and then name.
+// CorrelationIDLabel label equals correlationID, sorted by namespace and then name. It is
+// ListRollouts filtered on the label.
 //
-// The Rollouts come from the Application's resource tree; the label, phase, step index and
-// canary weight come from each Rollout's live manifest. An empty appName or correlationID is an
-// error, so unlabeled Rollouts are never matched. A Rollout with no live object (not yet created, or deleted
-// since ArgoCD last refreshed the tree) is skipped; any other failure to read a live Rollout fails
-// the whole call.
+// An empty appName or correlationID is an error and sends no request, so unlabeled Rollouts are
+// never matched. A Rollout with no live object (not yet created, or deleted since ArgoCD last
+// refreshed the tree) is skipped; any other failure to read a live Rollout fails the whole call.
 // When no Rollout matches, the result is an empty, non-nil slice and the error is nil.
 func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID string) ([]RolloutStatus, error) {
 	if appName == "" {
@@ -508,34 +507,16 @@ func (c *Client) ListRolloutGroup(ctx context.Context, appName, correlationID st
 		return nil, errors.New("correlation id is required")
 	}
 
-	tree, err := c.doGET(ctx, c.applicationURL(appName)+"/resource-tree")
-	if err != nil {
-		return nil, fmt.Errorf("error reading resource tree of %s: %w", appName, err)
-	}
-	nodes, err := decodeRolloutNodes(tree)
+	rollouts, err := c.ListRollouts(ctx, appName)
 	if err != nil {
 		return nil, err
 	}
 
-	statuses := make([]RolloutStatus, 0, len(nodes))
-	for _, node := range nodes {
-		live, err := c.getLiveRollout(ctx, appName, node)
-		if errors.Is(err, ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("error reading rollout %s/%s: %w", node.Namespace, node.Name, err)
-		}
-		if live.Metadata.Labels[CorrelationIDLabel] == correlationID {
-			statuses = append(statuses, newRolloutStatus(node, live))
+	group := make([]RolloutStatus, 0, len(rollouts))
+	for _, rollout := range rollouts {
+		if rollout.Labels[CorrelationIDLabel] == correlationID {
+			group = append(group, rollout)
 		}
 	}
-
-	sort.Slice(statuses, func(i, j int) bool {
-		if statuses[i].Ref.Namespace != statuses[j].Ref.Namespace {
-			return statuses[i].Ref.Namespace < statuses[j].Ref.Namespace
-		}
-		return statuses[i].Ref.Name < statuses[j].Ref.Name
-	})
-	return statuses, nil
+	return group, nil
 }

@@ -1048,3 +1048,18 @@ func TestListRollouts_NoRolloutsReturnsEmptySlice(t *testing.T) {
 		t.Errorf("statuses = %#v, want empty non-nil slice", got)
 	}
 }
+
+func TestListRolloutGroup_IgnoresUnlabelledRollouts(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	srv.resourceBody = resourceEnvelope(t,
+		`{"metadata":{"uid":"uid-1"},"spec":{"strategy":{"canary":{}}},"status":{"phase":"Healthy"}}`)
+
+	got, err := srv.client().ListRolloutGroup(context.Background(), fixtureApp, fixtureGroupA)
+	if err != nil {
+		t.Fatalf("ListRolloutGroup: %v", err)
+	}
+
+	if got == nil || len(got) != 0 {
+		t.Errorf("statuses = %#v, want an empty non-nil slice: no Rollout carries the label", got)
+	}
+}
