@@ -660,6 +660,19 @@ func TestListRolloutGroup_EmptyCorrelationID(t *testing.T) {
 	}
 }
 
+func TestListRolloutGroup_EmptyApplicationAndCorrelationReportsApplicationFirst(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+
+	_, err := srv.client().ListRolloutGroup(context.Background(), "", "")
+
+	if err == nil || !strings.Contains(err.Error(), "application name is required") {
+		t.Fatalf("expected the application name error, got %v", err)
+	}
+	if n := len(srv.recorded()); n != 0 {
+		t.Errorf("expected no HTTP calls, got %d", n)
+	}
+}
+
 func TestListRolloutGroup_EmptyApplicationName(t *testing.T) {
 	srv := newRolloutServer(t, "suspended")
 
@@ -896,6 +909,9 @@ func TestListRollouts_SortsByNamespaceThenName(t *testing.T) {
 	// Appended last in the tree, so only the sort puts it first; its live read is served from the
 	// rt-api fixture (the test server keys on the resource name).
 	srv.treeBody = withRolloutNode(t, srv.treeBody, "aaa-namespace", "rt-api", "uid-aaa")
+	// Two nodes in one namespace, appended in reverse name order, so only the name tie-break orders them.
+	srv.treeBody = withRolloutNode(t, srv.treeBody, "zzz-ns", "rt-worker", "uid-z1")
+	srv.treeBody = withRolloutNode(t, srv.treeBody, "zzz-ns", "rt-api", "uid-z2")
 
 	got, err := srv.client().ListRollouts(context.Background(), fixtureApp)
 	if err != nil {
@@ -911,9 +927,23 @@ func TestListRollouts_SortsByNamespaceThenName(t *testing.T) {
 		fixtureNamespace + "/rt-api",
 		fixtureNamespace + "/rt-other",
 		fixtureNamespace + "/rt-worker",
+		"zzz-ns/rt-api",
+		"zzz-ns/rt-worker",
 	}
 	if !reflect.DeepEqual(order, want) {
 		t.Errorf("order = %v, want %v", order, want)
+	}
+}
+
+func TestListRollouts_CancelledContext(t *testing.T) {
+	srv := newRolloutServer(t, "suspended")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := srv.client().ListRollouts(ctx, fixtureApp)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
 
