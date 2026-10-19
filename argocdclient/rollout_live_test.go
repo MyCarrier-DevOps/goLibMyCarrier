@@ -44,7 +44,11 @@ func TestGetLiveResource_ReturnsManifest(t *testing.T) {
 		{
 			"virtualservice",
 			ResourceRef{
-				Group: "networking.istio.io", Version: "v1beta1", Kind: "VirtualService", Namespace: "ns-a", Name: "rt-api",
+				Group:     "networking.istio.io",
+				Version:   "v1beta1",
+				Kind:      "VirtualService",
+				Namespace: "ns-a",
+				Name:      "rt-api",
 			},
 			`{"apiVersion":"networking.istio.io/v1beta1","kind":"VirtualService","spec":{"http":[{"name":"primary"}]}}`,
 		},
