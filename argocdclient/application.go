@@ -52,7 +52,7 @@ const applicationListPath = "/api/v1/applications?fields=items.metadata.name"
 // there are no Applications the result is an empty, non-nil slice and the error is nil.
 //
 // An HTTP answer of 400 or above that is not retried wraps *APIError, so errors.Is reaches
-// ErrPermissionDenied; see doGET for the retried statuses. A cancelled or expired ctx surfaces as
+// ErrPermissionDenied; see APIError for the statuses that are not retried. A cancelled or expired ctx surfaces as
 // the context error.
 func (c *Client) ListApplications(ctx context.Context) ([]string, error) {
 	body, err := c.doGET(ctx, c.baseUrl+applicationListPath)

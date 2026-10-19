@@ -1,7 +1,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient.svg)](https://pkg.go.dev/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient) [![Go Report Card](https://goreportcard.com/badge/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient)](https://goreportcard.com/report/github.com/MyCarrier-DevOps/goLibMyCarrier/argocdclient)
 # ArgoCD Client
 
-A Go client library for interacting with the ArgoCD API. This package retrieves ArgoCD application data and manifests, reports the status of Argo Rollouts grouped by correlation ID, and runs Rollout actions on the ArgoCD instance an application routes to. Reads retry on transient failures and HTTP failures that are not retried surface as a typed error.
+A Go client library for interacting with the ArgoCD API. This package retrieves ArgoCD application data and manifests, lists Applications, reports the status of every Argo Rollout of an Application or of those grouped by correlation ID, and runs Rollout actions on the ArgoCD instance an application routes to. Reads retry on transient failures and HTTP failures that are not retried surface as a typed error.
 
 ## Features
 
