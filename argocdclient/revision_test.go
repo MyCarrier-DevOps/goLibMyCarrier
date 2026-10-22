@@ -47,6 +47,17 @@ func TestGetRevisionMetadata_EscapesPathSegments(t *testing.T) {
 	}
 }
 
+func TestGetRevisionMetadata_NoDate(t *testing.T) {
+	srv := newApplicationListServer(t, http.StatusOK, `{"author":"bot"}`)
+	got, err := srv.client().GetRevisionMetadata(context.Background(), "app", "abc")
+	if err != nil {
+		t.Fatalf("GetRevisionMetadata: %v", err)
+	}
+	if !got.Date.IsZero() {
+		t.Errorf("Date = %v, want zero", got.Date)
+	}
+}
+
 func TestGetRevisionMetadata_Errors(t *testing.T) {
 	t.Run("empty arguments", func(t *testing.T) {
 		c := NewClient(&Config{ServerUrl: "http://unused", AuthToken: testToken})
@@ -55,6 +66,33 @@ func TestGetRevisionMetadata_Errors(t *testing.T) {
 		}
 		if _, err := c.GetRevisionMetadata(context.Background(), "app", ""); err == nil {
 			t.Error("want an error for an empty revision")
+		}
+	})
+	t.Run("dot segments", func(t *testing.T) {
+		srv := newApplicationListServer(t, http.StatusOK, `{}`)
+		for _, rev := range []string{".", ".."} {
+			if _, err := srv.client().GetRevisionMetadata(context.Background(), "app", rev); err == nil {
+				t.Errorf("want an error for revision %q", rev)
+			}
+		}
+		if n := len(srv.recorded()); n != 0 {
+			t.Errorf("expected no request, got %d", n)
+		}
+	})
+	t.Run("not found", func(t *testing.T) {
+		srv := newApplicationListServer(t, http.StatusNotFound, `{"message":"revision not found"}`)
+		_, err := srv.client().GetRevisionMetadata(context.Background(), "app", "abc")
+		if !errors.Is(err, ErrNotFound) {
+			t.Errorf("err = %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("cancelled context", func(t *testing.T) {
+		srv := newApplicationListServer(t, http.StatusOK, `{"date":"2026-10-20T15:49:29Z"}`)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := srv.client().GetRevisionMetadata(ctx, "app", "abc")
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
 		}
 	})
 	t.Run("permission denied", func(t *testing.T) {

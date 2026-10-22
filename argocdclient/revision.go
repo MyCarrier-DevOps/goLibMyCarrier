@@ -20,7 +20,7 @@ type RevisionMetadata struct {
 // GetRevisionMetadata returns the commit metadata of revision in the Git repository of the Application's source
 // (GET /api/v1/applications/{name}/revisions/{revision}/metadata). Date is the commit time, so a caller can tell
 // whether one revision of a shared GitOps repository is later than another. ArgoCD answers only for a Git source:
-// a Helm chart version gets an error.
+// a Helm chart version gets an error. A revision without a commit time in the answer has a zero Date.
 //
 // An HTTP answer of 400 or above that is not retried wraps *APIError, so errors.Is reaches ErrPermissionDenied and
 // ErrNotFound; see APIError for the statuses that are not retried. A cancelled or expired ctx surfaces as the
@@ -31,6 +31,10 @@ func (c *Client) GetRevisionMetadata(ctx context.Context, appName, revision stri
 	}
 	if revision == "" {
 		return RevisionMetadata{}, errors.New("revision is required")
+	}
+	if revision == "." || revision == ".." {
+		// url.PathEscape keeps dot segments, which a proxy or the server may resolve to another endpoint.
+		return RevisionMetadata{}, fmt.Errorf("invalid revision %q", revision)
 	}
 	body, err := c.doGET(ctx, c.applicationURL(appName)+"/revisions/"+url.PathEscape(revision)+"/metadata")
 	if err != nil {
