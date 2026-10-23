@@ -675,3 +675,73 @@ func TestClient_AggregateBuildFailurePropagatesSlipFailed(t *testing.T) {
 		}
 	})
 }
+
+func TestClient_SkipStep_CanaryGuard(t *testing.T) {
+	ctx := context.Background()
+
+	newClient := func(step string, status StepStatus) (*Client, *MockStore) {
+		store := NewMockStore()
+		slip := createTestSlip("corr-guard")
+		if status != "" {
+			slip.Steps[step] = Step{Status: status}
+		}
+		store.AddSlip(slip)
+		return NewClientWithDependencies(store, NewMockGitHubAPI(), Config{}), store
+	}
+
+	for _, step := range []string{"prod_canary", "preprod_rollback_test"} {
+		t.Run(step+" failed is refused", func(t *testing.T) {
+			client, store := newClient(step, StepStatusFailed)
+
+			err := client.SkipStep(ctx, "corr-guard", step, "", "deployment-strategy is not canary")
+
+			if !errors.Is(err, ErrSkipOverFailedCanary) {
+				t.Fatalf("expected ErrSkipOverFailedCanary, got %v", err)
+			}
+			if len(store.UpdateStepCalls) != 0 {
+				t.Errorf("expected no store write, got %d", len(store.UpdateStepCalls))
+			}
+		})
+
+		for _, status := range []StepStatus{
+			StepStatusPending, StepStatusRunning, StepStatusCompleted, StepStatusSkipped,
+			StepStatusTimeout, StepStatusAborted, "",
+		} {
+			t.Run(step+" "+string(status)+" is skippable", func(t *testing.T) {
+				client, store := newClient(step, status)
+
+				if err := client.SkipStep(ctx, "corr-guard", step, "", "not canary"); err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(store.UpdateStepCalls) != 1 || store.UpdateStepCalls[0].Status != StepStatusSkipped {
+					t.Errorf("expected one skipped write, got %+v", store.UpdateStepCalls)
+				}
+			})
+		}
+	}
+
+	t.Run("non-canary failed step is still skippable", func(t *testing.T) {
+		client, store := newClient("alert_gate", StepStatusFailed)
+
+		if err := client.SkipStep(ctx, "corr-guard", "alert_gate", "", "no alerts"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(store.UpdateStepCalls) != 1 {
+			t.Errorf("expected one write, got %d", len(store.UpdateStepCalls))
+		}
+	})
+
+	t.Run("load failure on a canary step surfaces and does not write", func(t *testing.T) {
+		client, store := newClient("prod_canary", StepStatusPending)
+		store.LoadError = errors.New("store down")
+
+		err := client.SkipStep(ctx, "corr-guard", "prod_canary", "", "not canary")
+
+		if err == nil || !strings.Contains(err.Error(), "store down") {
+			t.Fatalf("expected load error, got %v", err)
+		}
+		if len(store.UpdateStepCalls) != 0 {
+			t.Errorf("expected no store write, got %d", len(store.UpdateStepCalls))
+		}
+	})
+}
