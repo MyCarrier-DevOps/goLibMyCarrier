@@ -61,8 +61,9 @@ var canarySteps = map[string]struct{}{
 // A canary step (prod_canary, preprod_rollback_test) recorded as failed is never overwritten:
 // skipped counts as success, so the skip would unblock promotion past a failed canary. In that
 // case SkipStep returns ErrSkipOverFailedCanary and writes nothing. The check reads the slip
-// first and is not atomic with the write; the skip writer runs before the canary step starts,
-// so the window only matters for a re-run of an already-failed release.
+// first and is not atomic with the write. The skip writer (create-github-release step 0) runs
+// outside the release mutex, so a failed verdict that a concurrent run of the same slip writes
+// between the read and the write is overwritten.
 func (c *Client) SkipStep(ctx context.Context, correlationID, stepName, componentName, reason string) error {
 	if _, guarded := canarySteps[stepName]; guarded {
 		slip, err := c.store.Load(ctx, correlationID)
