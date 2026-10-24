@@ -208,6 +208,17 @@ the control-plane namespace, and a name can repeat. `ListRollouts`, `GetLiveReso
 and `Router` read only Applications in the control-plane namespace, so a caller skips
 any other Application on purpose. The caller knows its install namespace.
 
+
+#### (c *Client) GetRevisionMetadata(ctx context.Context, appName, revision string) (RevisionMetadata, error)
+
+Returns the commit metadata ArgoCD reports for `revision` in the Git repository of the Application's source:
+`RevisionMetadata{Author, Date, Tags, Message}`, from one
+`GET /api/v1/applications/{appName}/revisions/{revision}/metadata`. `Date` is the commit time, so a caller can tell
+whether one revision of a shared GitOps repository is later than another. ArgoCD answers only for a Git source; a Helm
+chart version gets an error. An empty `appName` or `revision` is an error and sends no request; both are escaped.
+HTTP 403 matches `ErrPermissionDenied` and HTTP 404 `ErrNotFound`; a cancelled or expired `ctx` returns the context
+error.
+
 #### (c *Client) GetManifests(revision, argoAppName string) ([]string, error)
 
 Retrieves application manifests from ArgoCD for the specified application and revision using the configured client.
