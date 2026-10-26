@@ -33,10 +33,12 @@ type RevisionMetadata struct {
 //
 // For a multi-source Application ArgoCD uses the first entry of spec.sources (this client sends no sourceIndex).
 //
-// Errors: a 500 is not retried and returns *APIError: ArgoCD answers 500 for a commit the repository does not have
-// and for a Helm or OCI first source, and every attempt would make the repo-server fetch the repository again. 403
-// matches ErrPermissionDenied (also a missing Application) and 404 ErrNotFound (the repository was not found); see
-// APIError for the other statuses. A cancelled or expired ctx surfaces as the context error.
+// Errors: a 500 is not retried and returns *APIError. ArgoCD answers 500 for a commit the repository does not have
+// (each attempt makes the repo-server fetch the repository again) and for a Helm or OCI first source, but also when
+// the repo-server fails to list the repository's refs or to fetch it (gRPC Internal or Unknown, both HTTP 500), so
+// a 500 can clear on a later call. 403 matches ErrPermissionDenied (also a missing Application) and 404 ErrNotFound
+// (the repository was not found); see APIError for the other statuses. A cancelled or expired ctx surfaces as the
+// context error.
 func (c *Client) GetRevisionMetadata(ctx context.Context, appName, revision string) (RevisionMetadata, error) {
 	if appName == "" {
 		return RevisionMetadata{}, errors.New("application name is required")

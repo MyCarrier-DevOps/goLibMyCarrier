@@ -224,7 +224,9 @@ and the zero `Date` as unknown. For a multi-source Application ArgoCD uses the f
 client sends no `sourceIndex`).
 
 Errors: a 500 is returned at once as `*APIError`, not retried. ArgoCD answers 500 for a commit the repository does not
-have and for a Helm or OCI first source, and each attempt would make the repo-server fetch the repository again. HTTP
+have (each attempt makes the repo-server fetch the repository again) and for a Helm or OCI first source, but also when
+the repo-server fails to list the repository's refs or to fetch it (gRPC Internal or Unknown, both HTTP 500), so a 500
+can clear on a later call: retry it on your own schedule if the caller can wait. HTTP
 403 matches `ErrPermissionDenied` (also an Application that does not exist), HTTP 404 `ErrNotFound` (the repository was
 not found); a cancelled or expired `ctx` returns the context error.
 

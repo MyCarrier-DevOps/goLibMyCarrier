@@ -47,7 +47,8 @@ func NewClient(config *Config) *Client {
 type noServerErrorRetryKey struct{}
 
 // withoutServerErrorRetry marks ctx so that a 500 answer is not retried but returned as *APIError: for requests
-// where ArgoCD answers 500 deterministically and each attempt is expensive on its side.
+// where ArgoCD's 500 is mostly permanent and each attempt is expensive on its side, so the caller decides when to
+// ask again.
 func withoutServerErrorRetry(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noServerErrorRetryKey{}, true)
 }
