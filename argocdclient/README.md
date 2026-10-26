@@ -213,11 +213,20 @@ any other Application on purpose. The caller knows its install namespace.
 
 Returns the commit metadata ArgoCD reports for `revision` in the Git repository of the Application's source:
 `RevisionMetadata{Author, Date, Tags, Message}`, from one
-`GET /api/v1/applications/{appName}/revisions/{revision}/metadata`. `Date` is the commit time, so a caller can tell
-whether one revision of a shared GitOps repository is later than another. ArgoCD answers only for a Git source; a Helm
-chart version gets an error. An empty `appName` or `revision` is an error and sends no request; both are escaped.
-HTTP 403 matches `ErrPermissionDenied` and HTTP 404 `ErrNotFound`; a cancelled or expired `ctx` returns the context
-error.
+`GET /api/v1/applications/{appName}/revisions/{revision}/metadata`. `revision` must be a commit SHA of at least 7 hex
+digits (SHA-1 or SHA-256), the only form ArgoCD resolves here; an empty `appName`, or any other `revision` (a branch, a
+tag, a chart version), is an error and sends no request.
+
+`Date` is the git author timestamp (`%at`) at one-second resolution, not the committer date: commits in the same second
+share a `Date`, and a rebased or cherry-picked commit keeps its original author date, so `Date` is not guaranteed to
+follow history order. ArgoCD sends the Unix epoch (`1970-01-01T00:00:00Z`) when it cannot read the timestamp; treat it
+and the zero `Date` as unknown. For a multi-source Application ArgoCD uses the first entry of `spec.sources` (this
+client sends no `sourceIndex`).
+
+Errors: a 500 is returned at once as `*APIError`, not retried. ArgoCD answers 500 for a commit the repository does not
+have and for a Helm or OCI first source, and each attempt would make the repo-server fetch the repository again. HTTP
+403 matches `ErrPermissionDenied` (also an Application that does not exist), HTTP 404 `ErrNotFound` (the repository was
+not found); a cancelled or expired `ctx` returns the context error.
 
 #### (c *Client) GetManifests(revision, argoAppName string) ([]string, error)
 

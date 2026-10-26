@@ -37,51 +37,69 @@ func TestGetRevisionMetadata(t *testing.T) {
 	}
 }
 
-func TestGetRevisionMetadata_EscapesPathSegments(t *testing.T) {
+// ArgoCD resolves only a commit SHA here (util/git/git.go: ^[0-9A-Fa-f]{7,}$); anything else would be a 500.
+func TestGetRevisionMetadata_RejectsWhatArgoCDCannotResolve(t *testing.T) {
 	srv := newApplicationListServer(t, http.StatusOK, `{"date":"2026-10-20T15:49:29Z"}`)
-	if _, err := srv.client().GetRevisionMetadata(context.Background(), "app", "feature/x?y"); err != nil {
-		t.Fatalf("GetRevisionMetadata: %v", err)
+	for _, rev := range []string{".", "..", "main", "feature/x?y", "a06887", "v1.2.3", "a06887g"} {
+		if _, err := srv.client().GetRevisionMetadata(context.Background(), "app", rev); err == nil {
+			t.Errorf("want an error for revision %q", rev)
+		}
 	}
-	if got, want := srv.recorded()[0].Path, "/api/v1/applications/app/revisions/feature%2Fx%3Fy/metadata"; got != want {
-		t.Errorf("path = %s, want %s", got, want)
+	if n := len(srv.recorded()); n != 0 {
+		t.Errorf("expected no request, got %d", n)
+	}
+	sha256 := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789ABCDEF"
+	if _, err := srv.client().GetRevisionMetadata(context.Background(), "app", sha256); err != nil {
+		t.Errorf("a SHA-256 commit: %v", err)
 	}
 }
 
-func TestGetRevisionMetadata_NoDate(t *testing.T) {
-	srv := newApplicationListServer(t, http.StatusOK, `{"author":"bot"}`)
-	got, err := srv.client().GetRevisionMetadata(context.Background(), "app", "abc")
-	if err != nil {
-		t.Fatalf("GetRevisionMetadata: %v", err)
-	}
-	if !got.Date.IsZero() {
-		t.Errorf("Date = %v, want zero", got.Date)
+// ArgoCD sends the Unix epoch when it cannot read the commit's author timestamp; a missing date decodes as zero.
+func TestGetRevisionMetadata_UnknownDate(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing": `{"author":"bot"}`,
+		"epoch":   `{"author":"bot","date":"1970-01-01T00:00:00Z"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := newApplicationListServer(t, http.StatusOK, body)
+			got, err := srv.client().GetRevisionMetadata(context.Background(), "app", "a06887f")
+			if err != nil {
+				t.Fatalf("GetRevisionMetadata: %v", err)
+			}
+			if !got.Date.IsZero() && got.Date.Unix() != 0 {
+				t.Errorf("Date = %v, want zero or the epoch", got.Date)
+			}
+		})
 	}
 }
 
 func TestGetRevisionMetadata_Errors(t *testing.T) {
 	t.Run("empty arguments", func(t *testing.T) {
 		c := NewClient(&Config{ServerUrl: "http://unused", AuthToken: testToken})
-		if _, err := c.GetRevisionMetadata(context.Background(), "", "abc"); err == nil {
+		if _, err := c.GetRevisionMetadata(context.Background(), "", "a06887f"); err == nil {
 			t.Error("want an error for an empty application name")
 		}
 		if _, err := c.GetRevisionMetadata(context.Background(), "app", ""); err == nil {
 			t.Error("want an error for an empty revision")
 		}
 	})
-	t.Run("dot segments", func(t *testing.T) {
-		srv := newApplicationListServer(t, http.StatusOK, `{}`)
-		for _, rev := range []string{".", ".."} {
-			if _, err := srv.client().GetRevisionMetadata(context.Background(), "app", rev); err == nil {
-				t.Errorf("want an error for revision %q", rev)
-			}
+	// An unknown commit, or a Helm first source, is a 500 from the repo-server. It is not retried: every attempt would
+	// make the repo-server fetch the repository again under its lock.
+	t.Run("server error is not retried", func(t *testing.T) {
+		srv := newApplicationListServer(t, http.StatusInternalServerError,
+			`{"code":2,"message":"unable to resolve 'a06887f' to a commit SHA"}`)
+		_, err := srv.client().GetRevisionMetadata(context.Background(), "app", "a06887f")
+		var apiErr *APIError
+		if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("err = %v, want *APIError 500", err)
 		}
-		if n := len(srv.recorded()); n != 0 {
-			t.Errorf("expected no request, got %d", n)
+		if n := len(srv.recorded()); n != 1 {
+			t.Errorf("expected 1 request, got %d", n)
 		}
 	})
-	t.Run("not found", func(t *testing.T) {
-		srv := newApplicationListServer(t, http.StatusNotFound, `{"message":"revision not found"}`)
-		_, err := srv.client().GetRevisionMetadata(context.Background(), "app", "abc")
+	t.Run("repository not found", func(t *testing.T) {
+		srv := newApplicationListServer(t, http.StatusNotFound, `{"message":"repository not found"}`)
+		_, err := srv.client().GetRevisionMetadata(context.Background(), "app", "a06887f")
 		if !errors.Is(err, ErrNotFound) {
 			t.Errorf("err = %v, want ErrNotFound", err)
 		}
@@ -90,21 +108,21 @@ func TestGetRevisionMetadata_Errors(t *testing.T) {
 		srv := newApplicationListServer(t, http.StatusOK, `{"date":"2026-10-20T15:49:29Z"}`)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		_, err := srv.client().GetRevisionMetadata(ctx, "app", "abc")
+		_, err := srv.client().GetRevisionMetadata(ctx, "app", "a06887f")
 		if !errors.Is(err, context.Canceled) {
 			t.Errorf("err = %v, want context.Canceled", err)
 		}
 	})
 	t.Run("permission denied", func(t *testing.T) {
 		srv := newApplicationListServer(t, http.StatusForbidden, `{"message":"permission denied"}`)
-		_, err := srv.client().GetRevisionMetadata(context.Background(), "app", "abc")
+		_, err := srv.client().GetRevisionMetadata(context.Background(), "app", "a06887f")
 		if !errors.Is(err, ErrPermissionDenied) {
 			t.Errorf("err = %v, want ErrPermissionDenied", err)
 		}
 	})
 	t.Run("invalid JSON", func(t *testing.T) {
 		srv := newApplicationListServer(t, http.StatusOK, `{`)
-		if _, err := srv.client().GetRevisionMetadata(context.Background(), "app", "abc"); err == nil {
+		if _, err := srv.client().GetRevisionMetadata(context.Background(), "app", "a06887f"); err == nil {
 			t.Error("want a decode error")
 		}
 	})
