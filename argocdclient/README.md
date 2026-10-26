@@ -208,6 +208,28 @@ the control-plane namespace, and a name can repeat. `ListRollouts`, `GetLiveReso
 and `Router` read only Applications in the control-plane namespace, so a caller skips
 any other Application on purpose. The caller knows its install namespace.
 
+
+#### (c *Client) GetRevisionMetadata(ctx context.Context, appName, revision string) (RevisionMetadata, error)
+
+Returns the commit metadata ArgoCD reports for `revision` in the Git repository of the Application's source:
+`RevisionMetadata{Author, Date, Tags, Message}`, from one
+`GET /api/v1/applications/{appName}/revisions/{revision}/metadata`. `revision` must be a commit SHA of at least 7 hex
+digits (SHA-1 or SHA-256), the only form ArgoCD resolves here; an empty `appName`, or any other `revision` (a branch, a
+tag, a chart version), is an error and sends no request.
+
+`Date` is the git author timestamp (`%at`) at one-second resolution, not the committer date: commits in the same second
+share a `Date`, and a rebased or cherry-picked commit keeps its original author date, so `Date` is not guaranteed to
+follow history order. ArgoCD sends the Unix epoch (`1970-01-01T00:00:00Z`) when it cannot read the timestamp; treat it
+and the zero `Date` as unknown. For a multi-source Application ArgoCD uses the first entry of `spec.sources` (this
+client sends no `sourceIndex`).
+
+Errors: a 500 is returned at once as `*APIError`, not retried. ArgoCD answers 500 for a commit the repository does not
+have (each attempt makes the repo-server fetch the repository again) and for a Helm or OCI first source, but also when
+the repo-server fails to list the repository's refs or to fetch it (gRPC Internal or Unknown, both HTTP 500), so a 500
+can clear on a later call: retry it on your own schedule if the caller can wait. HTTP
+403 matches `ErrPermissionDenied` (also an Application that does not exist), HTTP 404 `ErrNotFound` (the repository was
+not found); a cancelled or expired `ctx` returns the context error.
+
 #### (c *Client) GetManifests(revision, argoAppName string) ([]string, error)
 
 Retrieves application manifests from ArgoCD for the specified application and revision using the configured client.
