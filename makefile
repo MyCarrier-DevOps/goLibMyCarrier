@@ -8,8 +8,8 @@ LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafk
 # `make install-tools` / `make check-sec`, so this file is the single source of truth.
 #
 # GOLANGCI_LINT_VERSION must be built with a Go >= the toolchain CI resolves
-# (ci.yml uses `go-version: ^1.26` + `check-latest`, so a new Go minor is picked up
-# automatically). A linter built with an older Go panics on the newer stdlib:
+# (ci.yml pins `go-version: 1.26.10`; bump the pin and slippy/go.mod
+# together when Go moves). A linter built with an older Go panics on the newer stdlib:
 # "file requires newer Go version go1.27 (application built with go1.26)". When Go
 # ships a new minor, bump this to a release whose notes list that version's support
 # (`golangci-lint version` prints the Go it was built with).

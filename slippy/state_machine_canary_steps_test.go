@@ -470,3 +470,351 @@ func TestPipelineConfig_ExampleFiles_MirrorEachOtherAndLiveShape(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------------------------
+// Decision D13 (Byran, 2026-10-22): after a canary aborts or times out, prod_deploy and
+// prod_tests are `skipped`, not left `pending`. The skip writers (the canary workflow's abort
+// path) record that with SkipStep; the canary verdict itself is a primary failure (FailStep), so
+// the slip is `failed` whatever the order of those writes. The tests below lock that shape:
+// writes in either order, a lost canary write, the error shapes, and the skip writer's edge
+// cases. Spec text: STATE_MACHINE_V3.md, "Decision D13 (canary abort)".
+// ---------------------------------------------------------------------------------------------
+
+const d13SkipReason = "canary_abort"
+
+// d13Slip is the D13 start state: prod_canary running, prod_deploy and prod_tests pending,
+// prod_steady_state running as the lost-write test's second failure site.
+func d13Slip(corrID string) *Slip {
+	return canarySlip(corrID, SlipStatusInProgress, map[string]Step{
+		"prod_gate":            {Status: StepStatusCompleted},
+		"prod_release_created": {Status: StepStatusCompleted},
+		"prod_canary":          {Status: StepStatusRunning},
+		"prod_deploy":          {Status: StepStatusPending},
+		"prod_tests":           {Status: StepStatusPending},
+		"prod_steady_state":    {Status: StepStatusRunning},
+	})
+}
+
+// d13SkipDownstream writes the D13 skips: prod_deploy and prod_tests -> skipped.
+func d13SkipDownstream(t *testing.T, client *Client, corrID string) {
+	t.Helper()
+	for _, s := range []string{"prod_deploy", "prod_tests"} {
+		if err := client.SkipStep(context.Background(), corrID, s, "", d13SkipReason); err != nil {
+			t.Fatalf("SkipStep(%s): %v%s", s, err, stateMachineRef)
+		}
+	}
+}
+
+// d13AssertConsistent asserts I2 (slip=failed needs a primary failure) and the
+// I1 converse (a primary failure never leaves the slip in_progress), plus I3 (never completed
+// while a primary failure exists).
+func d13AssertConsistent(t *testing.T, store *MockStore, corrID, when string) *Slip {
+	t.Helper()
+	slip := canaryLoad(t, store, corrID)
+	primary := 0
+	for _, st := range slip.Steps {
+		if st.Status == StepStatusFailed || st.Status == StepStatusError || st.Status == StepStatusTimeout {
+			primary++
+		}
+	}
+	if slip.Status == SlipStatusFailed && primary == 0 {
+		t.Errorf("%s: I2 violated, slip=failed with no primary failure%s", when, stateMachineRef)
+	}
+	if slip.Status == SlipStatusInProgress && primary > 0 {
+		t.Errorf("%s: I1 violated, slip=in_progress with %d primary failure(s)%s", when, primary, stateMachineRef)
+	}
+	if slip.Status == SlipStatusCompleted && primary > 0 {
+		t.Errorf("%s: I3 violated, slip=completed with %d primary failure(s)%s", when, primary, stateMachineRef)
+	}
+	return slip
+}
+
+// d13AssertSkipped asserts prod_deploy and prod_tests are skipped (D13), not pending.
+func d13AssertSkipped(t *testing.T, slip *Slip, when string) {
+	t.Helper()
+	for _, s := range []string{"prod_deploy", "prod_tests"} {
+		if got := slip.Steps[s].Status; got != StepStatusSkipped {
+			t.Errorf("%s: expected %s=%q (D13), got %q%s", when, s, StepStatusSkipped, got, stateMachineRef)
+		}
+	}
+}
+
+// Precondition: prod_canary running. Action: skip prod_deploy and prod_tests, then FailStep(prod_canary).
+// Expected:     skips alone leave slip in_progress; the canary failure makes it failed; skips are kept.
+func TestStateMachine_D13_SkipsBeforeCanaryFail(t *testing.T) {
+	ctx := context.Background()
+	client, store := canaryTestClient()
+	corrID := "d13-skips-first"
+	store.AddSlip(d13Slip(corrID))
+
+	d13SkipDownstream(t, client, corrID)
+	slip := d13AssertConsistent(t, store, corrID, "after skips")
+	if slip.Status != SlipStatusInProgress {
+		t.Errorf("expected slip.status=%q after skips only, got %q%s",
+			SlipStatusInProgress, slip.Status, stateMachineRef)
+	}
+	d13AssertSkipped(t, slip, "after skips")
+
+	if err := client.FailStep(ctx, corrID, "prod_canary", "", "canary aborted"); err != nil {
+		t.Fatalf("FailStep(prod_canary): %v%s", err, stateMachineRef)
+	}
+	slip = d13AssertConsistent(t, store, corrID, "after canary fail")
+	if slip.Status != SlipStatusFailed {
+		t.Errorf("expected slip.status=%q after canary fail, got %q%s", SlipStatusFailed, slip.Status, stateMachineRef)
+	}
+	if got := slip.Steps["prod_canary"].Status; got != StepStatusFailed {
+		t.Errorf("expected prod_canary=%q, got %q%s", StepStatusFailed, got, stateMachineRef)
+	}
+	d13AssertSkipped(t, slip, "after canary fail")
+}
+
+// Precondition: prod_canary running. Action: FailStep(prod_canary), then skip prod_deploy, then prod_tests.
+// Expected:     slip=failed after each of the three writes; the skips never clear the failure.
+func TestStateMachine_D13_CanaryFailBeforeSkips(t *testing.T) {
+	ctx := context.Background()
+	client, store := canaryTestClient()
+	corrID := "d13-fail-first"
+	store.AddSlip(d13Slip(corrID))
+
+	if err := client.FailStep(ctx, corrID, "prod_canary", "", "canary aborted"); err != nil {
+		t.Fatalf("FailStep(prod_canary): %v%s", err, stateMachineRef)
+	}
+	writes := []string{"canary fail", "skip prod_deploy", "skip prod_tests"}
+	for i, s := range []string{"", "prod_deploy", "prod_tests"} {
+		if s != "" {
+			if err := client.SkipStep(ctx, corrID, s, "", d13SkipReason); err != nil {
+				t.Fatalf("SkipStep(%s): %v%s", s, err, stateMachineRef)
+			}
+		}
+		slip := d13AssertConsistent(t, store, corrID, "after "+writes[i])
+		if slip.Status != SlipStatusFailed {
+			t.Errorf("after %s: expected slip.status=%q, got %q%s",
+				writes[i], SlipStatusFailed, slip.Status, stateMachineRef)
+		}
+	}
+	slip := canaryLoad(t, store, corrID)
+	d13AssertSkipped(t, slip, "after all writes")
+	if got := slip.Steps["prod_canary"].Status; got != StepStatusFailed {
+		t.Errorf("expected prod_canary=%q, got %q%s", StepStatusFailed, got, stateMachineRef)
+	}
+}
+
+// Precondition: the canary failure write is lost (prod_canary stays running); skips are written.
+// Action:       skips, then FailStep(prod_steady_state).
+// Expected:     skips alone never complete the slip nor fail it; the later failure makes it failed.
+func TestStateMachine_D13_LostCanaryWrite(t *testing.T) {
+	ctx := context.Background()
+	client, store := canaryTestClient()
+	corrID := "d13-lost-canary"
+	store.AddSlip(d13Slip(corrID))
+
+	d13SkipDownstream(t, client, corrID)
+	slip := d13AssertConsistent(t, store, corrID, "after skips with the canary write lost")
+	if slip.Status != SlipStatusInProgress {
+		t.Errorf("skips alone must leave slip.status=%q, got %q%s", SlipStatusInProgress, slip.Status, stateMachineRef)
+	}
+	if got := slip.Steps["prod_canary"].Status; got != StepStatusRunning {
+		t.Errorf("setup: expected prod_canary=%q (write lost), got %q%s", StepStatusRunning, got, stateMachineRef)
+	}
+
+	if err := client.FailStep(ctx, corrID, "prod_steady_state", "", "steady state failed"); err != nil {
+		t.Fatalf("FailStep(prod_steady_state): %v%s", err, stateMachineRef)
+	}
+	slip = d13AssertConsistent(t, store, corrID, "after steady_state fail")
+	if slip.Status != SlipStatusFailed {
+		t.Errorf("expected slip.status=%q once prod_steady_state failed, got %q%s",
+			SlipStatusFailed, slip.Status, stateMachineRef)
+	}
+	d13AssertSkipped(t, slip, "after steady_state fail")
+}
+
+// Precondition: prod_canary running. Action: the error shapes of a canary abort.
+//
+//	watch_lost:     canary failed ("watch_lost" reason) and the D13 skips written.
+//	workflow_ended: canary failed, the workflow ended before the skips: deploy/tests stay pending.
+//
+// Expected:     slip=failed in both; I1 and I3 hold; the pending pair is not touched.
+func TestStateMachine_D13_ErrorShape_WatchLost(t *testing.T) {
+	cases := []struct {
+		name       string
+		reason     string
+		writeSkips bool
+		wantDown   StepStatus
+	}{
+		{"watch_lost", "watch_lost", true, StepStatusSkipped},
+		{"workflow_ended", "workflow_ended", false, StepStatusPending},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			client, store := canaryTestClient()
+			corrID := "d13-shape-" + tc.name
+			store.AddSlip(d13Slip(corrID))
+
+			if err := client.FailStep(ctx, corrID, "prod_canary", "", tc.reason); err != nil {
+				t.Fatalf("FailStep: %v%s", err, stateMachineRef)
+			}
+			if tc.writeSkips {
+				d13SkipDownstream(t, client, corrID)
+			}
+			slip := d13AssertConsistent(t, store, corrID, tc.name)
+			if slip.Status != SlipStatusFailed {
+				t.Errorf("expected slip.status=%q, got %q%s", SlipStatusFailed, slip.Status, stateMachineRef)
+			}
+			if got := slip.Steps["prod_canary"].Status; got != StepStatusFailed {
+				t.Errorf("expected prod_canary=%q, got %q%s", StepStatusFailed, got, stateMachineRef)
+			}
+			for _, s := range []string{"prod_deploy", "prod_tests"} {
+				if got := slip.Steps[s].Status; got != tc.wantDown {
+					t.Errorf("expected %s=%q, got %q%s", s, tc.wantDown, got, stateMachineRef)
+				}
+			}
+		})
+	}
+}
+
+// d13SkipOver runs SkipStep on prod_deploy while it holds `from` and returns the client and store.
+func d13SkipOver(t *testing.T, corrID string, from StepStatus) (*Client, *MockStore) {
+	t.Helper()
+	client, store := canaryTestClient()
+	slip := d13Slip(corrID)
+	slip.Steps["prod_deploy"] = Step{Status: from}
+	store.AddSlip(slip)
+	store.UpdateStepCalls = nil
+	if err := client.SkipStep(context.Background(), corrID, "prod_deploy", "", d13SkipReason); err != nil {
+		t.Fatalf("SkipStep over %s: %v%s", from, err, stateMachineRef)
+	}
+	return client, store
+}
+
+// Precondition: prod_deploy completed. Action: SkipStep(prod_deploy).
+// Expected:     nil error, one store write, prod_deploy=skipped (the guard covers failed canary steps only).
+func TestStateMachine_SkipOverCompletedStepAllowed(t *testing.T) {
+	_, store := d13SkipOver(t, "d13-skip-completed", StepStatusCompleted)
+	if len(store.UpdateStepCalls) != 1 {
+		t.Errorf("expected 1 store write, got %d%s", len(store.UpdateStepCalls), stateMachineRef)
+	}
+	if got := canaryStepStatus(t, store, "d13-skip-completed", "prod_deploy"); got != StepStatusSkipped {
+		t.Errorf("expected prod_deploy=%q, got %q%s", StepStatusSkipped, got, stateMachineRef)
+	}
+}
+
+// Precondition: prod_deploy (then prod_tests) failed. Action: SkipStep on that step.
+// Expected:     nil error, one store write, step=skipped. The guard covers the failed canary steps only,
+// so a guard widened to every failed step makes this test fail.
+func TestStateMachine_SkipOverFailedProdStepsAllowed(t *testing.T) {
+	for _, step := range []string{"prod_deploy", "prod_tests"} {
+		t.Run(step, func(t *testing.T) {
+			corrID := "d13-skip-failed-" + step
+			client, store := canaryTestClient()
+			slip := d13Slip(corrID)
+			slip.Steps[step] = Step{Status: StepStatusFailed}
+			store.AddSlip(slip)
+			store.UpdateStepCalls = nil
+			if err := client.SkipStep(context.Background(), corrID, step, "", d13SkipReason); err != nil {
+				t.Fatalf("SkipStep over failed %s: %v%s", step, err, stateMachineRef)
+			}
+			if len(store.UpdateStepCalls) != 1 {
+				t.Errorf("expected 1 store write, got %d%s", len(store.UpdateStepCalls), stateMachineRef)
+			}
+			if got := canaryStepStatus(t, store, corrID, step); got != StepStatusSkipped {
+				t.Errorf("expected %s=%q, got %q%s", step, StepStatusSkipped, got, stateMachineRef)
+			}
+		})
+	}
+}
+
+// Precondition: prod_deploy running. Action: SkipStep(prod_deploy).
+// Expected:     nil error, one store write, prod_deploy=skipped.
+func TestStateMachine_SkipOverRunningStepAllowed(t *testing.T) {
+	_, store := d13SkipOver(t, "d13-skip-running", StepStatusRunning)
+	if len(store.UpdateStepCalls) != 1 {
+		t.Errorf("expected 1 store write, got %d%s", len(store.UpdateStepCalls), stateMachineRef)
+	}
+	if got := canaryStepStatus(t, store, "d13-skip-running", "prod_deploy"); got != StepStatusSkipped {
+		t.Errorf("expected prod_deploy=%q, got %q%s", StepStatusSkipped, got, stateMachineRef)
+	}
+}
+
+// Precondition: prod_deploy pending. Action: SkipStep(prod_deploy) twice (a redelivered skip).
+// Expected:     both nil; prod_deploy=skipped; two skipped history entries (the writes are not deduplicated).
+func TestStateMachine_DuplicateSkipIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	client, store := canaryTestClient()
+	corrID := "d13-dup-skip"
+	store.AddSlip(d13Slip(corrID))
+
+	for i := 1; i <= 2; i++ {
+		if err := client.SkipStep(ctx, corrID, "prod_deploy", "", d13SkipReason); err != nil {
+			t.Fatalf("SkipStep #%d: %v%s", i, err, stateMachineRef)
+		}
+	}
+	slip := canaryLoad(t, store, corrID)
+	if got := slip.Steps["prod_deploy"].Status; got != StepStatusSkipped {
+		t.Errorf("expected prod_deploy=%q, got %q%s", StepStatusSkipped, got, stateMachineRef)
+	}
+	entries := 0
+	for _, e := range slip.StateHistory {
+		if e.Step == "prod_deploy" && e.Status == StepStatusSkipped {
+			entries++
+		}
+	}
+	if entries != 2 {
+		t.Errorf("expected 2 skipped history entries for prod_deploy, got %d%s", entries, stateMachineRef)
+	}
+}
+
+// Precondition: slip promoted (pipeline-terminal, I4-style immutable). Action: SkipStep(prod_deploy).
+// Expected:     nil error; the step is recorded skipped; slip.status stays promoted.
+func TestStateMachine_SkipOnPromotedSlipKeepsPromoted(t *testing.T) {
+	client, store := canaryTestClient()
+	corrID := "d13-promoted"
+	slip := d13Slip(corrID)
+	slip.Status = SlipStatusPromoted
+	store.AddSlip(slip)
+
+	if err := client.SkipStep(context.Background(), corrID, "prod_deploy", "", d13SkipReason); err != nil {
+		t.Fatalf("SkipStep: %v%s", err, stateMachineRef)
+	}
+	loaded := canaryLoad(t, store, corrID)
+	if loaded.Status != SlipStatusPromoted {
+		t.Errorf("expected slip.status=%q to stay, got %q%s", SlipStatusPromoted, loaded.Status, stateMachineRef)
+	}
+	if got := loaded.Steps["prod_deploy"].Status; got != StepStatusSkipped {
+		t.Errorf("expected prod_deploy=%q, got %q%s", StepStatusSkipped, got, stateMachineRef)
+	}
+}
+
+// Known gap (scenario H, bd mycarrier-h8sw6.3): canary aborts, D13 skips are written, then the
+// canary is retried and completes. The recovery reset (checkPipelineCompletion) only resets
+// `aborted` steps, so prod_deploy and prod_tests stay `skipped`, which counts as success:
+// prod_deploy would be bypassed on the retried release. This test SKIPs while that is true and
+// FAILS the moment the gap closes (prod_deploy back to pending), so whoever closes it must
+// update this test and STATE_MACHINE_V3.md together.
+func TestStateMachine_KnownGap_RetryLeavesSkippedProdDeploy_mycarrier_h8sw6_3(t *testing.T) {
+	ctx := context.Background()
+	client, store := canaryTestClient()
+	corrID := "d13-retry-gap"
+	store.AddSlip(d13Slip(corrID))
+
+	if err := client.FailStep(ctx, corrID, "prod_canary", "", "canary aborted"); err != nil {
+		t.Fatalf("FailStep: %v%s", err, stateMachineRef)
+	}
+	d13SkipDownstream(t, client, corrID)
+	if err := client.CompleteStep(ctx, corrID, "prod_canary", ""); err != nil {
+		t.Fatalf("CompleteStep(prod_canary) retry: %v%s", err, stateMachineRef)
+	}
+	slip := canaryLoad(t, store, corrID)
+	if slip.Status != SlipStatusInProgress {
+		t.Fatalf("expected slip.status=%q after the canary retry, got %q%s",
+			SlipStatusInProgress, slip.Status, stateMachineRef)
+	}
+	for _, step := range []string{"prod_deploy", "prod_tests"} {
+		if got := slip.Steps[step].Status; got != StepStatusSkipped {
+			t.Fatalf("the known gap mycarrier-h8sw6.3 has changed: %s=%q after a canary retry "+
+				"(was skipped). Update this test and STATE_MACHINE_V3.md (scenario H)%s", step, got, stateMachineRef)
+		}
+	}
+	t.Skip("known gap mycarrier-h8sw6.3: a retried canary leaves prod_deploy and prod_tests " +
+		"skipped (not reset to pending)")
+}
