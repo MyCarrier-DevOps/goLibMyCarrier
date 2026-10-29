@@ -2,7 +2,7 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/cievents
 
 go 1.26
 
-toolchain go1.26.5
+toolchain go1.26.10
 
 require (
 	github.com/cloudevents/sdk-go/v2 v2.16.2

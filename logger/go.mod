@@ -2,7 +2,7 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/logger
 
 go 1.26
 
-toolchain go1.26.5
+toolchain go1.26.10
 
 require (
 	github.com/smartystreets/goconvey v1.8.1
