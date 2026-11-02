@@ -31,8 +31,9 @@ var (
 
 // APIError is returned for an ArgoCD HTTP answer with a status of 400 or above
 // that is not retried: any status on an action POST, and on GETs every 4xx
-// except 429, plus 501. A GET still answered with 429, or with a status of 500
-// or above other than 501, after its retries returns the retry client's
+// except 429, plus 501 (and 500 on GetRevisionMetadata, which does not retry it).
+// A GET still answered with 429, or with another status of 500 or above, after
+// its retries returns the retry client's
 // "giving up after N attempt(s)" error instead: an untyped error with no Body
 // whose text does not name the status.
 // Body is the raw response body, typically grpc-gateway JSON such as

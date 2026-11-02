@@ -29,8 +29,9 @@ func NewClient(config *Config) *Client {
 	retryClient.RetryWaitMax = 4 * time.Second
 	retryClient.Backoff = retryablehttp.DefaultBackoff
 
-	// Use default retry policy (retries on 5xx and network errors)
-	retryClient.CheckRetry = retryablehttp.DefaultRetryPolicy
+	// Default retry policy (retries on 5xx and network errors), except a 500 for a request marked with
+	// withoutServerErrorRetry.
+	retryClient.CheckRetry = checkRetry
 
 	// Disable default logging to avoid noise
 	retryClient.Logger = nil
@@ -42,6 +43,26 @@ func NewClient(config *Config) *Client {
 	}
 }
 
+// noServerErrorRetryKey marks a request context whose 500 answer is returned at once.
+type noServerErrorRetryKey struct{}
+
+// withoutServerErrorRetry marks ctx so that a 500 answer is not retried but returned as *APIError: for requests
+// where ArgoCD's 500 is mostly permanent and each attempt is expensive on its side, so the caller decides when to
+// ask again.
+func withoutServerErrorRetry(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noServerErrorRetryKey{}, true)
+}
+
+// checkRetry is retryablehttp.DefaultRetryPolicy, except that it does not retry a 500 for a request marked with
+// withoutServerErrorRetry.
+func checkRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if err == nil && resp != nil && resp.StatusCode == http.StatusInternalServerError &&
+		ctx.Value(noServerErrorRetryKey{}) != nil {
+		return false, nil
+	}
+	return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+}
+
 // applicationURL returns the API URL of the Application appName, path-escaped.
 func (c *Client) applicationURL(appName string) string {
 	return fmt.Sprintf("%s/api/v1/applications/%s", c.baseUrl, url.PathEscape(appName))
@@ -50,9 +71,10 @@ func (c *Client) applicationURL(appName string) string {
 // doGET performs an authenticated GET request against the ArgoCD API.
 // It sets Authorization and Content-Type headers, handles retries via the
 // retryable HTTP client, and returns *APIError for the statuses it does not retry:
-// every 4xx except 429, plus 501. A 429, or a status of 500 or above other than
-// 501, that is still returned after the retries are exhausted surfaces as the retry
-// client's untyped "giving up after N attempt(s)" error instead.
+// every 4xx except 429, plus 501, and 500 for a ctx marked with withoutServerErrorRetry.
+// A 429, or another status of 500 or above, that is still returned after the retries
+// are exhausted surfaces as the retry client's untyped "giving up after N attempt(s)"
+// error instead.
 // Returns the raw response body on success.
 //
 // The request honors ctx cancellation/deadline. ctx must be non-nil; callers
