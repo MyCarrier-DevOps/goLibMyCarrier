@@ -2,7 +2,7 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/teamsbot
 
 go 1.26.0
 
-toolchain go1.26.5
+toolchain go1.26.10
 
 require (
 	github.com/spf13/viper v1.21.0

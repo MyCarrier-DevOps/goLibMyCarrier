@@ -48,9 +48,32 @@ func (c *Client) TimeoutStep(ctx context.Context, correlationID, stepName, compo
 		StepStatusTimeout, reason)
 }
 
+// canarySteps are the steps whose failed verdict SkipStep must never overwrite
+// (STATE_MACHINE_V3 "Skip-writer contract").
+var canarySteps = map[string]struct{}{
+	"prod_canary":           {},
+	"preprod_rollback_test": {},
+}
+
 // SkipStep marks a step as skipped.
 // The correlationID is the unique identifier for the routing slip.
+//
+// A canary step (prod_canary, preprod_rollback_test) recorded as failed is never overwritten:
+// skipped counts as success, so the skip would unblock promotion past a failed canary. In that
+// case SkipStep returns ErrSkipOverFailedCanary and writes nothing. The check reads the slip
+// first and is not atomic with the write. The skip writer (create-github-release step 0) runs
+// outside the release mutex, so a failed verdict that a concurrent run of the same slip writes
+// between the read and the write is overwritten.
 func (c *Client) SkipStep(ctx context.Context, correlationID, stepName, componentName, reason string) error {
+	if _, guarded := canarySteps[stepName]; guarded {
+		slip, err := c.store.Load(ctx, correlationID)
+		if err != nil {
+			return NewStepError("skip", correlationID, stepName, componentName, err)
+		}
+		if slip.Steps[stepName].Status == StepStatusFailed {
+			return NewStepError("skip", correlationID, stepName, componentName, ErrSkipOverFailedCanary)
+		}
+	}
 	return c.UpdateStepWithStatus(ctx, correlationID, stepName, componentName,
 		StepStatusSkipped, reason)
 }

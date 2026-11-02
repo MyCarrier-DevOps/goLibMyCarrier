@@ -194,3 +194,35 @@ func TestPostgresStore_SetComponentImageTag_Integration(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
 }
+
+// A skipped step is terminal (D13 writes it for prod_deploy/prod_tests). The I5 freshness guard
+// therefore refuses a non-terminal write over a fresh skip, and allows it once the skip is older
+// than the window (a real re-run). dev_deploy stands in for prod_deploy: the test pipeline config
+// has no canary steps and the guard is not step-specific.
+func TestPostgresStore_TerminalGuard_SkippedStep_Integration(t *testing.T) {
+	store, pool, _ := newMigratedStore(t)
+	ctx := context.Background()
+	mustCreate(t, store, "c1")
+
+	// Widen the window for the refusal phase so a slow runner cannot push the second write past
+	// it; t.Setenv restores the variable at test end, and the backdate below (1 h) still exceeds it.
+	t.Setenv("SLIPPY_I5_FRESHNESS_WINDOW_MS", "60000")
+	require.NoError(t, store.UpdateStep(ctx, "c1", "dev_deploy", "", StepStatusSkipped))
+
+	// Fresh skip -> running is a stale demotion and is refused; the skip stays.
+	require.ErrorIs(t, store.UpdateStep(ctx, "c1", "dev_deploy", "", StepStatusRunning), ErrTerminalAlreadyExists)
+	got, err := store.Load(ctx, "c1")
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusSkipped, got.Steps["dev_deploy"].Status, "fresh skip must not be demoted")
+
+	// Backdate the stored row past the freshness window (no sleeps): the write is now a re-run.
+	_, err = pool.Exec(ctx,
+		"UPDATE slip_component_states SET updated_at = now() - interval '1 hour' "+
+			"WHERE correlation_id = $1 AND step = $2", "c1", "dev_deploy")
+	require.NoError(t, err)
+
+	require.NoError(t, store.UpdateStep(ctx, "c1", "dev_deploy", "", StepStatusRunning))
+	got, err = store.Load(ctx, "c1")
+	require.NoError(t, err)
+	assert.Equal(t, StepStatusRunning, got.Steps["dev_deploy"].Status, "skip older than the window allows a re-run")
+}
