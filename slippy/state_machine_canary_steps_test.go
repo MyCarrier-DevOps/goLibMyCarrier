@@ -954,6 +954,62 @@ func TestStateMachine_D13_RetryResetsOnlyCanaryReasonSkips(t *testing.T) {
 	}
 }
 
+// Precondition: prod_canary failed; prod_deploy and prod_tests skipped (canary_abort) and
+// prod_alert_gate skipped with `reason`.
+// Action:       the retried canary completes.
+// Expected:     the reason the canary writers record on prod_alert_gate (rollout-watch and
+// create-github-release's canary-not-deployed, canary_not_promoted:<outcome>) resets it to pending
+// beside prod_deploy and prod_tests, so the aborted attempt's skip cannot satisfy
+// prod_steady_state for the retried release; any other reason, such as the exit handler's skip when
+// auto-rollback is off, keeps it skipped.
+func TestStateMachine_D13_RetryResetsCanaryAlertGateSkip(t *testing.T) {
+	cases := []struct {
+		reason string
+		want   StepStatus
+	}{
+		{"canary_not_promoted:Aborted", StepStatusPending},
+		{"canary_not_promoted:Timeout", StepStatusPending},
+		{"canary_not_promoted:SyncFailed", StepStatusPending},
+		{"canary_not_promoted:Error", StepStatusPending},
+		{"canary_not_promoted:deploy_failed", StepStatusPending},
+		{"canary_not_promoted:release_deadline_insufficient", StepStatusPending},
+		{"auto-rollback-enabled property not set to true — alert-gate skipped", StepStatusSkipped},
+		{"canary_abort", StepStatusSkipped},
+		{"", StepStatusSkipped},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			ctx := context.Background()
+			client, store := canaryTestClient()
+			corrID := "d13-alert-gate-" + tc.reason
+			slip := d13Slip(corrID)
+			slip.Steps["prod_alert_gate"] = Step{Status: StepStatusPending}
+			store.AddSlip(slip)
+
+			if err := client.FailStep(ctx, corrID, "prod_canary", "", d13SkipReason); err != nil {
+				t.Fatalf("FailStep: %v%s", err, stateMachineRef)
+			}
+			d13SkipDownstream(t, client, corrID)
+			if err := client.SkipStep(ctx, corrID, "prod_alert_gate", "", tc.reason); err != nil {
+				t.Fatalf("SkipStep(prod_alert_gate): %v%s", err, stateMachineRef)
+			}
+			if got := canaryLoad(t, store, corrID).Steps["prod_alert_gate"].Status; got != StepStatusSkipped {
+				t.Fatalf("setup: expected prod_alert_gate=%q while prod_canary is failed, got %q%s",
+					StepStatusSkipped, got, stateMachineRef)
+			}
+
+			if err := client.CompleteStep(ctx, corrID, "prod_canary", ""); err != nil {
+				t.Fatalf("CompleteStep(prod_canary) retry: %v%s", err, stateMachineRef)
+			}
+			got := d13AssertConsistent(t, store, corrID, "after the canary retry")
+			d13AssertReset(t, got, "after the canary retry")
+			if s := got.Steps["prod_alert_gate"].Status; s != tc.want {
+				t.Errorf("reason %q: expected prod_alert_gate=%q, got %q%s", tc.reason, tc.want, s, stateMachineRef)
+			}
+		})
+	}
+}
+
 // Precondition: canary failed and the D13 skips written (slip=failed). The retry claims prod_canary
 // (running), and an unrelated pipeline step reports a terminal status before the canary finishes:
 // with no primary failure left the slip recovers to in_progress while prod_canary is still running.

@@ -20,7 +20,8 @@ func canaryRetryPipelineConfig(t *testing.T) *PipelineConfig {
 			{"name": "push_parsed", "description": "push received"},
 			{"name": "prod_canary", "description": "canary", "prerequisites": ["push_parsed"]},
 			{"name": "prod_deploy", "description": "prod deploy", "prerequisites": ["prod_canary"]},
-			{"name": "prod_tests", "description": "prod tests", "prerequisites": ["prod_deploy"]}
+			{"name": "prod_tests", "description": "prod tests", "prerequisites": ["prod_deploy"]},
+			{"name": "prod_alert_gate", "description": "alert gate"}
 		]
 	}`
 	cfg, err := ParsePipelineConfig([]byte(j))
@@ -28,17 +29,25 @@ func canaryRetryPipelineConfig(t *testing.T) *PipelineConfig {
 	return cfg
 }
 
-// Scenario H against real Postgres (DEVOPS-554): the D13 skip reason survives the state_history
-// round trip, so a retried canary that completes resets the canary-skipped prod_deploy and
-// prod_tests to pending; a non-canary skip reason on the same path stays skipped.
+// Scenario H against real Postgres (DEVOPS-554): the D13 skip reasons survive the state_history
+// round trip, so a retried canary that completes resets the canary-skipped prod_deploy, prod_tests
+// and prod_alert_gate to pending; non-canary skip reasons on the same path stay skipped.
 func TestPostgresStore_CanaryRetryResetsCanarySkips_Integration(t *testing.T) {
 	tests := []struct {
-		name   string
-		reason string
-		want   StepStatus
+		name    string
+		reasons map[string]string
+		want    StepStatus
 	}{
-		{"canary reason resets", "canary_abort", StepStatusPending},
-		{"non-canary reason stays skipped", "deployment-strategy property is not canary", StepStatusSkipped},
+		{"canary reasons reset", map[string]string{
+			"prod_deploy":     "canary_abort",
+			"prod_tests":      "canary_abort",
+			"prod_alert_gate": "canary_not_promoted:Aborted",
+		}, StepStatusPending},
+		{"non-canary reasons stay skipped", map[string]string{
+			"prod_deploy":     "deployment-strategy property is not canary",
+			"prod_tests":      "deployment-strategy property is not canary",
+			"prod_alert_gate": "auto-rollback-enabled property not set to true — alert-gate skipped",
+		}, StepStatusSkipped},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -56,8 +65,8 @@ func TestPostgresStore_CanaryRetryResetsCanarySkips_Integration(t *testing.T) {
 			})
 
 			require.NoError(t, client.FailStep(ctx, "c1", "prod_canary", "", "canary_abort"))
-			for _, s := range []string{"prod_deploy", "prod_tests"} {
-				require.NoError(t, client.SkipStep(ctx, "c1", s, "", tt.reason))
+			for s, reason := range tt.reasons {
+				require.NoError(t, client.SkipStep(ctx, "c1", s, "", reason))
 			}
 			got, err := store.Load(ctx, "c1")
 			require.NoError(t, err)
@@ -76,7 +85,7 @@ func TestPostgresStore_CanaryRetryResetsCanarySkips_Integration(t *testing.T) {
 			got, err = store.Load(ctx, "c1")
 			require.NoError(t, err)
 			assert.Equal(t, SlipStatusInProgress, got.Status)
-			for _, s := range []string{"prod_deploy", "prod_tests"} {
+			for s := range tt.reasons {
 				assert.Equal(t, tt.want, got.Steps[s].Status, "%s after the canary retry", s)
 			}
 		})

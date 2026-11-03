@@ -247,8 +247,8 @@ func (c *Client) RunPostExecution(ctx context.Context, opts PostExecutionOptions
 //
 // When a previously-failed slip has no remaining primary failures, cascade-aborted steps
 // are reset to pending so they can re-run, and the slip status is reconciled to in_progress.
-// On every pass that does not complete the slip, prod_deploy and prod_tests skipped for a canary
-// reason (decision D13) are reset to pending once prod_canary has succeeded, whatever the slip
+// On every pass that does not complete the slip, prod_deploy, prod_tests and prod_alert_gate
+// skipped for a canary reason (decision D13) are reset to pending once prod_canary has succeeded, whatever the slip
 // status and whether or not another step has a primary failure (scenario H, see
 // canarySkipsToReset).
 func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID string) (bool, SlipStatus, error) {
@@ -410,14 +410,29 @@ var canarySkipReasons = map[string]struct{}{
 	"release_deadline_insufficient": {},
 }
 
+// canaryAlertGateSkipPrefix starts the reason the same canary writers record when they skip
+// prod_alert_gate after a failed canary: canary_not_promoted:<outcome>. alert.gate is published
+// only after a promotion, so a canary retry that reaches one runs the alert gate again.
+const canaryAlertGateSkipPrefix = "canary_not_promoted:"
+
 // canarySkippableSteps are the steps a D13 canary skip writes.
-var canarySkippableSteps = []string{"prod_deploy", "prod_tests"}
+var canarySkippableSteps = []string{"prod_deploy", "prod_tests", "prod_alert_gate"}
+
+// isCanarySkipReason reports whether reason is one a canary writer records when it skips stepName
+// after a failed canary.
+func isCanarySkipReason(stepName, reason string) bool {
+	if stepName == "prod_alert_gate" {
+		return strings.HasPrefix(reason, canaryAlertGateSkipPrefix)
+	}
+	_, ok := canarySkipReasons[reason]
+	return ok
+}
 
 // canarySkipsToReset returns the D13 canary skips that a successful prod_canary has made stale,
 // mapped to the reason each was skipped with: a step in canarySkippableSteps whose status is
-// skipped and whose latest pipeline-level history entry is that skip, with a canarySkipReasons
-// reason. It returns nothing while prod_canary is not a success, so a skip written beside a canary
-// failure that has not landed yet (or never lands) is kept.
+// skipped and whose latest pipeline-level history entry is that skip, with a canary reason for
+// that step (isCanarySkipReason). It returns nothing while prod_canary is not a success, so a skip
+// written beside a canary failure that has not landed yet (or never lands) is kept.
 func canarySkipsToReset(slip *Slip) map[string]string {
 	canary, ok := slip.Steps["prod_canary"]
 	if !ok || !canary.Status.IsSuccess() {
@@ -432,7 +447,7 @@ func canarySkipsToReset(slip *Slip) map[string]string {
 		if !found || entry.Status != StepStatusSkipped {
 			continue
 		}
-		if _, canaryReason := canarySkipReasons[entry.Message]; canaryReason {
+		if isCanarySkipReason(stepName, entry.Message) {
 			resets[stepName] = entry.Message
 		}
 	}
