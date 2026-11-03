@@ -247,9 +247,10 @@ func (c *Client) RunPostExecution(ctx context.Context, opts PostExecutionOptions
 //
 // When a previously-failed slip has no remaining primary failures, cascade-aborted steps
 // are reset to pending so they can re-run, and the slip status is reconciled to in_progress.
-// With no primary failures and the slip not completed, prod_deploy and prod_tests skipped for a
-// canary reason (decision D13) are reset to pending once prod_canary has succeeded, whatever the
-// slip status (scenario H, see canarySkipsToReset).
+// On every pass that does not complete the slip, prod_deploy and prod_tests skipped for a canary
+// reason (decision D13) are reset to pending once prod_canary has succeeded, whatever the slip
+// status and whether or not another step has a primary failure (scenario H, see
+// canarySkipsToReset).
 func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID string) (bool, SlipStatus, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
@@ -287,6 +288,18 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		}
 	}
 
+	// D13 canary skips that a successful prod_canary has made stale (scenario H) are reset to
+	// pending on every pass that does not complete the slip, whatever the slip status and whatever
+	// else has failed. The slip can already have recovered to in_progress while the retried canary
+	// was still running, and a step no prod step depends on (dev_tests, say) can be failed when the
+	// canary completes; tying the reset to either branch below would leave the skips satisfying
+	// prod_steady_state's prerequisites. The reset only writes skipped -> pending, and pending never
+	// satisfies a prerequisite, so it is safe beside a primary failure.
+	resets := make(map[string]string)
+	for stepName, reason := range canarySkipsToReset(slip) {
+		resets[stepName] = "reset: canary retried after " + reason
+	}
+
 	// If any step has a primary failure, the pipeline is in a failed state.
 	// Return completed=false because Failed is non-terminal — the pipeline can
 	// recover if the failed steps are retried and succeed.
@@ -295,7 +308,11 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 			"correlation_id":   correlationID,
 			"primary_failures": primaryFailures,
 			"cascade_failures": cascadeFailures,
+			"canary_resets":    resets,
 		})
+		// A canary reset that fails here is logged by resetStepsToPending; the conditions still
+		// hold, so the next terminal step event retries it.
+		c.resetStepsToPending(ctx, correlationID, resets)
 		if err := c.UpdateSlipStatus(ctx, correlationID, SlipStatusFailed); err != nil {
 			return false, SlipStatusFailed, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
@@ -312,15 +329,6 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 			return true, SlipStatusCompleted, fmt.Errorf("%w: %s", ErrSlipStatusUpdateFailed, err.Error())
 		}
 		return true, SlipStatusCompleted, nil
-	}
-
-	// No primary failures remain. D13 canary skips that a successful prod_canary has made stale
-	// (scenario H) are reset to pending whatever the slip status: the slip can already have
-	// recovered to in_progress while the retried canary was still running, so tying this reset
-	// to the failed branch below would leave them skipped.
-	resets := make(map[string]string)
-	for stepName, reason := range canarySkipsToReset(slip) {
-		resets[stepName] = "reset: canary retried after " + reason
 	}
 
 	// If the slip was previously failed, reconcile: reset cascade-aborted steps to pending so

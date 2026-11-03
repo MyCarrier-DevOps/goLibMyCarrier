@@ -988,3 +988,47 @@ func TestStateMachine_D13_RetryResetsCanarySkipsAfterEarlyRecovery(t *testing.T)
 	}
 	d13AssertReset(t, d13AssertConsistent(t, store, corrID, "after the canary retry"), "after the canary retry")
 }
+
+// Precondition: canary failed and the D13 skips written. The retry claims prod_canary, and
+// dev_tests, which no prod step depends on, fails while the retried canary runs.
+// Action:       the retried canary completes; later a dev_tests re-run passes.
+// Expected:     the skips are reset to pending as soon as the canary completes, although the slip
+// stays failed on dev_tests, so they never satisfy prod_steady_state's prerequisites; once
+// dev_tests passes the slip recovers to in_progress, not completed, with both steps still pending.
+func TestStateMachine_D13_RetryResetsCanarySkipsWhileAnotherStepFailed(t *testing.T) {
+	ctx := context.Background()
+	client, store := canaryTestClient()
+	corrID := "d13-retry-other-failure"
+	store.AddSlip(d13Slip(corrID))
+
+	if err := client.FailStep(ctx, corrID, "prod_canary", "", d13SkipReason); err != nil {
+		t.Fatalf("FailStep: %v%s", err, stateMachineRef)
+	}
+	d13SkipDownstream(t, client, corrID)
+	if err := client.StartStep(ctx, corrID, "prod_canary", ""); err != nil {
+		t.Fatalf("StartStep(prod_canary) retry: %v%s", err, stateMachineRef)
+	}
+	if err := client.FailStep(ctx, corrID, "dev_tests", "", "tests failed"); err != nil {
+		t.Fatalf("FailStep(dev_tests): %v%s", err, stateMachineRef)
+	}
+
+	if err := client.CompleteStep(ctx, corrID, "prod_canary", ""); err != nil {
+		t.Fatalf("CompleteStep(prod_canary) retry: %v%s", err, stateMachineRef)
+	}
+	slip := d13AssertConsistent(t, store, corrID, "after the canary retry")
+	d13AssertReset(t, slip, "after the canary retry with dev_tests failed")
+	if slip.Status != SlipStatusFailed {
+		t.Fatalf("expected slip.status=%q while dev_tests is failed, got %q%s",
+			SlipStatusFailed, slip.Status, stateMachineRef)
+	}
+
+	if err := client.CompleteStep(ctx, corrID, "dev_tests", ""); err != nil {
+		t.Fatalf("CompleteStep(dev_tests) re-run: %v%s", err, stateMachineRef)
+	}
+	slip = d13AssertConsistent(t, store, corrID, "after the dev_tests re-run")
+	if slip.Status != SlipStatusInProgress {
+		t.Fatalf("expected slip.status=%q after the dev_tests re-run, got %q%s",
+			SlipStatusInProgress, slip.Status, stateMachineRef)
+	}
+	d13AssertReset(t, slip, "after the dev_tests re-run")
+}
