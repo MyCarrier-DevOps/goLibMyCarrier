@@ -154,11 +154,14 @@ patch (`go 1.26.5`) and matching a Dockerfile builder tag — that guidance is f
 single-binary **services**. This repo is a **published library** and deliberately
 diverges:
 
-- The `go` directive in every module stays at the **minor** (`go 1.26`). For a
-  library the `go` directive is the *minimum* Go version a consumer must have, so
-  keeping it at the minor keeps the compatibility floor as low as possible. Do
-  **not** run `/go-repo-init`'s `pin-version` step here (it would raise the floor
-  for all downstream consumers).
+- The `go` directive in every module stays at the **minor** (`go 1.27` /
+  `go 1.27.0`). For a library the `go` directive is the *minimum* Go version a
+  consumer must have, so keeping it at the minor keeps the compatibility floor as
+  low as possible. Do **not** run `/go-repo-init`'s `pin-version` step here (it
+  would raise the floor for all downstream consumers).
+- The `toolchain` directive names the latest Go patch (`toolchain go1.27.3`). It
+  selects the Go this repo builds and tests with; consumers ignore a dependency's
+  `toolchain` line, so it does not raise their floor. Move it to each new patch.
 - There is **no Dockerfile** — nothing to pin a `golang:` builder tag against.
-- CI floats on the minor via `go-version: ^1.26` with `check-latest: true`; bump
+- CI floats on the minor via `go-version: 1.27.x` with `check-latest: true`; bump
   the minor by hand for a new Go release.

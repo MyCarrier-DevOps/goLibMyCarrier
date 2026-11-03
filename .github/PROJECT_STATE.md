@@ -1,7 +1,7 @@
 # Project State — goLibMyCarrier
 
 > **Last Updated:** 2026-05-14
-> **Status:** Multi-module Go library on Go 1.26; all Copilot PR review comments resolved (Rounds 1-6); coverage 83.9% (slippy); lint clean; state machine invariants documented; executor.go ordering fix applied; placeholder-filter divergence bug fixed (Path B recompute now aligns with Path A)
+> **Status:** Multi-module Go library on Go 1.27; all Copilot PR review comments resolved (Rounds 1-6); coverage 83.9% (slippy); lint clean; state machine invariants documented; executor.go ordering fix applied; placeholder-filter divergence bug fixed (Path B recompute now aligns with Path A)
 
 ---
 
