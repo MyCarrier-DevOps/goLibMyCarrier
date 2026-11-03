@@ -3,6 +3,7 @@ package slippy
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -246,6 +247,9 @@ func (c *Client) RunPostExecution(ctx context.Context, opts PostExecutionOptions
 //
 // When a previously-failed slip has no remaining primary failures, cascade-aborted steps
 // are reset to pending so they can re-run, and the slip status is reconciled to in_progress.
+// With no primary failures and the slip not completed, prod_deploy and prod_tests skipped for a
+// canary reason (decision D13) are reset to pending once prod_canary has succeeded, whatever the
+// slip status (scenario H, see canarySkipsToReset).
 func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID string) (bool, SlipStatus, error) {
 	slip, err := c.store.Load(ctx, correlationID)
 	if err != nil {
@@ -310,33 +314,32 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		return true, SlipStatusCompleted, nil
 	}
 
-	// No primary failures remain. If the slip was previously failed, reconcile:
-	// reset cascade-aborted steps to pending so they can re-run, then
-	// move the slip back to in_progress.
+	// No primary failures remain. D13 canary skips that a successful prod_canary has made stale
+	// (scenario H) are reset to pending whatever the slip status: the slip can already have
+	// recovered to in_progress while the retried canary was still running, so tying this reset
+	// to the failed branch below would leave them skipped.
+	resets := make(map[string]string)
+	for stepName, reason := range canarySkipsToReset(slip) {
+		resets[stepName] = "reset: canary retried after " + reason
+	}
+
+	// If the slip was previously failed, reconcile: reset cascade-aborted steps to pending so
+	// they can re-run, then move the slip back to in_progress.
 	if slip.Status == SlipStatusFailed {
 		c.logger.Info(ctx, "No primary failures remain, reconciling slip status to in_progress", map[string]interface{}{
 			"correlation_id": correlationID,
 			"cascade_resets": cascadeFailures,
+			"canary_resets":  resets,
 		})
 
 		// Reset cascade-aborted steps to pending so downstream steps can be
 		// re-evaluated by the prerequisite system on their next pre-execution.
 		// If any reset fails, keep the slip as Failed so the next call retries
 		// rather than leaving orphaned aborted steps on an in_progress slip.
-		var resetFailures []string
 		for _, stepName := range cascadeFailures {
-			if resetErr := c.UpdateStepWithStatus(
-				ctx, correlationID, stepName, "",
-				StepStatusPending, "reset: upstream failure resolved",
-			); resetErr != nil {
-				resetFailures = append(resetFailures, stepName)
-				c.logger.Warn(ctx, "Failed to reset aborted step to pending", map[string]interface{}{
-					"correlation_id": correlationID,
-					"step_name":      stepName,
-					"error":          resetErr.Error(),
-				})
-			}
+			resets[stepName] = "reset: upstream failure resolved"
 		}
+		resetFailures := c.resetStepsToPending(ctx, correlationID, resets)
 
 		// If any cascade resets failed, keep the slip as Failed so the next
 		// checkPipelineCompletion call retries the resets. Moving to InProgress
@@ -355,7 +358,88 @@ func (c *Client) checkPipelineCompletion(ctx context.Context, correlationID stri
 		return false, SlipStatusInProgress, nil
 	}
 
+	// A canary reset that fails here is logged by resetStepsToPending; the conditions still hold,
+	// so the next terminal step event retries it.
+	if len(resets) > 0 {
+		c.logger.Info(ctx, "Resetting canary skips after a successful canary retry", map[string]interface{}{
+			"correlation_id": correlationID,
+			"canary_resets":  resets,
+		})
+		c.resetStepsToPending(ctx, correlationID, resets)
+	}
+
 	return false, slip.Status, nil
+}
+
+// resetStepsToPending writes each step back to pending with its reset message and returns the
+// steps whose write failed (each failure is logged).
+func (c *Client) resetStepsToPending(ctx context.Context, correlationID string, resets map[string]string) []string {
+	var failures []string
+	for stepName, message := range resets {
+		if err := c.UpdateStepWithStatus(ctx, correlationID, stepName, "", StepStatusPending, message); err != nil {
+			failures = append(failures, stepName)
+			c.logger.Warn(ctx, "Failed to reset step to pending", map[string]interface{}{
+				"correlation_id": correlationID,
+				"step_name":      stepName,
+				"error":          err.Error(),
+			})
+		}
+	}
+	return failures
+}
+
+// canarySkipReasons are the reasons the canary writers record when they skip prod_deploy and
+// prod_tests after a failed canary (decision D13): rollout-watch for its Aborted, Timeout,
+// SyncFailed and Error outcomes, create-github-release's canary-not-deployed for a refusal before
+// the watch. A skip with any other reason (a non-canary repo, create-github-release step 0) is not
+// a canary skip.
+var canarySkipReasons = map[string]struct{}{
+	"canary_abort":                  {},
+	"timeout":                       {},
+	"sync_failed":                   {},
+	"watch_lost":                    {},
+	"deploy_failed":                 {},
+	"release_deadline_insufficient": {},
+}
+
+// canarySkippableSteps are the steps a D13 canary skip writes.
+var canarySkippableSteps = []string{"prod_deploy", "prod_tests"}
+
+// canarySkipsToReset returns the D13 canary skips that a successful prod_canary has made stale,
+// mapped to the reason each was skipped with: a step in canarySkippableSteps whose status is
+// skipped and whose latest pipeline-level history entry is that skip, with a canarySkipReasons
+// reason. It returns nothing while prod_canary is not a success, so a skip written beside a canary
+// failure that has not landed yet (or never lands) is kept.
+func canarySkipsToReset(slip *Slip) map[string]string {
+	canary, ok := slip.Steps["prod_canary"]
+	if !ok || !canary.Status.IsSuccess() {
+		return nil
+	}
+	resets := make(map[string]string)
+	for _, stepName := range canarySkippableSteps {
+		if slip.Steps[stepName].Status != StepStatusSkipped {
+			continue
+		}
+		entry, found := latestStepEntry(slip.StateHistory, stepName)
+		if !found || entry.Status != StepStatusSkipped {
+			continue
+		}
+		if _, canaryReason := canarySkipReasons[entry.Message]; canaryReason {
+			resets[stepName] = entry.Message
+		}
+	}
+	return resets
+}
+
+// latestStepEntry returns the last pipeline-level (componentless) history entry for stepName, in
+// append order.
+func latestStepEntry(history []StateHistoryEntry, stepName string) (StateHistoryEntry, bool) {
+	for _, entry := range slices.Backward(history) {
+		if entry.Step == stepName && entry.Component == "" {
+			return entry, true
+		}
+	}
+	return StateHistoryEntry{}, false
 }
 
 // ParsePrerequisites parses a comma-separated string of prerequisites.

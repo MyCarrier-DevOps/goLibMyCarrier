@@ -102,12 +102,14 @@ var (
 	ErrTerminalAlreadyExists = errors.New("terminal status already recorded for step")
 
 	// ErrSkipOverFailedCanary is returned by Client.SkipStep when the target is a canary step
-	// (prod_canary, preprod_rollback_test) whose recorded status is failed. skipped counts as
-	// success, so overwriting a failed canary verdict would unblock prod_deploy/prod_gate and
-	// nothing would revisit the failure. The intended recovery is to re-run the step to a new
-	// verdict, not to skip it. Callers should map this sentinel to HTTP 409 Conflict:
+	// (prod_canary, preprod_rollback_test) or a step a D13 canary skip writes (prod_deploy,
+	// prod_tests) whose recorded status is failed. skipped counts as success, so overwriting a
+	// failed canary verdict would unblock prod_deploy/prod_gate, and overwriting a failed
+	// prod_deploy or prod_tests would hide that failure; either way nothing would revisit it. The
+	// intended recovery is to re-run the step to a new verdict, not to skip it. Callers should map
+	// this sentinel to HTTP 409 Conflict:
 	//   errors.Is(err, slippy.ErrSkipOverFailedCanary)
-	ErrSkipOverFailedCanary = errors.New("refusing to skip a failed canary step")
+	ErrSkipOverFailedCanary = errors.New("refusing to skip a failed canary or prod deploy step")
 
 	// ErrDuplicateSlip indicates an insert conflicted with the one-row-per-commit
 	// unique index (uq_routing_slips_repo_sha). The push path treats it as "someone
