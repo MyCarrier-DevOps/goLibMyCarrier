@@ -227,8 +227,9 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   changed build paths. `ci.slip_rollbacks_pg` reads Postgres at query time, so it loses the
   rows too. Rollback reporting reads `ci.slip_rollbacks_retained` instead, a ClickHouse copy of
   the mirror refreshed every 5 minutes that nothing deletes from (DEVOPS-522); an attempt
-  recorded and repaved before the next successful refresh is not copied, and a failing
-  refresh shows only in `system.view_refreshes`. Slippy's own store keeps no
+  recorded and repaved before the next successful refresh is not copied. A failing or
+  stalled refresh shows in `system.view_refreshes` and fires the "Slip rollbacks retained
+  copy" Grafana alert. Slippy's own store keeps no
   tombstone, archive or retention copy. That was decided in DEVOPS-231 §4, and re-examined
   and confirmed on 2026-09-09 under **DEVOPS-277**, which declined both soft-delete
   (DEVOPS-230's partial-index model) and a tombstone row: nothing consumes a superseded
