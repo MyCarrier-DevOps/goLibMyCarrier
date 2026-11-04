@@ -225,8 +225,12 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
   is a push with no new commits, for which pushhookparser reads the head commit's own
   changes (`config/parse.go`), so it builds and repaves the ended slip whenever that commit
   changed build paths. `ci.slip_rollbacks_pg` reads Postgres at query time, so it loses the
-  rows too; reporting that must outlive a repave needs its own retained copy. No tombstone, archive
-  or retention copy exists anywhere. That was decided in DEVOPS-231 §4, and re-examined
+  rows too. Rollback reporting reads `ci.slip_rollbacks_retained` instead, a ClickHouse copy of
+  the mirror refreshed every 5 minutes that nothing deletes from (DEVOPS-522); an attempt
+  recorded and repaved before the next successful refresh is not copied. A failing or
+  stalled refresh shows in `system.view_refreshes` and fires the "Slip rollbacks retained
+  copy" Grafana alert. Slippy's own store keeps no
+  tombstone, archive or retention copy. That was decided in DEVOPS-231 §4, and re-examined
   and confirmed on 2026-09-09 under **DEVOPS-277**, which declined both soft-delete
   (DEVOPS-230's partial-index model) and a tombstone row: nothing consumes a superseded
   run's history, and the 22 dashboard queries that read `routing_slips_pg` with no status
