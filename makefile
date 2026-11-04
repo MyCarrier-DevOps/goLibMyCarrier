@@ -8,12 +8,12 @@ LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafk
 # `make install-tools` / `make check-sec`, so this file is the single source of truth.
 #
 # GOLANGCI_LINT_VERSION must be built with a Go >= the toolchain CI resolves
-# (ci.yml uses `go-version: 1.26.x` + `check-latest`, so a new Go patch is picked up
+# (ci.yml uses `go-version: 1.27.x` + `check-latest`, so a new Go patch is picked up
 # automatically). A linter built with an older Go panics on the newer stdlib:
-# "file requires newer Go version go1.27 (application built with go1.26)". When Go
+# "file requires newer Go version go1.28 (application built with go1.27)". When Go
 # ships a new minor, bump this to a release whose notes list that version's support
 # (`golangci-lint version` prints the Go it was built with).
-GOLANGCI_LINT_VERSION := v2.13.1
+GOLANGCI_LINT_VERSION := v2.15.0
 # Commit that $(GOLANGCI_LINT_VERSION) points at. Pinned SEPARATELY because a git tag is
 # mutable: absent a tag-protection rule it can be force-moved, raw.githubusercontent.com serves
 # whatever the ref resolves to at fetch time with no integrity check, and install.sh verifies
@@ -21,8 +21,8 @@ GOLANGCI_LINT_VERSION := v2.13.1
 # was the weaker argument, and the sibling repo pins it, so both now agree. Refresh with:
 #   gh api /repos/golangci/golangci-lint/git/ref/tags/$(GOLANGCI_LINT_VERSION) --jq .object.sha
 #   gh api /repos/golangci/golangci-lint/git/tags/<that-sha> --jq .object.sha
-GOLANGCI_LINT_INSTALLER_SHA := 6d2288e072e6f9c9bca28180cae9ce58a049c912
-GOVULNCHECK_VERSION   := v1.7.0
+GOLANGCI_LINT_INSTALLER_SHA := 25c5369a93aacb8cccea0d46e1569ca4a194564d
+GOVULNCHECK_VERSION   := v1.9.0
 GO_TEST_COVERAGE_VERSION := v2.19.0
 
 # Coverage floor. MUST match `threshold-total` in .github/workflows/ci.yml: CI enforces it

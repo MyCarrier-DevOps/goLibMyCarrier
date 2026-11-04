@@ -689,7 +689,7 @@ func TestClient_SkipStep_CanaryGuard(t *testing.T) {
 		return NewClientWithDependencies(store, NewMockGitHubAPI(), Config{}), store
 	}
 
-	for _, step := range []string{"prod_canary", "preprod_rollback_test"} {
+	for _, step := range []string{"prod_canary", "preprod_rollback_test", "prod_deploy", "prod_tests"} {
 		t.Run(step+" failed is refused", func(t *testing.T) {
 			client, store := newClient(step, StepStatusFailed)
 

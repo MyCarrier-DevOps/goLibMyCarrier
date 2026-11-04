@@ -48,24 +48,30 @@ func (c *Client) TimeoutStep(ctx context.Context, correlationID, stepName, compo
 		StepStatusTimeout, reason)
 }
 
-// canarySteps are the steps whose failed verdict SkipStep must never overwrite
-// (STATE_MACHINE_V3 "Skip-writer contract").
-var canarySteps = map[string]struct{}{
+// skipGuardedSteps are the steps whose failed status SkipStep must never overwrite
+// (STATE_MACHINE_V3 "Skip-writer contract"): the canary steps, and the two steps a D13 canary
+// skip writes.
+var skipGuardedSteps = map[string]struct{}{
 	"prod_canary":           {},
 	"preprod_rollback_test": {},
+	"prod_deploy":           {},
+	"prod_tests":            {},
 }
 
 // SkipStep marks a step as skipped.
 // The correlationID is the unique identifier for the routing slip.
 //
-// A canary step (prod_canary, preprod_rollback_test) recorded as failed is never overwritten:
-// skipped counts as success, so the skip would unblock promotion past a failed canary. In that
-// case SkipStep returns ErrSkipOverFailedCanary and writes nothing. The check reads the slip
-// first and is not atomic with the write. The skip writer (create-github-release step 0) runs
-// outside the release mutex, so a failed verdict that a concurrent run of the same slip writes
-// between the read and the write is overwritten.
+// A failed prod_canary, preprod_rollback_test, prod_deploy or prod_tests is never overwritten:
+// skipped counts as success, so the skip would clear a primary failure. For a canary step it
+// would unblock promotion past a failed canary; for prod_deploy or prod_tests (a D13 canary skip
+// on a re-run whose deploy already failed) it would hide the failed deploy, and a later canary
+// retry would return the slip to in_progress. In that case SkipStep returns
+// ErrSkipOverFailedCanary and writes nothing. The check reads the slip first and is not atomic
+// with the write. The skip writers (create-github-release step 0, rollout-watch) run outside the
+// release mutex, so a failed status that a concurrent run of the same slip writes between the
+// read and the write is overwritten.
 func (c *Client) SkipStep(ctx context.Context, correlationID, stepName, componentName, reason string) error {
-	if _, guarded := canarySteps[stepName]; guarded {
+	if _, guarded := skipGuardedSteps[stepName]; guarded {
 		slip, err := c.store.Load(ctx, correlationID)
 		if err != nil {
 			return NewStepError("skip", correlationID, stepName, componentName, err)
