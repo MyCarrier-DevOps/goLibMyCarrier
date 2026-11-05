@@ -979,13 +979,13 @@ and `slip_ancestry` the direct parent links.
 
 One row per gitops-rollback attempt for a slip, written through slippy-api with
 `PostgresStore.RecordRollback` and read with `ListRollbacks`. ClickHouse mirrors it as
-`ci.slip_rollbacks_pg` and `ci_test.slip_rollbacks_pg` for reporting (DDL in
-`clickhouse/slip_rollbacks_pg.sql`). A repave deletes a slip's rows from the mirror, so rollback
-reporting reads `ci.slip_rollbacks_retained` and `ci_test.slip_rollbacks_retained` instead:
-ClickHouse copies of the mirror, refreshed every 5 minutes, that nothing deletes from. Read them
-with `FINAL`: each refresh appends every mirror row again, and the duplicates collapse only in
-background merges. Their DDL
-and apply steps are in the `MyCarrier-DevOps/grafana-dashboards` repository under `sql/`.
+`ci.slip_rollbacks_pg` and `ci_test.slip_rollbacks_pg` for reporting. A repave deletes a slip's
+rows from the mirror, so rollback reporting reads `ci.slip_rollbacks_retained` and
+`ci_test.slip_rollbacks_retained` instead: ClickHouse copies of the mirror, refreshed every 5
+minutes, that nothing deletes from. Read them with `FINAL`: each refresh appends every mirror row
+again, and the duplicates collapse only in background merges. The DDL of the mirrors and of the
+retained copies, and their apply steps, are in the `MyCarrier-DevOps/grafana-dashboards`
+repository under `sql/`.
 
 | Column | Type | Description |
 |--------|------|-------------|
