@@ -2,7 +2,7 @@ SHELL:=/bin/bash
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
-LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafka logger otel pollyapi postgres postgresmigrator repocanon slippy slippyapi teamsbot vault yaml
+LIB_DIRS := argocdclient auth cievents clickhouse clickhousemigrator github kafka logger otel pollyapi postgres postgresmigrator repocanon slippy slippyapi teamsbot vault workflowmark yaml
 
 # Tool versions, pinned so local and CI judge identically. CI installs these via
 # `make install-tools` / `make check-sec`, so this file is the single source of truth.
