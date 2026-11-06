@@ -112,6 +112,10 @@ type CanaryStep struct {
 	// setWeight or setCanaryScale step across reconciles, until the canary pods are available and,
 	// for setWeight, the router weight is verified. The controller completes at most one step per reconcile.
 	Waits bool
+	// UntimedPause is true for a pause step with no duration (`pause: {}`). The Rollout waits there
+	// until a person promotes it. A pause with a duration, even `duration: 0`, is timed and is false.
+	// Argo Rollouts keeps RolloutPause.Duration as a pointer: only a nil Duration is indefinite.
+	UntimedPause bool
 }
 
 // RolloutStatus is the combined state of one Rollout in an Application.
@@ -267,8 +271,10 @@ type liveRollout struct {
 
 type canaryStrategy struct {
 	Steps []struct {
-		SetWeight  *int32           `json:"setWeight"`
-		Pause      *json.RawMessage `json:"pause"`
+		SetWeight *int32 `json:"setWeight"`
+		Pause     *struct {
+			Duration *json.RawMessage `json:"duration"`
+		} `json:"pause"`
 		Analysis   *json.RawMessage `json:"analysis"`
 		Experiment *json.RawMessage `json:"experiment"`
 		Plugin     *json.RawMessage `json:"plugin"`
@@ -393,6 +399,7 @@ func canarySteps(canary *canaryStrategy) []CanaryStep {
 		if step.SetWeight != nil {
 			steps[i].SetWeight = *step.SetWeight
 		}
+		steps[i].UntimedPause = step.Pause != nil && step.Pause.Duration == nil
 		steps[i].Waits = step.Pause != nil || step.Analysis != nil || step.Experiment != nil || step.Plugin != nil
 	}
 	return steps

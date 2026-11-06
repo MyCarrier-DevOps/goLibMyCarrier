@@ -184,6 +184,30 @@ func TestDecodeRollout(t *testing.T) {
 	}
 }
 
+func TestCanarySteps_UntimedPause(t *testing.T) {
+	manifest := `{"spec":{"strategy":{"canary":{"steps":[
+		{"setWeight":20},
+		{"pause":{}},
+		{"pause":{"duration":"5m"}},
+		{"pause":{"duration":0}},
+		{"pause":{"duration":null}},
+		{"analysis":{"templates":[{"templateName":"health"}]}}]}}}}`
+	steps := newRolloutStatus(resourceNode{}, mustDecodeRollout(t, manifest)).CanarySteps
+	want := []bool{false, true, false, false, true, false}
+	wantWaits := []bool{false, true, true, true, true, true}
+	if len(steps) != len(want) {
+		t.Fatalf("len(CanarySteps) = %d, want %d", len(steps), len(want))
+	}
+	for i, step := range steps {
+		if step.UntimedPause != want[i] {
+			t.Errorf("step %d UntimedPause = %v, want %v", i, step.UntimedPause, want[i])
+		}
+		if step.Waits != wantWaits[i] {
+			t.Errorf("step %d Waits = %v, want %v", i, step.Waits, wantWaits[i])
+		}
+	}
+}
+
 func TestCanarySteps(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -224,7 +248,7 @@ func TestCanarySteps(t *testing.T) {
 				{},
 				{Waits: true},
 				{},
-				{Waits: true},
+				{Waits: true, UntimedPause: true},
 			},
 		},
 		{
@@ -324,7 +348,7 @@ func TestNewRolloutStatus(t *testing.T) {
 		Labels: map[string]string{CorrelationIDLabel: "corr-1", "app": "api"},
 		CanarySteps: []CanaryStep{
 			{SetWeight: 50},
-			{Waits: true},
+			{Waits: true, UntimedPause: true},
 			{SetWeight: 100},
 		},
 		StepPluginStatuses: []StepPluginStatus{
@@ -524,7 +548,7 @@ var fixtureLive = map[string]struct {
 
 // fixtureSteps are the canary steps of every recorded Rollout: setWeight 50, pause, setWeight 75, pause,
 // setWeight 100.
-var fixtureSteps = []CanaryStep{{SetWeight: 50}, {Waits: true}, {SetWeight: 75}, {Waits: true}, {SetWeight: 100}}
+var fixtureSteps = []CanaryStep{{SetWeight: 50}, {Waits: true, UntimedPause: true}, {SetWeight: 75}, {Waits: true, UntimedPause: true}, {SetWeight: 100}}
 
 // fixtureStatus builds the expected status of a recorded Rollout. stableRS and podHash are the
 // manifest's status.stableRS and status.currentPodHash, which differ per state.
