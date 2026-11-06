@@ -42,4 +42,5 @@ if mark.By != "" {
 - Authenticates as the pod's service account. It needs `get` on `workflows.argoproj.io` in its namespace.
 - Re-reads the token on every call, because projected tokens rotate.
 - Each read has a 10 s timeout and reads at most 32 MiB of the body.
+- Asks for the workflow's metadata only (`Accept: application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1`), so the read stays small whatever the workflow's status holds. Plain `application/json` stays in the `Accept` list: a server that does not convert answers with the whole workflow, which decodes the same way.
 - A non-200 answer, or a body that is not a workflow, is an error. An unmarked run, and a workflow with no annotations, both return an empty `Mark`.

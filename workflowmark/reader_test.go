@@ -203,3 +203,31 @@ func TestReader_SupersededBy_CloseError(t *testing.T) {
 		t.Fatal("want the close error")
 	}
 }
+
+// The read asks the API server for the workflow's metadata only (PartialObjectMetadata, which it serves for custom
+// resources too), so a workflow with a large node status costs no more than one without. Plain JSON stays acceptable:
+// a server that does not convert answers with the whole workflow, whose metadata decodes the same way.
+func TestReader_SupersededBy_AsksForMetadataOnly(t *testing.T) {
+	const wantAccept = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json"
+	var gotAccept string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAccept = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1")
+		_, _ = w.Write([]byte(`{"kind":"PartialObjectMetadata","apiVersion":"meta.k8s.io/v1",` +
+			`"metadata":{"name":"build-old","annotations":{"ci.mycarrier.tech/superseded-by":"build-new"}}}`))
+	}))
+	t.Cleanup(srv.Close)
+	r := newReader(t, srv, serviceAccountDir(t, srv, "sa-token"))
+
+	mark, err := r.SupersededBy(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotAccept != wantAccept {
+		t.Errorf("Accept = %q, want %q", gotAccept, wantAccept)
+	}
+	if mark != (Mark{By: "build-new"}) {
+		t.Errorf("mark = %+v, want the PartialObjectMetadata answer's mark", mark)
+	}
+}

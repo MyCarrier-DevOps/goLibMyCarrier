@@ -41,9 +41,15 @@ const (
 // requestTimeout bounds one read. A caller usually holds a write on it, so it stays short.
 const requestTimeout = 10 * time.Second
 
-// maxBody bounds the workflow read. A running workflow's status carries every node, so it is
-// generous.
+// maxBody bounds the workflow read. The read asks for metadata only, but a server that answers with
+// the whole workflow sends a status that carries every node, so it is generous.
 const maxBody = 32 << 20
+
+// accept asks the API server for the workflow's metadata only (PartialObjectMetadata, served for
+// custom resources too), so the read stays small whatever the workflow's status holds. Plain JSON
+// stays acceptable: a server that does not convert answers with the whole workflow, whose metadata
+// decodes the same way.
+const accept = "application/json;as=PartialObjectMetadata;g=meta.k8s.io;v=v1,application/json"
 
 // Mark is a workflow's supersede mark: the run that superseded it ("" while none has, or when the
 // workflow's template is not preemptible), and that run's correlation id and commit ("" when the
@@ -98,7 +104,7 @@ func (r *Reader) SupersededBy(ctx context.Context) (Mark, error) {
 		return Mark{}, fmt.Errorf("build the workflow read: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", accept)
 	resp, err := r.client.Do(req)
 	if err != nil {
 		return Mark{}, fmt.Errorf("read the workflow: %w", err)
@@ -117,7 +123,8 @@ func (r *Reader) SupersededBy(ctx context.Context) (Mark, error) {
 	}, nil
 }
 
-// decodeAnnotations returns the annotations of the workflow in a 200 answer.
+// decodeAnnotations returns the annotations in a 200 answer: the workflow's PartialObjectMetadata,
+// or the whole workflow.
 func decodeAnnotations(resp *http.Response) (map[string]string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("read the workflow: HTTP %d", resp.StatusCode)
