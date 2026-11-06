@@ -130,9 +130,28 @@ func MetaEnvFor(environment string) string {
 // Input is lowercased and whitespace-trimmed before comparison.
 func ClusterFor(metaEnv string) string {
 	if strings.ToLower(strings.TrimSpace(metaEnv)) == "prod" {
-		return "production-csp"
+		return LegacyProdCluster
 	}
 	return "development"
+}
+
+const (
+	// LegacyProdCluster is the prod ArgoCD cluster name before the
+	// 2026-11-26 DR rename (DEVOPS-317).
+	LegacyProdCluster = "production-csp"
+	// RenamedProdCluster is the prod ArgoCD cluster name after the rename.
+	RenamedProdCluster = "production"
+)
+
+// ClusterCandidates returns the cluster names a metaEnv may live under, the
+// current name (what ClusterFor returns) first. For "prod" that is
+// [LegacyProdCluster, RenamedProdCluster] while the rename is pending;
+// otherwise a single-element list.
+func ClusterCandidates(metaEnv string) []string {
+	if strings.ToLower(strings.TrimSpace(metaEnv)) == "prod" {
+		return []string{LegacyProdCluster, RenamedProdCluster}
+	}
+	return []string{ClusterFor(metaEnv)}
 }
 
 // ArgoCDAppNames returns the deterministic ArgoCD app names for both layers:
@@ -217,7 +236,23 @@ func (n Names) ArgoCDAppName(environment, chartType string) string {
 		return n.Service + "-offload-" + env
 	}
 	if env == "prod" {
-		return "production-csp-prod-" + n.Service
+		return LegacyProdCluster + "-prod-" + n.Service
 	}
 	return "development-" + env + "-" + n.Service
+}
+
+// ArgoCDAppNameCandidates returns the ordered app names to probe for the
+// deploy. The first element always equals ArgoCDAppName (legacy name); for
+// the legacy prod branch (env "prod", chart not mc-environment) a second
+// element with the renamed cluster ("production-prod-{svc}") follows.
+// Empty Service returns nil.
+func (n Names) ArgoCDAppNameCandidates(environment, chartType string) []string {
+	first := n.ArgoCDAppName(environment, chartType)
+	if first == "" {
+		return nil
+	}
+	if strings.HasPrefix(first, LegacyProdCluster+"-prod-") {
+		return []string{first, RenamedProdCluster + "-prod-" + n.Service}
+	}
+	return []string{first}
 }

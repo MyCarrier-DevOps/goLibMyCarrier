@@ -108,7 +108,7 @@ that workflow YAML and Go consumers stay in lock-step.
 |---|---|---|
 | `chartType == "mc-environment"` | `{svc}-{env}` | New unified scheme (any env) |
 | `environment` starts with `feature` | `{svc}-offload-{env}` | Legacy feature offload |
-| `environment == "prod"` | `production-csp-prod-{svc}` | Legacy prod cluster selector |
+| `environment == "prod"` | `production-csp-prod-{svc}` | Legacy prod cluster selector. After the 2026-11-26 DR rename the cluster is `production`; `ArgoCDAppNameCandidates` returns both `production-csp-prod-{svc}` and `production-prod-{svc}` (legacy first) |
 | _otherwise_ | `development-{env}-{svc}` | Legacy dev / preprod default |
 
 `environment` and `chartType` are lowercased + whitespace-trimmed before
