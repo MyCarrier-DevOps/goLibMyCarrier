@@ -739,6 +739,7 @@ func (m *MockStore) UpdateStep(
 
 	step := slip.Steps[stepName]
 	step.Status = status
+	step.ClaimedBy = claimantFor(status, "")
 	slip.Steps[stepName] = step
 
 	return nil
@@ -1020,6 +1021,7 @@ func (m *MockStore) UpdateStepWithHistory(
 	}
 	step := slip.Steps[stepName]
 	step.Status = status
+	step.ClaimedBy = claimantFor(status, entry.ClaimedBy)
 	slip.Steps[stepName] = step
 
 	// Append history
@@ -1186,3 +1188,12 @@ func (m *MockStore) AddSlip(slip *Slip) {
 
 // Ensure MockStore implements SlipStore.
 var _ SlipStore = (*MockStore)(nil)
+
+// claimantFor is the claimant a pipeline-level step shows after a write of status: the run that
+// started it while it is running, and none otherwise, as PostgresStore reports it.
+func claimantFor(status StepStatus, claimedBy string) string {
+	if status == StepStatusRunning {
+		return claimedBy
+	}
+	return ""
+}

@@ -48,6 +48,7 @@ func TestPostgresStore_FindByCommits_OK(t *testing.T) {
 	mock.ExpectQuery("JOIN unnest").
 		WithArgs(anyArgs(2)...).
 		WillReturnRows(rows)
+	expectClaimantRead(mock)
 
 	slip, matched, err := store.FindByCommits(context.Background(), "owner/repo", []string{"sha1", "sha2"})
 	require.NoError(t, err)
@@ -72,6 +73,7 @@ func TestPostgresStore_FindAllByCommits_OK(t *testing.T) {
 	mock.ExpectQuery("JOIN unnest").
 		WithArgs(anyArgs(2)...).
 		WillReturnRows(rows)
+	expectClaimantRead(mock)
 
 	results, err := store.FindAllByCommits(context.Background(), "owner/repo", []string{"sha1", "sha2"})
 	require.NoError(t, err)

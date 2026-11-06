@@ -204,6 +204,17 @@ func TestPostgresStore_Load_NotFound(t *testing.T) {
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
+// expectClaimantRead expects the claimant query every slip read now runs after the slip row, and
+// answers it with rows (id, step, claimed_by).
+func expectClaimantRead(mock pgxmock.PgxPoolIface, rows ...[]any) {
+	r := pgxmock.NewRows([]string{"correlation_id", "step", "claimed_by"})
+	for _, row := range rows {
+		r.AddRow(row...)
+	}
+	mock.ExpectQuery("FROM slip_component_states WHERE correlation_id = ANY").
+		WithArgs(pgxmock.AnyArg()).WillReturnRows(r)
+}
+
 func TestPostgresStore_Load_Hydrates(t *testing.T) {
 	store, mock := newMockStore(t)
 
@@ -224,6 +235,7 @@ func TestPostgresStore_Load_Hydrates(t *testing.T) {
 	)
 	mock.ExpectQuery("SELECT .* FROM routing_slips WHERE correlation_id").
 		WithArgs("c1").WillReturnRows(rows)
+	expectClaimantRead(mock)
 
 	slip, err := store.Load(context.Background(), "c1")
 	require.NoError(t, err)
@@ -257,6 +269,7 @@ func TestPostgresStore_LoadByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *testing.
 			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
 			`updated_at DESC LIMIT 1`,
 	).WithArgs("owner/repo", "sha1").WillReturnRows(rows)
+	expectClaimantRead(mock)
 
 	slip, err := store.LoadByCommit(context.Background(), "owner/repo", "sha1")
 	require.NoError(t, err)
@@ -277,6 +290,7 @@ func TestPostgresStore_LoadLiveByCommit_OrdersLiveFirstThenUpdatedAtDesc(t *test
 			`ORDER BY \(status IN \('failed','completed','abandoned','promoted','compensated'\)\) ASC, `+
 			`updated_at DESC LIMIT 1`,
 	).WithArgs("owner/repo", "sha1").WillReturnRows(rows)
+	expectClaimantRead(mock)
 
 	slip, err := store.LoadLiveByCommit(context.Background(), "owner/repo", "sha1")
 	require.NoError(t, err)
@@ -538,4 +552,26 @@ func TestReconstructStepTimingFromHistory(t *testing.T) {
 			t.Errorf("StartedAt should be first running time %v, got %v", firstRunning, step.StartedAt)
 		}
 	})
+}
+
+// A running pipeline step shows the run recorded on its component-state row; a step that is
+// running with no recorded claimant, and a step that is not running, show none.
+func TestPostgresStore_Load_FillsClaimantOnRunningSteps(t *testing.T) {
+	store, mock := newMockStore(t)
+	rows := pgxmock.NewRows(store.slipSelectColumns()).AddRow(
+		"c1", "owner/repo", "main", "sha1", time.Now(), time.Now(),
+		"in_progress", []byte(`{}`), []byte(`{"entries":[]}`),
+		"completed", "completed", "completed", "running", // push_parsed, builds, unit_tests, dev_deploy
+		[]byte(`{"items":[]}`),
+		nil, // claimed_from
+	)
+	mock.ExpectQuery("SELECT .* FROM routing_slips WHERE correlation_id").WithArgs("c1").WillReturnRows(rows)
+	// unit_tests is completed, so its leftover claimant is not shown; dev_deploy is running.
+	expectClaimantRead(mock, []any{"c1", "dev_deploy", "wf-a"}, []any{"c1", "unit_tests", "wf-old"})
+
+	slip, err := store.Load(context.Background(), "c1")
+	require.NoError(t, err)
+	assert.Equal(t, "wf-a", slip.Steps["dev_deploy"].ClaimedBy)
+	assert.Empty(t, slip.Steps["unit_tests"].ClaimedBy)
+	require.NoError(t, mock.ExpectationsWereMet())
 }

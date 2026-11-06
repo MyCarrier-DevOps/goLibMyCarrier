@@ -454,7 +454,21 @@ func (s *PostgresStore) updateStepTx(
 			return err
 		}
 
-		applied, err := s.upsertComponentState(ctx, tx, correlationID, stepName, componentName, status, message, "")
+		claimedBy := ""
+		if entry != nil {
+			claimedBy = entry.ClaimedBy
+		}
+		applied, err := s.upsertComponentState(
+			ctx,
+			tx,
+			correlationID,
+			stepName,
+			componentName,
+			status,
+			message,
+			"",
+			claimedBy,
+		)
 		if err != nil {
 			return err
 		}
@@ -547,21 +561,28 @@ func (s *PostgresStore) writeStepStatusColumn(
 // aborted->pending cascade-reset. The age is computed entirely on the Postgres server clock
 // (now() vs the stored updated_at, both this one server), so it is immune to clock skew.
 // A non-empty image_tag is preserved when the incoming one is empty.
+//
+// claimedBy is the run that started the step. A running write replaces the stored claimant with
+// it (an empty one clears it, so a start that names nobody is never read as a run's own); a
+// write of any other status leaves the stored claimant alone, because the reader only shows a
+// claimant while the step is running (see applyClaimants).
 func (s *PostgresStore) upsertComponentState(
 	ctx context.Context,
 	tx pgx.Tx,
 	correlationID, step, component string,
 	status StepStatus,
-	message, imageTag string,
+	message, imageTag, claimedBy string,
 ) (bool, error) {
 	q := fmt.Sprintf(`
-		INSERT INTO slip_component_states (correlation_id, step, component, status, message, image_tag, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, now())
+		INSERT INTO slip_component_states (correlation_id, step, component, status, message, image_tag, claimed_by, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, NULLIF($9, ''), now())
 		ON CONFLICT (correlation_id, step, component) DO UPDATE SET
 			status     = EXCLUDED.status,
 			message    = EXCLUDED.message,
 			image_tag  = CASE WHEN EXCLUDED.image_tag <> '' THEN EXCLUDED.image_tag
 			                  ELSE slip_component_states.image_tag END,
+			claimed_by = CASE WHEN EXCLUDED.status = 'running' THEN EXCLUDED.claimed_by
+			                  ELSE slip_component_states.claimed_by END,
 			updated_at = now()
 		WHERE NOT $8::boolean
 		   OR NOT (slip_component_states.status IN (%s)
@@ -573,6 +594,10 @@ func (s *PostgresStore) upsertComponentState(
 	// guarded is false when the gate is disabled or this is a bypass step's pipeline-level
 	// write; then NOT $8 makes the WHERE always true (a plain upsert). Otherwise the terminal
 	// guard applies within the freshness window.
+	// Only a running write records a claimant; the insert of any other status stores none.
+	if status != StepStatusRunning {
+		claimedBy = ""
+	}
 	window := freshnessWindow()
 	if window > maxFreshnessWindowMS*time.Millisecond {
 		window = maxFreshnessWindowMS * time.Millisecond
@@ -580,7 +605,7 @@ func (s *PostgresStore) upsertComponentState(
 	guarded := gateEnabled() && (!gateBypassSteps[step] || component != "")
 
 	tag, err := tx.Exec(ctx, q, correlationID, step, component, string(status), message, imageTag,
-		window.Milliseconds(), guarded)
+		window.Milliseconds(), guarded, claimedBy)
 	if err != nil {
 		return false, fmt.Errorf("failed to record component state %s/%s: %w", step, component, err)
 	}

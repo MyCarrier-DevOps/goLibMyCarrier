@@ -106,7 +106,7 @@ func TestPostgresStore_UpdateStep_PipelineStep(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec("UPDATE routing_slips SET unit_tests_status").
 		WithArgs("running", "c1").
@@ -122,7 +122,7 @@ func TestPostgresStore_UpdateStep_TerminalGuardBlocks(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 0)) // guard blocked
 	mock.ExpectRollback()
 
@@ -139,7 +139,7 @@ func TestPostgresStore_UpdateStep_PushParsedBypassesGate(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "push_parsed", "", "running", "", "", pgxmock.AnyArg(), false).
+		WithArgs("c1", "push_parsed", "", "running", "", "", pgxmock.AnyArg(), false, "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec("UPDATE routing_slips SET push_parsed_status").
 		WithArgs("running", "c1").
@@ -157,7 +157,7 @@ func TestPostgresStore_UpdateStep_NonBypassStepIsGuarded(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), true).
+		WithArgs("c1", "unit_tests", "", "running", "", "", pgxmock.AnyArg(), true, "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec("UPDATE routing_slips SET unit_tests_status").
 		WithArgs("running", "c1").
@@ -190,7 +190,7 @@ func TestPostgresStore_UpdateStep_ComponentAggregate(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "component_builds", "api", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs("c1", "component_builds", "api", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	// recompute: read current items, read component rows, write back.
 	mock.ExpectQuery("SELECT builds FROM routing_slips").
@@ -223,7 +223,7 @@ func TestPostgresStore_UpdateStep_InjectionSafe_UnknownStepSkipsColumn(t *testin
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", evil, "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs("c1", evil, "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	// Deliberately no "UPDATE routing_slips SET ..." expectation.
 	mock.ExpectCommit()
@@ -243,7 +243,7 @@ func TestPostgresStore_UpdateStep_AggregateNoComponents_WritesTheStepsOwnStatus(
 			mock.ExpectBegin()
 			expectLock(mock, "c1")
 			mock.ExpectExec("INSERT INTO slip_component_states").
-				WithArgs("c1", "builds", "", string(status), "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+				WithArgs("c1", "builds", "", string(status), "", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 				WillReturnResult(pgxmock.NewResult("INSERT", 1))
 			mock.ExpectQuery("SELECT builds FROM routing_slips").
 				WithArgs("c1").
@@ -271,7 +271,7 @@ func TestPostgresStore_UpdateStep_AggregateNoComponents_StepStatusWriteErrorRoll
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "builds", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs("c1", "builds", "", "running", "", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectQuery("SELECT builds FROM routing_slips").
 		WithArgs("c1").
@@ -298,7 +298,7 @@ func TestPostgresStore_UpdateStep_AggregateWithComponents_RollupStillWins(t *tes
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "builds", "", "failed", "", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs("c1", "builds", "", "failed", "", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectQuery("SELECT builds FROM routing_slips").
 		WithArgs("c1").
@@ -322,7 +322,7 @@ func TestPostgresStore_UpdateStepWithHistory_Pipeline(t *testing.T) {
 	mock.ExpectBegin()
 	expectLock(mock, "c1")
 	mock.ExpectExec("INSERT INTO slip_component_states").
-		WithArgs("c1", "unit_tests", "", "completed", "all green", "", pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs("c1", "unit_tests", "", "completed", "all green", "", pgxmock.AnyArg(), pgxmock.AnyArg(), "").
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	mock.ExpectExec("UPDATE routing_slips SET unit_tests_status").
 		WithArgs("completed", "c1").

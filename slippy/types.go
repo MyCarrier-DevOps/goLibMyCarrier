@@ -218,6 +218,11 @@ type Step struct {
 
 	// HeldReason explains why the step is held (if Status is held)
 	HeldReason string `json:"held_reason,omitempty"`
+
+	// ClaimedBy names the run that started the step, and is set only while Status is running.
+	// A running step with no claimant was started by a caller that named none, so a reader
+	// deciding whether a step is its own must treat an empty ClaimedBy as not its own.
+	ClaimedBy string `json:"claimed_by,omitempty"`
 }
 
 // ApplyStatusTransition updates the step's status and sets appropriate timestamps.
@@ -253,6 +258,12 @@ type StateHistoryEntry struct {
 
 	// Message provides additional context about the transition
 	Message string `json:"message,omitempty"`
+
+	// ClaimedBy names the run that caused a running transition (the CLI's workflow name). The
+	// store records it on the step's component-state row when the transition is a running
+	// write, and clears it on any other running write that names none; a terminal write leaves
+	// the step with no visible claimant. Empty on every other entry.
+	ClaimedBy string `json:"claimed_by,omitempty"`
 }
 
 // SlipOptions configures a new slip during creation.

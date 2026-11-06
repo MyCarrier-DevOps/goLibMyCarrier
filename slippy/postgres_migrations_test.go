@@ -241,12 +241,12 @@ func TestUniquenessMigration_V5(t *testing.T) {
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
 
 	migs := mgr.GenerateMigrations()
-	require.Len(t, migs, 7, "v1-v4, v5 (DEVOPS-231 Phase B), v6 (DEVOPS-367), v7 (DEVOPS-320)")
+	require.Len(t, migs, 8, "v1-v4, v5 (DEVOPS-231 Phase B), v6 (DEVOPS-367), v7 (DEVOPS-320), v8 (DEVOPS-501)")
 	v5 := migs[4]
 	assert.Equal(t, 5, v5.Version)
 	assert.Equal(t, "one_slip_per_commit", v5.Name)
-	assert.Equal(t, 7, mgr.LatestVersion(), "v7 (DEVOPS-320) is now latest; v5's own version is asserted above")
-	assert.Equal(t, 7, GetPostgresDynamicMigrationVersion(cfg))
+	assert.Equal(t, 8, mgr.LatestVersion(), "v8 (DEVOPS-501) is now latest; v5's own version is asserted above")
+	assert.Equal(t, 8, GetPostgresDynamicMigrationVersion(cfg))
 
 	// Every assertion below runs against the SQL with -- comments stripped, because they are all
 	// about what the migration EXECUTES, not how it is documented. No comment supplies any of
@@ -316,7 +316,7 @@ func TestUniquenessMigration_V5(t *testing.T) {
 func TestClaimedFromMigration_V6(t *testing.T) {
 	cfg := pgTestPipelineConfig(t)
 	migs := NewPostgresDynamicMigrationManager(cfg, nil).GenerateMigrations()
-	require.Len(t, migs, 7, "v6 (DEVOPS-367) sits under v7 (DEVOPS-320)")
+	require.Len(t, migs, 8, "v6 (DEVOPS-367) sits under v7 (DEVOPS-320) and v8 (DEVOPS-501)")
 	v6 := migs[5]
 
 	assert.Equal(t, 6, v6.Version)
@@ -398,13 +398,13 @@ func TestSlipRollbacksMigration_V7(t *testing.T) {
 	cfg := pgTestPipelineConfig(t)
 	mgr := NewPostgresDynamicMigrationManager(cfg, nil)
 	migs := mgr.GenerateMigrations()
-	require.Len(t, migs, 7, "DEVOPS-320 adds migration v7 on top of v1-v6")
+	require.Len(t, migs, 8, "DEVOPS-320 adds migration v7 on top of v1-v6; v8 (DEVOPS-501) follows it")
 	v7 := migs[6]
 
 	assert.Equal(t, 7, v7.Version)
 	assert.Equal(t, "create_slip_rollbacks", v7.Name)
-	assert.Equal(t, 7, mgr.LatestVersion())
-	assert.Equal(t, 7, GetPostgresDynamicMigrationVersion(cfg))
+	assert.Equal(t, 8, mgr.LatestVersion())
+	assert.Equal(t, 8, GetPostgresDynamicMigrationVersion(cfg))
 
 	up := stripSQLLineComments(v7.UpSQL)
 	for _, want := range []string{
