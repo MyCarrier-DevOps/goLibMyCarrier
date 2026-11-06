@@ -432,3 +432,326 @@ func TestTokenSourceExchange(t *testing.T) {
 		t.Errorf("scope = %q, want %q", got, "https://api.botframework.com/.default")
 	}
 }
+
+const (
+	threadConvID = "19:abc@thread.tacv2;messageid=1730918805123"
+	threadActID  = "1730918805123"
+	threadPath   = "/v3/conversations/19:abc@thread.tacv2;messageid=1730918805123/activities/1730918805123"
+	// threadRawPath is how the escaped IDs appear on the wire: ";" is a
+	// path-segment delimiter and must not reach the server unescaped.
+	threadRawPath = "/v3/conversations/19:abc@thread.tacv2%3Bmessageid=1730918805123/activities/1730918805123"
+)
+
+func threadCard() Activity {
+	return AdaptiveCardActivity(json.RawMessage(`{"type":"AdaptiveCard"}`))
+}
+
+type seenRequest struct {
+	method, path, rawPath, requestURI, auth, contentType string
+	body                                                 map[string]any
+}
+
+func recordingServer(t *testing.T, status int, respBody string, got *seenRequest) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got.method = r.Method
+		got.path = r.URL.Path
+		got.rawPath = r.URL.RawPath
+		got.requestURI = r.RequestURI
+		got.auth = r.Header.Get("Authorization")
+		got.contentType = r.Header.Get("Content-Type")
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &got.body)
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(respBody))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func checkThreadRequest(t *testing.T, got seenRequest, method string) {
+	t.Helper()
+	if got.method != method {
+		t.Errorf("method = %q, want %q", got.method, method)
+	}
+	if got.path != threadPath {
+		t.Errorf("decoded path = %q, want %q", got.path, threadPath)
+	}
+	if got.requestURI != threadRawPath {
+		t.Errorf("request URI = %q, want %q", got.requestURI, threadRawPath)
+	}
+	if !strings.Contains(got.requestURI, "%3B") {
+		t.Errorf("';' is not escaped in %q", got.requestURI)
+	}
+	if got.auth != "Bearer test-token" {
+		t.Errorf("auth = %q", got.auth)
+	}
+	if got.contentType != "application/json" {
+		t.Errorf("Content-Type = %q", got.contentType)
+	}
+}
+
+func TestUpdateActivity_PutsToEscapedPath(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusOK, `{"id":"ignored"}`, &got)
+
+	err := staticClient(t, srv.URL).UpdateActivity(context.Background(), threadConvID, threadActID, threadCard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	checkThreadRequest(t, got, http.MethodPut)
+	if got.body["id"] != threadActID {
+		t.Errorf("body id = %v, want %q", got.body["id"], threadActID)
+	}
+	if _, ok := got.body["replyToId"]; ok {
+		t.Errorf("update body must not carry replyToId: %v", got.body)
+	}
+	if got.body["type"] != "message" {
+		t.Errorf("body type = %v", got.body["type"])
+	}
+	atts, _ := got.body["attachments"].([]any)
+	if len(atts) != 1 {
+		t.Fatalf("attachments = %v", got.body["attachments"])
+	}
+}
+
+func TestUpdateActivity_EmptyBodySuccess(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusNoContent, ``, &got)
+	if err := staticClient(
+		t,
+		srv.URL,
+	).UpdateActivity(context.Background(), threadConvID, threadActID, threadCard()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestUpdateActivity_OverridesCallerID(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusOK, ``, &got)
+	act := threadCard()
+	act.ID = "stale"
+	act.ReplyToID = "stale-reply"
+	if err := staticClient(
+		t,
+		srv.URL,
+	).UpdateActivity(context.Background(), threadConvID, threadActID, act); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.body["id"] != threadActID {
+		t.Errorf("body id = %v, want %q", got.body["id"], threadActID)
+	}
+}
+
+func TestReplyToActivity_PostsAndReturnsNewActivityID(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusCreated, `{"id":"999"}`, &got)
+
+	res, err := staticClient(t, srv.URL).ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res != (SendResult{ConversationID: threadConvID, ActivityID: "999"}) {
+		t.Fatalf("got %+v", res)
+	}
+	checkThreadRequest(t, got, http.MethodPost)
+	if got.body["replyToId"] != threadActID {
+		t.Errorf("body replyToId = %v, want %q", got.body["replyToId"], threadActID)
+	}
+	if _, ok := got.body["id"]; ok {
+		t.Errorf("reply body must not carry id: %v", got.body)
+	}
+}
+
+func TestReplyToActivity_EmptyBodySuccess(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusOK, ``, &got)
+	res, err := staticClient(t, srv.URL).ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res != (SendResult{ConversationID: threadConvID}) {
+		t.Fatalf("got %+v", res)
+	}
+}
+
+func TestReplyToActivity_OverridesCallerReplyToID(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusOK, `{"id":"1"}`, &got)
+	act := threadCard()
+	act.ID = "stale"
+	act.ReplyToID = "stale-reply"
+	if _, err := staticClient(
+		t,
+		srv.URL,
+	).ReplyToActivity(context.Background(), threadConvID, threadActID, act); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.body["replyToId"] != threadActID {
+		t.Errorf("body replyToId = %v, want %q", got.body["replyToId"], threadActID)
+	}
+}
+
+func TestReplyToActivity_BadBody(t *testing.T) {
+	tests := []struct {
+		name, body, wantSub string
+	}{
+		{"malformed", `{not json`, "decode response"},
+		{"oversized", `{"id":"` + strings.Repeat("a", maxResponseBody) + `"}`, "exceeds"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got seenRequest
+			srv := recordingServer(t, http.StatusOK, tt.body, &got)
+			_, err := staticClient(
+				t,
+				srv.URL,
+			).ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard())
+			if !errors.Is(err, ErrBadResponse) || !strings.Contains(err.Error(), tt.wantSub) {
+				t.Fatalf("want ErrBadResponse containing %q, got %v", tt.wantSub, err)
+			}
+		})
+	}
+}
+
+func TestUpdateActivity_Non2xxIsAPIError(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusNotFound, `{"error":{"code":"ActivityNotFound","message":"gone"}}`, &got)
+
+	err := staticClient(t, srv.URL).UpdateActivity(context.Background(), threadConvID, threadActID, threadCard())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusNotFound || apiErr.Code != "ActivityNotFound" {
+		t.Fatalf("want 404 APIError, got %v", err)
+	}
+}
+
+func TestReplyToActivity_Non2xxIsAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"code":"Throttled","message":"slow down"}}`))
+	}))
+	defer srv.Close()
+
+	res, err := staticClient(t, srv.URL).ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTooManyRequests || apiErr.RetryAfter != 7 {
+		t.Fatalf("want 429 APIError with RetryAfter 7, got %v", err)
+	}
+	if res != (SendResult{}) {
+		t.Errorf("result on error = %+v, want zero", res)
+	}
+}
+
+func TestThreadCalls_RejectEmptyIDs(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := staticClient(t, srv.URL)
+
+	ids := []struct{ name, conv, act string }{
+		{"empty conversation", "", threadActID},
+		{"empty activity", threadConvID, ""},
+		{"blank conversation", "  ", threadActID},
+		{"blank activity", threadConvID, " \t"},
+	}
+	for _, id := range ids {
+		t.Run("update/"+id.name, func(t *testing.T) {
+			if err := c.UpdateActivity(context.Background(), id.conv, id.act, threadCard()); err == nil {
+				t.Error("expected error")
+			}
+		})
+		t.Run("reply/"+id.name, func(t *testing.T) {
+			res, err := c.ReplyToActivity(context.Background(), id.conv, id.act, threadCard())
+			if err == nil {
+				t.Error("expected error")
+			}
+			if res != (SendResult{}) {
+				t.Errorf("result = %+v, want zero", res)
+			}
+		})
+	}
+	if hits != 0 {
+		t.Errorf("server got %d requests, want 0", hits)
+	}
+}
+
+func TestThreadCalls_RejectEmptyAttachmentContent(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	c := staticClient(t, srv.URL)
+	for _, content := range []string{``, `  `, `null`} {
+		act := Activity{
+			Type:        "message",
+			Attachments: []Attachment{{ContentType: AdaptiveCardContentType, Content: json.RawMessage(content)}},
+		}
+		if err := c.UpdateActivity(context.Background(), threadConvID, threadActID, act); err == nil ||
+			!strings.Contains(err.Error(), "attachment 0 has no content") {
+			t.Errorf("update %q: got %v", content, err)
+		}
+		if _, err := c.ReplyToActivity(context.Background(), threadConvID, threadActID, act); err == nil ||
+			!strings.Contains(err.Error(), "attachment 0 has no content") {
+			t.Errorf("reply %q: got %v", content, err)
+		}
+	}
+	if hits != 0 {
+		t.Errorf("server got %d requests, want 0", hits)
+	}
+}
+
+func TestThreadCalls_TokenError(t *testing.T) {
+	cfg := &Config{AppID: "id", AppSecret: "s", TenantID: "t", ServiceURL: "http://unused.test"}
+	c := NewClient(cfg, WithTokenSource(errTokenSource{}))
+	if err := c.UpdateActivity(context.Background(), threadConvID, threadActID, threadCard()); err == nil ||
+		!strings.Contains(err.Error(), "acquire token") {
+		t.Errorf("update: got %v", err)
+	}
+	if _, err := c.ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard()); err == nil ||
+		!strings.Contains(err.Error(), "acquire token") {
+		t.Errorf("reply: got %v", err)
+	}
+}
+
+func TestThreadCalls_InitError(t *testing.T) {
+	c := NewClient(&Config{ServiceURL: "http://insecure.test"},
+		WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "x"})))
+	if err := c.UpdateActivity(context.Background(), threadConvID, threadActID, threadCard()); err == nil {
+		t.Error("update: expected init error")
+	}
+	if _, err := c.ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard()); err == nil {
+		t.Error("reply: expected init error")
+	}
+}
+
+func TestThreadCalls_RedirectNotFollowed(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://evil.test/", http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+	err := staticClient(t, srv.URL).UpdateActivity(context.Background(), threadConvID, threadActID, threadCard())
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("want 307 APIError, got %v", err)
+	}
+}
+
+func TestThreadCalls_ServiceURLTrim(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusOK, `{"id":"1"}`, &got)
+	if err := staticClient(
+		t,
+		srv.URL+"/",
+	).UpdateActivity(context.Background(), threadConvID, threadActID, threadCard()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.requestURI != threadRawPath {
+		t.Errorf("request URI = %q", got.requestURI)
+	}
+}

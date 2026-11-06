@@ -11,6 +11,10 @@ type Activity struct {
 	Type        string       `json:"type"`
 	Text        string       `json:"text,omitempty"`
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// ID names the activity to replace. UpdateActivity sets it.
+	ID string `json:"id,omitempty"`
+	// ReplyToID names the activity to reply to. ReplyToActivity sets it.
+	ReplyToID string `json:"replyToId,omitempty"`
 }
 
 // Attachment carries a card (or other content) on an Activity. Content is opaque

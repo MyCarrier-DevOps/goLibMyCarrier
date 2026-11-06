@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -126,6 +127,18 @@ func NewClientFromEnv(opts ...Option) (*Client, error) {
 	return NewClient(cfg, opts...), nil
 }
 
+// ThreadSender extends Sender with calls that edit a posted activity in place
+// and reply in its thread. Client implements it; teamsbottest.MockSender is the
+// test double. Sender itself is unchanged so existing implementations keep
+// compiling.
+type ThreadSender interface {
+	Sender
+	UpdateActivity(ctx context.Context, conversationID, activityID string, act Activity) error
+	ReplyToActivity(ctx context.Context, conversationID, activityID string, act Activity) (SendResult, error)
+}
+
+var _ ThreadSender = (*Client)(nil)
+
 // SendToChannel posts act to the Teams channel identified by channelID within
 // tenantID, creating a new conversation (thread) with the activity embedded. It
 // returns the resulting conversation and activity IDs. On any non-2xx response
@@ -141,11 +154,6 @@ func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, 
 	if strings.TrimSpace(tenantID) == "" {
 		return zero, fmt.Errorf("teamsbot: tenantID is required")
 	}
-	for i := range act.Attachments {
-		if c := bytes.TrimSpace(act.Attachments[i].Content); len(c) == 0 || string(c) == "null" {
-			return zero, fmt.Errorf("teamsbot: attachment %d has no content", i)
-		}
-	}
 
 	params := conversationParameters{
 		IsGroup: true,
@@ -155,50 +163,126 @@ func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, 
 		},
 		Activity: act,
 	}
-	body, err := json.Marshal(params)
+	var result SendResult
+	if err := c.do(ctx, http.MethodPost, "/v3/conversations", params, act.Attachments, &result); err != nil {
+		return zero, err
+	}
+	return result, nil
+}
+
+// UpdateActivity replaces the activity activityID in conversation
+// conversationID with act, editing the posted message in place. A 2xx response
+// is success and its body is ignored. On any non-2xx response it returns an
+// *APIError.
+func (c *Client) UpdateActivity(ctx context.Context, conversationID, activityID string, act Activity) error {
+	if c.initErr != nil {
+		return c.initErr
+	}
+	path, err := activityPath(conversationID, activityID)
 	if err != nil {
-		return zero, fmt.Errorf("teamsbot: marshal conversation: %w", err)
+		return err
+	}
+	act.ID = activityID
+	return c.do(ctx, http.MethodPut, path, act, act.Attachments, nil)
+}
+
+// ReplyToActivity posts act as a reply to activity activityID in conversation
+// conversationID. It returns the conversation ID and the ID of the new reply
+// activity. On any non-2xx response it returns an *APIError.
+func (c *Client) ReplyToActivity(
+	ctx context.Context,
+	conversationID, activityID string,
+	act Activity,
+) (SendResult, error) {
+	var zero SendResult
+	if c.initErr != nil {
+		return zero, c.initErr
+	}
+	path, err := activityPath(conversationID, activityID)
+	if err != nil {
+		return zero, err
+	}
+	act.ReplyToID = activityID
+	// The reply response carries the new activity's ID in "id". SendResult's
+	// "id" tag is the conversation ID, so decode into a private struct.
+	var resp struct {
+		ID string `json:"id"`
+	}
+	if err := c.do(ctx, http.MethodPost, path, act, act.Attachments, &resp); err != nil {
+		return zero, err
+	}
+	return SendResult{ConversationID: conversationID, ActivityID: resp.ID}, nil
+}
+
+// activityPath builds the Bot Connector path of one activity. Each ID is
+// escaped as a path segment: Teams conversation IDs contain ";" and "@".
+func activityPath(conversationID, activityID string) (string, error) {
+	if strings.TrimSpace(conversationID) == "" {
+		return "", fmt.Errorf("teamsbot: conversationID is required")
+	}
+	if strings.TrimSpace(activityID) == "" {
+		return "", fmt.Errorf("teamsbot: activityID is required")
+	}
+	return "/v3/conversations/" + url.PathEscape(conversationID) +
+		"/activities/" + url.PathEscape(activityID), nil
+}
+
+// do sends one JSON request to the Bot Connector and decodes a 2xx body into
+// out. A nil out ignores the body. An empty 2xx body is success. Non-2xx
+// responses become an *APIError. path must already be escaped.
+func (c *Client) do(
+	ctx context.Context,
+	method, path string,
+	payload any,
+	attachments []Attachment,
+	out any,
+) error {
+	for i := range attachments {
+		if c := bytes.TrimSpace(attachments[i].Content); len(c) == 0 || string(c) == "null" {
+			return fmt.Errorf("teamsbot: attachment %d has no content", i)
+		}
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("teamsbot: marshal request: %w", err)
 	}
 
 	token, err := c.tokenSource.Token()
 	if err != nil {
-		return zero, fmt.Errorf("teamsbot: acquire token: %w", err)
+		return fmt.Errorf("teamsbot: acquire token: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		c.serviceURL+"/v3/conversations",
-		bytes.NewReader(body),
-	)
+	req, err := http.NewRequestWithContext(ctx, method, c.serviceURL+path, bytes.NewReader(body))
 	if err != nil {
-		return zero, fmt.Errorf("teamsbot: build request: %w", err)
+		return fmt.Errorf("teamsbot: build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	token.SetAuthHeader(req)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return zero, fmt.Errorf("teamsbot: send request: %w", err)
+		return fmt.Errorf("teamsbot: send request: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // best-effort close
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return zero, parseAPIError(resp)
+		return parseAPIError(resp)
+	}
+	if out == nil {
+		return nil
 	}
 
-	var result SendResult
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(&result); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(out); err != nil {
 		switch {
 		case errors.Is(err, io.EOF):
 			// 200/204 with an empty body: the status already said the activity
 			// was accepted, so there is nothing to decode and nothing failed.
-			return result, nil
+			return nil
 		case errors.Is(err, io.ErrUnexpectedEOF):
-			return zero, fmt.Errorf("%w: body exceeds %d bytes", ErrBadResponse, maxResponseBody)
+			return fmt.Errorf("%w: body exceeds %d bytes", ErrBadResponse, maxResponseBody)
 		default:
-			return zero, fmt.Errorf("%w: %w", ErrBadResponse, err)
+			return fmt.Errorf("%w: %w", ErrBadResponse, err)
 		}
 	}
-	return result, nil
+	return nil
 }
