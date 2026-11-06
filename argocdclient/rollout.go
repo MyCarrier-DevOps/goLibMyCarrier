@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"time"
 )
 
 // CorrelationIDLabel is the Rollout label that carries the pipeline correlation ID.
@@ -99,6 +100,8 @@ type StepPluginStatus struct {
 	Operation StepPluginOperation `json:"operation"`
 	Phase     StepPluginPhase     `json:"phase"`
 	Message   string              `json:"message"`
+	// FinishedAt is the entry's finishedAt: when the step plugin operation ended. nil while it runs.
+	FinishedAt *time.Time `json:"finishedAt"`
 }
 
 // CanaryStep is what RolloutStatus reports of one entry of spec.strategy.canary.steps.
@@ -142,6 +145,11 @@ type RolloutStatus struct {
 	// not reset it. With StepPluginStatuses it proves that the Rollout completed every step before a
 	// plugin step that has a Run entry, and nothing about a later step.
 	CanarySteps []CanaryStep
+	// PausedAt is the lastTransitionTime of the live Rollout's Paused condition while that condition is
+	// True; nil otherwise. An abort resets status.pauseConditions, but the controller stops updating the
+	// Paused condition once the Rollout is aborted (Argo Rollouts v1.10.0 rollout/sync.go:510), so after
+	// an abort it still tells when the Rollout last paused.
+	PausedAt *time.Time
 	// UID is metadata.uid of the live Rollout.
 	UID string
 	// StableRS is status.stableRS of the live Rollout.
@@ -243,6 +251,11 @@ type liveRollout struct {
 			} `json:"weights"`
 			StepPluginStatuses []StepPluginStatus `json:"stepPluginStatuses"`
 		} `json:"canary"`
+		Conditions []struct {
+			Type               string     `json:"type"`
+			Status             string     `json:"status"`
+			LastTransitionTime *time.Time `json:"lastTransitionTime"`
+		} `json:"conditions"`
 	} `json:"status"`
 }
 
@@ -340,6 +353,7 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 		CanaryWeight:         canaryWeight(live),
 		StepPluginStatuses:   live.Status.Canary.StepPluginStatuses,
 		CanarySteps:          canarySteps(live.Spec.Strategy.Canary),
+		PausedAt:             pausedAt(live),
 		UID:                  live.Metadata.UID,
 		StableRS:             live.Status.StableRS,
 		CurrentPodHash:       live.Status.CurrentPodHash,
@@ -351,6 +365,16 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 		Generation:           live.Metadata.Generation,
 		ObservedGeneration:   live.Status.ObservedGen,
 	}
+}
+
+// pausedAt returns the lastTransitionTime of live's Paused condition while it is True, or nil.
+func pausedAt(live liveRollout) *time.Time {
+	for _, c := range live.Status.Conditions {
+		if c.Type == "Paused" && c.Status == "True" {
+			return c.LastTransitionTime
+		}
+	}
+	return nil
 }
 
 // canarySteps projects spec.strategy.canary.steps, or returns nil when the Rollout has no canary strategy.

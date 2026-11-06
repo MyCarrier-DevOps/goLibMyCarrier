@@ -386,8 +386,9 @@ are returned wrapped as-is.
 | `CurrentStepIndex` | live Rollout | `status.currentStepIndex`; `nil` when unset |
 | `Aborted` | live Rollout | `status.abort` |
 | `CanaryWeight` | live Rollout | Percentage of traffic on the canary, see below |
-| `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, operation, phase, message) |
+| `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, operation, phase, message, `FinishedAt`: the entry's `finishedAt`, `nil` while it runs) |
 | `CanarySteps` | live Rollout | `spec.strategy.canary.steps` by index: each step's `SetWeight` (0 when it sets none) and `Waits` (true for a `pause`, `analysis`, `experiment` or `plugin` step); `nil` without a canary strategy. An abort resets `CurrentStepIndex` and `CanaryWeight` but not these. With `StepPluginStatuses` they prove that the Rollout completed every step before a plugin step that has a `Run` entry, and nothing about a later step: a Rollout can stay on a `setWeight` or `setCanaryScale` step until its canary pods are available, and the controller completes at most one step per reconcile |
+| `PausedAt` | live Rollout | `lastTransitionTime` of the `Paused` condition while it is `True`, else `nil`. An abort resets `pauseConditions` but stops updating this condition, so after an abort it still tells when the Rollout last paused |
 | `UID` | live Rollout | `metadata.uid` |
 | `StableRS` | live Rollout | `status.stableRS` |
 | `CurrentPodHash` | live Rollout | `status.currentPodHash` |
