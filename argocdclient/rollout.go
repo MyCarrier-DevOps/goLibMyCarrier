@@ -101,6 +101,15 @@ type StepPluginStatus struct {
 	Message   string              `json:"message"`
 }
 
+// CanaryStep is what RolloutStatus reports of one entry of spec.strategy.canary.steps.
+type CanaryStep struct {
+	// SetWeight is the step's setWeight, 0 when it sets none.
+	SetWeight int32
+	// Waits is true for a step the Rollout can wait at across reconciles: a pause, analysis,
+	// experiment or plugin step. The steps between two waiting steps run within one reconcile.
+	Waits bool
+}
+
 // RolloutStatus is the combined state of one Rollout in an Application.
 //
 // Ref, Health and Message come from the Application's resource-tree node.
@@ -127,6 +136,10 @@ type RolloutStatus struct {
 	CanaryWeight int32
 	// StepPluginStatuses is status.canary.stepPluginStatuses of the live Rollout.
 	StepPluginStatuses []StepPluginStatus
+	// CanarySteps is spec.strategy.canary.steps of the live Rollout, by step index. It is nil when
+	// the Rollout has no canary strategy. Unlike CurrentStepIndex and CanaryWeight, an abort does
+	// not reset it, so with StepPluginStatuses it still tells which steps the Rollout passed.
+	CanarySteps []CanaryStep
 	// UID is metadata.uid of the live Rollout.
 	UID string
 	// StableRS is status.stableRS of the live Rollout.
@@ -233,7 +246,11 @@ type liveRollout struct {
 
 type canaryStrategy struct {
 	Steps []struct {
-		SetWeight *int32 `json:"setWeight"`
+		SetWeight  *int32           `json:"setWeight"`
+		Pause      *json.RawMessage `json:"pause"`
+		Analysis   *json.RawMessage `json:"analysis"`
+		Experiment *json.RawMessage `json:"experiment"`
+		Plugin     *json.RawMessage `json:"plugin"`
 	} `json:"steps"`
 	TrafficRouting *struct {
 		MaxTrafficWeight *int32 `json:"maxTrafficWeight"`
@@ -320,6 +337,7 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 		Aborted:              live.Status.Abort,
 		CanaryWeight:         canaryWeight(live),
 		StepPluginStatuses:   live.Status.Canary.StepPluginStatuses,
+		CanarySteps:          canarySteps(live.Spec.Strategy.Canary),
 		UID:                  live.Metadata.UID,
 		StableRS:             live.Status.StableRS,
 		CurrentPodHash:       live.Status.CurrentPodHash,
@@ -331,6 +349,21 @@ func newRolloutStatus(node resourceNode, live liveRollout) RolloutStatus {
 		Generation:           live.Metadata.Generation,
 		ObservedGeneration:   live.Status.ObservedGen,
 	}
+}
+
+// canarySteps projects spec.strategy.canary.steps, or returns nil when the Rollout has no canary strategy.
+func canarySteps(canary *canaryStrategy) []CanaryStep {
+	if canary == nil {
+		return nil
+	}
+	steps := make([]CanaryStep, len(canary.Steps))
+	for i, step := range canary.Steps {
+		if step.SetWeight != nil {
+			steps[i].SetWeight = *step.SetWeight
+		}
+		steps[i].Waits = step.Pause != nil || step.Analysis != nil || step.Experiment != nil || step.Plugin != nil
+	}
+	return steps
 }
 
 // strategyOf returns the RolloutStrategy* value for the strategy block live declares, or "".

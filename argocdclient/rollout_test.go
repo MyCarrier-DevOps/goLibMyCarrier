@@ -183,6 +183,66 @@ func TestDecodeRollout(t *testing.T) {
 	}
 }
 
+func TestCanarySteps(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     []CanaryStep
+	}{
+		{
+			name:     "no strategy",
+			manifest: `{"spec":{}}`,
+			want:     nil,
+		},
+		{
+			name:     "blue-green",
+			manifest: `{"spec":{"strategy":{"blueGreen":{"activeService":"api"}}}}`,
+			want:     nil,
+		},
+		{
+			name:     "canary without steps",
+			manifest: `{"spec":{"strategy":{"canary":{}}}}`,
+			want:     []CanaryStep{},
+		},
+		{
+			name: "each waiting kind waits, the others do not",
+			manifest: `{"spec":{"strategy":{"canary":{"steps":[
+				{"plugin":{"name":"example/barrier","config":{"barrier":"start"}}},
+				{"setWeight":10},
+				{"analysis":{"templates":[{"templateName":"health"}]}},
+				{"pause":{"duration":"1m"}},
+				{"setCanaryScale":{"replicas":1}},
+				{"experiment":{"templates":[{"name":"baseline","specRef":"stable"}]}},
+				{"setWeight":0},
+				{"pause":{}}]}}}}`,
+			want: []CanaryStep{
+				{Waits: true},
+				{SetWeight: 10},
+				{Waits: true},
+				{Waits: true},
+				{},
+				{Waits: true},
+				{},
+				{Waits: true},
+			},
+		},
+		{
+			name: "an abort resets the status but not the steps",
+			manifest: `{"spec":{"strategy":{"canary":{"steps":[{"plugin":{"name":"example/barrier"}},{"setWeight":10},
+				{"analysis":{}}]}}},"status":{"abort":true,"currentStepIndex":0,"canary":{"weights":{"canary":{"weight":0}}}}}`,
+			want: []CanaryStep{{Waits: true}, {SetWeight: 10}, {Waits: true}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := newRolloutStatus(resourceNode{}, mustDecodeRollout(t, tt.manifest)).CanarySteps
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("CanarySteps = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestDecodeRollout_InvalidJSON(t *testing.T) {
 	if _, err := decodeRollout("not json"); err == nil {
 		t.Fatal("expected error for invalid JSON")
@@ -215,6 +275,11 @@ func TestNewRolloutStatus(t *testing.T) {
 		// Labels come from realisticRollout metadata.labels. The fixture has no uid, stableRS,
 		// currentPodHash, annotations, Istio virtual services or managedRoutes, so those stay empty.
 		Labels: map[string]string{CorrelationIDLabel: "corr-1", "app": "api"},
+		CanarySteps: []CanaryStep{
+			{SetWeight: 50},
+			{Waits: true},
+			{SetWeight: 100},
+		},
 		StepPluginStatuses: []StepPluginStatus{
 			{
 				Index:     0,
@@ -386,12 +451,17 @@ func rolloutRef(name string) ResourceRef {
 // fixtureLive holds the identity-bound live fields of each recorded Rollout manifest in
 // testdata/resource-<name>-<state>.json: metadata.uid, the correlation label value and the
 // single trafficRouting.istio.virtualService name (equal to the rollout name in every fixture).
-// The fixtures set no trafficRouting.managedRoutes, so ManagedRoutes is nil.
+// The fixtures set no trafficRouting.managedRoutes, so ManagedRoutes is nil. Every fixture has the
+// canary steps fixtureSteps.
 var fixtureLive = map[string]struct{ uid, group string }{
 	"rt-api":    {"afc0e4fd-69c8-48ff-8455-aff9e3909d68", fixtureGroupA},
 	"rt-worker": {"759734b8-af00-4e55-97f3-27fafb89bd0d", fixtureGroupA},
 	"rt-other":  {"358be5b9-f474-4f3c-a9c5-3b4258e0d3d3", fixtureGroupB},
 }
+
+// fixtureSteps are the canary steps of every recorded Rollout: setWeight 50, pause, setWeight 75, pause,
+// setWeight 100.
+var fixtureSteps = []CanaryStep{{SetWeight: 50}, {Waits: true}, {SetWeight: 75}, {Waits: true}, {SetWeight: 100}}
 
 // fixtureStatus builds the expected status of a recorded Rollout. stableRS and podHash are the
 // manifest's status.stableRS and status.currentPodHash, which differ per state.
@@ -409,6 +479,7 @@ func fixtureStatus(
 		Aborted:            aborted,
 		CanaryWeight:       weight,
 		StepPluginStatuses: nil,
+		CanarySteps:        fixtureSteps,
 		UID:                live.uid,
 		StableRS:           stableRS,
 		CurrentPodHash:     podHash,
