@@ -146,9 +146,11 @@ type RolloutStatus struct {
 	// plugin step that has a Run entry, and nothing about a later step.
 	CanarySteps []CanaryStep
 	// PausedAt is the lastTransitionTime of the live Rollout's Paused condition while that condition is
-	// True; nil otherwise. An abort resets status.pauseConditions, but the controller stops updating the
-	// Paused condition once the Rollout is aborted (Argo Rollouts v1.10.0 rollout/sync.go:510), so after
-	// an abort it still tells when the Rollout last paused.
+	// True; nil otherwise. The condition is also True for a manual pause (spec.paused) or an inconclusive
+	// background analysis, so PausedAt alone does not prove the Rollout reached a pause step. An abort
+	// resets status.pauseConditions, but the controller stops updating the Paused condition once the
+	// Rollout is aborted (Argo Rollouts v1.10.0 rollout/sync.go:510), so after an abort it tells when a
+	// pause still in effect at the abort began. The time has one-second resolution.
 	PausedAt *time.Time
 	// UID is metadata.uid of the live Rollout.
 	UID string
