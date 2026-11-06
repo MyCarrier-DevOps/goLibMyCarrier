@@ -25,7 +25,9 @@ func (c *Client) FailStep(ctx context.Context, correlationID, stepName, componen
 //
 // claimedBy names the run that starts the step (the CLI's workflow name). The store records it
 // while the step is running, and a start that names none leaves the step unclaimed, so a reader
-// deciding whether a running step belongs to a run reads an empty claimant as not its own.
+// deciding whether a running step belongs to a run reads an empty claimant as not its own. That
+// read is not atomic with a later write: another run of the same slip can start the step between
+// the read and the reader's close, and the close then lands on that run's step.
 func (c *Client) StartStep(ctx context.Context, correlationID, stepName, componentName, claimedBy string) error {
 	return c.updateStep(ctx, correlationID, stepName, componentName, StepStatusRunning, "step started", claimedBy)
 }

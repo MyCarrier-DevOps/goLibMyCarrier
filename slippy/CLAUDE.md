@@ -476,12 +476,16 @@ also be ended with `POST /v1/slips/{id}/abandon`; an already-terminal one ignore
 (I4) and keeps its claim, so use the step-then-release route there. Then re-run the down.
 
 **Migration v8 (`slip_component_states.claimed_by`, DEVOPS-501) rollout order.** `Load`,
-`FindByCommits` and `FindAllByCommits` read `claimed_by` to fill `Step.ClaimedBy`, so a library
-at or past this version fails every slip read with Postgres 42703 against a database still at v7.
+`FindByCommits` and `FindAllByCommits` read `claimed_by` to fill `Step.ClaimedBy`, and every step
+write names it in the `slip_component_states` upsert, so a library at or past this version fails
+every slip read and every step write with Postgres 42703 against a database still at v7.
 `PostgresStore.ProbeSchema` checks for the column (`probeStepClaimant`) and reports
 `ErrSchemaBehind`, so a consumer that calls it at startup refuses to serve until the migrator has
 applied v8, as for v6. The column is nullable with no default and no backfill, and v8's down
 drops it (the data is only the current claimant of running steps, so nothing needs draining).
+Roll every consumer back to a library before this version first: the down breaks every slip read
+and step write of a process still on it, and `ProbeSchema` is a startup check, so a pod that is
+already serving does not notice.
 `StartStep` takes the claimant as its last argument and `PreExecutionOptions` carries it as
 `ClaimedBy`; both doubles (`slippytest.MockStore` and the in-package `MockStore`) report it as the
 store does, and `slippytest.RunClaimContract` pins the three implementers together.

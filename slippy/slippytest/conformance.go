@@ -321,6 +321,22 @@ func stepClaimantContractCases(id string) []ClaimContractCase {
 			Check: wantClaimant(""),
 		},
 		{
+			// The claimant of a component-scoped start lives on that component's row, which the
+			// read of a step does not return, so every implementer shows the step unclaimed.
+			Name: "a component-scoped start shows no claimant on the step",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.UpdateStepWithHistory(ctx, id, "builds", "api", slippy.StepStatusRunning,
+					slippy.StateHistoryEntry{Step: "builds", Component: "api", Status: slippy.StepStatusRunning,
+						Actor: slippy.LibraryActor, ClaimedBy: "wf-a"})
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "component-scoped start")
+				if got := slip.Steps["builds"].ClaimedBy; got != "" {
+					t.Errorf("builds claimed_by = %q after a component-scoped start, want none", got)
+				}
+			},
+		},
+		{
 			Name: "a step that is no longer running shows no claimant",
 			Run: func(ctx context.Context, s slippy.SlipStore) error {
 				if err := startAs("wf-a")(ctx, s); err != nil {

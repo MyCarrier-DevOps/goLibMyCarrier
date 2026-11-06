@@ -222,6 +222,8 @@ type Step struct {
 	// ClaimedBy names the run that started the step, and is set only while Status is running.
 	// A running step with no claimant was started by a caller that named none, so a reader
 	// deciding whether a step is its own must treat an empty ClaimedBy as not its own.
+	// The check is not atomic with a later write: another run of the same slip can start the
+	// step between the read and the reader's close, and the close then lands on that run's step.
 	ClaimedBy string `json:"claimed_by,omitempty"`
 }
 

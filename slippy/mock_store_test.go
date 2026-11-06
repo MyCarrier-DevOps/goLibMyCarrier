@@ -739,7 +739,9 @@ func (m *MockStore) UpdateStep(
 
 	step := slip.Steps[stepName]
 	step.Status = status
-	step.ClaimedBy = claimantFor(status, "")
+	if componentName == "" || status != StepStatusRunning {
+		step.ClaimedBy = ""
+	}
 	slip.Steps[stepName] = step
 
 	return nil
@@ -1021,7 +1023,11 @@ func (m *MockStore) UpdateStepWithHistory(
 	}
 	step := slip.Steps[stepName]
 	step.Status = status
-	step.ClaimedBy = claimantFor(status, entry.ClaimedBy)
+	if componentName == "" {
+		step.ClaimedBy = claimantFor(status, entry.ClaimedBy)
+	} else if status != StepStatusRunning {
+		step.ClaimedBy = ""
+	}
 	slip.Steps[stepName] = step
 
 	// Append history
