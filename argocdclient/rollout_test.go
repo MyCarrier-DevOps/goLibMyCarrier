@@ -548,7 +548,13 @@ var fixtureLive = map[string]struct {
 
 // fixtureSteps are the canary steps of every recorded Rollout: setWeight 50, pause, setWeight 75, pause,
 // setWeight 100.
-var fixtureSteps = []CanaryStep{{SetWeight: 50}, {Waits: true, UntimedPause: true}, {SetWeight: 75}, {Waits: true, UntimedPause: true}, {SetWeight: 100}}
+var fixtureSteps = []CanaryStep{
+	{SetWeight: 50},
+	{Waits: true, UntimedPause: true},
+	{SetWeight: 75},
+	{Waits: true, UntimedPause: true},
+	{SetWeight: 100},
+}
 
 // fixtureStatus builds the expected status of a recorded Rollout. stableRS and podHash are the
 // manifest's status.stableRS and status.currentPodHash, which differ per state.

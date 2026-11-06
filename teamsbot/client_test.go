@@ -541,6 +541,9 @@ func TestUpdateActivity_OverridesCallerID(t *testing.T) {
 	if got.body["id"] != threadActID {
 		t.Errorf("body id = %v, want %q", got.body["id"], threadActID)
 	}
+	if _, ok := got.body["replyToId"]; ok {
+		t.Errorf("update body must clear the caller's replyToId: %v", got.body)
+	}
 }
 
 func TestReplyToActivity_PostsAndReturnsNewActivityID(t *testing.T) {
@@ -589,6 +592,26 @@ func TestReplyToActivity_OverridesCallerReplyToID(t *testing.T) {
 	}
 	if got.body["replyToId"] != threadActID {
 		t.Errorf("body replyToId = %v, want %q", got.body["replyToId"], threadActID)
+	}
+	if _, ok := got.body["id"]; ok {
+		t.Errorf("reply body must clear the caller's id: %v", got.body)
+	}
+}
+
+func TestSendToChannel_ClearsActivityIDFields(t *testing.T) {
+	var got seenRequest
+	srv := recordingServer(t, http.StatusOK, `{"id":"c","activityId":"a"}`, &got)
+	act := threadCard()
+	act.ID = "stale"
+	act.ReplyToID = "stale-reply"
+	if _, err := staticClient(t, srv.URL).SendToChannel(context.Background(), "19:abc", "t", act); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	activity, _ := got.body["activity"].(map[string]any)
+	for _, k := range []string{"id", "replyToId"} {
+		if _, ok := activity[k]; ok {
+			t.Errorf("activity.%s must be cleared: %v", k, activity)
+		}
 	}
 }
 
@@ -719,14 +742,31 @@ func TestThreadCalls_TokenError(t *testing.T) {
 	}
 }
 
+type failTransport struct{ hits int }
+
+func (f *failTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	f.hits++
+	return nil, errors.New("unexpected request")
+}
+
 func TestThreadCalls_InitError(t *testing.T) {
-	c := NewClient(&Config{ServiceURL: "http://insecure.test"},
+	ft := &failTransport{}
+	c := NewClient(&Config{ServiceURL: "https://h/teams?x=1"},
+		WithHTTPClient(&http.Client{Transport: ft}),
 		WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "x"})))
-	if err := c.UpdateActivity(context.Background(), threadConvID, threadActID, threadCard()); err == nil {
-		t.Error("update: expected init error")
+	err := c.UpdateActivity(context.Background(), threadConvID, threadActID, threadCard())
+	if err == nil || !strings.Contains(err.Error(), "query or fragment") {
+		t.Errorf("update: got %v, want the ServiceURL shape error", err)
 	}
-	if _, err := c.ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard()); err == nil {
-		t.Error("reply: expected init error")
+	res, err := c.ReplyToActivity(context.Background(), threadConvID, threadActID, threadCard())
+	if err == nil || !strings.Contains(err.Error(), "query or fragment") {
+		t.Errorf("reply: got %v, want the ServiceURL shape error", err)
+	}
+	if res != (SendResult{}) {
+		t.Errorf("result = %+v, want zero", res)
+	}
+	if ft.hits != 0 {
+		t.Errorf("transport got %d requests, want 0", ft.hits)
 	}
 }
 

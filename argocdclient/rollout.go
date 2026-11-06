@@ -114,7 +114,8 @@ type CanaryStep struct {
 	Waits bool
 	// UntimedPause is true for a pause step with no duration (`pause: {}`). The Rollout waits there
 	// until a person promotes it. A pause with a duration, even `duration: 0`, is timed and is false.
-	// Argo Rollouts keeps RolloutPause.Duration as a pointer: only a nil Duration is indefinite.
+	// Argo Rollouts keeps RolloutPause.Duration as a pointer: only a nil Duration is indefinite
+	// (Argo Rollouts v1.10.0, rollout/canary.go:170 and rollout/pause.go:179).
 	UntimedPause bool
 }
 

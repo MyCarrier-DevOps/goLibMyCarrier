@@ -32,6 +32,7 @@ func TestMockSenderFuncOverride(t *testing.T) {
 		t.Fatalf("override not used: %v", err)
 	}
 }
+
 func TestMockSender_ThreadCallsDefaultToSuccess(t *testing.T) {
 	m := &MockSender{}
 	act := teamsbot.TextActivity("hi")

@@ -62,7 +62,8 @@ type tenantInfo struct {
 	ID string `json:"id"`
 }
 
-// SendResult is the Bot Connector response to a successful create-conversation.
+// SendResult identifies a posted activity. SendToChannel returns it from the
+// create-conversation response; ReplyToActivity returns it for the new reply.
 type SendResult struct {
 	ConversationID string `json:"id"`
 	ActivityID     string `json:"activityId"`

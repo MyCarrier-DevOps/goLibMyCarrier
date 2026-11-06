@@ -38,7 +38,7 @@ type Client struct {
 	tokenSource oauth2.TokenSource
 	httpClient  *http.Client
 	// initErr is set at construction time when serviceURL fails shape
-	// validation. NewClient has no error return, so SendToChannel surfaces it
+	// validation. NewClient has no error return, so the send methods surface it
 	// on first use instead of the client silently sending to a bad URL.
 	initErr error
 }
@@ -155,6 +155,11 @@ func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, 
 		return zero, fmt.Errorf("teamsbot: tenantID is required")
 	}
 
+	if err := validateAttachments(act.Attachments); err != nil {
+		return zero, err
+	}
+	// A new conversation has no activity to edit or reply to.
+	act.ID, act.ReplyToID = "", ""
 	params := conversationParameters{
 		IsGroup: true,
 		ChannelData: channelData{
@@ -164,7 +169,7 @@ func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, 
 		Activity: act,
 	}
 	var result SendResult
-	if err := c.do(ctx, http.MethodPost, "/v3/conversations", params, act.Attachments, &result); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v3/conversations", params, &result); err != nil {
 		return zero, err
 	}
 	return result, nil
@@ -182,13 +187,17 @@ func (c *Client) UpdateActivity(ctx context.Context, conversationID, activityID 
 	if err != nil {
 		return err
 	}
-	act.ID = activityID
-	return c.do(ctx, http.MethodPut, path, act, act.Attachments, nil)
+	if err := validateAttachments(act.Attachments); err != nil {
+		return err
+	}
+	act.ID, act.ReplyToID = activityID, ""
+	return c.do(ctx, http.MethodPut, path, act, nil)
 }
 
 // ReplyToActivity posts act as a reply to activity activityID in conversation
 // conversationID. It returns the conversation ID and the ID of the new reply
-// activity. On any non-2xx response it returns an *APIError.
+// activity. ActivityID is "" when the 2xx response has an empty body. On any
+// non-2xx response it returns an *APIError.
 func (c *Client) ReplyToActivity(
 	ctx context.Context,
 	conversationID, activityID string,
@@ -202,13 +211,16 @@ func (c *Client) ReplyToActivity(
 	if err != nil {
 		return zero, err
 	}
-	act.ReplyToID = activityID
+	if err := validateAttachments(act.Attachments); err != nil {
+		return zero, err
+	}
+	act.ID, act.ReplyToID = "", activityID
 	// The reply response carries the new activity's ID in "id". SendResult's
 	// "id" tag is the conversation ID, so decode into a private struct.
 	var resp struct {
 		ID string `json:"id"`
 	}
-	if err := c.do(ctx, http.MethodPost, path, act, act.Attachments, &resp); err != nil {
+	if err := c.do(ctx, http.MethodPost, path, act, &resp); err != nil {
 		return zero, err
 	}
 	return SendResult{ConversationID: conversationID, ActivityID: resp.ID}, nil
@@ -227,6 +239,17 @@ func activityPath(conversationID, activityID string) (string, error) {
 		"/activities/" + url.PathEscape(activityID), nil
 }
 
+// validateAttachments rejects an attachment with no content, which Teams would
+// render as an empty card.
+func validateAttachments(atts []Attachment) error {
+	for i := range atts {
+		if content := bytes.TrimSpace(atts[i].Content); len(content) == 0 || string(content) == "null" {
+			return fmt.Errorf("teamsbot: attachment %d has no content", i)
+		}
+	}
+	return nil
+}
+
 // do sends one JSON request to the Bot Connector and decodes a 2xx body into
 // out. A nil out ignores the body. An empty 2xx body is success. Non-2xx
 // responses become an *APIError. path must already be escaped.
@@ -234,14 +257,8 @@ func (c *Client) do(
 	ctx context.Context,
 	method, path string,
 	payload any,
-	attachments []Attachment,
 	out any,
 ) error {
-	for i := range attachments {
-		if c := bytes.TrimSpace(attachments[i].Content); len(c) == 0 || string(c) == "null" {
-			return fmt.Errorf("teamsbot: attachment %d has no content", i)
-		}
-	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("teamsbot: marshal request: %w", err)
@@ -269,6 +286,8 @@ func (c *Client) do(
 		return parseAPIError(resp)
 	}
 	if out == nil {
+		// Drain so the connection can be reused.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBody)) //nolint:errcheck // best-effort drain
 		return nil
 	}
 

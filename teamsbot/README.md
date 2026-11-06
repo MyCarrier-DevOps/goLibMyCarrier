@@ -13,7 +13,7 @@ if err != nil {
     return err
 }
 card := json.RawMessage(`{"type":"AdaptiveCard","version":"1.5", ...}`)
-_, err = c.SendToChannel(ctx, "19:...@thread.tacv2", tenantID, teamsbot.AdaptiveCardActivity(card))
+res, err := c.SendToChannel(ctx, "19:...@thread.tacv2", tenantID, teamsbot.AdaptiveCardActivity(card))
 ```
 
 ### Edit a card and reply in its thread
@@ -30,8 +30,9 @@ reply, err := c.ReplyToActivity(ctx, res.ConversationID, res.ActivityID, teamsbo
 `UpdateActivity` edits the message in place (PUT). `ReplyToActivity` posts in
 the thread (POST) and returns the reply's activity ID. Both escape the IDs as
 URL path segments, so Teams IDs such as `19:abc@thread.tacv2;messageid=123` are
-safe. A non-2xx response returns an `*APIError`; an update of a deleted message
-returns Status 404.
+safe. A non-2xx response returns an `*APIError` with the Teams status passed through.
+Teams is expected to return 404 for a deleted message; this library does not
+verify that.
 
 `ThreadSender` embeds `Sender` and adds the two methods. `Sender` is unchanged,
 because a new method on `Sender` would break every other implementation. `Client`
