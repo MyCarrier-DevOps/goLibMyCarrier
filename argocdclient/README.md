@@ -387,7 +387,7 @@ are returned wrapped as-is.
 | `Aborted` | live Rollout | `status.abort` |
 | `CanaryWeight` | live Rollout | Percentage of traffic on the canary, see below |
 | `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, operation, phase, message) |
-| `CanarySteps` | live Rollout | `spec.strategy.canary.steps` by index: each step's `SetWeight` (0 when it sets none) and `Waits` (true for a `pause`, `analysis`, `experiment` or `plugin` step); `nil` without a canary strategy. An abort resets `CurrentStepIndex` and `CanaryWeight` but not these, so with `StepPluginStatuses` they still tell which steps the Rollout passed |
+| `CanarySteps` | live Rollout | `spec.strategy.canary.steps` by index: each step's `SetWeight` (0 when it sets none) and `Waits` (true for a `pause`, `analysis`, `experiment` or `plugin` step); `nil` without a canary strategy. An abort resets `CurrentStepIndex` and `CanaryWeight` but not these. With `StepPluginStatuses` they prove that the Rollout completed every step before a plugin step that has a `Run` entry, and nothing about a later step: a Rollout can stay on a `setWeight` or `setCanaryScale` step until its canary pods are available, and the controller completes at most one step per reconcile |
 | `UID` | live Rollout | `metadata.uid` |
 | `StableRS` | live Rollout | `status.stableRS` |
 | `CurrentPodHash` | live Rollout | `status.currentPodHash` |

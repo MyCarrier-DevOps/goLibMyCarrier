@@ -105,8 +105,9 @@ type StepPluginStatus struct {
 type CanaryStep struct {
 	// SetWeight is the step's setWeight, 0 when it sets none.
 	SetWeight int32
-	// Waits is true for a step the Rollout can wait at across reconciles: a pause, analysis,
-	// experiment or plugin step. The steps between two waiting steps run within one reconcile.
+	// Waits is true for a pause, analysis, experiment or plugin step. A Rollout can also stay on a
+	// setWeight or setCanaryScale step across reconciles, until the canary pods are available and,
+	// for setWeight, the router weight is verified. The controller completes at most one step per reconcile.
 	Waits bool
 }
 
@@ -138,7 +139,8 @@ type RolloutStatus struct {
 	StepPluginStatuses []StepPluginStatus
 	// CanarySteps is spec.strategy.canary.steps of the live Rollout, by step index. It is nil when
 	// the Rollout has no canary strategy. Unlike CurrentStepIndex and CanaryWeight, an abort does
-	// not reset it, so with StepPluginStatuses it still tells which steps the Rollout passed.
+	// not reset it. With StepPluginStatuses it proves that the Rollout completed every step before a
+	// plugin step that has a Run entry, and nothing about a later step.
 	CanarySteps []CanaryStep
 	// UID is metadata.uid of the live Rollout.
 	UID string
