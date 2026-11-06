@@ -142,8 +142,12 @@ type RolloutStatus struct {
 	StepPluginStatuses []StepPluginStatus
 	// CanarySteps is spec.strategy.canary.steps of the live Rollout, by step index. It is nil when
 	// the Rollout has no canary strategy. Unlike CurrentStepIndex and CanaryWeight, an abort does
-	// not reset it. With StepPluginStatuses it proves that the Rollout completed every step before a
-	// plugin step that has a Run entry, and nothing about a later step.
+	// not reset it. With StepPluginStatuses it proves that the Rollout moved past every step before a
+	// plugin step that has a Run entry, and nothing about a later step. The controller completed those
+	// steps unless a person moved status.currentStepIndex past one, for example with Argo CD's
+	// skip-current-step action, or a promote (kubectl argo rollouts promote, the Rollouts dashboard) of a
+	// Rollout that has no pause condition or waits on an inconclusive step analysis. MovedPastTrafficStep
+	// reads them.
 	CanarySteps []CanaryStep
 	// PausedAt is the lastTransitionTime of the live Rollout's Paused condition while that condition is
 	// True; nil otherwise. The condition is also True for a manual pause (spec.paused) or an inconclusive

@@ -387,7 +387,7 @@ are returned wrapped as-is.
 | `Aborted` | live Rollout | `status.abort` |
 | `CanaryWeight` | live Rollout | Percentage of traffic on the canary, see below |
 | `StepPluginStatuses` | live Rollout | `status.canary.stepPluginStatuses` (index, name, operation, phase, message, `FinishedAt`: the entry's `finishedAt`, `nil` while it runs) |
-| `CanarySteps` | live Rollout | `spec.strategy.canary.steps` by index: each step's `SetWeight` (0 when it sets none) and `Waits` (true for a `pause`, `analysis`, `experiment` or `plugin` step); `nil` without a canary strategy. An abort resets `CurrentStepIndex` and `CanaryWeight` but not these. With `StepPluginStatuses` they prove that the Rollout completed every step before a plugin step that has a `Run` entry, and nothing about a later step: a Rollout can stay on a `setWeight` or `setCanaryScale` step until its canary pods are available, and the controller completes at most one step per reconcile |
+| `CanarySteps` | live Rollout | `spec.strategy.canary.steps` by index: each step's `SetWeight` (0 when it sets none) and `Waits` (true for a `pause`, `analysis`, `experiment` or `plugin` step); `nil` without a canary strategy. An abort resets `CurrentStepIndex` and `CanaryWeight` but not these. With `StepPluginStatuses` they prove that the Rollout moved past every step before a plugin step that has a `Run` entry, and nothing about a later step: a Rollout can stay on a `setWeight` or `setCanaryScale` step until its canary pods are available, and the controller completes at most one step per reconcile. The controller completed those steps unless a person moved `currentStepIndex` past one, for example with Argo CD's `skip-current-step` action, or a promote of a Rollout that has no pause condition or waits on an inconclusive step analysis |
 | `PausedAt` | live Rollout | `lastTransitionTime` of the `Paused` condition while it is `True`, else `nil`. The condition is also `True` for a manual pause (`spec.paused`) or an inconclusive background analysis, so `PausedAt` alone does not prove the Rollout reached a pause step. An abort resets `pauseConditions` but stops updating this condition, so after an abort it tells when a pause still in effect at the abort began; `nil` then means no pause was in effect. The time has one-second resolution |
 | `UID` | live Rollout | `metadata.uid` |
 | `StableRS` | live Rollout | `status.stableRS` |
@@ -437,6 +437,50 @@ for _, s := range statuses {
     fmt.Printf("%s/%s health=%s phase=%s weight=%d%%\n",
         s.Ref.Namespace, s.Ref.Name, s.Health, s.Phase, s.CanaryWeight)
 }
+```
+
+### Canary traffic evidence
+
+`MovedPastTrafficStep(CanaryEvidence) bool` reports whether what an aborted Rollout's status
+still shows proves that it moved past a `setWeight` step above 0, so its canary took traffic
+before the abort. Fill `CanaryEvidence` from a `RolloutStatus` (`CanarySteps`,
+`StepPluginStatuses`, `CurrentStepIndex`, `Message`, `PausedAt`) or from your own Rollout type,
+and name the step plugin whose steps are barriers in `BarrierPlugin`.
+
+The controller completes at most one step per reconcile, and a `setWeight` step completes only
+once the canary pods are available and the router weight is verified. So a `setWeight` at index
+`i` counts when:
+
+1. `i` is below the index of one of the barrier plugin's `Run` entries, in any phase;
+2. `i` is below `CurrentStepIndex` (an abort resets it to `0`, at a pause step before anything
+   else runs, so this covers a read before the reset or an abort on a step that is neither a
+   pause nor a plugin step);
+3. `i` lies after the last passed barrier (from the first step when none passed), at or before
+   the first waiting step after it, and either the message is a step analysis abort
+   (`Step-based analysis phase error/failed`) or the `Paused` condition turned `True` strictly
+   after that barrier finished. The `Paused` term needs a passed barrier.
+
+Trade-offs:
+- **Underclaim:** an abort on the `setWeight` step, or after it without a pause, step analysis or
+  later `Run` entry that the status still shows, gets no credit. Neither does a pause that began
+  in the second the barrier finished (one-second resolution, strict comparison).
+- **Overclaim:** a person's pause (`spec.paused`) or an inconclusive background analysis while the
+  Rollout still waits on the `setWeight` step also sets the `Paused` condition, so an abort after
+  it counts even if the canary pods never became available. So does a person's skip of the
+  `setWeight` step (`kubectl argo rollouts promote` or the dashboard's Promote while no pause
+  condition is set, the deprecated `--skip-current-step`, Argo CD's `skip-current-step` action):
+  the index moves past the step without completing it, and any of the evidence above can then
+  credit it.
+
+```go
+traffic := argocdclient.MovedPastTrafficStep(argocdclient.CanaryEvidence{
+    Steps:              s.CanarySteps,
+    BarrierPlugin:      "example/barrier",
+    StepPluginStatuses: s.StepPluginStatuses,
+    CurrentStepIndex:   s.CurrentStepIndex,
+    Message:            s.Message,
+    PausedAt:           s.PausedAt,
+})
 ```
 
 ## Resource Actions
