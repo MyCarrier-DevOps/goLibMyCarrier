@@ -185,6 +185,7 @@ func claimContractSequence(id string) []ClaimContractCase {
 	// Grouped in their own function (below) to keep this literal's cyclomatic complexity under
 	// the repo's gocyclo gate; see componentlessAggregateContractCases for why they exist.
 	cases = append(cases, componentlessAggregateContractCases(id)...)
+	cases = append(cases, stepClaimantContractCases(id)...)
 
 	cases = append(cases,
 		ClaimContractCase{
@@ -265,6 +266,98 @@ func claimContractSequence(id string) []ClaimContractCase {
 	)
 
 	return cases
+}
+
+// startEntry is a running history entry for a pure pipeline step, naming claimant.
+func startEntry(step, claimant string) slippy.StateHistoryEntry {
+	return slippy.StateHistoryEntry{
+		Step: step, Status: slippy.StepStatusRunning, Actor: slippy.LibraryActor,
+		Message: "step started", ClaimedBy: claimant,
+	}
+}
+
+// stepClaimantContractCases pin which run a running step belongs to. A reader that closes a
+// step on behalf of a run (the exit hook of a superseded workflow) needs to know the run
+// started it, not only that it is running, and a step with no claimant is never its own.
+func stepClaimantContractCases(id string) []ClaimContractCase {
+	const step = "dev_deploy"
+	startAs := func(claimant string) func(context.Context, slippy.SlipStore) error {
+		return func(ctx context.Context, s slippy.SlipStore) error {
+			return s.UpdateStepWithHistory(ctx, id, step, "", slippy.StepStatusRunning, startEntry(step, claimant))
+		}
+	}
+	wantClaimant := func(want string) func(*testing.T, error, *slippy.Slip) {
+		return func(t *testing.T, err error, slip *slippy.Slip) {
+			contractRequireNoErr(t, err, "step write")
+			if got := slip.Steps[step].ClaimedBy; got != want {
+				t.Errorf("%s claimed_by = %q, want %q", step, got, want)
+			}
+		}
+	}
+	return []ClaimContractCase{
+		{
+			Name:  "a running write that names a claimant shows it on the running step",
+			Run:   startAs("wf-a"),
+			Check: wantClaimant("wf-a"),
+		},
+		{
+			Name: "a later start by another run replaces the claimant",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				if err := startAs("wf-a")(ctx, s); err != nil {
+					return err
+				}
+				return startAs("wf-b")(ctx, s)
+			},
+			Check: wantClaimant("wf-b"),
+		},
+		{
+			Name: "a running write that names no claimant leaves the step unclaimed",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				if err := startAs("wf-a")(ctx, s); err != nil {
+					return err
+				}
+				return startAs("")(ctx, s)
+			},
+			Check: wantClaimant(""),
+		},
+		{
+			// The claimant of a component-scoped start lives on that component's row, which the
+			// read of a step does not return, so every implementer shows the step unclaimed.
+			Name: "a component-scoped start shows no claimant on the step",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				return s.UpdateStepWithHistory(ctx, id, "builds", "api", slippy.StepStatusRunning,
+					slippy.StateHistoryEntry{Step: "builds", Component: "api", Status: slippy.StepStatusRunning,
+						Actor: slippy.LibraryActor, ClaimedBy: "wf-a"})
+			},
+			Check: func(t *testing.T, err error, slip *slippy.Slip) {
+				contractRequireNoErr(t, err, "component-scoped start")
+				if got := slip.Steps["builds"].ClaimedBy; got != "" {
+					t.Errorf("builds claimed_by = %q after a component-scoped start, want none", got)
+				}
+			},
+		},
+		{
+			Name: "a step that is no longer running shows no claimant",
+			Run: func(ctx context.Context, s slippy.SlipStore) error {
+				if err := startAs("wf-a")(ctx, s); err != nil {
+					return err
+				}
+				return s.UpdateStepWithHistory(
+					ctx,
+					id,
+					step,
+					"",
+					slippy.StepStatusCompleted,
+					slippy.StateHistoryEntry{
+						Step:   step,
+						Status: slippy.StepStatusCompleted,
+						Actor:  slippy.LibraryActor,
+					},
+				)
+			},
+			Check: wantClaimant(""),
+		},
+	}
 }
 
 // componentlessAggregateContractCases are the three DEVOPS-373 cases, kept in their own

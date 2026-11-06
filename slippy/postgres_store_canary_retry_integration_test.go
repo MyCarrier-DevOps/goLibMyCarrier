@@ -79,7 +79,7 @@ func TestPostgresStore_CanaryRetryResetsCanarySkips_Integration(t *testing.T) {
 				"c1")
 			require.NoError(t, err)
 
-			require.NoError(t, client.StartStep(ctx, "c1", "prod_canary", ""))
+			require.NoError(t, client.StartStep(ctx, "c1", "prod_canary", "", ""))
 			require.NoError(t, client.CompleteStep(ctx, "c1", "prod_canary", ""))
 
 			got, err = store.Load(ctx, "c1")

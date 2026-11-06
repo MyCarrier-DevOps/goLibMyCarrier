@@ -182,7 +182,10 @@ func (s *PostgresStore) ProbeSchema(ctx context.Context) error {
 	if err := s.probeRoutingSlipColumns(ctx); err != nil {
 		return err
 	}
-	return s.probeChildTables(ctx)
+	if err := s.probeChildTables(ctx); err != nil {
+		return err
+	}
+	return s.probeStepClaimant(ctx)
 }
 
 // LoadByCommit retrieves the slip for (repository, commitSHA).
@@ -339,6 +342,24 @@ func (s *PostgresStore) probeChildTables(ctx context.Context) error {
 	if len(missing) > 0 {
 		return fmt.Errorf("missing tables %v (apply migrations before serving): %w",
 			missing, ErrSchemaBehind)
+	}
+	return nil
+}
+
+// probeStepClaimant confirms slip_component_states carries claimed_by (migration v8). Load
+// reads it for every slip, so a process on this library that starts before the migrator has
+// applied v8 would fail every slip read with Postgres 42703; this turns that into a refusal to
+// start, as probeRoutingSlipColumns does for routing_slips.
+func (s *PostgresStore) probeStepClaimant(ctx context.Context) error {
+	var present bool
+	if err := s.pool.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('slip_component_states') "+
+			"AND attname = 'claimed_by' AND NOT attisdropped AND attnum > 0)").Scan(&present); err != nil {
+		return fmt.Errorf("probe slip_component_states.claimed_by: %w", err)
+	}
+	if !present {
+		return fmt.Errorf("slip_component_states missing column claimed_by (apply migrations before serving): %w",
+			ErrSchemaBehind)
 	}
 	return nil
 }
@@ -676,7 +697,50 @@ func (s *PostgresStore) queryOne(ctx context.Context, query string, args ...any)
 		}
 		return nil, fmt.Errorf("failed to load slip: %w", err)
 	}
-	return s.populate(sc), nil
+	slip := s.populate(sc)
+	if err := s.applyClaimants(ctx, slip); err != nil {
+		return nil, err
+	}
+	return slip, nil
+}
+
+// applyClaimants fills Step.ClaimedBy on each slip's running pipeline-level steps from their
+// slip_component_states rows, the source of truth for who started a step (STATE_MACHINE_V3
+// checklist item 10). One query covers every slip passed. A step that is not running shows no
+// claimant, and neither does a running step whose row carries none.
+func (s *PostgresStore) applyClaimants(ctx context.Context, slips ...*Slip) error {
+	if len(slips) == 0 {
+		return nil
+	}
+	byID := make(map[string]*Slip, len(slips))
+	ids := make([]string, 0, len(slips))
+	for _, slip := range slips {
+		byID[slip.CorrelationID] = slip
+		ids = append(ids, slip.CorrelationID)
+	}
+	rows, err := s.pool.Query(ctx,
+		"SELECT correlation_id, step, claimed_by FROM slip_component_states "+
+			"WHERE correlation_id = ANY($1) AND component = '' AND status = 'running' AND claimed_by IS NOT NULL",
+		ids)
+	if err != nil {
+		return fmt.Errorf("failed to load step claimants: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, step, claimedBy string
+		if err := rows.Scan(&id, &step, &claimedBy); err != nil {
+			return fmt.Errorf("failed to scan step claimant: %w", err)
+		}
+		slip := byID[id]
+		if st, ok := slip.Steps[step]; ok && st.Status == StepStatusRunning {
+			st.ClaimedBy = claimedBy
+			slip.Steps[step] = st
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("failed to iterate step claimants: %w", err)
+	}
+	return nil
 }
 
 // slipValues returns the column values for slip in slipColumns() order, marshaling jsonb

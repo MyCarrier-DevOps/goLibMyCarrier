@@ -1026,7 +1026,7 @@ func TestStateMachine_D13_RetryResetsCanarySkipsAfterEarlyRecovery(t *testing.T)
 		t.Fatalf("FailStep: %v%s", err, stateMachineRef)
 	}
 	d13SkipDownstream(t, client, corrID)
-	if err := client.StartStep(ctx, corrID, "prod_canary", ""); err != nil {
+	if err := client.StartStep(ctx, corrID, "prod_canary", "", ""); err != nil {
 		t.Fatalf("StartStep(prod_canary) retry: %v%s", err, stateMachineRef)
 	}
 	if err := client.CompleteStep(ctx, corrID, "dev_tests", ""); err != nil {
@@ -1061,7 +1061,7 @@ func TestStateMachine_D13_RetryResetsCanarySkipsWhileAnotherStepFailed(t *testin
 		t.Fatalf("FailStep: %v%s", err, stateMachineRef)
 	}
 	d13SkipDownstream(t, client, corrID)
-	if err := client.StartStep(ctx, corrID, "prod_canary", ""); err != nil {
+	if err := client.StartStep(ctx, corrID, "prod_canary", "", ""); err != nil {
 		t.Fatalf("StartStep(prod_canary) retry: %v%s", err, stateMachineRef)
 	}
 	if err := client.FailStep(ctx, corrID, "dev_tests", "", "tests failed"); err != nil {

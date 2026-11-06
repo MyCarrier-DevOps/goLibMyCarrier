@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClient_RunPreExecution(t *testing.T) {
@@ -52,6 +55,26 @@ func TestClient_RunPreExecution(t *testing.T) {
 		if result.ResolvedBy != "ancestry" {
 			t.Errorf("expected resolved_by 'ancestry', got '%s'", result.ResolvedBy)
 		}
+	})
+
+	t.Run("the step starts claimed by the run that asked for it", func(t *testing.T) {
+		store := NewMockStore()
+		github := NewMockGitHubAPI()
+		client := NewClientWithDependencies(store, github, Config{AncestryDepth: 20})
+		store.AddSlip(&Slip{
+			CorrelationID: "corr-preexec-claim", Repository: "owner/repo", Branch: "main", CommitSHA: "abc123",
+			CreatedAt: time.Now(), UpdatedAt: time.Now(), Status: SlipStatusInProgress, Steps: make(map[string]Step),
+		})
+		github.SetAncestry("owner", "repo", "HEAD", []string{"abc123"})
+
+		_, err := client.RunPreExecution(ctx, PreExecutionOptions{
+			Repository: "owner/repo", Branch: "main", Ref: "HEAD", StepName: "dev_deploy", ClaimedBy: "wf-a",
+		})
+		require.NoError(t, err)
+
+		slip, err := store.Load(ctx, "corr-preexec-claim")
+		require.NoError(t, err)
+		assert.Equal(t, "wf-a", slip.Steps["dev_deploy"].ClaimedBy)
 	})
 
 	t.Run("proceed after prerequisites satisfied", func(t *testing.T) {
