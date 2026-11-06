@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func mustDecodeRollout(t *testing.T, manifest string) liveRollout {
@@ -183,6 +184,112 @@ func TestDecodeRollout(t *testing.T) {
 	}
 }
 
+func TestCanarySteps(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     []CanaryStep
+	}{
+		{
+			name:     "no strategy",
+			manifest: `{"spec":{}}`,
+			want:     nil,
+		},
+		{
+			name:     "blue-green",
+			manifest: `{"spec":{"strategy":{"blueGreen":{"activeService":"api"}}}}`,
+			want:     nil,
+		},
+		{
+			name:     "canary without steps",
+			manifest: `{"spec":{"strategy":{"canary":{}}}}`,
+			want:     []CanaryStep{},
+		},
+		{
+			name: "each waiting kind waits, the others do not",
+			manifest: `{"spec":{"strategy":{"canary":{"steps":[
+				{"plugin":{"name":"example/barrier","config":{"barrier":"start"}}},
+				{"setWeight":10},
+				{"analysis":{"templates":[{"templateName":"health"}]}},
+				{"pause":{"duration":"1m"}},
+				{"setCanaryScale":{"replicas":1}},
+				{"experiment":{"templates":[{"name":"baseline","specRef":"stable"}]}},
+				{"setWeight":0},
+				{"pause":{}}]}}}}`,
+			want: []CanaryStep{
+				{Waits: true},
+				{SetWeight: 10},
+				{Waits: true},
+				{Waits: true},
+				{},
+				{Waits: true},
+				{},
+				{Waits: true},
+			},
+		},
+		{
+			name: "an abort resets the status but not the steps",
+			manifest: `{"spec":{"strategy":{"canary":{"steps":[{"plugin":{"name":"example/barrier"}},{"setWeight":10},
+				{"analysis":{}}]}}},"status":{"abort":true,"currentStepIndex":0,"canary":{"weights":{"canary":{"weight":0}}}}}`,
+			want: []CanaryStep{{Waits: true}, {SetWeight: 10}, {Waits: true}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := newRolloutStatus(resourceNode{}, mustDecodeRollout(t, tt.manifest)).CanarySteps
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("CanarySteps = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewRolloutStatus_PauseEvidenceSurvivesAnAbort(t *testing.T) {
+	// The shape of a Rollout aborted while paused at its pause step: the controller has reset the step
+	// index and the weight, and keeps the Paused condition and the step plugin entries' finish times.
+	const aborted = `{"spec":{"strategy":{"canary":{"steps":[{"plugin":{"name":"example/barrier"}},{"setWeight":10},
+		{"pause":{}}]}}},"status":{"abort":true,"currentStepIndex":0,"canary":{"weights":{"canary":{"weight":0}},
+		"stepPluginStatuses":[
+		{"index":0,"name":"example/barrier","operation":"Run","phase":"Successful","finishedAt":"2026-11-06T03:09:51Z"},
+		{"index":0,"name":"example/barrier","operation":"Abort","phase":"Running"}]},
+		"conditions":[
+		{"type":"Available","status":"True","lastTransitionTime":"2026-11-05T05:04:05Z"},
+		{"type":"Paused","status":"True","lastTransitionTime":"2026-11-06T03:11:45Z"}]}}`
+	finished := time.Date(2026, 11, 6, 3, 9, 51, 0, time.UTC)
+	paused := time.Date(2026, 11, 6, 3, 11, 45, 0, time.UTC)
+
+	got := newRolloutStatus(resourceNode{}, mustDecodeRollout(t, aborted))
+
+	wantPlugins := []StepPluginStatus{
+		{
+			Index: 0, Name: "example/barrier", Operation: StepPluginOperationRun,
+			Phase: StepPluginPhaseSuccessful, FinishedAt: &finished,
+		},
+		{Index: 0, Name: "example/barrier", Operation: StepPluginOperationAbort, Phase: StepPluginPhaseRunning},
+	}
+	if !reflect.DeepEqual(got.StepPluginStatuses, wantPlugins) {
+		t.Errorf("StepPluginStatuses = %+v, want %+v", got.StepPluginStatuses, wantPlugins)
+	}
+	if got.PausedAt == nil || !got.PausedAt.Equal(paused) {
+		t.Errorf("PausedAt = %v, want %v", got.PausedAt, paused)
+	}
+}
+
+func TestNewRolloutStatus_PausedAtOnlyWhileThePausedConditionIsTrue(t *testing.T) {
+	tests := map[string]string{
+		"no conditions":          `{"status":{}}`,
+		"no Paused condition":    `{"status":{"conditions":[{"type":"Available","status":"True","lastTransitionTime":"2026-11-06T03:11:45Z"}]}}`,
+		"Paused condition False": `{"status":{"conditions":[{"type":"Paused","status":"False","lastTransitionTime":"2026-11-06T03:11:45Z"}]}}`,
+	}
+	for name, manifest := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := newRolloutStatus(resourceNode{}, mustDecodeRollout(t, manifest)).PausedAt; got != nil {
+				t.Errorf("PausedAt = %v, want nil", got)
+			}
+		})
+	}
+}
+
 func TestDecodeRollout_InvalidJSON(t *testing.T) {
 	if _, err := decodeRollout("not json"); err == nil {
 		t.Fatal("expected error for invalid JSON")
@@ -215,6 +322,11 @@ func TestNewRolloutStatus(t *testing.T) {
 		// Labels come from realisticRollout metadata.labels. The fixture has no uid, stableRS,
 		// currentPodHash, annotations, Istio virtual services or managedRoutes, so those stay empty.
 		Labels: map[string]string{CorrelationIDLabel: "corr-1", "app": "api"},
+		CanarySteps: []CanaryStep{
+			{SetWeight: 50},
+			{Waits: true},
+			{SetWeight: 100},
+		},
 		StepPluginStatuses: []StepPluginStatus{
 			{
 				Index:     0,
@@ -384,14 +496,35 @@ func rolloutRef(name string) ResourceRef {
 }
 
 // fixtureLive holds the identity-bound live fields of each recorded Rollout manifest in
-// testdata/resource-<name>-<state>.json: metadata.uid, the correlation label value and the
+// testdata/resource-<name>-<state>.json: metadata.uid, the correlation label value, the
+// lastTransitionTime of the Paused condition (True in the suspended and degraded recordings) and the
 // single trafficRouting.istio.virtualService name (equal to the rollout name in every fixture).
-// The fixtures set no trafficRouting.managedRoutes, so ManagedRoutes is nil.
-var fixtureLive = map[string]struct{ uid, group string }{
-	"rt-api":    {"afc0e4fd-69c8-48ff-8455-aff9e3909d68", fixtureGroupA},
-	"rt-worker": {"759734b8-af00-4e55-97f3-27fafb89bd0d", fixtureGroupA},
-	"rt-other":  {"358be5b9-f474-4f3c-a9c5-3b4258e0d3d3", fixtureGroupB},
+// The fixtures set no trafficRouting.managedRoutes, so ManagedRoutes is nil. Every fixture has the
+// canary steps fixtureSteps.
+var fixtureLive = map[string]struct {
+	uid, group string
+	paused     time.Time
+}{
+	"rt-api": {
+		"afc0e4fd-69c8-48ff-8455-aff9e3909d68",
+		fixtureGroupA,
+		time.Date(2026, 9, 30, 21, 32, 35, 0, time.UTC),
+	},
+	"rt-worker": {
+		"759734b8-af00-4e55-97f3-27fafb89bd0d",
+		fixtureGroupA,
+		time.Date(2026, 9, 30, 21, 32, 42, 0, time.UTC),
+	},
+	"rt-other": {
+		"358be5b9-f474-4f3c-a9c5-3b4258e0d3d3",
+		fixtureGroupB,
+		time.Date(2026, 9, 30, 21, 32, 42, 0, time.UTC),
+	},
 }
+
+// fixtureSteps are the canary steps of every recorded Rollout: setWeight 50, pause, setWeight 75, pause,
+// setWeight 100.
+var fixtureSteps = []CanaryStep{{SetWeight: 50}, {Waits: true}, {SetWeight: 75}, {Waits: true}, {SetWeight: 100}}
 
 // fixtureStatus builds the expected status of a recorded Rollout. stableRS and podHash are the
 // manifest's status.stableRS and status.currentPodHash, which differ per state.
@@ -409,6 +542,7 @@ func fixtureStatus(
 		Aborted:            aborted,
 		CanaryWeight:       weight,
 		StepPluginStatuses: nil,
+		CanarySteps:        fixtureSteps,
 		UID:                live.uid,
 		StableRS:           stableRS,
 		CurrentPodHash:     podHash,
@@ -422,6 +556,18 @@ func fixtureStatus(
 		Generation:           2,
 		ObservedGeneration:   "2",
 	}
+}
+
+// pausedFixtureStatus is fixtureStatus for a recording whose Paused condition is True: the suspended
+// and degraded states.
+func pausedFixtureStatus(
+	name string, health HealthStatus, message string, phase RolloutPhase, index int32, aborted bool, weight int32,
+	stableRS, podHash string,
+) RolloutStatus {
+	s := fixtureStatus(name, health, message, phase, index, aborted, weight, stableRS, podHash)
+	paused := fixtureLive[name].paused
+	s.PausedAt = &paused
+	return s
 }
 
 func TestListRolloutGroup(t *testing.T) {
@@ -466,7 +612,7 @@ func TestListRolloutGroup(t *testing.T) {
 			"degraded",
 			fixtureGroupA,
 			[]RolloutStatus{
-				fixtureStatus(
+				pausedFixtureStatus(
 					"rt-api",
 					HealthStatusDegraded,
 					abortedMessage,
@@ -477,7 +623,7 @@ func TestListRolloutGroup(t *testing.T) {
 					"679bc4c8fc",
 					"775f8d9cb4",
 				),
-				fixtureStatus(
+				pausedFixtureStatus(
 					"rt-worker",
 					HealthStatusSuspended,
 					"CanaryPauseStep",
@@ -495,7 +641,7 @@ func TestListRolloutGroup(t *testing.T) {
 			"suspended",
 			fixtureGroupA,
 			[]RolloutStatus{
-				fixtureStatus(
+				pausedFixtureStatus(
 					"rt-api",
 					HealthStatusSuspended,
 					"CanaryPauseStep",
@@ -506,7 +652,7 @@ func TestListRolloutGroup(t *testing.T) {
 					"679bc4c8fc",
 					"775f8d9cb4",
 				),
-				fixtureStatus(
+				pausedFixtureStatus(
 					"rt-worker",
 					HealthStatusSuspended,
 					"CanaryPauseStep",
@@ -524,7 +670,7 @@ func TestListRolloutGroup(t *testing.T) {
 			"suspended",
 			fixtureGroupB,
 			[]RolloutStatus{
-				fixtureStatus(
+				pausedFixtureStatus(
 					"rt-other",
 					HealthStatusSuspended,
 					"CanaryPauseStep",
@@ -809,7 +955,7 @@ func TestListRollouts_ReturnsEveryRollout(t *testing.T) {
 	}
 
 	want := []RolloutStatus{
-		fixtureStatus(
+		pausedFixtureStatus(
 			"rt-api",
 			HealthStatusSuspended,
 			"CanaryPauseStep",
@@ -820,7 +966,7 @@ func TestListRollouts_ReturnsEveryRollout(t *testing.T) {
 			"679bc4c8fc",
 			"775f8d9cb4",
 		),
-		fixtureStatus(
+		pausedFixtureStatus(
 			"rt-other",
 			HealthStatusSuspended,
 			"CanaryPauseStep",
@@ -831,7 +977,7 @@ func TestListRollouts_ReturnsEveryRollout(t *testing.T) {
 			"796b5bb5b6",
 			"f99554ff5",
 		),
-		fixtureStatus(
+		pausedFixtureStatus(
 			"rt-worker",
 			HealthStatusSuspended,
 			"CanaryPauseStep",
