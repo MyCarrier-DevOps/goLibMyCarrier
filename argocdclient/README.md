@@ -287,7 +287,7 @@ the correct control plane so the caller can pick the matching
 |---|---|---|---|
 | 1 | contains `-offload-` | `InstanceDev` | Legacy feature offload (any env shape) |
 | 2 | prefix `development-dev-`, `development-preprod-`, `development-lab-dev-` or `development-lab-preprod-` | `InstanceMgmt` | Management-instance non-prod: legacy dev / preprod and MyCarrier-Product lab tier |
-| 3 | prefix `production-csp-` | `InstanceMgmt` | Legacy prod cluster selector |
+| 3 | prefix `production-csp-`, `production-prod-`, `production-dev-` or `production-preprod-` | `InstanceMgmt` | Prod cluster selector (`production-csp` renamed to `production` at the 2026-11-26 DR; both accepted) |
 | 4 | suffix `-prod` (NOT `-preprod`) | `InstanceProd` | New `mc-environment` scheme prod |
 | 5 | _otherwise_ (default) | `InstanceDev` | New `mc-environment` scheme dev / preprod / feature |
 

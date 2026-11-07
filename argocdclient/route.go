@@ -53,6 +53,7 @@ func (i Instance) String() string {
 //   - "development-dev-" or "development-preprod-" → InstanceMgmt  (legacy dev/preprod)
 //   - "development-lab-dev-" or "development-lab-preprod-" → InstanceMgmt  (MyCarrier-Product lab tier)
 //   - "production-csp-" prefix                     → InstanceMgmt  (legacy prod cluster selector)
+//   - "production-{prod,dev,preprod}-" prefix      → InstanceMgmt  (cluster renamed production-csp → production; same MGMT ArgoCD)
 //   - "-prod" suffix (NOT "-preprod")              → InstanceProd  (new mc-environment scheme)
 //   - otherwise                                     → InstanceDev   (default — new-scheme dev/preprod)
 //
@@ -91,6 +92,17 @@ func RouteInstance(appName string) Instance {
 
 	// Legacy prod cluster selector: "production-csp-{...}-{svc}".
 	if strings.HasPrefix(n, "production-csp-") {
+		return InstanceMgmt
+	}
+
+	// Renamed prod cluster ("production-csp" → "production", DEVOPS-317):
+	// "production-{env}-{svc}" stays on the MGMT ArgoCD. Must precede the
+	// "-prod" suffix rule so "production-prod-{svc}" is not misrouted, and
+	// is limited to known env segments so unrelated "production-*" names
+	// keep their existing routing.
+	if strings.HasPrefix(n, "production-prod-") ||
+		strings.HasPrefix(n, "production-dev-") ||
+		strings.HasPrefix(n, "production-preprod-") {
 		return InstanceMgmt
 	}
 

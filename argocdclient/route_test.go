@@ -59,6 +59,22 @@ func TestRouteInstance(t *testing.T) {
 			want:    InstanceMgmt,
 		},
 
+		// Renamed cluster (DEVOPS-317): production-{env}- → mgmt.
+		{name: "renamed production-prod → mgmt", appName: "production-prod-example", want: InstanceMgmt},
+		{name: "renamed production-dev → mgmt", appName: "production-dev-x", want: InstanceMgmt},
+		{name: "renamed production-preprod → mgmt", appName: "production-preprod-x", want: InstanceMgmt},
+		{name: "renamed uppercase → mgmt", appName: "Production-Prod-X", want: InstanceMgmt},
+		{name: "renamed offload still dev", appName: "production-prod-x-offload-feature1", want: InstanceDev},
+		{name: "legacy production-csp-dev → mgmt", appName: "production-csp-dev-x", want: InstanceMgmt},
+		{name: "production-csp- alone → mgmt", appName: "production-csp-", want: InstanceMgmt},
+		{name: "production- alone → dev", appName: "production-", want: InstanceDev},
+		{name: "production-prod- alone → mgmt", appName: "production-prod-", want: InstanceMgmt},
+		{name: "production-prod no trailing dash ends -prod → prod", appName: "production-prod", want: InstanceProd},
+		{name: "production-x unknown env → dev", appName: "production-x", want: InstanceDev},
+		{name: "mc-environment {svc}-prod unaffected → prod", appName: "example-prod", want: InstanceProd},
+		{name: "mc-environment {svc}-preprod unaffected → dev", appName: "example-preprod", want: InstanceDev},
+		{name: "unknown production-* with -prod suffix → prod", appName: "production-foo-prod", want: InstanceProd},
+
 		// New mc-environment scheme prod (suffix-based) → prod.
 		{
 			name:    "new-scheme -prod suffix → prod",
