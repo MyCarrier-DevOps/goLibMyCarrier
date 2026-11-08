@@ -169,7 +169,7 @@ func (c *Client) SendToChannel(ctx context.Context, channelID, tenantID string, 
 		Activity: act,
 	}
 	var result SendResult
-	if err := c.do(ctx, http.MethodPost, "/v3/conversations", params, &result); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/v3/conversations", "conversation", params, &result); err != nil {
 		return zero, err
 	}
 	return result, nil
@@ -191,7 +191,7 @@ func (c *Client) UpdateActivity(ctx context.Context, conversationID, activityID 
 		return err
 	}
 	act.ID, act.ReplyToID = activityID, ""
-	return c.do(ctx, http.MethodPut, path, act, nil)
+	return c.do(ctx, http.MethodPut, path, "activity", act, nil)
 }
 
 // ReplyToActivity posts act as a reply to activity activityID in conversation
@@ -220,7 +220,7 @@ func (c *Client) ReplyToActivity(
 	var resp struct {
 		ID string `json:"id"`
 	}
-	if err := c.do(ctx, http.MethodPost, path, act, &resp); err != nil {
+	if err := c.do(ctx, http.MethodPost, path, "activity", act, &resp); err != nil {
 		return zero, err
 	}
 	return SendResult{ConversationID: conversationID, ActivityID: resp.ID}, nil
@@ -252,16 +252,17 @@ func validateAttachments(atts []Attachment) error {
 
 // do sends one JSON request to the Bot Connector and decodes a 2xx body into
 // out. A nil out ignores the body. An empty 2xx body is success. Non-2xx
-// responses become an *APIError. path must already be escaped.
+// responses become an *APIError. path must already be escaped. what names the
+// payload in the marshal error text ("conversation", "activity").
 func (c *Client) do(
 	ctx context.Context,
-	method, path string,
+	method, path, what string,
 	payload any,
 	out any,
 ) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("teamsbot: marshal request: %w", err)
+		return fmt.Errorf("teamsbot: marshal %s: %w", what, err)
 	}
 
 	token, err := c.tokenSource.Token()

@@ -795,3 +795,35 @@ func TestThreadCalls_ServiceURLTrim(t *testing.T) {
 		t.Errorf("request URI = %q", got.requestURI)
 	}
 }
+
+func TestMarshalErrorText(t *testing.T) {
+	// A RawMessage that is not valid JSON passes validateAttachments but fails
+	// json.Marshal, which reaches the marshal error path.
+	bad := Activity{Attachments: []Attachment{{Content: json.RawMessage(`{bad`)}}}
+	c := staticClient(t, "http://127.0.0.1:0")
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		call func() error
+		want string
+	}{
+		{"SendToChannel", func() error {
+			_, err := c.SendToChannel(ctx, "19:abc@thread.tacv2", "tenant-1", bad)
+			return err
+		}, "teamsbot: marshal conversation: "},
+		{"UpdateActivity", func() error { return c.UpdateActivity(ctx, "conv", "act", bad) }, "teamsbot: marshal activity: "},
+		{"ReplyToActivity", func() error {
+			_, err := c.ReplyToActivity(ctx, "conv", "act", bad)
+			return err
+		}, "teamsbot: marshal activity: "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.call()
+			if err == nil || !strings.HasPrefix(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want prefix %q", err, tt.want)
+			}
+		})
+	}
+}
