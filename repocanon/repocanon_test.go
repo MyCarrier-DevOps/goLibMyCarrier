@@ -633,3 +633,64 @@ func BenchmarkFromRaw_AlreadyCanonical(b *testing.B) {
 		_ = FromRaw(input)
 	}
 }
+
+func TestClusterCandidates(t *testing.T) {
+	tests := []struct {
+		metaEnv string
+		want    []string
+	}{
+		{"prod", []string{"production-csp", "production"}},
+		{" PROD ", []string{"production-csp", "production"}},
+		{"dev", []string{"development"}},
+		{"", []string{"development"}},
+	}
+	for _, tt := range tests {
+		got := ClusterCandidates(tt.metaEnv)
+		if len(got) != len(tt.want) {
+			t.Fatalf("ClusterCandidates(%q) = %v, want %v", tt.metaEnv, got, tt.want)
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("ClusterCandidates(%q)[%d] = %q, want %q", tt.metaEnv, i, got[i], tt.want[i])
+			}
+		}
+		if got[0] != ClusterFor(tt.metaEnv) {
+			t.Errorf("first candidate %q != ClusterFor %q", got[0], ClusterFor(tt.metaEnv))
+		}
+	}
+}
+
+func TestArgoCDAppNameCandidates(t *testing.T) {
+	tests := []struct {
+		name  string
+		svc   string
+		env   string
+		chart string
+		want  []string
+	}{
+		{"legacy prod helm", "example", "prod", "mycarrier-helm", []string{"production-csp-prod-example", "production-prod-example"}},
+		{"prod empty chart", "example", " PROD ", "", []string{"production-csp-prod-example", "production-prod-example"}},
+		{"prod mc-environment", "example", "prod", "mc-environment", []string{"example-prod"}},
+		{"dev legacy", "example", "dev", "mycarrier-helm", []string{"development-dev-example"}},
+		{"preprod legacy", "example", "preprod", "", []string{"development-preprod-example"}},
+		{"feature offload", "example", "feature7", "mycarrier-helm", []string{"example-offload-feature7"}},
+		{"empty service", "", "prod", "mycarrier-helm", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n := Names{Service: tt.svc}
+			got := n.ArgoCDAppNameCandidates(tt.env, tt.chart)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Errorf("[%d] = %q, want %q", i, got[i], tt.want[i])
+				}
+			}
+			if len(got) > 0 && got[0] != n.ArgoCDAppName(tt.env, tt.chart) {
+				t.Errorf("first candidate %q != ArgoCDAppName %q", got[0], n.ArgoCDAppName(tt.env, tt.chart))
+			}
+		})
+	}
+}
