@@ -35,3 +35,33 @@ func TestTextActivity(t *testing.T) {
 		t.Fatalf("got %+v", act)
 	}
 }
+
+func TestActivityJSON_OmitsEmptyIDFields(t *testing.T) {
+	b, err := json.Marshal(AdaptiveCardActivity(json.RawMessage(`{"type":"AdaptiveCard"}`)))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for _, k := range []string{"id", "replyToId"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("%q present in %s", k, b)
+		}
+	}
+}
+
+func TestActivityJSON_IncludesSetIDFields(t *testing.T) {
+	b, err := json.Marshal(Activity{Type: "message", ID: "a1", ReplyToID: "r1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m["id"] != "a1" || m["replyToId"] != "r1" {
+		t.Errorf("got %s", b)
+	}
+}
