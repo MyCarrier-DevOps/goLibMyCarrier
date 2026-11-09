@@ -107,7 +107,7 @@ func TestClient_ClaimSlip_SecondRerunMessageSeesTheRunItWouldHaveDispatchedOnto(
 
 	// The dispatched run's pre-job starts a step. StartStep is not a terminal write, so the
 	// slip's own status does not move — this is the fact the previous round's reasoning missed.
-	require.NoError(t, client.StartStep(ctx, "corr-rerun", "builds", ""))
+	require.NoError(t, client.StartStep(ctx, "corr-rerun", "builds", "", ""))
 	got, err := store.Load(ctx, "corr-rerun")
 	require.NoError(t, err)
 	require.Equal(t, SlipStatusFailed, got.Status, "a running step does not reconcile the status")

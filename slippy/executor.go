@@ -28,6 +28,9 @@ type PreExecutionOptions struct {
 	// ComponentName is the component (if applicable)
 	ComponentName string
 
+	// ClaimedBy names the run starting the step; the store shows it while the step runs.
+	ClaimedBy string
+
 	// Prerequisites is the list of prerequisite step names
 	Prerequisites []string
 
@@ -157,7 +160,7 @@ func (c *Client) RunPreExecution(ctx context.Context, opts PreExecutionOptions) 
 	}
 
 	// Step 3: Prerequisites satisfied, mark as running
-	if err := c.StartStep(ctx, slip.CorrelationID, opts.StepName, opts.ComponentName); err != nil {
+	if err := c.StartStep(ctx, slip.CorrelationID, opts.StepName, opts.ComponentName, opts.ClaimedBy); err != nil {
 		// Return error - let caller decide if this should be blocking based on shadow mode
 		return nil, fmt.Errorf("failed to start step %s: %w", opts.StepName, err)
 	}

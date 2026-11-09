@@ -975,6 +975,13 @@ owned by the slippy-migrator Job.
 `slip_component_states` holds one current-state row per `(correlation_id, step, component)`,
 and `slip_ancestry` the direct parent links.
 
+`slip_component_states.claimed_by` (migration v8) is the run that started a pipeline-level step:
+`StartStep` and `PreExecutionOptions.ClaimedBy` pass it, a running write records it, and `Load`
+returns it as `Step.ClaimedBy` while the step is running. A running write that names no run, and
+a step in any other status, show no claimant. The column is nullable with no backfill, so a step
+started before v8 is unclaimed, and a reader deciding whether a running step is its own run's
+treats an empty claimant as not its own.
+
 ### Table: `slip_rollbacks` (migration v7, DEVOPS-320)
 
 One row per gitops-rollback attempt for a slip, written through slippy-api with

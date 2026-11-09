@@ -53,6 +53,7 @@ func (m *PostgresDynamicMigrationManager) GenerateMigrations() []postgresmigrato
 		m.uniquenessMigration(),
 		m.claimedFromMigration(),
 		m.slipRollbacksMigration(),
+		m.stepClaimedByMigration(),
 	}
 }
 
@@ -651,4 +652,33 @@ func GetPostgresDynamicMigrationVersion(config *PipelineConfig) int {
 		return 0
 	}
 	return NewPostgresDynamicMigrationManager(config, nil).LatestVersion()
+}
+
+// stepClaimedByMigration is v8: slip_component_states.claimed_by, the run that started a step.
+//
+// Nullable with no default and no backfill, on purpose. A row written before v8, or by a
+// caller that named no run, has no claimant, and a reader deciding whether a running step is
+// its own run's must read that as not its own. Filling old rows with a value would make an
+// old running step look claimed.
+//
+// ADD COLUMN IF NOT EXISTS is idempotent by name and cannot be wrong-shaped in a way that
+// matters here: the store only ever reads and writes the column as text. The ALTER takes an
+// ACCESS EXCLUSIVE lock on slip_component_states, and postgresmigrator runs each migration
+// with SET LOCAL lock_timeout = 0, so an unbounded request would queue ahead of every later
+// step write; the up and the down bound the wait first, as v6 and v7 do. Five seconds fails
+// the migration instead; re-run it.
+func (m *PostgresDynamicMigrationManager) stepClaimedByMigration() postgresmigrator.Migration {
+	return postgresmigrator.Migration{
+		Version:     8,
+		Name:        "step_claimed_by",
+		Description: "slip_component_states.claimed_by: the run that started a step, nullable, no backfill (DEVOPS-501)",
+		UpSQL: `
+			SET LOCAL lock_timeout = '5s';
+			ALTER TABLE slip_component_states ADD COLUMN IF NOT EXISTS claimed_by text;
+		`,
+		DownSQL: `
+			SET LOCAL lock_timeout = '5s';
+			ALTER TABLE slip_component_states DROP COLUMN IF EXISTS claimed_by;
+		`,
+	}
 }

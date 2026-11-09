@@ -11,6 +11,10 @@ type Activity struct {
 	Type        string       `json:"type"`
 	Text        string       `json:"text,omitempty"`
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// ID names the activity to replace. UpdateActivity sets it.
+	ID string `json:"id,omitempty"`
+	// ReplyToID names the activity to reply to. ReplyToActivity sets it.
+	ReplyToID string `json:"replyToId,omitempty"`
 }
 
 // Attachment carries a card (or other content) on an Activity. Content is opaque
@@ -58,7 +62,8 @@ type tenantInfo struct {
 	ID string `json:"id"`
 }
 
-// SendResult is the Bot Connector response to a successful create-conversation.
+// SendResult identifies a posted activity. SendToChannel returns it from the
+// create-conversation response; ReplyToActivity returns it for the new reply.
 type SendResult struct {
 	ConversationID string `json:"id"`
 	ActivityID     string `json:"activityId"`

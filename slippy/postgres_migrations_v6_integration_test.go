@@ -42,7 +42,7 @@ func TestClaimedFromMigration_V6_Integration(t *testing.T) {
 		cfg := pgTestPipelineConfig(t)
 		res, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
 		require.NoError(t, err)
-		assert.Equal(t, 7, res.EndVersion, "v7 (DEVOPS-320) is the latest; v6's shape is asserted below")
+		assert.Equal(t, 8, res.EndVersion, "v8 (DEVOPS-501) is the latest; v6's shape is asserted below")
 
 		exists, dt, nullable := v6ColumnShape(t, pool)
 		require.True(t, exists, "claimed_from must exist after v6")
@@ -104,6 +104,10 @@ func TestClaimedFromMigration_V6_DownRefusesHeldClaims_Integration(t *testing.T)
 	assert.Contains(t, err.Error(), "v6-held", "the refusal names the held correlation id")
 	exists, _, _ := v6ColumnShape(t, pool)
 	require.True(t, exists, "the refused down must leave the column in place")
+	// The down walked v8 and v7 off before v6 refused, each in its own transaction, and Load
+	// reads v8's column; bring the schema back to latest before reading.
+	_, err = RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
+	require.NoError(t, err)
 	got, err := store.Load(ctx, "v6-held")
 	require.NoError(t, err)
 	assert.Equal(t, SlipStatusFailed, got.ClaimedFrom, "and the claim intact")

@@ -52,7 +52,11 @@ func (s *PostgresStore) FindByCommits(
 		}
 		return nil, "", fmt.Errorf("failed to query slip by commits: %w", err)
 	}
-	return s.populate(sc), matched, nil
+	slip := s.populate(sc)
+	if err := s.applyClaimants(ctx, slip); err != nil {
+		return nil, "", err
+	}
+	return slip, matched, nil
 }
 
 // FindAllByCommits returns every slip matching any commit in the ordered list, ordered by
@@ -104,6 +108,14 @@ func (s *PostgresStore) FindAllByCommits(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate slips by commits: %w", err)
+	}
+	rows.Close()
+	slips := make([]*Slip, len(results))
+	for i := range results {
+		slips[i] = results[i].Slip
+	}
+	if err := s.applyClaimants(ctx, slips...); err != nil {
+		return nil, err
 	}
 	return results, nil
 }
