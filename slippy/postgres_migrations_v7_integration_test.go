@@ -39,7 +39,7 @@ func TestSlipRollbacksMigration_V7_Integration(t *testing.T) {
 		cfg := pgTestPipelineConfig(t)
 		res, err := RunPostgresMigrations(ctx, pool, PostgresMigrateOptions{PipelineConfig: cfg})
 		require.NoError(t, err)
-		assert.Equal(t, 7, res.EndVersion, "v7 is the new latest")
+		assert.Equal(t, 8, res.EndVersion, "v8 (DEVOPS-501) is the latest; v7's shape is asserted below")
 
 		require.True(t, pgTableExists(t, pool, "slip_rollbacks"))
 		assert.Equal(t,

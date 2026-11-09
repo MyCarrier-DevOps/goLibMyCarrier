@@ -475,6 +475,21 @@ step (`POST /v1/slips/{id}/steps/{step}/complete`) and then release. A NON-termi
 also be ended with `POST /v1/slips/{id}/abandon`; an already-terminal one ignores that call
 (I4) and keeps its claim, so use the step-then-release route there. Then re-run the down.
 
+**Migration v8 (`slip_component_states.claimed_by`, DEVOPS-501) rollout order.** `Load`,
+`FindByCommits` and `FindAllByCommits` read `claimed_by` to fill `Step.ClaimedBy`, and every step
+write names it in the `slip_component_states` upsert, so a library at or past this version fails
+every slip read and every step write with Postgres 42703 against a database still at v7.
+`PostgresStore.ProbeSchema` checks for the column (`probeStepClaimant`) and reports
+`ErrSchemaBehind`, so a consumer that calls it at startup refuses to serve until the migrator has
+applied v8, as for v6. The column is nullable with no default and no backfill, and v8's down
+drops it (the data is only the current claimant of running steps, so nothing needs draining).
+Roll every consumer back to a library before this version first: the down breaks every slip read
+and step write of a process still on it, and `ProbeSchema` is a startup check, so a pod that is
+already serving does not notice.
+`StartStep` takes the claimant as its last argument and `PreExecutionOptions` carries it as
+`ClaimedBy`; both doubles (`slippytest.MockStore` and the in-package `MockStore`) report it as the
+store does, and `slippytest.RunClaimContract` pins the three implementers together.
+
 **Released core migrations are immutable.** postgresmigrator applies only the versions above
 the one a database has recorded, so an edit to a released migration never reaches an existing
 database; to change the schema, add a new version. `TestReleasedCoreMigrationsAreImmutable`
@@ -482,9 +497,9 @@ database; to change the schema, add a new version. `TestReleasedCoreMigrationsAr
 `releasedCoreMigrationDigests`. The merge that adds a core migration tags a release, so add
 its digest in the PR that adds it. That PR also updates the count pins, which check the
 migration count or the latest version: `TestUniquenessMigration_V5` and
-`TestClaimedFromMigration_V6` in `postgres_migrations_test.go`, and
-`TestUniquenessMigration_V5_Integration` and `TestClaimedFromMigration_V6_Integration` in the
-integration suites.
+`TestClaimedFromMigration_V6` and `TestSlipRollbacksMigration_V7` in `postgres_migrations_test.go`,
+and `TestUniquenessMigration_V5_Integration`, `TestClaimedFromMigration_V6_Integration` and
+`TestSlipRollbacksMigration_V7_Integration` in the integration suites.
 
 ### 3. Client Initialization Pattern
 

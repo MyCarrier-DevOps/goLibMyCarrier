@@ -52,9 +52,13 @@ func newStoreAtV4(t *testing.T) (*PostgresStore, *pgxpool.Pool, *PipelineConfig)
 	pool, cfg := v5PoolAtV4(t)
 	// v4 pins the schema to permit duplicate rows per commit, which is what these tests need.
 	// Every slip SELECT now also names claimed_from (v6, read-only), so add just that column
-	// here; it is orthogonal to the duplicate-ordering behaviour under test.
+	// here; it is orthogonal to the duplicate-ordering behaviour under test. Every slip read
+	// also names slip_component_states.claimed_by (v8), added the same way.
 	_, err := pool.Exec(context.Background(),
 		"ALTER TABLE routing_slips ADD COLUMN IF NOT EXISTS claimed_from text NULL")
+	require.NoError(t, err)
+	_, err = pool.Exec(context.Background(),
+		"ALTER TABLE slip_component_states ADD COLUMN IF NOT EXISTS claimed_by text NULL")
 	require.NoError(t, err)
 	store, err := NewPostgresStore(pool, cfg, nil)
 	require.NoError(t, err)

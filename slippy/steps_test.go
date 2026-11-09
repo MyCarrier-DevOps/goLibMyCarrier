@@ -6,6 +6,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestClient_CompleteStep(t *testing.T) {
@@ -125,7 +128,7 @@ func TestClient_StartStep(t *testing.T) {
 		slip := createTestSlip("corr-start-1")
 		store.AddSlip(slip)
 
-		err := client.StartStep(ctx, "corr-start-1", "preprod_deploy", "")
+		err := client.StartStep(ctx, "corr-start-1", "preprod_deploy", "", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -135,6 +138,26 @@ func TestClient_StartStep(t *testing.T) {
 			t.Errorf("expected status 'running', got '%s'", call.Status)
 		}
 	})
+
+	// The claimant is the run that started the step: StartStep passes it through to the store,
+	// and a start that names none leaves the step unclaimed.
+	for _, tc := range []struct{ name, claimedBy string }{
+		{"names the run that started the step", "wf-a"},
+		{"names nobody", ""},
+	} {
+		t.Run("claimant "+tc.name, func(t *testing.T) {
+			store := NewMockStore()
+			client := NewClientWithDependencies(store, NewMockGitHubAPI(), Config{})
+			store.AddSlip(createTestSlip("corr-start-2"))
+
+			require.NoError(t, client.StartStep(ctx, "corr-start-2", "dev_deploy", "", tc.claimedBy))
+
+			slip, err := store.Load(ctx, "corr-start-2")
+			require.NoError(t, err)
+			assert.Equal(t, tc.claimedBy, slip.Steps["dev_deploy"].ClaimedBy)
+			assert.Equal(t, StepStatusRunning, slip.Steps["dev_deploy"].Status)
+		})
+	}
 }
 
 func TestClient_HoldStep(t *testing.T) {
