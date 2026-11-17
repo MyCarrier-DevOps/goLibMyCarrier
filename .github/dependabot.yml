@@ -1,0 +1,45 @@
+# Version updates for goLibMyCarrier. Security updates are enabled separately
+# in the repository settings and keep working without this file.
+version: 2
+updates:
+  # Every Go module lives in its own top-level directory, so "/*" picks up new
+  # modules without editing this file. Directories without a go.mod are skipped.
+  - package-ecosystem: gomod
+    directories:
+      - "/*"
+    schedule:
+      interval: weekly
+      day: monday
+    # One pull request per module carries all its minor and patch updates, so
+    # packages that must move together (the go.opentelemetry.io/otel set) land
+    # in the same pull request. Major updates still get a pull request each.
+    groups:
+      go-minor-patch:
+        update-types:
+          - minor
+          - patch
+    # Every push to main releases all modules under a new version. Bumping the
+    # sibling goLibMyCarrier modules here would open a new pull request after
+    # every release, and the local replace directives decide the sibling code
+    # that CI builds anyway. Sibling versions are handled outside Dependabot.
+    ignore:
+      - dependency-name: github.com/MyCarrier-DevOps/goLibMyCarrier*
+    open-pull-requests-limit: 25
+    commit-message:
+      prefix: chore(deps)
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: chore(ci)
+    labels:
+      - dependencies
