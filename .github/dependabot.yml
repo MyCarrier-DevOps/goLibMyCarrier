@@ -1,0 +1,54 @@
+# Version updates for goLibMyCarrier. Security updates are enabled separately
+# in the repository settings and keep working without this file.
+version: 2
+updates:
+  # Every Go module lives in its own top-level directory, so "/*" picks up new
+  # modules without editing this file. Directories without a go.mod are skipped.
+  - package-ecosystem: gomod
+    directories:
+      - "/*"
+    schedule:
+      interval: weekly
+      day: monday
+    # Minor and patch updates are grouped, so packages that must move together
+    # (the go.opentelemetry.io/otel set) land in the same pull request. Major
+    # updates get a pull request each.
+    groups:
+      go-minor-patch:
+        update-types:
+          - minor
+          - patch
+    # Every push to main releases all modules under a new version. Bumping the
+    # sibling goLibMyCarrier modules here would open a new pull request after
+    # every release, and the local replace directives decide the sibling code
+    # that CI builds anyway. Consumers still get the sibling versions pinned in
+    # each go.mod, which are old: DEVOPS-616 fixes the sibling versions.
+    ignore:
+      - dependency-name: github.com/MyCarrier-DevOps/goLibMyCarrier*
+    open-pull-requests-limit: 25
+    commit-message:
+      prefix: chore(deps)
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # A new action release waits 7 days before it is proposed. The release job
+    # runs these actions with contents: write.
+    cooldown:
+      default-days: 7
+    # Minor and patch updates in one pull request. A major update gets its own
+    # pull request: the gitversion steps run only after the merge to main, in
+    # the release job, so pull request CI cannot catch a breaking major there.
+    groups:
+      github-actions:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: chore(ci)
+    labels:
+      - dependencies
