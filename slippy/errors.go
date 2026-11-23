@@ -101,13 +101,12 @@ var (
 	// errors.Is continues to work at the outermost caller.
 	ErrTerminalAlreadyExists = errors.New("terminal status already recorded for step")
 
-	// ErrSkipOverFailedCanary is returned by Client.SkipStep when the target is a canary step
-	// (prod_canary, preprod_rollback_test) or a step a D13 canary skip writes (prod_deploy,
-	// prod_tests) whose recorded status is failed. skipped counts as success, so overwriting a
-	// failed canary verdict would unblock prod_deploy/prod_gate, and overwriting a failed
-	// prod_deploy or prod_tests would hide that failure; either way nothing would revisit it. The
-	// intended recovery is to re-run the step to a new verdict, not to skip it. Callers should map
-	// this sentinel to HTTP 409 Conflict:
+	// ErrSkipOverFailedCanary is returned by Client.SkipStep when the target is the canary step
+	// (prod_canary) or a step a D13 canary skip writes (prod_deploy, prod_tests) whose recorded
+	// status is failed. skipped counts as success, so overwriting a failed canary verdict would
+	// unblock prod_deploy, and overwriting a failed prod_deploy or prod_tests would hide that
+	// failure; either way nothing would revisit it. The intended recovery is to re-run the step to
+	// a new verdict, not to skip it. Callers should map this sentinel to HTTP 409 Conflict:
 	//   errors.Is(err, slippy.ErrSkipOverFailedCanary)
 	ErrSkipOverFailedCanary = errors.New("refusing to skip a failed canary or prod deploy step")
 

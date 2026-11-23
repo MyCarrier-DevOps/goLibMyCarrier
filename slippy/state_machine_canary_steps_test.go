@@ -8,12 +8,11 @@ import (
 	"time"
 )
 
-// DEVOPS-314: the pipeline gains two steps, preprod_rollback_test (after preprod_tests, a
-// prerequisite of prod_gate) and prod_canary (after prod_release_created, a prerequisite of
-// prod_deploy). These tests pin the STATE_MACHINE_V3 invariants for the new shape. They are
+// DEVOPS-314: the pipeline gains prod_canary (after prod_release_created, a prerequisite of
+// prod_deploy). These tests pin the STATE_MACHINE_V3 invariants for that shape. They are
 // in their own file so they do not collide with state_machine_invariants_test.go.
 //
-// Scope note (library path only). The four slip-level tests below exercise the library hold
+// Scope note (library path only). The slip-level tests below exercise the library hold
 // path. The aborted-downstream behaviour they assert is what Client.WaitForPrerequisites does
 // (hold.go). The Slippy CLI, which is what Argo pre-jobs actually run, polls the read-only
 // step-prerequisites API (slippy-api reads never write `aborted`): a downstream step stays
@@ -130,83 +129,44 @@ func TestStateMachine_CanarySteps_FailProdCanary_SlipFailed_DownstreamAbortsLazi
 	}
 }
 
-// Precondition: preprod_rollback_test failed, everything else upstream of prod_gate completed.
-// Action:       hold prod_gate on preprod_deploy, preprod_tests, preprod_rollback_test.
-// Expected:     ErrPrerequisiteFailed; prod_gate is aborted, never running or completed.
-func TestStateMachine_CanarySteps_FailedPreprodRollbackTest_HoldsProdGate(t *testing.T) {
-	ctx := context.Background()
-	client, store := canaryTestClient()
-	corrID := "rollback-test-fail"
-	store.AddSlip(canarySlip(corrID, SlipStatusInProgress, map[string]Step{
-		"preprod_deploy":        {Status: StepStatusCompleted},
-		"preprod_tests":         {Status: StepStatusCompleted},
-		"preprod_rollback_test": {Status: StepStatusRunning},
-		"prod_gate":             {Status: StepStatusPending},
-	}))
-
-	if err := client.FailStep(ctx, corrID, "preprod_rollback_test", "", "rollback rehearsal failed"); err != nil {
-		t.Fatalf("FailStep returned unexpected error: %v%s", err, stateMachineRef)
-	}
-
-	err := client.WaitForPrerequisites(ctx, HoldOptions{
-		CorrelationID: corrID,
-		Prerequisites: []string{"preprod_deploy", "preprod_tests", "preprod_rollback_test"},
-		StepName:      "prod_gate",
-	})
-	if !errors.Is(err, ErrPrerequisiteFailed) {
-		t.Fatalf("expected ErrPrerequisiteFailed from prod_gate hold, got %v%s", err, stateMachineRef)
-	}
-	// Aborted implies it never reached running or completed.
-	if got := canaryStepStatus(t, store, corrID, "prod_gate"); got != StepStatusAborted {
-		t.Errorf("expected prod_gate=%q (library hold path), got %q%s", StepStatusAborted, got, stateMachineRef)
-	}
-}
-
-// Precondition: both new steps skipped (the non-canary repo path), rest of the prereqs completed.
-// Action:       CheckPrerequisites for prod_gate and prod_deploy; skip then re-check.
-// Expected:     PrereqStatusCompleted for both; the slip is not failed.
-func TestStateMachine_CanarySteps_SkippedNewSteps_SatisfyPrereqs(t *testing.T) {
+// Precondition: prod_canary pending (the non-canary repo path), the rest of prod_deploy's prereqs completed.
+// Action:       CheckPrerequisites for prod_deploy; skip prod_canary then re-check.
+// Expected:     PrereqStatusRunning before the skip, PrereqStatusCompleted after; the slip is not failed.
+func TestStateMachine_CanarySteps_SkippedCanary_SatisfiesProdDeployPrereqs(t *testing.T) {
 	ctx := context.Background()
 	client, store := canaryTestClient()
 	corrID := "canary-skipped"
 	store.AddSlip(canarySlip(corrID, SlipStatusInProgress, map[string]Step{
-		"preprod_deploy":        {Status: StepStatusCompleted},
-		"preprod_tests":         {Status: StepStatusCompleted},
-		"preprod_rollback_test": {Status: StepStatusPending},
-		"prod_gate":             {Status: StepStatusCompleted},
-		"prod_release_created":  {Status: StepStatusCompleted},
-		"prod_canary":           {Status: StepStatusPending},
+		"preprod_deploy":       {Status: StepStatusCompleted},
+		"preprod_tests":        {Status: StepStatusCompleted},
+		"prod_gate":            {Status: StepStatusCompleted},
+		"prod_release_created": {Status: StepStatusCompleted},
+		"prod_canary":          {Status: StepStatusPending},
 	}))
 
-	gatePrereqs := []string{"preprod_deploy", "preprod_tests", "preprod_rollback_test"}
 	deployPrereqs := []string{"prod_gate", "prod_release_created", "prod_canary"}
 
-	// checkBoth asserts both dependants resolve to want.
-	checkBoth := func(when string, want PrereqStatus) *Slip {
+	check := func(when string, want PrereqStatus) *Slip {
 		slip := canaryLoad(t, store, corrID)
-		for name, prereqs := range map[string][]string{"prod_gate": gatePrereqs, "prod_deploy": deployPrereqs} {
-			res, err := client.CheckPrerequisites(ctx, slip, prereqs, "")
-			if err != nil {
-				t.Fatalf("CheckPrerequisites(%s): %v%s", name, err, stateMachineRef)
-			}
-			if res.Status != want {
-				t.Errorf("%s %s: expected %q, got %q%s", name, when, want, res.Status, stateMachineRef)
-			}
+		res, err := client.CheckPrerequisites(ctx, slip, deployPrereqs, "")
+		if err != nil {
+			t.Fatalf("CheckPrerequisites(prod_deploy): %v%s", err, stateMachineRef)
+		}
+		if res.Status != want {
+			t.Errorf("prod_deploy %s: expected %q, got %q%s", when, want, res.Status, stateMachineRef)
 		}
 		return slip
 	}
 
-	// Before the skip a pending new step holds its dependants. This is why the skip writer
-	// must run before prod_gate on every repo that does not use canary.
-	checkBoth("with a pending new step", PrereqStatusRunning)
-	for _, s := range []string{"preprod_rollback_test", "prod_canary"} {
-		if err := client.SkipStep(ctx, corrID, s, "", "deployment-strategy is not canary"); err != nil {
-			t.Fatalf("SkipStep(%s): %v%s", s, err, stateMachineRef)
-		}
+	// Before the skip a pending prod_canary holds prod_deploy. This is why the skip writer
+	// must run before prod_deploy on every repo that does not use canary.
+	check("with a pending prod_canary", PrereqStatusRunning)
+	if err := client.SkipStep(ctx, corrID, "prod_canary", "", "deployment-strategy is not canary"); err != nil {
+		t.Fatalf("SkipStep(prod_canary): %v%s", err, stateMachineRef)
 	}
-	slip := checkBoth("with skipped new steps", PrereqStatusCompleted)
+	slip := check("with a skipped prod_canary", PrereqStatusCompleted)
 	if slip.Status == SlipStatusFailed {
-		t.Errorf("skipping the new steps must not fail the slip%s", stateMachineRef)
+		t.Errorf("skipping prod_canary must not fail the slip%s", stateMachineRef)
 	}
 	if got := slip.Steps["prod_canary"].Status; got != StepStatusSkipped {
 		t.Errorf("expected prod_canary=%q, got %q%s", StepStatusSkipped, got, stateMachineRef)
@@ -245,19 +205,18 @@ func TestStateMachine_CanarySteps_AbortedResetOnRetry(t *testing.T) {
 	}
 }
 
-// canaryExampleGraph is the expected prerequisite graph for the four steps DEVOPS-314 changed
-// or added, shared by both example files.
+// canaryExampleGraph is the expected prerequisite graph for the steps around the canary,
+// shared by both example files.
 var canaryExampleGraph = map[string][]string{
-	"preprod_tests":         {"preprod_deploy"},
-	"preprod_rollback_test": {"preprod_tests"},
-	"prod_gate":             {"preprod_deploy", "preprod_tests", "preprod_rollback_test"},
-	"prod_release_created":  {"prod_gate"},
-	"prod_canary":           {"prod_release_created"},
-	"prod_deploy":           {"prod_gate", "prod_release_created", "prod_canary"},
-	"prod_tests":            {"prod_gate", "prod_deploy"},
+	"preprod_tests":        {"preprod_deploy"},
+	"prod_gate":            {"preprod_deploy", "preprod_tests"},
+	"prod_release_created": {"prod_gate"},
+	"prod_canary":          {"prod_release_created"},
+	"prod_deploy":          {"prod_gate", "prod_release_created", "prod_canary"},
+	"prod_tests":           {"prod_gate", "prod_deploy"},
 }
 
-// TestPipelineConfig_ExampleFiles_CanaryGraph pins the DEVOPS-314 graph in both example configs.
+// TestPipelineConfig_ExampleFiles_CanaryGraph pins the canary graph in both example configs.
 // These files are examples (the live config is in Vault), so the graph is pinned for the steps
 // this change touches; it also asserts that mutation_tests is standalone and that
 // prod_steady_state waits on prod_alert_gate. Other drift from Vault is not asserted.
@@ -327,23 +286,23 @@ func TestPipelineConfig_ExampleFiles_CanaryGraph(t *testing.T) {
 				slices.Sort(out)
 				return out
 			}
-			if got := dependents("preprod_rollback_test"); !slices.Equal(got, []string{"prod_gate"}) {
-				t.Errorf("%s: steps depending on preprod_rollback_test = %v, want only [prod_gate]", tc.file, got)
+			if cfg.GetStep(retiredRehearsalStep) != nil {
+				t.Errorf("%s: retired step %q must not be configured", tc.file, retiredRehearsalStep)
+			}
+			if got := dependents(retiredRehearsalStep); len(got) != 0 {
+				t.Errorf("%s: steps depending on retired step %q = %v, want none", tc.file, retiredRehearsalStep, got)
 			}
 			if got := dependents("prod_canary"); !slices.Equal(got, []string{"prod_deploy"}) {
 				t.Errorf("%s: steps depending on prod_canary = %v, want only [prod_deploy]", tc.file, got)
 			}
-			// The new steps must not be gates and must not aggregate component work.
-			for _, name := range []string{"preprod_rollback_test", "prod_canary"} {
-				if s := cfg.GetStep(name); s != nil && (s.IsGate || s.Aggregates != "") {
-					t.Errorf(
-						"%s: %s must be a plain step (is_gate=%v aggregates=%q)",
-						tc.file,
-						name,
-						s.IsGate,
-						s.Aggregates,
-					)
-				}
+			// prod_canary must not be a gate and must not aggregate component work.
+			if s := cfg.GetStep("prod_canary"); s != nil && (s.IsGate || s.Aggregates != "") {
+				t.Errorf(
+					"%s: prod_canary must be a plain step (is_gate=%v aggregates=%q)",
+					tc.file,
+					s.IsGate,
+					s.Aggregates,
+				)
 			}
 		})
 	}
@@ -351,10 +310,10 @@ func TestPipelineConfig_ExampleFiles_CanaryGraph(t *testing.T) {
 
 // TestPipelineConfig_ExampleFiles_ProdSteadyStateReachable pins STATE_MACHINE_V3 rule 7
 // ("confirm prod_steady_state is reachable") for the example configs by walking the
-// prerequisite graph from an empty slip. It is reachable when the two canary-only steps are
-// skipped and when they complete (those two positive checks are sanity checks only: any
+// prerequisite graph from an empty slip. It is reachable when the canary-only step is
+// skipped and when it completes (those two positive checks are sanity checks only: any
 // config that loads is acyclic, so they cannot catch a wrong edge; the CanaryGraph reverse-edge
-// assertions do that). A canary step stuck in neither state blocks prod_deploy,
+// assertions do that). A prod_canary stuck in neither state blocks prod_deploy,
 // prod_tests and prod_steady_state, which is why the skip writer must run on non-canary repos.
 func TestPipelineConfig_ExampleFiles_ProdSteadyStateReachable(t *testing.T) {
 	// reach returns the steps that can finish. A step in satisfied counts as met without
@@ -388,12 +347,12 @@ func TestPipelineConfig_ExampleFiles_ProdSteadyStateReachable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("load %s: %v", file, err)
 			}
-			skipped := map[string]bool{"prod_canary": true, "preprod_rollback_test": true}
+			skipped := map[string]bool{"prod_canary": true}
 			if !reach(cfg, skipped, nil)["prod_steady_state"] {
-				t.Errorf("%s: prod_steady_state unreachable with the canary steps skipped", file)
+				t.Errorf("%s: prod_steady_state unreachable with prod_canary skipped", file)
 			}
 			if !reach(cfg, nil, nil)["prod_steady_state"] {
-				t.Errorf("%s: prod_steady_state unreachable with the canary steps completing", file)
+				t.Errorf("%s: prod_steady_state unreachable with prod_canary completing", file)
 			}
 			stuckCanary := reach(cfg, nil, map[string]bool{"prod_canary": true})
 			for _, s := range []string{"prod_deploy", "prod_tests", "prod_steady_state"} {
@@ -401,32 +360,21 @@ func TestPipelineConfig_ExampleFiles_ProdSteadyStateReachable(t *testing.T) {
 					t.Errorf("%s: %s must be blocked while prod_canary is neither completed nor skipped", file, s)
 				}
 			}
-			stuckRollback := reach(cfg, nil, map[string]bool{"preprod_rollback_test": true})
-			for _, s := range []string{"prod_gate", "prod_release_created", "prod_canary", "prod_deploy", "prod_tests", "prod_steady_state"} {
-				if stuckRollback[s] {
-					t.Errorf(
-						"%s: %s must be blocked while preprod_rollback_test is neither completed nor skipped",
-						file,
-						s,
-					)
-				}
-			}
 		})
 	}
 }
 
-// liveShapeStepOrder is the live Vault pipeline config's step order (config-dev v16, which equals
-// the prod `config` key) plus the two DEVOPS-314 steps.
+// liveShapeStepOrder is the step order of the example configs.
 var liveShapeStepOrder = []string{
 	"builds", "unit_tests", "mutation_tests", "secret_scan", "package_artifact",
-	"dev_deploy", "dev_tests", "preprod_deploy", "preprod_tests", "preprod_rollback_test",
+	"dev_deploy", "dev_tests", "preprod_deploy", "preprod_tests",
 	"prod_gate", "prod_release_created", "prod_canary", "prod_deploy", "prod_tests",
 	"prod_alert_gate", "prod_rollback", "prod_steady_state",
 }
 
 // TestPipelineConfig_ExampleFiles_MirrorEachOtherAndLiveShape pins that default.json and
 // production.json are identical field by field (name, description, is_gate, aggregates,
-// prerequisites) and that their step names and order match the live 18-step target. It also
+// prerequisites) and that their step names and order match the 17-step shape. It also
 // pins that prod_gate is the only gate step.
 func TestPipelineConfig_ExampleFiles_MirrorEachOtherAndLiveShape(t *testing.T) {
 	def, err := LoadPipelineConfigFromFile("default.json")

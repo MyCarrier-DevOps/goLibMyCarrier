@@ -54,20 +54,19 @@ func (c *Client) TimeoutStep(ctx context.Context, correlationID, stepName, compo
 }
 
 // skipGuardedSteps are the steps whose failed status SkipStep must never overwrite
-// (STATE_MACHINE_V3 "Skip-writer contract"): the canary steps, and the two steps a D13 canary
+// (STATE_MACHINE_V3 "Skip-writer contract"): the canary step, and the two steps a D13 canary
 // skip writes.
 var skipGuardedSteps = map[string]struct{}{
-	"prod_canary":           {},
-	"preprod_rollback_test": {},
-	"prod_deploy":           {},
-	"prod_tests":            {},
+	"prod_canary": {},
+	"prod_deploy": {},
+	"prod_tests":  {},
 }
 
 // SkipStep marks a step as skipped.
 // The correlationID is the unique identifier for the routing slip.
 //
-// A failed prod_canary, preprod_rollback_test, prod_deploy or prod_tests is never overwritten:
-// skipped counts as success, so the skip would clear a primary failure. For a canary step it
+// A failed prod_canary, prod_deploy or prod_tests is never overwritten:
+// skipped counts as success, so the skip would clear a primary failure. For prod_canary it
 // would unblock promotion past a failed canary; for prod_deploy or prod_tests (a D13 canary skip
 // on a re-run whose deploy already failed) it would hide the failed deploy, and a later canary
 // retry would return the slip to in_progress. In that case SkipStep returns

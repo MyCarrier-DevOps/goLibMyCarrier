@@ -50,15 +50,10 @@
       "prerequisites": ["preprod_deploy"]
     },
     {
-      "name": "preprod_rollback_test",
-      "description": "Rollback rehearsal in pre-production (canary repos only; skipped otherwise)",
-      "prerequisites": ["preprod_tests"]
-    },
-    {
       "name": "prod_gate",
       "description": "Checks that the code is ready to be promoted to production",
       "is_gate": true,
-      "prerequisites": ["preprod_deploy", "preprod_tests", "preprod_rollback_test"]
+      "prerequisites": ["preprod_deploy", "preprod_tests"]
     },
     {
       "name": "prod_release_created",
