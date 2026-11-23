@@ -9,7 +9,7 @@ require (
 	github.com/MyCarrier-DevOps/goLibMyCarrier/logger v1.4.1
 	github.com/MyCarrier-DevOps/goLibMyCarrier/postgresmigrator v1.4.1
 	github.com/jackc/pgx/v5 v5.13.0
-	github.com/pashagolub/pgxmock/v5 v5.2.0
+	github.com/pashagolub/pgxmock/v6 v6.0.0
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.45.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.45.0
