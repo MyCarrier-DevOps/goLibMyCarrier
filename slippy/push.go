@@ -121,9 +121,8 @@ type PushOptions struct {
 //
 // The third is easy to miss and is the reason this paragraph exists. What makes it a separate
 // class is NOT any file in this repo: `slippy/default.json` and `slippy/production.json` are
-// EXAMPLE configs (18-step target), and the live pipeline config is the document in Vault at
-// `DevOps/data/slippy/config#config` (16 steps until the dev/prod cutover), which no code or
-// test here can read. The load-bearing
+// EXAMPLE configs, and the live pipeline config is the document in Vault at
+// `DevOps/data/slippy/config#config`, which no code or test here can read. The load-bearing
 // fact is pushhookparser's dispatch behaviour: it fires the secret scan for every HUMAN commit
 // independently of builds and unit tests — the only exemption is a bot image-tag commit. (The
 // example configs illustrate it as a componentless non-aggregate step and a prerequisite of

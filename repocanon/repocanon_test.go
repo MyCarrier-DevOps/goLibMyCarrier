@@ -668,8 +668,20 @@ func TestArgoCDAppNameCandidates(t *testing.T) {
 		chart string
 		want  []string
 	}{
-		{"legacy prod helm", "example", "prod", "mycarrier-helm", []string{"production-csp-prod-example", "production-prod-example"}},
-		{"prod empty chart", "example", " PROD ", "", []string{"production-csp-prod-example", "production-prod-example"}},
+		{
+			"legacy prod helm",
+			"example",
+			"prod",
+			"mycarrier-helm",
+			[]string{"production-csp-prod-example", "production-prod-example"},
+		},
+		{
+			"prod empty chart",
+			"example",
+			" PROD ",
+			"",
+			[]string{"production-csp-prod-example", "production-prod-example"},
+		},
 		{"prod mc-environment", "example", "prod", "mc-environment", []string{"example-prod"}},
 		{"dev legacy", "example", "dev", "mycarrier-helm", []string{"development-dev-example"}},
 		{"preprod legacy", "example", "preprod", "", []string{"development-preprod-example"}},

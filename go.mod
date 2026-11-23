@@ -2,7 +2,7 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier
 
 go 1.27
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 // This is a meta-module that provides version tracking for all submodules.
 // Individual packages should be imported directly:

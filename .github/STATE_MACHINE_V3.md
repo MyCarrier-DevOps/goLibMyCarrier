@@ -33,7 +33,7 @@
 - Step dependencies defined by pipeline config (`production.json`).
 - Initial steps (no prereqs): `builds`, `unit_tests`, `secret_scan`, `package_artifact`.
 - Final step: `prod_steady_state`.
-- Canary steps (DEVOPS-314): `preprod_rollback_test` (prereq `preprod_tests`; added to `prod_gate` prereqs) and `prod_canary` (prereq `prod_release_created`; added to `prod_deploy` prereqs). Both are marked `skipped` by the release workflow unless the repo's `deployment-strategy` custom property is `canary` (see Canary Steps section).
+- Canary step (DEVOPS-314): `prod_canary` (prereq `prod_release_created`; added to `prod_deploy` prereqs). The release workflow marks it `skipped` unless the repo's `deployment-strategy` custom property is `canary` (see Canary Steps section).
 - All initial steps run in parallel for same correlation id. Build components run in parallel within `builds` aggregate.
 - Downstream steps run per config-defined prereqs (see Pipeline Flow diagram).
 
@@ -744,7 +744,7 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 
 > **Note:** "downstream lazy-abort" means downstream step rows are NOT changed by FailStep. Each downstream step transitions to `aborted` only when its own `WaitForPrerequisites` call observes the failed prereq.
 
-> **Note (DEVOPS-314):** the diagram predates the canary steps. `preprod_rollback_test` sits between `preprod_tests` and `PROD_GATE` (a prereq of `prod_gate`); `prod_canary` sits between `prod_release_created` and `prod_deploy` (a prereq of `prod_deploy`). Both are usually `skipped`, which satisfies prerequisites. See "Canary Steps (DEVOPS-314)".
+> **Note (DEVOPS-314):** the diagram predates the canary step. `prod_canary` sits between `prod_release_created` and `prod_deploy` (a prereq of `prod_deploy`). It is usually `skipped`, which satisfies prerequisites. See "Canary Steps (DEVOPS-314)".
 
 > **Note:** Prod steps do NOT become `aborted` synchronously when `prod_gate=failed`. Each transitions to `aborted` only when its own `WaitForPrerequisites` runs (`hold.go:83-111`). Steps that never enter pre-job stay `pending`. The recovery branch of `checkPipelineCompletion` (`executor.go`) resets only steps actually in `aborted` (plus the D13 canary skips of scenario H, which a `prod_gate` failure never writes) — vacuous if none ever transitioned.
 
@@ -811,10 +811,8 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 |-------|------------|---------|----------------|
 | `preprod_deploy=running` | `in_progress` | `builds+unit_tests+secret_scan=completed` | `failed` - blocks `prod_gate` |
 | `preprod_tests=running` | `in_progress` | ArgoCD PostSync → TestEngine ⚠️ | `failed` - blocks `prod_gate` |
-| `preprod_rollback_test=running` | `in_progress` | after `preprod_tests=completed` (or `skipped` by the release workflow) | `failed` - blocks `prod_gate` |
 | `preprod_deploy=failed` | `failed` | post-job | `preprod_tests` aborts if waiting; `prod_gate` blocked |
 | `preprod_tests=failed` | `failed` | TestEngine RunPostExecution | `prod_gate` blocked until resolved |
-| `preprod_rollback_test=failed` | `failed` | post-job | `prod_gate` blocked until resolved |
 
 > ⚠️ `preprod_tests` can run against a failed or restarted deployment (PROJECT_STATE.md - discrepancy #9).
 > `prod_gate` has no awareness of which deployment the test results belong to.
@@ -826,7 +824,7 @@ duplicate detection before migration v5" below); `CreateSlipForPush`
 | | |
 |---|---|
 | **slip.status** | `in_progress` |
-| **Prereqs** | `preprod_deploy=completed` AND `preprod_tests=completed` AND `preprod_rollback_test` terminal-success (`completed` or `skipped`) |
+| **Prereqs** | `preprod_deploy=completed` AND `preprod_tests=completed` |
 | **Running** | `prod_gate` (is_gate=true) |
 | **On success** | All downstream prod steps unblocked; pipeline continues to `PROD_RELEASE` |
 | **On failure** | `slip=failed` (FailStep only flips `prod_gate` + `slip.status`). Downstream steps NOT immediately aborted — each self-aborts lazily when its own `WaitForPrerequisites` observes `prod_gate=failed` (`hold.go:83-111`). Steps whose pre-job never runs stay `pending`. |
@@ -916,8 +914,7 @@ prod_gate=completed
 | `dev_deploy` failed | `failed` | `dev_tests` | `dev_tests` (if waiting) | Re-run `dev_deploy` - does NOT block preprod |
 | `dev_tests` failed | `failed` | Nothing downstream | None | Re-run `dev_tests` - does NOT block preprod |
 | `preprod_deploy` failed | `failed` | `preprod_tests`, `prod_gate` | `preprod_tests` (if waiting) | Re-run `preprod_deploy` |
-| `preprod_tests` failed | `failed` | `preprod_rollback_test`, `prod_gate` | `preprod_rollback_test` (if waiting) | Re-run `preprod_tests` |
-| `preprod_rollback_test` failed | `failed` | `prod_gate` and, through it, all production steps | `prod_gate` (library path: hold returns `ErrPrerequisiteFailed`, `prod_gate` -> `aborted`); CLI/Argo path: prod-gate pre-job exits non-zero, `prod_gate` stays `pending` | Re-run `preprod_rollback_test` |
+| `preprod_tests` failed | `failed` | `prod_gate` | `prod_gate` (library path, if in WaitForPrerequisites); on the Slippy CLI path nothing is written and `prod_gate` stays `pending` | Re-run `preprod_tests` |
 | `prod_gate` failed | `failed` | All production steps | `prod_release_created`, `prod_canary`, `prod_deploy`, `prod_tests`, `prod_alert_gate`, `prod_rollback`, `prod_steady_state` | Re-run `prod_gate` |
 | `prod_release_created` failed | `failed` | `prod_canary`, `prod_deploy`, `prod_tests` | None (prereqs not met - they stay pending) | Re-run `prod_release_created` |
 | `prod_canary` failed | `failed` | `prod_deploy`, `prod_tests`, `prod_steady_state` | `prod_deploy` (library path, if in WaitForPrerequisites); on the Slippy CLI path nothing is written and `prod_deploy` stays `pending` | Re-run `prod_canary` |
@@ -976,8 +973,7 @@ builds completes
 builds + unit_tests + secret_scan all complete
     └─► preprod_deploy
             └─► preprod_tests (TestEngine PostSync)
-                    └─► preprod_rollback_test (skipped unless canary repo)
-                            └─► prod_gate (after all preprod steps done)
+                    └─► prod_gate (after all preprod steps done)
                                     └─► prod_release_created
                                             └─► prod_canary (skipped unless canary repo)
                                                     └─► prod_deploy + prod_tests (parallel)
@@ -1001,7 +997,7 @@ Auto-deployer is **read-only** (polls `GetSlip`). It triggers Argo workflows via
 | `DEV_TESTS_RUNNING` | If `dev_tests=failed`: F2/F3 retry - POSTs `/autotriggertests` |
 | `PREPROD_RUNNING` | Triggers `preprod_deploy`; watches for completion |
 | `PREPROD_TESTS_RUNNING` | If `preprod_tests=failed`: F2/F3 retry |
-| `PROD_RELEASE` | Monitors prod_gate → prod_release_created → prod_deploy → prod_tests sequentially (tracks only these four: `release_stage.go:79-83,120,174`; `prod_canary` and `preprod_rollback_test` are NOT tracked, so their time counts against its 10m prod_gate / prod_release_created / prod_deploy waits, set at `main.go:240-242` from `DefaultDeployTimeout` (`internal/config/config.go:30`); time spent in the step-0 skip jobs also counts against the prod activation wait (`release_stage.go:160-165`, `WaitForActivation`), raised to 8m in auto-deployer#17 (open); follow-up DEVOPS-318/319, bd mycarrier-we5c); does NOT auto-retry |
+| `PROD_RELEASE` | Monitors prod_gate → prod_release_created → prod_deploy → prod_tests sequentially (tracks only these four: `release_stage.go:79-83,120,174`; `prod_canary` is NOT tracked, so its time counts against its 10m prod_gate / prod_release_created / prod_deploy waits, set at `main.go:240-242` from `DefaultDeployTimeout` (`internal/config/config.go:30`); time spent in the step-0 skip jobs also counts against the prod activation wait (`release_stage.go:160-165`, `WaitForActivation`), raised to 8m in auto-deployer#17 (open); follow-up DEVOPS-319, bd mycarrier-we5c); does NOT auto-retry |
 | Failures | Does NOT auto-retry prod_deploy or prod_gate |
 
 ---
@@ -1089,29 +1085,38 @@ checkPipelineCompletion(ctx, correlationID):
 
 ## Canary Steps (DEVOPS-314)
 
-Two config-driven steps (Postgres columns `preprod_rollback_test_status`, `prod_canary_status`, added by slippy-migrator before slippy-api restarts; ProbeSchema fails otherwise). The slippy-migrator Job does not re-run on a Vault edit: trigger it explicitly before restarting slippy-api:
+One config-driven step (Postgres column `prod_canary_status`, added by slippy-migrator before slippy-api restarts; ProbeSchema fails otherwise). The slippy-migrator Job does not re-run on a Vault edit: trigger it explicitly before restarting slippy-api:
 
 | Step | Prereqs | Added to |
 |------|---------|----------|
-| `preprod_rollback_test` | `preprod_tests` | `prod_gate` prereqs |
 | `prod_canary` | `prod_release_created` | `prod_deploy` prereqs |
 
 ### Skip-writer contract
 
 - **Status:** the skip writer lives in the workflows (`create-github-release` step 0 in workflow-dev/workflow-core), not in the Slippy library. The library provides `Client.SkipStep`; the workflows decide when to call it.
-- **Ordering invariant:** the skip writer must be live in the workflows before any Slippy config (Vault `#config-dev` / `#config`) gains these steps; otherwise non-canary releases hold `prod_gate`/`prod_deploy` for 60m and fail. The example JSON files carry no skip semantics.
-- **Fail-open:** missing/empty custom properties are treated as non-canary, so both steps are skipped (by design, decisions #2/#9: default = rolling). A canary repo whose properties fail to arrive therefore deploys without a canary. A consistency guard between `deployment-strategy` and helm `deploymentType: rollout` is DEVOPS-310's.
-- **When / rule:** it marks both steps `skipped` unless the repo custom property `deployment-strategy` equals `canary`. Absent or any other value means skip. Canary repos leave them `pending` for their own workflows to run: the canary runner (DEVOPS-319) records `prod_canary`, and the rollback-rehearsal driver (DEVOPS-318) drives `preprod_rollback_test`. If the workflow that should run one of these steps does not run, the step stays `pending`, `prod_gate` (or `prod_deploy`) holds for 60m, and the release fails.
-- **Why it matters:** `skipped` satisfies prerequisites (`status.go` IsSuccess, `prereqs.go`). A `pending` canary step blocks promotion, so the skip must be written before `prod_gate` on non-canary repos.
-- `SkipStep` refuses to overwrite a `failed` canary step, or a `failed` `prod_deploy` or `prod_tests`. `skipped` counts as success (`IsSuccess`) and retry recovery never resets a skip that was written over a failure, so skipping a `failed` `prod_canary` or `preprod_rollback_test` would unblock `prod_deploy`/`prod_gate` and nothing would revisit the failure (a re-run release whose custom properties fail to arrive, fail-open, would do exactly that), and skipping a `failed` `prod_deploy` or `prod_tests` would clear that primary failure and hide it. `Client.SkipStep` loads the slip and, for `prod_canary`, `preprod_rollback_test` (DEVOPS-319), `prod_deploy` and `prod_tests` (DEVOPS-554) only, returns `ErrSkipOverFailedCanary` without writing when the step's status is `failed`; API callers should map it to HTTP 409 (slippy-api answers 422 until it maps the sentinel). Every other status on those steps, and every status on other steps, is unchanged (the check is a read followed by the write, not atomic). A failed step is resolved by recording a new verdict for it, not by skipping it.
+- **Ordering invariant:** the skip writer must be live in the workflows before any Slippy config (Vault `#config-dev` / `#config`) gains this step; otherwise non-canary releases hold `prod_deploy` for 60m and fail. The example JSON files carry no skip semantics.
+- **Fail-open:** missing/empty custom properties are treated as non-canary, so the step is skipped (by design, decisions #2/#9: default = rolling). A canary repo whose properties fail to arrive therefore deploys without a canary. A consistency guard between `deployment-strategy` and helm `deploymentType: rollout` is DEVOPS-310's.
+- **When / rule:** it marks `prod_canary` `skipped` unless the repo custom property `deployment-strategy` equals `canary`. Absent or any other value means skip. Canary repos leave it `pending` for the canary runner (DEVOPS-319) to record. If that workflow does not run, the step stays `pending`, `prod_deploy` holds for 60m, and the release fails.
+- **Why it matters:** `skipped` satisfies prerequisites (`status.go` IsSuccess, `prereqs.go`). A `pending` `prod_canary` blocks promotion, so the skip must be written before `prod_deploy` on non-canary repos.
+- `SkipStep` refuses to overwrite a `failed` `prod_canary`, `prod_deploy` or `prod_tests`. `skipped` counts as success (`IsSuccess`) and retry recovery never resets a skip that was written over a failure, so skipping a `failed` `prod_canary` would unblock `prod_deploy` and nothing would revisit the failure (a re-run release whose custom properties fail to arrive, fail-open, would do exactly that), and skipping a `failed` `prod_deploy` or `prod_tests` would clear that primary failure and hide it. `Client.SkipStep` loads the slip and, for `prod_canary` (DEVOPS-319), `prod_deploy` and `prod_tests` (DEVOPS-554) only, returns `ErrSkipOverFailedCanary` without writing when the step's status is `failed`; API callers should map it to HTTP 409 (slippy-api answers 422 until it maps the sentinel). Every other status on those steps, and every status on other steps, is unchanged (the check is a read followed by the write, not atomic). A failed step is resolved by recording a new verdict for it, not by skipping it.
 - **Recovery after a canary failure:** for a repo switched to rolling after its canary failed, either complete `prod_canary` by hand (`POST /slips/{id}/steps/prod_canary/complete`, which needs the write key) or release a new commit. A canary-path re-run still records a new verdict. Completing `prod_canary` by hand after a D13 shape runs the scenario H reset: `prod_deploy`, `prod_tests` and `prod_alert_gate` are then `pending`, and `prod_steady_state` waits until a new release runs them or supersedes the slip.
+
+### Steps that leave the pipeline config
+
+A step can leave the config while slips that carry it are still in flight, and workflows that started before the config changed can still write it. The library tolerates both shapes without a flag:
+
+- **Reads follow the loaded config.** Prerequisites are read from the config at evaluation time (the CLI takes them from slippy-api's config, and the step-prerequisites route reads the same config), never from data stored on the slip. `PostgresStore` hydrates `slip.Steps` and the claim state only from the status columns of the loaded config. A step that is not in the config is therefore never in a loaded slip, and it cannot be a prerequisite, a primary failure or in-flight state. `checkPipelineCompletion` sees only the loaded steps, so such a step cannot hold `prod_gate` or move the slip to `failed`. A slip stored as `failed` because of it keeps that stored status until the next terminal pipeline-level write on a configured step, which recomputes it.
+- **Writes are accepted, not no-ops.** `StartStep`, `CompleteStep`, `FailStep` and `SkipStep` on a name that is not in the config return nil. The store records the event in `slip_component_states` and appends it to `state_history`, writes no status column (`writeStepStatusColumn` checks the config first), and the step never shows in a loaded slip. This is the decision (a no-op was the alternative). A no-op would put config knowledge into `Client`, would need a nil-config path, and must not swallow component names such as `build` and `unit_test` that are not step names. The accepted write needs no code and cannot fail a caller that outlives a config change. The slippy-api write routes do not check the step name against the config either. Only the step-prerequisites read answers 400 for an unknown step.
+- **The skip guard follows its list, not the config.** `skipGuardedSteps` names only `prod_canary`, `prod_deploy` and `prod_tests`. A skip of any other name is written without reading the slip.
+- **The migrator never drops a step column.** The config-driven ensurers only run `ADD COLUMN IF NOT EXISTS`, and no migration removes a column when its step leaves the config. The column stays in `routing_slips` as `NOT NULL DEFAULT 'pending'`. Slips created afterwards read `pending` in it, because no write names it any more, and slips created before keep their last value. Anything that mirrors `routing_slips` column by column (the ClickHouse `*_pg` mirrors) keeps working and sees a constant. Dropping the column needs a separate, reviewed migration; none exists.
+
+Where each is tested: `TestRetiredStep_WritesAreAccepted_Integration`, `TestRetiredStep_SlipCreatedWithStep_PassesProdGateWithoutIt_Integration` and `TestRetiredStep_KeptColumnReadsPendingForNewSlips_Integration` run against real Postgres with two configs on one database. `TestClient_WriteToRetiredStep_DoesNotFailCaller` and `TestPostgresDynamicEnsurers_RetiredStepIsNeverDropped` are hermetic. `MockStore` writes any step name into `slip.Steps`, unlike `PostgresStore`, so only the integration tests prove the read side.
 
 ### Checklist item 7 trace
 
 - **Cascade scope, `prod_canary` failed:** primary failure, so `slip=failed`. Library hold path (no D13 skips written): `prod_deploy`'s hold aborts it; `prod_tests` and `prod_steady_state` stay `pending` until their own holds (blocked until `prod_canary` is `completed` or `skipped`). A retry that completes `prod_canary` resets the aborted steps to `pending` and the slip to `in_progress`. When the canary writer has applied decision D13, `prod_deploy` and `prod_tests` are `skipped` instead (and `prod_alert_gate` too), and the same retry resets those canary skips to `pending` (scenario H); see "Decision D13 (canary abort)".
-- **`preprod_rollback_test` failed:** same library/CLI split (see below): `prod_gate` -> `aborted` (library) or stays `pending` (CLI). Blocks `prod_gate` and, through it, everything downstream including `prod_steady_state`.
 - **`prod_steady_state` reachability:** `prod_release_created -> prod_canary (skipped|completed) -> prod_deploy -> prod_tests -> prod_steady_state`. The example files and the live Vault config both list `[prod_deploy, prod_tests, prod_alert_gate]` as `prod_steady_state` prereqs, so reachability also depends on the alert-gate branch.
-- **Phases:** nothing upstream of the new steps changed (`dev_deploy` is unchanged; its prereqs are `[builds]` in both example files and the live config), so DEV and CI_PARALLEL are unaffected (rule 8).
+- **Phases:** nothing upstream of the canary step changed (`dev_deploy` is unchanged; its prereqs are `[builds]` in both example files and the live config), so DEV and CI_PARALLEL are unaffected (rule 8).
 
 ### Library vs CLI cascade
 
@@ -1162,7 +1167,7 @@ The "aborted automatically" cascade holds only in the library: `WaitForPrerequis
 | L | `promotion_not_confirmed` | `prod_canary=completed`, `prod_deploy=failed`; not D13 | `failed` |
 | M | `workflow_ended` | `prod_canary=failed` only; `prod_deploy`, `prod_tests` stay `pending` | `failed` |
 
-**The skip guard, exactly.** `SkipStep` refuses to overwrite a `failed` `prod_canary`, `preprod_rollback_test`, `prod_deploy` or `prod_tests` (`ErrSkipOverFailedCanary`, nothing written). It reads the slip and then writes, so it is not atomic. Everything else is allowed: a skip over `completed` or `running` (`prod_deploy` and `prod_tests` included), a repeated skip (a redelivery writes a second `skipped` history entry; the step stays `skipped`), and a skip on a `promoted` slip (the step is recorded; `slip.status` stays `promoted`). The `prod_deploy` / `prod_tests` half (DEVOPS-554) closes a hazard of the same class as scenario H: after scenario L leaves `prod_deploy` failed, a re-run whose canary aborts used to skip it, clearing the only primary failure, and a later canary retry returned the slip to `in_progress` with the failed deploy no longer visible. Now the D13 writer's skip of the failed step is refused (its `slippy-skip-job` fails; the rollout-watch and `canary-not-deployed` skip steps have `continueOn`, so the rest of the abort writes still run) and the slip stays `failed` on `prod_deploy`. Where each is tested: the skip-over-status cases (`completed`, `running`, failed `prod_deploy`, failed `prod_tests`), the repeated skip and the skip on a `promoted` slip are verified against `MockStore` only; no real-Postgres test covers the repeated skip or the promoted-slip skip. The real-Postgres integration test covers only the freshness guard: a skipped step is terminal for it, so a non-terminal write within the freshness window (default 750 ms) is refused with `ErrTerminalAlreadyExists`; after the window it is allowed as a re-run.
+**The skip guard, exactly.** `SkipStep` refuses to overwrite a `failed` `prod_canary`, `prod_deploy` or `prod_tests` (`ErrSkipOverFailedCanary`, nothing written). It reads the slip and then writes, so it is not atomic. Everything else is allowed: a skip over `completed` or `running` (`prod_deploy` and `prod_tests` included), a repeated skip (a redelivery writes a second `skipped` history entry; the step stays `skipped`), and a skip on a `promoted` slip (the step is recorded; `slip.status` stays `promoted`). The `prod_deploy` / `prod_tests` half (DEVOPS-554) closes a hazard of the same class as scenario H: after scenario L leaves `prod_deploy` failed, a re-run whose canary aborts used to skip it, clearing the only primary failure, and a later canary retry returned the slip to `in_progress` with the failed deploy no longer visible. Now the D13 writer's skip of the failed step is refused (its `slippy-skip-job` fails; the rollout-watch and `canary-not-deployed` skip steps have `continueOn`, so the rest of the abort writes still run) and the slip stays `failed` on `prod_deploy`. Where each is tested: the skip-over-status cases (`completed`, `running`, failed `prod_deploy`, failed `prod_tests`), the repeated skip and the skip on a `promoted` slip are verified against `MockStore` only; no real-Postgres test covers the repeated skip or the promoted-slip skip. The real-Postgres integration test covers only the freshness guard: a skipped step is terminal for it, so a non-terminal write within the freshness window (default 750 ms) is refused with `ErrTerminalAlreadyExists`; after the window it is allowed as a re-run.
 
 **Scenario H (canary retry; bd `mycarrier-h8sw6.3`, closed by DEVOPS-554):** when a canary retry makes `prod_canary` `completed` (or `skipped`) after the D13 skips were written, `checkPipelineCompletion` resets `prod_deploy`, `prod_tests` and `prod_alert_gate` to `pending` (history message `reset: canary retried after <reason>`), so `prod_deploy` and the alert gate must run again before `prod_steady_state` is satisfied. Before this rule only `aborted` steps were reset, so the skips stayed `skipped`, which satisfies prerequisites: on the narrow retry path (the re-run reaches Promoted, then the deploy pre-job fails before `StartStep` and the alert gate is still published) a slip could end `completed` with no prod deploy for the retried release, and if the retried release's alert gate had not written `prod_alert_gate` before `prod_steady_state` checked its prerequisites, steady state passed on the aborted attempt's skip with no alert-gate check of the retried release. A retry that reaches Promoted publishes `alert.gate` from the release exit handler (keyed on `promotion_status`, so also when the deploy pre-job fails afterwards), so the alert gate runs again for it. The rule, exactly (Recovery Rules has the pseudocode):
 
