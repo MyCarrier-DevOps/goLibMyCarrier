@@ -10,6 +10,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # Fixed time: the Monday digest (libMyCarrier dependabot-digest.yml) runs
+      # at 07:00 UTC.
+      time: "04:00"
     # Minor and patch updates are grouped, so packages that must move together
     # (the go.opentelemetry.io/otel set) land in the same pull request. Major
     # updates get a pull request each.
@@ -36,6 +39,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # Fixed time: the Monday digest (libMyCarrier dependabot-digest.yml) runs
+      # at 07:00 UTC.
+      time: "04:00"
     # A new action release waits 7 days before it is proposed. The release job
     # runs these actions with contents: write.
     cooldown:
