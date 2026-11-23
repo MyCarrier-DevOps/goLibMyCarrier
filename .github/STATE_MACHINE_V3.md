@@ -914,7 +914,7 @@ prod_gate=completed
 | `dev_deploy` failed | `failed` | `dev_tests` | `dev_tests` (if waiting) | Re-run `dev_deploy` - does NOT block preprod |
 | `dev_tests` failed | `failed` | Nothing downstream | None | Re-run `dev_tests` - does NOT block preprod |
 | `preprod_deploy` failed | `failed` | `preprod_tests`, `prod_gate` | `preprod_tests` (if waiting) | Re-run `preprod_deploy` |
-| `preprod_tests` failed | `failed` | `prod_gate` | - | Re-run `preprod_tests` |
+| `preprod_tests` failed | `failed` | `prod_gate` | `prod_gate` (library path, if in WaitForPrerequisites); on the Slippy CLI path nothing is written and `prod_gate` stays `pending` | Re-run `preprod_tests` |
 | `prod_gate` failed | `failed` | All production steps | `prod_release_created`, `prod_canary`, `prod_deploy`, `prod_tests`, `prod_alert_gate`, `prod_rollback`, `prod_steady_state` | Re-run `prod_gate` |
 | `prod_release_created` failed | `failed` | `prod_canary`, `prod_deploy`, `prod_tests` | None (prereqs not met - they stay pending) | Re-run `prod_release_created` |
 | `prod_canary` failed | `failed` | `prod_deploy`, `prod_tests`, `prod_steady_state` | `prod_deploy` (library path, if in WaitForPrerequisites); on the Slippy CLI path nothing is written and `prod_deploy` stays `pending` | Re-run `prod_canary` |

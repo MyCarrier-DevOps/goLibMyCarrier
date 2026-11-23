@@ -12,9 +12,11 @@ import (
 // that pin that tolerance name it here once.
 const retiredRehearsalStep = "preprod_rollback_test"
 
-// A slip that predates the removal can hold the retired step as failed. The skip guard no longer
-// covers it, so a skip is accepted instead of answering ErrSkipOverFailedCanary: a step that is
-// not in the config blocks nothing, so there is no failure for the skip to hide.
+// The skip guard no longer lists the retired step, so a skip of it is accepted instead of
+// answering ErrSkipOverFailedCanary. This describes the state after the live config drops the
+// step: PostgresStore builds slip.Steps from the config, so no loaded slip carries the step and
+// the status the guard would read is never failed. The mock slip holds a failed entry only to
+// show that SkipStep does not read it.
 func TestClient_SkipStep_RetiredStepIsNotGuarded(t *testing.T) {
 	ctx := context.Background()
 	store := NewMockStore()

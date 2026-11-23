@@ -541,7 +541,7 @@ func main() {
 
 ## Pipeline Stages
 
-The example pipeline configurations (`default.json` and `production.json`, which carry the same steps) are the live pipeline config plus the `prod_canary` step (DEVOPS-314). Your pipeline configuration may differ based on your specific workflow needs.
+The example pipeline configurations (`default.json` and `production.json`, which carry the same steps) are the 17-step shape this library targets: the base pipeline plus `prod_canary` (DEVOPS-314), without the retired `preprod_rollback_test` (DEVOPS-633). Your pipeline configuration may differ based on your specific workflow needs.
 
 | Stage | Step Name | Prerequisites | Description |
 |-------|-----------|---------------|-------------|
