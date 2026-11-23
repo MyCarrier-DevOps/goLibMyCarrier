@@ -812,7 +812,11 @@ func TestMarshalErrorText(t *testing.T) {
 			_, err := c.SendToChannel(ctx, "19:abc@thread.tacv2", "tenant-1", bad)
 			return err
 		}, "teamsbot: marshal conversation: "},
-		{"UpdateActivity", func() error { return c.UpdateActivity(ctx, "conv", "act", bad) }, "teamsbot: marshal activity: "},
+		{
+			"UpdateActivity",
+			func() error { return c.UpdateActivity(ctx, "conv", "act", bad) },
+			"teamsbot: marshal activity: ",
+		},
 		{"ReplyToActivity", func() error {
 			_, err := c.ReplyToActivity(ctx, "conv", "act", bad)
 			return err
