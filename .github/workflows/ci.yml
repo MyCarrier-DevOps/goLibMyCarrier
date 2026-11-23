@@ -7,7 +7,9 @@ on:
       - '!.claude/**'
       - '!docs/**'
       - '!.github/**'
-      - '!README.md'
+      # Markdown at the top level (README, CONTRIBUTING, RELEASING, agent
+      # instructions) does not change a module; * does not match /.
+      - '!*.md'
       - '.github/workflows/ci.yml'
       - '.github/Gitversion.yml'
     branches:
@@ -22,7 +24,9 @@ on:
       - '!.claude/**'
       - '!docs/**'
       - '!.github/**'
-      - '!README.md'
+      # Markdown at the top level (README, CONTRIBUTING, RELEASING, agent
+      # instructions) does not change a module; * does not match /.
+      - '!*.md'
       - '.github/workflows/ci.yml'
       - '.github/Gitversion.yml'
     branches:

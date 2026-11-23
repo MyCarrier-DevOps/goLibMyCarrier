@@ -85,18 +85,9 @@ The `-race` flag instruments the binary to detect concurrent memory access viola
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-When contributing:
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Write tests for your changes
-4. Run lint checks (`make lint`)
-5. Ensure all tests pass (`make test`)
-6. Cleanup go deps (`make tidy`)
-7. Commit your changes (`git commit -m 'Add some amazing feature'`)
-8. Push to the branch (`git push origin feature/amazing-feature`)
-9. Open a Pull Request
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the review rules, the local checks and how to open a
+pull request, and [RELEASING.md](RELEASING.md) for how a merge becomes a release of every
+module.
 
 ## Versioning
 
@@ -175,4 +166,4 @@ What breaks: `errors.Unwrap` only calls the single-error `Unwrap() error` form, 
 
 ## Support
 
-For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/MyCarrier-DevOps/go-client-langfuse).
+For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/MyCarrier-DevOps/goLibMyCarrier).
