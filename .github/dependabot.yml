@@ -10,6 +10,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # Fixed time: the Monday digest (libMyCarrier dependabot-digest.yml) runs
+      # at 07:00 UTC.
+      time: "04:00"
     # Minor and patch updates are grouped, so packages that must move together
     # (the go.opentelemetry.io/otel set) land in the same pull request. Major
     # updates get a pull request each.
@@ -36,6 +39,9 @@ updates:
     schedule:
       interval: weekly
       day: monday
+      # Fixed time: the Monday digest (libMyCarrier dependabot-digest.yml) runs
+      # at 07:00 UTC.
+      time: "04:00"
     # A new action release waits 7 days before it is proposed. The release job
     # runs these actions with contents: write.
     cooldown:
@@ -48,6 +54,17 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # gittools/actions v4.7 needs GitVersion 6.2 or newer; the release job
+      # pins 6.0.x. Both move together, with a check that 6.2 computes the same
+      # versions: DEVOPS-631. Pull request CI cannot catch this: the gitversion
+      # steps run only in the release job. DEVOPS-631 narrows this rule to v5
+      # and newer (versions: [">=5.0.0"]), not removes it: v5 needs GitVersion 7.
+      # The rule also holds back security updates of gittools/actions, so
+      # apply an advisory for it by hand.
+      - dependency-name: gittools/actions
+        update-types:
+          - version-update:semver-major
     commit-message:
       prefix: chore(ci)
     labels:
