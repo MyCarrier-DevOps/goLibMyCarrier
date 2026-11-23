@@ -2,7 +2,7 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/otel
 
 go 1.27.0
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/gin-gonic/gin v1.12.0

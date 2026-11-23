@@ -2,7 +2,7 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/clickhouse
 
 go 1.27.0
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.51.0

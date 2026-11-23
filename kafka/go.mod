@@ -2,7 +2,7 @@ module github.com/MyCarrier-DevOps/goLibMyCarrier/kafka
 
 go 1.27.0
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	github.com/segmentio/kafka-go v0.4.51

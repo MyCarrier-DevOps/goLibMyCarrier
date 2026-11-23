@@ -164,7 +164,7 @@ diverges:
   `run.go` names the same minor.
 - Never pin the `go` directive to a patch. Do **not** run `/go-repo-init`'s
   `pin-version` step here: it would force every consumer onto that exact patch.
-- The `toolchain` directive names the latest Go patch (`toolchain go1.27.3`). It
+- The `toolchain` directive names the latest Go patch (`toolchain go1.27.4`). It
   selects the Go this repo builds and tests with; consumers ignore a dependency's
   `toolchain` line. Move it to each new patch.
 - There is **no Dockerfile** — nothing to pin a `golang:` builder tag against.
