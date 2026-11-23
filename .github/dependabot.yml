@@ -48,6 +48,13 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # gittools/actions v4.7 needs GitVersion 6.2 or newer; the release job
+      # pins 6.0.x. Both move together, with a check that 6.2 computes the same
+      # versions: DEVOPS-631. Remove this rule there.
+      - dependency-name: gittools/actions
+        update-types:
+          - version-update:semver-major
     commit-message:
       prefix: chore(ci)
     labels:
