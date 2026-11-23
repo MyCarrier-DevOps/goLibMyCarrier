@@ -22,9 +22,11 @@ directory with a `go.mod` is its own module (`slippy`, `vault`, `logger`, ...). 
 merge while it is red: the merge would release nothing.
 
 CI ignores pull requests that change only `docs/**`, `.claude/**`, Markdown files at the top
-level (`README.md`, this file, ...) or files under `.github/` other than `ci.yml` and
-`Gitversion.yml`. Such a pull request gets no checks, so
-the required checks never report and only a `devsecops` member can merge it, with the bypass.
+level (`README.md`, `CLAUDE.md`, `AGENTS.md`, this file, ...) or files under `.github/` other
+than `ci.yml` and `Gitversion.yml`. Such a pull request gets no checks, so the required checks
+never report. Only a member of the `architects` or `devsecops` team can merge it, with the
+ruleset bypass. That includes a pull request that edits only the agent instructions in
+`CLAUDE.md` or `AGENTS.md`.
 
 ## Make a change
 
@@ -50,7 +52,12 @@ the required checks never report and only a `devsecops` member can merge it, wit
    make lint PKG=<module>
    make tidy
    make check-sec
+   make check-coverage PKG=<module>
    ```
+
+   CI fails "Unit tests status check" when a module's total coverage is below 75%.
+   `make check-coverage` runs the same gate, with the same threshold and the same exclusion
+   of test fixture packages.
 
 4. Open a pull request to `main`.
 
@@ -80,10 +87,10 @@ A change that breaks a consumer is a **minor** release, not a patch:
 
 Dependabot opens update pull requests every Monday at 04:00 UTC:
 
-* one pull request for all minor and patch updates of the Go modules, across every module;
+* one pull request for all minor and patch updates of the Go modules, across every module.
+  Updates to the modules of this repository itself are ignored;
 * a separate pull request for each major update;
-* one pull request for GitHub Actions minor and patch updates. Updates to the modules of
-  this repository itself are ignored.
+* one pull request for GitHub Actions minor and patch updates.
 
 Major updates of `gittools/actions` are held back until the release job moves to
 GitVersion 6.2 or newer (DEVOPS-631). That rule also holds back security updates of

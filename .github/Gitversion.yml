@@ -5,8 +5,9 @@ update-build-number: true
 tag-prefix: '[vV]?'
 
 strategies:
-  # ConfiguredNextVersion is what makes next-version above effective: with TaggedCommit alone
-  # the floor is parsed and ignored, and the breaking release would still ship as 1.4.x.
+  # ConfiguredNextVersion makes a next-version floor effective when one is set in this file:
+  # with TaggedCommit alone the floor is parsed and ignored. Keep it, and add or remove only
+  # next-version (RELEASING.md, "The version").
   - ConfiguredNextVersion
   - TaggedCommit
 

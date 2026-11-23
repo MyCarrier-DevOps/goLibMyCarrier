@@ -17,7 +17,12 @@ unless the push changes only `docs/**`, `.claude/**`, Markdown files at the top 
 
 A push that CI skips releases nothing. Re-run the workflow from the Actions tab
 (`workflow_dispatch` on `main`) to release the current `main`. The tags are created only if
-they do not exist yet, so a re-run is safe.
+they do not exist yet, so a re-run never tags twice.
+
+The release job tags the tip of the branch when the job starts, not the commit that started
+the run. An existing tag is skipped, never moved. So when two merges land close together, the
+first run can tag the second commit, and the second run then finds its tag and skips, still
+green.
 
 ## The version
 
@@ -70,3 +75,7 @@ go mod tidy
 * Modules that use `replace => ../<module>` give consumers the sibling version in their
   `require` line, not the code CI tested (DEVOPS-616).
 * The release job pins GitVersion 6.0 and `gittools/actions` v3 (DEVOPS-631).
+* The release job checks out `github.event.ref`, not `github.sha`, and the workflow has no
+  `concurrency` group (see "What starts a release"). On a feature branch, `<n>` counts
+  commits, so after a force-push with the same number of commits the prerelease tag stays on
+  the old code.
