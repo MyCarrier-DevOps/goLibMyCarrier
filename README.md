@@ -85,18 +85,9 @@ The `-race` flag instruments the binary to detect concurrent memory access viola
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-When contributing:
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Write tests for your changes
-4. Run lint checks (`make lint`)
-5. Ensure all tests pass (`make test`)
-6. Cleanup go deps (`make tidy`)
-7. Commit your changes (`git commit -m 'Add some amazing feature'`)
-8. Push to the branch (`git push origin feature/amazing-feature`)
-9. Open a Pull Request
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the review rules, the local checks and how to open a
+pull request, and [RELEASING.md](RELEASING.md) for how a merge becomes a release of every
+module.
 
 ## Versioning
 
@@ -104,16 +95,10 @@ This library follows [Semantic Versioning](https://semver.org/).
 
 ## Breaking changes
 
-Each break below is a **minor** bump, not a patch. main's GitVersion increment is `Patch`, so a
-breaking release carries a one-release floor in `.github/Gitversion.yml`: `next-version` plus
-the `ConfiguredNextVersion` strategy that makes it effective. Every module in this repo
-releases at one shared version, so the floor tags the sibling modules too. **The floor is for
-one release only: delete `next-version` (and `ConfiguredNextVersion`) once that version is
-tagged on main.** After that tag it does nothing: GitVersion takes the highest candidate, so
-main's Patch increment gives the next patch with or without it. It does not protect the next
-breaking change; for that, restore the floor (`next-version` and the `ConfiguredNextVersion`
-strategy), or put `+semver: minor` in that commit's message. The current floor is `1.5.0`, for
-DEVOPS-343; v1.4.0's floor was added in #87 and removed in #90.
+Each break below is a **minor** release, not a patch. Every module releases at one shared
+version, so the sibling modules get the minor too. [RELEASING.md](RELEASING.md) ("The
+version") says how to make one: `+semver: minor` in the squash commit message, or a
+one-release `next-version` floor in `.github/Gitversion.yml`.
 
 ### `slippy`: the ClickHouse slip store is removed — since `v1.5.0` (DEVOPS-343)
 
@@ -175,4 +160,4 @@ What breaks: `errors.Unwrap` only calls the single-error `Unwrap() error` form, 
 
 ## Support
 
-For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/MyCarrier-DevOps/go-client-langfuse).
+For issues, questions, or contributions, please visit the [GitHub repository](https://github.com/MyCarrier-DevOps/goLibMyCarrier).
