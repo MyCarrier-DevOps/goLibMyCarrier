@@ -541,7 +541,7 @@ func main() {
 
 ## Pipeline Stages
 
-The example pipeline configurations (`default.json` and `production.json`, which carry the same steps) are the live pipeline config plus the two DEVOPS-314 steps (`prod_canary`, `preprod_rollback_test`), the 18-step target the live Vault config moves to at cutover. Your pipeline configuration may differ based on your specific workflow needs.
+The example pipeline configurations (`default.json` and `production.json`, which carry the same steps) are the live pipeline config plus the `prod_canary` step (DEVOPS-314). Your pipeline configuration may differ based on your specific workflow needs.
 
 | Stage | Step Name | Prerequisites | Description |
 |-------|-----------|---------------|-------------|
@@ -554,8 +554,7 @@ The example pipeline configurations (`default.json` and `production.json`, which
 | Dev Tests | `dev_tests` | `dev_deploy` | Dev environment tests passed |
 | Pre-Prod Deploy | `preprod_deploy` | `builds`, `unit_tests`, `secret_scan` | Deployed to pre-production |
 | Pre-Prod Tests | `preprod_tests` | `preprod_deploy` | Pre-production tests passed |
-| Pre-Prod Rollback Test | `preprod_rollback_test` | `preprod_tests` | Rollback test passed; `skipped` unless repo `deployment-strategy` is `canary` |
-| Prod Gate | `prod_gate` | `preprod_deploy`, `preprod_tests`, `preprod_rollback_test` | Ready to promote to production (gate step) |
+| Prod Gate | `prod_gate` | `preprod_deploy`, `preprod_tests` | Ready to promote to production (gate step) |
 | Prod Release | `prod_release_created` | `prod_gate` | Production release created |
 | Prod Canary | `prod_canary` | `prod_release_created` | Canary soak passed; `skipped` unless repo `deployment-strategy` is `canary` |
 | Prod Deploy | `prod_deploy` | `prod_gate`, `prod_release_created`, `prod_canary` | Deployed to production |
