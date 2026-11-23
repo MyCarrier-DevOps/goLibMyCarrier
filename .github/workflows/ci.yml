@@ -246,12 +246,12 @@ jobs:
         ref: ${{ github.event.ref }}
         fetch-depth: 0
     - name: Install GitVersion
-      uses: gittools/actions/gitversion/setup@v3.1.11
+      uses: gittools/actions/gitversion/setup@v4.7.0
       with:
         versionSpec: '6.0.x'
     - name: Calculate Version
       id: calculate_version
-      uses: gittools/actions/gitversion/execute@v3.1.11
+      uses: gittools/actions/gitversion/execute@v4.7.0
       with:
         useConfigFile: true
         disableCache: true
