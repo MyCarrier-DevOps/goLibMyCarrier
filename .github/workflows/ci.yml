@@ -1,6 +1,11 @@
 name: Build And Release Pkgs
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a prerelease of every module from this branch (main always releases)
+        type: boolean
+        default: false
   push:
     paths:
       - '**'
@@ -12,10 +17,6 @@ on:
       - '.github/Gitversion.yml'
     branches:
       - main
-      - 'feature/**'
-      - 'hotfix/**'
-      - 'feat/**'
-      - 'fix/**'
   pull_request:
     paths:
       - '**'
@@ -231,12 +232,12 @@ jobs:
       - vuln-check
       # It has no if: or needs:, so every run that can release runs it too.
       - integration-test-slippy
+    # A tag on this public repo is cached by proxy.golang.org for good, so only main releases
+    # on its own. Any other branch releases only when someone runs the workflow by hand and
+    # ticks `release`.
     if: |
       github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/heads/feature/') ||
-      startsWith(github.ref, 'refs/heads/fix/') ||
-      startsWith(github.ref, 'refs/heads/feat/') ||
-      startsWith(github.ref, 'refs/heads/hotfix/')
+      (github.event_name == 'workflow_dispatch' && inputs.release)
     outputs:
       version: ${{ steps.release_version.outputs.version }}
     steps:
